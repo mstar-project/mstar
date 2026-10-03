@@ -44,10 +44,10 @@ from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConduc
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVReqConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     RaggedAttentionConfig,
@@ -306,6 +306,12 @@ class BagelModel(Model):
 
         # Set by get_worker_graphs() when config has LLM_cfg_text/LLM_cfg_img
         self._has_cfg_parallel = False
+        # Set when graph-walk-specific node groups place LLM cache consumers
+        # in separate worker instances.
+        self._has_llm_disaggregation = False
+        # The separate image-generation placement needs serial denoising
+        # until its published KV handoff and speculative scheduling agree.
+        self._image_gen_remote_handoff = False
 
     @property
     def _image_gen_walk(self) -> str:
@@ -445,13 +451,7 @@ class BagelModel(Model):
                 node_name=node_name,
             )
         elif node_name == "combine_cfg":
-            self._init_language_model_components(
-                device, autocast_dtype=autocast_dtype, tp_group=tp_group,
-            )
-            return CombineCFGSubmodule(
-                llm2vae=self.llm2vae,
-                config=self.config,
-            )
+            return CombineCFGSubmodule(config=self.config)
         elif node_name == "vit_encoder":
             self._init_vit_components(device, autocast_dtype=autocast_dtype)
             return ViTEncoderSubmodule(
@@ -731,8 +731,8 @@ class BagelModel(Model):
     # on absent, ungrouped nodes.
     _LLM_NODES = frozenset({"LLM", "LLM_cfg_text", "LLM_cfg_img"})
 
-    def _kv_config(self) -> KVConfig:
-        return KVConfig(
+    def _kv_config(self) -> PagedKVConfig:
+        return PagedKVConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.hidden_size // self.config.num_attention_heads,
@@ -741,14 +741,14 @@ class BagelModel(Model):
         )
 
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
-        """The text walk's prompt is its token ids, and so is every step it takes.
+        """The text walk's prompt is its token ids.
 
         The image walks write into this stream too, and an edit's picture lands
         at the positions its keyed text would have; only the text walk is named.
+        Generated pages are not keyed: the chat API sends a reply back inside
+        the next user turn, so their keys never match.
         """
-        return {"kv": {"main": PrefixStream(
-            "text_inputs", "ids", "prefill_text", "decode",
-        )}}
+        return {"kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text")}}
 
     def checkpoint_path(self) -> str:
         return snapshot_download(
@@ -816,16 +816,47 @@ class BagelModel(Model):
         model_kwargs = model_kwargs or {}
         cfg = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs["requires_cfg"]
         sampling = self.get_sampling_config("LLM", model_kwargs)
+        publish_labels: dict[tuple[str, str], list[str]] = {}
+        final_publish_labels: dict[tuple[str, str], list[str]] = {}
+        if cfg:
+            publish_labels.update({
+                ("LLM", "prefill_text"): ["cfg_text", "cfg_img"],
+                ("LLM", "prefill_vit"): ["cfg_text"],
+                ("LLM", "prefill_vae"): ["cfg_text"],
+            })
+            final_publish_labels[("LLM", "decode")] = ["cfg_img"]
+
+        if self._has_llm_disaggregation:
+            # Any prefill walk can be the last one before a remote decode or
+            # image-generation worker. Decode itself may hand off to a remote
+            # image-generation worker, but only its final state is needed.
+            for walk in ("prefill_text", "prefill_vit", "prefill_vae"):
+                publish_labels.setdefault(("LLM", walk), []).insert(0, "main")
+            final_publish_labels.setdefault(
+                ("LLM", "decode"), []
+            ).insert(0, "main")
+
         return {
             # The KV resource reads this in admit_retrieve, to know which of a
             # published request's streams to pull in. Guidance-off requests
             # name only "main", so a transfer never drags branches that this
             # request will not attend.
-            "kv": KVReqConfig(needed_labels_per_node_walk={
-                (node, walk): active_labels(walk, cfg, node)
-                for node in self._LLM_NODES
-                for walk in LLM_GRAPH_WALKS
-            }),
+            "kv": KVReqConfig(
+                needed_labels_per_node_walk={
+                    (node, walk): active_labels(walk, cfg, node)
+                    for node in self._LLM_NODES
+                    for walk in LLM_GRAPH_WALKS
+                },
+                # Only the main LLM instance creates cache branches consumed
+                # by the remote CFG replicas. Text-only requests export
+                # nothing. Think-then-image exports cfg_img once after decode
+                # stops, so image_gen_cfg sees the final KV without rewriting
+                # the SHM payload on every token. Disaggregated LLM placements
+                # additionally export main at prefill boundaries and once when
+                # decode stops.
+                publish_labels_per_node_walk=publish_labels,
+                final_publish_labels_per_node_walk=final_publish_labels,
+            ),
             "sampler": SamplingReqConfig(
                 temperature=sampling.temperature,
                 top_k=sampling.top_k,
@@ -852,7 +883,9 @@ class BagelModel(Model):
         from mstar.distributed.base import ShardingConfig
 
         return ShardingConfig(
-            groups=[], tp_enabled_nodes={"LLM"}, shard_dim={},
+            groups=[],
+            tp_enabled_nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"},
+            shard_dim={},
         )
 
     def get_worker_graphs(self, config_path: str):
@@ -864,6 +897,24 @@ class BagelModel(Model):
             name for g in node_groups for name in g["node_names"]
         }
         self._has_cfg_parallel = "LLM_cfg_text" in all_node_names
+        self._has_llm_disaggregation = sum(
+            "LLM" in group["node_names"] for group in node_groups
+        ) > 1
+        def llm_ranks(walk: str) -> set[int]:
+            return {
+                rank
+                for group in node_groups
+                if "LLM" in group["node_names"]
+                and (not group.get("graph_walks") or walk in group["graph_walks"])
+                for rank in group["ranks"]
+            }
+
+        image_ranks = llm_ranks("image_gen")
+        self._image_gen_remote_handoff = bool(
+            image_ranks
+            and image_ranks.isdisjoint(llm_ranks("prefill_text"))
+            and image_ranks.isdisjoint(llm_ranks("decode"))
+        )
         return super().get_worker_graphs(config_path)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -956,6 +1007,11 @@ class BagelModel(Model):
                         GraphEdge(next_node="LLM", name="latents"),
                         GraphEdge(next_node="LLM", name="time_index"),
                     ],
+                    # A separate image-generation worker combines a remote
+                    # KV handoff with this loop. The Rust speculative path
+                    # produced nondeterministic seeded output on that layout;
+                    # serial steps preserve the handoff's output.
+                    enable_async_scheduling=not self._image_gen_remote_handoff,
                 ),
                 max_iters=self.config.num_timesteps - 1,
                 outputs=[

@@ -72,6 +72,13 @@ Communication
        extension; raises if missing). ``AUTO``: the arena when the
        extension imports, files otherwise. Must match across the
        deployment — arena locations ride in the tensor descriptors.
+   * - ``MSTAR_KV_SHM_DIR``
+     - ``/dev/shm`` (or ``/tmp`` if unavailable)
+     - Base directory for host-staged KV snapshots when remote KV transfer
+       uses SHM. Each deployment creates a private child directory here;
+       request cleanup removes snapshots, and startup removes directories
+       left by dead deployments. All workers sharing KV snapshots must see
+       the same filesystem.
    * - ``MSTAR_SHM_ARENA_SEGMENT_MB``
      - ``256``
      - Size of each arena segment. The arena grows segment by segment;

@@ -1,10 +1,10 @@
 import logging
+import pickle
 from collections.abc import Callable
-from copy import deepcopy
 from dataclasses import dataclass, field
 
 from mstar.communication.tensors import TensorCommunicationManager
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
@@ -70,6 +70,10 @@ class WorkerGraphQueues:
     def __post_init__(self):
         self.nodes = set(self.worker_graph.section.get_nodes().keys())
         self.loops = set(self.worker_graph.section.get_loops().keys())
+        # Copied per request by unpickling, several times cheaper than deepcopy.
+        self._section_blob = pickle.dumps(
+            self.worker_graph.section, protocol=pickle.HIGHEST_PROTOCOL
+        )
 
     def process_new_inputs(
         self, request_id: int, inputs: list[GraphEdge],
@@ -102,7 +106,7 @@ class WorkerGraphQueues:
         """
         Initialize queues for a new request
         """
-        section_copy = deepcopy(self.worker_graph.section)
+        section_copy = pickle.loads(self._section_blob)
         queue = WorkerGraphIO(section_copy, wg_id=self.worker_graph_id)
         queue.register_communication_info(
             self.tensor_manager, request_id
@@ -183,6 +187,11 @@ class WorkerGraphQueues:
 @dataclass
 class PerPartitionInfo:
     current_fwd_info: CurrentForwardPassInfo
+    # Publication produced by this worker since its last completion message.
+    # Kept separate from current_fwd_info, which also contains peer state.
+    pending_resource_publish_info: dict[str, PublishedInfo] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -197,6 +206,10 @@ class PerRequestInfo:
     """
     # edge_name -> StreamBuffer
     stream_buffers: dict[str, StreamBuffer] = field(default_factory=dict)
+    # consumer node -> edge_name -> StreamBuffer, the same buffers indexed by consumer
+    stream_buffers_by_consumer: dict[str, dict[str, StreamBuffer]] = field(default_factory=dict)
+    # edges whose final chunk a built step consumed; a returned chunk leaves again
+    ended_streams: set[str] = field(default_factory=set)
     per_partition_info: dict[str, PerPartitionInfo] = field(default_factory=dict)
 
 
@@ -246,10 +259,43 @@ class RequestStateManager:
         if resource_publish_info is not None:
             part_info.current_fwd_info.update_publish_info(resource_publish_info)
 
+    def buffer_publish_info(
+        self,
+        request_id: int,
+        partition_name: str,
+        published: dict[str, PublishedInfo],
+    ) -> None:
+        pending = self.per_request_info[request_id].per_partition_info[
+            partition_name
+        ].pending_resource_publish_info
+        # finalize_batch also merges these objects into current_fwd_info.
+        # Detach the pending delta so a later peer update to that aggregate
+        # cannot leak another rank into this worker's completion message.
+        merge_publish_info(
+            pending, {name: info.clone() for name, info in published.items()}
+        )
+
+    def flush_publish_info(
+        self, request_id: int, partition_name: str,
+    ) -> dict[str, PublishedInfo]:
+        part_info = self.per_request_info[request_id].per_partition_info[
+            partition_name
+        ]
+        published = part_info.pending_resource_publish_info
+        part_info.pending_resource_publish_info = {}
+        return published
+
     def get_fwd_info(self, request_id: int, partition_name: str):
         return self.per_request_info[request_id].per_partition_info[
             partition_name
         ].current_fwd_info
+
+    def get_pending_publish_info(
+        self, request_id: int, partition_name: str,
+    ) -> dict[str, PublishedInfo]:
+        return self.per_request_info[request_id].per_partition_info[
+            partition_name
+        ].pending_resource_publish_info
 
     def get_partition_for_node(self, node_name: str) -> str | None:
         return self.node_to_partition.get(node_name)

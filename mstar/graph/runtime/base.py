@@ -5,6 +5,7 @@ from typing import NamedTuple
 from mstar.communication.tensors import NameToTensorList, TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
@@ -51,9 +52,9 @@ class EdgeTuple(NamedTuple):
 class InputTensors(NamedTuple):
     """What a batch build needs off a block, in one walk of the columns."""
     by_rid: dict[int, NameToTensorList]
-    # The rids whose edge carried a stream's final chunk. The CONSUMING pass
-    # reports the partition done, which is why this rides with the inputs.
-    final_stream_rids: set[int]
+    # Per rid, the edges that carried a stream's final chunk. The CONSUMING
+    # pass reports the partition done, which is why this rides with the inputs.
+    final_stream_edges: dict[int, set[str]]
 
 
 @dataclass
@@ -173,7 +174,7 @@ class ColumnarEdgeSpecs:
         self, get_tensor, rids: list[int] | None = None,
     ) -> InputTensors:
         """One walk for both things a batch build needs: each rid's inputs as
-        ``{signal: [tensor]}``, and the rids whose edge carried a stream's
+        ``{signal: [tensor]}``, and per rid the edges that carried a stream's
         final chunk.
 
         ``rids`` seeds the result so a rid with no ready edges still gets an
@@ -183,7 +184,7 @@ class ColumnarEdgeSpecs:
         by_rid: dict[int, NameToTensorList] = (
             {} if rids is None else {rid: {} for rid in rids}
         )
-        final_rids: set[int] = set()
+        final_edges: dict[int, set[str]] = {}
         names = self.signal_names
         uuids = self.uuids
         at = 0
@@ -192,13 +193,12 @@ class ColumnarEdgeSpecs:
             slot = by_rid.get(rid)
             if slot is None:
                 slot = by_rid[rid] = {}
-            slot[names[self.signal_name_idxs[i]]] = [
-                get_tensor(uuids[j]) for j in range(at, end)
-            ]
+            name = names[self.signal_name_idxs[i]]
+            slot[name] = [get_tensor(uuids[j]) for j in range(at, end)]
             if self.is_final_streaming_chunk[i]:
-                final_rids.add(rid)
+                final_edges.setdefault(rid, set()).add(name)
             at = end
-        return InputTensors(by_rid, final_rids)
+        return InputTensors(by_rid, final_edges)
 
     def edge_tuples(self) -> list[EdgeTuple]:
         """One ``EdgeTuple`` per edge.
@@ -452,6 +452,8 @@ class SendInput(NamedTuple):
     # rid -> (rx_info, tx_info, graph_timings). All three are populated only
     # under enable_prof, so this is None in production.
     profiling: ParallelList[int, Profiling] | None = None
+    # Only metadata produced by this worker since its last completion.
+    resource_publish_info: ParallelList[int, dict[str, PublishedInfo]] | None = None
 
 
 class GraphRuntime(ABC):
@@ -767,7 +769,7 @@ class GraphRuntime(ABC):
         graph_walk: str,
         last_node_run: str,
         loop_names: ParallelList[int, list[str]]
-    ):
+    ) -> list[int]:
         """
         (1) Stop loops in the graph
         (2) Updates pending_loop_stops list
@@ -776,6 +778,7 @@ class GraphRuntime(ABC):
         Rids whose current walk does not contain a named loop are filtered out
         here (that is a model bug, logged and dropped), so callers pass whatever
         check_stop produced.
+        Returns the rids whose loops were stopped.
         """
         pass
 
@@ -834,7 +837,7 @@ class GraphRuntime(ABC):
     def send_outputs(
         self,
         input: SendInput,
-    ):
+    ) -> list[int]:
         """
         (1) Send outputs to other workers
         (2) Buffer persist signals (the buffered signals will be internal to
@@ -843,5 +846,6 @@ class GraphRuntime(ABC):
         (4) Output signals -> api server
         (5) Remote streaming tensors
         (6) WG done messages to the conductor
+        Returns rids for which a WORKER_GRAPHS_DONE message was sent.
         """
         pass

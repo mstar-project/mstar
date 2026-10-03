@@ -6,7 +6,7 @@ import torch
 
 from mstar.engine.resources import Segment, StepContext
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVStep
+from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 
 PAGE = 8
@@ -32,7 +32,7 @@ def _no_transfer(monkeypatch):
 
 
 def _mgr(pages=6, name="kv"):
-    cfg = KVConfig(
+    cfg = PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=4,
         max_seq_len=pages * PAGE, max_num_pages=pages, page_size=PAGE,
     )

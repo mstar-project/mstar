@@ -61,6 +61,7 @@ def _worker(
         clear_rid=lambda rid, rid_str: w.cleared.append(rid),
         clear_wire_rid=w.cleared.append,
         fail_rids=lambda rids: w.failed.update(rids),  # noqa: PLW0108
+        failed_rids=w.failed,
         pending_tp_follow_count=dict.fromkeys(tp_follow, 1),
     )
     w.request_state = SimpleNamespace(
@@ -86,6 +87,22 @@ def _reads_done(w):
         m for e, m in w.sent
         if e == "conductor" and m.message_type == ConductorMessageType.READS_DONE
     ]
+
+
+def test_draining_and_pending_removal_rids_are_not_published():
+    w = _worker(known_rids=("healthy", "draining", "pending", "failed"))
+    w._draining_rids.add("draining")
+    w._pending_removes.add("pending")
+    w.scheduler.failed_rids.add("failed")
+    batch = SimpleNamespace(
+        request_ids=["healthy", "draining", "pending", "failed"],
+        per_request_info={
+            rid: SimpleNamespace(request_id=rid)
+            for rid in ("healthy", "draining", "pending", "failed")
+        },
+    )
+
+    assert w._publishable_request_ids(batch) == ["healthy"]
 
 
 def test_drain_acks_reads_done_when_no_inflight_reads():
@@ -164,6 +181,27 @@ def test_drain_deferred_behind_inflight_gpu_step():
 
     Worker._apply_pending_drains(w, set())  # step finished
     assert "X" in w._draining_rids and len(_reads_done(w)) == 1
+
+
+def test_speculation_stops_for_a_rid_being_torn_down():
+    """A same-node speculation chain keeps its rids in flight every step, so a
+    drain deferred behind it only fires once the chain lets the rid go."""
+    w = _worker(known_rids=("X", "Y"), in_flight=("X", "Y"))
+    assert not w._is_tearing_down("X")
+
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert "X" in w._pending_drains
+    assert w._is_tearing_down("X")
+    assert not w._is_tearing_down("Y")
+
+    w._pending_drains.clear()
+    w._in_flight_rids.clear()
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert "X" in w._draining_rids and "X" in w.scheduler.failed_rids
+    assert w._is_tearing_down("X")
+
+    w._pending_removes.add("Y")
+    assert w._is_tearing_down("Y")
 
 
 def test_follower_ignores_conductor_drain():
@@ -350,6 +388,7 @@ def _preprocess(inflight_reads=False):
     wt.tensor_uuid_to_metadata_per_request = {}
     wt.request_model_kwargs = {}
     wt.in_flight_requests = set()
+    wt.request_output_state = {}
     return wt
 
 
@@ -409,12 +448,19 @@ def test_preprocess_finished_reading_gates_ack_when_not_drained():
 
 
 def test_preprocess_hard_cleanup_force_drops_and_clears():
+    from mstar.api_server.data_worker import RequestOutputState
+
     wt = _preprocess()
     wt._draining_rids.add("X")
     wt._reads_done_sent.add("X")
     wt.tensor_uuid_to_metadata_per_request["X"] = {"u": {}}
     wt.request_model_kwargs["X"] = {}
     wt.in_flight_requests.add("X")
+    # the completed-request path ends here, so the output-order state must go too
+    wt.request_output_state["X"] = RequestOutputState(
+        order={"u": (0, None)}, next_sequence=2, next_emit=1,
+        pending={1: object()}, frame_index=8,
+    )
 
     wt._hard_cleanup("X")
     assert wt.forced == ["X"]
@@ -423,3 +469,4 @@ def test_preprocess_hard_cleanup_force_drops_and_clears():
     assert "X" not in wt.tensor_uuid_to_metadata_per_request
     assert "X" not in wt.request_model_kwargs
     assert "X" not in wt.in_flight_requests
+    assert "X" not in wt.request_output_state
