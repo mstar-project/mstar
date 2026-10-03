@@ -29,6 +29,8 @@ class PrefixIndex:
         self._stamp: list[int] = [0] * num_pages
         self._leaves: list[tuple[int, int]] = []
         self._clock = 0
+        self._evictable: frozenset[int] = frozenset()
+        self._evictable_at: int | None = None
 
     def lookup(self, keys: Sequence[bytes]) -> list[int]:
         """Walk ``keys`` from the root and stop at the first one not indexed."""
@@ -80,13 +82,23 @@ class PrefixIndex:
         # not `lookup`: this is not a hit, and must not re-stamp the page
         return self._by_key.get(key)
 
-    def evictable(self) -> set[int]:
+    def evictable(self) -> frozenset[int]:
         """The pages `evict` could free, cascading from the leaves.
 
         A page only the index holds is still out of reach while any page below
         it is held by someone else: eviction takes leaves only, and that one is
         never a leaf it can drop.
+
+        Kept until a page's owners change, the index's own inserts and removals
+        included: a request waiting at the head of the admission queue asks on
+        every scheduling pass, and the walk is over every page indexed.
         """
+        if self._evictable_at != self._arena.owner_changes:
+            self._evictable = self._find_evictable()
+            self._evictable_at = self._arena.owner_changes
+        return self._evictable
+
+    def _find_evictable(self) -> frozenset[int]:
         pinned: set[int] = set()
         for page in self._by_key.values():
             if self._arena.num_owners[page] > 1:
@@ -94,10 +106,10 @@ class PrefixIndex:
                 while parent is not None and parent not in pinned:
                     pinned.add(parent)
                     parent = self._parent[parent]
-        return {
+        return frozenset(
             page for page in self._by_key.values()
             if self._arena.num_owners[page] == 1 and page not in pinned
-        }
+        )
 
     def pages(self) -> list[int]:
         """Every page the index is holding a reference to."""
