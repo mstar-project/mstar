@@ -436,7 +436,7 @@ class Worker:
         # Lazy-initialized — workers without CUDA never touch it.
         self._d2h_stream: "torch.cuda.Stream | None" = None
         self._pinned_d2h_buffers: dict[
-            tuple[str, torch.dtype, tuple[int, ...]], list[torch.Tensor]
+            tuple[str, torch.dtype, int], list[torch.Tensor]
         ] = defaultdict(list)
 
         # Streaming buffers: request_id -> edge_name -> list of tensors
@@ -2653,13 +2653,18 @@ class Worker:
         dtype: torch.dtype,
         index: int = 0,
     ) -> torch.Tensor:
-        key = (purpose, dtype, tuple(shape))
+        numel = torch.Size(shape).numel()
+        key = (purpose, dtype, self._pinned_size(numel))
         buffers = self._pinned_d2h_buffers[key]
         while len(buffers) <= index:
             buffers.append(
                 torch.empty(key[2], dtype=dtype, device="cpu", pin_memory=True)
             )
-        return buffers[index]
+        return buffers[index][:numel].view(shape)
+
+    @staticmethod
+    def _pinned_size(numel: int) -> int:
+        return 1 << max(numel - 1, 0).bit_length()
 
 
     def _d2h_batched(
@@ -2765,7 +2770,7 @@ class Worker:
             )
 
         cpu_per_rid: dict = {}
-        buffer_indices: dict[tuple[str, torch.dtype, tuple[int, ...]], int] = defaultdict(int)
+        buffer_indices: dict[tuple[str, torch.dtype, int], int] = defaultdict(int)
         with torch.cuda.stream(side):
             for rid, name_to_list in source.items():
                 if not isinstance(name_to_list, dict):
@@ -2779,7 +2784,8 @@ class Worker:
                     new_list = []
                     for t in tensors:
                         if torch.is_tensor(t) and t.is_cuda:
-                            key = ("check_stop", t.dtype, tuple(t.shape))
+                            # by size class, not shape: a per-shape count gives two shapes in one class the same buffer
+                            key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
                             idx = buffer_indices[key]
                             buffer_indices[key] += 1
                             cpu_t = self._get_pinned_d2h_buffer(
