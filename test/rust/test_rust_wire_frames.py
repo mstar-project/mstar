@@ -133,6 +133,7 @@ def _send(rt, completion_id, **aos):
     ntc_rids, ntc = split("new_token_counts")
     con_rids, con = split("stream_tokens_consumed")
     prof_rids, prof = split("profiling")
+    publish_rids, publications = split("publications")
     rt.send_outputs(
         completion_id=completion_id,
         info_rids=info_rids, request_infos=infos,
@@ -140,6 +141,7 @@ def _send(rt, completion_id, **aos):
         consumed_rids=con_rids,
         stream_tokens_consumed=[dict(c) for c in con],
         prof_rids=prof_rids, profiling=prof,
+        publish_rids=publish_rids, publications=publications,
     )
 
 
@@ -348,7 +350,9 @@ def test_resource_publish_info_keeps_its_subclass(tmp_path):
     rid = mesh.admit()
     got = mesh.run(rid, uuids=[], request_infos=[
         (rid, encode_field(fwd, CurrentForwardPassInfo)),
-    ])
+    ], publications=[(
+        rid, encode_field({"kv": cls()}, dict[str, PublishedInfo]),
+    )])
     published = got["conductor"][0].body.resource_publish_info
     assert isinstance(published["kv"], cls)
 

@@ -72,6 +72,13 @@ Communication
        extension; raises if missing). ``AUTO``: the arena when the
        extension imports, files otherwise. Must match across the
        deployment — arena locations ride in the tensor descriptors.
+   * - ``MSTAR_KV_SHM_DIR``
+     - ``/dev/shm`` (or ``/tmp`` if unavailable)
+     - Base directory for host-staged KV snapshots when remote KV transfer
+       uses SHM. Each deployment creates a private child directory here;
+       request cleanup removes snapshots, and startup removes directories
+       left by dead deployments. All workers sharing KV snapshots must see
+       the same filesystem.
    * - ``MSTAR_SHM_ARENA_SEGMENT_MB``
      - ``256``
      - Size of each arena segment. The arena grows segment by segment;
@@ -306,3 +313,18 @@ Worker scheduling
        ``remove_request``, check the KV page bookkeeping (free list, owner
        counts, seals) against the streams holding the pages. Walks every
        live stream; tests and debugging only.
+
+Compilation
+-----------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_RECOMPILE_LIMIT``
+     - ``84``
+     - Dynamo's recompile limit, clamped to [8, 256]. Raise it if the logs
+       show ``hit config.recompile_limit``.

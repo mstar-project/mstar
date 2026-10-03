@@ -16,7 +16,14 @@ from mstar.engine.resources.base import (
     PublishedInfo,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep, PrefixSpan
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVSpec,
+    KVStep,
+    PagedKVConfig,
+    PrefixSpan,
+    RetentionPolicy,
+)
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_key
 from mstar.engine.resources.kv.plan import (
@@ -102,14 +109,6 @@ class PageArena:
         return self.allocator.num_free
 
 
-@dataclass(frozen=True)
-class RetentionPolicy:
-    """fifo retention of `context_budget`"""
-    context_budget: int
-    # front tokens the window never releases; only pages within them are indexed
-    protected_prefix: int = 0
-
-
 def _items_on(spans: list[PrefixSpan], page: int, page_size: int) -> list[PageItem]:
     """The items with a slot on ``page``, as the preprocess worker keyed them."""
     first_slot, end = page * page_size, (page + 1) * page_size
@@ -192,7 +191,15 @@ class CacheStream:
     page_indices: list[int] = field(default_factory=list)
     stored_len: int = 0
     position: int = 0
+    # tokens compacted out of the front by `release_oldest` so far; the
+    # stream's committed content is then `[0, protected_prefix) + the newest
+    # (stored_len - protected_prefix)` tokens of what was written
     released: int = 0
+    # the first `protected_prefix` committed tokens (a text prefix, say) are
+    # never released; set once, after they commit (`protect_prefix`)
+    protected_prefix: int = 0
+    # the policy the last committing step declared for this stream
+    # (`KVStep.retention`): the index caps at its prefix, `reset` clears it
     retention: RetentionPolicy | None = None
     read_pending: bool = False
     read_future: Future | None = None
@@ -207,18 +214,30 @@ class CacheStream:
     # set at conversion, cleared at `commit`, so a refused admit's re-probe answers the same
     converted: bool = False
     offloaded: bool = False
+    # General mutation epoch used by plans and offload claims. Appends move it.
     generation: int = 0
+    # Logical-content epoch exported to remote readers. Unlike generation, an
+    # append does not move it; rewinds and whole-stream replacements do.
+    reset_generation: int = 0
+    # Last remote logical-content epoch this cache observed. None keeps
+    # transfer descriptors from before reset_generation compatible.
+    remote_reset_generation: int | None = None
 
     # set from a successful admit until commit: an admitted step already holds
     # addressing into these pages, so an offload in that window must not claim
     # them. read by `_claim_for_offload`
     step_in_flight: bool = False
 
-    def reset(self, freed: bool=False):
+    def reset(self, freed: bool=False, *, content_reset: bool=True):
         self.stored_len = 0
         self.position = 0
         self.released = 0
+        self.protected_prefix = 0
+        self.retention = None
         self.generation += 1
+        if content_reset:
+            self.reset_generation += 1
+            self.remote_reset_generation = None
         self.step_in_flight = False
 
         if freed:
@@ -243,6 +262,7 @@ class ClaimedStream:
     stored_len: int
     position: int
     released: int
+    protected_prefix: int
 
 
 LabelToStream = dict[str, CacheStream]
@@ -253,6 +273,7 @@ class KVSequenceInfo:
     # for tracking KV cache
     latest_kv_transfer_info: Any
     page_indices: list[int] = field(default_factory=list)
+    reset_generation: int | None = None
 
 
 @dataclass
@@ -280,6 +301,23 @@ class PublishedKVInfo(PublishedInfo):
                 **self.info[key],
                 **val
             }
+
+    def clone(self) -> "PublishedKVInfo":
+        return PublishedKVInfo(
+            info={
+                rank: {
+                    label: KVSequenceInfo(
+                        seq_len=seq.seq_len,
+                        latest_kv_transfer_info=seq.latest_kv_transfer_info,
+                        page_indices=list(seq.page_indices),
+                        reset_generation=seq.reset_generation,
+                    )
+                    for label, seq in labels.items()
+                }
+                for rank, labels in self.info.items()
+            },
+            world_size=self.world_size,
+        )
 
     def get(self, rank: int) -> dict[str, KVSequenceInfo]:
         return self.info.get(rank, {})
@@ -319,12 +357,13 @@ class KVManager(AttentionResource):
 
     def __init__(
         self,
-        cfg: KVConfig,
+        cfg: PagedKVConfig,
         name: str,
         joint_comm_group: JointGroups | None,
         transfer_engine_info: TransferEngineInfo,
         device: torch.device,
         dtype=torch.bfloat16,
+        needs_remote_transfer: bool = False,
     ):
         self.config = cfg
         if joint_comm_group is not None:
@@ -343,7 +382,10 @@ class KVManager(AttentionResource):
         sink = self._arena.acquire(1)
         assert sink == [SINK_PAGE], f"expected page {SINK_PAGE} first, got {sink}"
         self._transfer = KVTransferManager(
-            transfer_engine_info, self.kv_cache
+            transfer_engine_info,
+            self.kv_cache,
+            resource_key=name,
+            needs_remote_transfer=needs_remote_transfer,
         )
         self._cpu_pool: CPUPagePool | None = None
         if cfg.cpu_offload_pages > 0:
@@ -381,9 +423,9 @@ class KVManager(AttentionResource):
         self._preplan_key = None
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
 
-        # (rid, to_label, stored_len, generation) for pre-forks appliedb by
-        # a staged step; facilitates clear_preplan function
-        self._preplan_fork_undo: list[tuple[str, str, int, int]] = []
+        # Prior length and epochs for pre-forks applied by a staged step;
+        # facilitates clear_preplan.
+        self._preplan_fork_undo: list[tuple[str, str, int, int, int]] = []
         # (rid, to_label) for intialized reservations by staged step; cleared_preplan removes
         # recorded in admit not plan, so separate from above.
         self._preplan_new_labels: list[tuple[str, str]] = []
@@ -400,6 +442,7 @@ class KVManager(AttentionResource):
             joint_comm_group=info.joint_comm_group,
             transfer_engine_info=info.transfer_engine_info,
             dtype=info.kv_dtype,
+            needs_remote_transfer=info.needs_remote_transfer,
         )
 
     def build_cuda_graph_buffers(
@@ -869,7 +912,30 @@ class KVManager(AttentionResource):
                     return AdmitOutcome(ok=True, ready=False)
 
                 stream = self._ensure_label(rid, label)
-                own = seq_info.latest_kv_transfer_info == self._own_transfer_info()
+                own = self._transfer.owns_transfer_info(
+                    transfer_info=seq_info.latest_kv_transfer_info,
+                    request_id=rid,
+                    label=label,
+                )
+                remote_reset_generation = seq_info.reset_generation
+                if (
+                    not own
+                    and remote_reset_generation is not None
+                    and stream.remote_reset_generation is not None
+                    and remote_reset_generation
+                    != stream.remote_reset_generation
+                ):
+                    # The producer rewound/replaced this logical stream. Its
+                    # seq_len may be unchanged, so length alone cannot prove
+                    # the receiver still holds the published contents.
+                    self._release_lease(stream)
+                    drop = self._arena.any_sealed(stream.page_indices)
+                    if drop:
+                        self._arena.release(stream.page_indices)
+                    stream.reset(freed=drop)
+                    stream.forget_chain()
+                if not own and remote_reset_generation is not None:
+                    stream.remote_reset_generation = remote_reset_generation
                 if not own and stream.chain is not None:
                     # another rank sampled the token after this record, so the pending tail is one behind
                     stream.chain.unkeyed = None
@@ -1011,7 +1077,7 @@ class KVManager(AttentionResource):
                     )
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
-        # TODO: apply retention policy
+        # retention is applied at commit (see `_apply_retention`)
 
         return ADMIT_OK
 
@@ -1199,13 +1265,20 @@ class KVManager(AttentionResource):
         # state: dropping the cached plan is not enough, the pre-forks already
         # copied pages and moved lengths
         with self._lock:
-            for rid, label, stored_len, generation in reversed(
+            for (
+                rid,
+                label,
+                stored_len,
+                generation,
+                reset_generation,
+            ) in reversed(
                 self._preplan_fork_undo
             ):
                 stream = self._streams.get(rid, {}).get(label)
                 if stream is not None:
                     stream.stored_len = stored_len
                     stream.generation = generation
+                    stream.reset_generation = reset_generation
             self._preplan_fork_undo = []
             # labels the staged step invented are removed, not rewound to 0:
             # a stream at 0 that nothing asked for is still a stream, and it
@@ -1250,10 +1323,23 @@ class KVManager(AttentionResource):
                     stream.stored_len += segment.span
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
+                    policy = step.retention.get((segment.request_id, segment.label))
+                    if policy is not None:
+                        self._adopt_retention(stream, policy, segment)
                     self._index_filled_pages(segment, stream, ctx)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
+                    # The step's retention, if it declared one: drop what aged
+                    # past the context budget now that this step's tokens
+                    # count. Here, under the lock and before `commit_done`
+                    # lets the next step pre-plan, so no admitted plan
+                    # addresses the pages this frees (this step's own kernels
+                    # may still be reading them, but every later user of the
+                    # pages queues behind them on the node's stream, the host
+                    # pool's copies included)
+                    if policy is not None:
+                        self._apply_retention(stream, policy)
             # post-forks copy what this step just wrote, so they land after the
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
@@ -1261,7 +1347,127 @@ class KVManager(AttentionResource):
                     self._apply_fork(rid, from_label, to_label)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
-        # TODO: handle retention policy, free pages if not commit
+
+    # Partial release behind a protected prefix (windowed generation): a
+    # request that generates in windows commits each window's K/V and, once
+    # its context horizon fills, drops the oldest generated pages while the
+    # prompt prefix stays. Two routes to the same page-floored front release:
+    # a `RetentionPolicy` the committing step declares (`KVStep.retention`),
+    # applied inside that commit — the served route, safe under pre-planning —
+    # and the explicit `protect_prefix` / `release_oldest` pair for a driver
+    # that runs between steps. Ported from #198's PagedAllocationManager
+    # (merceod) onto the pool's streams.
+
+    @torch.compiler.disable
+    def protect_prefix(
+        self, request_id: str, num_tokens: int, label: str | None = None,
+    ) -> None:
+        """Mark the first ``num_tokens`` committed tokens of the stream as never
+        releasable. Set once, after the prefix commits and before any release;
+        idempotent at the same value."""
+        if label is None:
+            label = self._default_label
+        with self._lock:
+            stream = self._streams[request_id][label]
+            if num_tokens < 0 or num_tokens > stream.stored_len:
+                raise ValueError(
+                    f"protect_prefix({num_tokens}) outside the committed {stream.stored_len} "
+                    f"tokens of request {request_id!r} label {label!r}"
+                )
+            if stream.released:
+                raise ValueError(
+                    f"protect_prefix must precede any release_oldest for request "
+                    f"{request_id!r} label {label!r}"
+                )
+            if stream.protected_prefix not in (0, num_tokens):
+                raise ValueError(
+                    f"protected prefix already {stream.protected_prefix} tokens for "
+                    f"request {request_id!r} label {label!r}, got {num_tokens}"
+                )
+            stream.protected_prefix = num_tokens
+
+    def _adopt_retention(
+        self, stream: CacheStream, policy: RetentionPolicy, segment: Segment,
+    ) -> None:
+        """Take the policy a committing step declares for its stream: the
+        protected prefix must be committed and agree with any earlier one
+        (`protect_prefix`, or the previous window's). The budget may change
+        between windows. Under the lock."""
+        if policy.protected_prefix > stream.stored_len:
+            raise ValueError(
+                f"retention for request {segment.request_id!r} label {segment.label!r} "
+                f"protects {policy.protected_prefix} tokens but only "
+                f"{stream.stored_len} are committed"
+            )
+        if stream.protected_prefix not in (0, policy.protected_prefix):
+            raise ValueError(
+                f"protected prefix already {stream.protected_prefix} tokens for "
+                f"request {segment.request_id!r} label {segment.label!r}, got "
+                f"{policy.protected_prefix}"
+            )
+        stream.protected_prefix = policy.protected_prefix
+        stream.retention = policy
+
+    def _apply_retention(self, stream: CacheStream, policy: RetentionPolicy) -> int:
+        """Release what the step's policy no longer keeps. Under the lock."""
+        excess = stream.stored_len - policy.protected_prefix - policy.context_budget
+        if excess <= 0:
+            return 0
+        return self._release_oldest_locked(stream, excess)
+
+    def _release_oldest_locked(self, stream: CacheStream, num_tokens: int) -> int:
+        """The page-floored front release shared by ``release_oldest`` and the
+        commit-time retention. Under the lock."""
+        page_size = self.config.page_size
+        first = (stream.protected_prefix + page_size - 1) // page_size
+        releasable = stream.stored_len // page_size - first
+        k = min(num_tokens // page_size, releasable)
+        if k <= 0:
+            return 0
+        freed = stream.page_indices[first:first + k]
+        del stream.page_indices[first:first + k]
+        stream.stored_len -= k * page_size
+        stream.released += k * page_size
+        stream.generation += 1
+        self._arena.release(freed)
+        return k * page_size
+
+    @torch.compiler.disable
+    def release_oldest(
+        self, request_id: str, num_tokens: int, label: str | None = None,
+    ) -> int:
+        """Free the oldest unprotected committed tokens of a live stream, whole
+        pages only, compacting the page list so the remaining stream stays
+        contiguous in page-list order. Returns the tokens actually freed.
+
+        The freed span starts at the first page fully past the protected
+        prefix; a page straddling the protection boundary and a partially
+        filled tail page are never freed, so the realized release can fall
+        short of ``num_tokens`` by up to a page — callers re-offer the
+        shortfall next time (see ``WindowedKVSession``). ``stored_len`` drops
+        by exactly the freed count and ``generation`` moves, so a prefix a
+        backend gathered out of these pages is re-read (the dense backend keys
+        its gathered prefix on it). Positions are not touched: the tokens that
+        remain keep the absolute positions their K/V was written with.
+
+        Refused under an admitted step (its plan addresses these pages) and
+        while the stream is offloaded or being retrieved.
+        """
+        if label is None:
+            label = self._default_label
+        with self._lock:
+            stream = self._streams[request_id][label]
+            if stream.step_in_flight:
+                raise RuntimeError(
+                    f"release_oldest on request {request_id!r} label {label!r} under an "
+                    "admitted step; release between steps"
+                )
+            if stream.offloaded or stream.read_pending:
+                raise RuntimeError(
+                    f"release_oldest on request {request_id!r} label {label!r} while its "
+                    "pages are offloaded or in transfer"
+                )
+            return self._release_oldest_locked(stream, num_tokens)
 
     # Eviction
 
@@ -1318,6 +1524,7 @@ class KVManager(AttentionResource):
                     gpu_page_indices=claim.pages,
                     stored_len=claim.stored_len, position=claim.position,
                     released=claim.released,
+                    protected_prefix=claim.protected_prefix,
                 )
             ]
             if not moved:
@@ -1360,6 +1567,7 @@ class KVManager(AttentionResource):
                     stored_len=stream.stored_len,
                     position=stream.position,
                     released=stream.released,
+                    protected_prefix=stream.protected_prefix,
                 ))
                 if stream.read_future is not None:
                     read_futures.append(stream.read_future)
@@ -1389,7 +1597,8 @@ class KVManager(AttentionResource):
                 freed += len(claim.pages)
                 self._arena.release(claim.pages)
                 stream.page_indices = []
-                stream.reset()
+                # Offload changes residency, not logical stream contents.
+                stream.reset(content_reset=False)
             return freed, {claim.label for claim in moved}
 
     def _abandon_claims(self, rid: str, labels: list[str]) -> None:
@@ -1452,6 +1661,7 @@ class KVManager(AttentionResource):
                 stream.stored_len = state.stored_len
                 stream.position = state.position
                 stream.released = state.released
+                stream.protected_prefix = state.protected_prefix
                 stream.offloaded = False
         # sync outside the lock: orders the reload H2D copies before attention
         # reads them, but the pages are already assigned so it touches no
@@ -1471,28 +1681,81 @@ class KVManager(AttentionResource):
         """Device pages the request is holding — the most reclaimable first."""
         return float(self.reclaimable(rid))
 
-    def _own_transfer_info(self):
+    def _own_transfer_info(
+        self,
+        request_id: str,
+        label: str,
+        stream: CacheStream,
+    ):
         """This cache's transfer descriptor, as `publish` stamps it."""
-        return self._transfer.get_kv_transfer_info()
+        return self._transfer.get_kv_transfer_info(
+            request_id=request_id,
+            label=label,
+            page_indices=stream.page_indices,
+            seq_len=stream.stored_len,
+            reset_generation=stream.reset_generation,
+        )
 
-    def publish(self, request_id: str):
-        # `remove_request` can pop the streams from another thread between the
-        # forward and finalize; nothing to publish then
-        streams = self._streams.get(request_id)
-        if streams is None:
-            return None
-
-        transfer_info = self._own_transfer_info()
+    def publish(
+        self,
+        request_id: str,
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+        *,
+        final: bool = False,
+    ):
         with self._lock:
+            # remove_request can race finalize on another thread. Resolve the
+            # request and build its descriptor in this one critical section.
+            streams = self._streams.get(request_id)
+            overrides = self._overrides.get(request_id)
+            if streams is None or overrides is None:
+                return None
+            labels = overrides.get_publish_labels(
+                node_name, graph_walk, list(streams), final=final,
+            )
+            if not labels:
+                return None
             seq_info = {
                 label: KVSequenceInfo(
                     seq_len=stream.stored_len,
-                    latest_kv_transfer_info=transfer_info,
+                    latest_kv_transfer_info=self._own_transfer_info(
+                        request_id=request_id,
+                        label=label,
+                        stream=stream,
+                    ),
                     page_indices=list(stream.page_indices),
-                ) for label, stream in streams.items()
+                    reset_generation=stream.reset_generation,
+                ) for label in labels
+                if (stream := streams.get(label)) is not None
             }
+            if not seq_info:
+                return None
         return PublishedKVInfo.build_for_rank(
             rank=self._rank, world_size=self._world_size, seq_info=seq_info,
+        )
+
+    def publish_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        return self.publish(
+            request_id, node_name=node_name, graph_walk=graph_walk,
+        )
+
+    def publish_after_stop(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        return self.publish(
+            request_id,
+            node_name=node_name,
+            graph_walk=graph_walk,
+            final=True,
         )
 
     def reset_request(self, rid: str, free: bool=False):
@@ -1540,6 +1803,7 @@ class KVManager(AttentionResource):
                 self._cpu_pool.remove_request(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
+            self._transfer.remove_request(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -1716,8 +1980,8 @@ class KVManager(AttentionResource):
         Locked (reentrant): called from plan (pre-forks, else unguarded) and
         from the already-locked commit (post-forks).
 
-        ``undo`` collects each target's prior ``(stored_len, generation)`` so a
-        preplan that is abandoned can be reversed; see `clear_preplan`.
+        ``undo`` collects each target's prior length and epochs so a preplan
+        that is abandoned can be reversed; see `clear_preplan`.
         """
         with self._lock:
             if from_label not in self._streams[rid]:
@@ -1726,7 +1990,13 @@ class KVManager(AttentionResource):
             to_stream = self._ensure_label(rid, to_label)
             if undo is not None:
                 undo.append(
-                    (rid, to_label, to_stream.stored_len, to_stream.generation)
+                    (
+                        rid,
+                        to_label,
+                        to_stream.stored_len,
+                        to_stream.generation,
+                        to_stream.reset_generation,
+                    )
                 )
             # sized off the source's length, not either side's page count:
             # both can hold more pages than the fork needs, and a target left
@@ -1751,6 +2021,7 @@ class KVManager(AttentionResource):
             )
             to_stream.stored_len = from_stream.stored_len
             to_stream.generation += 1
+            to_stream.reset_generation += 1
 
     def _alloc(
         self, request_id: str, label: str, seq_len: int

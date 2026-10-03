@@ -19,7 +19,7 @@ from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, RouteInput, SpeculationPrepInput
 from mstar.graph.runtime.python import PythonGraphRuntime
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
 
@@ -1848,3 +1848,189 @@ def test_accumulated_loop_outputs_are_staged_for_every_iteration(rollout):
         "ones the completing batch produced"
     )
     assert out.register_rids == [rid, rid]
+
+
+# --- persisted outputs a later walk reads ------------------------------------
+
+def _admit_with_remote(rt, remote):
+    """With ``remote``, the request also has a node on a second worker."""
+    if not remote:
+        return _admit(rt)
+    return rt.add_request(
+        request_id="r1", partition="default", graph_walk=WALK,
+        partition_worker_graph_ids=[WG_ID, 1],
+        worker_graph_to_workers=ParallelList([WG_ID, 1], [[WORKER], ["worker1"]]),
+    )
+
+
+def _persisting_rollout(which, next_node, remote=False):
+    """``rollout`` with the accumulated edge persisted, as Whisper's decode
+    loop persists its transcript for the alignment walk."""
+    wg = WorkerGraph(
+        section=_rollout_graph(GraphEdge(name="pred", next_node=next_node, persist=True)),
+        graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}, 1: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: {"roll"}, 1: set()},
+        all_wg_ids_to_nodes={WG_ID: ROLL_NODES, 1: {"remote"}},
+        node_to_partition={**dict.fromkeys(ROLL_NODES, "default"), "remote": "default"},
+        sharding_config=_sharding(),
+    )
+    if which == "python":
+        book = PythonTensorBookkeeping()
+        rt = PythonGraphRuntime(
+            tensor_manager=_StubTensorManager(book), communicator=None, **common,
+        )
+    else:
+        book = RustTensorBookkeeping()
+        rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
+    return rt, book, _admit_with_remote(rt, remote)
+
+
+def _roll(rt, book, rid):
+    """encode, then both loop iterations, in the worker's order: consumed
+    inputs are released before the completion routes. Returns the last
+    RouteOutput."""
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("video", "encode")]))
+    out = None
+    for node, uuid in (("encode", 1), ("step", 2), ("step", 3)):
+        rt.pop_rids(node, WALK, [rid])
+        rt.cleanup_consumed_inputs(node, [rid], [WG_ID])
+        book.put_tensor(uuid, _info(uuid))
+        book.increment_ref(uuid, 1)
+        out = rt.complete_and_route_batch(
+            RouteInput(
+                partition="default", graph_walk=WALK, node_name=node,
+                output_signals=["pred"], wg_ids=ParallelList([rid], [WG_ID]),
+                tensors=[uuid], num_tensors=[1],
+            ),
+        )
+    return out
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_persisted_accumulated_outputs_outlive_the_client_read(which):
+    """A later walk reads them through the conductor, so once the client has
+    read the emitted copies, every iteration's tensor is still held by its
+    persist mark, not only the last batch's."""
+    rt, book, rid = _persisting_rollout(which, EMIT_TO_CLIENT)
+    _roll(rt, book, rid)
+    for uuid in (2, 3):
+        book.dereference(uuid, 1)  # the client's read
+
+    assert not _released(book, 2), "an earlier iteration's tensor was freed"
+    assert not _released(book, 3)
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+@pytest.mark.parametrize("remote", [False, True], ids=["local", "remote"])
+def test_persisted_accumulated_outputs_are_staged_for_a_remote_reader(which, remote):
+    """Only the persist pass stages an EMPTY_DESTINATION edge: every
+    iteration's tensor for a remote reader, none without one."""
+    rt, book, rid = _persisting_rollout(which, EMPTY_DESTINATION, remote)
+    out = _roll(rt, book, rid)
+    assert sorted(out.register_uuids) == ([2, 3] if remote else [])
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+@pytest.mark.parametrize("remote", [False, True], ids=["local", "remote"])
+def test_a_persisted_output_is_staged_only_for_a_remote_reader(which, remote):
+    """With every node on this worker, a later walk reads the state from this
+    worker's own store, so staging it writes a file nobody opens."""
+    section = GraphNode(
+        name="only", input_names={"prompt"},
+        outputs=[
+            GraphEdge(name="state", next_node=EMPTY_DESTINATION, persist=True),
+            GraphEdge(name="out", next_node=EMIT_TO_CLIENT),
+        ],
+    )
+    wg = WorkerGraph(
+        section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}, 1: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: set(), 1: set()},
+        all_wg_ids_to_nodes={WG_ID: {"only"}, 1: {"remote"}},
+        node_to_partition={"only": "default", "remote": "default"},
+        sharding_config=_sharding(),
+    )
+    if which == "python":
+        book = PythonTensorBookkeeping()
+        rt = PythonGraphRuntime(
+            tensor_manager=_StubTensorManager(book), communicator=None, **common,
+        )
+    else:
+        book = RustTensorBookkeeping()
+        rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
+    rid = _admit_with_remote(rt, remote)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "only")]))
+    rt.pop_rids("only", WALK, [rid])
+    for uuid in (1, 2):
+        book.put_tensor(uuid, _info(uuid))
+        book.increment_ref(uuid, 1)
+    out = rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="only",
+            output_signals=["state", "out"], wg_ids=ParallelList([rid], [WG_ID]),
+            tensors=[1, 2], num_tensors=[1, 1],
+        ),
+    )
+    assert sorted(out.register_uuids) == ([1, 2] if remote else [2])
+
+
+def test_an_unread_loop_back_sends_nothing():
+    """The token loops back only to feed the accumulated output. The node
+    never reads it, so routing it would frame it to this same worker."""
+    section = Sequential(sections=[
+        GraphNode(
+            name="prefill", input_names={"prompt"},
+            outputs=[GraphEdge(name="text_inputs", next_node="decode")],
+        ),
+        Loop(
+            name="decode_loop",
+            section=GraphNode(
+                name="decode", input_names={"text_inputs"},
+                outputs=[
+                    GraphEdge(name="new_token", next_node="decode"),
+                    GraphEdge(name="text_inputs", next_node="decode"),
+                ],
+            ),
+            outputs=[],
+            accumulated_outputs=[GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT)],
+            max_iters=4,
+        ),
+    ])
+    nodes = {"prefill", "decode"}
+    book = RustTensorBookkeeping()
+    rt = rust_runtime.RustGraphRuntime(
+        my_worker_id=WORKER,
+        my_worker_graphs=[WorkerGraph(
+            section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+        )],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: {"decode_loop"}},
+        all_wg_ids_to_nodes={WG_ID: nodes},
+        node_to_partition=dict.fromkeys(nodes, "default"),
+        sharding_config=_sharding(),
+        bookkeeping=book,
+    )
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
+    _route_one(rt, book, None, rid, "prefill", "text_inputs", 1)
+
+    rt.pop_rids("decode", WALK, [rid])
+    for uuid in (2, 3):
+        book.put_tensor(uuid, _info(uuid))
+        book.increment_ref(uuid, 1)
+    out = rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="decode",
+            output_signals=["new_token", "text_inputs"],
+            wg_ids=ParallelList([rid], [WG_ID]),
+            tensors=[2, 3], num_tensors=[1, 1],
+        ),
+    )
+    assert out.rids_needing_request_info == frozenset()

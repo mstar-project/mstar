@@ -20,7 +20,7 @@ import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
-from mstar.engine.resources.kv.config import KVConfig, KVSpec
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint
 from mstar.model.base import PrefixStream, ProcessPromptOutput, Span, TensorAndMetadata
 
@@ -66,7 +66,7 @@ class _StubModel:
     def get_node_resources(self):
         return [KVSpec(
             resource_key="kv", nodes={"LLM"},
-            config=KVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096),
+            config=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096),
         )]
 
     def preprocess_fingerprint(self):

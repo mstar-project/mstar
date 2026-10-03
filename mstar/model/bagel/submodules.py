@@ -826,12 +826,14 @@ class LLMSubmodule(ARNodeSubmodule):
     def cg_key_info(
         self, graph_walk: str,
         per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs,
     ):
         """Guidance on/off, which is what separates this walk's two decode
         captures. Same fact `declare_step` stamps on the step, read from the
         batch rather than from the prepared inputs because the lease can be
         taken before `prepare_inputs` runs (the speculation path)."""
-        del graph_walk
+        del graph_walk, per_request_input_metadata, kwargs
         return self._batch_get_requires_cfg(per_request_info)
 
     def prepare_inputs(
@@ -1685,22 +1687,16 @@ class VAEDecoderSubmodule(NodeSubmodule):
 class CombineCFGSubmodule(NodeSubmodule):
     """Lightweight node: applies CFG formula + Euler step.
 
-    Receives 3 velocity tensors (v_main, v_cfg_text, v_cfg_img) plus
-    latents and time_index from the parallel LLM branches. Projects
-    velocities to VAE space, applies the 2-node CFG formula with
-    renormalization, then performs an Euler step.
+    Receives 3 VAE-space velocity tensors (v_main, v_cfg_text, v_cfg_img)
+    plus latents and time_index from the parallel LLM branches. Applies the
+    2-node CFG formula with renormalization, then performs an Euler step.
 
     Used in the image_gen_cfg graph walk (parallel CFG architecture).
     Runs on the same GPU as the main LLM branch (enc_dec engine, no KV cache).
     """
 
-    def __init__(
-        self,
-        llm2vae: nn.Linear,
-        config: "BagelModelConfig",
-    ):
+    def __init__(self, config: "BagelModelConfig"):
         super().__init__()
-        self.llm2vae = llm2vae
         self.config = config
 
     @staticmethod
@@ -1714,7 +1710,9 @@ class CombineCFGSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        device = self.get_device()
+        # The join has no parameters; incoming branch output identifies the
+        # worker device without loading an otherwise-unused model component.
+        device = inputs["v_main"][0].device
 
         result = {
             "v_main": inputs["v_main"][0],
@@ -1785,13 +1783,7 @@ class CombineCFGSubmodule(NodeSubmodule):
         timestep_next = self._apply_timestep_shift(t=t_uniform_next, shift=shift)
         dt = (timestep - timestep_next)[0]
 
-        # Project to VAE space, strip BOI/EOI
-        # v_m = self.llm2vae(v_main[1:-1])
-        # v_ct = self.llm2vae(v_cfg_text[1:-1])
-        # v_ci = self.llm2vae(v_cfg_img[1:-1])
-        # Branches now project to VAE space themselves in
-        # _forward_image_gen_single_branch (avoids re-projecting the same
-        # hidden state on every CFG combine).
+        # Branches project to VAE space before routing to this join.
         v_m = v_main
         v_ct = v_cfg_text
         v_ci = v_cfg_img

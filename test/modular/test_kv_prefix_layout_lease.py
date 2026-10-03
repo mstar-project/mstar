@@ -24,7 +24,7 @@ import torch
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.communication.wire import decode, encode
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import KVConfig, PositionConfig, PositionStep, StepRunner
+from mstar.engine.resources import PagedKVConfig, PositionConfig, PositionStep, StepRunner
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan
 from mstar.engine.resources.kv.keys import PageItem, chain
@@ -50,7 +50,7 @@ PARTS = [TEXT, IMAGE, TAIL]
 
 @pytest.fixture(autouse=True)
 def _no_transfer(monkeypatch):
-    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda info, cache: None)
+    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda *args, **kwargs: None)
 
 
 def _config(parts: list) -> KVReqConfig:
@@ -90,7 +90,7 @@ class _Node:
     def __init__(self, seeded: list | None = PARTS, parts: list | None = None):
         device = torch.device("cpu")
         self.kv = KVManager(
-            cfg=KVConfig(
+            cfg=PagedKVConfig(
                 num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
                 max_num_pages=64, page_size=PAGE_SIZE,
             ),
@@ -249,8 +249,9 @@ def test_a_layout_reaches_the_kv_config_across_the_wire():
 
 
 def test_a_stream_read_in_from_the_rank_that_prefilled_indexes_its_prompt_at_decode(monkeypatch):
-    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda info, cache: SimpleNamespace(
-        start_async_retrieve=lambda **kwargs: None, get_kv_transfer_info=lambda: None,
+    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda *args, **kwargs: SimpleNamespace(
+        start_async_retrieve=lambda **kwargs: None, get_kv_transfer_info=lambda **kwargs: None,
+        owns_transfer_info=lambda **kwargs: False,
     ))
     prompt = list(range(1, 51))
     node = _Node(None, [prompt])

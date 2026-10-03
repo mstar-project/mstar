@@ -147,6 +147,7 @@ def test_bagels_walks_pass_the_load_check_under_cfg_parallelism():
     )
     # the KV then spans LLM_cfg_text and LLM_cfg_img, which no prefill walk runs
     model._has_cfg_parallel = True
+    model._image_gen_remote_handoff = False
     assert model.prefix_key_streams()["kv"]["main"].layout_walks == ("prefill_vit",), (
         "bagel names no layout walk, so the check below never looks at its walks"
     )

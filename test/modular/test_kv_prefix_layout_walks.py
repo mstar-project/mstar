@@ -15,7 +15,7 @@ sys.path.insert(0, ".")
 
 import pytest
 
-from mstar.engine.resources.kv.config import KVConfig, KVSpec
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import PrefixStream
@@ -65,7 +65,7 @@ class _StubModel:
 def _specs(nodes=frozenset({"LLM"})) -> list[KVSpec]:
     return [KVSpec(
         resource_key="kv", nodes=set(nodes),
-        config=KVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64),
+        config=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64),
     )]
 
 

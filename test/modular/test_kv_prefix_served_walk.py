@@ -25,7 +25,7 @@ from mstar.communication.tensors import StoredOutputs
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext, StepRunner
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.graph.runtime.base import FreedTensors, RouteOutput
@@ -71,7 +71,7 @@ class _StubGraphRuntime:
         )
 
     def send_outputs(self, send_input):
-        pass
+        return []
 
 
 class _StubTensorManager:
@@ -106,6 +106,8 @@ def _worker() -> Worker:
     ))
     w.request_state = SimpleNamespace(
         per_request_info={}, get_fwd_info=lambda rid, partition: None,
+        buffer_publish_info=lambda rid, partition, published: None,
+        get_pending_publish_info=lambda rid, partition: {},
     )
     w.device = torch.device("cpu")
     w.enable_nvtx = False
@@ -140,9 +142,9 @@ def test_a_served_walk_is_routed_with_no_tensors():
 
 @pytest.mark.parametrize("refused", [False, True], ids=["probed", "refused"])
 def test_a_keyed_text_walk_placing_its_own_positions_fails_probed_or_refused(monkeypatch, refused):
-    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda info, cache: None)
+    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda *args, **kwargs: None)
     kv = KVManager(
-        cfg=KVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=16),
+        cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=16),
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
     )
@@ -176,8 +178,8 @@ class _StubModel:
 
 
 def test_the_layout_walks_reach_both_the_probe_and_the_cache(monkeypatch):
-    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda info, cache: None)
-    config = KVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, prefix_cache_salt="a salt")
+    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda *args, **kwargs: None)
+    config = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, prefix_cache_salt="a salt")
     kv = KVManager(
         cfg=config, name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,

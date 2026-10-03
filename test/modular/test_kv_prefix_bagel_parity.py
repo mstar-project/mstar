@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from mstar.engine.resources import (
-    KVConfig,
+    PagedKVConfig,
     PositionConfig,
     StepContext,
     StepRunner,
@@ -65,11 +65,18 @@ DTYPE = torch.bfloat16
 class _StubTransfer:
     """No engine, no bytes moved."""
 
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
-    def get_kv_transfer_info(self):
-        return None
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del kwargs
+        return transfer_info == self.get_kv_transfer_info()
+
+    def remove_request(self, request_id):
+        del request_id
 
     def start_async_retrieve(self, **kwargs):
         del kwargs
@@ -135,7 +142,7 @@ class _Node:
         ).eval()
         _initialise(self.llm)
 
-        kv_config = KVConfig(
+        kv_config = PagedKVConfig(
             num_layers=config.num_hidden_layers,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.hidden_size // config.num_attention_heads,

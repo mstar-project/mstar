@@ -229,6 +229,14 @@ class WorkerParallelGroups:
     # projections).
     node_to_tp_group: dict[str, CommGroup] = field(default_factory=dict)
     node_to_sp_group: dict[str, CommGroup] = field(default_factory=dict)
+    # Global topology metadata. Unlike the comm-group maps above, these maps
+    # describe every replica, including ones this worker does not host.
+    node_to_parallel_shapes: dict[
+        str, frozenset[tuple[int, int]]
+    ] = field(default_factory=dict)
+    node_to_instance_groups: dict[
+        str, frozenset[tuple[int, ...]]
+    ] = field(default_factory=dict)
     _device: torch.device | None = field(default=None, init=False, repr=False)
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
@@ -351,6 +359,40 @@ class WorkerParallelGroups:
                 return False
         return True
 
+    def all_have_compatible_parallel_shape(self, nodes: set[str]) -> bool:
+        """Whether every replica uses the same tensor/sequence parallel size."""
+        shapes: set[tuple[int, int]] = set()
+        for node in nodes:
+            global_shapes = self.node_to_parallel_shapes.get(node)
+            if global_shapes:
+                shapes.update(global_shapes)
+                continue
+            tp = self.node_to_tp_group.get(node)
+            sp = self.node_to_sp_group.get(node)
+            shapes.add((
+                tp.world_size if tp is not None else 1,
+                sp.world_size if sp is not None else 1,
+            ))
+        return len(shapes) <= 1
+
+    def resource_needs_remote_transfer(
+        self, nodes: set[str], local_nodes: set[str],
+    ) -> bool:
+        """Whether a logical resource spans more than one worker instance."""
+        instance_groups: set[tuple[int, ...]] = set()
+        topology_known = True
+        for node in nodes:
+            groups = self.node_to_instance_groups.get(node)
+            if not groups:
+                topology_known = False
+                break
+            instance_groups.update(groups)
+        if topology_known:
+            return len(instance_groups) > 1
+        # Preserve sensible behavior for hand-built/test configs that lack the
+        # global maps: another named consumer necessarily needs a transfer.
+        return bool(nodes - local_nodes)
+
     def barrier_all(self) -> None:
         """Global barrier across every worker process in the run.
 
@@ -378,6 +420,26 @@ class GlobalParallelConfig:
         any_parallelism = any(
             wg.tp_size > 1 or wg.sp_size > 1 for wg in worker_graphs.values()
         )
+        node_to_parallel_shapes: dict[str, set[tuple[int, int]]] = {}
+        node_to_instance_groups: dict[str, set[tuple[int, ...]]] = {}
+        for wg in worker_graphs.values():
+            shape = (wg._tp_comm_size, wg.sp_size)
+            instance_groups = wg._instance_ranks or [
+                [rank] for rank in wg.ranks
+            ]
+            for node in wg.section.get_nodes():
+                node_to_parallel_shapes.setdefault(node, set()).add(shape)
+                node_to_instance_groups.setdefault(node, set()).update(
+                    tuple(group) for group in instance_groups
+                )
+        frozen_parallel_shapes = {
+            node: frozenset(shapes)
+            for node, shapes in node_to_parallel_shapes.items()
+        }
+        frozen_instance_groups = {
+            node: frozenset(groups)
+            for node, groups in node_to_instance_groups.items()
+        }
         world_tp_groups: list[tuple[int, ...]] = sorted({
             tuple(rank_group)
             for wg in worker_graphs.values()
@@ -400,6 +462,8 @@ class GlobalParallelConfig:
                 global_rank=i, num_workers=self.num_workers,
                 any_parallelism=any_parallelism,
                 world_parallel_groups=world_parallel_groups,
+                node_to_parallel_shapes=frozen_parallel_shapes,
+                node_to_instance_groups=frozen_instance_groups,
             ) for i, wid in enumerate(worker_ids)
         }
 

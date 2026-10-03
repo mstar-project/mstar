@@ -6,6 +6,7 @@ from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -94,6 +95,9 @@ class GraphRuntimeRequestInfo:
     node_to_workers: dict[NodeAndGraphWalk, list[str]]
     dyn_loop_to_workers: dict[NodeAndGraphWalk, list[str]]
     sharding_config: ShardingConfig
+    # Whether any node of this request runs on another worker. Without one, a
+    # persisted tensor is only ever read back from this worker's own store.
+    has_remote_workers: bool = True
     # Per-loop stop indices. Worker-only, so it lives here rather than riding
     # on CurrentForwardPassInfo across the wire.
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
@@ -230,7 +234,11 @@ class PythonGraphRuntime(GraphRuntime):
                 worker_graph_ids=[],
                 node_to_workers=node_to_workers,
                 dyn_loop_to_workers=dyn_loop_to_workers,
-                sharding_config=sharding_config
+                sharding_config=sharding_config,
+                has_remote_workers=any(
+                    worker != self._my_worker_id
+                    for workers in node_to_workers.values() for worker in workers
+                ),
             )
 
         for graph_id in partition_worker_graph_ids:
@@ -885,7 +893,15 @@ class PythonGraphRuntime(GraphRuntime):
             self._undo_spec_ingest(node, into_signals, into_next_iter)
             return None
 
-        slots = node.ready_next_iter if same_node else node.ready_signals
+        inputs = dict(
+            node.ready_next_iter.ready_inputs if same_node
+            else node.ready_signals.ready_inputs
+        )
+        if same_node:
+            # Carry over the loop-external inputs sitting in ready_signals —
+            # the same set `is_ready_for_speculation` just counted as ready.
+            for name in node.persisted_input_names():
+                inputs.setdefault(name, node.ready_signals.ready_inputs[name])
         return _SpecRidPrep(
             rid=rid,
             node=node,
@@ -895,7 +911,7 @@ class PythonGraphRuntime(GraphRuntime):
                     name,
                     [info.uuid for info in edge.tensor_info],
                     edge._final_stream_chunk,
-                ) for name, edge in slots.ready_inputs.items()
+                ) for name, edge in inputs.items()
             ],
             into_signals=into_signals,
             into_next_iter=into_next_iter,
@@ -937,6 +953,10 @@ class PythonGraphRuntime(GraphRuntime):
         for edge in non_streaming_outputs:
             wg_id = self._walk_node_to_wg_id.get((graph_walk, edge.next_node))
             if wg_id is not None and wg_id in self._queues:
+                if edge.next_node == node_name and not self._node_reads(rid, wg_id, edge):
+                    # Only feeds the loop's accumulated outputs, which already
+                    # cached it; routed, it would bounce off this worker.
+                    continue
                 fanout = sharding_config.fanout_graph_edges(
                     edge, source_node=node_name,
                     source_graph_walk=graph_walk,
@@ -1049,6 +1069,11 @@ class PythonGraphRuntime(GraphRuntime):
         )
 
 
+    def _node_reads(self, rid: int, wg_id: int, edge: GraphEdge) -> bool:
+        wgio = self._queues[wg_id].per_request_queues.get(rid)
+        node = wgio.nodes.get(edge.next_node) if wgio is not None else None
+        return node is None or edge.name in node.input_names
+
     def _mark_node_complete(
         self, rid: int, wg_id: int, node_name: str,
     ) -> NodeCompletionOutput:
@@ -1065,7 +1090,8 @@ class PythonGraphRuntime(GraphRuntime):
         graph_walk: str,
         last_node_run: str,
         loop_names: ParallelList[int, list[str]]
-    ):
+    ) -> list[int]:
+        stopped_rids = []
         for rid, names in loop_names:
             wanted = {
                 name for name in names
@@ -1078,6 +1104,8 @@ class PythonGraphRuntime(GraphRuntime):
                 PendingLoopStop(rid, graph_walk, name) for name in wanted
             )
             self._fan_out_loop_stops(rid, partition, wanted)
+            stopped_rids.append(rid)
+        return stopped_rids
 
     def _stop_loops_for_rid(
         self, rid: int, partition: str, loop_names: set[str],
@@ -1233,10 +1261,12 @@ class PythonGraphRuntime(GraphRuntime):
             )
             routing_per_rid[rid] = routing
 
+            # Even when this batch produced none of them: an accumulated output
+            # carries earlier iterations' tensors.
+            for edge in routing.persist:
+                for info in edge.tensor_info:
+                    self._tensor_manager.set_persist(info.uuid, persist=True)
             if owned:
-                for edge in routing.persist:
-                    for info in edge.tensor_info:
-                        self._tensor_manager.set_persist(info.uuid, persist=True)
                 # persist is deliberately absent: those tensors are held alive
                 # by the persist marker, and counting them here would
                 # double-count a signal whose destination is EMPTY_DESTINATION
@@ -1254,9 +1284,15 @@ class PythonGraphRuntime(GraphRuntime):
             # an outgoing edge, not just the ones this batch produced: a loop
             # edge carries tensors from earlier iterations, and those need
             # staging just as much. Deduped by uuid, so a re-emitted edge does
-            # not stage twice.
+            # not stage twice. Persisted tensors only for a remote reader:
+            # otherwise later walks read them from this worker's store.
+            req_info = self._request_info.get(rid)
+            persist = (
+                routing.persist
+                if req_info is None or req_info.has_remote_workers else []
+            )
             for edge in (
-                routing.persist + routing.emit_to_client
+                persist + routing.emit_to_client
                 + sum(routing.to_workers.values(), start=[])
                 + sum(routing.streaming_to_workers.values(), start=[])
             ):
@@ -1320,7 +1356,7 @@ class PythonGraphRuntime(GraphRuntime):
     def send_outputs(
         self,
         input: SendInput,
-    ):
+    ) -> list[int]:
         completion = self._completions.pop(input.completion_id)
         partition = completion.partition
         fwd_infos = dict(iter(input.per_request_info))
@@ -1333,6 +1369,11 @@ class PythonGraphRuntime(GraphRuntime):
         profiling = (
             {} if input.profiling is None else dict(iter(input.profiling))
         )
+        publications = (
+            {} if input.resource_publish_info is None
+            else dict(iter(input.resource_publish_info))
+        )
+        sent_rids: list[int] = []
 
         for rid, routing in completion.routing.items():
             fwd_info = fwd_infos.get(rid)
@@ -1391,6 +1432,7 @@ class PythonGraphRuntime(GraphRuntime):
                 )._speculatively_scheduled
                 self._send_worker_graphs_done(
                     rid, routing, info, fwd_info, partition,
+                    resource_publish_info=publications.get(rid, {}),
                     stream_tokens_consumed=consumed.get(rid, {}),
                     # A speculatively-scheduled node has not really finished
                     # the partition, so it must not report done.
@@ -1400,6 +1442,8 @@ class PythonGraphRuntime(GraphRuntime):
                     ),
                     profiling=profiling.get(rid),
                 )
+                sent_rids.append(rid)
+        return sent_rids
 
     def _send_input_signals(
         self, rid: int, worker_id: str, edges: list[GraphEdge],
@@ -1424,6 +1468,7 @@ class PythonGraphRuntime(GraphRuntime):
         info: GraphRuntimeRequestInfo,
         fwd_info: CurrentForwardPassInfo | None,
         partition: str,
+        resource_publish_info: dict[str, PublishedInfo],
         stream_tokens_consumed: dict[str, int],
         partition_done: bool,
         profiling: Profiling | None,
@@ -1433,9 +1478,16 @@ class PythonGraphRuntime(GraphRuntime):
         self._tensor_manager.refresh_shm_placement(
             info.pending_persist_signals
         )
+        # A loop can persist a name once per iteration before this goes out, so
+        # keep all of them; one output routed twice repeats its uuids.
         persist_signals: dict[str, list[TensorPointerInfo]] = {}
+        seen: set[tuple[str, int]] = set()
         for edge in info.pending_persist_signals:
-            persist_signals[edge.name] = edge.tensor_info
+            infos = persist_signals.setdefault(edge.name, [])
+            for i in edge.tensor_info:
+                if (edge.name, i.uuid) not in seen:
+                    seen.add((edge.name, i.uuid))
+                    infos.append(i)
         info.pending_persist_signals = []
         new_token_counts = info.pending_new_token_counts
         info.pending_new_token_counts = {}
@@ -1455,9 +1507,7 @@ class PythonGraphRuntime(GraphRuntime):
                 persist_signals=persist_signals,
                 new_token_counts=new_token_counts,
                 output_signal_names=output_signal_names,
-                resource_publish_info=(
-                    {} if fwd_info is None else fwd_info.resource_publish_info
-                ),
+                resource_publish_info=resource_publish_info,
                 partition_name=partition,
                 partition_done=partition_done,
                 stream_tokens_consumed=stream_tokens_consumed,
