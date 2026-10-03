@@ -21,9 +21,6 @@ import torch
 
 from mstar.model.multimodal import PromptPart
 
-VIT_TOKENS = 70 * 70 + 2
-VAE_TOKENS = 64 * 64 + 2
-
 
 class _StubTokenizer:
     """One id per character; the specials Bagel scans for are single ids."""
@@ -58,6 +55,7 @@ def bagel():
             self.config = SimpleNamespace(
                 think_mode=False, vit_max_num_patch_per_side=70,
                 max_latent_size=64, latent_downsample=16,
+                vit_config=SimpleNamespace(patch_size=14),
             )
             self.tokenizer = _StubTokenizer()
             self.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]
@@ -77,23 +75,6 @@ def test_a_text_request_reserves_its_prompt_and_decodes_on_main(bagel):
         "prompt_slots": {"kv": {"main": _text_tokens(out)}},
         "decode_labels": {"kv": ["main"]},
     }, "a text request was sized other than by its prompt, growing by decode"
-
-
-def test_an_attachment_counts_at_its_encoders_largest_grid(bagel):
-    parts = [
-        PromptPart(modality="text", text="look at this"),
-        PromptPart(modality="image", index=0),
-    ]
-    out = bagel.process_prompt(
-        "look at this", ["text", "image"], ["text"],
-        tensors={"image_inputs": [torch.zeros(3, 32, 32)]}, prompt_parts=parts,
-    )
-
-    slots = out.metadata["prompt_slots"]["kv"]["main"]
-    assert slots == _text_tokens(out) + VIT_TOKENS, (
-        "a small attachment was counted at its own size; the ViT walk can "
-        "write up to its largest grid"
-    )
 
 
 def test_an_image_request_counts_its_latents_on_every_guidance_label(bagel):
@@ -122,10 +103,12 @@ def test_an_edit_sizes_its_latents_off_its_input(bagel):
         tensors={"image_inputs": [torch.zeros(3, 512, 1024)]}, prompt_parts=parts,
     )
 
-    # already 1024 on its long edge, so the edit keeps its size
+    # already 1024 on its long edge, so the edit keeps its size; the ViT walk
+    # takes it to 490x980 (35x70 patches), the VAE walk keeps it (32x64)
+    vit, vae = 35 * 70 + 2, 32 * 64 + 2
     latents = (512 // 16) * (1024 // 16) + 2
     slots = out.metadata["prompt_slots"]["kv"]["main"]
-    assert slots == _text_tokens(out) + VIT_TOKENS + VAE_TOKENS + latents, (
+    assert slots == _text_tokens(out) + vit + vae + latents, (
         "an edit generates at its input's size, and its attachment writes "
         "both a ViT and a VAE walk"
     )

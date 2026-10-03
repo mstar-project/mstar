@@ -225,7 +225,11 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
             height, width = img.shape[-2:]
         else:
             width, height = img.size
+        new_height, new_width = self.target_size(height, width, img_num)
+        return F.resize(img, (new_height, new_width), self.interpolation, antialias=self.antialias)
 
+    def target_size(self, height: int, width: int, img_num: int = 1) -> tuple[int, int]:
+        """The ``(height, width)`` an image of this size is resized to."""
         scale = min(self.max_size / max(width, height), 1.0)
         scale = max(scale, self.min_size / min(width, height))
         new_width, new_height = self._apply_scale(width, height, scale)
@@ -240,7 +244,7 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
             scale = self.max_size / max(new_width, new_height)
             new_width, new_height = self._apply_scale(new_width, new_height, scale)
 
-        return F.resize(img, (new_height, new_width), self.interpolation, antialias=self.antialias)
+        return new_height, new_width
 
 
 class ImageTransform:
@@ -294,6 +298,14 @@ def vllm_vae_resize(
     normalization is applied separately by the caller.
     """
     _, h, w = image.shape
+    new_h, new_w = vllm_vae_target_size(h, w, stride, max_img_size, min_img_size)
+    return F.resize(image, (new_h, new_w), InterpolationMode.BICUBIC, antialias=True)
+
+
+def vllm_vae_target_size(
+    h: int, w: int, stride: int, max_img_size: int, min_img_size: int = 256,
+) -> tuple[int, int]:
+    """The ``(height, width)`` :func:`vllm_vae_resize` resizes an image of this size to."""
     scale = min(max_img_size / max(w, h), 1.0)
     min_size = min(min_img_size, max_img_size)
     scale = max(scale, min_size / min(w, h))
@@ -301,4 +313,4 @@ def vllm_vae_resize(
     new_h = max(stride, int(round(h * scale / stride) * stride))
     new_w = min(new_w, max_img_size)
     new_h = min(new_h, max_img_size)
-    return F.resize(image, (new_h, new_w), InterpolationMode.BICUBIC, antialias=True)
+    return new_h, new_w

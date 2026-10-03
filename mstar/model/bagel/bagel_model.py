@@ -79,6 +79,8 @@ from mstar.model.bagel.submodules import (
     VAEDecoderSubmodule,
     VAEEncoderSubmodule,
     ViTEncoderSubmodule,
+    vae_image_slots,
+    vit_image_slots,
 )
 from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream, ProcessPromptOutput
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
@@ -713,20 +715,29 @@ class BagelModel(Model):
         """What each ``kv`` label holds over the request's life, decode aside,
         and the labels decode grows, for the cache to admit the request by.
 
-        An attachment counts at its encoder's largest grid, not the size it is
-        resized to, so the count never falls short of what its ViT and VAE walks
-        write. The guidance labels take main's count: each holds at most main's.
+        An attachment counts at the size its ViT and VAE walks resize it to,
+        from the image they are given: an edit's, resized to fit the output,
+        else the one attached. The guidance labels take main's count: each
+        holds at most main's.
         """
         segments = result.get("text_inputs")
         if not segments:
             return {}
         cfg = self.config
         generating = "image" in output_modalities
-        images = (tensors or {}).get("image_inputs") or []
-        per_image = cfg.vit_max_num_patch_per_side ** 2 + 2
-        if generating:
-            per_image += cfg.max_latent_size ** 2 + 2
-        main = sum(len(span) for span in segments) + len(images) * per_image
+        images = result.get("image_inputs") or (tensors or {}).get("image_inputs") or []
+        preprocess = kwargs.get("image_preprocess", "default")
+        main = sum(len(span) for span in segments)
+        for image in images:
+            height, width = image.shape[-2:]
+            main += vit_image_slots(
+                height, width, preprocess,
+                cfg.vit_config.patch_size, cfg.vit_max_num_patch_per_side,
+            )
+            if generating:
+                main += vae_image_slots(
+                    height, width, preprocess, cfg.latent_downsample, cfg.max_latent_size,
+                )
         if not generating:
             return {"prompt_slots": {"kv": {"main": main}}, "decode_labels": {"kv": ["main"]}}
         # an edit generates at its input's size (see get_initial_forward_pass_args)
