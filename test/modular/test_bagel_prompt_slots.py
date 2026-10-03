@@ -77,6 +77,52 @@ def test_a_text_request_reserves_its_prompt_and_decodes_on_main(bagel):
     }, "a text request was sized other than by its prompt, growing by decode"
 
 
+class _StubTransfer:
+    """No engine, no bytes moved."""
+
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
+
+
+def test_an_attachment_counts_at_the_size_its_walk_writes(bagel, monkeypatch):
+    from mstar.engine.resources.kv import manager as manager_mod
+    from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
+
+    parts = [
+        PromptPart(modality="image", index=0),
+        PromptPart(modality="text", text="What is this?"),
+    ]
+    out = bagel.process_prompt(
+        "What is this?", ["image", "text"], ["text"],
+        tensors={"image_inputs": [torch.zeros(3, 480, 640)]}, prompt_parts=parts,
+    )
+
+    # the walk resizes 480x640 to 512x688 for the VAE, then to 518x686: 37x49 patches
+    slots = out.metadata["prompt_slots"]["kv"]["main"]
+    assert slots == _text_tokens(out) + 37 * 49 + 2
+    assert -(-slots // 128) == 15, (
+        "a 480x640 attachment was counted at the ViT's largest grid, not its own size"
+    )
+
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    kv = manager_mod.KVManager(
+        cfg=PagedKVConfig(
+            num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=32768,
+            max_num_pages=20, page_size=128,
+        ),
+        name="kv", joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.ingest_request("look", KVReqConfig(
+        max_tokens=256, prompt_slots=out.metadata["prompt_slots"]["kv"],
+        decode_labels=out.metadata["decode_labels"]["kv"],
+    ))
+
+    assert kv.admit_retrieve("look", "LLM", "prefill_vit", None).ready, (
+        "a request whose prompt and decode fit in 20 pages was not admitted"
+    )
+
+
 def test_an_image_request_counts_its_latents_on_every_guidance_label(bagel):
     out = bagel.process_prompt(
         "a red cube", ["text"], ["image"], height=512, width=512,
