@@ -327,3 +327,71 @@ def test_streaming_inputs_propagate_to_ready_signals():
     assert node.ready_next_iter.streaming_inputs == {"a"}
     assert node.speculative_signals.streaming_inputs == {"a"}
     assert node.consumes_stream is True
+
+
+def test_queue_add_suppressed_in_flight_is_restored_when_the_flag_clears():
+    """A node marked in-flight must not be queued by an arriving input, and must
+    be queued once the flag clears -- otherwise the wake-up is lost and the
+    request stalls.
+
+    ``register_ingested_input`` only runs at ingest time and skips the add while
+    ``_speculatively_scheduled`` is set, so clearing the flag has to re-evaluate
+    membership. A loop member's add walks up to the root registry, which is where
+    ``requeue_if_ready`` has to look.
+    """
+    io = WorkerGraphIO(_ar_loop_graph())
+    registry = io.wg_state_registry
+    decode = io.get_node("ar_decode")
+
+    # Mark the node in flight, then deliver everything it needs.
+    decode._speculatively_scheduled = True
+    io.ingest_input(GraphEdge(name="token", next_node="ar_decode"))
+    io.ingest_input(GraphEdge(name="kv_cache", next_node="ar_decode"))
+
+    assert decode.ready_signals.is_ready, "inputs should still be recorded as ready"
+    assert "ar_decode" not in registry.ready_names, \
+        "an in-flight node must not be queued while the flag is set"
+
+    # Clearing the flag must hand the node back to the scheduler.
+    decode._speculatively_scheduled = False
+    registry.requeue_if_ready("ar_decode")
+    assert "ar_decode" in registry.ready_names, \
+        "clearing the in-flight flag lost the queue add -- the request would stall"
+
+
+def test_requeue_if_ready_is_a_noop_while_still_in_flight():
+    io = WorkerGraphIO(_ar_loop_graph())
+    registry = io.wg_state_registry
+    decode = io.get_node("ar_decode")
+    decode._speculatively_scheduled = True
+    io.ingest_input(GraphEdge(name="token", next_node="ar_decode"))
+    io.ingest_input(GraphEdge(name="kv_cache", next_node="ar_decode"))
+    registry.requeue_if_ready("ar_decode")
+    assert "ar_decode" not in registry.ready_names
+
+
+def test_runtime_clear_flag_requeues_through_the_real_attribute_chain():
+    """Exercise ``PythonGraphRuntime.set_speculatively_scheduled`` itself.
+
+    The method reaches the registry as ``queues[rid].wg_state_registry``; writing
+    it against ``WorkerGraphIO`` instead raises AttributeError only at runtime,
+    which no parity test catches (they skip when the rid is absent from the
+    queues). So drive the real method over a real WorkerGraphIO.
+    """
+    from types import SimpleNamespace
+
+    from mstar.graph.runtime.python import PythonGraphRuntime
+
+    io = WorkerGraphIO(_ar_loop_graph())
+    decode = io.get_node("ar_decode")
+    decode._speculatively_scheduled = True
+    io.ingest_input(GraphEdge(name="token", next_node="ar_decode"))
+    io.ingest_input(GraphEdge(name="kv_cache", next_node="ar_decode"))
+    assert "ar_decode" not in io.wg_state_registry.ready_names
+
+    stub = SimpleNamespace(_queues={7: SimpleNamespace(per_request_queues={42: io})})
+    PythonGraphRuntime.set_speculatively_scheduled(stub, "ar_decode", 7, [42], False)
+
+    assert decode._speculatively_scheduled is False
+    assert "ar_decode" in io.wg_state_registry.ready_names, \
+        "clearing the flag through the runtime did not re-queue the node"

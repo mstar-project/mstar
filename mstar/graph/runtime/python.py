@@ -358,8 +358,16 @@ class PythonGraphRuntime(GraphRuntime):
         for rid in request_ids:
             iter_counts: dict[str, int] = {}
             part_info = self._request_info[rid].partition_info[partition]
+            _per_wg = []  # TRACE
             for wg_id in part_info.graph_walk_worker_graph_ids:
-                iter_counts.update(self._queues[wg_id].get_dynamic_loop_iters(rid))
+                _one = self._queues[wg_id].get_dynamic_loop_iters(rid)
+                _per_wg.append((wg_id, dict(_one)))  # TRACE
+                iter_counts.update(_one)
+            # TRACE: more than one worker graph reporting the same loop name means
+            # the last one wins -- an idle walk's loop sits at 0 and clobbers.
+            if len(_per_wg) > 1:
+                logger.warning("TRACE_ITERS rid=%s walk=%s per_wg=%s -> %s",
+                               rid, part_info.graph_walk, _per_wg, iter_counts)
             values.append(iter_counts)
         return ParallelList(list(request_ids), values)
 
