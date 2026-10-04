@@ -1,5 +1,6 @@
 from collections import deque
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
@@ -14,6 +15,32 @@ class StreamChunk:
     chunk_index: int
     start_offset: int = 0  # global position of the first item in this chunk
     is_final: bool = False
+    # leading items of this chunk that an earlier chunk already delivered
+    # (sliding-window overlap / left context); the consumer trims their output
+    context_items: int = 0
+    # items in this chunk (context included); lets a consumer pick its
+    # capture bucket before the chunk tensor is unpacked
+    num_items: int = 0
+
+    @property
+    def info(self) -> "StreamChunkInfo":
+        return StreamChunkInfo(
+            self.start_offset, self.context_items, self.num_items, self.is_final,
+        )
+
+
+class StreamChunkInfo(NamedTuple):
+    """A chunk's place in its stream, without its data."""
+    start_offset: int
+    context_items: int
+    num_items: int
+    is_final: bool
+
+
+class StreamingEdge(NamedTuple):
+    """A synthetic streaming-input edge and the chunk it carries."""
+    edge: GraphEdge
+    chunk: StreamChunkInfo
 
 
 @dataclass
@@ -32,13 +59,18 @@ class StreamBuffer:
     from_partition: str
     policy: ChunkPolicy
 
-    _waiting_graph_edges: deque = field(default_factory=deque)
+    _waiting_graph_edges: deque[StreamingEdge] = field(default_factory=deque)
+    # last chunk the graph accepted; read by the batch that consumes it
+    ingested_chunk: StreamChunkInfo | None = None
 
     _buffer: list = field(default_factory=list)
     _tensor_ids_in_order: deque = field(default_factory=deque)
     _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
     _chunks_popped: int = 0
+    # global position just past the last item ever handed out; everything
+    # before it in a later window is context, not new data
+    _delivered_end: int = 0
     producer_done: bool = False
     # Set once a chunk has been popped with ``is_final=True`` (the terminal
     # flush). Guards the empty-buffer final flush below so it fires exactly
@@ -47,6 +79,13 @@ class StreamBuffer:
 
     _num_tensors_registered = 0
     _num_buffer_writes = 0
+
+    def prime_context(self, context_items: int) -> None:
+        """The first ``context_items`` items the producer sends are context only
+        (e.g. a voice clone's reference frames): the first chunk carries them
+        ahead of its new items, reported as ``context_items``."""
+        self.policy.prime(context_items)
+        self._delivered_end = context_items
 
     def pre_read_register(self, tensor_id: str):
         self._num_tensors_registered += 1
@@ -73,7 +112,7 @@ class StreamBuffer:
     def _producer_done_and_all_read(self) -> bool:
         return self.producer_done and self._num_buffer_writes >= self._num_tensors_registered
 
-    def pop_waiting_edge(self) -> GraphEdge | None:
+    def pop_waiting_edge(self) -> StreamingEdge | None:
         if len(self._waiting_graph_edges) > 0:
             return self._waiting_graph_edges.popleft()
 
@@ -138,12 +177,15 @@ class StreamBuffer:
             chunk_index=self._chunks_popped,
             start_offset=offset,
             is_final=is_final,
+            context_items=min(max(self._delivered_end - offset, 0), len(items)),
+            num_items=len(items),
         )
+        self._delivered_end = max(self._delivered_end, offset + len(items))
         self._chunks_popped += 1
         return chunk
 
-    def store_uningested_edge(self, edge: GraphEdge):
-        self._waiting_graph_edges.append(edge)
+    def store_uningested_edge(self, streaming_edge: StreamingEdge):
+        self._waiting_graph_edges.append(streaming_edge)
 
     def _collate(self, items: list) -> dict[str, torch.Tensor | None]:
         if not items:

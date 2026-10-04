@@ -283,6 +283,10 @@ class ForwardPassArgs:
     # is passed into the fwd pass
     step_metadata: dict = field(default_factory=dict)
 
+    # initial args only: CurrentForwardPassInfo.stream_lead_items for the
+    # partition's consumer streams
+    stream_lead_items: dict[str, int] = field(default_factory=dict)
+
 
 class Model(ABC):
     def _get_worker_graphs_for_graph_walk(
@@ -317,6 +321,16 @@ class Model(ABC):
             node_groups=node_groups,
             input_streams=input_streams,
         )
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Reject a deployment YAML this model cannot serve.
+
+        Called by the Conductor at startup with the parsed YAML. The model
+        sees only ``model_kwargs`` in ``__init__``, so checks on other keys
+        (``max_concurrent_requests``, ``resources``, ...) belong here. Raise
+        ``ValueError`` naming the key; ``config_path`` is for the message.
+        """
+        return
 
     def get_worker_graphs(self, config_path: str) -> list[WorkerGraph]:
         with open(config_path, "r") as f:
@@ -546,7 +560,7 @@ class Model(ABC):
     def postprocess(
         self,
         output: torch.Tensor,
-        modality: str,  # text | image | video | audio
+        modality: str,  # text | image | video | video_frame | audio
         request_kwargs: dict | None = None,
     ) -> bytes:
         """
@@ -612,6 +626,42 @@ class Model(ABC):
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for
         audio. Mono default (the speech models); stereo models override."""
         return 1
+
+    def warmup_preprocess(self) -> None:
+        """Called once in the preprocess worker before it takes requests.
+
+        Build what ``process_prompt`` needs lazily (a G2P front end, a
+        tokenizer, a feature extractor) so the first request does not pay for
+        it. The default does nothing.
+        """
+        return None
+
+    def get_voices(self) -> list[str] | None:
+        """The speaker ids a speech model accepts as ``voice``, for
+        ``GET /v1/audio/voices``. ``None`` (the default) means the model has no
+        fixed voice list, and the route answers 404."""
+        return None
+
+    def get_default_voice(self) -> str | None:
+        """The ``voice`` used when a speech request names none."""
+        return None
+
+    def get_output_frame_rate(
+        self,
+        modality: str = "video_frame",
+        request_kwargs: dict | None = None,
+    ) -> float:
+        """Frame rate for raw RGB ``video_frame`` output.
+
+        Raw frames have no container header from which a client could recover
+        timing, so models that expose this modality must override this hook.
+        ``request_kwargs`` permits a future model with a per-request frame rate;
+        Waypoint's checkpoint uses a fixed rate.
+        """
+        del request_kwargs
+        raise ValueError(
+            f"{type(self).__name__} does not define a frame rate for {modality!r} output"
+        )
 
     # ------------------------------------------------------------------
     # Partition API (optional, backward-compatible defaults)

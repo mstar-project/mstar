@@ -22,7 +22,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources import KVConfig, PositionConfig, StepContext, StepRunner
+from mstar.engine.resources import PagedKVConfig, PositionConfig, StepContext, StepRunner
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep
 from mstar.engine.resources.kv.keys import chain
@@ -43,11 +43,18 @@ SUFFIX = list(range(9000, 9037))
 class _StubTransfer:
     """No engine, no bytes moved."""
 
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
-    def get_kv_transfer_info(self):
-        return None
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del kwargs
+        return transfer_info == self.get_kv_transfer_info()
+
+    def remove_request(self, request_id):
+        del request_id
 
     def start_async_retrieve(self, **kwargs):
         del kwargs
@@ -67,7 +74,7 @@ class _Node:
     def __init__(self, cached: bool = True):
         device = torch.device("cpu")
         self.kv = KVManager(
-            cfg=KVConfig(
+            cfg=PagedKVConfig(
                 num_layers=2, num_kv_heads=1, head_dim=4, max_seq_len=4096,
                 max_num_pages=128, page_size=PAGE_SIZE,
             ),
@@ -250,7 +257,7 @@ def test_orpheus_declares_the_tensor_its_llm_prefills_from():
     declared = OrpheusModel.prefix_key_streams(object())
 
     assert declared == {
-        KV_CACHE: {"main": PrefixStream("text_inputs", "ids", "prefill", "decode")}
+        KV_CACHE: {"main": PrefixStream("text_inputs", "ids", "prefill")}
     }, "the LLM node's prompt does not arrive under the name it keys"
 
 
@@ -261,5 +268,5 @@ def test_bagel_declares_the_tensor_its_text_walk_prefills_from():
     declared = BagelModel.prefix_key_streams(object())
 
     assert declared == {
-        "kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}
+        "kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text")}
     }, "the text walk's prompt does not arrive under the name it keys"

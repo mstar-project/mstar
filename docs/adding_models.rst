@@ -197,7 +197,10 @@ request, and the engine passes each config to its resource when the request is i
 There are two ``ResourceReqConfig`` subclasses:
 
 - ``SamplingReqConfig`` holds ``temperature``, ``top_k``, ``top_p``,
-  ``repetition_penalty`` and ``ignore_eos``. The conductor fills in the per-request seed.
+  ``repetition_penalty``, ``min_p`` and ``ignore_eos``. The conductor fills in the
+  per-request seed. ``min_p`` follows the HF processor order (after the penalty and
+  temperature, before top-k/top-p) and needs ``enable_min_p=True`` on the node's
+  ``SamplerSpec``, which adds the filter to that node's captured sampler only.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
@@ -336,20 +339,27 @@ The spec types are:
 
    * - Spec
      - What it builds
-   * - ``KVSpec(config=KVConfig(...))``
-     - A paged KV cache. ``KVConfig`` holds ``num_layers``, ``num_kv_heads``,
-       ``head_dim``, ``max_seq_len`` and ``num_qo_heads``. It also holds five fields that
+   * - ``KVSpec(config=PagedKVConfig(...))``
+     - A paged KV cache. ``KVConfig`` is the abstract base for common model geometry;
+       ``PagedKVConfig`` adds ``max_seq_len`` and five fields that
        a deployment can tune: ``max_num_pages``, ``page_size``, ``cpu_offload_pages``
        (the number of pinned host pages used for offload; 0 disables offload),
        ``prefix_cache`` and ``prefix_cache_salt``.
+   * - ``KVSpec(config=RingKVConfig(...))``
+     - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
+       ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
+       Ring storage is currently paired with FlexAttention.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
-       ``AttnBackend.FLASHINFER`` (the default) or ``AttnBackend.DENSE``.
+       ``AttnBackend.FLASHINFER`` (the default), ``AttnBackend.DENSE`` or
+       ``AttnBackend.FLEX``. FlashInfer and dense attention require a
+       ``PagedKVConfig``; FlexAttention requires a ``RingKVConfig``.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
-       ``"fa3"``.
+       ``"fa3"`` when the FlashInfer backend is selected.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
-     - Attention over a context that is written once and never extended. See
-       `Cross-attention (encoder-decoder models)`_.
+     - Attention over a paged context that is written once and never extended. Only
+       the FlashInfer backend is implemented. See `Cross-attention (encoder-decoder
+       models)`_.
    * - ``RaggedAttentionSpec(config=RaggedAttentionConfig(...))``
      - Cacheless (ragged) varlen self-attention over the segments packed into one
        forward. Nothing is paged, and nothing carries to the next step.
@@ -382,7 +392,7 @@ appears in no spec, so it receives no resources:
 
    # mstar/model/orpheus/orpheus_model.py
    def get_node_resources(self) -> list[NodeResourceSpec]:
-       kv_config = KVConfig(
+       kv_config = PagedKVConfig(
            num_layers=self.config.num_hidden_layers,
            num_kv_heads=self.config.num_key_value_heads,
            head_dim=self.config.head_dim,
@@ -997,6 +1007,9 @@ Both types share the base ``CudaGraphConfig`` fields:
   engine's eager batch size for the walk. The default is ``True``, so the engine never
   batches beyond a captured size.
 - ``compile`` runs ``torch.compile`` before capture. The default is ``True``.
+- ``required`` makes every bucket in the config mandatory. If capture fails locally or
+  on another participating rank, warmup raises after rank-wide agreement instead of
+  dropping the bucket and falling back to eager execution. The default is ``False``.
 
 ``BatchedCudaGraphConfig`` also accepts ``total_tokens_multiplier``. Use it when one
 request's step commits KV across several labels that are combined into a single plan, as
@@ -1108,6 +1121,9 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
+- ``required`` makes every declared shape mandatory. If any participating rank cannot
+  capture one, warmup raises instead of leaving that shape on the eager path. The default
+  is ``False``.
 
 **Splitting the declaration.** When a region leases its own slot, exactly one of the two
 declarations must own each resource. The common pattern is for the outer ``declare_step``
@@ -1281,11 +1297,16 @@ that a misspelled setting is never silently ignored:
 
    * - Spec
      - Accepts
-   * - ``KVSpec``
+   * - ``KVSpec`` with ``PagedKVConfig``
      - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``,
        ``prefix_cache``, ``prefix_cache_salt``
-   * - ``AttentionSpec`` / ``CrossAttentionSpec``
-     - ``backend`` (``flashinfer`` / ``dense``), ``flashinfer_backend``
+   * - ``KVSpec`` with ``RingKVConfig``
+     - ``num_sessions``
+   * - ``AttentionSpec``
+     - ``backend`` (``flashinfer`` / ``dense`` / ``flex``),
+       ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
+   * - ``CrossAttentionSpec``
+     - ``backend`` (only ``flashinfer`` is implemented), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``)
    * - ``RaggedAttentionSpec``
      - ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``),
@@ -1294,8 +1315,9 @@ that a misspelled setting is never silently ignored:
        not the model.
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
-example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``, while
-``configs/cosmos3_nano.yaml`` sets the page count under its KV key.
+example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
+``configs/cosmos3_nano.yaml`` sets the page count under its paged KV key, and
+``configs/waypoint.yaml`` sets the resident world count under its ring KV key.
 
 .. note::
 
@@ -1618,6 +1640,74 @@ Whisper's ``declare_step`` shows how a write-once context is expressed with span
 context segments have a non-zero span in the prefill step that writes them, and a span of
 0 in every later step. The ``commit`` in the prefill step converts the reservation into
 resident pages that the later steps read.
+
+Worked example: an image DiT on the diffusion scaffold
+------------------------------------------------------
+
+Flow-matching image and video transformers (FLUX-family DiTs, Z-Image, Wan-style
+video) share one graph shape, so M* ships it as a scaffold in
+``mstar/model/components/diffusion/``; a model adds only its exact component
+ports, its checkpoint remap and a few hooks.
+
+Graph and Walks::
+
+    text_encoder ──text_embeds──▶ Loop("denoise_loop", dit) ──latents──▶ vae_decoder ──▶ EMIT image
+    vae_encoder  ──ref_latents──▶ (image_edit only)
+
+    encode_text  : text_inputs  -> text_embeds  (persist)
+    encode_image : image_inputs -> ref_latents  (persist)
+    image_gen    : Sequential[Loop(dit) -> vae_decoder]
+    image_edit   : image_gen with ref_latents as an extra Loop input
+
+``latents`` is the loop-back edge; every other input is re-injected each
+iteration. The step index is the engine's loop counter
+(``fwd_info.dynamic_loop_iter_counts``), so there is no host sync per step.
+
+The ``dit`` node subclasses ``DenoiseLoopSubmodule`` (``denoise_loop.py``), which owns
+the engine contract — seeded initial noise, per-request schedules, equal-key request
+batching (``can_batch``), stacked ``forward_batched``, ``check_stop`` at the request's own
+step count, the ragged-attention ``declare_step`` and one CUDA-graph bucket per
+``bucket_key`` with the Euler update inside the graph — and asks the model for:
+
+.. code-block:: python
+
+    class MyDenoise(DenoiseLoopSubmodule):
+        def bucket_key_for(self, fwd_info): ...       # hashable: latent grid, text length, ...
+        def schedule_for(self, fwd_info, key): ...    # FlowMatchSchedule (flow_match.py)
+        def seed_latents(self, fwd_info, key, gen): ...  # [L, C] initial noise, seeded
+        def request_inputs(self, fwd_info, inputs, key): ...  # per-row conditioning tensors
+        def num_tokens(self, key): ...                # image tokens for the attention step
+        def capture_request_inputs(self, key, device): ...   # dummy rows for graph capture
+        def denoise(self, engine_inputs, key, latents, timestep, sigma, sigma_next, **cond): ...
+        # optional: extra attention spans (a refiner over the image tokens alone, ...)
+        def attention_segments(self, key): return (("main", self.num_tokens(key)),)
+
+``bucket_key`` is whatever has to match for two rows to share a forward, and it is also
+the CUDA-graph bucket key — shape, but equally a knob like whether CFG is on.
+
+A multi-step scheduler that carries solver state between iterations (wan22's UniPC, with
+``unipc_model_outputs`` and ``unipc_last_sample``) names it in ``SOLVER_STATE``; those
+become loop-back edges alongside ``latents``, seeded by ``seed_loop_back`` and returned
+from ``denoise`` as a ``{name: tensor}`` mapping. A scheduler needing another per-step
+scalar adds a ``STEP_SCALARS`` entry naming the attribute of its ``FlowMatchSchedule``
+to slice it from — the base stages that tensor on the device and slices it per step, so
+nothing in the batching path has to change.
+
+Every span a layer attends over must be declared with its own label (default: one
+``"main"`` segment per request); ``ragged_for(label)`` hands that span's kernel to the
+layers, which fall back to SDPA when no ragged resource is bound.
+
+Shared pieces to build the components from: ``flow_match.py`` (shift schedules and the
+exact Euler step), ``rope.py`` (multi-axis rotary embeddings), ``attention.py`` (joint
+attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under graphs),
+``text_encoder.py`` (native Qwen3 hidden-state taps), ``autoencoder_kl.py`` (the KL VAE
+family), ``image_io.py`` (latent packing, PNG) and ``lora.py`` (static LoRA merge at load,
+also into fused ``q``/``k``/``v`` shards via ``FusedColumnLinear.shard_slice``).
+
+On the API side ``DiffusionImageAdapter`` (``mstar/api_server/openai/adapters.py``) serves
+``/v1/images/generations`` and ``/v1/images/edits`` for any such model (``size`` becomes
+``width``/``height``, ``seed`` and other knobs pass through); register it under the
+model's registry key. The SDK exposes ``generate_image`` and ``edit_image``.
 
 Advanced: async partitions and streaming
 ----------------------------------------

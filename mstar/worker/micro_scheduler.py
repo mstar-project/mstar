@@ -1,10 +1,11 @@
+import functools
 import logging
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AdmitRuntimeError
@@ -412,6 +413,7 @@ class MicroScheduler:
         # e.g., when adding to a speculative batch, we want to the requests that
         # are being speculated to be included in the batch size cap
         pre_existing_batch_size: int=0,
+        capture_group_of: int | None = None,
     ) -> ScheduledBatch | None:
         """
         Scans all worker graph queues for ready nodes, groups by node name,
@@ -421,11 +423,17 @@ class MicroScheduler:
         forward — takes precedence over a fresh scan, so a split set drains
         before anything else starts.
 
+        A batch holds one capture group (``Engine.capture_group``); rids of
+        another group wait in the backlog for a batch of their own.
+
         Args:
             max_batch_size: If set, limit the number of requests in the batch.
                 Defaults to the engine's cap for the (node, walk) it picks.
             target: If set, only schedule this (node name, graph walk).
             exclude_target: If set, skip this (node_name, graph_walk) pair.
+            capture_group_of: If set, the rid whose capture group the batch
+                must share; the speculation merge passes a continuing rid.
+                Otherwise the batch's first rid sets the group.
         """
         # Expire stale hold entries; done before any early returns
         now = time.monotonic()
@@ -436,7 +444,8 @@ class MicroScheduler:
         sched_from_backlog = self._schedule_from_backlogged(
             request_state, target=target,
             max_batch_size=max_batch_size,
-            pre_existing_batch_size=pre_existing_batch_size
+            pre_existing_batch_size=pre_existing_batch_size,
+            capture_group_of=capture_group_of,
         )
         if sched_from_backlog is not None:
             return sched_from_backlog
@@ -518,7 +527,12 @@ class MicroScheduler:
 
         # Everything past the first step is already popped off the queues, so
         # it has to be remembered here or it would never run.
-        return self._cap_batch_and_schedule(batch=full_batch, max_bs=remaining)
+        return self._cap_batch_and_schedule(
+            batch=full_batch, max_bs=remaining,
+            exclude_rids=self._off_group_rids(
+                request_state, full_batch, anchor=capture_group_of,
+            ),
+        )
 
     @staticmethod
     def _remaining_capacity(
@@ -528,9 +542,67 @@ class MicroScheduler:
         None stays None: an uncapped node takes the whole ready set."""
         return None if max_batch_size is None else max_batch_size - pre_existing
 
+    def _capture_group(
+        self, request_state: RequestStateManager,
+        node_name: str, graph_walk: str, rid: int,
+    ) -> Any | None:
+        fwd_info = request_state.get_fwd_info(
+            rid, request_state.get_partition_for_node(node_name),
+        )
+        return self.engine_manager.get_engine(node_name).capture_group(
+            node_name, graph_walk, rid, fwd_info,
+        )
+
+    def _off_group_rids(
+        self, request_state: RequestStateManager, batch: ScheduledBatch,
+        exclude_rids: set[int] = frozenset(), anchor: int | None = None,
+    ) -> set[int]:
+        """The rids of ``batch`` outside ``anchor``'s capture group, or outside
+        the first eligible rid's when no anchor is given."""
+        rids = [
+            rid for rid in batch.request_to_worker_graph
+            if rid not in exclude_rids
+        ]
+        if not rids:
+            return set()
+        group = functools.partial(
+            self._capture_group, request_state,
+            batch.node_name, batch.graph_walk,
+        )
+        # `is not None`: handle 0 is a real rid
+        wanted = group(rids[0] if anchor is None else anchor)
+        return {rid for rid in rids if group(rid) != wanted}
+
+    def backlog_splits_from(
+        self, request_state: RequestStateManager,
+        target: tuple[str, str], rid: int,
+    ) -> bool:
+        """Whether ``target``'s backlog holds a live rid outside ``rid``'s
+        capture group.
+
+        A speculation chain only merges its own group, so such a rid waits
+        until the chain stops; the chain has to yield for it to run.
+        """
+        waiting = self.backlog.get(target)
+        if waiting is None:
+            return False
+        now = time.monotonic()
+        live = {
+            r for r in waiting.request_to_worker_graph
+            if r not in self.failed_rids and r not in self.pending_removes
+            and self.held_until.get(r, 0.0) <= now
+        }
+        if not live:
+            return False
+        exclude = set(waiting.request_to_worker_graph) - live
+        return bool(self._off_group_rids(
+            request_state, waiting, exclude_rids=exclude, anchor=rid,
+        ))
+
     def _filter_cap_and_schedule(
         self, batch: ScheduledBatch, max_bs: int,
         request_state: RequestStateManager,
+        capture_group_of: int | None = None,
     ):
         node_partition = request_state.get_partition_for_node(batch.node_name)
         not_ready_rids = {
@@ -550,7 +622,12 @@ class MicroScheduler:
                 batch.request_to_worker_graph.keys()
             )
         not_ready_rids -= self.failed_rids
-        return self._cap_batch_and_schedule(batch, max_bs, not_ready_rids)
+        off_group = self._off_group_rids(
+            request_state, batch, not_ready_rids, anchor=capture_group_of,
+        )
+        return self._cap_batch_and_schedule(
+            batch, max_bs, not_ready_rids | off_group,
+        )
 
 
     def _cap_batch_and_schedule(
@@ -606,7 +683,8 @@ class MicroScheduler:
         self, request_state: RequestStateManager,
         target: tuple[str, str] | None = None,
         max_batch_size: int | None=None,
-        pre_existing_batch_size: int = 0
+        pre_existing_batch_size: int = 0,
+        capture_group_of: int | None = None,
     ) -> ScheduledBatch | None:
         """The oldest backlogged step with a ready request in it.
 
@@ -634,7 +712,8 @@ class MicroScheduler:
             scheduled = self._filter_cap_and_schedule(
                 batch=backlogged,
                 max_bs=self._remaining_capacity(curr_max_bs, pre_existing_batch_size),
-                request_state=request_state
+                request_state=request_state,
+                capture_group_of=capture_group_of,
             )
             if scheduled is not None:
                 return scheduled

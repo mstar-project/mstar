@@ -71,7 +71,7 @@ class GraphEdge:
     conductor_new_token: bool = field(default=False)  # counted by the conductor toward the output-token total
     is_streaming: bool = field(default=False)  # streaming edge: tokens accumulate at destination buffer
     # only for EMIT_TO_CLIENT
-    output_modality: str = field(default="")  # text | image | video | audio
+    output_modality: str = field(default="")  # text | image | video | video_frame | audio
     _persist_for_loop: bool = field(default=False)
     # set on a synthetic streaming-input edge carrying the final chunk, so the
     # consuming pass (not the earlier ingest) reports the partition done
@@ -324,6 +324,16 @@ class GraphNode(GraphSection):
             loop_back=loop_back
         )
 
+    def persisted_input_names(self) -> set[str]:
+        """Inputs the enclosing loop re-injects unchanged into ``ready_signals``
+        every iteration (``Loop.ingest_external_input`` / ``complete_iter``): a
+        denoise step's text conditioning, say. They never land in
+        ``ready_next_iter``, but they are as good as ready for the next one."""
+        return {
+            name for name, edge in self.ready_signals.ready_inputs.items()
+            if edge._persist_for_loop
+        }
+
     def is_ready_for_speculation(
         self, check_next_iter: bool=False,
         allow_streaming: bool=True
@@ -332,8 +342,12 @@ class GraphNode(GraphSection):
         if allow_streaming:
             needed_inputs = needed_inputs - self._streaming_inputs
         if check_next_iter:
+            # Count the persisted inputs here so a same-node next-iteration
+            # speculation isn't blocked on inputs guaranteed to reappear.
             return needed_inputs.issubset(
-                self.ready_next_iter.ready_names | self.speculative_signals.ready_names
+                self.ready_next_iter.ready_names
+                | self.speculative_signals.ready_names
+                | self.persisted_input_names()
             )
         return needed_inputs.issubset(
             self.ready_signals.ready_names | self.speculative_signals.ready_names
