@@ -79,10 +79,6 @@ from mstar.worker.node_manager_utils import RequestStateManager
 
 logger = logging.getLogger(__name__)
 
-# EXPERIMENT toggle, see _prep_speculation. Default ON so the validation run
-# exercises it; set MSTAR_NO_FRESH_MERGE_ON_NEW_ITER=0 for the old behaviour.
-_NO_FRESH_MERGE_ON_NEW_ITER = os.environ.get("MSTAR_NO_FRESH_MERGE_ON_NEW_ITER", "1") == "1"
-
 # seconds between "no offload possible" lines for one node and walk: a hold is
 # retried every backoff, and a line per retry buries the rest of the log
 _HOLD_LOG_INTERVAL = 5.0
@@ -2192,18 +2188,6 @@ class Worker:
             capture_group_of=prep.ready_rids[0],
         )
 
-        # EXPERIMENT (MSTAR_NO_FRESH_MERGE_ON_NEW_ITER=1): a fresh rid joins the batch
-        # but is never added to `continuing`, so _speculative_fwd_info skips its `+1`
-        # and it re-runs the in-flight iteration. Dropping the merge when the target is
-        # itself a new loop iteration costs batching, but tests that directly.
-        if fresh_batch is not None and spec_target.is_new_loop_iter and _NO_FRESH_MERGE_ON_NEW_ITER:
-            self._graph_runtime.push_back_node(
-                fresh_batch.node_name,
-                list(fresh_batch.request_to_worker_graph),
-                list(fresh_batch.request_to_worker_graph.values()),
-            )
-            fresh_batch = None
-
         if fresh_batch is not None:
             # The merge below relabels these node objects with the spec
             # target's name/walk, so a batch for any other node must not be
@@ -2635,16 +2619,6 @@ class Worker:
             list(per_request_info), partition=batch_N.partition,
         ):
             per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
-            # A speculative batch carries `replace()`d copies of the shared fwd info
-            # (_speculative_fwd_info), so the update above lands on the copy and the
-            # shared counters never advance -- a later pass built from the shared info
-            # then re-runs an iteration it has already done. Write through.
-            try:
-                shared = self.request_state.get_fwd_info(rid, batch_N.partition)
-            except KeyError:  # request already finished/removed
-                shared = None
-            if shared is not None and shared is not per_request_info[rid]:
-                shared.dynamic_loop_iter_counts.update(new_iters)
 
         # Check for stops. Prematerialising pulls sampled tokens to the host,
         # so this can carry a device transfer as well as the stop logic.
@@ -3638,6 +3612,13 @@ class Worker:
                     range_push("worker.build_node_batch", synchronize=False)
                 node_batch = self._build_executing_batch(batch)
                 batch_partition = self.request_state.get_partition_for_node(batch.node_name)
+                # Keep this node off the ready queue while the step is in flight --
+                # the same protection a committed speculation gets. Without it an
+                # input ingested mid-flight re-queues the node and the scheduler can
+                # run the SAME iteration twice (the loop index only advances at
+                # route_outputs, after this batch's postprocess). Cleared where the
+                # speculative flag is, once the batch completes.
+                self._set_speculative_flag(batch, True)
 
                 for request_id, new_iters in self._graph_runtime.get_dynamic_loop_iters(
                     list(node_batch.per_request_info), partition=batch_partition,

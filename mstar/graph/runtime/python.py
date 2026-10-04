@@ -333,7 +333,13 @@ class PythonGraphRuntime(GraphRuntime):
         for rid in rids:
             if rid not in queues:
                 continue
-            queues[rid].get_node(node)._speculatively_scheduled = speculatively_scheduled
+            wgio = queues[rid]
+            wgio.get_node(node)._speculatively_scheduled = speculatively_scheduled
+            if not speculatively_scheduled:
+                # The flag SUPPRESSES ready-queue adds, so an input ingested while it
+                # was set leaves the node ready but unqueued, and nothing re-adds it
+                # later. Re-evaluate on the way down or that wake-up is lost.
+                wgio.requeue_if_ready(node)
 
     def is_speculatively_scheduled(
         self, node: str, wg_id: int, rid: int,
@@ -916,7 +922,10 @@ class PythonGraphRuntime(GraphRuntime):
         """
         node = wgio.nodes[spec_node_name]
         # Held True across the ingest so a streaming input cannot re-add the
-        # node to the ready queue underneath us.
+        # node to the ready queue underneath us. Saved, not assumed False: this
+        # node may already be speculatively scheduled from a committed step still
+        # in flight, and forcing it down would drop that step's protection.
+        was_spec_scheduled = node._speculatively_scheduled
         node._speculatively_scheduled = True
 
         # ingest_input reports success without saying WHICH slot it used, so
@@ -940,7 +949,7 @@ class PythonGraphRuntime(GraphRuntime):
             check_next_iter=same_node, allow_streaming=False,
         )
         wgio.clear_speculative_inputs()
-        node._speculatively_scheduled = False  # reset in case the rid is dropped
+        node._speculatively_scheduled = was_spec_scheduled  # restore; may still be in flight
 
         if not fully_ready:
             self._undo_spec_ingest(node, into_signals, into_next_iter)

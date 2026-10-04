@@ -35,6 +35,11 @@ if [ -z "${VIRTUAL_ENV:-}" ] && [ -f .venv/bin/activate ]; then
 fi
 command -v mstar >/dev/null || { echo "mstar not on PATH -- activate the env first"; exit 2; }
 
+# The in-flight-flag fix is PYTHON-ONLY so far: the Rust runtime has the same two
+# holes (runtime.rs:736/768 force the flag down instead of restoring it) and has not
+# been ported. Default to the Python runtime so the fix is actually exercised.
+export MSTAR_RUST_GRAPH=${MSTAR_RUST_GRAPH:-0}
+
 echo "repo=$REPO  port=$PORT  steps=$STEPS"
 echo "git:  $(git rev-parse --short HEAD 2>/dev/null)  $(git status --porcelain 2>/dev/null | grep -cv '^??') modified file(s)"
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader 2>/dev/null | head -4
