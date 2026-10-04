@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from mstar.model.sessions import (
-    SessionParkedPolicy,
+    SessionCapacityPolicy,
     SessionsConfig,
     SessionTTLMode,
 )
@@ -197,7 +197,8 @@ class SessionRegistry:
         if live >= config.max_concurrent_sessions:
             victim = (
                 self._lru_idle_locked()
-                if config.parked_policy is SessionParkedPolicy.EVICT else None
+                if config.capacity_policy is SessionCapacityPolicy.EVICT
+                else None
             )
             if victim is None:
                 raise SessionError(
@@ -237,7 +238,8 @@ class SessionRegistry:
                 f"session {session_id!r} is being torn down"
                 + (f": {record.closing_reason}" if record.closing_reason else ""),
             )
-        if record.active_request_ids and not self.config.interruptible:
+        if record.active_request_ids:
+            # One request at a time; see SessionsConfig.max_requests_in_flight.
             raise SessionError(
                 409,
                 f"session {session_id!r} already has a request in flight "

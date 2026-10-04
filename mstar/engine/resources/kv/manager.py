@@ -1647,6 +1647,17 @@ class KVManager(AttentionResource):
 
     @staticmethod
     def session_rid(session_id: str) -> str:
+        """The reserved rid a session parks its state under.
+
+        A string, not a handle: handles are minted per request by the worker's
+        graph runtime and recycled once the request is gone, and the negative
+        range belongs to dummy rids, so there is no value here that is
+        guaranteed not to collide with a live request's.
+
+        TODO: a handle minter shared with the cuda graph runner's dummy id
+        production — one that can mint a (negative) handle for anything not
+        tied to a real request.
+        """
         return f"__mstar_session__{session_id}"
 
     def adopt_session_state(self, rid: str, session_id: str) -> None:

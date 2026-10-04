@@ -54,7 +54,6 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata, video_metadata_dict
-from mstar.model.sessions import RequestSession
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
@@ -827,7 +826,7 @@ class VJepa2Model(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
-        session: RequestSession | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         walk = self._initial_walk(model_kwargs)
         full_metadata = CurrentForwardConductorMetadata(

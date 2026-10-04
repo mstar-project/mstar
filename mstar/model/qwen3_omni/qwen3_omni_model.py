@@ -77,7 +77,6 @@ from mstar.model.qwen3_omni.config import (
     THINKER_POS,
     THINKER_SAMPLER,
 )
-from mstar.model.sessions import RequestSession
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import Operation, WeightConverter
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
@@ -585,7 +584,7 @@ class Qwen3OmniModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
-        session: RequestSession | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         audio_output = "audio" in output_modalities
 

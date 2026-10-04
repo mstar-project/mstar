@@ -498,7 +498,8 @@ class Model(ABC):
         model_kwargs: dict | None = None,
         session: RequestSession | None = None,
     ) -> ForwardPassArgs:
-        pass
+        """Open a request on one partition. Called with keywords only, so an
+        implementation that ignores an argument can take ``**kwargs``."""
 
     @abstractmethod
     def process_prompt(

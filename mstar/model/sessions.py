@@ -32,8 +32,8 @@ class SessionOverflowPolicy(Enum):
     ERROR = "error"
 
 
-class SessionParkedPolicy(Enum):
-    """What happens to a session's parked state when the deployment is full."""
+class SessionCapacityPolicy(Enum):
+    """What a deployment at ``max_concurrent_sessions`` does with a new one."""
 
     # Nothing: it lives until the client ends the session or its TTL expires,
     # and a new session past the cap is refused.
@@ -96,20 +96,22 @@ class SessionsConfig:
     default_timeout_s: float = 300.0
     max_timeout_s: float = 3600.0
     ttl_mode: SessionTTLMode = SessionTTLMode.IDLE
-    # What a full deployment does with parked state; see SessionParkedPolicy.
-    parked_policy: SessionParkedPolicy = SessionParkedPolicy.KEEP
-    # Whether a resume may land on a session that already has a request in
-    # flight (bidirectional streaming). False refuses it with a 409.
-    interruptible: bool = False
+    # What a deployment at its cap does; see SessionCapacityPolicy.
+    capacity_policy: SessionCapacityPolicy = SessionCapacityPolicy.KEEP
     # Sessions are one-request-at-a-time for now; the field names the
     # assumption the conductor and the resources rely on.
+    # TODO: bidirectional streaming needs an `interruptible` flag here, so a
+    # resume may land on a session that already has a request in flight. It
+    # needs the runtime to route the second request's inputs into the first,
+    # which nothing does yet; two requests sharing a session's resource state
+    # would corrupt it.
     max_requests_in_flight: int = 1
 
     def __post_init__(self):
         if isinstance(self.ttl_mode, str):
             self.ttl_mode = SessionTTLMode(self.ttl_mode)
-        if isinstance(self.parked_policy, str):
-            self.parked_policy = SessionParkedPolicy(self.parked_policy)
+        if isinstance(self.capacity_policy, str):
+            self.capacity_policy = SessionCapacityPolicy(self.capacity_policy)
         self.resources = {
             key: (
                 cfg if isinstance(cfg, SessionResourceConfig)
@@ -135,15 +137,6 @@ class SessionsConfig:
         if self.max_requests_in_flight != 1:
             raise ValueError(
                 "sessions currently allow exactly one in-flight request"
-            )
-        if self.interruptible:
-            # The field is the extension point for bidirectional streaming;
-            # nothing downstream routes a second request's inputs into an
-            # in-progress one yet, and letting two requests share a session's
-            # resource state would corrupt it.
-            raise ValueError(
-                "interruptible sessions are declared but not implemented: a "
-                "second in-flight request would share the first's state"
             )
 
     def resolve_timeout_s(self, requested: float | None) -> float:
@@ -187,7 +180,7 @@ def apply_sessions_yaml_overrides(
     resources = overrides.pop("resources", None)
     known = {
         "max_concurrent_sessions", "default_timeout_s", "max_timeout_s",
-        "ttl_mode", "parked_policy", "interruptible",
+        "ttl_mode", "capacity_policy",
     }
     unknown = sorted(overrides.keys() - known)
     if unknown:
@@ -206,8 +199,9 @@ def apply_sessions_yaml_overrides(
         ),
         max_timeout_s=overrides.get("max_timeout_s", config.max_timeout_s),
         ttl_mode=overrides.get("ttl_mode", config.ttl_mode),
-        parked_policy=overrides.get("parked_policy", config.parked_policy),
-        interruptible=overrides.get("interruptible", config.interruptible),
+        capacity_policy=overrides.get(
+            "capacity_policy", config.capacity_policy
+        ),
     )
     for key, kwargs in (resources or {}).items():
         if key not in merged.resources:

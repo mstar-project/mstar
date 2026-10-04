@@ -123,8 +123,8 @@ does not hold across a session.
 finished; ``absolute`` expires it that long after it was started, however busy
 it is. A session with a request in flight is never collected.
 
-``parked_policy`` decides what a full deployment does with the state sessions
-have parked. ``keep`` (the default) holds every session until its client ends it
+``capacity_policy`` decides what a deployment at ``max_concurrent_sessions``
+does with a new session. ``keep`` (the default) holds every session until its client ends it
 or its TTL expires, and refuses a new one past the cap with a 429. ``evict``
 instead tears down the least recently used **idle** session to make room. A
 session with a request in flight is never evicted — it is writing its state
@@ -244,10 +244,10 @@ with the budget error.
 Limits in this version
 ----------------------
 
-- One in-flight request per session: a concurrent ``resume`` is a 409. The
-  ``interruptible`` flag names where bidirectional streaming will hook in, and
-  is refused for now — nothing routes a second request's inputs into an
-  in-progress one.
+- One in-flight request per session: a concurrent ``resume`` is a 409. Lifting
+  it waits on bidirectional streaming, which needs the runtime to route the
+  second request's inputs into the first; two requests sharing a session's
+  resource state would corrupt it.
 - No rollback: a failed request ends its session rather than rewinding it.
 - State parked between a session's requests is not an eviction candidate: the
   worker's LRU only sees live requests. Size ``max_concurrent_sessions`` times

@@ -46,7 +46,6 @@ from mstar.model.kokoro.config import (
 )
 from mstar.model.kokoro.g2p import LANG_NAMES, G2PFrontend, normalize_lang_code
 from mstar.model.kokoro.voices import VoiceRegistry
-from mstar.model.sessions import RequestSession
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -200,7 +199,7 @@ class KokoroModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
-        session: RequestSession | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         del partition_name, model_kwargs
         metadata = CurrentForwardConductorMetadata(

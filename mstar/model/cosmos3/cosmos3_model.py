@@ -114,7 +114,6 @@ from mstar.model.cosmos3.submodules import (
     Cosmos3VisionEncoderSubmodule,
 )
 from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
-from mstar.model.sessions import RequestSession
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -1480,7 +1479,7 @@ class Cosmos3Model(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
-        session: RequestSession | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         # The windowed decoder partition starts idle on its decode walk for
         # every request — text ones included, which is why this comes before

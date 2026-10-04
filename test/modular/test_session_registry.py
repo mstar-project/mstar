@@ -193,7 +193,7 @@ def test_keep_is_the_default_and_refuses_rather_than_evicting():
 
 def test_evict_makes_room_by_tearing_down_the_idle_session():
     reg, _, torn_down = _registry(
-        max_concurrent_sessions=1, parked_policy="evict",
+        max_concurrent_sessions=1, capacity_policy="evict",
     )
     _start(reg, request_id="r0", session_id="a")
     reg.finish_request("r0")
@@ -208,7 +208,7 @@ def test_evict_makes_room_by_tearing_down_the_idle_session():
 
 def test_evict_takes_the_least_recently_used_idle_session():
     reg, clock, torn_down = _registry(
-        max_concurrent_sessions=2, parked_policy="evict",
+        max_concurrent_sessions=2, capacity_policy="evict",
     )
     _start(reg, request_id="r0", session_id="old")
     reg.finish_request("r0")
@@ -224,7 +224,7 @@ def test_evict_takes_the_least_recently_used_idle_session():
 def test_a_session_with_a_request_in_flight_is_never_evicted():
     # it is writing its state right now
     reg, clock, torn_down = _registry(
-        max_concurrent_sessions=1, parked_policy="evict",
+        max_concurrent_sessions=1, capacity_policy="evict",
     )
     _start(reg, request_id="r0", session_id="busy")
     clock.advance(1000.0)
@@ -238,7 +238,7 @@ def test_a_session_with_a_request_in_flight_is_never_evicted():
 
 def test_evict_skips_a_session_that_is_already_closing():
     reg, _, torn_down = _registry(
-        max_concurrent_sessions=2, parked_policy="evict",
+        max_concurrent_sessions=2, capacity_policy="evict",
     )
     _start(reg, request_id="r0", session_id="a")
     reg.finish_request("r0")
@@ -279,17 +279,6 @@ def test_resume_is_allowed_once_the_previous_request_finished():
     resolved = _resume(reg, "s", "r1")
 
     assert (resolved.session_id, resolved.created) == ("s", False)
-
-
-def test_an_interruptible_deployment_allows_a_concurrent_resume():
-    # the config refuses the flag for now (nothing routes a second request's
-    # inputs into an in-progress one), so set it past the guard to reach the
-    # registry branch that bidirectional streaming will use
-    reg, _, _ = _registry()
-    reg.config.interruptible = True
-    _start(reg, request_id="r0", session_id="s")
-
-    assert _resume(reg, "s", "r1").session_id == "s"
 
 
 def test_resume_of_a_closing_session_is_a_409():

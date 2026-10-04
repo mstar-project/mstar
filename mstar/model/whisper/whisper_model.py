@@ -49,7 +49,6 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.sessions import RequestSession
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.whisper.config import (
     ATTN,
@@ -254,7 +253,7 @@ class WhisperModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
-        session: RequestSession | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,

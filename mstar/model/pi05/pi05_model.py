@@ -66,7 +66,6 @@ from mstar.model.pi05.config import (
     load_pi05_config,
 )
 from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
-from mstar.model.sessions import RequestSession
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -549,7 +548,7 @@ class Pi05Model(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
-        session: RequestSession | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
