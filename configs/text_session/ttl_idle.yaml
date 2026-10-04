@@ -1,0 +1,23 @@
+# A short idle TTL, so a session expires inside a test: it is collected 20s
+# after its last request finished, and every request it serves pushes that out.
+model: "test_text_session"
+max_seq_len: 32768
+max_concurrent_requests: 8
+
+sessions:
+  max_concurrent_sessions: 4
+  capacity_policy: keep
+  default_timeout_s: 20.0
+  # low enough that a client asking for the usual 300s is a 400
+  max_timeout_s: 60.0
+  ttl_mode: idle
+  resources:
+    kv:
+      max_state: 64
+      overflow_policy: clear
+
+node_groups:
+  - node_names:
+      - LLM
+    ranks:
+      - 0
