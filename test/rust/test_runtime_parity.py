@@ -470,9 +470,9 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
         lambda rt, r: rt.push_back_node("prefill", [r], [WG_ID]),
         id="push_back_node"),
     pytest.param(
-        lambda rt, r: rt.set_speculatively_scheduled(
+        lambda rt, r: rt.set_in_flight(
             "prefill", WG_ID, [r], True),
-        id="set_speculatively_scheduled"),
+        id="set_in_flight"),
     pytest.param(
         lambda rt, r: rt.pop_rids("prefill", WALK, [r]), id="pop_rids"),
     pytest.param(
@@ -1291,7 +1291,7 @@ def test_the_follower_target_reports_the_same_signals(pair):
     )
 
 
-def test_marking_speculatively_scheduled_does_not_unready_the_node(pair):
+def test_marking_in_flight_does_not_unready_the_node(pair):
     """Python sets a flag that gates FUTURE ingests; it never withdraws a node
     that is already ready. Rust folded `scheduled` into the readiness
     predicate, so marking a node pulled it out of the ready set -- and
@@ -1301,10 +1301,10 @@ def test_marking_speculatively_scheduled_does_not_unready_the_node(pair):
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     assert _ready(rt) == [("prefill", WALK, [rid])]
 
-    rt.set_speculatively_scheduled("prefill", WG_ID, [rid], True)
+    rt.set_in_flight("prefill", WG_ID, [rid], True)
     assert _ready(rt) == [("prefill", WALK, [rid])], "marking withdrew it"
 
-    rt.set_speculatively_scheduled("prefill", WG_ID, [rid], False)
+    rt.set_in_flight("prefill", WG_ID, [rid], False)
     assert _ready(rt) == [("prefill", WALK, [rid])]
 
 
