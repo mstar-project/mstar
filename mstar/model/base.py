@@ -509,6 +509,7 @@ class Model(ABC):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
+        session: RequestSession | None = None,
         **kwargs,
     ) -> "NameToTensorList | ProcessPromptOutput":
         """Tokenize prompt and produce initial tensors for the request.
@@ -531,6 +532,11 @@ class Model(ABC):
             prompt_parts: Ordered text/attachment sequence as written.
                 ``None`` from entrypoints with no ordering to preserve; see
                 :func:`mstar.model.multimodal.parts_from_modalities`.
+            session: The session this request runs in, or None outside one.
+                A model that renders a chat envelope reads ``resumed`` here:
+                a resuming turn is appended to state that already holds the
+                conversation, so re-rendering a system prompt or a leading BOS
+                would inject it mid-conversation.
             **kwargs: Model-specific parameters (e.g., from model_kwargs).
 
         Returns:

@@ -10,6 +10,13 @@ It is BAGEL's LLM and tokenizer with everything else taken away — only the
 image walks are not part of the deployment. Subclassing rather than copying
 keeps it honest: the LLM path it tests is the one BAGEL actually serves.
 
+It renders each turn in its own role block, and a resuming turn without the
+system block: that turn is appended to a KV which already holds the
+conversation, so re-rendering the block would introduce the model to itself
+again mid-conversation. The override lives here rather than in ``BagelModel`` so
+the models serving chat today keep their current rendering; PR #340 is bringing
+per-turn role blocks to BAGEL itself.
+
 Cross-request prefix reuse is off here. Both features share the page pool and
 coexist fine (a resumed request steps out of the index on its own), but a test
 model should exercise one thing, and a prefix hit would otherwise hide a session
@@ -35,6 +42,16 @@ TEXT_WALKS = ("prefill_text", "decode")
 
 
 class TextSessionModel(BagelModel):
+    # One role block per turn, and no system block on a resuming turn: it is
+    # appended to a KV that already holds the conversation.
+    OPENING_TURN_TEMPLATE = (
+        "<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    )
+    RESUMING_TURN_TEMPLATE = (
+        "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    )
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         walks = super().get_graph_walk_graphs()
         missing = sorted(set(TEXT_WALKS) - walks.keys())
@@ -77,7 +94,7 @@ class TextSessionModel(BagelModel):
 
     def process_prompt(
         self, prompt, input_modalities, output_modalities,
-        tensors=None, prompt_parts=None, **kwargs,
+        tensors=None, prompt_parts=None, session=None, **kwargs,
     ):
         refused = sorted(set(input_modalities) - {TEXT})
         if refused:
@@ -90,7 +107,17 @@ class TextSessionModel(BagelModel):
                 f"{type(self).__name__} generates text only; got "
                 f"output_modalities={output_modalities}"
             )
+        if prompt is not None:
+            template = (
+                self.RESUMING_TURN_TEMPLATE
+                if session is not None and session.resumed
+                else self.OPENING_TURN_TEMPLATE
+            )
+            return {"text_inputs": [self._encode_text(template.format(
+                system_prompt=self.BAGEL_DEFAULT_SYSTEM_PROMPT, prompt=prompt,
+            ))]}
         return super().process_prompt(
             prompt, input_modalities, output_modalities,
-            tensors=tensors, prompt_parts=prompt_parts, **kwargs,
+            tensors=tensors, prompt_parts=prompt_parts, session=session,
+            **kwargs,
         )

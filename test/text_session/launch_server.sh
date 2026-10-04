@@ -7,6 +7,9 @@
 set -euo pipefail
 
 PORT=${PORT:-8000}
+# $CONFIG so the session-matrix job can point one launcher at each corner of the
+# session config; see configs/text_session/.
+CONFIG=${CONFIG:-configs/test_text_session.yaml}
 WHO=${WHO:-$(whoami)}
 DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 # A prefix of its own: --port alone does not isolate the ZMQ IPC sockets, so two
@@ -24,8 +27,10 @@ PYTHON=${PYTHON:-$([ -x .venv/bin/python ] && echo .venv/bin/python || echo pyth
 PATH="$(cd "$(dirname "$PYTHON")" && pwd):$PATH"
 export PATH
 
-CUDA_VISIBLE_DEVICES=$DEVICES "$PYTHON" -m mstar.api_server.entrypoint \
-    --config configs/test_text_session.yaml \
+# exec, so this script's pid *is* the server's: bash does not forward the
+# SIGINT that shuts the deployment down to a child.
+exec env CUDA_VISIBLE_DEVICES=$DEVICES "$PYTHON" -m mstar.api_server.entrypoint \
+    --config "$CONFIG" \
     --port "$PORT" \
     --socket-path-prefix "$PREFIX" \
     --upload-dir "/tmp/mstar_uploads_${WHO}/" \

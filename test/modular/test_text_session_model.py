@@ -22,6 +22,7 @@ from mstar.engine.resources.attn.ragged.config import RaggedAttentionSpec
 from mstar.graph.base import TensorPointerInfo
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.sessions import (
+    RequestSession,
     SessionOverflowPolicy,
     apply_sessions_yaml_overrides,
 )
@@ -73,6 +74,51 @@ def test_a_text_prompt_tokenizes_to_one_span(model):
     assert list(out) == ["text_inputs"]
     assert len(out["text_inputs"]) == 1
     assert out["text_inputs"][0].numel() > 0
+
+
+# ── what a turn renders to ──────────────────────────────────────────────────
+
+def _ids(model, prompt, session=None):
+    out = model.process_prompt(prompt, ["text"], ["text"], session=session)
+    assert list(out) == ["text_inputs"]
+    assert len(out["text_inputs"]) == 1
+    return model.tokenizer.decode(out["text_inputs"][0].tolist())
+
+
+def test_a_turn_that_opens_a_session_renders_the_system_prompt(model):
+    rendered = _ids(model, "Hello", session=RequestSession("s"))
+
+    assert model.BAGEL_DEFAULT_SYSTEM_PROMPT in rendered
+
+
+def test_a_resuming_turn_leaves_the_system_prompt_out(model):
+    # it is appended to a KV that already holds the conversation, so the system
+    # block would land mid-conversation and introduce the model to itself again
+    rendered = _ids(model, "Hello", session=RequestSession("s", resumed=True))
+
+    assert model.BAGEL_DEFAULT_SYSTEM_PROMPT not in rendered
+    assert rendered == "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+
+
+def test_every_turn_names_the_role_that_speaks_it(model):
+    # without a role label the model cannot tell its own turn from the user's,
+    # and answers "what is my name?" as though the name were its own
+    opening = _ids(model, "Hello", session=RequestSession("s"))
+
+    assert "<|im_start|>system\n" in opening
+    assert "<|im_start|>user\nHello" in opening
+    assert opening.endswith("<|im_start|>assistant\n")
+
+
+def test_a_resuming_turn_is_the_opening_turn_minus_its_system_block(model):
+    opening = _ids(model, "Hello", session=RequestSession("s"))
+    resumed = _ids(model, "Hello", session=RequestSession("s", resumed=True))
+
+    assert opening.endswith(resumed)
+
+
+def test_a_sessionless_turn_renders_like_one_opening_a_session(model):
+    assert _ids(model, "Hello") == _ids(model, "Hello", RequestSession("s"))
 
 
 @pytest.mark.parametrize(

@@ -66,6 +66,15 @@ class RequestSession:
     # The session ends when this request finishes.
     end_session: bool = False
 
+    @property
+    def started(self) -> bool:
+        """This request opened the session: it is its first turn.
+
+        A property, not a field: every session request either starts or resumes,
+        so a second flag could only ever disagree with this one.
+        """
+        return not self.resumed
+
 
 @dataclass
 class SessionResourceConfig:

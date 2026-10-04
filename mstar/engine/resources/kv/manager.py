@@ -1663,7 +1663,16 @@ class KVManager(AttentionResource):
     def adopt_session_state(self, rid: str, session_id: str) -> None:
         with self._lock:
             if not self._move_streams(self.session_rid(session_id), rid):
+                # the session's first request, or a handover that went missing
+                logger.info(
+                    "KV %s: session %s held no state for %s",
+                    self.name, session_id, rid,
+                )
                 return
+            logger.info(
+                "KV %s: %s adopted %d pages from session %s",
+                self.name, rid, self._pages_held(rid), session_id,
+            )
             # its keys describe the new turn only, not the pages it inherited
             overrides = self._overrides.get(rid)
             if overrides is not None and overrides.prefix_cache:
@@ -1674,15 +1683,22 @@ class KVManager(AttentionResource):
                 )
 
     def retain_session_state(self, rid: str, session_id: str) -> None:
-        self._move_streams(rid, self.session_rid(session_id))
+        if self._move_streams(rid, self.session_rid(session_id)):
+            logger.info(
+                "KV %s: session %s keeps %d pages from %s",
+                self.name, session_id, self.session_state_size(session_id), rid,
+            )
 
     def remove_session(self, session_id: str) -> None:
         self.remove_request(self.session_rid(session_id))
 
     def session_state_size(self, session_id: str) -> int:
         """Device pages the session holds."""
+        return self._pages_held(self.session_rid(session_id))
+
+    def _pages_held(self, rid: str) -> int:
         with self._lock:
-            streams = self._streams.get(self.session_rid(session_id), {})
+            streams = self._streams.get(rid, {})
             return sum(len(stream.page_indices) for stream in streams.values())
 
     def _move_streams(self, src: str, dst: str) -> bool:

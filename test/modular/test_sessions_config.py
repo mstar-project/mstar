@@ -14,6 +14,7 @@ sys.path.insert(0, ".")
 import pytest
 
 from mstar.model.sessions import (
+    RequestSession,
     SessionCapacityPolicy,
     SessionOverflowPolicy,
     SessionResourceConfig,
@@ -128,3 +129,10 @@ def test_block_on_a_model_without_sessions_is_refused():
 def test_unknown_key_is_refused():
     with pytest.raises(ValueError, match="unknown key"):
         apply_sessions_yaml_overrides(_config(), {"sessions": {"ttl": 30}})
+
+
+# ── what one request knows about its session ────────────────────────────────
+
+def test_a_request_either_starts_its_session_or_resumes_it():
+    assert RequestSession("s").started is True
+    assert RequestSession("s", resumed=True).started is False

@@ -16,9 +16,11 @@ sys.path.insert(0, ".")
 
 from types import SimpleNamespace
 
+from mstar.api_server.data_worker import _request_session
 from mstar.api_server.entrypoint import APIServer, PendingRequest
 from mstar.api_server.request_types import (
     APIServerMessage,
+    PreprocessInput,
     RequestComplete,
     RequestFailed,
     SessionTornDown,
@@ -133,6 +135,37 @@ def test_the_flags_reach_the_data_worker():
     assert preprocess_input.end_session is True
     # end_session holds the tombstone from submit, not from completion
     assert s.sessions.snapshot()[0]["closing"] is True
+
+
+def _preprocess_input(**session):
+    return PreprocessInput(
+        request_id="r0", text="hi", file_paths=None,
+        input_modalities=["text"], output_modalities=["text"], model_kwargs={},
+        **session,
+    )
+
+
+def test_the_data_worker_hands_the_model_the_session():
+    # what `process_prompt` reads to tell a resuming turn from an opening one
+    session = _request_session(_preprocess_input(
+        session_id="s", resumed=True, end_session=True,
+    ))
+
+    assert session.session_id == "s"
+    assert session.resumed is True
+    assert session.started is False
+    assert session.end_session is True
+
+
+def test_the_data_worker_hands_the_model_no_session_without_one():
+    assert _request_session(_preprocess_input()) is None
+
+
+def test_an_opening_turn_reaches_the_model_as_one():
+    session = _request_session(_preprocess_input(session_id="s"))
+
+    assert session.started is True
+    assert session.resumed is False
 
 
 def test_a_sessionless_request_emits_no_session_chunk():

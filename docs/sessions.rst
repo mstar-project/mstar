@@ -241,6 +241,35 @@ single generated token: it sends long turns into one session until the held stat
 passes the configured ``max_state``, and the turn after that has to come back
 with the budget error.
 
+What a model renders for a resuming turn
+---------------------------------------
+
+``process_prompt`` receives the request's session (``session_id``, and
+``started`` / ``resumed`` / ``end_session``), so a model that renders a chat
+envelope can tell an opening turn from one that continues a conversation already
+in the KV. A resuming turn should render as one more turn and nothing else: a
+re-rendered system prompt or leading BOS lands in the middle of the
+conversation, which a small model reads as being introduced to itself again.
+
+``TextSessionModel.process_prompt`` is the worked example: each turn renders in
+its own role block, and a resuming turn renders the user block and the
+assistant's opener alone. A model that ignores the argument renders as it always
+did.
+
+The role label is not cosmetic. Over 20 greedy two-turn chats on that model,
+asked ``What is my name?`` after being told it:
+
+==========================================  ==============  =================
+resuming turn renders as                    reference kept  roles kept straight
+==========================================  ==============  =================
+a system block and no role labels           9/20            4/20
+one role block, no system block             19/20           20/20
+one role block, system block on turn one    20/20           20/20
+==========================================  ==============  =================
+
+With no label the model cannot tell its own turn from the client's, and answers
+as though the client's name were its own.
+
 Limits in this version
 ----------------------
 
