@@ -20,6 +20,8 @@ import logging
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, ".")
 
 from mstar.engine import engine as engine_mod
@@ -132,6 +134,9 @@ class _Resource:
 
     def reclaimable(self, rid):
         return 0 if rid in self.holds_nothing else 1
+
+    def can_reload(self, rid):
+        return True
 
     def offload(self, rid):
         if self.refuse_offload:
@@ -312,6 +317,45 @@ def test_a_partial_reload_gives_back_what_it_reloaded():
     assert first.is_offloaded("a") and first.free == 8, (
         "the first resource kept pages the delta never mentions"
     )
+
+
+class _Unsure(_Resource):
+    """Answers ``can_reload`` as ``KVManager`` does: no for a request it never offloaded."""
+
+    def __init__(self, fits: bool = True):
+        super().__init__()
+        self.fits = fits
+
+    def can_reload(self, rid):
+        return rid in self.offloaded and self.fits
+
+
+def test_a_resource_that_never_offloaded_the_request_does_not_block_its_reload():
+    """An offload that found nothing to move on one resource leaves it out of the
+    reload too; asking it anyway refuses every retry and strands the request."""
+    engine = _Engine()
+    holder, bystander = _Unsure(), _Unsure()
+    holder.offloaded = {"a"}
+    engine._submodules = {
+        "node": SimpleNamespace(resources={"holder": holder, "bystander": bystander})
+    }
+
+    assert engine.reload_request("node", "a") is True
+    assert not engine.is_offloaded("node", "a")
+
+
+def test_a_resource_that_cannot_fit_stops_the_reload_before_anything_moves():
+    engine = _Engine()
+    first, second = _Unsure(), _Unsure(fits=False)
+    first.offloaded = {"a"}
+    second.offloaded = {"a"}
+    first.reload = second.reload = lambda rid: pytest.fail("reloaded past a refusal")
+    engine._submodules = {
+        "node": SimpleNamespace(resources={"first": first, "second": second})
+    }
+
+    assert engine.reload_request("node", "a") is False
+    assert len(engine.take_resident_delta("node")) == 0
 
 
 def test_a_reloaded_request_is_ready_again():

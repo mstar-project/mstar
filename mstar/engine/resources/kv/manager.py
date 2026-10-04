@@ -1339,6 +1339,21 @@ class KVManager(AttentionResource):
             request_id=rid,
         )
 
+    def _reload_pages_needed(self, rid: str) -> int:
+        return sum(
+            self._cpu_pool.num_pages(rid, label)
+            for label in self._cpu_pool.labels(rid)
+        )
+
+    def can_reload(self, rid: str) -> bool:
+        """Whether the free pages plus what the prefix index could evict cover
+        ``rid``'s offloaded streams. An upper bound: ``reload`` can still refuse."""
+        if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
+            return False
+        with self._lock:
+            evictable = 0 if self._index is None else self._index.num_sole_owned()
+            return self._reload_pages_needed(rid) <= self._arena.num_free + evictable
+
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
 
@@ -1349,7 +1364,7 @@ class KVManager(AttentionResource):
             return False
         with self._lock:
             labels = self._cpu_pool.labels(rid)
-            needed = sum(self._cpu_pool.num_pages(rid, label) for label in labels)
+            needed = self._reload_pages_needed(rid)
             if needed > self._arena.num_free and self._index is not None:
                 # as `_alloc` does: once the pool is all cached pages, nothing
                 # else would ever free one for this request to come back to

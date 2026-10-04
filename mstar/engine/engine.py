@@ -1579,11 +1579,16 @@ class Engine:
             # eviction freed, so it is just as much rank 0's call. Not ready here
             # until the delta says so.
             return False
-        # ponytail: a failed retry reloads and re-offloads whatever fit; check every resource fits before reloading any
+        offloaded = [
+            resource
+            for resource in self._submodules[node_name].resources.values()
+            if resource.supports_eviction and resource.is_offloaded(request_id)
+        ]
+        # check every resource fits first, so a refusal doesn't reload and re-offload whatever did
+        if not all(resource.can_reload(request_id) for resource in offloaded):
+            return False
         reloaded: list[Resource] = []
-        for resource in self._submodules[node_name].resources.values():
-            if not (resource.supports_eviction and resource.is_offloaded(request_id)):
-                continue
+        for resource in offloaded:
             if not resource.reload(request_id):
                 # undone, not kept: every page move rank 0 makes is journalled or undone, and a partial one can't be
                 for done in reloaded:

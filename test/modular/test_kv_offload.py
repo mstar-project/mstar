@@ -315,6 +315,28 @@ def test_reload_declines_when_device_full():
 
 
 @requires_cuda
+def test_can_reload_tracks_free_pages_without_a_prefix_index():
+    """The index is off at world size > 1, so under TP this is the only case."""
+    mgr = _make_manager(max_num_pages=8)
+    assert mgr._index is None
+    mgr.ingest_request("r0")
+    mgr.ingest_request("r1")
+    assert mgr.can_reload("r0") is False
+    _grow(mgr, "r0", "main", 3 * PAGE_SIZE)
+
+    assert mgr.offload("r0") == 3
+    assert mgr.can_reload("r0") is True
+    while mgr._arena.num_free:
+        assert _grow(mgr, "r1", "main", PAGE_SIZE).ok
+    assert mgr.can_reload("r0") is False
+
+    mgr.remove_request("r1")
+    assert mgr.can_reload("r0") is True
+    assert mgr.reload("r0") is True
+    _assert_pages_conserved(mgr)
+
+
+@requires_cuda
 def test_remove_request_returns_host_pages():
     mgr = _make_manager(cpu_offload_pages=4)
     mgr.ingest_request("r0")

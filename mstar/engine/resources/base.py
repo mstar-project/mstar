@@ -242,6 +242,12 @@ class Resource(ABC):
         """Bring it back. False when it doesn't fit on device yet."""
         return True
 
+    def can_reload(self, rid: str) -> bool:
+        """Whether the request can be reloaded. If this is False, the Engine
+        will not attempt to reload. If True, it will attempt to reload but still
+        check that the reload was successful."""
+        return True
+
     def reclaimable(self, rid: str) -> int:
         """What `offload` would free, in whatever this resource counts.
 
