@@ -272,3 +272,16 @@ def test_register_rejects_a_window_wider_than_the_ring():
     )
     with pytest.raises(ValueError, match="exceeds the ring width"):
         ring.register_request("r", params=TTSSamplingParams(repetition_window=5))
+
+
+def test_register_with_an_unstorable_value_takes_no_slot():
+    """A failed register must leave the request unregistered, with no slot leaked."""
+    ring = Zonos2SamplerBuffers.allocate(
+        max_batch_size=1, n_codebooks=C, window=4, repetition_codebooks=-1, device=DEVICE,
+    )
+    free = len(ring._free_slots)
+    with pytest.raises(ValueError, match="Overflow"):
+        ring.register_request("r", seed=2**64)
+    assert "r" not in ring._rid_to_slot and len(ring._free_slots) == free
+    ring.register_request("r", seed=7)
+    assert int(ring.const_master["seed"][ring._rid_to_slot["r"]]) == 7

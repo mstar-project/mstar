@@ -248,6 +248,9 @@ def test_for_request_applies_kwargs_over_defaults_and_normalizes():
     ({"temperature": True}, "must be a number"),
     ({"temperature": float("nan")}, "must be finite"),
     ({"topk": 2.5}, "must be an integer"),
+    ({"topk": float("inf")}, "must be an integer"),
+    ({"topk": 2**70}, "64-bit"),
+    ({"repetition_codebooks": -(2**63) - 1}, "64-bit"),
     ({"ignore_eos": 1}, "must be true or false"),
     ({"repetition_window": 65}, "at most 64"),
 ])

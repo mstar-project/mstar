@@ -66,6 +66,22 @@ def _req_id_to_seed(req_id: str):
     return int.from_bytes(digest[:4], "little")
 
 
+def _request_seed(model_kwargs: dict, request_id: str) -> int:
+    """The request's seed: its explicit ``seed`` kwarg, else one from its id.
+
+    Raises ``ValueError`` unless the explicit seed is an integer that fits in
+    int64, the widest seed a sampler can store or pass to ``manual_seed``.
+    """
+    seed = model_kwargs.get("seed")
+    if seed is None:
+        return _req_id_to_seed(request_id)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f"seed must be an integer, got {seed!r}.")
+    if not -(2**63) <= seed < 2**63:
+        raise ValueError(f"seed must fit in a signed 64-bit integer, got {seed}.")
+    return seed
+
+
 def _pick_free_tcp_port() -> int:
     """Ask the OS for an unused ephemeral TCP port.
 
@@ -642,7 +658,7 @@ class Conductor:
                 body.request_id, len(self.requests),
                 str(self.max_concurrent_requests),
             )
-            self._do_ingest_request(body)
+            self._admit_request(body)
 
     def _ingest_request(
         self, body: NewRequestConductor
@@ -663,6 +679,11 @@ class Conductor:
                 "Request %s was aborted before ingest; dropping", body.request_id
             )
             return
+        try:
+            _request_seed(body.model_kwargs or {}, body.request_id)
+        except ValueError as exc:
+            self._reject_request(body.request_id, str(exc), status=400)
+            return
         if (self.max_concurrent_requests is not None
                 and len(self.requests) >= self.max_concurrent_requests):
             logger.info(
@@ -674,9 +695,45 @@ class Conductor:
             return
         if self.enable_nvtx:
             range_push("conductor._do_ingest_request")
-        self._do_ingest_request(body)
+        self._admit_request(body)
         if self.enable_nvtx:
             range_pop()
+
+    def _admit_request(self, body: NewRequestConductor):
+        """Dispatch ``body``; if that raises, fail the request instead of dropping it.
+
+        An exception here would otherwise reach the run loop, which only logs
+        it, and the client would wait for its timeout.
+        """
+        try:
+            self._do_ingest_request(body)
+        # Any failure must reach the client.
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ingest failed for request %s", body.request_id)
+            error = f"Ingest failed: {type(exc).__name__}: {exc}"
+            request_data = self.requests.get(body.request_id)
+            if request_data is None:
+                self._reject_request(body.request_id, error, status=500)
+            elif body.request_id not in self.draining:
+                # Some workers may already hold it: drain them like a worker failure.
+                self._remove_request(body.request_id, request_data, failure_error=error)
+
+    def _reject_request(self, request_id: str, error: str, status: int):
+        """Fail a request that was never dispatched to any worker.
+
+        Only the preprocess worker holds its input signals, so hard-remove
+        them there, as an abort before admission does, then tell the client.
+        """
+        logger.error("Rejecting request %s: %s", request_id, error)
+        self._early_reads_done.pop(request_id, None)
+        self._send_remove_to_preprocess_worker(request_id)
+        self.communicator.send(
+            "api_server",
+            APIServerMessage(
+                message_type="request_failed",
+                body=RequestFailed(request_id=request_id, error_message=error, status=status),
+            ),
+        )
 
     def _do_ingest_request(
         self, body: NewRequestConductor
@@ -689,9 +746,9 @@ class Conductor:
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self.model.get_max_output_tokens(**model_kwargs)
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
-        # otherwise derive a stable seed from the request id.
-        explicit_seed = model_kwargs.get("seed")
-        seed = int(explicit_seed) if explicit_seed is not None else _req_id_to_seed(body.request_id)
+        # otherwise derive a stable seed from the request id. ``_ingest_request``
+        # already rejected a bad one.
+        seed = _request_seed(model_kwargs, body.request_id)
 
         partitions = self.model.get_partitions()
         topology = self.model.get_partition_topology()

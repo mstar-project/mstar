@@ -159,13 +159,6 @@ class Zonos2SamplerBuffers:
         """
         if rid in self._rid_to_slot:
             return
-        if not self._free_slots:
-            self._grow_master(self._master_capacity * 2)
-        slot = self._free_slots.pop()
-        self._rid_to_slot[rid] = slot
-        self.ring_master[slot].fill_(-1)
-        self.cursor_master[slot] = 0
-        self.offset_master[slot] = 0
         p = params if params is not None else self.defaults
         if p.repetition_window > self.window:
             raise ValueError(
@@ -178,6 +171,15 @@ class Zonos2SamplerBuffers:
             "seed": seed, "window": p.repetition_window,
             "codebooks": C if p.repetition_codebooks < 0 else min(p.repetition_codebooks, C),
         }
+        # Convert before taking a slot, so a value that does not fit leaks nothing.
+        values = {k: torch.tensor(v, dtype=_CONSTS[k]) for k, v in values.items()}
+        if not self._free_slots:
+            self._grow_master(self._master_capacity * 2)
+        slot = self._free_slots.pop()
+        self._rid_to_slot[rid] = slot
+        self.ring_master[slot].fill_(-1)
+        self.cursor_master[slot] = 0
+        self.offset_master[slot] = 0
         for k, v in values.items():
             self.const_master[k][slot] = v
 

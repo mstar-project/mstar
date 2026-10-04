@@ -76,6 +76,9 @@ class TTSSamplingParams(ResourceReqConfig):
         return out
 
 
+_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
+
+
 def _coerce(name: str, value, kind: type):
     """Convert a request kwarg to its field's type, or raise ``ValueError``."""
     if kind is bool:
@@ -85,9 +88,13 @@ def _coerce(name: str, value, kind: type):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a number, got {value!r}.")
     if kind is int:
-        if float(value) != int(value):
+        if isinstance(value, float) and not value.is_integer():
             raise ValueError(f"{name} must be an integer, got {value!r}.")
-        return int(value)
+        value = int(value)
+        # The sampler stores these in int64 tensors; a wider value fails its whole batch.
+        if not _INT64_MIN <= value <= _INT64_MAX:
+            raise ValueError(f"{name} must fit in a signed 64-bit integer, got {value}.")
+        return value
     if not math.isfinite(value):
         raise ValueError(f"{name} must be finite, got {value!r}.")
     return float(value)
