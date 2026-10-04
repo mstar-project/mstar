@@ -79,6 +79,10 @@ from mstar.worker.node_manager_utils import RequestStateManager
 
 logger = logging.getLogger(__name__)
 
+# EXPERIMENT toggle, see _prep_speculation. Default ON so the validation run
+# exercises it; set MSTAR_NO_FRESH_MERGE_ON_NEW_ITER=0 for the old behaviour.
+_NO_FRESH_MERGE_ON_NEW_ITER = os.environ.get("MSTAR_NO_FRESH_MERGE_ON_NEW_ITER", "1") == "1"
+
 # seconds between "no offload possible" lines for one node and walk: a hold is
 # retried every backoff, and a line per retry buries the rest of the log
 _HOLD_LOG_INTERVAL = 5.0
@@ -2187,6 +2191,18 @@ class Worker:
             pre_existing_batch_size=len(continuing),
             capture_group_of=prep.ready_rids[0],
         )
+
+        # EXPERIMENT (MSTAR_NO_FRESH_MERGE_ON_NEW_ITER=1): a fresh rid joins the batch
+        # but is never added to `continuing`, so _speculative_fwd_info skips its `+1`
+        # and it re-runs the in-flight iteration. Dropping the merge when the target is
+        # itself a new loop iteration costs batching, but tests that directly.
+        if fresh_batch is not None and spec_target.is_new_loop_iter and _NO_FRESH_MERGE_ON_NEW_ITER:
+            self._graph_runtime.push_back_node(
+                fresh_batch.node_name,
+                list(fresh_batch.request_to_worker_graph),
+                list(fresh_batch.request_to_worker_graph.values()),
+            )
+            fresh_batch = None
 
         if fresh_batch is not None:
             # The merge below relabels these node objects with the spec

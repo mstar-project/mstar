@@ -123,6 +123,15 @@ sys.exit(0 if ok else 1)
 PY
 
 echo
+echo "=== per-request denoise step sequences (from prepare_inputs) ==="
+# A clean request is k=0,1,2,...  A repeat (0,0,2,3 / 0,1,2,0) is the loop-counter bug.
+# check_stop reads a different info object and can look clean while this does not.
+grep -o "prepare request [0-9a-f-]* k=[0-9]*" "$LOG" 2>/dev/null \
+  | awk '{split($NF,a,"="); print $3, a[2]}' \
+  | awk '{seq[$1]=seq[$1]" "$2} END {for (r in seq) print substr(r,1,8)":"seq[r]}' \
+  | sort | awk '{n=split($0,f," "); ok=1; for(i=2;i<=n;i++) if(f[i]+0 != i-2) ok=0;
+                 print $0 (ok?"":"   <<< REPEATED/MISSING STEP")}'
+echo
 echo "=== images in $OUT ; server log $LOG ==="
 [ "$RC" = 0 ] && echo "RESULT: PASS -- concurrent requests match their solo images" \
               || echo "RESULT: FAIL -- the loop-counter bug is still reachable"
