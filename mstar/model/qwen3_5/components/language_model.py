@@ -5,10 +5,10 @@ position among its own kind; see ``Qwen3_5Config.resource_layer_index``.
 
 TP shards by head (q-heads for attention, k/v-heads for the delta net), and the
 engine shards the KV cache and recurrent pool to match, so
-``get_node_resources`` stays unsharded. ``gate/up`` and the delta net's four
-projections are each fused into one GEMM, since at decode width they are
-latency-bound; ``q/k/v`` stay apart. ``num_key_value_heads`` is 4 or 2, so past
-that TP degree the K/V heads replicate (see ``KVColumnParallelLinear``).
+``get_node_resources`` stays unsharded. ``q/k/v``, ``gate/up`` and the delta
+net's four projections are each fused into one GEMM, since at decode width they
+are latency-bound. ``num_key_value_heads`` is 4 or 2, so past
+that TP degree the K/V heads replicate (see ``QKVParallelLinear``).
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from mstar.distributed.utils import divide
 from mstar.model.components import Attention, DecoderLayer, RMSNorm
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
-    KVColumnParallelLinear,
+    QKVParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
 )
@@ -61,8 +61,9 @@ class RopeCache:
 class Qwen3_5Attention(Attention):
     """Full attention with Qwen3.5's output gate.
 
-    ``q_proj`` interleaves query and gate **per head** (``[q | gate]`` per
-    head block), so it is chunked after the per-head view, never before.
+    The checkpoint's ``q_proj`` interleaves query and gate **per head**
+    (``[q | gate]`` per head block), so the q part of ``qkv_proj`` is chunked
+    after the per-head view, never before.
     """
 
     def __init__(
@@ -88,24 +89,17 @@ class Qwen3_5Attention(Attention):
         self.total_num_heads = self.num_heads
         self.num_heads = divide(self.num_heads, tp)
 
-        # the gate is inside each head's block, so a head shard keeps it intact
-        self.q_proj = ColumnParallelLinear(
-            comm_group=comm_group, input_size=self.input_hidden_size,
-            output_size=self.total_num_heads * self.head_dim * (2 if output_gate else 1),
-            bias=qkv_bias,
-        )
-        self.k_proj = KVColumnParallelLinear(
-            comm_group=comm_group, input_size=self.input_hidden_size,
-            head_size=self.head_dim, total_num_kv_heads=self.num_kv_heads,
-            bias=qkv_bias,
-        )
-        self.v_proj = KVColumnParallelLinear(
-            comm_group=comm_group, input_size=self.input_hidden_size,
-            head_size=self.head_dim, total_num_kv_heads=self.num_kv_heads,
-            bias=qkv_bias,
+        # One GEMM for q, k and v. The gate is inside each query head's block,
+        # so q counts as twice the heads and a head shard keeps it intact.
+        self.q_proj = self.k_proj = self.v_proj = None
+        self.qkv_proj = QKVParallelLinear(
+            comm_group=comm_group, hidden_size=self.input_hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.total_num_heads * (2 if output_gate else 1),
+            total_num_kv_heads=self.num_kv_heads, bias=qkv_bias,
         )
         self.total_num_kv_heads = self.num_kv_heads
-        self.num_kv_heads = self.k_proj.num_kv_heads
+        self.num_kv_heads = self.qkv_proj.num_kv_heads
         self.o_proj = RowParallelLinear(
             comm_group=comm_group,
             input_size=self.total_num_heads * self.head_dim,
@@ -120,33 +114,24 @@ class Qwen3_5Attention(Attention):
             return super()._apply_rope(q, k, label)
         return apply_partial_mrope(q, k, self.rope_cache.cos, self.rope_cache.sin)
 
-    def consolidate_qkv_weight(self) -> None:
-        if self.output_gate:
-            # q_proj is twice as wide as the fused layout assumes
-            return
-        super().consolidate_qkv_weight()
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if not self.output_gate:
-            return super().forward(hidden_states)
         num_tokens = hidden_states.shape[0]
-        q, gate = torch.chunk(
-            self.q_proj(hidden_states).view(
-                num_tokens, self.num_heads, self.head_dim * 2
-            ),
-            2,
-            dim=-1,
-        )
-        k = self.k_proj(hidden_states).view(
-            num_tokens, self.num_kv_heads, self.head_dim
-        )
-        v = self.v_proj(hidden_states).view(
-            num_tokens, self.num_kv_heads, self.head_dim
-        )
+        q_dim = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
+        kv_dim = self.num_kv_heads * self.head_dim
+        q, k, v = self.qkv_proj(hidden_states).split([q_dim, kv_dim, kv_dim], dim=-1)
+        if self.output_gate:
+            q, gate = torch.chunk(
+                q.view(num_tokens, self.num_heads, self.head_dim * 2), 2, dim=-1,
+            )
+        else:
+            q = q.view(num_tokens, self.num_heads, self.head_dim)
+        k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
+        v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         q, k = self._apply_qk_norm(q, k)
         q, k = self._apply_rope(q, k, self.attend.label)
         out = self.attend(q, k, v).reshape(num_tokens, self.num_heads * self.head_dim)
-        out = out * torch.sigmoid(gate.reshape(num_tokens, -1))
+        if self.output_gate:
+            out = out * torch.sigmoid(gate.reshape(num_tokens, -1))
         return self.o_proj(out)
 
 

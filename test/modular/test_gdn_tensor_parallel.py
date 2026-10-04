@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.distributed import QKVParallelLinear
 from mstar.model.components.distributed.linear_attn import ParallelGatedDeltaNet
 from mstar.model.components.linear_attn import GDNProjLayout
 from mstar.model.loader.base import load_weights_into
@@ -102,13 +103,17 @@ def load(module, weights: dict[str, torch.Tensor], source=None) -> None:
             by_rule.append((key, tensor))
             continue
         src = src_modules.get(name.rsplit(".", 1)[0])
+        # QKVParallelLinear names its blocks; the merged layers index them
+        ids = "qkv" if isinstance(owner, QKVParallelLinear) else range(len(sizes))
         offset = 0
-        for block, size in enumerate(getattr(src, "output_sizes", sizes)):
+        for block, (shard_id, size) in enumerate(
+            zip(ids, getattr(src, "output_sizes", sizes), strict=True),
+        ):
             # the alignment pad is the one block whose width differs between
             # degrees, and it holds no weight — everything else loads
             if size and size == sizes[block]:
                 owner.weight_loader(
-                    params[key], tensor.narrow(0, offset, size), block,
+                    params[key], tensor.narrow(0, offset, size), shard_id,
                 )
             offset += size
         loaded.add(key)
@@ -244,9 +249,13 @@ def rejoin(
     )
 
     owner = modules[name.rsplit(".", 1)[0]]
-    # covers the delta net's [q|k|v|z|a|b] and the MLP's [gate|up] alike:
-    # every block is divided separately, so a flat cat would be wrong
-    if isinstance(owner, MergedColumnParallelLinear) and name.endswith("weight"):
+    # covers the delta net's [q|k|v|z|a|b], the MLP's [gate|up] and
+    # attention's [q|k|v] alike: every block is divided separately, so a flat
+    # cat would be wrong
+    if (
+        isinstance(owner, (MergedColumnParallelLinear, QKVParallelLinear))
+        and name.endswith("weight")
+    ):
         return rejoin_blocks(shards, owner.output_sizes)
     if name.endswith("conv1d.weight"):
         mixer = modules[name[: -len(".conv1d.weight")]]
@@ -264,8 +273,8 @@ def rejoin(
 def test_whole_stack_reassembles_across_ranks():
     """Every parameter of a TP=2 pair rebuilds the TP=1 model.
 
-    Broader than the GDN checks above: this also covers attention's
-    double-width `q_proj`, the KV projections, the MLP and the vocab-parallel
+    Broader than the GDN checks above: this also covers attention's fused
+    `qkv_proj` with its double-width q, the MLP and the vocab-parallel
     embedding — anywhere a wrong axis or a wrong offset would survive every
     shape assertion and only show up as bad output.
     """

@@ -2,8 +2,8 @@
 
 Mostly a rename: the text stack sits under ``language_model`` and the delta
 net mixer is ``linear_attn`` (ours: ``self_attn``); vision tensors lose their
-``model.visual.`` prefix. ``_STACKED_PARAMS`` routes the separate gate/up and
-delta net input projections by shard id into their fused parameters. The two
+``model.visual.`` prefix. ``_STACKED_PARAMS`` routes the separate q/k/v, gate/up
+and delta net input projections by shard id into their fused parameters. The two
 towers load separately, as separate nodes. The MTP head (``mtp.*``) is skipped.
 """
 from __future__ import annotations
@@ -19,6 +19,9 @@ from mstar.model.loader.iterators import iter_safetensors_shards
 # ints index `MergedColumnParallelLinear.output_sizes`; names key
 # `SPLIT_SHARD_BLOCKS`
 _STACKED_PARAMS: list[StackedParamRule] = [
+    StackedParamRule(".qkv_proj", ".q_proj", "q"),
+    StackedParamRule(".qkv_proj", ".k_proj", "k"),
+    StackedParamRule(".qkv_proj", ".v_proj", "v"),
     StackedParamRule(".gate_up_proj", ".gate_proj", 0),
     StackedParamRule(".gate_up_proj", ".up_proj", 1),
     StackedParamRule(".in_proj_fused", ".in_proj_qkv", "qkv"),
