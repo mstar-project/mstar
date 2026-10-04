@@ -339,7 +339,10 @@ class PythonGraphRuntime(GraphRuntime):
                 # The flag SUPPRESSES ready-queue adds, so an input ingested while it
                 # was set leaves the node ready but unqueued, and nothing re-adds it
                 # later. Re-evaluate on the way down or that wake-up is lost.
-                wgio.requeue_if_ready(node)
+                # The queue add always walks up to the root registry (a loop member's
+                # LoopStateRegistry forwards through Loop.ingest_external_input), so
+                # that is where membership has to be re-evaluated.
+                wgio.wg_state_registry.requeue_if_ready(node)
 
     def is_speculatively_scheduled(
         self, node: str, wg_id: int, rid: int,
