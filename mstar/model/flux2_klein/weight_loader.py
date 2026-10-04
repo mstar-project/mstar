@@ -7,7 +7,7 @@ safetensors shards through ``load_weights_into`` with a name remapper.
 
 Completeness is a hard contract: a checkpoint key that reaches no parameter, or a
 parameter no key reached, raises. The only keys dropped on purpose are listed in
-``_IGNORED_KEYS`` (a BatchNorm step counter and, for the 9B, the LM head the
+``weight_loading._IGNORED_KEYS`` (a BatchNorm step counter and, for the 9B, the LM head the
 encoder never runs).
 
 Key remaps (checkpoint -> native):
@@ -35,22 +35,30 @@ Key remaps (checkpoint -> native):
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import torch
-from safetensors import safe_open
 
 from mstar.model.components.diffusion.lora import LoraSpec, apply_loras
-from mstar.model.components.diffusion.text_encoder import Qwen3HiddenStateEncoder
+from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig, Qwen3HiddenStateEncoder
+from mstar.model.components.diffusion.qwen3.weight_loading import (
+    QKV_RULES_LM,
+    make_text_encoder,
+    remap_text_encoder_key,
+    text_encoder_skip,
+)
+from mstar.model.components.diffusion.weight_loading import (
+    iter_diffusers_component,
+    iter_transformers_component,
+    load_native,
+    materialize,
+)
 from mstar.model.flux2_klein.components.transformer import Flux2DiT
 from mstar.model.flux2_klein.components.vae import Flux2VAE, remap_flux2_vae_key
-from mstar.model.flux2_klein.config import Flux2KleinConfig, Qwen3EncoderConfig
-from mstar.model.loader.base import StackedParamRule, load_weights_into
-from mstar.model.loader.iterators import iter_safetensors_file
+from mstar.model.flux2_klein.config import Flux2KleinConfig
+from mstar.model.loader.base import StackedParamRule
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +70,6 @@ _QKV_RULES_DIT = [
     StackedParamRule(".attn.txt_qkv", ".attn.add_k_proj", "k"),
     StackedParamRule(".attn.txt_qkv", ".attn.add_v_proj", "v"),
 ]
-_QKV_RULES_LM = [
-    StackedParamRule(".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
-    StackedParamRule(".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
-    StackedParamRule(".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
-]
-
 _TRANSFORMER_MAP = [
     (re.compile(r"^time_guidance_embed\.timestep_embedder\.linear_1\."), "time_embed.linear_in."),
     (re.compile(r"^time_guidance_embed\.timestep_embedder\.linear_2\."), "time_embed.linear_out."),
@@ -117,109 +119,10 @@ def remap_transformer_key(name: str) -> str:
 remap_vae_key = remap_flux2_vae_key
 
 
-def remap_text_encoder_key(name: str) -> str:
-    return name[len("model."):] if name.startswith("model.") else name
-
-
-# Checkpoint keys that intentionally load nothing.
-_IGNORED_KEYS = {"bn.num_batches_tracked"}
-
-
-def _iter_component(
-    component_dir: Path, device, index_name: str, single_name: str, skip: Callable[[str], bool] | None = None,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Stream the safetensors of one pipeline component (sharded or single file).
-
-    ``skip`` names the checkpoint keys the caller will not load (the encoder's unused LM
-    layers, say); they are filtered before the read, so they never touch the device.
-    """
-    def wanted(names) -> set[str]:
-        return {name for name in names if skip is None or not skip(name)}
-
-    index_path = component_dir / index_name
-    if index_path.exists():
-        with open(index_path) as f:
-            weight_map: dict[str, str] = json.load(f)["weight_map"]
-        for shard in sorted(set(weight_map.values())):
-            keys = wanted(name for name, in_shard in weight_map.items() if in_shard == shard)
-            if keys:
-                yield from iter_safetensors_file(component_dir / shard, device=device, keys=keys)
-        return
-    single = component_dir / single_name
-    if single.exists():
-        with safe_open(str(single), framework="pt", device="cpu") as f:
-            keys = wanted(f.keys())
-        yield from iter_safetensors_file(single, device=device, keys=keys)
-        return
-    raise FileNotFoundError(f"no safetensors checkpoint in {component_dir}")
-
-
-def iter_diffusers_component(component_dir: Path, device) -> Iterator[tuple[str, torch.Tensor]]:
-    return _iter_component(
-        component_dir, device, "diffusion_pytorch_model.safetensors.index.json", "diffusion_pytorch_model.safetensors",
-    )
-
-
-def iter_transformers_component(
-    component_dir: Path, device, skip: Callable[[str], bool] | None = None,
-) -> Iterator[tuple[str, torch.Tensor]]:
-    return _iter_component(component_dir, device, "model.safetensors.index.json", "model.safetensors", skip=skip)
-
-
-def load_native(
-    module: torch.nn.Module,
-    weights: Iterator[tuple[str, torch.Tensor]],
-    remap,
-    what: str,
-    stacked_params: list[StackedParamRule] | None = None,
-    skip=None,
-) -> torch.nn.Module:
-    """Stream ``weights`` into ``module`` through ``remap`` and enforce the completeness contract."""
-    targets = dict(module.named_parameters())
-    targets.update(dict(module.named_buffers()))
-    unexpected: list[str] = []
-    skipped: list[str] = []
-
-    def remapper(name: str) -> str | None:
-        if name in _IGNORED_KEYS or (skip is not None and skip(name)):
-            skipped.append(name)
-            return None
-        mapped = remap(name)
-        # a stacked rule's source name maps to the fused target; check that instead
-        for rule in stacked_params or ():
-            if rule.source_suffix in mapped:
-                mapped_target = mapped.replace(rule.source_suffix, rule.target_suffix)
-                if mapped_target in targets:
-                    return mapped
-                unexpected.append(name)
-                return None
-        if mapped not in targets:
-            unexpected.append(name)
-            return None
-        return mapped
-
-    loaded = load_weights_into(module, weights, stacked_params=stacked_params, name_remapper=remapper)
-    missing = sorted(set(targets) - loaded)
-    if unexpected or missing:
-        raise RuntimeError(
-            f"{what}: checkpoint/module mismatch — {len(unexpected)} unexpected checkpoint keys "
-            f"{unexpected[:5]}, {len(missing)} unloaded parameters/buffers {missing[:5]}; refusing to serve a "
-            "partially loaded module."
-        )
-    if skipped:
-        logger.info("%s: skipped %d checkpoint keys by design (%s...)", what, len(skipped), skipped[:2])
-    return module.eval()
-
-
-def _materialize(module: torch.nn.Module, dtype: torch.dtype, device) -> torch.nn.Module:
-    module.to(dtype)  # on meta: storage is allocated directly in the serving dtype below
-    return module.to_empty(device=device)
-
-
 def build_transformer(config: Flux2KleinConfig, snapshot: Path, device, dtype=torch.bfloat16) -> Flux2DiT:
     with torch.device("meta"):
         dit = Flux2DiT(config.transformer)
-    _materialize(dit, dtype, device)
+    materialize(dit, dtype, device)
     return load_native(
         dit, iter_diffusers_component(snapshot / "transformer", device), remap_transformer_key,
         "FLUX.2 transformer", stacked_params=_QKV_RULES_DIT,
@@ -229,7 +132,7 @@ def build_transformer(config: Flux2KleinConfig, snapshot: Path, device, dtype=to
 def build_vae(config: Flux2KleinConfig, snapshot: Path, device, dtype=torch.bfloat16) -> Flux2VAE:
     with torch.device("meta"):
         vae = Flux2VAE(config.vae)
-    _materialize(vae, dtype, device)
+    materialize(vae, dtype, device)
     return load_native(vae, iter_diffusers_component(snapshot / "vae", device), remap_vae_key, "FLUX.2 VAE")
 
 
@@ -238,40 +141,11 @@ def build_text_encoder(
 ) -> Qwen3HiddenStateEncoder:
     with torch.device("meta"):
         encoder = make_text_encoder(text_config)
-    _materialize(encoder, dtype, device)
+    materialize(encoder, dtype, device)
     skip = text_encoder_skip(text_config)  # filtered before the read: unused LM layers never reach the device
     return load_native(
         encoder, iter_transformers_component(snapshot / "text_encoder", device, skip=skip), remap_text_encoder_key,
-        "Qwen3 text encoder", stacked_params=_QKV_RULES_LM, skip=skip,
-    )
-
-
-def text_encoder_skip(text_config: Qwen3EncoderConfig):
-    """Predicate for the LM checkpoint keys the encoder never runs: the LM head, the
-    final norm, and every decoder layer past the deepest tapped one."""
-    needed = text_config.num_layers_needed
-    layer_re = re.compile(r"^model\.layers\.(\d+)\.")
-
-    def skip(name: str) -> bool:
-        if name.startswith("lm_head.") or name == "model.norm.weight":
-            return True
-        m = layer_re.match(name)
-        return m is not None and int(m.group(1)) >= needed
-
-    return skip
-
-
-def make_text_encoder(text_config: Qwen3EncoderConfig) -> Qwen3HiddenStateEncoder:
-    return Qwen3HiddenStateEncoder(
-        vocab_size=text_config.vocab_size,
-        hidden_size=text_config.hidden_size,
-        intermediate_size=text_config.intermediate_size,
-        num_heads=text_config.num_attention_heads,
-        num_kv_heads=text_config.num_key_value_heads,
-        head_dim=text_config.head_dim,
-        rms_norm_eps=text_config.rms_norm_eps,
-        rope_theta=text_config.rope_theta,
-        tap_layers=text_config.hidden_state_layers,
+        "Qwen3 text encoder", stacked_params=QKV_RULES_LM, skip=skip,
     )
 
 

@@ -21,12 +21,12 @@ from diffusers import Flux2Transformer2DModel  # noqa: E402
 from mstar.model.components.diffusion.image_io import image_grid_ids, text_ids  # noqa: E402
 from mstar.model.components.diffusion.lora import LoraSpec, merge_lora, normalize_lora_state_dict  # noqa: E402
 from mstar.model.components.diffusion.rope import MultiAxisRoPE  # noqa: E402
+from mstar.model.components.diffusion.weight_loading import load_native  # noqa: E402
 from mstar.model.flux2_klein.components.transformer import Flux2DiT  # noqa: E402
 from mstar.model.flux2_klein.config import Flux2TransformerConfig  # noqa: E402
 from mstar.model.flux2_klein.weight_loader import (  # noqa: E402
     _QKV_RULES_DIT,
     convert_bfl_lora_keys,
-    load_native,
     remap_transformer_key,
 )
 

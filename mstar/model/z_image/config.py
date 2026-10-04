@@ -17,7 +17,8 @@ from pathlib import Path
 
 from mstar.model.components.diffusion.autoencoder_kl import AutoencoderKLConfig
 from mstar.model.components.diffusion.flow_match import FlowMatchConfig
-from mstar.model.flux2_klein.config import Qwen3EncoderConfig, resolve_snapshot_dir
+from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig
+from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 DIT_ATTN = "dit_attn"
 DENOISE_LOOP = "denoise_loop"

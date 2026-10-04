@@ -355,7 +355,7 @@ def test_load_image_resamples_before_rgb_conversion(tmp_path):
 
 
 def test_qwen3_encoder_config_rejects_taps_at_or_past_the_final_norm():
-    from mstar.model.flux2_klein.config import Qwen3EncoderConfig
+    from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig
 
     with pytest.raises(ValueError, match="below layer"):
         Qwen3EncoderConfig(num_hidden_layers=36, hidden_state_layers=(9, 36))
@@ -369,7 +369,7 @@ def test_component_iterator_filters_skipped_keys_before_reading(tmp_path):
 
     from safetensors.torch import save_file
 
-    from mstar.model.flux2_klein.weight_loader import iter_transformers_component
+    from mstar.model.components.diffusion.weight_loading import iter_transformers_component
 
     tensors = {
         "model.layers.0.w": torch.ones(2), "model.layers.5.w": torch.ones(3),
@@ -455,7 +455,8 @@ def test_vae_compile_knob_reaches_the_decoder_node():
 
 def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(monkeypatch):
     import mstar.model.flux2_klein.submodules as subs
-    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule, decode_in_chunks
+    from mstar.model.components.diffusion.decode_utils import decode_in_chunks
+    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
 
     class RecordingVae(torch.nn.Module):
         def __init__(self):
@@ -493,7 +494,7 @@ def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(mon
 
 
 def test_vae_decode_sizes_are_the_four_compiled_sizes_clamped_to_the_max_batch():
-    from mstar.model.flux2_klein.submodules import VAE_DECODE_BATCH_SIZES
+    from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
 
     assert VAE_DECODE_BATCH_SIZES == (1, 2, 4, 8)
     small = _make_model(max_batch_size=4, capture_batch_sizes=[1, 2, 3, 4])
@@ -508,7 +509,7 @@ def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch):
     to compile silently inherits it (the VAE decode did, by node build order)."""
     import torch._inductor.config as inductor_config
 
-    from mstar.model.flux2_klein.submodules import compile_transformer_forward
+    from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
 
     calls, seen = [], []
     monkeypatch.setattr(torch, "compile", lambda fn, **kw: calls.append(kw) or fn)
@@ -538,7 +539,7 @@ def test_the_vae_decode_asks_for_its_own_rounding_instead_of_inheriting(monkeypa
     the decoder's kernels depended on which node was built first."""
     import torch._inductor.config as inductor_config
 
-    from mstar.model.flux2_klein.submodules import compile_vae_decode
+    from mstar.model.components.diffusion.decode_utils import compile_vae_decode
 
     seen = []
     monkeypatch.setattr(torch, "compile", lambda fn, **kw: fn)

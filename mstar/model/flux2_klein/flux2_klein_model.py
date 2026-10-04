@@ -44,6 +44,7 @@ from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, Ragg
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
 from mstar.model.components.diffusion.image_io import encode_image
 from mstar.model.components.diffusion.lora import LoraSpec
 from mstar.model.flux2_klein.config import (
@@ -51,7 +52,6 @@ from mstar.model.flux2_klein.config import (
     DIT_ATTN,
     FLUX2_KLEIN_4B,
     Flux2KleinConfig,
-    resolve_snapshot_dir,
 )
 from mstar.model.flux2_klein.submodules import (
     IMAGE_INPUTS,
@@ -61,7 +61,6 @@ from mstar.model.flux2_klein.submodules import (
     TEXT_EMBEDS,
     TEXT_INPUTS,
     TEXT_MASK,
-    VAE_DECODE_BATCH_SIZES,
     KleinDenoiseSubmodule,
     KleinShape,
     KleinTextEncoderSubmodule,
@@ -69,6 +68,7 @@ from mstar.model.flux2_klein.submodules import (
     KleinVaeEncoderSubmodule,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 

@@ -27,16 +27,18 @@ from pathlib import Path
 import torch
 
 from mstar.model.components.diffusion.autoencoder_kl import AutoencoderKL, remap_autoencoder_kl_key
-from mstar.model.components.diffusion.text_encoder import Qwen3HiddenStateEncoder
-from mstar.model.flux2_klein.weight_loader import (
-    _QKV_RULES_LM,
-    _materialize,
-    iter_diffusers_component,
-    iter_transformers_component,
-    load_native,
+from mstar.model.components.diffusion.qwen3.encoder import Qwen3HiddenStateEncoder
+from mstar.model.components.diffusion.qwen3.weight_loading import (
+    QKV_RULES_LM,
     make_text_encoder,
     remap_text_encoder_key,
     text_encoder_skip,
+)
+from mstar.model.components.diffusion.weight_loading import (
+    iter_diffusers_component,
+    iter_transformers_component,
+    load_native,
+    materialize,
 )
 from mstar.model.loader.base import StackedParamRule
 from mstar.model.z_image.components.transformer import ZImageDiT
@@ -84,7 +86,7 @@ def remap_transformer_key(name: str) -> str:
 def build_transformer(config: ZImageConfig, snapshot: Path, device, dtype=torch.bfloat16) -> ZImageDiT:
     with torch.device("meta"):
         dit = ZImageDiT(config.transformer)
-    _materialize(dit, dtype, device)
+    materialize(dit, dtype, device)
     return load_native(
         dit, iter_diffusers_component(snapshot / "transformer", device), remap_transformer_key,
         "Z-Image transformer", stacked_params=_STACKED_RULES,
@@ -94,16 +96,16 @@ def build_transformer(config: ZImageConfig, snapshot: Path, device, dtype=torch.
 def build_vae(config: ZImageConfig, snapshot: Path, device, dtype=torch.bfloat16) -> AutoencoderKL:
     with torch.device("meta"):
         vae = AutoencoderKL(config.vae)
-    _materialize(vae, dtype, device)
+    materialize(vae, dtype, device)
     return load_native(vae, iter_diffusers_component(snapshot / "vae", device), remap_autoencoder_kl_key, "Z-Image VAE")
 
 
 def build_text_encoder(config: ZImageConfig, snapshot: Path, device, dtype=torch.bfloat16) -> Qwen3HiddenStateEncoder:
     with torch.device("meta"):
         encoder = make_text_encoder(config.text_encoder)
-    _materialize(encoder, dtype, device)
+    materialize(encoder, dtype, device)
     skip = text_encoder_skip(config.text_encoder)  # filtered before the read: the unused last layer stays on disk
     return load_native(
         encoder, iter_transformers_component(snapshot / "text_encoder", device, skip=skip), remap_text_encoder_key,
-        "Qwen3 caption encoder", stacked_params=_QKV_RULES_LM, skip=skip,
+        "Qwen3 caption encoder", stacked_params=QKV_RULES_LM, skip=skip,
     )

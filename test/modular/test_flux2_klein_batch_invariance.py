@@ -28,10 +28,11 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.model.flux2_klein.config import DENOISE_LOOP, Flux2KleinConfig, resolve_snapshot_dir
+from mstar.model.flux2_klein.config import DENOISE_LOOP, Flux2KleinConfig
 from mstar.model.flux2_klein.flux2_klein_model import IMAGE_GEN_WALK, Flux2KleinModel
 from mstar.model.flux2_klein.submodules import LATENTS, TEXT_EMBEDS
 from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 MODEL_REPO = os.environ.get("FLUX2_KLEIN_REPO", "black-forest-labs/FLUX.2-klein-4B")
 CUDA_AVAILABLE = torch.cuda.is_available()

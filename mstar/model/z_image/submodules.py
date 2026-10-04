@@ -23,15 +23,15 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
-from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
-from mstar.model.components.diffusion.image_io import pixels_to_uint8
-from mstar.model.flux2_klein.submodules import (
+from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
+from mstar.model.components.diffusion.decode_utils import (
     VAE_DECODE_BATCH_SIZES,
-    compile_transformer_forward,
     compile_vae_decode,
     decode_in_chunks,
 )
+from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
+from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
+from mstar.model.components.diffusion.image_io import pixels_to_uint8
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.model.z_image.components.transformer import (
     ATTENTION_SPANS,
@@ -217,7 +217,9 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
         h, w = bucket_key.grid
         return {
             LATENTS: torch.zeros(tcfg.in_channels, h * tcfg.patch_size, w * tcfg.patch_size, device=device),
-            TEXT_EMBEDS: torch.zeros(bucket_key.cap_len, tcfg.cap_feat_dim, dtype=self.transformer.dtype, device=device),
+            TEXT_EMBEDS: torch.zeros(
+                bucket_key.cap_len, tcfg.cap_feat_dim, dtype=self.transformer.dtype, device=device,
+            ),
             CAP_PAD_MASK: torch.zeros(bucket_key.cap_len, dtype=torch.bool, device=device),
         }
 

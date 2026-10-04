@@ -21,14 +21,14 @@ transformers = pytest.importorskip("transformers")
 from diffusers import ZImageTransformer2DModel  # noqa: E402
 
 from mstar.model.components.diffusion.flow_match import euler_step  # noqa: E402
-from mstar.model.flux2_klein.config import Qwen3EncoderConfig  # noqa: E402
-from mstar.model.flux2_klein.weight_loader import (  # noqa: E402
-    _QKV_RULES_LM,
-    load_native,
+from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig  # noqa: E402
+from mstar.model.components.diffusion.qwen3.weight_loading import (  # noqa: E402
+    QKV_RULES_LM,
     make_text_encoder,
     remap_text_encoder_key,
     text_encoder_skip,
 )
+from mstar.model.components.diffusion.weight_loading import load_native  # noqa: E402
 from mstar.model.z_image.components.transformer import (  # noqa: E402
     ZImageDiT,
     ZImageRoPE,
@@ -139,7 +139,7 @@ def test_caption_encoder_tap_is_the_second_to_last_hidden_state():
                                        hidden_state_layers=(hf_cfg.num_hidden_layers - 1,), max_sequence_length=12)
     native = make_text_encoder(cfg).eval()
     load_native(native, iter(ref.state_dict().items()), remap_text_encoder_key, "tiny qwen3",
-                stacked_params=_QKV_RULES_LM, skip=text_encoder_skip(cfg))
+                stacked_params=QKV_RULES_LM, skip=text_encoder_skip(cfg))
     assert len(native.layers) == hf_cfg.num_hidden_layers - 1
     ids = torch.randint(3, 100, (2, 12), generator=torch.Generator().manual_seed(1))
     mask = torch.ones(2, 12, dtype=torch.long)

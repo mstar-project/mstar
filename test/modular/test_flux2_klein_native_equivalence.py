@@ -44,19 +44,22 @@ from mstar.model.components.diffusion.image_io import (  # noqa: E402
     unpack_latents,
     unpatchify_latents,
 )
-from mstar.model.components.diffusion.rope import MultiAxisRoPE, apply_rotary_interleaved  # noqa: E402
-from mstar.model.flux2_klein.components.transformer import Flux2DiT  # noqa: E402
-from mstar.model.flux2_klein.components.vae import Flux2VAE  # noqa: E402
-from mstar.model.flux2_klein.config import Flux2TransformerConfig, Flux2VaeConfig, Qwen3EncoderConfig  # noqa: E402
-from mstar.model.flux2_klein.weight_loader import (  # noqa: E402
-    _QKV_RULES_DIT,
-    _QKV_RULES_LM,
-    load_native,
+from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig  # noqa: E402
+from mstar.model.components.diffusion.qwen3.weight_loading import (  # noqa: E402
+    QKV_RULES_LM,
     make_text_encoder,
     remap_text_encoder_key,
+    text_encoder_skip,
+)
+from mstar.model.components.diffusion.rope import MultiAxisRoPE, apply_rotary_interleaved  # noqa: E402
+from mstar.model.components.diffusion.weight_loading import load_native  # noqa: E402
+from mstar.model.flux2_klein.components.transformer import Flux2DiT  # noqa: E402
+from mstar.model.flux2_klein.components.vae import Flux2VAE  # noqa: E402
+from mstar.model.flux2_klein.config import Flux2TransformerConfig, Flux2VaeConfig  # noqa: E402
+from mstar.model.flux2_klein.weight_loader import (  # noqa: E402
+    _QKV_RULES_DIT,
     remap_transformer_key,
     remap_vae_key,
-    text_encoder_skip,
 )
 
 KLEIN_SCHEDULER = dict(
@@ -290,7 +293,7 @@ def test_text_encoder_tapped_hidden_states_bit_exact_with_padding():
                                             max_sequence_length=12)
     native = make_text_encoder(text_cfg).eval()
     load_native(native, iter(ref.state_dict().items()), remap_text_encoder_key, "tiny qwen3",
-                stacked_params=_QKV_RULES_LM, skip=text_encoder_skip(text_cfg))
+                stacked_params=QKV_RULES_LM, skip=text_encoder_skip(text_cfg))
     # only the layers up to the deepest tap exist (klein: 27 of 36)
     assert len(native.layers) == max(taps) < hf_cfg.num_hidden_layers
 

@@ -19,8 +19,9 @@ import time
 import torch
 
 from mstar.model.components.diffusion.image_io import pixels_to_uint8
-from mstar.model.flux2_klein.config import Flux2KleinConfig, resolve_snapshot_dir
+from mstar.model.flux2_klein.config import Flux2KleinConfig
 from mstar.model.flux2_klein.weight_loader import build_vae
+from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 
 def _psnr(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -87,7 +88,7 @@ def main() -> None:
                 # exact-ops compile: GroupNorm / SiLU on the eager kernels, conv layout optimisation off
                 import torch._inductor.config as inductor_config
 
-                from mstar.model.flux2_klein.submodules import exclude_from_compile
+                from mstar.model.components.diffusion.compile_utils import exclude_from_compile
 
                 torch.backends.cudnn.benchmark = False
                 plain = torch.compile(vae.decode, fullgraph=False, dynamic=False)

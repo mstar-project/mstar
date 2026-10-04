@@ -8,9 +8,9 @@ import pytest
 import torch
 from torch import nn
 
+from mstar.model.components.diffusion.compile_utils import EXACT_OP_TYPES, exact_op_types, exclude_from_compile
 from mstar.model.flux2_klein.components.transformer import Flux2DiT
 from mstar.model.flux2_klein.config import Flux2TransformerConfig
-from mstar.model.flux2_klein.submodules import EXACT_OP_TYPES, exact_op_types, exclude_from_compile
 from mstar.model.z_image.components.transformer import ScaledRMSNorm
 
 TINY = Flux2TransformerConfig(

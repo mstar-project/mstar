@@ -33,7 +33,7 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mstar.model.flux2_klein.config import DENOISE_LOOP, Flux2KleinConfig, resolve_snapshot_dir  # noqa: E402
+from mstar.model.flux2_klein.config import DENOISE_LOOP, Flux2KleinConfig  # noqa: E402
 from mstar.model.flux2_klein.flux2_klein_model import IMAGE_EDIT_WALK, IMAGE_GEN_WALK, Flux2KleinModel  # noqa: E402
 from mstar.model.flux2_klein.submodules import (  # noqa: E402
     LATENTS,
@@ -45,6 +45,7 @@ from mstar.model.flux2_klein.submodules import (  # noqa: E402
     KleinVaeEncoderSubmodule,
 )
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
+from mstar.utils.hf_snapshot import resolve_snapshot_dir  # noqa: E402
 
 MODEL_REPO = os.environ.get("FLUX2_KLEIN_REPO", "black-forest-labs/FLUX.2-klein-4B")
 _ORACLE_ENV = os.environ.get("FLUX2_KLEIN_ORACLE_DIR", "")
