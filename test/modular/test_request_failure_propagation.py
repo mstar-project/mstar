@@ -52,7 +52,7 @@ class _Runtime:
     def get_rid_string(self, h):
         return h
 
-    def set_speculatively_scheduled(self, node, wg_id, rids, value):
+    def set_in_flight(self, node, wg_id, rids, value):
         del wg_id
         if not value:
             self.cleared.append((node, list(rids)))

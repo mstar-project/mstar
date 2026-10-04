@@ -6,10 +6,10 @@ import threading
 import time
 import time as _time
 from collections import defaultdict
-from collections.abc import Callable, Container, Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
 from time import sleep
@@ -1266,9 +1266,33 @@ class Worker:
     # Batch building
     # ------------------------------------------------------------------
 
+    def _build_input_metadata_and_fwd_info(
+        self, node_name: str,
+        batch_partition: str,
+        per_request_inputs: dict[int, NameToTensorList],
+        increment_loop_rids: list[int] | None = None,
+        increment_loop_name: str | None=None
+    ) -> tuple[dict[str, InputMetadata], dict[str, CurrentForwardPassInfo]]:
+        meta = {}
+        fwd_info = {}
+        for rid, inputs in per_request_inputs.items():
+            req_info = self.request_state.get_fwd_info(rid, batch_partition)
+            fwd_info[rid] = req_info
+            meta[rid] = InputMetadata(
+                dynamic_loop_iter_counts=req_info.dynamic_loop_iter_counts.copy()
+            )
+            if chunks := self._stream_chunks_for(rid, node_name, inputs):
+                meta[rid].stream_chunks = chunks
+
+        if increment_loop_rids is not None and increment_loop_name is not None:
+            for rid in increment_loop_rids:
+                meta[rid].dynamic_loop_iter_counts[increment_loop_name] = \
+                    meta[rid].dynamic_loop_iter_counts.get(increment_loop_name, 0) + 1
+        return meta, fwd_info
+
+
     def _build_executing_batch(self, batch: ScheduledBatch) -> ExecutingBatch:
         """Gather input tensors from tensor_manager for all requests in the batch."""
-        per_request_info: dict[int, CurrentForwardPassInfo] = {}
         batch_partition = self.request_state.get_partition_for_node(batch.node_name)
 
         # One walk of the columns for both: each rid's inputs as tensors, and
@@ -1296,13 +1320,10 @@ class Worker:
             # failed anyway is not asked for forward-pass state as well.
             per_request_inputs.pop(rid, None)
             final_edges.pop(rid, None)
-        per_request_input_metadata: dict[int, InputMetadata] = {}
-        for request_id, inputs in per_request_inputs.items():
-            per_request_info[request_id] = self.request_state.get_fwd_info(
-                request_id, batch_partition
-            )
-            if chunks := self._stream_chunks_for(request_id, batch.node_name, inputs):
-                per_request_input_metadata[request_id] = InputMetadata(stream_chunks=chunks)
+        per_request_input_metadata, per_request_info = self._build_input_metadata_and_fwd_info(
+            node_name=batch.node_name, batch_partition=batch_partition,
+            per_request_inputs=per_request_inputs,
+        )
 
         node_batch = self._make_executing_batch(
             node_name=batch.node_name,
@@ -2001,40 +2022,6 @@ class Worker:
             )
         )
 
-    def _speculative_fwd_info(
-        self,
-        request_ids: list[int],
-        partition: str,
-        spec_target: SpeculationOutput,
-        continuing: Container[int],
-    ) -> dict[int, CurrentForwardPassInfo]:
-        """The step context a speculative batch runs each rid under.
-
-        A request's shared info is refreshed as each batch is built, so while
-        iteration k of a loop is in flight it reads k, and stays there until the
-        step lands. A speculative next iteration that ran under it would take k
-        again: a denoise step would run the same sigma twice, and the overshoot
-        past the last step would never be vetoed. So the speculative batch gets a
-        view of its own, with the counters it will run at: one past the in-flight
-        iteration for a continuing rid on a new iteration of its loop, and the
-        loops' current indices otherwise (a fresh rid's loop already advanced when
-        its last step routed). The mutable per-request tables are shared, so what
-        an engine records on the view is seen by later steps; the in-flight batch
-        keeps the shared info, so its stop check still reads k.
-        """
-        per_request_info = {}
-        for rid, new_iters in self._graph_runtime.get_dynamic_loop_iters(
-            request_ids, partition=partition,
-        ):
-            info = self.request_state.get_fwd_info(rid, partition)
-            counts = dict(info.dynamic_loop_iter_counts)
-            counts.update(new_iters)
-            if spec_target.is_new_loop_iter and rid in continuing:
-                loop = spec_target.loop_name
-                counts[loop] = counts.get(loop, 0) + 1
-            per_request_info[rid] = replace(info, dynamic_loop_iter_counts=counts)
-        return per_request_info
-
     def _assemble_speculation(
         self,
         pending: PendingBatch,
@@ -2066,20 +2053,24 @@ class Worker:
             output_signals=spec_target.output_signals,
             tp_seq=tp_seq,
         )
+        input_meta, per_request_info = self._build_input_metadata_and_fwd_info(
+            node_name=spec_node, batch_partition=pending.partition,
+            per_request_inputs=per_request_inputs,
+            increment_loop_rids=continuing if spec_target.is_new_loop_iter else None,
+            increment_loop_name=spec_target.loop_name
+        )
         spec_node_batch = self._make_executing_batch(
             node_name=spec_node,
             graph_walk=pending.graph_walk,
             request_ids=request_ids,
             per_request_input_tensors=per_request_inputs,
-            per_request_info=self._speculative_fwd_info(
-                request_ids, pending.partition, spec_target, set(continuing),
-            ),
+            per_request_info=per_request_info,
             final_edges={
                 rid: {se.edge.name for se in edges if se.chunk.is_final}
                 for rid, edges in consumed_streaming_edges.items()
                 if any(se.chunk.is_final for se in edges)
             },
-            per_request_input_metadata=per_request_input_metadata,
+            per_request_input_metadata=input_meta,
         )
         return Speculation(
             scheduled_batch=spec_batch,
@@ -2123,7 +2114,7 @@ class Worker:
         than two. The two halves address DIFFERENT rids: the flag goes on
         ``scheduled_batch``, already pruned of the dropped rids, while the undo
         targets exactly those dropped rids. The flag is cleared elsewhere
-        (``_clear_speculative_flag``), on paths with no stage to settle.
+        (``_clear_in_flight_flag``), on paths with no stage to settle.
         """
         batch = speculation.scheduled_batch
         rids = list(batch.request_to_worker_graph) if success else []
@@ -2626,17 +2617,17 @@ class Worker:
     # ------------------------------------------------------------------
     # Postprocessing
     # ------------------------------------------------------------------
-    def _set_speculative_flag(self, batch: ScheduledBatch, value: bool) -> None:
+    def _set_in_flight_flag(self, batch: ScheduledBatch, value: bool) -> None:
         rids = list(batch.request_to_worker_graph)
         if not rids:
             return
-        self._graph_runtime.set_speculatively_scheduled(
+        self._graph_runtime.set_in_flight(
             batch.node_name, batch.request_to_worker_graph[rids[0]],
             rids, value,
         )
 
-    def _clear_speculative_flag(self, batch: ScheduledBatch) -> None:
-        self._set_speculative_flag(batch, False)
+    def _clear_in_flight_flag(self, batch: ScheduledBatch) -> None:
+        self._set_in_flight_flag(batch, False)
 
 
     def _postprocess_batch(
@@ -3142,7 +3133,7 @@ class Worker:
             if stale is None:
                 continue
             failed_rids.update(stale.batch.request_to_worker_graph)
-            self._clear_speculative_flag(stale.batch)
+            self._clear_in_flight_flag(stale.batch)
             # Drain before dropping the reference: the future owns engine state
             # on the GPU thread, and an abandoned one leaves that thread writing
             # into a batch nobody will collect. Already-finished futures (the
@@ -3158,7 +3149,7 @@ class Worker:
                 )
         if batch is not None:
             failed_rids.update(batch.request_to_worker_graph)
-            self._clear_speculative_flag(batch)
+            self._clear_in_flight_flag(batch)
         if speculation is not None and speculation.plan_future is not None:
             # Armed but never submitted: the plan thread may still be staging
             # a pre-plan for a step that will now never run. Drain it, then
@@ -3180,7 +3171,7 @@ class Worker:
             # which survive this error and would otherwise hold a chunk in a
             # slot the next ingest can overtake.
             self._settle_speculation(speculation, success=False)
-            self._clear_speculative_flag(sb)
+            self._clear_in_flight_flag(sb)
             fresh = {
                 rid: wg_id
                 for rid, wg_id in sb.request_to_worker_graph.items()
@@ -3579,9 +3570,9 @@ class Worker:
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
 
-                    # set node._speculatively_scheduled to false, since
+                    # set node._in_flight to false, since
                     # the node has just completed
-                    self._clear_speculative_flag(pending.batch)
+                    self._clear_in_flight_flag(pending.batch)
 
                     def _maybe_clear_spec():
                         nonlocal speculation
@@ -3628,7 +3619,7 @@ class Worker:
                         # first drops its pre-plan, releasing pages the eviction
                         # would otherwise go looking for. Nothing is speculated on
                         # a refusal, so in practice there is nothing to clear.
-                        self._clear_speculative_flag(pending.batch)
+                        self._clear_in_flight_flag(pending.batch)
                         _maybe_clear_spec()
                         self._handle_admit_failure(
                             pending.batch, pending.node_batch,
@@ -3787,6 +3778,7 @@ class Worker:
                 # the launch — but it still has to be fenceable, or the next
                 # iteration schedules against an admit that hasn't run.
                 node_batch.launch_started_event = threading.Event()
+                self._set_in_flight_flag(batch, True)
                 future = gpu_executor.submit(
                     self._execute_on_gpu_thread, batch, node_batch, None,
                 )

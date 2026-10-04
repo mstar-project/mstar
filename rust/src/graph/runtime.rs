@@ -731,9 +731,12 @@ pub struct GraphRuntime {
             .collect();
 
         let state = self.state_mut(wg, rid)?;
-        // Held True across the ingest so a streaming input cannot re-add the
-        // node to the ready queue underneath us.
-        state.set_spec_scheduled(spec_node, true);
+        // Held true across the ingest so a streaming input cannot re-add the
+        // node to the ready queue underneath us. Saved rather than assumed
+        // false: the node may already be in flight from a committed batch, and
+        // forcing it down below would drop that batch's protection.
+        let was_in_flight = state.is_in_flight(spec_node);
+        state.set_in_flight(spec_node, true);
 
         // ingest reports success without saying WHICH slot it used, so the
         // slot is inferred by peeking first -- the rollback removes from the
@@ -765,7 +768,8 @@ pub struct GraphRuntime {
         state.ingest_for_speculation(&g, curr_node, &source_edges);
         let ready = state.ready_for_speculation(spec_node, same_node, false);
         state.clear_speculative_inputs();
-        state.set_spec_scheduled(spec_node, false); // reset if the rid drops
+        // Restore, not force-false: the node may still be in flight.
+        state.set_in_flight(spec_node, was_in_flight);
 
         if !ready {
             for &(slot, from_next) in &ingested {
@@ -2084,7 +2088,7 @@ impl GraphRuntime {
     /// undone, so the chunk leaves the slot without being dereferenced and the
     /// caller can hand it back to its StreamBuffer. The rest are forgotten.
     /// See `GraphRuntime.commit_speculation` for why both halves matter.
-    /// ``scheduled_rids`` are marked speculatively scheduled on ``node`` in the
+    /// ``scheduled_rids`` are marked in flight on ``node`` in the
     /// SAME call, so committing a speculation is one crossing rather than two.
     /// They are passed rather than taken from the stage because a spec batch
     /// also carries rids that staged no chunk -- fresh ones off the ready queue,
@@ -2100,7 +2104,7 @@ impl GraphRuntime {
     ) -> PyResult<()> {
         if success {
             if let (Some(node), Some(wg_id)) = (node, wg_id) {
-                self.set_speculatively_scheduled(
+                self.set_in_flight(
                     node, wg_id, scheduled_rids, true,
                 )?;
             }
@@ -2234,7 +2238,7 @@ impl GraphRuntime {
                 continue;
             };
             // Before complete(), which clears the flag.
-            let was_speculative = state.is_spec_scheduled(node);
+            let was_speculative = state.is_in_flight(node);
             let completed = state.complete(&g, node, &out_tensors);
             let mut pre_shard_edges = completed.edges;
             let freed_inputs = completed.freed;
@@ -3235,15 +3239,15 @@ impl GraphRuntime {
         }
     }
 
-    fn set_speculatively_scheduled(
+    fn set_in_flight(
         &mut self, node: String,
         wg_id: u32, rids: Vec<u32>,
-        speculatively_scheduled: bool,
+        in_flight: bool,
     ) -> PyResult<()> {
         let wg = self.wg_index(wg_id).ok_or_else(|| {
             PyValueError::new_err(format!("unknown worker graph id {wg_id}"))
         })?;
-        // NOT interner.get(): that is the STRING id, and set_spec_scheduled
+        // NOT interner.get(): that is the STRING id, and set_in_flight
         // wants the node's index within this worker graph. The two id spaces
         // are both u32, so only the Option here made the mix-up visible.
         let node_id = self.nid(wg, &node).ok_or_else(|| {
@@ -3253,7 +3257,7 @@ impl GraphRuntime {
         })?;
         for rid in rids {
             if let Some(state) = self.state_mut(wg, rid) {
-                state.set_spec_scheduled(node_id, speculatively_scheduled);
+                state.set_in_flight(node_id, in_flight);
             }
         }
         Ok(())
@@ -3265,8 +3269,8 @@ impl GraphRuntime {
     /// assertable from the parity tests: `State::complete` used to clear it,
     /// which let `refresh_ready` re-add a node whose rids were still in
     /// flight. Python holds the same state in
-    /// `GraphNode._speculatively_scheduled`.
-    fn is_speculatively_scheduled(
+    /// `GraphNode._in_flight`.
+    fn is_in_flight(
         &self, node: String, wg_id: u32, rid: u32,
     ) -> PyResult<bool> {
         let wg = self.wg_index(wg_id).ok_or_else(|| {
@@ -3279,7 +3283,7 @@ impl GraphRuntime {
         })?;
         Ok(self
             .state(wg, rid)
-            .map(|s| s.is_spec_scheduled(node_id))
+            .map(|s| s.is_in_flight(node_id))
             .unwrap_or(false))
     }
 }

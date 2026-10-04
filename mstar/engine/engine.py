@@ -177,6 +177,26 @@ class SubmoduleManagement:
         for runner in self.piecewise_runners.values():
             runner.set_slot(slot)
 
+@dataclass
+class ForwardPassInfoWrapper:
+    """
+    Stop-gap solution: the dynamic loop iters in CurrentForwardPassInfo may
+    be used in two places at once: in _postprocess_batch (for batch N), and
+    in the forward pass for batch N+1, which require different iterations.
+    The InputMetadata is built per executing batch, so its value is guaranteed
+    to be up-to-date.
+
+    TODO: the long-term solution is to maybe move the dynamic loop iters off
+    of CurrentForwardPassInfo entirely.
+    """
+    info: CurrentForwardPassInfo
+    metadata: InputMetadata
+
+    def __getattr__(self, name):
+        if name == "dynamic_loop_iter_counts":
+            return self.metadata.dynamic_loop_iter_counts
+        return getattr(self.info, name)
+
 
 @dataclass
 class ExecutingBatch:
@@ -264,6 +284,17 @@ class ExecutingBatch:
     # Per-step wall-clock, for the worker's profiler
     exec_timings: ExecTimings = field(default_factory=ExecTimings)
 
+    def __post_init__(self):
+        self.per_request_info_wrapped = {
+            rid: ForwardPassInfoWrapper(
+                # Sparse: only rids with stream chunks or loop counters get an
+                # entry, so default like the .get() at prepare_inputs does.
+                info=info, metadata=self.per_request_input_metadata.get(
+                    rid, EMPTY_INPUT_METADATA,
+                ),
+            ) for rid, info in self.per_request_info.items()
+        }
+
     @property
     def request_ids(self):
         return self.step_context.request_ids
@@ -304,6 +335,10 @@ class ExecutingBatch:
         self.request_ids = [rid for rid in self.request_ids if rid not in rids]
         self.per_request_info = {
             rid: info for rid, info in self.per_request_info.items()
+            if rid not in rids
+        }
+        self.per_request_info_wrapped = {
+            rid: info for rid, info in self.per_request_info_wrapped.items()
             if rid not in rids
         }
 
@@ -666,7 +701,7 @@ class Engine:
             try:
                 req_inputs = submodule.prepare_inputs(
                     graph_walk=batch.step_context.graph_walk,
-                    fwd_info=batch.per_request_info[rid],
+                    fwd_info=batch.per_request_info_wrapped[rid],
                     inputs=batch.per_request_input_tensors.get(rid, {}),
                     resources=self._submodules[batch.node_name].resources,
                     # the step that ends the last of the node's streams: it must
@@ -731,7 +766,7 @@ class Engine:
         if matched <= 0:
             return inputs
         return self._submodules[batch.node_name].submodule.split_inputs(
-            walk, batch.per_request_info[rid], inputs,
+            walk, batch.per_request_info_wrapped[rid], inputs,
             matched, inputs.input_seq_len,
         )
 
@@ -806,11 +841,11 @@ class Engine:
         real_bs = len(batch.request_ids)
 
         inputs = batch.inputs
-        req_info = batch.per_request_info
+        req_info = batch.per_request_info_wrapped
         if lease is not None:
             inputs = cg_runner.pad_inputs(lease, inputs)
             req_info = cg_runner.step_metadata(
-                lease, batch.request_ids, batch.per_request_info
+                lease, batch.request_ids, req_info
             )
             batch.step_context.set_padded_rids(
                 cg_runner.step_ids(lease, batch.request_ids)
@@ -919,7 +954,7 @@ class Engine:
         slot_events: dict[int, torch.cuda.Event] = {}
 
         for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
-            req_info = {rid: batch.per_request_info[rid]}
+            req_info = {rid: batch.per_request_info_wrapped[rid]}
             slot = ctxs[rid].slot
             submodule_mgmt.set_piecewise_slot(slot)
             in_flight = slot_events.get(slot)
@@ -1208,7 +1243,7 @@ class Engine:
             try:
                 submodule.postprocess(
                     request_id=rid,
-                    request_info=batch.per_request_info[rid],
+                    request_info=batch.per_request_info_wrapped[rid],
                     outputs=outputs.get(rid, {}),
                     inputs=node_inputs,
                 )
@@ -1255,7 +1290,7 @@ class Engine:
                 continue
             try:
                 rid_stops = submodule.check_stop(
-                    rid, batch.per_request_info[rid], rid_outputs
+                    rid, batch.per_request_info_wrapped[rid], rid_outputs
                 )
             except Exception as error:
                 logger.exception(
@@ -1487,7 +1522,7 @@ class Engine:
         # step is declared, so the submodule is asked directly. It answers from
         # the same per-request facts its `declare_step` stamps on the step.
         batch.cg_key_info = submodule_mgmt.submodule.cg_key_info(
-            batch.step_context.graph_walk, batch.per_request_info,
+            batch.step_context.graph_walk, batch.per_request_info_wrapped,
             per_request_input_metadata=batch.per_request_input_metadata,
         )
         lease = cg_runner.lease_slot(
