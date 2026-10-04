@@ -793,6 +793,13 @@ class CudaGraphRunner:
                 best = key
         return best
 
+    def captures_walk(self, graph_walk: str) -> bool:
+        """Whether any capture replays this walk."""
+        return any(
+            graph_walk in config.replay_graph_walks
+            for config in self._capture_configs
+        )
+
     def max_batch_size_for(self, graph_walk: str) -> int | None:
         """Largest batch this walk was captured for, or None for no cap.
 

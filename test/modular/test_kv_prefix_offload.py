@@ -47,11 +47,19 @@ class _StubTransfer:
 
     started: list[dict] = []
 
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
-    def get_kv_transfer_info(self):
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
         return "own-ipc-handle"
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del kwargs
+        return transfer_info == self.get_kv_transfer_info()
+
+    def remove_request(self, request_id):
+        del request_id
 
     def start_async_retrieve(self, **kwargs):
         type(self).started.append(kwargs)

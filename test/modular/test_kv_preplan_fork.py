@@ -34,10 +34,10 @@ RESIDENT = 2 * PAGE_SIZE
 
 
 class _StubTransferManager:
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
-    def get_kv_transfer_info(self):
+    def get_kv_transfer_info(self, **kwargs):
         return None
 
     def start_async_retrieve(self, **kwargs):

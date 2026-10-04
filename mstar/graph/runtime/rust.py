@@ -28,6 +28,7 @@ from mstar.communication import wire
 from mstar.communication.tensor_store import TensorBookkeeping
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphNode, GraphSection, Loop
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -513,6 +514,17 @@ class RustGraphRuntime(GraphRuntime):
             ready_rids=out.ready_rids,
             wg_ids=out.wg_ids,
             input_edges=_columns(out),
+            spec_id=out.spec_id,
+        )
+
+    def commit_speculation(
+        self, spec_id: int, success: bool, dropped_rids: list[int] = (),
+        node: str | None = None, wg_id: int | None = None,
+        scheduled_rids: list[int] = (),
+    ):
+        self._rust.commit_speculation(
+            spec_id, success, list(dropped_rids),
+            node, wg_id, list(scheduled_rids),
         )
 
     def prep_spec_rids(
@@ -568,9 +580,9 @@ class RustGraphRuntime(GraphRuntime):
     def stop_loops_batched(
         self, partition: str, graph_walk: str, last_node_run: str,
         loop_names: ParallelList[int, list[str]],
-    ):
+    ) -> list[int]:
         """Rust stops the loops, decides who to tell, and sends."""
-        self._rust.stop_loops_batched(
+        return self._rust.stop_loops_batched(
             partition, graph_walk, last_node_run,
             list(loop_names.keys), [list(v) for v in loop_names.values],
         )
@@ -603,14 +615,13 @@ class RustGraphRuntime(GraphRuntime):
             for name, order, indices, fwd in self._rust.get_loop_stop_times(rid)
         }
 
-    def send_outputs(self, input: SendInput):
+    def send_outputs(self, input: SendInput) -> list[int]:
         """A thin wrapper: Rust decides what goes where AND builds the frames.
 
         Only the Python-owned payloads are prepared here.
-        ``CurrentForwardPassInfo`` is encoded rather than handed over, so Rust
-        never owns the type -- and with it ``resource_publish_info``, whose
-        ``PublishedInfo`` is abstract and would otherwise mean a Rust change
-        for every new resource. Both splice in untouched.
+        ``CurrentForwardPassInfo`` and this worker's publication delta are
+        encoded separately. Rust forwards both without interpreting the
+        abstract ``PublishedInfo`` resource types.
 
         Encoded every pass, never cached: ``engine.finalize_batch`` folds each
         pass's published resource state into the SAME object the worker keeps,
@@ -654,11 +665,23 @@ class RustGraphRuntime(GraphRuntime):
                 wire.encode_fields(p, _PROFILING_HINTS)
                 for p in input.profiling.values
             ],
+            publish_rids=(
+                [] if input.resource_publish_info is None
+                else input.resource_publish_info.keys
+            ),
+            publications=(
+                [] if input.resource_publish_info is None
+                else [
+                    wire.encode_field(value, dict[str, PublishedInfo])
+                    for value in input.resource_publish_info.values
+                ]
+            ),
         )
         if PHASE_PERIOD:
             _t1 = _time.perf_counter()
             phase_record("rust.send_outputs.marshal", _t1 - _t0)
-            self._rust.send_outputs(**args)
+            sent_rids = self._rust.send_outputs(**args)
             phase_record("rust.send_outputs.call", _time.perf_counter() - _t1)
+            return sent_rids
         else:
-            self._rust.send_outputs(**args)
+            return self._rust.send_outputs(**args)

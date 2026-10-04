@@ -126,26 +126,13 @@ fn w_value(out: &mut Vec<u8>, v: &Value) {
     rmpv::encode::write_value(out, v).expect("vec sink");
 }
 
-/// A field Python already encoded, decoded so a single key can be taken out of
-/// it. Only `spliced_field` needs this.
+/// Decode a field Python already encoded for forwarding into an outgoing frame.
 fn spliced(bytes: &[u8]) -> Value {
     rmpv::decode::read_value(&mut &bytes[..]).unwrap_or(Value::Nil)
 }
 
-/// One key out of an already-encoded map.
-///
-/// `resource_publish_info` is a FIELD of CurrentForwardPassInfo, and Python
-/// sends that whole object anyway -- so it is read back out of the same blob
-/// rather than encoded a second time. Absent yields None, which omits the
-/// field and leaves the decoder's default.
-pub fn spliced_field(bytes: Option<&[u8]>, key: &str) -> Option<Value> {
-    match spliced(bytes?) {
-        Value::Map(m) => m
-            .into_iter()
-            .find(|(k, _)| k.as_str() == Some(key))
-            .map(|(_, v)| v),
-        _ => None,
-    }
+pub fn spliced_value(bytes: Option<&[u8]>) -> Option<Value> {
+    bytes.map(spliced)
 }
 
 /// The profiling payload is one blob holding `[rx_info, tx_info,
@@ -254,7 +241,7 @@ pub struct WorkerGraphsDone<'a> {
     pub stream_tokens_consumed: &'a [(String, i64)],
     pub output_loop_indices: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
     /// `dict[str, PublishedInfo]` -- abstract, so it stays Python's. Read
-    /// out of the CurrentForwardPassInfo blob by `spliced_field`.
+    /// encoded by Python and forwarded without interpreting resource types.
     pub resource_publish_info: Option<Value>,
     /// `rx_info`, `tx_info`, `graph_timings`, in that order: only populated
     /// under enable_prof, and already encoded when they reach us.

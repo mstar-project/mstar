@@ -11,6 +11,7 @@ for audio helpers) — no torch / CUDA.
     print(client.chat("Hello!").text)
     client.tts("Hi there", voice="tara").to_wav("out.wav")
     open("cat.png", "wb").write(client.generate_image("a cat in a hat"))
+    open("edit.png", "wb").write(client.edit_image("make it a watercolor", "cat.png"))
 """
 
 from __future__ import annotations
@@ -178,6 +179,17 @@ class MStarClient:
             raise RuntimeError("Server returned no image output")
         return res.images[0]
 
+    def edit_image(self, prompt: str, image, **model_kwargs) -> bytes:
+        """Return PNG bytes for an image-editing request: ``image`` (a path, raw
+        bytes or a ``(filename, bytes)`` tuple, or a list of them for multi-reference
+        models) plus the edit instruction (e.g. BAGEL)."""
+        res = self.generate(
+            text=prompt, images=image, output_modalities=("image",), **model_kwargs,
+        )
+        if not res.images:
+            raise RuntimeError("Server returned no image output")
+        return res.images[0]
+
     def tts(
         self,
         text: str,
@@ -211,6 +223,23 @@ class MStarClient:
             raise RuntimeError("Server returned no audio output")
         return res.audio
 
+    def transcribe(self, audio, *, language: str | None = None, text: str = "", **model_kwargs) -> str:
+        """Speech-to-text. ``audio`` is a path, raw bytes, or a ``(filename,
+        bytes)`` tuple; ``language`` is an ISO-639-1 code (``None`` lets a
+        model that can detect the language do so). Model knobs such as
+        ``prompt`` or ``timestamps`` pass through as ``model_kwargs``."""
+        res = self.generate(
+            text=text,
+            audio=audio,
+            input_modalities=("audio", "text"),
+            output_modalities=("text",),
+            language=language,
+            **model_kwargs,
+        )
+        if res.text is None:
+            raise RuntimeError("Server returned no transcript")
+        return res.text
+
     def voices(self) -> list[str]:
         """The ``voice`` ids the served speech model accepts (``GET /v1/audio/voices``)."""
         r = self._session.get(f"{self.base_url}/v1/audio/voices", timeout=self.timeout)
@@ -239,6 +268,7 @@ class MStarClient:
                 and isinstance(items[0], str)
                 and isinstance(items[1], (bytes, bytearray))
             )
+            # one path, one blob, or one (filename, bytes) pair
             if isinstance(items, (str, bytes, bytearray, Path)) or named_bytes:
                 items = [items]
             for i, item in enumerate(items):

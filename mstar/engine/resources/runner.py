@@ -319,9 +319,12 @@ class StepRunner:
             self._resources[key].clear_preplan()
 
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
-        """reserve capacity for step"""
+        """Reserve capacity for step. A refused admit gives back everything
+        the step reserved.
+        """
         self._drop_stale_preplan(step)
         ready = True
+        admitted: list[str] = []
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.admit.{key}")
@@ -338,7 +341,12 @@ class StepRunner:
                     "Admit for resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
+                for done in reversed([*admitted, key]):
+                    self._resources[done].rollback_admit(
+                        step.get(done), step.ctx,
+                    )
                 return FullAdmitOutcome(outcome, key)
+            admitted.append(key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
@@ -371,8 +379,12 @@ class StepRunner:
         """admit over the pre-planning subset, a step ahead
 
         the later full `admit` covers the rest; these resources see their own
-        state as already reserved and no-op"""
+        state as already reserved and no-op
+
+        Unwound on refusal exactly as ``admit`` is.
+        """
         ready = True
+        admitted: list[str] = []
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_admit.{key}")
@@ -386,7 +398,12 @@ class StepRunner:
                     "Admit for pre-planning resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
+                for done in reversed([*admitted, key]):
+                    self._resources[done].rollback_admit(
+                        step.get(done), step.ctx,
+                    )
                 return FullAdmitOutcome(outcome, key)
+            admitted.append(key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
@@ -426,7 +443,10 @@ class StepRunner:
                     range_pop()
 
     def publish(
-        self, request_ids: list[str], node_name: str | None = None,
+        self,
+        request_ids: list[str],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """durable state outward publish
 
@@ -442,13 +462,36 @@ class StepRunner:
         for rid in request_ids:
             per_key: dict[str, PublishedInfo] = {}
             for key, resource in publishers:
-                info = resource.publish(rid)
+                info = resource.publish_for_step(
+                    rid, node_name=node_name, graph_walk=graph_walk,
+                )
                 if info is not None:
                     per_key[key] = info
             out[rid] = per_key
         return out
 
-
+    def publish_after_stop(
+        self,
+        request_ids: list[str],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+    ) -> dict[str, dict[str, PublishedInfo]]:
+        """Publish resources configured for the end of a dynamic loop."""
+        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        if not order:
+            return {rid: {} for rid in request_ids}
+        publishers = [(key, self._resources[key]) for key in order]
+        out: dict[str, dict[str, PublishedInfo]] = {}
+        for rid in request_ids:
+            per_key: dict[str, PublishedInfo] = {}
+            for key, resource in publishers:
+                info = resource.publish_after_stop(
+                    rid, node_name=node_name, graph_walk=graph_walk,
+                )
+                if info is not None:
+                    per_key[key] = info
+            out[rid] = per_key
+        return out
 
     def build_cuda_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,

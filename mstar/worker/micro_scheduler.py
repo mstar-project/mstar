@@ -1,15 +1,16 @@
+import functools
 import logging
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AdmitRuntimeError
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime
-from mstar.utils.ipc_format import ScheduleTPNode
+from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
 
@@ -199,6 +200,19 @@ class MicroScheduler:
         # exactly the one the drain must wait for. Purged by ``clear_wire_rid``.
         self.pending_tp_follow_count: dict[str, int] = defaultdict(int)
 
+        # pending resident deltas for TP follow nodes
+        self._pending_resident_deltas: dict[str, OffloadDelta] = {}
+        self._last_resident_delta: int = -1
+        # popped, not settled: a settled head can still fail to build, and its removals wait for its admit
+        self._last_popped_tp_seq: int = -1
+
+    @property
+    def last_consumed_tp_seq(self) -> int:
+        """Highest leader step this rank has taken off the FIFO. What orders a
+        forwarded removal against the step stream — see
+        ``Worker._removal_step_reached``."""
+        return self._last_popped_tp_seq
+
     def _select_node_rr(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
     ):
@@ -249,11 +263,47 @@ class MicroScheduler:
             return None
         return self.tp_batches_pending_schedule[0]
 
+    def _apply_resident_delta(self, node_name: str, new_delta: OffloadDelta | None=None) -> bool:
+        if node_name not in self._pending_resident_deltas:
+            self._pending_resident_deltas[node_name] = OffloadDelta.new()
+        delta = self._pending_resident_deltas[node_name]
+        if new_delta is not None:
+            delta.extend(new_delta)
+
+        if not len(delta):
+            return True
+
+        engine = self.engine_manager.get_engine(node_name)
+        return engine.apply_resident_delta(node_name, delta)
+
+    def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
+        if self._last_resident_delta < message.spec_seq:
+            self._last_resident_delta = message.spec_seq
+            return self._apply_resident_delta(message.node_name, message.resident_delta)
+        return self._apply_resident_delta(message.node_name)
+
+    def settle_tp_follow_delta(self) -> bool:
+        """Replay the front head's resident delta; True once every move landed.
+
+        The one seam both consumers of this FIFO go through — the serial path
+        below and the async follower's ``_try_follow_speculation`` — so neither
+        can build a step against a half-replayed page state. The async path used
+        to skip this entirely and read the difference as "rid not ready", which
+        it then polled on for ever.
+
+        """
+        head = self.peek_tp_follow()
+        if head is None:
+            return True
+        return self._apply_delta_from_message(head)
+
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
         # and the async follower's build / drop / void paths) pops here, so the
         # drain refcount is discharged in one place.
         message = self.tp_batches_pending_schedule.popleft()
+        self._apply_delta_from_message(message)
+        self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
         for rid in message.request_ids:
             if rid not in self.pending_tp_follow_count:
                 continue
@@ -296,7 +346,7 @@ class MicroScheduler:
                     )
                 return None
             fwd_info = request_state.get_fwd_info(rid, node_partition)
-            if not self._check_ready(node_name, rid, fwd_info):
+            if not self._check_ready(node_name, rid, fwd_info,  allow_reload=False):
                 return None
 
         popped = self.runtime.pop_rids(
@@ -332,6 +382,8 @@ class MicroScheduler:
             return
         # Check readiness for every rid to pop all-or-none. Use the
         # leader's graph walk.
+        if not self.settle_tp_follow_delta():
+            return # every pending move has to land before the step is built
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name,
             first_tp_node.graph_walk, self.tp_rids(first_tp_node),
@@ -361,6 +413,7 @@ class MicroScheduler:
         # e.g., when adding to a speculative batch, we want to the requests that
         # are being speculated to be included in the batch size cap
         pre_existing_batch_size: int=0,
+        capture_group_of: int | None = None,
     ) -> ScheduledBatch | None:
         """
         Scans all worker graph queues for ready nodes, groups by node name,
@@ -370,11 +423,17 @@ class MicroScheduler:
         forward — takes precedence over a fresh scan, so a split set drains
         before anything else starts.
 
+        A batch holds one capture group (``Engine.capture_group``); rids of
+        another group wait in the backlog for a batch of their own.
+
         Args:
             max_batch_size: If set, limit the number of requests in the batch.
                 Defaults to the engine's cap for the (node, walk) it picks.
             target: If set, only schedule this (node name, graph walk).
             exclude_target: If set, skip this (node_name, graph_walk) pair.
+            capture_group_of: If set, the rid whose capture group the batch
+                must share; the speculation merge passes a continuing rid.
+                Otherwise the batch's first rid sets the group.
         """
         # Expire stale hold entries; done before any early returns
         now = time.monotonic()
@@ -385,7 +444,8 @@ class MicroScheduler:
         sched_from_backlog = self._schedule_from_backlogged(
             request_state, target=target,
             max_batch_size=max_batch_size,
-            pre_existing_batch_size=pre_existing_batch_size
+            pre_existing_batch_size=pre_existing_batch_size,
+            capture_group_of=capture_group_of,
         )
         if sched_from_backlog is not None:
             return sched_from_backlog
@@ -467,7 +527,12 @@ class MicroScheduler:
 
         # Everything past the first step is already popped off the queues, so
         # it has to be remembered here or it would never run.
-        return self._cap_batch_and_schedule(batch=full_batch, max_bs=remaining)
+        return self._cap_batch_and_schedule(
+            batch=full_batch, max_bs=remaining,
+            exclude_rids=self._off_group_rids(
+                request_state, full_batch, anchor=capture_group_of,
+            ),
+        )
 
     @staticmethod
     def _remaining_capacity(
@@ -477,9 +542,67 @@ class MicroScheduler:
         None stays None: an uncapped node takes the whole ready set."""
         return None if max_batch_size is None else max_batch_size - pre_existing
 
+    def _capture_group(
+        self, request_state: RequestStateManager,
+        node_name: str, graph_walk: str, rid: int,
+    ) -> Any | None:
+        fwd_info = request_state.get_fwd_info(
+            rid, request_state.get_partition_for_node(node_name),
+        )
+        return self.engine_manager.get_engine(node_name).capture_group(
+            node_name, graph_walk, rid, fwd_info,
+        )
+
+    def _off_group_rids(
+        self, request_state: RequestStateManager, batch: ScheduledBatch,
+        exclude_rids: set[int] = frozenset(), anchor: int | None = None,
+    ) -> set[int]:
+        """The rids of ``batch`` outside ``anchor``'s capture group, or outside
+        the first eligible rid's when no anchor is given."""
+        rids = [
+            rid for rid in batch.request_to_worker_graph
+            if rid not in exclude_rids
+        ]
+        if not rids:
+            return set()
+        group = functools.partial(
+            self._capture_group, request_state,
+            batch.node_name, batch.graph_walk,
+        )
+        # `is not None`: handle 0 is a real rid
+        wanted = group(rids[0] if anchor is None else anchor)
+        return {rid for rid in rids if group(rid) != wanted}
+
+    def backlog_splits_from(
+        self, request_state: RequestStateManager,
+        target: tuple[str, str], rid: int,
+    ) -> bool:
+        """Whether ``target``'s backlog holds a live rid outside ``rid``'s
+        capture group.
+
+        A speculation chain only merges its own group, so such a rid waits
+        until the chain stops; the chain has to yield for it to run.
+        """
+        waiting = self.backlog.get(target)
+        if waiting is None:
+            return False
+        now = time.monotonic()
+        live = {
+            r for r in waiting.request_to_worker_graph
+            if r not in self.failed_rids and r not in self.pending_removes
+            and self.held_until.get(r, 0.0) <= now
+        }
+        if not live:
+            return False
+        exclude = set(waiting.request_to_worker_graph) - live
+        return bool(self._off_group_rids(
+            request_state, waiting, exclude_rids=exclude, anchor=rid,
+        ))
+
     def _filter_cap_and_schedule(
         self, batch: ScheduledBatch, max_bs: int,
         request_state: RequestStateManager,
+        capture_group_of: int | None = None,
     ):
         node_partition = request_state.get_partition_for_node(batch.node_name)
         not_ready_rids = {
@@ -499,7 +622,12 @@ class MicroScheduler:
                 batch.request_to_worker_graph.keys()
             )
         not_ready_rids -= self.failed_rids
-        return self._cap_batch_and_schedule(batch, max_bs, not_ready_rids)
+        off_group = self._off_group_rids(
+            request_state, batch, not_ready_rids, anchor=capture_group_of,
+        )
+        return self._cap_batch_and_schedule(
+            batch, max_bs, not_ready_rids | off_group,
+        )
 
 
     def _cap_batch_and_schedule(
@@ -555,7 +683,8 @@ class MicroScheduler:
         self, request_state: RequestStateManager,
         target: tuple[str, str] | None = None,
         max_batch_size: int | None=None,
-        pre_existing_batch_size: int = 0
+        pre_existing_batch_size: int = 0,
+        capture_group_of: int | None = None,
     ) -> ScheduledBatch | None:
         """The oldest backlogged step with a ready request in it.
 
@@ -583,7 +712,8 @@ class MicroScheduler:
             scheduled = self._filter_cap_and_schedule(
                 batch=backlogged,
                 max_bs=self._remaining_capacity(curr_max_bs, pre_existing_batch_size),
-                request_state=request_state
+                request_state=request_state,
+                capture_group_of=capture_group_of,
             )
             if scheduled is not None:
                 return scheduled
@@ -733,13 +863,14 @@ class MicroScheduler:
 
     def _check_ready(
         self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
+        allow_reload: bool=True
     ) -> bool:
         """Engine-level readiness, with a terminal failure taken out of the
         scan. Retryable not-ready (an in-flight KV read, a reload that doesn't
         fit) just comes back False; an ``AdmitRuntimeError`` never will, so the
         rid is parked for the worker to fail instead of rescanned forever."""
         engine = self.engine_manager.get_engine(node_name)
-        outcome = engine.check_ready(node_name, rid, fwd_info)
+        outcome = engine.check_ready(node_name, rid, fwd_info, allow_reload=allow_reload)
         if isinstance(outcome.reason, AdmitRuntimeError):
             logger.error(
                 "Request %s cannot be served on node %s by resource %s: %s",

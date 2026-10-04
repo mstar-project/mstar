@@ -12,6 +12,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
+from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model
 from mstar.utils.streams import reset_device_scheduling
 
@@ -110,6 +111,7 @@ class EngineManager:
         parallel_groups: WorkerParallelGroups,
         transfer_engine_info: TransferEngineInfo,
         model: Model,
+        graph_runtime: GraphRuntime,
         enable_nvtx: bool = False,
         enable_prof: bool=False,
     ) -> "EngineManager":
@@ -164,6 +166,7 @@ class EngineManager:
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
 
         engine = Engine(
+            graph_runtime=graph_runtime,
             autocast_dtype=autocast_dtype,
             enable_nvtx=enable_nvtx,
             enable_profile=enable_prof,

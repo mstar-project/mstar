@@ -5,6 +5,7 @@ from typing import NamedTuple
 from mstar.communication.tensors import NameToTensorList, TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
@@ -54,6 +55,9 @@ class InputTensors(NamedTuple):
     # Per rid, the edges that carried a stream's final chunk. The CONSUMING
     # pass reports the partition done, which is why this rides with the inputs.
     final_stream_edges: dict[int, set[str]]
+    # Rids with an edge whose tensor the store no longer has, under
+    # ``skip_missing``. Empty otherwise, because the lookup raises instead.
+    unresolved_rids: frozenset[int] = frozenset()
 
 
 @dataclass
@@ -171,6 +175,7 @@ class ColumnarEdgeSpecs:
 
     def to_input_tensors(
         self, get_tensor, rids: list[int] | None = None,
+        skip_missing: bool = False,
     ) -> InputTensors:
         """One walk for both things a batch build needs: each rid's inputs as
         ``{signal: [tensor]}``, and per rid the edges that carried a stream's
@@ -179,11 +184,20 @@ class ColumnarEdgeSpecs:
         ``rids`` seeds the result so a rid with no ready edges still gets an
         empty mapping -- what slicing a zero-length run used to give. Left
         None, only the rids that actually have edges appear.
+
+        ``skip_missing`` makes a uuid the store has forgotten take only its own
+        rid out, reported in ``unresolved_rids``, instead of raising out of the
+        whole walk. That a live rid reaches here holding a freed uuid is always
+        a bug, but this resolves the batch, so without the per-rid skip one such
+        rid fails every other request in the step with it. Off by default: the
+        speculative preps roll back and retry serially, so for them raising is
+        the better answer.
         """
         by_rid: dict[int, NameToTensorList] = (
             {} if rids is None else {rid: {} for rid in rids}
         )
         final_edges: dict[int, set[str]] = {}
+        unresolved: set[int] = set()
         names = self.signal_names
         uuids = self.uuids
         at = 0
@@ -193,11 +207,22 @@ class ColumnarEdgeSpecs:
             if slot is None:
                 slot = by_rid[rid] = {}
             name = names[self.signal_name_idxs[i]]
-            slot[name] = [get_tensor(uuids[j]) for j in range(at, end)]
+            try:
+                tensors = [get_tensor(uuids[j]) for j in range(at, end)]
+            except KeyError:
+                if not skip_missing:
+                    raise
+                # Leave the signal absent rather than half-filled: the caller
+                # drops the rid, and a partial input dict would otherwise
+                # surface as a missing-signal error further down.
+                unresolved.add(rid)
+                at = end
+                continue
+            slot[name] = tensors
             if self.is_final_streaming_chunk[i]:
                 final_edges.setdefault(rid, set()).add(name)
             at = end
-        return InputTensors(by_rid, final_edges)
+        return InputTensors(by_rid, final_edges, frozenset(unresolved))
 
     def edge_tuples(self) -> list[EdgeTuple]:
         """One ``EdgeTuple`` per edge.
@@ -361,6 +386,10 @@ class SpeculationPrepOutput(NamedTuple):
     # edges simply has none here, so callers that want an entry for it pass
     # ready_rids to ``to_input_tensors``.
     input_edges: ColumnarEdgeSpecs
+    # Handle for ``commit_speculation``, which every prep that returns one must
+    # eventually be settled with. 0 when the prep staged no streaming ingest,
+    # and so has nothing to settle.
+    spec_id: int = 0
 
 
 class ReadyNodeSpec(NamedTuple):
@@ -451,6 +480,8 @@ class SendInput(NamedTuple):
     # rid -> (rx_info, tx_info, graph_timings). All three are populated only
     # under enable_prof, so this is None in production.
     profiling: ParallelList[int, Profiling] | None = None
+    # Only metadata produced by this worker since its last completion.
+    resource_publish_info: ParallelList[int, dict[str, PublishedInfo]] | None = None
 
 
 class GraphRuntime(ABC):
@@ -759,6 +790,26 @@ class GraphRuntime(ABC):
         """
         pass
 
+    @abstractmethod
+    def commit_speculation(
+        self, spec_id: int, success: bool, dropped_rids: list[int] = (),
+        node: str | None = None, wg_id: int | None = None,
+        scheduled_rids: list[int] = (),
+    ):
+        """Settle the streaming ingests a prep staged under ``spec_id``.
+        On ``success``, ``scheduled_rids`` are also marked speculatively
+        scheduled on ``node``.
+
+        The scheduled rids are passed rather than read off the stage in order
+        to also include the fresh rids rolled in from the ready queue. For
+        dropped rids, stream chunks are returned to the stream buffers and
+        un-ingested from the graph.
+
+        Idempotent, and a no-op for an unknown or 0 id, so a caller settling a
+        prep that staged nothing (or settling twice on an error path) is safe.
+        """
+        pass
+
     # --------- Postprocess ----------
     @abstractmethod
     def stop_loops_batched(
@@ -766,7 +817,7 @@ class GraphRuntime(ABC):
         graph_walk: str,
         last_node_run: str,
         loop_names: ParallelList[int, list[str]]
-    ):
+    ) -> list[int]:
         """
         (1) Stop loops in the graph
         (2) Updates pending_loop_stops list
@@ -775,6 +826,7 @@ class GraphRuntime(ABC):
         Rids whose current walk does not contain a named loop are filtered out
         here (that is a model bug, logged and dropped), so callers pass whatever
         check_stop produced.
+        Returns the rids whose loops were stopped.
         """
         pass
 
@@ -833,7 +885,7 @@ class GraphRuntime(ABC):
     def send_outputs(
         self,
         input: SendInput,
-    ):
+    ) -> list[int]:
         """
         (1) Send outputs to other workers
         (2) Buffer persist signals (the buffered signals will be internal to
@@ -842,5 +894,6 @@ class GraphRuntime(ABC):
         (4) Output signals -> api server
         (5) Remote streaming tensors
         (6) WG done messages to the conductor
+        Returns rids for which a WORKER_GRAPHS_DONE message was sent.
         """
         pass
