@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 03, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -601,6 +601,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.evict"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.evict()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.insert"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.insert()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.lookup"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.lookup()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.num_sole_owned()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.page_for"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.page_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.pages"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.pages()</span></code></a></li>
 </ul>
@@ -694,6 +695,17 @@ Returns how many pages reached the free list.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned">
+<span class="sig-name descname"><span class="pre">num_sole_owned</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/prefix_index.html#PrefixIndex.num_sole_owned"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned" title="Link to this definition">#</a></dt>
+<dd><p>Indexed pages nothing else holds: an upper bound on what <code class="docutils literal notranslate"><span class="pre">evict</span></code> can free.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.prefix_index.PrefixIndex.page_for">
 <span class="sig-name descname"><span class="pre">page_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/prefix_index.html#PrefixIndex.page_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.page_for" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -772,6 +784,7 @@ Returns how many pages reached the free list.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.evict"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.evict()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.insert"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.insert()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.lookup"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.lookup()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.num_sole_owned"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.num_sole_owned()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.page_for"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.page_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.prefix_index.PrefixIndex.pages"><code class="docutils literal notranslate"><span class="pre">PrefixIndex.pages()</span></code></a></li>
 </ul>
@@ -809,7 +822,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 03, 2026.
+  Last updated on Oct 04, 2026.
   <br/>
 </p>
   </div>

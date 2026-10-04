@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 03, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -671,7 +671,8 @@ and handing to next. (in fact, maybe <cite>plan</cite> should do this and runner
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.runner.StepRunner.admit">
 <span class="sig-name descname"><span class="pre">admit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.admit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.runner.StepRunner.admit" title="Link to this definition">#</a></dt>
-<dd><p>reserve capacity for step</p>
+<dd><p>Reserve capacity for step. A refused admit gives back everything
+the step reserved.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a>)</p>
@@ -834,6 +835,7 @@ again could possibly move that into <cite>plan</cite> itself</p>
 <dd><p>admit over the pre-planning subset, a step ahead</p>
 <p>the later full <cite>admit</cite> covers the rest; these resources see their own
 state as already reserved and no-op</p>
+<p>Unwound on refusal exactly as <code class="docutils literal notranslate"><span class="pre">admit</span></code> is.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a>)</p>
@@ -1064,7 +1066,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 03, 2026.
+  Last updated on Oct 04, 2026.
   <br/>
 </p>
   </div>

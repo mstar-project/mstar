@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 03, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -599,6 +599,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.AllocResult"><code class="docutils literal notranslate"><span class="pre">AllocResult</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.AllocResult.error"><code class="docutils literal notranslate"><span class="pre">AllocResult.error</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.AllocResult.new_pages"><code class="docutils literal notranslate"><span class="pre">AllocResult.new_pages</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.AllocResult.success"><code class="docutils literal notranslate"><span class="pre">AllocResult.success</span></code></a></li>
 </ul>
 </li>
@@ -641,6 +642,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.assert_pages_conserved"><code class="docutils literal notranslate"><span class="pre">KVManager.assert_pages_conserved()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build"><code class="docutils literal notranslate"><span class="pre">KVManager.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">KVManager.build_cuda_graph_buffers()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.can_reload"><code class="docutils literal notranslate"><span class="pre">KVManager.can_reload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.cleanup"><code class="docutils literal notranslate"><span class="pre">KVManager.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.clear_preplan"><code class="docutils literal notranslate"><span class="pre">KVManager.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.commit"><code class="docutils literal notranslate"><span class="pre">KVManager.commit()</span></code></a></li>
@@ -667,6 +669,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.reset_default_cursors"><code class="docutils literal notranslate"><span class="pre">KVManager.reset_default_cursors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.reset_request"><code class="docutils literal notranslate"><span class="pre">KVManager.reset_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">KVManager.resolve_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.rollback_admit"><code class="docutils literal notranslate"><span class="pre">KVManager.rollback_admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">KVManager.set_layer_idx()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.supports_eviction"><code class="docutils literal notranslate"><span class="pre">KVManager.supports_eviction</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.supports_preplan"><code class="docutils literal notranslate"><span class="pre">KVManager.supports_preplan</span></code></a></li>
@@ -738,7 +741,7 @@
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.AllocResult" title="mstar.engine.resources.kv.manager.AllocResult"><code class="xref py py-obj docutils literal notranslate"><span class="pre">AllocResult</span></code></a>([success, error])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.AllocResult" title="mstar.engine.resources.kv.manager.AllocResult"><code class="xref py py-obj docutils literal notranslate"><span class="pre">AllocResult</span></code></a>([success, error, new_pages])</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.CacheStream" title="mstar.engine.resources.kv.manager.CacheStream"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CacheStream</span></code></a>([page_indices, stored_len, ...])</p></td>
@@ -770,19 +773,25 @@
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.AllocResult">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.manager.</span></span><span class="sig-name descname"><span class="pre">AllocResult</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">success</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">error</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.AdmitFailedReason" title="mstar.engine.resources.step.AdmitFailedReason"><span class="pre">mstar.engine.resources.step.AdmitFailedReason</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#AllocResult"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.AllocResult" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.manager.</span></span><span class="sig-name descname"><span class="pre">AllocResult</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">success</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">error</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.AdmitFailedReason" title="mstar.engine.resources.step.AdmitFailedReason"><span class="pre">mstar.engine.resources.step.AdmitFailedReason</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">new_pages</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#AllocResult"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.AllocResult" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>success</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>error</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.AdmitFailedReason" title="mstar.engine.resources.step.AdmitFailedReason"><em>AdmitFailedReason</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>new_pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.AllocResult.error">
 <span class="sig-name descname"><span class="pre">error</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.AdmitFailedReason" title="mstar.engine.resources.step.AdmitFailedReason"><span class="pre">AdmitFailedReason</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.AllocResult.error" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.AllocResult.new_pages">
+<span class="sig-name descname"><span class="pre">new_pages</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.AllocResult.new_pages" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1100,6 +1109,21 @@ earlier call already sized.</p>
 <li><p><strong>max_bs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>max_seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.can_reload">
+<span class="sig-name descname"><span class="pre">can_reload</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.can_reload"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.can_reload" title="Link to this definition">#</a></dt>
+<dd><p>Whether the free pages plus what the prefix index could evict cover
+<code class="docutils literal notranslate"><span class="pre">rid</span></code>’s offloaded streams. An upper bound: <code class="docutils literal notranslate"><span class="pre">reload</span></code> can still refuse.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1487,6 +1511,27 @@ again.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.rollback_admit">
+<span class="sig-name descname"><span class="pre">rollback_admit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ctx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.rollback_admit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.rollback_admit" title="Link to this definition">#</a></dt>
+<dd><p>Give back the pages this admit freshly acquired. Does not touch pages
+retained by a shared prefix or a lease converted onto the stream.</p>
+<p><code class="docutils literal notranslate"><span class="pre">page_indices</span></code> maps token position to page, so the reserved pages can
+only be dropped off the tail. If something else has extended the stream
+since, the tail can no longer be safely removed.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVStep" title="mstar.engine.resources.kv.config.KVStep"><em>KVStep</em></a>)</p></li>
+<li><p><strong>ctx</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.StepContext" title="mstar.engine.resources.step.StepContext"><em>StepContext</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1968,6 +2013,7 @@ counts and seals need none of their own.</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.AllocResult"><code class="docutils literal notranslate"><span class="pre">AllocResult</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.AllocResult.error"><code class="docutils literal notranslate"><span class="pre">AllocResult.error</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.AllocResult.new_pages"><code class="docutils literal notranslate"><span class="pre">AllocResult.new_pages</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.AllocResult.success"><code class="docutils literal notranslate"><span class="pre">AllocResult.success</span></code></a></li>
 </ul>
 </li>
@@ -2010,6 +2056,7 @@ counts and seals need none of their own.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.assert_pages_conserved"><code class="docutils literal notranslate"><span class="pre">KVManager.assert_pages_conserved()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build"><code class="docutils literal notranslate"><span class="pre">KVManager.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">KVManager.build_cuda_graph_buffers()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.can_reload"><code class="docutils literal notranslate"><span class="pre">KVManager.can_reload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.cleanup"><code class="docutils literal notranslate"><span class="pre">KVManager.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.clear_preplan"><code class="docutils literal notranslate"><span class="pre">KVManager.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.commit"><code class="docutils literal notranslate"><span class="pre">KVManager.commit()</span></code></a></li>
@@ -2036,6 +2083,7 @@ counts and seals need none of their own.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.reset_default_cursors"><code class="docutils literal notranslate"><span class="pre">KVManager.reset_default_cursors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.reset_request"><code class="docutils literal notranslate"><span class="pre">KVManager.reset_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">KVManager.resolve_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.rollback_admit"><code class="docutils literal notranslate"><span class="pre">KVManager.rollback_admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">KVManager.set_layer_idx()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.supports_eviction"><code class="docutils literal notranslate"><span class="pre">KVManager.supports_eviction</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.supports_preplan"><code class="docutils literal notranslate"><span class="pre">KVManager.supports_preplan</span></code></a></li>
@@ -2124,7 +2172,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 03, 2026.
+  Last updated on Oct 04, 2026.
   <br/>
 </p>
   </div>

@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 03, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -930,6 +930,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">FULL_ADMIT_NOT_READY</span><span class="p">,</span>
     <span class="n">AdmitOutcome</span><span class="p">,</span>
 <span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.runtime.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphRuntime</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">EMPTY_INPUT_METADATA</span><span class="p">,</span>
     <span class="n">ARNodeInputs</span><span class="p">,</span>
@@ -940,6 +941,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">NodeSubmodule</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.profile.worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">ExecTimings</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.ipc_format</span><span class="w"> </span><span class="kn">import</span> <span class="n">OffloadDelta</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">mark</span><span class="p">,</span> <span class="n">range_pop</span><span class="p">,</span> <span class="n">range_push</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
@@ -952,6 +954,7 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># GPU(N+1)/postprocess(N) overlap. Enable only where 2 steps overflow the CUDA</span>
 <span class="c1"># launch queue and block a launch (machine/driver dependent).</span>
 <span class="n">_ENGINE_STEP_SYNC</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_ENGINE_STEP_SYNC"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span>
+
 
 
 <div class="viewcode-block" id="checkpoint_identity">
@@ -1251,7 +1254,8 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Engine</span><span class="p">:</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_runtime</span><span class="p">:</span> <span class="n">GraphRuntime</span><span class="p">,</span>
+        <span class="n">autocast_dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
         <span class="n">enable_nvtx</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">enable_profile</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
     <span class="p">):</span>
@@ -1260,6 +1264,17 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Resource</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_submodules</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">SubmoduleManagement</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_runner</span><span class="p">:</span> <span class="n">StepRunner</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_graph_runtime</span> <span class="o">=</span> <span class="n">graph_runtime</span>
+
+        <span class="c1"># node -&gt; (offloaded, reloaded) since the last ``take_resident_delta``.</span>
+        <span class="c1"># Only a TP leader drains this, to replicate its resident set onto the</span>
+        <span class="c1"># rest of the instance; see ``ScheduleTPNode``.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_resident_delta</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">OffloadDelta</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># Nodes this rank leads (journals its moves for the others) and nodes it</span>
+        <span class="c1"># follows (may not move pages at all — see ``offload_request``). A node</span>
+        <span class="c1"># that is not sharded is in neither: it owns its own eviction.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tp_leader_nodes</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tp_follower_nodes</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_enable_nvtx</span> <span class="o">=</span> <span class="n">enable_nvtx</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_enable_profile</span> <span class="o">=</span> <span class="n">enable_profile</span>
@@ -1283,6 +1298,9 @@ window.runMermaid = runMermaid;</script>
         <span class="n">node_names</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">submodules</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
         <span class="n">node_to_resources</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="n">specs_by_key</span> <span class="o">=</span> <span class="n">resolve_spec_dependencies</span><span class="p">(</span><span class="n">specs</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_classify_tp_roles</span><span class="p">(</span><span class="n">node_names</span><span class="p">,</span> <span class="n">parallel_groups</span><span class="p">)</span>
+
         <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="p">:</span>
             <span class="n">relevant_nodes</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span> <span class="o">&amp;</span> <span class="n">node_names</span>
             <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">relevant_nodes</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
@@ -2385,6 +2403,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">check_ready</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
         <span class="n">request_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
+        <span class="n">allow_reload</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">FullAdmitOutcome</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Whether this node can run the request now.</span>
 
@@ -2398,10 +2417,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        unservable (``AdmitRuntimeError``), and the caller has to fail it</span>
 <span class="sd">        rather than scan it again forever.</span>
 <span class="sd">        """</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_offloaded</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">request_id</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">reload_request</span><span class="p">(</span>
-            <span class="n">node_name</span><span class="p">,</span> <span class="n">request_id</span>
-        <span class="p">):</span>
-            <span class="k">return</span> <span class="n">FULL_ADMIT_NOT_READY</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_offloaded</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">request_id</span><span class="p">):</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">allow_reload</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">FULL_ADMIT_NOT_READY</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">reload_request</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">request_id</span><span class="p">):</span>
+                <span class="k">return</span> <span class="n">FULL_ADMIT_NOT_READY</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_runner</span><span class="o">.</span><span class="n">admit_retrieve</span><span class="p">(</span>
             <span class="n">rid</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span> <span class="n">node_name</span><span class="o">=</span><span class="n">node_name</span><span class="p">,</span>
             <span class="n">graph_walk</span><span class="o">=</span><span class="n">request_info</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">,</span>
@@ -2615,30 +2635,199 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="Engine.offload_request">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine.offload_request">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">offload_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">offload_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Move the request off-device across this node's resources.</span>
 
 <span class="sd">        Returns what was reclaimed, in whatever each resource counts (pages,</span>
 <span class="sd">        today); 0 means nothing moved and the caller should pick another</span>
 <span class="sd">        victim.</span>
 <span class="sd">        """</span>
-        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span>
+        <span class="k">if</span> <span class="n">node_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tp_follower_nodes</span><span class="p">:</span>
+            <span class="c1"># Rank 0 decides what this instance evicts, and its decision arrives</span>
+            <span class="c1"># as a resident-set delta. TP followers can deadlock if they are not</span>
+            <span class="c1"># given a single source of truth for eviction.</span>
+            <span class="k">return</span> <span class="mi">0</span>
+        <span class="n">freed</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span>
             <span class="n">resource</span><span class="o">.</span><span class="n">offload</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">resource</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodules</span><span class="p">[</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">resources</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
             <span class="k">if</span> <span class="n">resource</span><span class="o">.</span><span class="n">supports_eviction</span>
-        <span class="p">)</span></div>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">freed</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">node_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resident_delta</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_resident_delta</span><span class="p">[</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">add_offloaded</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_graph_runtime</span><span class="o">.</span><span class="n">get_rid_string</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="n">freed</span></div>
 
 
 <div class="viewcode-block" id="Engine.reload_request">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine.reload_request">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">reload_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">reload_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Bring it back. False when any resource can't fit it yet, in which</span>
 <span class="sd">        case the request stays offloaded and the caller retries later."""</span>
-        <span class="k">return</span> <span class="nb">all</span><span class="p">(</span>
-            <span class="n">resource</span><span class="o">.</span><span class="n">reload</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">node_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tp_follower_nodes</span><span class="p">:</span>
+            <span class="c1"># Same rule the other way round: a reload spends the pages an</span>
+            <span class="c1"># eviction freed, so it is just as much rank 0's call. Not ready here</span>
+            <span class="c1"># until the delta says so.</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="n">offloaded</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">resource</span>
             <span class="k">for</span> <span class="n">resource</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodules</span><span class="p">[</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">resources</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
             <span class="k">if</span> <span class="n">resource</span><span class="o">.</span><span class="n">supports_eviction</span> <span class="ow">and</span> <span class="n">resource</span><span class="o">.</span><span class="n">is_offloaded</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
-        <span class="p">)</span></div>
+        <span class="p">]</span>
+        <span class="c1"># check every resource fits first, so a refusal doesn't reload and re-offload whatever did</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">all</span><span class="p">(</span><span class="n">resource</span><span class="o">.</span><span class="n">can_reload</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span> <span class="k">for</span> <span class="n">resource</span> <span class="ow">in</span> <span class="n">offloaded</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="n">reloaded</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Resource</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">resource</span> <span class="ow">in</span> <span class="n">offloaded</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">resource</span><span class="o">.</span><span class="n">reload</span><span class="p">(</span><span class="n">request_id</span><span class="p">):</span>
+                <span class="c1"># undone, not kept: every page move rank 0 makes is journalled or undone, and a partial one can't be</span>
+                <span class="k">for</span> <span class="n">done</span> <span class="ow">in</span> <span class="n">reloaded</span><span class="p">:</span>
+                    <span class="n">done</span><span class="o">.</span><span class="n">offload</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
+                <span class="k">return</span> <span class="kc">False</span>
+            <span class="n">reloaded</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">resource</span><span class="p">)</span>
+        <span class="c1"># Logged at the same level as the eviction in</span>
+        <span class="c1"># ``Worker._try_offload_cold_request`` and as a follower's replay, so</span>
+        <span class="c1"># the two ranks' resident-set moves can be lined up side by side.</span>
+        <span class="c1"># A reload only happens after an eviction, so this is not chatty.</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+            <span class="s2">"Reloaded request </span><span class="si">%s</span><span class="s2"> on </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_graph_runtime</span><span class="o">.</span><span class="n">get_rid_string</span><span class="p">(</span><span class="n">request_id</span><span class="p">),</span> <span class="n">node_name</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">node_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resident_delta</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_resident_delta</span><span class="p">[</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">add_reloaded</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_graph_runtime</span><span class="o">.</span><span class="n">get_rid_string</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="kc">True</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_classify_tp_roles</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">node_names</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">parallel_groups</span><span class="p">:</span> <span class="n">WorkerParallelGroups</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Sort this rank's nodes into the ones it leads, follows, or owns alone.</span>
+
+<span class="sd">        ``world_size &gt; 1``, not ``&gt; 0``: every node has a world size of at least</span>
+<span class="sd">        one, so ``&gt; 0`` makes an un-sharded node a "leader" and leaves it</span>
+<span class="sd">        journalling resident-set moves that nothing ever drains —</span>
+<span class="sd">        ``take_resident_delta`` is only reached through the TP broadcast, which</span>
+<span class="sd">        skips un-sharded nodes, so the journal grows for the life of the process.</span>
+<span class="sd">        """</span>
+        <span class="n">sharded</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">node</span> <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">node_names</span>
+            <span class="k">if</span> <span class="n">parallel_groups</span><span class="o">.</span><span class="n">get_instance_world_size_for_node</span><span class="p">(</span><span class="n">node</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span>
+        <span class="p">}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tp_leader_nodes</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">node</span> <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">sharded</span>
+            <span class="k">if</span> <span class="n">parallel_groups</span><span class="o">.</span><span class="n">get_instance_rank_for_node</span><span class="p">(</span><span class="n">node</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span>
+        <span class="p">}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tp_follower_nodes</span> <span class="o">=</span> <span class="n">sharded</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tp_leader_nodes</span>
+        <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tp_leader_nodes</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_resident_delta</span><span class="p">[</span><span class="n">node</span><span class="p">]</span> <span class="o">=</span> <span class="n">OffloadDelta</span><span class="o">.</span><span class="n">new</span><span class="p">()</span>
+
+<div class="viewcode-block" id="Engine.take_resident_delta">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine.take_resident_delta">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">take_resident_delta</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">OffloadDelta</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The moves on this node since the last call, ready for the wire.</span>
+
+<span class="sd">        Verbatim. Every move in it is one this rank executed, so a rank in the</span>
+<span class="sd">        same state can always apply it — which is what makes a refused replay</span>
+<span class="sd">        mean the states differ, and nothing else.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="n">node_name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resident_delta</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">OffloadDelta</span><span class="o">.</span><span class="n">new</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resident_delta</span><span class="p">[</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">take</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="Engine.apply_resident_delta">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine.apply_resident_delta">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply_resident_delta</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">delta</span><span class="p">:</span> <span class="n">OffloadDelta</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Match the leader's resident set on this node. Mutates OffloadDelta</span>
+<span class="sd">        by popping off the steps that have already landed. False means not all</span>
+<span class="sd">        has landed and the caller must retry before trying the next step.</span>
+<span class="sd">        """</span>
+
+        <span class="n">resources</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodules</span><span class="p">[</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">resources</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">delta</span><span class="p">)):</span>
+            <span class="n">wire_rid</span><span class="p">,</span> <span class="n">is_offload</span> <span class="o">=</span> <span class="n">delta</span><span class="o">.</span><span class="n">peek_left</span><span class="p">()</span>
+            <span class="c1"># Wire strings, not handles: a handle is minted per worker, so rank</span>
+            <span class="c1"># 0's is meaningless here. None means this rank has no live request</span>
+            <span class="c1"># by that name -- it removed it already, on the other side of the</span>
+            <span class="c1"># step rank 0 recorded the move. Its pages are gone, so the move is</span>
+            <span class="c1"># moot and the entry is spent; logged because reaching this for a</span>
+            <span class="c1"># rid the rank has NOT YET admitted would silently lose a move and</span>
+            <span class="c1"># diverge the resident set for good.</span>
+            <span class="n">rid</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_runtime</span><span class="o">.</span><span class="n">get_rid_handle</span><span class="p">(</span><span class="n">wire_rid</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">rid</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+                    <span class="s2">"Replay: no live request named </span><span class="si">%s</span><span class="s2"> on </span><span class="si">%s</span><span class="s2">; move is moot"</span><span class="p">,</span>
+                    <span class="n">wire_rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span>
+                <span class="p">)</span>
+                <span class="n">delta</span><span class="o">.</span><span class="n">pop_left</span><span class="p">()</span>
+                <span class="k">continue</span>
+            <span class="k">if</span> <span class="n">is_offload</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_offloaded</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">rid</span><span class="p">):</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+                        <span class="s2">"Replay: </span><span class="si">%s</span><span class="s2"> already off </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">wire_rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span>
+                    <span class="p">)</span>
+                <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">reclaimable</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">rid</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="c1"># Nothing resident to move, so this rank already matches the</span>
+                    <span class="c1"># leader. Distinct from the refusal below, and the difference</span>
+                    <span class="c1"># matters: ``offload`` answers 0 for both, and treating</span>
+                    <span class="c1"># "nothing to free" as retryable wedges the caller forever.</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+                        <span class="s2">"Replay: </span><span class="si">%s</span><span class="s2"> holds nothing on </span><span class="si">%s</span><span class="s2"> to offload"</span><span class="p">,</span>
+                        <span class="n">wire_rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span>
+                    <span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">freed</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span>
+                        <span class="n">resource</span><span class="o">.</span><span class="n">offload</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+                        <span class="k">for</span> <span class="n">resource</span> <span class="ow">in</span> <span class="n">resources</span>
+                        <span class="k">if</span> <span class="n">resource</span><span class="o">.</span><span class="n">supports_eviction</span>
+                    <span class="p">)</span>
+                    <span class="k">if</span> <span class="n">freed</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+                        <span class="c1"># Refused for now: a step still holds these pages and</span>
+                        <span class="c1"># will release them when it commits.</span>
+                        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                            <span class="s2">"Replay of rank 0's offload of </span><span class="si">%s</span><span class="s2"> on </span><span class="si">%s</span><span class="s2"> refused "</span>
+                            <span class="s2">"(a step still holds its pages); </span><span class="si">%d</span><span class="s2"> moves still "</span>
+                            <span class="s2">"owed. This rank cannot run rank 0's next step "</span>
+                            <span class="s2">"until it catches up."</span><span class="p">,</span>
+                            <span class="n">wire_rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">delta</span><span class="p">),</span>
+                        <span class="p">)</span>
+                        <span class="k">return</span> <span class="kc">False</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                        <span class="s2">"Replayed rank 0's offload of request </span><span class="si">%s</span><span class="s2"> from </span><span class="si">%s</span><span class="s2"> "</span>
+                        <span class="s2">"(</span><span class="si">%d</span><span class="s2"> reclaimed)"</span><span class="p">,</span> <span class="n">wire_rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">freed</span><span class="p">,</span>
+                    <span class="p">)</span>
+            <span class="k">elif</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_offloaded</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">rid</span><span class="p">):</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+                    <span class="s2">"Replay: </span><span class="si">%s</span><span class="s2"> already resident on </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">wire_rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="k">elif</span> <span class="ow">not</span> <span class="nb">all</span><span class="p">(</span>
+                <span class="n">resource</span><span class="o">.</span><span class="n">reload</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">resource</span> <span class="ow">in</span> <span class="n">resources</span>
+                <span class="k">if</span> <span class="n">resource</span><span class="o">.</span><span class="n">supports_eviction</span> <span class="ow">and</span> <span class="n">resource</span><span class="o">.</span><span class="n">is_offloaded</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+            <span class="p">):</span>
+                    <span class="c1"># No room yet. Silent until now, and this is the shape of a</span>
+                    <span class="c1"># follower that stops mid-delta and never finishes: rank 0</span>
+                    <span class="c1"># then waits on a collective this rank will never join.</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">"Replay of rank 0's reload of </span><span class="si">%s</span><span class="s2"> on </span><span class="si">%s</span><span class="s2"> does not fit; "</span>
+                    <span class="s2">"</span><span class="si">%d</span><span class="s2"> moves still owed. This rank cannot run rank 0's "</span>
+                    <span class="s2">"next step until it catches up."</span><span class="p">,</span>
+                    <span class="n">wire_rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">delta</span><span class="p">),</span>
+                <span class="p">)</span>
+                <span class="k">return</span> <span class="kc">False</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                    <span class="s2">"Replayed rank 0's reload of request </span><span class="si">%s</span><span class="s2"> on </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
+                    <span class="n">wire_rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="n">delta</span><span class="o">.</span><span class="n">pop_left</span><span class="p">()</span>
+        <span class="k">return</span> <span class="kc">True</span></div>
 
 
 <div class="viewcode-block" id="Engine.reclaimable">
@@ -2742,7 +2931,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 03, 2026.
+  Last updated on Oct 04, 2026.
   <br/>
 </p>
   </div>

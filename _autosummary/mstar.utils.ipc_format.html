@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 03, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -660,12 +660,26 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.NewRequestConductor.request_id"><code class="docutils literal notranslate"><span class="pre">NewRequestConductor.request_id</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta"><code class="docutils literal notranslate"><span class="pre">OffloadDelta</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.add_offloaded"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.add_offloaded()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.add_reloaded"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.add_reloaded()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.copy"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.copy()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.extend"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.extend()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.is_offload"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.is_offload</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.new"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.new()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.peek_left"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.peek_left()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.pop_left"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.pop_left()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.rids"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.rids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.take"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.take()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone"><code class="docutils literal notranslate"><span class="pre">ReadsDone</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone.entity_id"><code class="docutils literal notranslate"><span class="pre">ReadsDone.entity_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone.request_id"><code class="docutils literal notranslate"><span class="pre">ReadsDone.request_id</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.RemoveRequest"><code class="docutils literal notranslate"><span class="pre">RemoveRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.RemoveRequest.after_tp_seq"><code class="docutils literal notranslate"><span class="pre">RemoveRequest.after_tp_seq</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.RemoveRequest.request_id"><code class="docutils literal notranslate"><span class="pre">RemoveRequest.request_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.RemoveRequest.source"><code class="docutils literal notranslate"><span class="pre">RemoveRequest.source</span></code></a></li>
 </ul>
@@ -674,6 +688,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.graph_walk"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.node_name"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.node_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.request_ids"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.request_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.resident_delta"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.resident_delta</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.spec_from_seq"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.spec_from_seq</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.spec_seq"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.spec_seq</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.speculative"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.speculative</span></code></a></li>
@@ -794,40 +809,43 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.NewRequestConductor" title="mstar.utils.ipc_format.NewRequestConductor"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NewRequestConductor</span></code></a>(request_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ReadsDone" title="mstar.utils.ipc_format.ReadsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ReadsDone</span></code></a>(request_id, entity_id)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.OffloadDelta" title="mstar.utils.ipc_format.OffloadDelta"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OffloadDelta</span></code></a>([rids, is_offload])</p></td>
+<td><p>A rank's offloads and reloads, in the order it made them.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ReadsDone" title="mstar.utils.ipc_format.ReadsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ReadsDone</span></code></a>(request_id, entity_id)</p></td>
 <td><p>An entity confirming it has no in-flight reads for a request and will start none — the conductor's gate before sending the hard RemoveRequest.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.RemoveRequest" title="mstar.utils.ipc_format.RemoveRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RemoveRequest</span></code></a>(request_id, source)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.RemoveRequest" title="mstar.utils.ipc_format.RemoveRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RemoveRequest</span></code></a>(request_id, source, after_tp_seq)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ScheduleTPNode" title="mstar.utils.ipc_format.ScheduleTPNode"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ScheduleTPNode</span></code></a>(node_name, graph_walk, ...[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ScheduleTPNode" title="mstar.utils.ipc_format.ScheduleTPNode"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ScheduleTPNode</span></code></a>(node_name, graph_walk, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.SetupDone" title="mstar.utils.ipc_format.SetupDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SetupDone</span></code></a>(worker_id)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.SetupDone" title="mstar.utils.ipc_format.SetupDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SetupDone</span></code></a>(worker_id)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.Status" title="mstar.utils.ipc_format.Status"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Status</span></code></a>(*values)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.Status" title="mstar.utils.ipc_format.Status"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Status</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.StopLoops" title="mstar.utils.ipc_format.StopLoops"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopLoops</span></code></a>(request_id, loop_names, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.StopLoops" title="mstar.utils.ipc_format.StopLoops"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopLoops</span></code></a>(request_id, loop_names, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TPNoSpeculation" title="mstar.utils.ipc_format.TPNoSpeculation"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TPNoSpeculation</span></code></a>(node_name, graph_walk, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TPNoSpeculation" title="mstar.utils.ipc_format.TPNoSpeculation"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TPNoSpeculation</span></code></a>(node_name, graph_walk, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TensorReceived" title="mstar.utils.ipc_format.TensorReceived"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorReceived</span></code></a>(request_id, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TensorReceived" title="mstar.utils.ipc_format.TensorReceived"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorReceived</span></code></a>(request_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.UnpersistTensors" title="mstar.utils.ipc_format.UnpersistTensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">UnpersistTensors</span></code></a>(request_id, uuid_to_ref_count)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.UnpersistTensors" title="mstar.utils.ipc_format.UnpersistTensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">UnpersistTensors</span></code></a>(request_id, uuid_to_ref_count)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerGraphsDone" title="mstar.utils.ipc_format.WorkerGraphsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerGraphsDone</span></code></a>(request_id, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerGraphsDone" title="mstar.utils.ipc_format.WorkerGraphsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerGraphsDone</span></code></a>(request_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessage" title="mstar.utils.ipc_format.WorkerMessage"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessage</span></code></a>(message_type, body)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessage" title="mstar.utils.ipc_format.WorkerMessage"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessage</span></code></a>(message_type, body)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessageType" title="mstar.utils.ipc_format.WorkerMessageType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a>(*values)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessageType" title="mstar.utils.ipc_format.WorkerMessageType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -1131,6 +1149,128 @@ step can fail several of them for different reasons.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.OffloadDelta">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">OffloadDelta</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">is_offload</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#OffloadDelta"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.OffloadDelta" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>A rank’s offloads and reloads, in the order it made them.</p>
+<p>Ordered so the follower replays the leader’s decisions in the same order: a
+sequence that worked for the leader works for the followers too.</p>
+<p>Holds WIRE request ids, not worker-local handles: a handle is minted per
+worker, so rank 0’s would name different requests on the follower.</p>
+<p>A dataclass of lists rather than a NamedTuple of deques so that the wire codec
+can automatically encode it. <code class="docutils literal notranslate"><span class="pre">pop_left</span></code> is O(n) on a list, which costs nothing
+at the handful of entries a delta ever holds.</p>
+<p><code class="docutils literal notranslate"><span class="pre">__len__</span></code> is the queue depth, so an empty delta is falsy – several callers
+lean on that.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>is_offload</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.OffloadDelta.add_offloaded">
+<span class="sig-name descname"><span class="pre">add_offloaded</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#OffloadDelta.add_offloaded"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.OffloadDelta.add_offloaded" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.OffloadDelta.add_reloaded">
+<span class="sig-name descname"><span class="pre">add_reloaded</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#OffloadDelta.add_reloaded"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.OffloadDelta.add_reloaded" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.OffloadDelta.copy">
+<span class="sig-name descname"><span class="pre">copy</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#OffloadDelta.copy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.OffloadDelta.copy" title="Link to this definition">#</a></dt>
+<dd><p>An independent queue holding the same moves.</p>
+<p>One per follower: each replays at its own pace, popping as it goes.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="#mstar.utils.ipc_format.OffloadDelta" title="mstar.utils.ipc_format.OffloadDelta"><em>OffloadDelta</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.OffloadDelta.extend">
+<span class="sig-name descname"><span class="pre">extend</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">other</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#OffloadDelta.extend"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.OffloadDelta.extend" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>other</strong> (<a class="reference internal" href="#mstar.utils.ipc_format.OffloadDelta" title="mstar.utils.ipc_format.OffloadDelta"><em>OffloadDelta</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.OffloadDelta.is_offload">
+<span class="sig-name descname"><span class="pre">is_offload</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.utils.ipc_format.OffloadDelta.is_offload" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.OffloadDelta.new">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">new</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#OffloadDelta.new"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.OffloadDelta.new" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="#mstar.utils.ipc_format.OffloadDelta" title="mstar.utils.ipc_format.OffloadDelta"><em>OffloadDelta</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.OffloadDelta.peek_left">
+<span class="sig-name descname"><span class="pre">peek_left</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#OffloadDelta.peek_left"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.OffloadDelta.peek_left" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a>] | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.OffloadDelta.pop_left">
+<span class="sig-name descname"><span class="pre">pop_left</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#OffloadDelta.pop_left"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.OffloadDelta.pop_left" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a>] | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.OffloadDelta.rids">
+<span class="sig-name descname"><span class="pre">rids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.utils.ipc_format.OffloadDelta.rids" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.OffloadDelta.take">
+<span class="sig-name descname"><span class="pre">take</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#OffloadDelta.take"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.OffloadDelta.take" title="Link to this definition">#</a></dt>
+<dd><p>Hand the queue over and leave this one empty.</p>
+<p>Copies and clears rather than rebinding, so a holder of this delta (the
+engine keeps its journal in a dict) sees it emptied.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="#mstar.utils.ipc_format.OffloadDelta" title="mstar.utils.ipc_format.OffloadDelta"><em>OffloadDelta</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.ReadsDone">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">ReadsDone</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">entity_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#ReadsDone"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.ReadsDone" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
@@ -1158,16 +1298,22 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.RemoveRequest">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">RemoveRequest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">source</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">&lt;MessageSource.CONDUCTOR:</span> <span class="pre">0&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#RemoveRequest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.RemoveRequest" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">RemoveRequest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">source</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">&lt;MessageSource.CONDUCTOR:</span> <span class="pre">0&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">after_tp_seq</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">-1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#RemoveRequest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.RemoveRequest" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>source</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>after_tp_seq</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.RemoveRequest.after_tp_seq">
+<span class="sig-name descname"><span class="pre">after_tp_seq</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">-1</span></span><a class="headerlink" href="#mstar.utils.ipc_format.RemoveRequest.after_tp_seq" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.RemoveRequest.request_id">
 <span class="sig-name descname"><span class="pre">request_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.RemoveRequest.request_id" title="Link to this definition">#</a></dt>
@@ -1182,7 +1328,7 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.ScheduleTPNode">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">ScheduleTPNode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">speculative</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">spec_seq</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">-1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">spec_from_seq</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">-1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#ScheduleTPNode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.ScheduleTPNode" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">ScheduleTPNode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">node_name:</span> <span class="pre">str,</span> <span class="pre">graph_walk:</span> <span class="pre">str,</span> <span class="pre">request_ids:</span> <span class="pre">list[str],</span> <span class="pre">speculative:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False,</span> <span class="pre">spec_seq:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">-1,</span> <span class="pre">spec_from_seq:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">-1,</span> <span class="pre">resident_delta:</span> <span class="pre">mstar.utils.ipc_format.OffloadDelta</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#ScheduleTPNode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.ScheduleTPNode" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1193,6 +1339,7 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 <li><p><strong>speculative</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>spec_seq</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>spec_from_seq</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>resident_delta</strong> (<a class="reference internal" href="#mstar.utils.ipc_format.OffloadDelta" title="mstar.utils.ipc_format.OffloadDelta"><em>OffloadDelta</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1209,6 +1356,11 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.ScheduleTPNode.request_ids">
 <span class="sig-name descname"><span class="pre">request_ids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.utils.ipc_format.ScheduleTPNode.request_ids" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ScheduleTPNode.resident_delta">
+<span class="sig-name descname"><span class="pre">resident_delta</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.utils.ipc_format.OffloadDelta" title="mstar.utils.ipc_format.OffloadDelta"><span class="pre">OffloadDelta</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.ScheduleTPNode.resident_delta" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1673,12 +1825,26 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.NewRequestConductor.request_id"><code class="docutils literal notranslate"><span class="pre">NewRequestConductor.request_id</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta"><code class="docutils literal notranslate"><span class="pre">OffloadDelta</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.add_offloaded"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.add_offloaded()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.add_reloaded"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.add_reloaded()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.copy"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.copy()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.extend"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.extend()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.is_offload"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.is_offload</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.new"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.new()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.peek_left"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.peek_left()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.pop_left"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.pop_left()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.rids"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.rids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.OffloadDelta.take"><code class="docutils literal notranslate"><span class="pre">OffloadDelta.take()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone"><code class="docutils literal notranslate"><span class="pre">ReadsDone</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone.entity_id"><code class="docutils literal notranslate"><span class="pre">ReadsDone.entity_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone.request_id"><code class="docutils literal notranslate"><span class="pre">ReadsDone.request_id</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.RemoveRequest"><code class="docutils literal notranslate"><span class="pre">RemoveRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.RemoveRequest.after_tp_seq"><code class="docutils literal notranslate"><span class="pre">RemoveRequest.after_tp_seq</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.RemoveRequest.request_id"><code class="docutils literal notranslate"><span class="pre">RemoveRequest.request_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.RemoveRequest.source"><code class="docutils literal notranslate"><span class="pre">RemoveRequest.source</span></code></a></li>
 </ul>
@@ -1687,6 +1853,7 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.graph_walk"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.node_name"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.node_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.request_ids"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.request_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.resident_delta"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.resident_delta</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.spec_from_seq"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.spec_from_seq</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.spec_seq"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.spec_seq</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.speculative"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.speculative</span></code></a></li>
@@ -1794,7 +1961,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 03, 2026.
+  Last updated on Oct 04, 2026.
   <br/>
 </p>
   </div>

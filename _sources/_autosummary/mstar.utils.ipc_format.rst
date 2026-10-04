@@ -27,6 +27,7 @@ mstar.utils.ipc\_format
       MessageSource
       NewRequest
       NewRequestConductor
+      OffloadDelta
       ReadsDone
       RemoveRequest
       ScheduleTPNode

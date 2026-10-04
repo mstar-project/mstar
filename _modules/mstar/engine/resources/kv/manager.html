@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 03, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -1249,7 +1249,8 @@ window.runMermaid = runMermaid;</script>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">AllocResult</span><span class="p">:</span>
     <span class="n">success</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="n">error</span><span class="p">:</span> <span class="n">AdmitFailedReason</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">error</span><span class="p">:</span> <span class="n">AdmitFailedReason</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">new_pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -1364,6 +1365,17 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># (rid, label) marked step_in_flight by a staged step, so an abandoned</span>
         <span class="c1"># one does not leave its streams unevictable</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_marked</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
+
+        <span class="c1"># (rid, label) -&gt; pages the live reservation freshly acquired, for</span>
+        <span class="c1"># ``rollback_admit``. One record, not one per pass: only the plan thread</span>
+        <span class="c1"># or the GPU thread holds a reservation at a time, and the unwind has to</span>
+        <span class="c1"># find it whichever it was.</span>
+        <span class="c1">#</span>
+        <span class="c1"># Handle-keyed, so it MUST be purged when the handle is released: handles</span>
+        <span class="c1"># are recycled, and a stale entry would resolve against whichever request</span>
+        <span class="c1"># gets that handle next. ``admit`` clears the record, but a pre-planned</span>
+        <span class="c1"># step's admit returns first -- see ``remove_request`` / ``reset_request``.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_admit_reserved_pages</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
 
 <div class="viewcode-block" id="KVManager.build">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.build">[docs]</a>
@@ -1828,12 +1840,19 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AdmitOutcome</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_key</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_key</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">):</span>
-                <span class="c1"># pages were already reserved by the preplan pass</span>
+                <span class="c1"># pages were already reserved by the preplan pass — and the record</span>
+                <span class="c1"># of them has to survive this call, because it is what a refusal</span>
+                <span class="c1"># further down the resource order unwinds. Falling through to the</span>
+                <span class="c1"># clear below would leak them.</span>
                 <span class="k">return</span> <span class="n">ADMIT_OK</span>
             <span class="c1"># a different step arrived first (see `plan`): drop the staged</span>
             <span class="c1"># plan and reserve for this step normally. The staged step's own</span>
             <span class="c1"># span pages stay with its stream, where its re-admit finds them.</span>
+            <span class="c1"># Its reservation went with ``clear_preplan``, so the record of it is</span>
+            <span class="c1"># stale and the clear below is right for this path.</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_admit_reserved_pages</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="c1"># forks reserve here and copy later (plan for pre-, commit for post-),</span>
         <span class="c1"># so a step that never runs leaves pages resident but no page contents</span>
         <span class="c1"># moved — re-admitting it allocates nothing and re-copies nothing.</span>
@@ -1891,6 +1910,9 @@ window.runMermaid = runMermaid;</script>
                     <span class="p">)</span>
                     <span class="k">if</span> <span class="ow">not</span> <span class="n">alloc_res</span><span class="o">.</span><span class="n">success</span><span class="p">:</span>
                         <span class="k">return</span> <span class="n">AdmitOutcome</span><span class="p">(</span><span class="n">ok</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">reason</span><span class="o">=</span><span class="n">alloc_res</span><span class="o">.</span><span class="n">error</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">alloc_res</span><span class="o">.</span><span class="n">new_pages</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_admit_reserved_pages</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span>
+                            <span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">to_label</span><span class="p">),</span> <span class="p">[])</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">alloc_res</span><span class="o">.</span><span class="n">new_pages</span><span class="p">)</span>
 
             <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">segment</span><span class="o">.</span><span class="n">span</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
@@ -1903,6 +1925,10 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">)</span>
                 <span class="k">if</span> <span class="ow">not</span> <span class="n">alloc_res</span><span class="o">.</span><span class="n">success</span><span class="p">:</span>
                     <span class="k">return</span> <span class="n">AdmitOutcome</span><span class="p">(</span><span class="n">ok</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">reason</span><span class="o">=</span><span class="n">alloc_res</span><span class="o">.</span><span class="n">error</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">alloc_res</span><span class="o">.</span><span class="n">new_pages</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_admit_reserved_pages</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span>
+                        <span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">),</span> <span class="p">[]</span>
+                    <span class="p">)</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">alloc_res</span><span class="o">.</span><span class="n">new_pages</span><span class="p">)</span>
 
             <span class="c1"># marked here rather than in plan so the mark also covers</span>
             <span class="c1"># admit -&gt; plan, where an offload would otherwise release pages</span>
@@ -1927,6 +1953,48 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">return</span> <span class="n">ADMIT_OK</span></div>
 
+
+<div class="viewcode-block" id="KVManager.rollback_admit">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.rollback_admit">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">rollback_admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Give back the pages this admit freshly acquired. Does not touch pages</span>
+<span class="sd">        retained by a shared prefix or a lease converted onto the stream.</span>
+
+<span class="sd">        ``page_indices`` maps token position to page, so the reserved pages can</span>
+<span class="sd">        only be dropped off the tail. If something else has extended the stream</span>
+<span class="sd">        since, the tail can no longer be safely removed.</span>
+<span class="sd">        """</span>
+        <span class="k">del</span> <span class="n">step</span><span class="p">,</span> <span class="n">ctx</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="n">reserved</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_reserved_pages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_reserved_pages</span><span class="p">,</span> <span class="p">{}</span>
+            <span class="k">for</span> <span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">),</span> <span class="n">pages</span> <span class="ow">in</span> <span class="n">reserved</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">pages</span><span class="p">:</span>
+                    <span class="k">continue</span>  <span class="c1"># `page_indices[:-0]` would empty the whole stream</span>
+                <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">stream</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">continue</span>  <span class="c1"># reset or removed under us; its pages went with it</span>
+                <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">[</span><span class="o">-</span><span class="nb">len</span><span class="p">(</span><span class="n">pages</span><span class="p">):]</span> <span class="o">!=</span> <span class="n">pages</span><span class="p">:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+                        <span class="s2">"KV </span><span class="si">%s</span><span class="s2">: cannot unwind </span><span class="si">%s</span><span class="s2">/</span><span class="si">%s</span><span class="s2">'s admit — its pages are no "</span>
+                        <span class="s2">"longer the tail of the stream (</span><span class="si">%d</span><span class="s2"> reserved, stream has "</span>
+                        <span class="s2">"</span><span class="si">%d</span><span class="s2">). Leaving them; the free pool is short by that much."</span><span class="p">,</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">pages</span><span class="p">),</span>
+                        <span class="nb">len</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">),</span>
+                    <span class="p">)</span>
+                    <span class="k">continue</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">pages</span><span class="p">)</span>
+                <span class="k">del</span> <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">[</span><span class="o">-</span><span class="nb">len</span><span class="p">(</span><span class="n">pages</span><span class="p">):]</span>
+                <span class="c1"># so an offload that claimed this stream mid-admit notices its</span>
+                <span class="c1"># host copy no longer describes it and aborts</span>
+                <span class="n">stream</span><span class="o">.</span><span class="n">generation</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">if</span> <span class="n">_DEBUG_ASSERTS</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">assert_pages_conserved</span><span class="p">()</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_forget_reservations</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Drop ``rid``'s unwind record. Caller holds the lock."""</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="p">[</span><span class="n">k</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_reserved_pages</span> <span class="k">if</span> <span class="n">k</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">rid</span><span class="p">]:</span>
+            <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_reserved_pages</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_sequence_views</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">segments</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Segment</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">SequenceView</span><span class="p">]:</span>
         <span class="n">views</span> <span class="o">=</span> <span class="p">[]</span>
@@ -2157,6 +2225,8 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">commit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
         <span class="c1"># atomic against admit_retrieve reading stored_len on another thread</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="c1"># committed, so there is nothing left to unwind</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_admit_reserved_pages</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
             <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">:</span>
                 <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">][</span><span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">]</span>
                 <span class="c1"># cleared before the `step.commit` test: a step that keeps no</span>
@@ -2495,6 +2565,24 @@ window.runMermaid = runMermaid;</script>
             <span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span>
         <span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_reload_pages_needed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span><span class="o">.</span><span class="n">num_pages</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">label</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="p">)</span>
+
+<div class="viewcode-block" id="KVManager.can_reload">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.can_reload">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">can_reload</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether the free pages plus what the prefix index could evict cover</span>
+<span class="sd">        ``rid``'s offloaded streams. An upper bound: ``reload`` can still refuse."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span><span class="o">.</span><span class="n">is_offloaded</span><span class="p">(</span><span class="n">rid</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="n">evictable</span> <span class="o">=</span> <span class="mi">0</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span><span class="o">.</span><span class="n">num_sole_owned</span><span class="p">()</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reload_pages_needed</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_free</span> <span class="o">+</span> <span class="n">evictable</span></div>
+
+
 <div class="viewcode-block" id="KVManager.reload">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.reload">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">reload</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -2507,7 +2595,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="kc">False</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
             <span class="n">labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
-            <span class="n">needed</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span><span class="o">.</span><span class="n">num_pages</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span> <span class="k">for</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">labels</span><span class="p">)</span>
+            <span class="n">needed</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reload_pages_needed</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">needed</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_free</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="c1"># as `_alloc` does: once the pool is all cached pages, nothing</span>
                 <span class="c1"># else would ever free one for this request to come back to</span>
@@ -2670,6 +2758,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">stream</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">freed</span><span class="o">=</span><span class="n">drop</span><span class="p">)</span>
                 <span class="c1"># a stale cursor or generated key would misfile what the rerun writes</span>
                 <span class="n">stream</span><span class="o">.</span><span class="n">forget_chain</span><span class="p">()</span>
+            <span class="c1"># the pages above were released, so any record of them is stale</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_forget_reservations</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">stream</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_seed_keys</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">stream</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">_DEBUG_ASSERTS</span><span class="p">:</span>
@@ -2692,6 +2782,9 @@ window.runMermaid = runMermaid;</script>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span><span class="o">.</span><span class="n">remove_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+            <span class="c1"># handle-keyed, and this releases the handle: a survivor would be</span>
+            <span class="c1"># unwound against whichever request is given this handle next</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_forget_reservations</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_transfer</span><span class="o">.</span><span class="n">remove_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
@@ -2938,6 +3031,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">)</span>
             <span class="n">num_pages_needed</span> <span class="o">=</span> <span class="p">(</span><span class="n">seq_len</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
             <span class="n">num_new_pages</span> <span class="o">=</span> <span class="n">num_pages_needed</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span>
+            <span class="c1"># a stream that already holds enough pages acquires none, and has</span>
+            <span class="c1"># nothing for ``rollback_admit`` to give back</span>
+            <span class="n">new_pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
             <span class="k">if</span> <span class="n">num_new_pages</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="n">new_pages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">acquire</span><span class="p">(</span><span class="n">num_new_pages</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">new_pages</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -2962,7 +3058,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="p">)</span>
                 <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">new_pages</span><span class="p">)</span>
                 <span class="n">stream</span><span class="o">.</span><span class="n">generation</span> <span class="o">+=</span> <span class="mi">1</span>
-        <span class="k">return</span> <span class="n">AllocResult</span><span class="p">()</span>
+        <span class="k">return</span> <span class="n">AllocResult</span><span class="p">(</span><span class="n">new_pages</span><span class="o">=</span><span class="n">new_pages</span><span class="p">)</span>
 
     <span class="c1">### Submodule-level functionality</span>
     <span class="c1"># Label / layer cursors come from `AttentionResource`; the readers resolve</span>
@@ -3085,7 +3181,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 03, 2026.
+  Last updated on Oct 04, 2026.
   <br/>
 </p>
   </div>

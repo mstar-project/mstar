@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 03, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -971,7 +971,11 @@ window.runMermaid = runMermaid;</script>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">RemoveRequest</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
     <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">source</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">MessageSource</span><span class="o">.</span><span class="n">CONDUCTOR</span></div>
+    <span class="n">source</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">MessageSource</span><span class="o">.</span><span class="n">CONDUCTOR</span>
+    <span class="c1"># Rank 0 forwarding a removal to its followers stamps the last step it had</span>
+    <span class="c1"># broadcast, so they tear the request down at the same point in the step</span>
+    <span class="c1"># sequence it did, maintaining KV cache state symmetry.</span>
+    <span class="n">after_tp_seq</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span></div>
 
 
 
@@ -1030,6 +1034,103 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="OffloadDelta">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.OffloadDelta">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">OffloadDelta</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A rank's offloads and reloads, in the order it made them.</span>
+
+<span class="sd">    Ordered so the follower replays the leader's decisions in the same order: a</span>
+<span class="sd">    sequence that worked for the leader works for the followers too.</span>
+
+<span class="sd">    Holds WIRE request ids, not worker-local handles: a handle is minted per</span>
+<span class="sd">    worker, so rank 0's would name different requests on the follower.</span>
+
+<span class="sd">    A dataclass of lists rather than a NamedTuple of deques so that the wire codec</span>
+<span class="sd">    can automatically encode it. ``pop_left`` is O(n) on a list, which costs nothing</span>
+<span class="sd">    at the handful of entries a delta ever holds.</span>
+
+<span class="sd">    ``__len__`` is the queue depth, so an empty delta is falsy -- several callers</span>
+<span class="sd">    lean on that.</span>
+<span class="sd">    """</span>
+
+    <span class="c1"># parallel lists: rids[i] was offloaded if is_offload[i], else reloaded</span>
+    <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">is_offload</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+
+<div class="viewcode-block" id="OffloadDelta.new">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.OffloadDelta.new">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">new</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"OffloadDelta"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="OffloadDelta.add_offloaded">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.OffloadDelta.add_offloaded">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">add_offloaded</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_offload</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="OffloadDelta.add_reloaded">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.OffloadDelta.add_reloaded">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">add_reloaded</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_offload</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="kc">False</span><span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__len__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">rids</span><span class="p">)</span>
+
+<div class="viewcode-block" id="OffloadDelta.peek_left">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.OffloadDelta.peek_left">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">peek_left</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+            <span class="k">return</span>
+        <span class="k">return</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">rids</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_offload</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span></div>
+
+
+<div class="viewcode-block" id="OffloadDelta.pop_left">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.OffloadDelta.pop_left">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pop_left</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">rids</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_offload</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span></div>
+
+
+<div class="viewcode-block" id="OffloadDelta.copy">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.OffloadDelta.copy">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"OffloadDelta"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""An independent queue holding the same moves.</span>
+
+<span class="sd">        One per follower: each replays at its own pace, popping as it goes.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="n">OffloadDelta</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">rids</span><span class="p">),</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">is_offload</span><span class="p">))</span></div>
+
+
+<div class="viewcode-block" id="OffloadDelta.take">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.OffloadDelta.take">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">take</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"OffloadDelta"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Hand the queue over and leave this one empty.</span>
+
+<span class="sd">        Copies and clears rather than rebinding, so a holder of this delta (the</span>
+<span class="sd">        engine keeps its journal in a dict) sees it emptied.</span>
+<span class="sd">        """</span>
+        <span class="n">taken</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rids</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_offload</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+        <span class="k">return</span> <span class="n">taken</span></div>
+
+
+<div class="viewcode-block" id="OffloadDelta.extend">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.OffloadDelta.extend">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">extend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">"OffloadDelta"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rids</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">other</span><span class="o">.</span><span class="n">rids</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_offload</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">other</span><span class="o">.</span><span class="n">is_offload</span><span class="p">)</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="ScheduleTPNode">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ScheduleTPNode">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -1039,7 +1140,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
     <span class="n">speculative</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">spec_seq</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
-    <span class="n">spec_from_seq</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span></div>
+    <span class="n">spec_from_seq</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
+    <span class="n">resident_delta</span><span class="p">:</span> <span class="n">OffloadDelta</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">OffloadDelta</span><span class="o">.</span><span class="n">new</span><span class="p">)</span></div>
 
 
 
@@ -1207,7 +1309,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 03, 2026.
+  Last updated on Oct 04, 2026.
   <br/>
 </p>
   </div>

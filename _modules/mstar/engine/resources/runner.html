@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 03, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -1236,9 +1236,12 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="StepRunner.admit">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.admit">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">FullAdmitOutcome</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""reserve capacity for step"""</span>
+<span class="w">        </span><span class="sd">"""Reserve capacity for step. A refused admit gives back everything</span>
+<span class="sd">        the step reserved.</span>
+<span class="sd">        """</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_drop_stale_preplan</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
         <span class="n">ready</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="n">admitted</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                 <span class="n">range_push</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.admit.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
@@ -1252,7 +1255,12 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">"Admit for resource </span><span class="si">%s</span><span class="s2"> failed with error: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
                     <span class="n">key</span><span class="p">,</span> <span class="n">outcome</span><span class="o">.</span><span class="n">reason</span><span class="o">.</span><span class="n">message</span>
                 <span class="p">)</span>
+                <span class="k">for</span> <span class="n">done</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">([</span><span class="o">*</span><span class="n">admitted</span><span class="p">,</span> <span class="n">key</span><span class="p">]):</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">done</span><span class="p">]</span><span class="o">.</span><span class="n">rollback_admit</span><span class="p">(</span>
+                        <span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">done</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">,</span>
+                    <span class="p">)</span>
                 <span class="k">return</span> <span class="n">FullAdmitOutcome</span><span class="p">(</span><span class="n">outcome</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span>
+            <span class="n">admitted</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
             <span class="n">ready</span> <span class="o">=</span> <span class="n">ready</span> <span class="ow">and</span> <span class="n">outcome</span><span class="o">.</span><span class="n">ready</span>
         <span class="k">return</span> <span class="n">FULL_ADMIT_OK</span> <span class="k">if</span> <span class="n">ready</span> <span class="k">else</span> <span class="n">FULL_ADMIT_NOT_READY</span></div>
 
@@ -1288,8 +1296,12 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""admit over the pre-planning subset, a step ahead</span>
 
 <span class="sd">        the later full `admit` covers the rest; these resources see their own</span>
-<span class="sd">        state as already reserved and no-op"""</span>
+<span class="sd">        state as already reserved and no-op</span>
+
+<span class="sd">        Unwound on refusal exactly as ``admit`` is.</span>
+<span class="sd">        """</span>
         <span class="n">ready</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="n">admitted</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                 <span class="n">range_push</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.pre_admit.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
@@ -1303,7 +1315,12 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">"Admit for pre-planning resource </span><span class="si">%s</span><span class="s2"> failed with error: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
                     <span class="n">key</span><span class="p">,</span> <span class="n">outcome</span><span class="o">.</span><span class="n">reason</span><span class="o">.</span><span class="n">message</span>
                 <span class="p">)</span>
+                <span class="k">for</span> <span class="n">done</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">([</span><span class="o">*</span><span class="n">admitted</span><span class="p">,</span> <span class="n">key</span><span class="p">]):</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">done</span><span class="p">]</span><span class="o">.</span><span class="n">rollback_admit</span><span class="p">(</span>
+                        <span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">done</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">,</span>
+                    <span class="p">)</span>
                 <span class="k">return</span> <span class="n">FullAdmitOutcome</span><span class="p">(</span><span class="n">outcome</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span>
+            <span class="n">admitted</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
             <span class="n">ready</span> <span class="o">=</span> <span class="n">ready</span> <span class="ow">and</span> <span class="n">outcome</span><span class="o">.</span><span class="n">ready</span>
         <span class="k">return</span> <span class="n">FULL_ADMIT_OK</span> <span class="k">if</span> <span class="n">ready</span> <span class="k">else</span> <span class="n">FULL_ADMIT_NOT_READY</span></div>
 
@@ -1464,7 +1481,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 03, 2026.
+  Last updated on Oct 04, 2026.
   <br/>
 </p>
   </div>
