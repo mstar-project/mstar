@@ -263,7 +263,7 @@ def test_ingest_binds_the_request_to_its_session():
     assert w._sessions.session_of("Y") == "s"
 
 
-def test_ingest_fails_a_request_whose_session_overflowed_under_the_error_policy():
+def test_ingest_fails_a_request_whose_session_went_over_its_budget():
     w = _worker(known_rids=())
     w.session_errors["s"] = "session s exceeded its state budget"
     failed = {}

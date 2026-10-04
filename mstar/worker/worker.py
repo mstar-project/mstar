@@ -564,7 +564,7 @@ class Worker:
             session_id=session_id,
         )
         if session_id is not None:
-            # An ERROR-policy overflow the session owes this request: it was
+            # A budget overflow the session owes this request: it was
             # cleared rather than truncated, so say so instead of continuing
             # from a context that is no longer what the client built.
             error = self.engine_manager.take_session_error(session_id)

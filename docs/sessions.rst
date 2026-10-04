@@ -20,17 +20,13 @@ session and the deployment-facing caps:
 
 .. code-block:: python
 
-   from mstar.model.sessions import (
-       SessionOverflowPolicy, SessionResourceConfig, SessionsConfig,
-   )
+   from mstar.model.sessions import SessionResourceConfig, SessionsConfig
 
    def get_sessions_config(self):
        return SessionsConfig(
            resources={
-               "kv_cache": SessionResourceConfig(
-                   max_state=512,  # pages, this resource's own unit
-                   overflow_policy=SessionOverflowPolicy.ERROR,
-               ),
+               # max_state is in pages, this resource's own unit
+               "kv_cache": SessionResourceConfig(max_state=512),
            },
            max_concurrent_sessions=8,
            default_timeout_s=300.0,
@@ -54,26 +50,24 @@ keys that do not describe them. Adopting a session's state therefore turns that
 one request's prefix cache off, which shuts the probe, the apply, the extend and
 the filing together.
 
-Overflow policies
-^^^^^^^^^^^^^^^^^
+Outgrowing the budget
+^^^^^^^^^^^^^^^^^^^^^
 
 ``max_state`` is checked when a request hands its state back to the session, not
-on every step, so an in-flight request may exceed it. When the session is over
-budget:
-
-- ``CLEAR`` (the default) drops everything the session holds. The next request
-  in it starts from scratch.
-- ``ERROR`` drops the state *and* fails the session's next request, so a client
-  is told rather than silently served from a context it did not build.
+on every step, so an in-flight request may exceed it. A session over budget is
+dropped, and its next request is refused with the reason — the client is told
+rather than silently served from an empty context it believes still holds the
+conversation. There is no quieter option: a session whose state vanished between
+turns is not one a client can reason about.
 
 The budget is a backstop against a session outgrowing what the deployment will
 hold, not a way to trim one. **A bounded, rolling context is a different thing
 and belongs to the resource**: a KV stream declares a
 :class:`~mstar.engine.resources.kv.config.RetentionPolicy` on its step, and
 ``commit`` releases its oldest whole pages behind ``protected_prefix`` as the
-stream grows — which is how windowed generation holds a fixed context. A
-deployment that wants a session to keep generating indefinitely wants that, not a
-budget it periodically trips.
+stream grows — which is how sliding-window attention holds a fixed context
+indefinitely. A deployment that wants a session to keep generating forever wants
+that, not a budget it periodically trips.
 
 What a request's model sees
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -117,7 +111,6 @@ does not hold across a session.
      resources:
        kv_cache:
          max_state: 1024
-         overflow_policy: clear
 
 ``ttl_mode: idle`` expires a session ``timeout_s`` after its last request
 finished; ``absolute`` expires it that long after it was started, however busy

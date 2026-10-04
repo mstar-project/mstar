@@ -23,7 +23,6 @@ from mstar.graph.base import TensorPointerInfo
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.sessions import (
     RequestSession,
-    SessionOverflowPolicy,
     apply_sessions_yaml_overrides,
 )
 from mstar.model.test_text_session.model import TEXT_WALKS
@@ -210,9 +209,7 @@ def test_the_shipped_config_merges_over_the_declaration(model, serving_config):
 
     assert merged is not None
     assert set(merged.resources) == {"kv"}
-    assert (
-        merged.resources["kv"].overflow_policy is SessionOverflowPolicy.ERROR
-    )
+    assert merged.resources["kv"].max_state == 64
     assert merged.max_timeout_s == 1800.0
 
 

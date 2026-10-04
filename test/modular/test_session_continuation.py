@@ -31,7 +31,6 @@ from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.model.sessions import (
-    SessionOverflowPolicy,
     SessionResourceConfig,
     SessionsConfig,
 )
@@ -76,7 +75,7 @@ class _Node:
     """One node's KV and positions, marked up by the engine from a model's
     ``SessionsConfig`` exactly as a worker would at load."""
 
-    def __init__(self, max_state: int | None = None, policy=None):
+    def __init__(self, max_state: int | None = None):
         device = torch.device("cpu")
         self.kv = KVManager(
             cfg=PagedKVConfig(
@@ -98,7 +97,6 @@ class _Node:
         # counters over it have to come along
         config = SessionsConfig(resources={KV: SessionResourceConfig(
             max_state=max_state,
-            overflow_policy=policy or SessionOverflowPolicy.CLEAR,
         )})
         engine = Engine.__new__(Engine)
         engine._resources = {KV: self.kv, ROPE: self.rope}
@@ -249,7 +247,7 @@ def test_a_turn_after_the_session_ended_starts_from_nothing():
 # ── the budget ──────────────────────────────────────────────────────────────
 
 def test_a_session_over_budget_is_cleared_and_the_next_turn_starts_over():
-    node = _Node(max_state=2, policy=SessionOverflowPolicy.CLEAR)
+    node = _Node(max_state=2)
     node.start("r0")
     node.step("r0", 100)  # 7 pages, well past the 2 it may hold
 
@@ -264,7 +262,7 @@ def test_a_session_over_budget_is_cleared_and_the_next_turn_starts_over():
 def test_the_clear_takes_the_counters_with_the_pages():
     # the counters address the pages: clearing one and not the other would put
     # the next turn's tokens past a context that is no longer there
-    node = _Node(max_state=2, policy=SessionOverflowPolicy.CLEAR)
+    node = _Node(max_state=2)
     node.start("r0")
     node.step("r0", 100)
 
@@ -274,8 +272,8 @@ def test_the_clear_takes_the_counters_with_the_pages():
     assert node.rope.session_state_size(SESSION) == 0
 
 
-def test_the_error_policy_owes_the_next_turn_an_explanation():
-    node = _Node(max_state=2, policy=SessionOverflowPolicy.ERROR)
+def test_the_cleared_session_owes_the_next_turn_an_explanation():
+    node = _Node(max_state=2)
     node.start("r0")
     node.step("r0", 100)
 
@@ -287,7 +285,7 @@ def test_the_error_policy_owes_the_next_turn_an_explanation():
 
 
 def test_a_session_inside_its_budget_is_left_alone():
-    node = _Node(max_state=8, policy=SessionOverflowPolicy.ERROR)
+    node = _Node(max_state=8)
     node.start("r0")
     node.step("r0", 100)
 

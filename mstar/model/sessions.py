@@ -18,20 +18,6 @@ logger = logging.getLogger(__name__)
 ABSOLUTE_MAX_TIMEOUT_S = 24 * 3600
 
 
-class SessionOverflowPolicy(Enum):
-    """What happens when a session's held state exceeds its budget.
-
-    A backstop, not a way to trim: a bounded rolling context is the resource's
-    own business (a KV stream's ``RetentionPolicy``), not this budget's.
-    """
-
-    # Drop everything the session holds; the next request starts from scratch.
-    CLEAR = "clear"
-    # Drop everything and fail the session's next request, so a client is told
-    # rather than silently served from a truncated context.
-    ERROR = "error"
-
-
 class SessionCapacityPolicy(Enum):
     """What a deployment at ``max_concurrent_sessions`` does with a new one."""
 
@@ -78,16 +64,19 @@ class RequestSession:
 
 @dataclass
 class SessionResourceConfig:
-    """One resource's session behaviour."""
+    """One resource's session behaviour.
+
+    ``max_state`` is a backstop, not a way to trim: a session that outgrows it
+    is dropped and told so on its next request. Serving a bounded rolling
+    context instead is the resource's own business -- sliding-window attention,
+    or a KV stream's ``RetentionPolicy`` -- not this budget's.
+    """
 
     # Resource-native units: pages for a KV cache, slots for recurrent state.
     # None means unbounded (bounded in practice by the resource's own pool).
     max_state: int | None = None
-    overflow_policy: SessionOverflowPolicy = SessionOverflowPolicy.CLEAR
 
     def __post_init__(self):
-        if isinstance(self.overflow_policy, str):
-            self.overflow_policy = SessionOverflowPolicy(self.overflow_policy)
         if self.max_state is not None and self.max_state <= 0:
             raise ValueError(
                 f"max_state must be positive, got {self.max_state}"

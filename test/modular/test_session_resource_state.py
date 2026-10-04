@@ -2,7 +2,7 @@
 
 ``StepRunner`` is the only thing that knows a request belongs to a session, so
 it decides per resource whether a removal frees the state or hands it to the
-session — and it is what applies the overflow policy once the state is the
+session — and it is what enforces the state budget once the state is the
 session's. A resource that holds no session state must see exactly the calls it
 saw before.
 """
@@ -13,10 +13,9 @@ import sys
 
 sys.path.insert(0, ".")
 
-import pytest
 
 from mstar.engine.resources import Resource, StepRunner
-from mstar.model.sessions import SessionOverflowPolicy, SessionResourceConfig
+from mstar.model.sessions import SessionResourceConfig
 
 
 class _Stub(Resource):
@@ -64,7 +63,7 @@ class _Stub(Resource):
         return self.sessions.get(session_id, 0)
 
 
-def _runner(session_keys=(), max_state=None, policy=None, derived=()):
+def _runner(session_keys=(), max_state=None, derived=()):
     """A runner over three stubs. ``session_keys`` hold session state under the
     given budget; ``derived`` hold it with no budget of their own, which is what
     the engine gives a resource built against a session resource."""
@@ -76,7 +75,6 @@ def _runner(session_keys=(), max_state=None, policy=None, derived=()):
     for key in session_keys:
         resources[key].session_config = SessionResourceConfig(
             max_state=max_state,
-            overflow_policy=policy or SessionOverflowPolicy.CLEAR,
         )
     for key in derived:
         resources[key].session_config = SessionResourceConfig()
@@ -163,26 +161,8 @@ def test_no_budget_means_no_check():
     assert res["kv"].sessions == {"s": 10_000}
 
 
-def test_the_clear_policy_drops_the_whole_session_state():
-    runner, res = _runner(
-        session_keys=("kv",), max_state=10,
-        policy=SessionOverflowPolicy.CLEAR,
-    )
-    runner.ingest_request("r0", session_id="s")
-    res["kv"].requests["r0"] = 11
-
-    runner.remove_request("r0", session_id="s")
-
-    assert res["kv"].sessions == {}
-    # the session survives; only its state went
-    assert runner.take_session_error("s") is None
-
-
-def test_the_error_policy_clears_and_owes_the_next_request_an_error():
-    runner, res = _runner(
-        session_keys=("kv",), max_state=10,
-        policy=SessionOverflowPolicy.ERROR,
-    )
+def test_going_over_budget_clears_and_owes_the_next_request_an_error():
+    runner, res = _runner(session_keys=("kv",), max_state=10)
     runner.ingest_request("r0", session_id="s")
     res["kv"].requests["r0"] = 40
 
@@ -197,10 +177,7 @@ def test_the_error_policy_clears_and_owes_the_next_request_an_error():
 
 
 def test_ending_the_session_drops_the_owed_error_too():
-    runner, res = _runner(
-        session_keys=("kv",), max_state=1,
-        policy=SessionOverflowPolicy.ERROR,
-    )
+    runner, res = _runner(session_keys=("kv",), max_state=1)
     runner.ingest_request("r0", session_id="s")
     res["kv"].requests["r0"] = 40
     runner.remove_request("r0", session_id="s")
@@ -224,9 +201,8 @@ def test_a_breach_on_one_resource_clears_every_session_resource():
     assert res["pos"].sessions == {}
 
 
-@pytest.mark.parametrize("policy", list(SessionOverflowPolicy))
-def test_every_policy_leaves_the_session_usable_or_told(policy):
-    runner, res = _runner(session_keys=("kv",), max_state=4, policy=policy)
+def test_a_cleared_session_is_still_usable():
+    runner, res = _runner(session_keys=("kv",), max_state=4)
     runner.ingest_request("r0", session_id="s")
     res["kv"].requests["r0"] = 99
     runner.remove_request("r0", session_id="s")

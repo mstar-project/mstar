@@ -19,7 +19,6 @@ from mstar.engine.resources.step import (
     FullAdmitOutcome,
     SubmoduleStep,
 )
-from mstar.model.sessions import SessionOverflowPolicy
 from mstar.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -69,7 +68,7 @@ class StepRunner:
         # is a real CUDA call even with no profiler attached.
         self._nvtx = enable_nvtx
         self._resources: dict[str, Resource] = dict(resources)
-        # ERROR-policy overflows owed to a session, read at its next ingest
+        # Budget overflows owed to a session, read at its next ingest
         self._session_errors: dict[str, str] = {}
         self._order = topo_sort(self._resources) # only toposort once to minimize cpu time on python
         self._preplan_order = [
@@ -269,17 +268,17 @@ class StepRunner:
             held = resource.session_state_size(session_id)
             if held <= cfg.max_state:
                 continue
-            policy = cfg.overflow_policy
             logger.warning(
                 "Session %s holds %d of resource %s, over its budget of %d; "
-                "applying %s", session_id, held, key, cfg.max_state, policy.value,
+                "dropping it", session_id, held, key, cfg.max_state,
             )
             self._clear_session(session_id)
-            if policy is SessionOverflowPolicy.ERROR:
-                self._session_errors[session_id] = (
-                    f"session {session_id} exceeded its state budget for "
-                    f"resource {key!r} ({held} > {cfg.max_state}) and was cleared"
-                )
+            # the client is told rather than silently served from an empty
+            # context it thinks still holds its conversation
+            self._session_errors[session_id] = (
+                f"session {session_id} exceeded its state budget for "
+                f"resource {key!r} ({held} > {cfg.max_state}) and was cleared"
+            )
             return  # nothing is left to be over budget
 
     def _clear_session(self, session_id: str) -> None:
@@ -293,7 +292,7 @@ class StepRunner:
             self._resources[key].remove_session(session_id)
 
     def take_session_error(self, session_id: str) -> str | None:
-        """The ERROR-policy overflow owed to this session, consumed once."""
+        """The budget overflow owed to this session, consumed once."""
         return self._session_errors.pop(session_id, None)
 
     def session_resource_keys(self) -> list[str]:

@@ -1,5 +1,5 @@
-# The forgiving corner: a full deployment evicts its least recently used idle
-# session to make room, and a session over its budget is quietly cleared.
+# A full deployment refuses a new session rather than making room, so a client
+# at the cap is told to end one first.
 model: "test_text_session"
 max_seq_len: 32768
 max_concurrent_requests: 8
@@ -7,7 +7,7 @@ max_concurrent_requests: 8
 sessions:
   # small on purpose: two sessions is enough to reach the cap in a test
   max_concurrent_sessions: 2
-  capacity_policy: evict
+  capacity_policy: keep
   default_timeout_s: 600.0
   max_timeout_s: 1800.0
   ttl_mode: idle
@@ -15,7 +15,6 @@ sessions:
     kv:
       # pages (128 tokens each), so ~8k tokens of conversation per session
       max_state: 64
-      overflow_policy: clear
 
 node_groups:
   - node_names:

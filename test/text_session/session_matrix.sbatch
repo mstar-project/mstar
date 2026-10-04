@@ -29,7 +29,7 @@ JOB=${SLURM_ARRAY_JOB_ID:-local}_${SLURM_ARRAY_TASK_ID:-0}
 TASK=${SLURM_ARRAY_TASK_ID:-0}
 
 # One config per array task; add a config here and widen --array to match.
-CONFIGS=(keep_error evict_clear ttl_idle ttl_absolute)
+CONFIGS=(capacity_keep capacity_evict ttl_idle ttl_absolute)
 NAME=${CONFIGS[$TASK]}
 CONFIG=configs/text_session/$NAME.yaml
 
@@ -117,20 +117,20 @@ scenario() {  # scenario <name>
 }
 
 case $NAME in
-  keep_error)
+  capacity_keep)
     run happy "$PYTHON" test/text_session/session_request.py --url "$URL"
     run happy-ws "$PYTHON" test/text_session/ws_session_request.py \
         --url "ws://localhost:$PORT"
     scenario limits
     scenario capacity_refuse
     run budget "$PYTHON" test/text_session/budget_probe.py --url "$URL" \
-        --config "$CONFIG" --server-log "$SERVER_LOG"
+        --config "$CONFIG"
     ;;
-  evict_clear)
+  capacity_evict)
     run happy "$PYTHON" test/text_session/session_request.py --url "$URL"
     scenario capacity_evict
     run budget "$PYTHON" test/text_session/budget_probe.py --url "$URL" \
-        --config "$CONFIG" --server-log "$SERVER_LOG"
+        --config "$CONFIG"
     ;;
   ttl_idle)
     scenario limits

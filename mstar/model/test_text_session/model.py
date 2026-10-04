@@ -30,7 +30,6 @@ from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.base import PrefixStream
 from mstar.model.multimodal import TEXT
 from mstar.model.sessions import (
-    SessionOverflowPolicy,
     SessionResourceConfig,
     SessionsConfig,
 )
@@ -82,10 +81,7 @@ class TextSessionModel(BagelModel):
         """
         return SessionsConfig(
             resources={
-                "kv": SessionResourceConfig(
-                    max_state=64,
-                    overflow_policy=SessionOverflowPolicy.ERROR,
-                ),
+                "kv": SessionResourceConfig(max_state=64),
             },
             max_concurrent_sessions=4,
             default_timeout_s=300.0,

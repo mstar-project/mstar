@@ -1738,7 +1738,7 @@ class Engine:
             submodule_mgmt.submodule.cleanup_session(session_id)
 
     def take_session_error(self, session_id: str) -> str | None:
-        """An ERROR-policy overflow this session owes its next request."""
+        """The budget overflow this session owes its next request, if any."""
         return self._runner.take_session_error(session_id)
 
     def shutdown(self):

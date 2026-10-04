@@ -16,7 +16,6 @@ import pytest
 from mstar.model.sessions import (
     RequestSession,
     SessionCapacityPolicy,
-    SessionOverflowPolicy,
     SessionResourceConfig,
     SessionsConfig,
     SessionTTLMode,
@@ -34,14 +33,16 @@ def _config(**kwargs) -> SessionsConfig:
 
 def test_string_enums_are_coerced():
     cfg = SessionsConfig(
-        resources={"kv_cache": {"max_state": 8, "overflow_policy": "error"}},
+        resources={"kv_cache": {"max_state": 8}},
         ttl_mode="absolute",
+        capacity_policy="evict",
     )
 
     assert cfg.ttl_mode is SessionTTLMode.ABSOLUTE
+    assert cfg.capacity_policy is SessionCapacityPolicy.EVICT
     resource = cfg.resources["kv_cache"]
     assert isinstance(resource, SessionResourceConfig)
-    assert resource.overflow_policy is SessionOverflowPolicy.ERROR
+    assert resource.max_state == 8
 
 
 def test_the_capacity_policy_defaults_to_keeping_state():
@@ -92,17 +93,13 @@ def test_block_tunes_caps_and_budgets():
         "max_concurrent_sessions": 32,
         "capacity_policy": "evict",
         "default_timeout_s": 60.0,
-        "resources": {"kv_cache": {"max_state": 256, "overflow_policy": "error"}},
+        "resources": {"kv_cache": {"max_state": 256}},
     }})
 
     assert merged.max_concurrent_sessions == 32
     assert merged.capacity_policy is SessionCapacityPolicy.EVICT
     assert merged.default_timeout_s == 60.0
     assert merged.resources["kv_cache"].max_state == 256
-    assert (
-        merged.resources["kv_cache"].overflow_policy
-        is SessionOverflowPolicy.ERROR
-    )
 
 
 def test_overrides_do_not_mutate_the_model_s_declaration():
