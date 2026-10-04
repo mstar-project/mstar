@@ -889,6 +889,15 @@ class Worker:
             self._graph_runtime.set_walk(
                 request_id, body.partition_name, body.request_info.graph_walk,
             )
+            # Seed this walk's loop counters. Nothing else initialises them: they
+            # only ever appear via the `update(new_iters)` in _postprocess_batch or
+            # the non-speculative build path, so a request folded into a speculative
+            # batch on its first iteration reaches the submodule with an empty dict
+            # -- which `step_index`'s `.get(name, 0)` reads as iteration 0.
+            for _rid, _iters in self._graph_runtime.get_dynamic_loop_iters(
+                [request_id], partition=body.partition_name,
+            ):
+                body.request_info.dynamic_loop_iter_counts.update(_iters)
             self.request_state.update_request_info(
                 request_id, current_fwd_info=body.request_info,
                 partition_name=body.partition_name
@@ -2610,6 +2619,16 @@ class Worker:
             list(per_request_info), partition=batch_N.partition,
         ):
             per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
+            # A speculative batch carries `replace()`d copies of the shared fwd info
+            # (_speculative_fwd_info), so the update above lands on the copy and the
+            # shared counters never advance -- a later pass built from the shared info
+            # then re-runs an iteration it has already done. Write through.
+            try:
+                shared = self.request_state.get_fwd_info(rid, batch_N.partition)
+            except KeyError:  # request already finished/removed
+                shared = None
+            if shared is not None and shared is not per_request_info[rid]:
+                shared.dynamic_loop_iter_counts.update(new_iters)
 
         # Check for stops. Prematerialising pulls sampled tokens to the host,
         # so this can carry a device transfer as well as the stop logic.
