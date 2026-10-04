@@ -133,6 +133,10 @@ class KimiK2Model(Model):
             # ``prefill_vision`` walk; the chat path then treats image parts
             # as unsupported.
             self.config = replace(self.config, vision=None)
+        if "prefill_max_batch_tokens" in kwargs:
+            self.config = replace(
+                self.config, prefill_max_batch_tokens=kwargs["prefill_max_batch_tokens"],
+            )
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}

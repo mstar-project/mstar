@@ -266,6 +266,9 @@ class KimiLLMSubmodule(ARNodeSubmodule):
             )
         }
 
+    def max_batch_tokens(self, graph_walk: str) -> int | None:
+        return self.config.prefill_max_batch_tokens if graph_walk == "prefill" else None
+
     def can_batch(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:

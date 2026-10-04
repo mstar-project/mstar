@@ -176,6 +176,11 @@ class KimiK2Config:
 
     prefill_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
+    # Prompt tokens one prefill step takes (always at least one request), so a
+    # burst of long prompts runs as several steps interleaved with decode
+    # rather than one step every request waits on. vLLM's max_num_batched_tokens
+    # plays the same role. None: no budget.
+    prefill_max_batch_tokens: int | None = 16384
 
     # None for text-only checkpoints/variants; set for Kimi-K2.7-Code.
     vision: KimiVisionConfig | None = None

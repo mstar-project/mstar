@@ -332,6 +332,20 @@ class WorkerGraphsManager:
                 )
         return inputs
 
+    def input_tokens(self, worker_graph_id: str, request_id: str, node_name: str) -> int:
+        """Leading-dimension total of the tensors ``node_name`` holds as ready
+        inputs for ``request_id``: its token count for a text prefill. 0 when
+        unknown. Read off the edges' metadata; no tensor is touched."""
+        queue = self.queues[worker_graph_id].per_request_queues.get(request_id)
+        node = None if queue is None else queue.nodes.get(node_name)
+        if node is None:
+            return 0
+        return sum(
+            info.dims[0]
+            for edge in node.ready_signals.ready_inputs.values()
+            for info in edge.tensor_info if info.dims
+        )
+
     def process_new_streaming_inputs(
         self,
         request_id: str,

@@ -498,3 +498,96 @@ def test_clearing_a_rid_forgets_its_undelivered_admit_error():
 
     assert sched.take_admit_errors() == {}
     assert sched.failed_rids == set()
+
+
+# ── token budget ────────────────────────────────────────────────────────
+
+
+class _TokenEngine(_Engine):
+    def __init__(self, budget, **kw):
+        super().__init__(**kw)
+        self._budget = budget
+
+    def get_max_batch_tokens(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return self._budget
+
+
+class _TokenManager(_Manager):
+    def __init__(self, tokens: dict[str, int], **kw):
+        super().__init__(list(tokens), **kw)
+        self._tokens = tokens
+
+    def input_tokens(self, worker_graph_id, rid, node_name):
+        del worker_graph_id, node_name
+        return self._tokens[rid]
+
+
+def test_a_token_budget_splits_a_burst_of_long_prompts():
+    sched = _scheduler(_TokenEngine(budget=16384))
+    mgr = _TokenManager({f"r{i}": 8192 for i in range(5)}, walk="prefill")
+
+    batch = sched.get_next_batch(mgr)
+
+    assert list(batch.node_objects) == ["r0", "r1"]
+
+
+def test_requests_past_the_budget_stay_ready_rather_than_backlogged():
+    """The backlog drains ahead of every other walk; the overflow must instead
+    stay on its ready queue so round-robin can run, e.g., decode in between."""
+    sched = _scheduler(_TokenEngine(budget=16384))
+    mgr = _TokenManager({f"r{i}": 8192 for i in range(5)}, walk="prefill")
+
+    sched.get_next_batch(mgr)
+
+    assert not sched.backlog
+    assert set(mgr.queues["wg0"].get_ready_node_names()) == {"r2", "r3", "r4"}
+    assert list(sched.get_next_batch(mgr).node_objects) == ["r2", "r3"]
+
+
+def test_a_prompt_longer_than_the_budget_still_runs_alone():
+    sched = _scheduler(_TokenEngine(budget=16384))
+    mgr = _TokenManager({"long": 22000, "short": 100}, walk="prefill")
+
+    assert list(sched.get_next_batch(mgr).node_objects) == ["long"]
+    assert list(sched.get_next_batch(mgr).node_objects) == ["short"]
+
+
+def test_short_prompts_fill_the_budget():
+    sched = _scheduler(_TokenEngine(budget=1000))
+    mgr = _TokenManager({f"r{i}": 100 for i in range(12)}, walk="prefill")
+
+    assert len(sched.get_next_batch(mgr).node_objects) == 10
+
+
+def test_no_budget_takes_the_whole_ready_set():
+    sched = _scheduler(_TokenEngine(budget=None))
+    mgr = _TokenManager({f"r{i}": 8192 for i in range(5)}, walk="prefill")
+
+    assert len(sched.get_next_batch(mgr).node_objects) == 5
+
+
+def test_the_count_cap_still_applies_under_a_budget():
+    sched = _scheduler(_TokenEngine(budget=1 << 20, max_bs=3))
+    mgr = _TokenManager({f"r{i}": 10 for i in range(5)}, walk="prefill")
+
+    assert len(sched.get_next_batch(mgr).node_objects) == 3
+
+
+def test_input_tokens_sums_the_leading_dims_of_a_nodes_ready_inputs():
+    from mstar.graph.base import GraphEdge, TensorPointerInfo
+    from mstar.worker.node_manager_utils import WorkerGraphsManager
+
+    def info(n):
+        return TensorPointerInfo(dims=[n], dtype="int64", nbytes=8 * n, address=0, stride=[1],
+                                 uuid=f"u{n}", source_session_id="s", source_entity="api_server")
+
+    edge = GraphEdge(next_node=NODE, name="text_inputs", tensor_info=[info(8192)])
+    node = SimpleNamespace(ready_signals=SimpleNamespace(ready_inputs={"text_inputs": edge}))
+    io = SimpleNamespace(nodes={NODE: node})
+    mgr = WorkerGraphsManager.__new__(WorkerGraphsManager)
+    mgr.queues = {"wg0": SimpleNamespace(per_request_queues={"r0": io})}
+
+    assert mgr.input_tokens("wg0", "r0", NODE) == 8192
+    assert mgr.input_tokens("wg0", "gone", NODE) == 0
+    assert mgr.input_tokens("wg0", "r0", "other_node") == 0

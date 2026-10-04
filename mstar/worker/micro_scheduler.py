@@ -385,6 +385,9 @@ class MicroScheduler:
         # Pop ready nodes for all requests of this node name
         entries = [e for e in node_name_to_requests[best_node_name] \
                    if e.graph_walk == graph_walk]
+        entries = self._within_token_budget(
+            worker_graphs_manager, best_node_name, graph_walk, entries,
+        )
 
         if max_batch_size is None:
             max_batch_size = self._max_batch_size(best_node_name, graph_walk)
@@ -404,6 +407,34 @@ class MicroScheduler:
         # Everything past the first step is already popped off the queues, so
         # it has to be remembered here or it would never run.
         return self._cap_batch_and_schedule(batch=full_batch, max_bs=remaining)
+
+    def _within_token_budget(
+        self, worker_graphs_manager: WorkerGraphsManager,
+        node_name: str, graph_walk: str, entries: list[ReadyNodeEntry],
+    ) -> list[ReadyNodeEntry]:
+        """The leading ``entries`` whose inputs fit the engine's per-step token
+        budget for this walk, always at least one.
+
+        Trimmed before the batch is assembled, so the rest never leave their
+        ready queues: the backlog would drain them ahead of everything else,
+        while from the queues the next pass sees them beside the other walks
+        and round-robin interleaves the chunks (with decode steps, say).
+        """
+        get_budget = getattr(self.engine_manager.get_engine(node_name), "get_max_batch_tokens", None)
+        budget = None if get_budget is None else get_budget(node_name, graph_walk)
+        if budget is None or len(entries) <= 1:
+            return entries
+        kept: list[ReadyNodeEntry] = []
+        total = 0
+        for entry in entries:
+            tokens = worker_graphs_manager.input_tokens(
+                entry.worker_graph_id, entry.request_id, node_name,
+            )
+            if kept and total + tokens > budget:
+                break
+            kept.append(entry)
+            total += tokens
+        return kept
 
     @staticmethod
     def _remaining_capacity(

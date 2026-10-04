@@ -514,6 +514,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
+    def max_batch_tokens(self, graph_walk: str) -> int | None:
+        """Most input tokens one step of ``graph_walk`` should take, or None
+        for no budget. The scheduler admits requests in arrival order while
+        their inputs' leading dimensions fit (always at least one), so long
+        prefills spread over several steps that alternate with other walks."""
+        return None
+
     def get_autocast_dtype(self) -> torch.dtype | None:
         """Per-submodule autocast dtype override for the engine's forward
         wrap. The engine consults this on each ``execute_batch`` and uses
