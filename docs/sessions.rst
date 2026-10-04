@@ -94,6 +94,12 @@ registry, no TTL, no teardown barrier. Porting such a model means reading the
 Submodule state
 ^^^^^^^^^^^^^^^
 
+Session state need not be a resource's. ``Cosmos3Model`` declares sessions with
+an empty ``resources`` and keeps a windowed rollout's world in its submodules
+instead: the DiT node holds the last clean window, the streaming decoder its
+decode context, so a later request resumes the same world with a new prompt.
+Only the caps (concurrency, TTL) come from its ``SessionsConfig``.
+
 Alongside the per-request ``PerRequestState``, a submodule has a per-session
 one. ``self.session_state(session_id)`` reaches it directly; a forward reads
 the batch's through ``ModelInputsFromEngine.per_session_states``, keyed by

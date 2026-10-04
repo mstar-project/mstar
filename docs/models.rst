@@ -533,26 +533,8 @@ own ``window_decoder`` partition; a request opts in per call:
        assembled clip. ``/generate`` streams the chunks as NDJSON lines,
        ``/generate/ws`` as frames, ``/v1/videos/generations`` switches to an
        NDJSON body (``video`` lines with a running ``index``, closed by ``done``).
-   * - ``session_id``
-     - —
-     - Names a world-state session: the DiT node keeps the rollout's last window
-       and the decoder its context. The most recent ``session_store_size`` idle
-       sessions are kept; a session with a request in flight is never evicted, and
-       a second request on it is refused until the first finishes.
-   * - ``resume_session``
-     - ``false``
-     - Continue the named session: window 0 is conditioned on the stored last
-       frames (pinned clean, like a chained overlap) and only the ``num_frames``
-       new frames are delivered — a new prompt steers the same world.
-   * - ``session_timeout_s``
-     - 600
-     - Seconds an idle session is kept after its request finishes, capped at the
-       deployment's ``session_timeout_max_s`` (3600). An expired session resumes
-       like an unknown one: the request is rejected.
-   * - ``end_session``
-     - ``false``
-     - Drop the named session once this request is done (with or without
-       ``resume_session``) instead of keeping its state.
+
+A windowed rollout can be continued later: see **Sessions** below.
 
 .. code-block:: bash
 
@@ -571,6 +553,41 @@ latent shape, the clean/noisy frame layout carried as a mask input; plain t2v/i2
 graph, which captures the paged attention, measured 3-6% slower than the eager dense
 FA3 step for both the 121-frame clip and the 29-frame window, so it only pays for
 small, launch-bound tiers.
+
+Sessions
+^^^^^^^^
+
+A windowed rollout's world can outlive its request: the DiT keeps the rollout's
+last clean window and the streaming decoder its decode context, so a later
+request resumes the same world with a new prompt. The session fields are
+:doc:`request fields <sessions>`, not ``model_kwargs`` — ``start_session``,
+``resume_session``, ``end_session``, ``session_id`` and ``session_timeout_s`` —
+and the server owns the id, the TTL, the concurrency cap and the teardown.
+
+.. code-block:: bash
+
+   # open a world
+   curl -sN http://localhost:8000/generate \
+     -F 'text=a drone flies over a coastal town at dawn' \
+     -F 'output_modalities=video' -F 'start_session=true' \
+     -F 'model_kwargs={"num_frames":241,"window_mode":"kv","window_frames":29}'
+   # -> the reply names the session the server minted
+
+   # continue it: window 0 is conditioned on the stored last frames, and only
+   # the new num_frames are delivered
+   curl -sN http://localhost:8000/generate \
+     -F 'text=the drone turns inland over the hills' \
+     -F 'output_modalities=video' \
+     -F 'resume_session=true' -F 'session_id=<id>' \
+     -F 'model_kwargs={"num_frames":121,"window_mode":"kv","window_frames":29}'
+
+The deployment's caps come from the checkpoint config: ``session_store_size``
+sets how many sessions may be held at once, ``session_timeout_s`` /
+``session_timeout_max_s`` the default and maximum TTL. Resuming a session the
+server no longer holds is a 404, and resuming one with a request in flight is a
+409; a resume cannot carry a conditioning image, since it conditions on the
+session's own last frames.
+
 
 Wan2.2 (``wan22``)
 ------------------

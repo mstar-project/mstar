@@ -76,7 +76,6 @@ from mstar.model.cosmos3.constants import (
     VIDEO_GEN_WALK,
     VIDEO_SOUND_GEN_WALK,
 )
-from mstar.model.cosmos3.sessions import SessionStore
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -86,6 +85,11 @@ from mstar.model.submodule_base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Keys the two windowed nodes keep their session state under: the DiT's last
+# clean window, and the streaming decoder's decode context behind it.
+WINDOW_TAIL = "window_tail"
+DECODE_TAIL = "decode_tail"
 
 # image_gen and video_gen run the identical denoise step (the DiT loop is
 # shape-general over the frame count); they differ only in the emitted output
@@ -236,13 +240,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         self._scheduler_template = scheduler
         # Per-request denoise state lives in the engine-managed
         # ``request_states`` store from the NodeSubmodule base.
-        # Windowed sessions: the last window's clean latents per session id;
-        # a follow-up request with ``resume_session`` re-pins its head from
-        # here (see ``_prepare_windowed_prefill``). A session is pinned while
-        # a request generates under it and idles out after its timeout.
-        self._sessions = SessionStore(
-            config.session_store_size, config.session_timeout_s, config.session_timeout_max_s,
-        )
+        # Windowed sessions: the last window's clean latents live in the
+        # engine's per-session state under ``WINDOW_TAIL``, so a follow-up with
+        # ``resume_session`` re-pins its head from there (see
+        # ``_prepare_windowed_prefill``). The server owns the lifecycle: it
+        # refuses a second request on a live session, never evicts one
+        # mid-rollout, and drops the state at teardown.
         # Compile the pure denoise compute (~1.2-1.3x/step; the kernels bake
         # into the CUDA graphs at capture). fullgraph=False breaks at the
         # attention; ``config.compile_denoise=False`` keeps the eager step for
@@ -638,11 +641,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         has_image_condition = bool(md.get("has_image_condition", False))
         # A resumed session re-pins the stored tail as window 0's clean head:
         # the same clean-frame layout a chained window uses for its overlap.
-        session_id = md.get("session_id")
-        if session_id:
-            # Pins the session for this request: a second request on a live
-            # session is refused, and the store never evicts it mid-rollout.
-            self._sessions.begin(str(session_id), fwd_info.rid_handle)
+        # The session is the request's, carried on every forward pass.
+        session = fwd_info.session
+        session_id = None if session is None else session.session_id
         resume_units = int(md.get("resume_latent_units", 0) or 0)
         resume_tail = None
         if resume_units:
@@ -665,9 +666,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             cond_video[:, :, :resume_units] = resume_tail.to(device=device, dtype=dtype)
             st.add_all(vmask=vmask, cond_video_latents=cond_video)
         st.add_all(
-            ar_session_id=md.get("session_id"),
-            ar_end_session=bool(md.get("end_session")),
-            ar_session_ttl=md.get("session_timeout_s"),
+            # kept on the request's state: _finish_window has no step to read
+            ar_session_id=session_id,
             cond=cond,
             uncond=uncond,
             gs=gs,
@@ -705,7 +705,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         size. Unknown (or evicted) sessions and size mismatches are request
         errors — silently starting from scratch would break the client's
         frame accounting."""
-        tail = self._sessions.get(session_id)  # promotes the session
+        tail = self.session_state(session_id).tensors.get(WINDOW_TAIL)
         if tail is None:
             raise ValueError(
                 f"Cosmos3 resume_session: unknown or expired session {session_id!r}."
@@ -719,21 +719,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return tail[:, :, -units:]
 
     def _store_session_tail(self, st, window_latents: torch.Tensor) -> None:
-        """The rollout's final window, kept for a ``resume_session`` follow-up
-        until the session's timeout; ``end_session`` drops the session instead.
-        Either way the request lets go of its pin."""
+        """The rollout's final window, kept for a ``resume_session`` follow-up.
+
+        The engine holds it until the session's TTL expires or it is torn down
+        (``end_session``, a DELETE, a failed request), so there is nothing to
+        release here: a request that dies mid-rollout takes its session with it.
+        """
         session_id = st.get("ar_session_id")
         if not session_id:
             return
-        if st.get("ar_end_session"):
-            self._sessions.end(str(session_id))
-            return
-        self._sessions.put(str(session_id), window_latents.detach().clone(), st.get("ar_session_ttl"))
-
-    def cleanup_request(self, request_id: str):
-        # A request removed mid-rollout (cancel, failure) lets go of its session.
-        self._sessions.release(request_id)
-        super().cleanup_request(request_id)
+        state = self.session_state(str(session_id))
+        state.tensors[WINDOW_TAIL] = window_latents.detach().clone()
 
     def _window_statics_for(self, st, plan, device):
         # Chained windows restart their positions at 0, so every window past
@@ -2721,11 +2717,9 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
     def __init__(self, vae, config):
         super().__init__(vae, config)
         # Per-session decode context (the latents behind a session's last
-        # frames), so a resumed rollout's first window decodes seamlessly.
-        # Same store as the DiT's, so the two age their sessions alike.
-        self._sessions = SessionStore(
-            config.session_store_size, config.session_timeout_s, config.session_timeout_max_s,
-        )
+        # frames) lives in the engine's per-session state under ``DECODE_TAIL``,
+        # so a resumed rollout's first window decodes seamlessly. The same state
+        # the DiT keeps its window tail in, so the two age together.
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         chunks = (inputs or {}).get("window_latents") or []
@@ -2739,8 +2733,10 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         rid = engine_inputs.request_ids[0]
         st = self.request_state(rid)
         if "ar_chunks" not in st:
-            md = engine_inputs.per_request_info[rid].step_metadata
-            session_id = md.get("session_id")
+            info = engine_inputs.per_request_info[rid]
+            md = info.step_metadata
+            session = info.session
+            session_id = None if session is None else session.session_id
             resume = int(md.get("resume_latent_units", 0) or 0)
             st.add_all(
                 ar_chunks=0,
@@ -2753,17 +2749,16 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
                 ar_stream=bool(md.get("stream_video")),
                 ar_emitted=0,
                 ar_pixels=[],
-                ar_session_id=str(session_id) if session_id else None,
+                ar_session_id=session_id,
                 # A resumed session: window 0's pinned head duplicates frames
                 # the client already has, so it is trimmed like an overlap,
                 # and the session's decode context (when this node still
                 # holds it) warms the conv stack behind the first new frame.
                 ar_resume=resume,
-                ar_end_session=bool(md.get("end_session")),
-                ar_session_ttl=md.get("session_timeout_s"),
             )
             if resume and session_id:
-                tail = self._sessions.get(str(session_id))  # promotes, like the DiT
+                session_state = engine_inputs.per_session_states[rid]
+                tail = session_state.tensors.get(DECODE_TAIL)
                 if tail is not None:
                     st.add("ar_tail", tail)
         index = st["ar_chunks"]
@@ -2784,10 +2779,8 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         st.add("ar_tail", stream_tail[:, :, -st["ar_ctx"]:])
         st.add("ar_chunks", index + 1)
         if index + 1 >= st["ar_windows"] and st["ar_session_id"]:
-            if st.get("ar_end_session"):
-                self._sessions.end(st["ar_session_id"])
-            else:
-                self._sessions.put(st["ar_session_id"], st["ar_tail"], st.get("ar_session_ttl"))
+            # the engine drops it at teardown, so end_session needs nothing here
+            engine_inputs.per_session_states[rid].tensors[DECODE_TAIL] = st["ar_tail"]
         if st["ar_stream"]:
             # Deliver each window as its own chunk, capped at the frames still
             # owed (the padded final window can outrun the requested count);

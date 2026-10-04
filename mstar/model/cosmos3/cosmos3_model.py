@@ -114,6 +114,7 @@ from mstar.model.cosmos3.submodules import (
     Cosmos3VisionEncoderSubmodule,
 )
 from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
+from mstar.model.sessions import RequestSession, SessionsConfig
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -1093,7 +1094,8 @@ class Cosmos3Model(Model):
     # ------------------------------------------------------------------
 
     def _resolve_gen_params(
-        self, model_kwargs: dict | None, input_modalities: list[str], output_modalities: list[str],
+        self, model_kwargs: dict | None, input_modalities: list[str],
+        output_modalities: list[str], session: RequestSession | None = None,
     ) -> dict:
         """Resolve the per-request generation knobs (size, steps, guidance, …)
         from request ``model_kwargs``, applying defaults. Used by both
@@ -1298,7 +1300,9 @@ class Cosmos3Model(Model):
             params["generate_sound"] = True
             if mk.get("sound_duration") is not None:
                 params["sound_duration"] = float(mk["sound_duration"])
-        self._resolve_window_params(mk, params, num_frames, action_mode, has_video_condition)
+        self._resolve_window_params(
+            mk, params, num_frames, action_mode, has_video_condition, session,
+        )
         return params
 
     def _resolve_distilled_params(self, mk, steps, action_mode, input_modalities, output_modalities):
@@ -1327,7 +1331,25 @@ class Cosmos3Model(Model):
             raise ValueError("This Cosmos3 checkpoint is distilled; video conditioning is not available on it.")
         return fixed, 1.0
 
-    def _resolve_window_params(self, mk, params, num_frames, action_mode, has_video_condition) -> None:
+    def get_sessions_config(self) -> SessionsConfig:
+        """A windowed rollout's world lives for the session, not the request.
+
+        What is kept is the DiT's last clean window and the streaming decoder's
+        decode context. Both are per-session *submodule* state rather than a
+        resource's, so ``resources`` stays empty: the caps below are all the
+        runtime needs to hold them. ``session_store_size`` was the old store's
+        idle capacity and becomes the deployment's concurrent-session cap.
+        """
+        return SessionsConfig(
+            max_concurrent_sessions=self.config.session_store_size,
+            default_timeout_s=self.config.session_timeout_s,
+            max_timeout_s=self.config.session_timeout_max_s,
+        )
+
+    def _resolve_window_params(
+        self, mk, params, num_frames, action_mode, has_video_condition,
+        session: RequestSession | None = None,
+    ) -> None:
         """Opt-in windowed AR video: the clip is generated window by window.
         ``chained`` conditions each window on the previous window's tail
         (full bidirectional denoise per window); ``kv`` runs block-causal
@@ -1408,28 +1430,17 @@ class Cosmos3Model(Model):
         # of window 0 as clean conditioning (the chained overlap, at least the
         # two-frame V2V floor), and the schedule grows by those units so
         # ``num_frames`` stays the count of new frames the client receives.
-        session_id = mk.get("session_id")
-        resume = bool(mk.get("resume_session"))
-        end_session = bool(mk.get("end_session"))
-        if resume and not session_id:
-            raise ValueError("Cosmos3 resume_session requires a session_id.")
-        if end_session and not session_id:
-            raise ValueError("Cosmos3 end_session requires a session_id.")
+        # The session arrives validated: the server owns the id, the TTL, the
+        # concurrency cap and the teardown, so only what the geometry forbids
+        # is checked here. Only the geometry it implies becomes metadata -- the
+        # id itself rides on every ``CurrentForwardPassInfo``, so the nodes read
+        # it off the step rather than from a step_metadata copy.
+        resume = session is not None and session.resumed
         if resume and params.get("has_image_condition"):
             raise ValueError(
                 "Cosmos3 resume_session conditions on the session's last frames; "
                 "drop the conditioning image."
             )
-        if session_id is not None:
-            params["session_id"] = str(session_id)
-            # Drop the session once this request is done instead of keeping it.
-            params["end_session"] = end_session
-            timeout = mk.get("session_timeout_s")
-            if timeout is not None:
-                timeout = float(timeout)
-                if not timeout > 0:
-                    raise ValueError("Cosmos3 session_timeout_s must be > 0.")
-                params["session_timeout_s"] = min(timeout, float(self.config.session_timeout_max_s))
         resume_units = max(overlap_units, 2) if resume else 0
         if resume_units and resume_units >= window_units:
             raise ValueError(
@@ -1479,6 +1490,7 @@ class Cosmos3Model(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        session: RequestSession | None = None,
         **kwargs,
     ) -> ForwardPassArgs:
         # The windowed decoder partition starts idle on its decode walk for
@@ -1491,7 +1503,9 @@ class Cosmos3Model(Model):
         # flush, which it skips.
         if partition_name == constants.WINDOW_DECODER_PARTITION:
             is_text = "text" in (output_modalities or [])
-            params = {} if is_text else self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
+            params = {} if is_text else self._resolve_gen_params(
+                model_kwargs, input_modalities, output_modalities, session,
+            )
             md = CurrentForwardConductorMetadata(
                 input_modalities=input_modalities,
                 output_modalities=output_modalities,
@@ -1505,7 +1519,9 @@ class Cosmos3Model(Model):
             )
         if "text" in (output_modalities or []):
             return self._initial_reasoner_args(input_modalities, output_modalities, input_signals, model_kwargs)
-        params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
+        params = self._resolve_gen_params(
+            model_kwargs, input_modalities, output_modalities, session,
+        )
         # Visual conditioning routes through a conditioned prefill that also feeds
         # the DiT the input to VAE-encode: a video (action inverse-dynamics) or an
         # image (image-to-video, action policy/forward-dynamics). Fall back to the
