@@ -131,6 +131,9 @@ echo
 echo "=== per-request denoise step sequences (from prepare_inputs) ==="
 # A clean request is k=0,1,2,...  A repeat (0,0,2,3 / 0,1,2,0) is the loop-counter bug.
 # check_stop reads a different info object and can look clean while this does not.
+echo "  (a bad pass reading k=0: key_present=False means an unseeded fwd_info,"
+echo "   key_present=True means a seeded one that never advanced)"
+grep -E "prepare request .* k=0/.* key_present=False" "$LOG" 2>/dev/null | tail -5
 grep -o "prepare request [0-9a-f-]* k=[0-9]*" "$LOG" 2>/dev/null \
   | awk '{split($NF,a,"="); print $3, a[2]}' \
   | awk '{seq[$1]=seq[$1]" "$2} END {for (r in seq) print substr(r,1,8)":"seq[r]}' \

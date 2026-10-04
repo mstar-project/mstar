@@ -267,8 +267,13 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # The step the FORWARD actually runs, which is not what check_stop logs: that
         # reads the in-flight batch's info, this reads the per-pass one, and under
         # speculation the two can disagree. A repeated k here is the loop-counter bug.
-        logger.info("%s: prepare request %s k=%d/%d walk=%s", type(self).__name__,
-                    fwd_info.request_id, k, num_steps, fwd_info.graph_walk)
+        # key_present distinguishes the two ways k can read 0: an fwd_info whose
+        # counters were never seeded (key absent -- a freshly built object), versus
+        # one that was seeded and never advanced (key present, value 0).
+        _counts = fwd_info.dynamic_loop_iter_counts
+        logger.info("%s: prepare request %s k=%d/%d walk=%s key_present=%s counts=%s info=%x",
+                    type(self).__name__, fwd_info.request_id, k, num_steps, fwd_info.graph_walk,
+                    self.loop_name in _counts, dict(_counts), id(_counts))
         return NodeInputs(
             tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=bucket_key,
         )
