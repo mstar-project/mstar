@@ -43,6 +43,8 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
     w._draining_rids = set()
     w._reads_done_sent = set()
     w._pending_removes = set()
+    w._removes_awaiting_step = {}
+    w._tp_broadcast_seq = 0
     w._last_active = {}
     w._unprocessed_messages = {}
     w._my_consumer_connections = []
@@ -53,6 +55,7 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
         clear_wire_rid=lambda wire_rid: None,
         fail_rids=lambda rids: None,
         pending_tp_follow_count={},
+        last_consumed_tp_seq=0,
     )
     # Identity interning, as main's worker tests do: the rid string is its own
     # handle, so the string/handle split is exercised without a real runtime.
@@ -166,6 +169,29 @@ def test_a_deferred_removal_keeps_its_end_session_flag():
     # the GPU step retires and the deferred remove is applied
     w._in_flight_rids.clear()
     Worker._apply_pending_removes_safe_to_drop(w, set())
+
+    assert w.removed == [("X", True)]
+    assert _acks(w) == ["s"]
+
+
+def test_a_follower_that_waits_for_step_symmetry_still_ends_the_session():
+    # main stamps a forwarded removal with the step rank 0 released its pages
+    # after, and a follower that has not reached it parks the removal. The
+    # parked removal has to keep end_session, or the follower frees the request
+    # and leaves the session's state behind with no ACK for the barrier.
+    w = _worker(sessions={"s": {"X"}}, is_follower=True)
+    w.scheduler.last_consumed_tp_seq = 3
+
+    Worker._remove_request(w, RemoveRequest(
+        request_id="X", source=MessageSource.TP_RANK_0,
+        after_tp_seq=7, end_session=True,
+    ))
+
+    assert w.removed == [], "it should be waiting for step 7"
+    assert w.removed_sessions == [] and _acks(w) == []
+
+    w.scheduler.last_consumed_tp_seq = 7
+    Worker._apply_removes_whose_step_landed(w)
 
     assert w.removed == [("X", True)]
     assert _acks(w) == ["s"]

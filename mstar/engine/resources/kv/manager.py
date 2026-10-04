@@ -295,6 +295,7 @@ class PublishedKVInfo(PublishedInfo):
 class AllocResult:
     success: bool = True
     error: AdmitFailedReason | None = None
+    new_pages: list[int] | None = None
 
 
 @dataclass
@@ -400,6 +401,17 @@ class KVManager(AttentionResource):
         # (rid, label) marked step_in_flight by a staged step, so an abandoned
         # one does not leave its streams unevictable
         self._preplan_marked: list[tuple[str, str]] = []
+
+        # (rid, label) -> pages the live reservation freshly acquired, for
+        # ``rollback_admit``. One record, not one per pass: only the plan thread
+        # or the GPU thread holds a reservation at a time, and the unwind has to
+        # find it whichever it was.
+        #
+        # Handle-keyed, so it MUST be purged when the handle is released: handles
+        # are recycled, and a stale entry would resolve against whichever request
+        # gets that handle next. ``admit`` clears the record, but a pre-planned
+        # step's admit returns first -- see ``remove_request`` / ``reset_request``.
+        self._admit_reserved_pages: dict[tuple[int, str], list[int]] = {}
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
@@ -835,12 +847,19 @@ class KVManager(AttentionResource):
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned and not ctx.is_preplan:
             if self._preplan_key == self._plan_key(step, ctx):
-                # pages were already reserved by the preplan pass
+                # pages were already reserved by the preplan pass — and the record
+                # of them has to survive this call, because it is what a refusal
+                # further down the resource order unwinds. Falling through to the
+                # clear below would leak them.
                 return ADMIT_OK
             # a different step arrived first (see `plan`): drop the staged
             # plan and reserve for this step normally. The staged step's own
             # span pages stay with its stream, where its re-admit finds them.
+            # Its reservation went with ``clear_preplan``, so the record of it is
+            # stale and the clear below is right for this path.
             self.clear_preplan()
+        with self._lock:
+            self._admit_reserved_pages.clear()
         # forks reserve here and copy later (plan for pre-, commit for post-),
         # so a step that never runs leaves pages resident but no page contents
         # moved — re-admitting it allocates nothing and re-copies nothing.
@@ -898,6 +917,9 @@ class KVManager(AttentionResource):
                     )
                     if not alloc_res.success:
                         return AdmitOutcome(ok=False, reason=alloc_res.error)
+                    if alloc_res.new_pages:
+                        self._admit_reserved_pages.setdefault(
+                            (rid, to_label), []).extend(alloc_res.new_pages)
 
             for segment in step.segments:
                 if segment.span == 0:
@@ -910,6 +932,10 @@ class KVManager(AttentionResource):
                 )
                 if not alloc_res.success:
                     return AdmitOutcome(ok=False, reason=alloc_res.error)
+                if alloc_res.new_pages:
+                    self._admit_reserved_pages.setdefault(
+                        (segment.request_id, segment.label), []
+                    ).extend(alloc_res.new_pages)
 
             # marked here rather than in plan so the mark also covers
             # admit -> plan, where an offload would otherwise release pages
@@ -933,6 +959,45 @@ class KVManager(AttentionResource):
         # retention is applied at commit (see `_apply_retention`)
 
         return ADMIT_OK
+
+    def rollback_admit(self, step: KVStep, ctx: StepContext) -> None:
+        """Give back the pages this admit freshly acquired. Does not touch pages
+        retained by a shared prefix or a lease converted onto the stream.
+
+        ``page_indices`` maps token position to page, so the reserved pages can
+        only be dropped off the tail. If something else has extended the stream
+        since, the tail can no longer be safely removed.
+        """
+        del step, ctx
+        with self._lock:
+            reserved, self._admit_reserved_pages = self._admit_reserved_pages, {}
+            for (rid, label), pages in reserved.items():
+                if not pages:
+                    continue  # `page_indices[:-0]` would empty the whole stream
+                stream = self._streams.get(rid, {}).get(label)
+                if stream is None:
+                    continue  # reset or removed under us; its pages went with it
+                if stream.page_indices[-len(pages):] != pages:
+                    logger.error(
+                        "KV %s: cannot unwind %s/%s's admit — its pages are no "
+                        "longer the tail of the stream (%d reserved, stream has "
+                        "%d). Leaving them; the free pool is short by that much.",
+                        self.name, rid, label, len(pages),
+                        len(stream.page_indices),
+                    )
+                    continue
+                self._arena.release(pages)
+                del stream.page_indices[-len(pages):]
+                # so an offload that claimed this stream mid-admit notices its
+                # host copy no longer describes it and aborts
+                stream.generation += 1
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
+
+    def _forget_reservations(self, rid: int) -> None:
+        """Drop ``rid``'s unwind record. Caller holds the lock."""
+        for key in [k for k in self._admit_reserved_pages if k[0] == rid]:
+            del self._admit_reserved_pages[key]
 
     def _sequence_views(self, segments: list[Segment]) -> list[SequenceView]:
         views = []
@@ -1155,6 +1220,8 @@ class KVManager(AttentionResource):
     def commit(self, step: KVStep, ctx: StepContext):
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
+            # committed, so there is nothing left to unwind
+            self._admit_reserved_pages.clear()
             for segment in step.segments:
                 stream = self._streams[segment.request_id][segment.label]
                 # cleared before the `step.commit` test: a step that keeps no
@@ -1480,6 +1547,21 @@ class KVManager(AttentionResource):
             request_id=rid,
         )
 
+    def _reload_pages_needed(self, rid: str) -> int:
+        return sum(
+            self._cpu_pool.num_pages(rid, label)
+            for label in self._cpu_pool.labels(rid)
+        )
+
+    def can_reload(self, rid: str) -> bool:
+        """Whether the free pages plus what the prefix index could evict cover
+        ``rid``'s offloaded streams. An upper bound: ``reload`` can still refuse."""
+        if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
+            return False
+        with self._lock:
+            evictable = 0 if self._index is None else self._index.num_sole_owned()
+            return self._reload_pages_needed(rid) <= self._arena.num_free + evictable
+
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
 
@@ -1490,7 +1572,7 @@ class KVManager(AttentionResource):
             return False
         with self._lock:
             labels = self._cpu_pool.labels(rid)
-            needed = sum(self._cpu_pool.num_pages(rid, label) for label in labels)
+            needed = self._reload_pages_needed(rid)
             if needed > self._arena.num_free and self._index is not None:
                 # as `_alloc` does: once the pool is all cached pages, nothing
                 # else would ever free one for this request to come back to
@@ -1635,6 +1717,8 @@ class KVManager(AttentionResource):
                 stream.reset(freed=drop)
                 # a stale cursor or generated key would misfile what the rerun writes
                 stream.forget_chain()
+            # the pages above were released, so any record of them is stale
+            self._forget_reservations(rid)
             for label, stream in self._streams.get(rid, {}).items():
                 self._seed_keys(rid, label, stream)
             if _DEBUG_ASSERTS:
@@ -1754,6 +1838,9 @@ class KVManager(AttentionResource):
                     self._arena.release(stream.page_indices)
             if self._cpu_pool is not None:
                 self._cpu_pool.remove_request(rid)
+            # handle-keyed, and this releases the handle: a survivor would be
+            # unwound against whichever request is given this handle next
+            self._forget_reservations(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
             self._transfer.remove_request(rid)
@@ -1990,6 +2077,9 @@ class KVManager(AttentionResource):
                 )
             num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
             num_new_pages = num_pages_needed - len(stream.page_indices)
+            # a stream that already holds enough pages acquires none, and has
+            # nothing for ``rollback_admit`` to give back
+            new_pages: list[int] = []
             if num_new_pages > 0:
                 new_pages = self._arena.acquire(num_new_pages)
                 if new_pages is None and self._index is not None:
@@ -2014,7 +2104,7 @@ class KVManager(AttentionResource):
                     )
                 stream.page_indices.extend(new_pages)
                 stream.generation += 1
-        return AllocResult()
+        return AllocResult(new_pages=new_pages)
 
     ### Submodule-level functionality
     # Label / layer cursors come from `AttentionResource`; the readers resolve

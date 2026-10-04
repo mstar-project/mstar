@@ -18,6 +18,9 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "qwen3_tts_1p7b": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "qwen3_tts_voicedesign": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "qwen3_tts_base": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "test_text_session": ("mstar.model.test_text_session.model", "TextSessionModel"),
     "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
@@ -67,7 +70,14 @@ HF_MODELS: dict[str, dict] = {
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
+    # Qwen3-TTS 12 Hz family: one class, the variant is read from config.json.
+    # CustomVoice = built-in speakers (1.7B also takes style instructions),
+    # VoiceDesign = voice described by an instruction, Base = voice cloned
+    # from reference audio.
     "qwen3_tts": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"},
+    "qwen3_tts_1p7b": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"},
+    "qwen3_tts_voicedesign": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"},
+    "qwen3_tts_base": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"},
     # BAGEL's LLM on its own, text in and text out, with its KV held across a
     # persistent session. The deployment that exercises session semantics.
     "test_text_session": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},

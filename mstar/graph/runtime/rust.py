@@ -514,6 +514,17 @@ class RustGraphRuntime(GraphRuntime):
             ready_rids=out.ready_rids,
             wg_ids=out.wg_ids,
             input_edges=_columns(out),
+            spec_id=out.spec_id,
+        )
+
+    def commit_speculation(
+        self, spec_id: int, success: bool, dropped_rids: list[int] = (),
+        node: str | None = None, wg_id: int | None = None,
+        scheduled_rids: list[int] = (),
+    ):
+        self._rust.commit_speculation(
+            spec_id, success, list(dropped_rids),
+            node, wg_id, list(scheduled_rids),
         )
 
     def prep_spec_rids(

@@ -274,3 +274,54 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     assert handle is not None
     assert got == {"state": handle, "engine": handle, "tensors": handle}
     assert info.rid_handle == handle
+
+
+def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer():
+    """Both partitions of a request land on one worker: the first NEW makes the
+    stream buffer, the consumer's NEW primes it (and must not replace it)."""
+    import collections
+
+    import torch
+
+    from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
+    from mstar.streaming.topology import Connection
+
+    w, _ = _worker()
+    req = SimpleNamespace(stream_buffers={}, stream_buffers_by_consumer={})
+    w.request_state.add_request = lambda request_id, request_info: None
+    w.request_state.per_request_info = collections.defaultdict(lambda: req)
+    w.engine_manager = SimpleNamespace(add_request=lambda rid, cfgs, session_id=None: None, evictable_nodes=lambda: [])
+    w.tensor_manager = SimpleNamespace(
+        register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
+    )
+    w._draining_rids, w._last_active, w._unprocessed_messages = set(), {}, {}
+    w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    w._consumer_node_cache = {"codec_tokens": "Codec"}
+    w._my_consumer_connections = [Connection(
+        from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",
+        chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3),
+    )]
+
+    def new(partition, lead):
+        info = SimpleNamespace(
+            rid_handle=-1, resource_configs={}, graph_walk="w", partition_name=partition,
+            stream_lead_items=lead, session=None,
+        )
+        body = SimpleNamespace(
+            request_id="wire-1", request_info=info, partition_worker_graph_ids={},
+            worker_graph_to_workers={}, initial_inputs=[],
+        )
+        Worker._add_new_request(w, body)
+
+    new("Talker", {})
+    sbuf = next(iter(req.stream_buffers.values()))
+    sbuf.pre_read_register("t0")
+    sbuf.put("t0", torch.tensor([0]))
+    new("Codec", {"codec_tokens": 2})
+    assert next(iter(req.stream_buffers.values())) is sbuf   # kept, item and all
+    assert req.stream_buffers_by_consumer == {"Codec": {"codec_tokens": sbuf}}
+    for i in (1, 2):
+        sbuf.pre_read_register(f"t{i}")
+        sbuf.put(f"t{i}", torch.tensor([i]))
+    chunk = sbuf.pop_chunk()
+    assert (chunk.context_items, chunk.num_items) == (2, 3)   # two lead items, then the first real one

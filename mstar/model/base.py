@@ -284,6 +284,10 @@ class ForwardPassArgs:
     # is passed into the fwd pass
     step_metadata: dict = field(default_factory=dict)
 
+    # initial args only: CurrentForwardPassInfo.stream_lead_items for the
+    # partition's consumer streams
+    stream_lead_items: dict[str, int] = field(default_factory=dict)
+
 
 class Model(ABC):
     def _get_worker_graphs_for_graph_walk(
