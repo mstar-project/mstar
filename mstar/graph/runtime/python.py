@@ -333,16 +333,7 @@ class PythonGraphRuntime(GraphRuntime):
         for rid in rids:
             if rid not in queues:
                 continue
-            wgio = queues[rid]
-            wgio.get_node(node)._speculatively_scheduled = speculatively_scheduled
-            if not speculatively_scheduled:
-                # The flag SUPPRESSES ready-queue adds, so an input ingested while it
-                # was set leaves the node ready but unqueued, and nothing re-adds it
-                # later. Re-evaluate on the way down or that wake-up is lost.
-                # The queue add always walks up to the root registry (a loop member's
-                # LoopStateRegistry forwards through Loop.ingest_external_input), so
-                # that is where membership has to be re-evaluated.
-                wgio.wg_state_registry.requeue_if_ready(node)
+            queues[rid].get_node(node)._speculatively_scheduled = speculatively_scheduled
 
     def is_speculatively_scheduled(
         self, node: str, wg_id: int, rid: int,
@@ -358,16 +349,8 @@ class PythonGraphRuntime(GraphRuntime):
         for rid in request_ids:
             iter_counts: dict[str, int] = {}
             part_info = self._request_info[rid].partition_info[partition]
-            _per_wg = []  # TRACE
             for wg_id in part_info.graph_walk_worker_graph_ids:
-                _one = self._queues[wg_id].get_dynamic_loop_iters(rid)
-                _per_wg.append((wg_id, dict(_one)))  # TRACE
-                iter_counts.update(_one)
-            # TRACE: more than one worker graph reporting the same loop name means
-            # the last one wins -- an idle walk's loop sits at 0 and clobbers.
-            if len(_per_wg) > 1:
-                logger.warning("TRACE_ITERS rid=%s walk=%s per_wg=%s -> %s",
-                               rid, part_info.graph_walk, _per_wg, iter_counts)
+                iter_counts.update(self._queues[wg_id].get_dynamic_loop_iters(rid))
             values.append(iter_counts)
         return ParallelList(list(request_ids), values)
 
@@ -933,10 +916,7 @@ class PythonGraphRuntime(GraphRuntime):
         """
         node = wgio.nodes[spec_node_name]
         # Held True across the ingest so a streaming input cannot re-add the
-        # node to the ready queue underneath us. Saved, not assumed False: this
-        # node may already be speculatively scheduled from a committed step still
-        # in flight, and forcing it down would drop that step's protection.
-        was_spec_scheduled = node._speculatively_scheduled
+        # node to the ready queue underneath us.
         node._speculatively_scheduled = True
 
         # ingest_input reports success without saying WHICH slot it used, so
@@ -960,7 +940,7 @@ class PythonGraphRuntime(GraphRuntime):
             check_next_iter=same_node, allow_streaming=False,
         )
         wgio.clear_speculative_inputs()
-        node._speculatively_scheduled = was_spec_scheduled  # restore; may still be in flight
+        node._speculatively_scheduled = False  # reset in case the rid is dropped
 
         if not fully_ready:
             self._undo_spec_ingest(node, into_signals, into_next_iter)

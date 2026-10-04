@@ -794,28 +794,6 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         self.ready_for_streaming = set(self.only_streaming_inputs)
         self.ready_streaming_next_iter = set(self.only_streaming_inputs)
 
-    def requeue_if_ready(self, node_name: str):
-        """Re-evaluate a node's queue membership from its current readiness.
-
-        ``register_ingested_input`` runs only at ingest time and skips the queue
-        add while ``_speculatively_scheduled`` is set, so an input that arrived
-        during an in-flight step leaves the node ready but unqueued, and nothing
-        puts it back later. Called when the flag is cleared.
-        """
-        node = self.nodes.get(node_name)
-        if node is None or node._speculatively_scheduled:
-            return
-        if node.ready_signals.is_ready:
-            self.ready_names.add(node.name)
-            self.ready_for_streaming.discard(node.name)
-        elif node.ready_signals.is_ready_for_streaming:
-            self.ready_for_streaming.add(node.name)
-        if node.ready_next_iter.is_ready:
-            self.ready_next_iter.add(node.name)
-            self.ready_streaming_next_iter.discard(node.name)
-        elif node.ready_next_iter.is_ready_for_streaming:
-            self.ready_streaming_next_iter.add(node.name)
-
     def register_ingested_input(self, graph_edge: GraphEdge):
         node = self.nodes[graph_edge.next_node]
         # If node._speculatively_scheduled, the node is already executing as

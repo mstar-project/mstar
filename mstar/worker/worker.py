@@ -889,15 +889,6 @@ class Worker:
             self._graph_runtime.set_walk(
                 request_id, body.partition_name, body.request_info.graph_walk,
             )
-            # Seed this walk's loop counters. Nothing else initialises them: they
-            # only ever appear via the `update(new_iters)` in _postprocess_batch or
-            # the non-speculative build path, so a request folded into a speculative
-            # batch on its first iteration reaches the submodule with an empty dict
-            # -- which `step_index`'s `.get(name, 0)` reads as iteration 0.
-            for _rid, _iters in self._graph_runtime.get_dynamic_loop_iters(
-                [request_id], partition=body.partition_name,
-            ):
-                body.request_info.dynamic_loop_iter_counts.update(_iters)
             self.request_state.update_request_info(
                 request_id, current_fwd_info=body.request_info,
                 partition_name=body.partition_name
@@ -3612,13 +3603,6 @@ class Worker:
                     range_push("worker.build_node_batch", synchronize=False)
                 node_batch = self._build_executing_batch(batch)
                 batch_partition = self.request_state.get_partition_for_node(batch.node_name)
-                # Keep this node off the ready queue while the step is in flight --
-                # the same protection a committed speculation gets. Without it an
-                # input ingested mid-flight re-queues the node and the scheduler can
-                # run the SAME iteration twice (the loop index only advances at
-                # route_outputs, after this batch's postprocess). Cleared where the
-                # speculative flag is, once the batch completes.
-                self._set_speculative_flag(batch, True)
 
                 for request_id, new_iters in self._graph_runtime.get_dynamic_loop_iters(
                     list(node_batch.per_request_info), partition=batch_partition,
