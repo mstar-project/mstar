@@ -116,6 +116,11 @@ does not hold across a session.
 finished; ``absolute`` expires it that long after it was started, however busy
 it is. A session with a request in flight is never collected.
 
+Expiry is noticed by a sweep rather than a timer, so a session outlives its
+deadline by up to one sweep. ``MSTAR_SESSION_SWEEP_INTERVAL_S`` (1.0s) sets how
+often it runs: raise it on a deployment holding many sessions, lower it to make
+a short TTL expire promptly in a test. See :doc:`environment_variables`.
+
 ``capacity_policy`` decides what a deployment at ``max_concurrent_sessions``
 does with a new session. ``keep`` (the default) holds every session until its client ends it
 or its TTL expires, and refuses a new one past the cap with a 429. ``evict``
@@ -157,6 +162,27 @@ streaming (modality ``"session"``, with ``session_id`` in its metadata), and as
 ``/generate/ws`` takes the same five fields on each message, and answers a
 refused session in-band with the status the form route would have given, so a
 control loop can tell a 409 from a 404 without dropping its socket.
+
+``POST /v1/chat/completions`` takes the same five fields as top-level request
+keys — an mstar extension, since OpenAI has no session concept. A turn in a
+session carries that turn's messages alone rather than the whole transcript, and
+the server answers with ``session_id`` beside ``choices`` (or on the stream's
+opening chunk). The other OpenAI routes generate one-shot speech, images and
+video; they ignore the session fields rather than refusing them, since the
+request models accept unknown keys.
+
+.. code-block:: bash
+
+   curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+     "model": "bagel", "start_session": true,
+     "messages": [{"role": "user", "content": "Who painted Guernica?"}]
+   }'
+   # -> {... "choices": [...], "session_id": "9f2c..."}
+
+   curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+     "model": "bagel", "resume_session": true, "session_id": "9f2c...",
+     "messages": [{"role": "user", "content": "And when?"}]
+   }'
 
 Refusals
 ^^^^^^^^
@@ -278,7 +304,12 @@ Limits in this version
   admission. (A session's state does follow its request through an offload
   while that request is running.)
 - Sessions are reachable through the ``POST /generate`` form, the
-  ``/generate/ws`` control-loop socket, and the SDK. The OpenAI-compatible routes
-  and the optional Rust frontend (``--rust-frontend``) carry no session fields.
+  ``/generate/ws`` control-loop socket, ``/v1/chat/completions`` and the SDK. The
+  other OpenAI-compatible routes have no use for them (one-shot speech, image
+  and video generation), and the optional Rust frontend (``--rust-frontend``)
+  carries no session fields: it serves its own HTTP surface, so it would need
+  the five fields on its ``/generate`` and chat routes, the session chunk in its
+  writers, and new bridge messages for ``GET /sessions`` and
+  ``DELETE /sessions/{id}``, which live only in the Python server.
 - Only ``test_text_session`` declares session support. Any other deployment
   refuses sessions until its model opts in.

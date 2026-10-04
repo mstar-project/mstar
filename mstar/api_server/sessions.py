@@ -27,11 +27,16 @@ logger = logging.getLogger(__name__)
 
 
 class SessionError(Exception):
-    """A session request the server refuses, with the status to answer with."""
+    """A session request the server refuses, with the status to answer with.
 
-    def __init__(self, status: int, detail: str):
+    ``status_code`` / ``detail`` are HTTPException's names on purpose: a route
+    that already reports ``getattr(exc, "status_code", 500)`` -- the OpenAI
+    router does -- then answers a refused session correctly with no new case.
+    """
+
+    def __init__(self, status_code: int, detail: str):
         super().__init__(detail)
-        self.status = status
+        self.status_code = status_code
         self.detail = detail
 
 

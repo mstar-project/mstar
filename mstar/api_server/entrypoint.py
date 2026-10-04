@@ -318,7 +318,7 @@ class APIServer:
             sessions_config, teardown=self._request_session_teardown,
         )
         self._next_session_sweep = 0.0
-        self._session_sweep_interval_s = 1.0
+        self._session_sweep_interval_s = float(os.environ.get("MSTAR_SESSION_SWEEP_INTERVAL_S", "1.0"))
 
         # Background thread that drains results from the conductor. Started by
         # finalize_setup() once the workers report ready — before that there's
@@ -1386,7 +1386,7 @@ async def generate_ws(websocket: WebSocket):
                 api_server.sessions.finish_request(
                     request_id, failed=True, error=str(exc),
                 )
-            status = exc.status if isinstance(exc, SessionError) else None
+            status = exc.status_code if isinstance(exc, SessionError) else None
             reply = {"request_id": request_id, "error": str(exc)}
             if status is not None:
                 reply["status"] = status
@@ -1559,7 +1559,7 @@ async def generate(
                 request_id=request_id,
             )
         except SessionError as e:
-            raise HTTPException(status_code=e.status, detail=e.detail) from e
+            raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
     try:
         request_id = api_server.submit_request(
@@ -1630,7 +1630,7 @@ async def delete_session(session_id: str):
     try:
         api_server.sessions.delete(session_id)
     except SessionError as e:
-        raise HTTPException(status_code=e.status, detail=e.detail) from e
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
     return {"session_id": session_id, "status": "closing"}
 
 

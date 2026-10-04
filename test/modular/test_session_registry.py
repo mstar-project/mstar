@@ -74,7 +74,7 @@ def test_sessions_on_a_deployment_without_them_is_a_400():
 
     with pytest.raises(SessionError) as e:
         _start(reg)
-    assert e.value.status == 400
+    assert e.value.status_code == 400
 
 
 def test_start_and_resume_together_is_refused():
@@ -85,7 +85,7 @@ def test_start_and_resume_together_is_refused():
             start_session=True, resume_session=True, end_session=False,
             session_id="s", session_timeout_s=None, request_id="r0",
         )
-    assert e.value.status == 400
+    assert e.value.status_code == 400
 
 
 def test_naming_a_session_without_start_or_resume_is_refused():
@@ -126,7 +126,7 @@ def test_a_timeout_over_the_deployment_maximum_is_refused():
             start_session=True, resume_session=False, end_session=False,
             session_id=None, session_timeout_s=600.0, request_id="r0",
         )
-    assert e.value.status == 400
+    assert e.value.status_code == 400
 
 
 # ── start ───────────────────────────────────────────────────────────────────
@@ -155,7 +155,7 @@ def test_start_on_an_existing_id_is_a_409():
 
     with pytest.raises(SessionError, match="already exists") as e:
         _start(reg, request_id="r1", session_id="mine")
-    assert e.value.status == 409
+    assert e.value.status_code == 409
 
 
 def test_start_past_the_concurrency_cap_is_a_429():
@@ -165,7 +165,7 @@ def test_start_past_the_concurrency_cap_is_a_429():
 
     with pytest.raises(SessionError) as e:
         _start(reg, request_id="r2", session_id="c")
-    assert e.value.status == 429
+    assert e.value.status_code == 429
 
 
 def test_a_closing_session_does_not_count_against_the_cap():
@@ -187,7 +187,7 @@ def test_keep_is_the_default_and_refuses_rather_than_evicting():
     with pytest.raises(SessionError) as e:
         _start(reg, request_id="r1", session_id="b")
 
-    assert e.value.status == 429
+    assert e.value.status_code == 429
     assert torn_down == []
 
 
@@ -232,7 +232,7 @@ def test_a_session_with_a_request_in_flight_is_never_evicted():
     with pytest.raises(SessionError) as e:
         _start(reg, request_id="r1", session_id="b")
 
-    assert e.value.status == 429
+    assert e.value.status_code == 429
     assert torn_down == []
 
 
@@ -259,7 +259,7 @@ def test_resume_of_an_unknown_session_is_a_404():
 
     with pytest.raises(SessionError) as e:
         _resume(reg, "nope", "r0")
-    assert e.value.status == 404
+    assert e.value.status_code == 404
 
 
 def test_resume_with_a_request_in_flight_is_a_409():
@@ -268,7 +268,7 @@ def test_resume_with_a_request_in_flight_is_a_409():
 
     with pytest.raises(SessionError, match="already has a request in flight") as e:
         _resume(reg, "s", "r1")
-    assert e.value.status == 409
+    assert e.value.status_code == 409
 
 
 def test_resume_is_allowed_once_the_previous_request_finished():
@@ -289,7 +289,7 @@ def test_resume_of_a_closing_session_is_a_409():
 
     with pytest.raises(SessionError, match="being torn down") as e:
         _resume(reg, "s", "r1")
-    assert e.value.status == 409
+    assert e.value.status_code == 409
 
 
 # ── ending and teardown ─────────────────────────────────────────────────────
@@ -323,7 +323,7 @@ def test_delete_with_a_request_in_flight_is_a_409():
 
     with pytest.raises(SessionError, match="request in flight") as e:
         reg.delete("s")
-    assert (e.value.status, torn_down) == (409, [])
+    assert (e.value.status_code, torn_down) == (409, [])
 
 
 def test_delete_of_an_unknown_session_is_a_404():
@@ -331,7 +331,7 @@ def test_delete_of_an_unknown_session_is_a_404():
 
     with pytest.raises(SessionError) as e:
         reg.delete("nope")
-    assert e.value.status == 404
+    assert e.value.status_code == 404
 
 
 def test_the_id_is_usable_again_only_after_the_conductor_acks():
