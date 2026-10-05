@@ -115,7 +115,7 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[dev]``
      - ``ruff`` + ``pytest`` for linting and the test suite.
    * - ``.[all]``
-     - The union of the index-hosted dependencies for CUDA models and output formats above.
+     - The union of the index-hosted dependencies from every model extra above.
        Convenient for a machine that serves multiple models; heavier and slower to
        install than a single family's extra. It excludes the separately installed
        TAEHV and ``flash-attn`` packages; see below and `flash-attn (Qwen3-Omni)`_.
