@@ -247,7 +247,7 @@ class APIServer:
         # cost is invisible to worker-side markers. Streaming a 720p chunk means
         # base64-encoding 11 MiB into 14.7 MiB of ASCII and copying that again
         # through json.dumps, once per engine step.
-        self.enable_nvtx = enable_nvtx
+        self.enable_nvtx = profiler.nvtx_enabled(enable_nvtx)
 
         # Per-request profiling: when enabled, a RequestProfile is collected for
         # each request and pretty-printed when the request finishes. ``log_stats_file``
@@ -270,7 +270,7 @@ class APIServer:
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=self.log_stats,
-            enable_nvtx=enable_nvtx,
+            enable_nvtx=self.enable_nvtx,
         )
 
         # Concurrent request tracking
@@ -1478,7 +1478,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "--enable-nvtx",
         action="store_true",
-        help="Enable torch.cuda.nvtx markers during execution",
+        help="Enable NVTX markers during CUDA execution (disabled on XPU and CPU)",
     )
     parser.add_argument(
         "--tensor-comm-protocol",

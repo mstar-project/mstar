@@ -3,6 +3,7 @@ test/modular/test_resource_runner.py
 test/modular/test_admit_failure_handling.py
 test/modular/test_micro_scheduler.py
 test/modular/test_worker_drain.py
+test/modular/test_profiler_nvtx.py
 test/modular/test_ragged_attention_cpu.py
 test/modular/test_rid_handles.py
 test/modular/test_tensor_uuid.py
