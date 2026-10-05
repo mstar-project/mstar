@@ -79,6 +79,12 @@ class PrefixIndex:
         """Every page the index is holding a reference to."""
         return list(self._by_key.values())
 
+    def num_sole_owned(self) -> int:
+        """Indexed pages nothing else holds: an upper bound on what ``evict`` can free."""
+        return sum(
+            1 for page in self._by_key.values() if self._arena.num_owners[page] == 1
+        )
+
     def evict(self, n: int) -> int:
         """Drop the oldest leaves the index alone holds, until ``n`` are free.
 

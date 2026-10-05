@@ -41,19 +41,22 @@ from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     AdmitOutcome,
 )
+from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.submodule_base import (
+    EMPTY_INPUT_METADATA,
     ARNodeInputs,
+    InputMetadata,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
 )
 from mstar.profile.worker import ExecTimings
+from mstar.utils.ipc_format import OffloadDelta
 from mstar.utils.profiler import mark, range_pop, range_push
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
-    from mstar.streaming.stream_buffer import StreamChunkInfo
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +65,7 @@ logger = logging.getLogger(__name__)
 # GPU(N+1)/postprocess(N) overlap. Enable only where 2 steps overflow the CUDA
 # launch queue and block a launch (machine/driver dependent).
 _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
+
 
 
 def checkpoint_identity(path: str | Path) -> bytes:
@@ -212,10 +216,8 @@ class ExecutingBatch:
     # rids for which this step ends every finite stream into the node; the
     # consumer flushes what it held back
     final_stream_rids: set[str] = field(default_factory=set)
-    # rid -> {input_name: chunk info} for rids consuming a streamed input
-    per_request_stream_chunks: Mapping[str, Mapping[str, "StreamChunkInfo"]] = field(
-        default_factory=dict
-    )
+    # rid -> this step's InputMetadata; rids without any are absent
+    per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
     # rids for which this step ends every finite stream into the partition;
     # this step reports the partition done
@@ -325,7 +327,8 @@ class ExecutingBatch:
 
 class Engine:
     def __init__(
-        self, autocast_dtype=torch.bfloat16,
+        self, graph_runtime: GraphRuntime,
+        autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
         enable_profile: bool=False,
     ):
@@ -334,6 +337,17 @@ class Engine:
         self._resources: dict[str, Resource] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
+        self._graph_runtime = graph_runtime
+
+        # node -> (offloaded, reloaded) since the last ``take_resident_delta``.
+        # Only a TP leader drains this, to replicate its resident set onto the
+        # rest of the instance; see ``ScheduleTPNode``.
+        self._resident_delta: dict[str, OffloadDelta] = {}
+        # Nodes this rank leads (journals its moves for the others) and nodes it
+        # follows (may not move pages at all — see ``offload_request``). A node
+        # that is not sharded is in neither: it owns its own eviction.
+        self._tp_leader_nodes: set[str] = set()
+        self._tp_follower_nodes: set[str] = set()
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
@@ -356,6 +370,9 @@ class Engine:
         node_names = set(submodules.keys())
         node_to_resources = {}
         specs_by_key = resolve_spec_dependencies(specs)
+
+        self._classify_tp_roles(node_names, parallel_groups)
+
         for spec in specs:
             relevant_nodes = spec.nodes & node_names
             if len(relevant_nodes) == 0:
@@ -658,6 +675,7 @@ class Engine:
                     # flush whatever it held back (a vocoder's crossfade tail, the
                     # look-ahead frames a token encoder withholds)
                     is_final_stream_chunk=rid in batch.final_stream_rids,
+                    input_metadata=batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA),
                 )
                 if req_inputs is not None:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
@@ -1101,7 +1119,7 @@ class Engine:
             per_request_states=LazyRequestStates(submodule, rids),
             captured=lease is not None,
             step=step,
-            per_request_stream_chunks=batch.per_request_stream_chunks,
+            per_request_input_metadata=batch.per_request_input_metadata,
         )
         if nvtx:
             range_push("engine.preprocess")
@@ -1432,6 +1450,7 @@ class Engine:
     def check_ready(
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,
+        allow_reload: bool = True,
     ) -> FullAdmitOutcome:
         """Whether this node can run the request now.
 
@@ -1445,10 +1464,11 @@ class Engine:
         unservable (``AdmitRuntimeError``), and the caller has to fail it
         rather than scan it again forever.
         """
-        if self.is_offloaded(node_name, request_id) and not self.reload_request(
-            node_name, request_id
-        ):
-            return FULL_ADMIT_NOT_READY
+        if self.is_offloaded(node_name, request_id):
+            if not allow_reload:
+                return FULL_ADMIT_NOT_READY
+            if not self.reload_request(node_name, request_id):
+                return FULL_ADMIT_NOT_READY
         return self._runner.admit_retrieve(
             rid=request_id, node_name=node_name,
             graph_walk=request_info.graph_walk,
@@ -1481,6 +1501,7 @@ class Engine:
         # the same per-request facts its `declare_step` stamps on the step.
         batch.cg_key_info = submodule_mgmt.submodule.cg_key_info(
             batch.step_context.graph_walk, batch.per_request_info,
+            per_request_input_metadata=batch.per_request_input_metadata,
         )
         lease = cg_runner.lease_slot(
             graph_walk=batch.step_context.graph_walk,
@@ -1637,27 +1658,190 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
         )
 
-    def offload_request(self, node_name: str, request_id: str) -> int:
+    def offload_request(self, node_name: str, request_id: int) -> int:
         """Move the request off-device across this node's resources.
 
         Returns what was reclaimed, in whatever each resource counts (pages,
         today); 0 means nothing moved and the caller should pick another
         victim.
         """
-        return sum(
+        if node_name in self._tp_follower_nodes:
+            # Rank 0 decides what this instance evicts, and its decision arrives
+            # as a resident-set delta. TP followers can deadlock if they are not
+            # given a single source of truth for eviction.
+            return 0
+        freed = sum(
             resource.offload(request_id)
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction
         )
+        if freed > 0 and node_name in self._resident_delta:
+            self._resident_delta[node_name].add_offloaded(
+                self._graph_runtime.get_rid_string(request_id)
+            )
+        return freed
 
-    def reload_request(self, node_name: str, request_id: str) -> bool:
+    def reload_request(self, node_name: str, request_id: int) -> bool:
         """Bring it back. False when any resource can't fit it yet, in which
         case the request stays offloaded and the caller retries later."""
-        return all(
-            resource.reload(request_id)
+        if node_name in self._tp_follower_nodes:
+            # Same rule the other way round: a reload spends the pages an
+            # eviction freed, so it is just as much rank 0's call. Not ready here
+            # until the delta says so.
+            return False
+        offloaded = [
+            resource
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction and resource.is_offloaded(request_id)
+        ]
+        # check every resource fits first, so a refusal doesn't reload and re-offload whatever did
+        if not all(resource.can_reload(request_id) for resource in offloaded):
+            return False
+        reloaded: list[Resource] = []
+        for resource in offloaded:
+            if not resource.reload(request_id):
+                # undone, not kept: every page move rank 0 makes is journalled or undone, and a partial one can't be
+                for done in reloaded:
+                    done.offload(request_id)
+                return False
+            reloaded.append(resource)
+        # Logged at the same level as the eviction in
+        # ``Worker._try_offload_cold_request`` and as a follower's replay, so
+        # the two ranks' resident-set moves can be lined up side by side.
+        # A reload only happens after an eviction, so this is not chatty.
+        logger.info(
+            "Reloaded request %s on %s",
+            self._graph_runtime.get_rid_string(request_id), node_name,
         )
+        if node_name in self._resident_delta:
+            self._resident_delta[node_name].add_reloaded(
+                self._graph_runtime.get_rid_string(request_id)
+            )
+        return True
+
+    def _classify_tp_roles(
+        self, node_names: set[str], parallel_groups: WorkerParallelGroups,
+    ) -> None:
+        """Sort this rank's nodes into the ones it leads, follows, or owns alone.
+
+        ``world_size > 1``, not ``> 0``: every node has a world size of at least
+        one, so ``> 0`` makes an un-sharded node a "leader" and leaves it
+        journalling resident-set moves that nothing ever drains —
+        ``take_resident_delta`` is only reached through the TP broadcast, which
+        skips un-sharded nodes, so the journal grows for the life of the process.
+        """
+        sharded = {
+            node for node in node_names
+            if parallel_groups.get_instance_world_size_for_node(node) > 1
+        }
+        self._tp_leader_nodes = {
+            node for node in sharded
+            if parallel_groups.get_instance_rank_for_node(node) == 0
+        }
+        self._tp_follower_nodes = sharded - self._tp_leader_nodes
+        for node in self._tp_leader_nodes:
+            self._resident_delta[node] = OffloadDelta.new()
+
+    def take_resident_delta(
+        self, node_name: str,
+    ) -> OffloadDelta:
+        """The moves on this node since the last call, ready for the wire.
+
+        Verbatim. Every move in it is one this rank executed, so a rank in the
+        same state can always apply it — which is what makes a refused replay
+        mean the states differ, and nothing else.
+        """
+        if node_name not in self._resident_delta:
+            return OffloadDelta.new()
+        return self._resident_delta[node_name].take()
+
+    def apply_resident_delta(
+        self, node_name: str, delta: OffloadDelta,
+    ) -> bool:
+        """Match the leader's resident set on this node. Mutates OffloadDelta
+        by popping off the steps that have already landed. False means not all
+        has landed and the caller must retry before trying the next step.
+        """
+
+        resources = self._submodules[node_name].resources.values()
+        for _ in range(len(delta)):
+            wire_rid, is_offload = delta.peek_left()
+            # Wire strings, not handles: a handle is minted per worker, so rank
+            # 0's is meaningless here. None means this rank has no live request
+            # by that name -- it removed it already, on the other side of the
+            # step rank 0 recorded the move. Its pages are gone, so the move is
+            # moot and the entry is spent; logged because reaching this for a
+            # rid the rank has NOT YET admitted would silently lose a move and
+            # diverge the resident set for good.
+            rid = self._graph_runtime.get_rid_handle(wire_rid)
+            if rid is None:
+                logger.debug(
+                    "Replay: no live request named %s on %s; move is moot",
+                    wire_rid, node_name,
+                )
+                delta.pop_left()
+                continue
+            if is_offload:
+                if self.is_offloaded(node_name, rid):
+                    logger.debug(
+                        "Replay: %s already off %s", wire_rid, node_name,
+                    )
+                elif self.reclaimable(node_name, rid) <= 0:
+                    # Nothing resident to move, so this rank already matches the
+                    # leader. Distinct from the refusal below, and the difference
+                    # matters: ``offload`` answers 0 for both, and treating
+                    # "nothing to free" as retryable wedges the caller forever.
+                    logger.debug(
+                        "Replay: %s holds nothing on %s to offload",
+                        wire_rid, node_name,
+                    )
+                else:
+                    freed = sum(
+                        resource.offload(rid)
+                        for resource in resources
+                        if resource.supports_eviction
+                    )
+                    if freed <= 0:
+                        # Refused for now: a step still holds these pages and
+                        # will release them when it commits.
+                        logger.warning(
+                            "Replay of rank 0's offload of %s on %s refused "
+                            "(a step still holds its pages); %d moves still "
+                            "owed. This rank cannot run rank 0's next step "
+                            "until it catches up.",
+                            wire_rid, node_name, len(delta),
+                        )
+                        return False
+                    logger.info(
+                        "Replayed rank 0's offload of request %s from %s "
+                        "(%d reclaimed)", wire_rid, node_name, freed,
+                    )
+            elif not self.is_offloaded(node_name, rid):
+                logger.debug(
+                    "Replay: %s already resident on %s", wire_rid, node_name,
+                )
+            elif not all(
+                resource.reload(rid)
+                for resource in resources
+                if resource.supports_eviction and resource.is_offloaded(rid)
+            ):
+                    # No room yet. Silent until now, and this is the shape of a
+                    # follower that stops mid-delta and never finishes: rank 0
+                    # then waits on a collective this rank will never join.
+                logger.warning(
+                    "Replay of rank 0's reload of %s on %s does not fit; "
+                    "%d moves still owed. This rank cannot run rank 0's "
+                    "next step until it catches up.",
+                    wire_rid, node_name, len(delta),
+                )
+                return False
+            else:
+                logger.info(
+                    "Replayed rank 0's reload of request %s on %s",
+                    wire_rid, node_name,
+                )
+            delta.pop_left()
+        return True
 
     def reclaimable(self, node_name: str, request_id: str, affected_resources: set[str] | None=None) -> int:
         """What this node's resources could reclaim from the request. 0 means

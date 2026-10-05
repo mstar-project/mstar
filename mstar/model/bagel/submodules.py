@@ -855,12 +855,14 @@ class LLMSubmodule(ARNodeSubmodule):
     def cg_key_info(
         self, graph_walk: str,
         per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs,
     ):
         """Guidance on/off, which is what separates this walk's two decode
         captures. Same fact `declare_step` stamps on the step, read from the
         batch rather than from the prepared inputs because the lease can be
         taken before `prepare_inputs` runs (the speculation path)."""
-        del graph_walk
+        del graph_walk, per_request_input_metadata, kwargs
         return self._batch_get_requires_cfg(per_request_info)
 
     def prepare_inputs(

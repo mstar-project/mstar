@@ -168,6 +168,17 @@ class Resource(ABC):
         """
         return ADMIT_OK
 
+    def rollback_admit(self, step: ResourceStep, ctx: StepContext) -> None:
+        """Give back whatever the live reservation for this step took.
+
+        Called on a refused admit, for every resource the step reached including
+        the one that refused.
+
+        Only what was freshly taken. A page retained from a shared prefix, or a
+        lease converted onto a stream, belongs to whoever else holds it.
+        """
+        return
+
     def plan(self, step: ResourceStep, ctx: StepContext) -> Any:
         """ret is immutable and opaque to runner; only gives to `ctx.plan_results`"""
         return None
@@ -255,6 +266,12 @@ class Resource(ABC):
 
     def reload(self, rid: str) -> bool:
         """Bring it back. False when it doesn't fit on device yet."""
+        return True
+
+    def can_reload(self, rid: str) -> bool:
+        """Whether the request can be reloaded. If this is False, the Engine
+        will not attempt to reload. If True, it will attempt to reload but still
+        check that the reload was successful."""
         return True
 
     def reclaimable(self, rid: str) -> int:

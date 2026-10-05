@@ -158,6 +158,11 @@ class PythonGraphRuntime(GraphRuntime):
         self._completions: dict[int, CompletionState] = {}
         self._completion_counter = 0
 
+        # Streaming ingests a prep staged, parked until commit_speculation
+        # settles them: spec_id -> [(rid, node, into_signals, into_next_iter)].
+        self._staged_specs: dict[int, list[tuple]] = {}
+        self._spec_counter = 0
+
         # worker graph info
         self._queues = {
             worker_graph.worker_graph_id: WorkerGraphQueues(
@@ -272,6 +277,16 @@ class PythonGraphRuntime(GraphRuntime):
             del self._completions[cid]
         for c in self._completions.values():
             c.routing.pop(rid, None)
+        # Same recycling hazard for a staged speculation nobody settled: its
+        # undo would otherwise run against whichever request gets this handle
+        # next. The node objects go away with the queues below anyway.
+        for sid in [
+            sid for sid, staged in self._staged_specs.items()
+            if all(s[0] == rid for s in staged)
+        ]:
+            del self._staged_specs[sid]
+        for sid, staged in self._staged_specs.items():
+            self._staged_specs[sid] = [s for s in staged if s[0] != rid]
 
         info = self._request_info.pop(rid)
         for wg_id in info.worker_graph_ids:
@@ -759,6 +774,7 @@ class PythonGraphRuntime(GraphRuntime):
             ready_rids=[p.rid for p in prepped],
             wg_ids=[wg_id] * len(prepped),
             input_edges=edges,
+            spec_id=self._stage_spec(prepped),
         )
 
     def prep_spec_rids(
@@ -782,6 +798,7 @@ class PythonGraphRuntime(GraphRuntime):
         consumed_idxs: list[int] = []
         ready_rids: list[int] = []
         wg_ids: list[int] = []
+        staged: list["_SpecRidPrep"] = []
         edges = ColumnarEdgeSpecs.empty()
 
         for rid, indexed_edges in per_rid_edges:
@@ -809,6 +826,7 @@ class PythonGraphRuntime(GraphRuntime):
             consumed_idxs.extend(prepped.consumed_idxs)
             ready_rids.append(rid)
             wg_ids.append(wg_id)
+            staged.append(prepped)
             for signal, uuids, final_chunk in prepped.input_edges:
                 edges.add(rid, signal, uuids, final_chunk)
 
@@ -817,7 +835,42 @@ class PythonGraphRuntime(GraphRuntime):
             ready_rids=ready_rids,
             wg_ids=wg_ids,
             input_edges=edges,
+            spec_id=self._stage_spec(staged),
         )
+
+    def _stage_spec(self, prepped: list["_SpecRidPrep"]) -> int:
+        """Park what a prep ingested, for ``commit_speculation`` to settle.
+
+        0 when nothing was ingested: there is no stage to undo, so the caller
+        has nothing to settle and does not need an id to forget.
+        """
+        staged = [
+            (p.rid, p.node, p.into_signals, p.into_next_iter) for p in prepped
+            if p.into_signals or p.into_next_iter
+        ]
+        if not staged:
+            return 0
+        self._spec_counter += 1
+        self._staged_specs[self._spec_counter] = staged
+        return self._spec_counter
+
+    def commit_speculation(
+        self, spec_id: int, success: bool, dropped_rids: list[int] = (),
+        node: str | None = None, wg_id: int | None = None,
+        scheduled_rids: list[int] = (),
+    ):
+        if success and node is not None and wg_id is not None:
+            self.set_speculatively_scheduled(
+                node, wg_id, list(scheduled_rids), True,
+            )
+        staged = self._staged_specs.pop(spec_id, None)
+        if staged is None:
+            return
+        dropped = set(dropped_rids)
+        for rid, staged_node, into_signals, into_next_iter in staged:
+            if success and rid not in dropped:
+                continue
+            self._undo_spec_ingest(staged_node, into_signals, into_next_iter)
 
     def _can_continue_loop(
         self, rid: int, wgio, spec_info, graph_walk: str,
@@ -898,12 +951,10 @@ class PythonGraphRuntime(GraphRuntime):
             else node.ready_signals.ready_inputs
         )
         if same_node:
-            # Carry over loop-external inputs sitting in ready_signals (see
-            # GraphNode.is_ready_for_speculation): they are re-injected
-            # unchanged every iteration and never land in ready_next_iter.
-            for name, edge in node.ready_signals.ready_inputs.items():
-                if edge._persist_for_loop and name not in inputs:
-                    inputs[name] = edge
+            # Carry over the loop-external inputs sitting in ready_signals —
+            # the same set `is_ready_for_speculation` just counted as ready.
+            for name in node.persisted_input_names():
+                inputs.setdefault(name, node.ready_signals.ready_inputs[name])
         return _SpecRidPrep(
             rid=rid,
             node=node,

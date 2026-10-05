@@ -181,8 +181,8 @@ class _Engine:
         del node_name, graph_walk, fwd_info
         return self.groups.get(rid)
 
-    def check_ready(self, node_name, rid, fwd_info):
-        del node_name, fwd_info
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        del allow_reload, node_name, fwd_info
         if rid in self.unservable:
             return FullAdmitOutcome(
                 AdmitOutcome(

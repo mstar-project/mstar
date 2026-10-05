@@ -2,9 +2,9 @@ model: "whisper_large"
 max_seq_len: 448
 resources:
   kv_cache:
-    cpu_offload_pages: 128
+    cpu_offload_pages: 4096
   cross_kv_cache:
-    cpu_offload_pages: 128
+    cpu_offload_pages: 4096
 node_groups:
   - node_names: [audio_encoder]
     ranks: [0]
