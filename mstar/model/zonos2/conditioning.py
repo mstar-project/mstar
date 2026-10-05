@@ -134,6 +134,19 @@ def _neutral_speaking_rate_bytes_per_second(
     return (low + high) / 2.0
 
 
+def _finite_number(name: str, value) -> float:
+    """``value`` as a float; reject a bool, a non-number or a non-finite value."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, got {value!r}.")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number, got {value!r}.") from None
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {value!r}.")
+    return number
+
+
 def resolve_speaking_rate_bucket(
     config: Zonos2Config,
     *,
@@ -170,7 +183,11 @@ def resolve_speaking_rate_bucket(
         raise ValueError("Current model does not support speaking-rate conditioning.")
 
     if speaking_rate_bucket is not None:
-        bucket = int(speaking_rate_bucket)
+        if isinstance(speaking_rate_bucket, bool) or not isinstance(speaking_rate_bucket, int):
+            raise ValueError(
+                f"speaking_rate_bucket must be an integer, got {speaking_rate_bucket!r}."
+            )
+        bucket = speaking_rate_bucket
         if bucket < 0 or bucket >= num_buckets:
             raise ValueError(
                 f"speaking_rate_bucket must be in [0, {num_buckets - 1}], got {bucket}."
@@ -186,11 +203,12 @@ def resolve_speaking_rate_bucket(
 
     if speaking_rate is not None:
         return _speaking_rate_bucket_for_rate(
-            float(speaking_rate), num_buckets=num_buckets, ranges=ranges,
+            _finite_number("speaking_rate", speaking_rate),
+            num_buckets=num_buckets, ranges=ranges,
         )
 
     assert speed is not None
-    speed_value = float(speed)
+    speed_value = _finite_number("speed", speed)
     if speed_value <= 0:
         raise ValueError("speed must be positive.")
     return _speaking_rate_bucket_for_rate(

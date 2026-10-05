@@ -254,21 +254,35 @@ Zonos2 environment requirements
   :doc:`installation`. Drop the ``speaker_encoder`` node group from the config YAML to serve
   text-only; clone requests then fail instead of ignoring the reference audio.
 - Clone requests send reference audio (``audio=...`` with ``"audio"`` in
-  ``input_modalities``). A clip must be longer than 16 ms (the encoder's analysis window)
-  and at most 30 s (``speaker_clip_max_seconds`` in the serving YAML); others get a 400.
-  A client that caches the returned embedding can pass it back as the
-  ``speaker_embedding`` model kwarg to skip the encoder.
+  ``input_modalities``). Send one clip of at least 100 ms and at most 30 s
+  (``speaker_clip_max_seconds`` in the serving YAML); other lengths, a clip that does not
+  decode, or more than one clip get a 400. A client that caches the returned embedding can
+  pass it back as the ``speaker_embedding`` model kwarg to skip the encoder; sending both
+  an embedding and a clip is a 400.
 - **Defaults match the reference server**: ``accurate_mode: true``,
   ``clean_speaker_background: false``, a 0.25–0.5 s trailing-silence quality token
   (``quality_enabled: false`` drops it), the whole context as the frame budget, and text
   normalization when ``.[zonos2-norm]`` is installed (``language`` picks it; default
-  ``en_us``); see :doc:`installation`.
+  ``en_us``; only languages in ``text_normalization_languages`` are normalized); see
+  :doc:`installation`.
 - **Per-request knobs** (``model_kwargs``, the reference's names): ``temperature``
   (``<= 0`` is greedy), ``topk``, ``top_p``, ``min_p``, ``repetition_penalty``,
   ``repetition_window`` (at most ``max_repetition_window``, 256), ``repetition_codebooks``,
   ``ignore_eos`` and ``seed``. ``max_output_tokens`` (or ``max_tokens``) is the frame budget
   and must be at least 1. ``speed``, ``speaking_rate`` and ``speaking_rate_bucket`` take
-  effect only with ``speaking_rate_enabled: true``, as in the reference.
+  effect only with ``speaking_rate_enabled: true``, as in the reference; each maps to the
+  nearest of the checkpoint's rate buckets, so values past the end buckets act like them,
+  and speech degrades toward the ends (``speed: 2`` is already garbled).
+- **Sampling is required.** The model needs sampling and the repetition penalty: greedy or
+  near-greedy settings (``temperature: 0``, a tiny ``top_p``, ``min_p`` near 1) give a few
+  seconds of non-speech, and turning the penalty off (``repetition_window: 0`` or
+  ``repetition_codebooks: 0``) gives long babble. Keep the defaults unless testing.
+- **Seeds** reproduce a request only under the same batching: the sampling noise does not
+  depend on the batch, but bf16 logits change with the batch size, so concurrent traffic
+  can change the audio for a given seed.
+- **Text input.** Empty text, or text with no letter or digit (e.g. only emoji), gets a
+  400. Zonos2 has no SSML support: a prompt starting with ``<speak`` has its tags removed
+  and its words read.
 - **Text length.** The model's context is 6144 frames: one per UTF-8 byte of (normalized)
   text, plus the generated audio (~86 frames/s). Generation stops when the context is full:
   ~70 s of speech after a short prompt, less after a long one. Text too long to leave room

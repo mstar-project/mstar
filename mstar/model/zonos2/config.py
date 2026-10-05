@@ -107,6 +107,11 @@ class Zonos2Config:
     # Written-to-spoken text normalization (the zonos2-norm extra). On by
     # default, as in the reference; a request can still turn it off.
     text_normalization: bool = True
+    # Request language codes whose grammars are built at startup; other
+    # languages are spoken as written.
+    text_normalization_languages: tuple[str, ...] = ("en_us",)
+    # NeMo time per request; past it the remaining sentences pass through raw.
+    text_normalization_time_budget_s: float = 2.0
     # The largest repetition_window a request may ask for; it sets the ring width.
     max_repetition_window: int = 256
 

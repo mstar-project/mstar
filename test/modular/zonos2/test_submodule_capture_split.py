@@ -536,10 +536,10 @@ def test_ignore_eos_and_max_tokens_are_per_request():
     base = _params()
     eoa = 8
 
-    def stop_step(knobs, max_tokens):
+    def stop_step(knobs, frames):
         sub = _sub(base)
-        info = SimpleNamespace(
-            dynamic_loop_iter_counts={}, max_tokens=max_tokens,
+        info = SimpleNamespace(  # the conductor's budget counts C + 1 values per frame
+            dynamic_loop_iter_counts={}, max_tokens=frames * (C + 1),
             resource_configs={SAMPLING: base.for_request(knobs, max_window=64)},
         )
         frame = torch.full((1, C + 1), eoa)                    # eoa on every codebook

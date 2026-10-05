@@ -359,9 +359,9 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
 
         ``(seed, step)`` makes each request reproducible. ``seed`` is the
         conductor's ``random_seed``, and ``step`` is the frame
-        count of the request (``Zonos2SamplerBuffers.offset``). It does not
-        depend on the batch position, so a batched run and a sequential run draw
-        the same frame.
+        count of the request (``Zonos2SamplerBuffers.offset``). The noise does
+        not depend on the batch position, but bf16 logits change with the batch
+        size, so a seed reproduces only under the same batching.
 
         The method reads the batch size from ``logits`` (``pb`` is the padded
         batch), so it needs no list of request ids. Host-side code does the
@@ -452,8 +452,10 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
             st["countdown"] -= 1
 
         finished = st["eos_frame"] is not None and st["countdown"] <= 0
-        # Count emitted frames, prefill's included, so max_tokens=N gives N.
-        max_tokens = getattr(request_info, "max_tokens", None) or self.params.max_tokens
+        # Count emitted frames, prefill's included, so max_tokens=N gives N. The
+        # conductor's budget is in values per frame (get_max_output_tokens).
+        budget = getattr(request_info, "max_tokens", None)
+        max_tokens = max(budget // (self.n_codebooks + 1), 1) if budget else self.params.max_tokens
         if st["step"] + 1 >= max_tokens:
             finished = True
         # Cap generation at the remaining trained context, as the reference does.

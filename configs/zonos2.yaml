@@ -2,6 +2,9 @@ model: "zonos2"
 # The checkpoint's max_seqlen (6144) is the real limit; this key is only
 # required by the conductor.
 max_seq_len: 6144
+# Requests past this wait in the conductor's queue. A shared data-worker
+# thread falls behind above ~200 streams and then fails whole bursts.
+max_concurrent_requests: 128
 # Two-GPU: GPU 0 runs the LLM (prefill + decode) and the voice-clone speaker
 # encoder, GPU 1 runs the DAC vocoder.
 #

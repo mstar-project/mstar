@@ -105,7 +105,31 @@ def test_no_cap_without_a_recorded_prompt():
 def test_prefill_never_signals_the_decode_loop():
     # The prefill walk has no decode_loop; the conductor's cap ends a 1-frame request.
     sub = _sub()
-    ri = SimpleNamespace(dynamic_loop_iter_counts={}, max_tokens=1, graph_walk="prefill")
+    ri = SimpleNamespace(dynamic_loop_iter_counts={}, max_tokens=C + 1, graph_walk="prefill")
     assert sub.check_stop("r", ri, {"new_token": [_frame([])]}) == set()
     ri.graph_walk = "decode"
     assert sub.check_stop("r", ri, {"new_token": [_frame([])]}) == {"decode_loop"}
+
+
+@pytest.mark.parametrize("frames", range(1, 13))
+def test_budget_of_n_frames_emits_n_frames(frames):
+    """Prefill plus decode steps, with the budget in the conductor's units.
+
+    The conductor counts C + 1 values per frame and ends the request once the
+    count reaches the budget, so it must never end it before check_stop does.
+    """
+    from mstar.model.zonos2.config import Zonos2Config
+    from mstar.model.zonos2.zonos2_model import Zonos2Model
+
+    model = Zonos2Model("x", config=Zonos2Config(n_codebooks=C), skip_weight_loading=True)
+    budget = model.get_max_output_tokens(max_output_tokens=frames)
+    sub = _sub()
+    ri = SimpleNamespace(dynamic_loop_iter_counts={}, max_tokens=budget, graph_walk="prefill")
+    sub.check_stop("r", ri, {"new_token": [_frame([])]})
+    emitted, counted = 1, C + 1
+    ri.graph_walk = "decode"
+    while counted < budget:  # the conductor's cap
+        emitted, counted = emitted + 1, counted + C + 1
+        if sub.check_stop("r", ri, {"new_token": [_frame([])]}):
+            break
+    assert emitted == frames

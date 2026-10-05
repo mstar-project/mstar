@@ -23,8 +23,12 @@ the LLM, and ``dac_chunk`` on the DAC.
 """
 from __future__ import annotations
 
+import html
+import importlib.util
 import logging
 import os
+import re
+import unicodedata
 
 import torch
 
@@ -60,6 +64,8 @@ from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
+
+_SSML_TAG_RE = re.compile(r"<[^<>]*>")
 
 _LLM = "LLM"
 _DAC_NODE = "dac_decoder"
@@ -105,6 +111,14 @@ class Zonos2Model(Model):
         )
         self._submodule_cache: dict[str, torch.nn.Module | None] = {}
         self._text_normalizer = None  # built on the first request that needs it
+        if (
+            self.config.text_normalization
+            and importlib.util.find_spec("nemo_text_processing") is None
+        ):
+            logger.info(
+                "Zonos2: text_normalization is on, but nemo_text_processing (the "
+                "zonos2-norm extra) is not installed; text is spoken as written."
+            )
 
     def _load_config(self) -> Zonos2Config:
         """Build the config from the ``params.json`` of the checkpoint.
@@ -183,11 +197,19 @@ class Zonos2Model(Model):
         ]
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
-        """The request's frame budget. ``max_tokens`` is the reference's name."""
+        """The request's frame budget, in the conductor's units: values per frame.
+
+        The conductor counts emitted values, not frames, and prefill emits one
+        whole frame. A budget in frames would end requests of up to
+        ``n_codebooks + 1`` frames after prefill. ``check_stop`` converts back.
+        ``max_tokens`` is the reference's name.
+        """
+        frames = self.sampling_params.max_tokens
         for key in ("max_output_tokens", "max_tokens"):
             if model_kwargs.get(key) is not None:
-                return int(model_kwargs[key])
-        return self.sampling_params.max_tokens
+                frames = int(model_kwargs[key])
+                break
+        return frames * (self.config.n_codebooks + 1)
 
     def get_request_resource_configs(
         self,
@@ -441,8 +463,12 @@ class Zonos2Model(Model):
         from mstar.model.base import TensorAndMetadata
 
         sample_rate = self.config.speaker_encoder_sample_rate
-        decoder = AudioDecoder(filepath, sample_rate=sample_rate, num_channels=1)
-        audio = decoder.get_all_samples().data[0]
+        try:
+            decoder = AudioDecoder(filepath, sample_rate=sample_rate, num_channels=1)
+            audio = decoder.get_all_samples().data[0]
+        except Exception as exc:  # noqa: BLE001 - torchcodec raises several types
+            # The message would expose the server's upload path; keep it in the log.
+            raise ValueError("Could not decode the reference audio.") from exc
         return TensorAndMetadata(
             data=audio, metadata=dict(sample_rate=sample_rate, num_channels=1),
         )
@@ -455,14 +481,16 @@ class Zonos2Model(Model):
         tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        if prompt is None:
-            return {}
-
+        prompt = self._speakable_text(prompt)
         speaker_embedding = self._resolve_speaker_embedding(kwargs.get("speaker_embedding"))
-        has_reference_audio = bool((tensors or {}).get("audio_inputs"))
-        for clip in (tensors or {}).get("audio_inputs") or []:
+        clips = (tensors or {}).get("audio_inputs") or []
+        if len(clips) > 1:
+            raise ValueError(f"Send one reference clip, not {len(clips)}.")
+        if clips and speaker_embedding is not None:
+            raise ValueError("Send a reference clip or a speaker_embedding, not both.")
+        for clip in clips:
             self._validate_reference_clip(clip)
-        speaker = speaker_embedding is not None or has_reference_audio
+        speaker = speaker_embedding is not None or bool(clips)
         if speaker and not self.config.speaker_enabled:
             raise ValueError(
                 "Reference audio / speaker_embedding was supplied, but this Zonos2 "
@@ -480,9 +508,7 @@ class Zonos2Model(Model):
         self._check_max_output_tokens(kwargs)
         flags = self._request_flags(kwargs)
 
-        prompt = self._normalize_text(prompt, kwargs.get("language"), flags)
-        frames = self._prompt_builder.build(
-            prompt,
+        build_kwargs = dict(
             speaker=speaker,
             clean_speaker_background=flags["clean_speaker_background"],
             accurate_mode=flags["accurate_mode"],
@@ -499,13 +525,31 @@ class Zonos2Model(Model):
                 quality_values=kwargs.get("quality_values"),
                 quality_enabled=flags["quality_enabled"],
             ),
-        )  # (num_frames, n_codebooks + 1)
+        )
+        # Spoken form is never shorter than written, so reject what cannot fit before NeMo runs.
+        overhead = self._prompt_builder.build("", **build_kwargs).shape[0]
+        self._check_prompt_fits(prompt, overhead + len(prompt.encode("utf-8")))
+
+        prompt = self._normalize_text(prompt, kwargs.get("language"), flags)
+        frames = self._prompt_builder.build(prompt, **build_kwargs)  # (num_frames, n_codebooks + 1)
         self._check_prompt_fits(prompt, frames.shape[0])
 
         out: NameToTensorList = {"text_inputs": [frames]}
         if speaker_embedding is not None:
             out["speaker_embedding"] = [speaker_embedding]
         return out
+
+    @staticmethod
+    def _speakable_text(prompt: str | None) -> str:
+        """Strip SSML markup; reject text with no letter or digit to speak."""
+        if prompt is None or not prompt.strip():
+            raise ValueError("Text is empty; send the text to speak.")
+        if prompt.lstrip().startswith("<speak"):
+            # Zonos2 has no SSML support; read the words, not the tags.
+            prompt = html.unescape(_SSML_TAG_RE.sub(" ", prompt)).strip()
+        if not any(unicodedata.category(ch)[0] in "LN" for ch in prompt):
+            raise ValueError("Text has no letters or digits to speak.")
+        return prompt
 
     def _normalize_text(self, text: str, language, flags: dict[str, bool]) -> str:
         """Spoken-form text when normalization is on for the deployment and request."""
@@ -514,14 +558,21 @@ class Zonos2Model(Model):
             raise ValueError(f"language must be a string, got {language!r}.")
         if not (self.config.text_normalization and flags["text_normalization"]):
             return text
+        return self._get_text_normalizer().normalize(text, language)
+
+    def _get_text_normalizer(self):
         if self._text_normalizer is None:
             from mstar.model.zonos2.textnorm import TextNormalizer
 
             root = os.path.join(
                 self.cache_dir or os.path.expanduser("~/.cache"), "zonos2_textnorm",
             )
-            self._text_normalizer = TextNormalizer(root)
-        return self._text_normalizer.normalize(text, language)
+            self._text_normalizer = TextNormalizer(
+                root, time_budget_s=self.config.text_normalization_time_budget_s,
+            )
+            # Only the API server calls process_prompt, so only it builds grammars.
+            self._text_normalizer.start_build(tuple(self.config.text_normalization_languages))
+        return self._text_normalizer
 
     # Boolean request flags and their defaults, which are the reference's.
     _FLAG_DEFAULTS = {
@@ -585,8 +636,8 @@ class Zonos2Model(Model):
         max_seconds = self.config.speaker_clip_max_seconds
         if seconds < min_seconds:
             raise ValueError(
-                f"Reference audio is {seconds * 1000:.1f} ms; voice cloning needs "
-                f"at least {min_seconds * 1000:.1f} ms."
+                f"Reference audio is {seconds * 1000:.2f} ms; voice cloning needs "
+                f"at least {min_seconds * 1000:g} ms."
             )
         if seconds > max_seconds:
             raise ValueError(

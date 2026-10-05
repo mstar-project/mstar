@@ -43,8 +43,9 @@ class Qwen3SpeakerEncoder(nn.Module):
     N_MELS = 128
     F_MIN = 0.0
     F_MAX = 12_000.0
-    # The reflect pad in ``_make_mel`` needs more samples than it pads, at 24 kHz.
-    MIN_SAMPLES = (N_FFT - HOP_LENGTH) // 2 + 1
+    # The encoder's reflect-padded convs need 5 mel frames (1,280 samples, measured);
+    # rounded up to 100 ms, as a shorter clip carries no usable voice.
+    MIN_SAMPLES = 2_400
 
     def __init__(
         self,

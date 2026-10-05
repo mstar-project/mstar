@@ -305,8 +305,12 @@ form when ``.[zonos2-norm]`` is installed:
 
    pip install -e ".[zonos2-norm]"
 
-The first request in each language builds NeMo's grammars (about 20 s for English) and caches
-them under ``<cache dir>/zonos2_textnorm``; later server starts load them in under a second.
+The first request builds NeMo's grammars, on a background thread, for the languages in
+``text_normalization_languages`` (YAML ``model_kwargs``; default ``[en_us]``). Text is spoken
+as written until its grammars are ready: the first build takes about 20 s for English and is
+cached under ``<cache dir>/zonos2_textnorm``, and later server starts load it in under a
+second. Text in a language not in the list is spoken as written, with a warning in the log. Each request gets ``text_normalization_time_budget_s`` (default 2 s)
+of normalizer time; once that is spent, the remaining sentences are spoken as written.
 Normalization never fails a request: without the extra, or on a normalizer error, the text
 is spoken as written. Turn it off per request with ``"text_normalization": false``, or for
 a deployment with ``text_normalization: false`` in the YAML ``model_kwargs``.

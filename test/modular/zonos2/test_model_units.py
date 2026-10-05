@@ -13,6 +13,10 @@ anyway, so per-position isolation is preserved.
 """
 from __future__ import annotations
 
+import re
+import time
+from types import SimpleNamespace
+
 import pytest
 from torch import nn
 
@@ -465,11 +469,18 @@ def _clone(model, samples):
 def test_reference_clip_at_encoder_floor_is_accepted():
     from mstar.model.zonos2.speaker_encoder import Qwen3SpeakerEncoder
 
-    assert Qwen3SpeakerEncoder.MIN_SAMPLES == 385  # reflect pad is 384
+    # The encoder fails below 5 mel frames (1,280 samples, measured); the floor is 100 ms.
+    assert Qwen3SpeakerEncoder.MIN_SAMPLES >= 5 * Qwen3SpeakerEncoder.HOP_LENGTH
+    assert Qwen3SpeakerEncoder.MIN_SAMPLES == 2_400
     assert "text_inputs" in _clone(_clone_model(), Qwen3SpeakerEncoder.MIN_SAMPLES)
 
 
-@pytest.mark.parametrize("samples", [0, 1, 384])
+def test_short_clip_message_does_not_contradict_itself():
+    with pytest.raises(ValueError, match=r"is 99\.96 ms; voice cloning needs at least 100 ms"):
+        _clone(_clone_model(), 2_399)
+
+
+@pytest.mark.parametrize("samples", [0, 1, 384, 1_279, 2_399])
 def test_reference_clip_below_encoder_floor_is_rejected(samples):
     # These used to crash the encoder and every clone batched with them.
     with pytest.raises(ValueError, match="at least"):
@@ -488,8 +499,8 @@ def test_speaker_encoder_rejects_short_clip_with_clear_error():
     from mstar.model.zonos2.speaker_encoder import Qwen3SpeakerEncoder
 
     enc = object.__new__(Qwen3SpeakerEncoder)  # skip the HF model load
-    with pytest.raises(ValueError, match="needs at least 385"):
-        enc._make_mel(torch.zeros(1, 384))
+    with pytest.raises(ValueError, match="needs at least 2400"):
+        enc._make_mel(torch.zeros(1, 2_399))
 
 
 # -- prompt length vs the trained context -------------------------------------
@@ -526,10 +537,19 @@ def test_bad_request_knobs_are_rejected_before_the_engine(kwargs, match):
 
 def test_frame_budget_reads_max_tokens_as_an_alias():
     model = _clone_model()
-    assert model.get_max_output_tokens() == model.sampling_params.max_tokens
-    assert model.get_max_output_tokens(max_tokens=50) == 50
-    assert model.get_max_output_tokens(max_tokens=50, max_output_tokens=70) == 70
+    width = model.config.n_codebooks + 1  # the conductor counts values, not frames
+    assert model.get_max_output_tokens() == model.sampling_params.max_tokens * width
+    assert model.get_max_output_tokens(max_tokens=50) == 50 * width
+    assert model.get_max_output_tokens(max_tokens=50, max_output_tokens=70) == 70 * width
     _prompt(model, max_output_tokens=1)  # the smallest accepted
+
+
+@pytest.mark.parametrize("frames", [2, 5, 10])
+def test_small_budgets_outlast_the_prefill_frame(frames):
+    """The conductor ends a request once its counted values reach the budget."""
+    model = _clone_model()
+    prefill_values = model.config.n_codebooks + 1
+    assert model.get_max_output_tokens(max_output_tokens=frames) > prefill_values
 
 
 def test_request_knobs_reach_the_resource_config():
@@ -539,6 +559,22 @@ def test_request_knobs_reach_the_resource_config():
     cfg = model.get_request_resource_configs({}, {"temperature": 0.3, "topk": 5})[SAMPLING]
     assert (cfg.temperature, cfg.topk) == (0.3, 5)
     assert cfg.min_p == model.sampling_params.min_p           # untouched knobs keep defaults
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    ({"speed": float("inf")}, "speed must be finite"),
+    ({"speed": float("nan")}, "speed must be finite"),
+    ({"speed": 1e309}, "speed must be finite"),
+    ({"speed": True}, "speed must be a number"),
+    ({"speed": "fast"}, "speed must be a number"),
+    ({"speaking_rate": float("inf")}, "speaking_rate must be finite"),
+    ({"speaking_rate_bucket": "1"}, "must be an integer"),
+    ({"speaking_rate_bucket": 1.0}, "must be an integer"),
+])
+def test_bad_speaking_rate_values_are_rejected(kwargs, match):
+    model = _clone_model(speaking_rate_num_buckets=3)
+    with pytest.raises(ValueError, match=match):
+        _prompt(model, speaking_rate_enabled=True, **kwargs)
 
 
 def test_speed_is_ignored_unless_speaking_rate_is_enabled():
@@ -580,7 +616,8 @@ def test_defaults_are_the_reference_servers():
     assert torch.equal(_clone_prompt(model), _clone_prompt(model, **reference))
     old = {"accurate_mode": False, "clean_speaker_background": True, "quality_enabled": False}
     assert not torch.equal(_clone_prompt(model), _clone_prompt(model, **old))
-    assert model.get_max_output_tokens() == model.config.max_position_embeddings
+    width = model.config.n_codebooks + 1
+    assert model.get_max_output_tokens() == model.config.max_position_embeddings * width
 
 
 def test_quality_default_needs_the_feature_and_can_be_turned_off():
@@ -617,7 +654,7 @@ def _normalized(model, **kwargs):
     build = model._prompt_builder.build
     model._prompt_builder.build = lambda text, **kw: seen.append(text) or build(text, **kw)
     _prompt(model, **kwargs)
-    return seen[0]
+    return seen[-1]
 
 
 def test_text_is_normalized_unless_the_request_or_deployment_turns_it_off():
@@ -640,5 +677,144 @@ def test_real_normalizer_reads_money_and_time(tmp_path):
     pytest.importorskip("nemo_text_processing")
     from mstar.model.zonos2.textnorm import TextNormalizer
 
-    out = TextNormalizer(str(tmp_path)).normalize("It costs $1,250.75 at 5:30 PM.", "en_us")
-    assert "dollars" in out and "five thirty" in out
+    n = TextNormalizer(str(tmp_path))
+    n.start_build(["en_us"]).join()
+    out = n.normalize("It costs $1,250.75 at 5:30 PM. Call at 3:15 PM!", "en_us")
+    assert "dollars" in out and "five thirty" in out and "three fifteen" in out
+
+
+def test_text_over_the_context_is_rejected_before_normalizing():
+    model = _clone_model(text_normalization=True)
+    calls = []
+    model._text_normalizer = SimpleNamespace(normalize=lambda t, lang: calls.append(t) or t)
+    text = "a" * model.config.max_position_embeddings
+    with pytest.raises(ValueError, match="Split long text"):
+        model.process_prompt(text, ["text"], ["audio"])
+    assert calls == []
+
+
+class _FakeNemo:
+    """Upper-cases each call's text; ``delay`` stretches each call."""
+
+    def __init__(self, delay=0.0):
+        self.delay = delay
+        self.calls = []
+
+    def split_text_into_sentences(self, text):
+        return re.split(r"(?<=[.!?])\s", text)
+
+    def normalize(self, text, punct_post_process=False):
+        self.calls.append(text)
+        time.sleep(self.delay)
+        return text.upper()
+
+
+def _fake_normalizer(monkeypatch, nemo, **kw):
+    from mstar.model.zonos2 import textnorm
+
+    monkeypatch.setattr(textnorm, "available", lambda: True)
+    n = textnorm.TextNormalizer("/nonexistent", **kw)
+    n._normalizers["en"] = nemo
+    return n
+
+
+def test_unbuilt_language_passes_through_without_building(monkeypatch):
+    from mstar.model.zonos2 import textnorm
+
+    n = _fake_normalizer(monkeypatch, _FakeNemo())
+    monkeypatch.setattr(textnorm.TextNormalizer, "_get", lambda *a: pytest.fail("built inline"))
+    assert n.normalize("Il coute 5 $.", "fr_fr") == "Il coute 5 $."
+    assert n.normalize("Hi.", "en_us") == "HI."
+
+
+def test_normalizer_works_a_sentence_at_a_time_and_cuts_long_ones(monkeypatch):
+    from mstar.model.zonos2 import textnorm
+
+    nemo = _FakeNemo()
+    n = _fake_normalizer(monkeypatch, nemo)
+    long_sentence = " ".join(["word"] * 500)  # 2,499 bytes, no sentence end
+    assert n.normalize(f"One. Two? {long_sentence}", "en_us") == f"ONE. TWO? {long_sentence.upper()}"
+    assert nemo.calls[:2] == ["One.", "Two?"]
+    assert all(len(c.encode()) <= textnorm.MAX_CHUNK_BYTES for c in nemo.calls)
+    assert len(nemo.calls) == 5
+
+
+def test_normalizer_passes_the_rest_through_past_its_budget(monkeypatch):
+    nemo = _FakeNemo(delay=0.05)
+    n = _fake_normalizer(monkeypatch, nemo, time_budget_s=0.12)
+    out = n.normalize(" ".join(f"s{i}." for i in range(10)), "en_us").split()
+    assert len(nemo.calls) == 3  # checked before each sentence: 0, 0.05, 0.10 s
+    assert out == ["S0.", "S1.", "S2."] + [f"s{i}." for i in range(3, 10)]
+
+
+def test_first_request_starts_one_build_of_the_configured_languages(monkeypatch):
+    from mstar.model.zonos2 import textnorm
+
+    builds = []
+    monkeypatch.setattr(textnorm.TextNormalizer, "start_build", lambda self, langs: builds.append(langs))
+    model = _clone_model(text_normalization=True, text_normalization_languages=("en_us", "de"))
+    _prompt(model)
+    _prompt(model)
+    assert builds == [("en_us", "de")]
+    _prompt(_clone_model(text_normalization=False))
+    assert len(builds) == 1
+
+
+def test_text_passes_through_while_its_grammars_build(monkeypatch):
+    nemo = _FakeNemo()
+    n = _fake_normalizer(monkeypatch, nemo)
+    del n._normalizers["en"]
+    n._building.add("en")
+    assert n.normalize("Hi.", "en_us") == "Hi."
+    assert nemo.calls == [] and "en" not in n._warned_unbuilt
+
+
+# -- text the model can speak -----------------------------------------------------
+@pytest.mark.parametrize("text, match", [
+    (None, "Text is empty"),
+    ("", "Text is empty"),
+    ("   \n", "Text is empty"),
+    ("\U0001F600\U0001F44D", "no letters or digits"),
+    ("...!?", "no letters or digits"),
+    ("<speak></speak>", "no letters or digits"),
+])
+def test_unspeakable_text_is_rejected(text, match):
+    with pytest.raises(ValueError, match=match):
+        _clone_model().process_prompt(text, ["text"], ["audio"])
+
+
+def _built_text(model, text):
+    """The text the prompt builder was given for ``text``."""
+    seen = []
+    build = model._prompt_builder.build
+    model._prompt_builder.build = lambda t, **kw: seen.append(t) or build(t, **kw)
+    model.process_prompt(text, ["text"], ["audio"])
+    return seen[-1]
+
+
+def test_ssml_tags_are_stripped():
+    ssml = '<speak>Hello <break time="1s"/> &amp; bye.</speak>'
+    assert _built_text(_clone_model(), ssml).split() == ["Hello", "&", "bye."]
+    assert _built_text(_clone_model(), "a < b and c > d") == "a < b and c > d"  # not SSML
+
+
+# -- reference audio --------------------------------------------------------------
+def test_two_clips_or_a_clip_and_an_embedding_are_rejected():
+    model = _clone_model()
+    clip = torch.zeros(24_000)
+    with pytest.raises(ValueError, match="one reference clip, not 2"):
+        model.process_prompt("Hi.", ["audio", "audio", "text"], ["audio"],
+                             tensors={"audio_inputs": [clip, clip]})
+    emb = [0.0] * model.config.speaker_embedding_dim
+    with pytest.raises(ValueError, match="not both"):
+        model.process_prompt("Hi.", ["audio", "text"], ["audio"],
+                             tensors={"audio_inputs": [clip]}, speaker_embedding=emb)
+
+
+def test_undecodable_clip_is_a_400_without_the_upload_path(tmp_path):
+    pytest.importorskip("torchcodec")
+    bad = tmp_path / "secret_upload_dir_clip.wav"
+    bad.write_bytes(b"not audio at all")
+    with pytest.raises(ValueError) as exc:
+        _clone_model().load_audio(str(bad), "cpu")
+    assert str(exc.value) == "Could not decode the reference audio."
