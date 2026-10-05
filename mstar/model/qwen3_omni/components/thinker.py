@@ -21,36 +21,86 @@ Weight name prefix: ``thinker.``
   - thinker.lm_head.weight
 """
 
+import logging
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components import ParallelSparseMoeBlock, RMSNorm
+from mstar.model.components import ExpertParallelSparseMoeBlock, ParallelSparseMoeBlock, RMSNorm
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
 from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, Qwen3OmniModelConfig
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ThinkerMoeParallelConfig:
+    """How the Thinker's routed experts split across its node group.
+
+    Read from the deployment yaml's ``model_kwargs.thinker_moe``. Attention
+    and dense MLPs stay TP-sharded either way.
+    """
+
+    # "tp": every rank holds a slice of every expert; "ep": whole experts per rank.
+    parallel: str = "tp"
+    # Comm group EP spans. Only "tp", the node group's TP ranks, exists today.
+    ep_group: str = "tp"
+    # Temporary: device-assert every rank routes to the same experts.
+    debug_check_routing: bool = False
+    # Log per-rank EP slot counts every N Thinker steps; 0 is off.
+    log_expert_load_every: int = 0
+
+    def __post_init__(self):
+        if self.parallel not in ("tp", "ep"):
+            raise ValueError(f"thinker_moe.parallel must be 'tp' or 'ep', got {self.parallel!r}")
+        if self.ep_group != "tp":
+            raise ValueError(f"thinker_moe.ep_group must be 'tp', got {self.ep_group!r}")
+        if self.log_expert_load_every < 0:
+            raise ValueError("thinker_moe.log_expert_load_every must be >= 0")
+        if self.parallel != "ep" and (self.debug_check_routing or self.log_expert_load_every):
+            raise ValueError(
+                "thinker_moe.debug_check_routing and log_expert_load_every need parallel: ep"
+            )
+
+    @classmethod
+    def from_yaml(cls, section: dict | None) -> "ThinkerMoeParallelConfig":
+        section = dict(section or {})
+        unknown = set(section) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ValueError(f"unknown thinker_moe keys: {sorted(unknown)}")
+        return cls(**section)
+
+    def resolve_ep_group(self, tp_group: CommGroup | None) -> CommGroup | None:
+        # Only one choice for now; new mesh axes would be selected here.
+        return tp_group
 
 
 class Qwen3OmniThinkerLayer(nn.Module):
     """Single Thinker decoder layer: attention + MoE/dense MLP.
 
-    Uses ``ParallelSparseMoeBlock`` for most layers, and a dense
+    Uses ``ParallelSparseMoeBlock``, or ``ExpertParallelSparseMoeBlock``
+    under ``moe_parallel.parallel == "ep"``, for most layers, and a dense
     ``ParallelGatedMLP`` (SiLU SwiGLU) for layers in ``mlp_only_layers``.
 
     Args:
         config: top-level Qwen3-Omni model configuration.
         layer_idx: index of this layer in the stack.
         comm_group: TP communication group for MoE/MLP sharding.
+        moe_parallel: TP or EP for the routed experts; TP when None.
     """
 
     def __init__(
         self, config: Qwen3OmniModelConfig, layer_idx: int,
         comm_group: CommGroup | None = None,
+        moe_parallel: ThinkerMoeParallelConfig | None = None,
     ):
         super().__init__()
         tc = config.thinker_text
+        moe_parallel = moe_parallel or ThinkerMoeParallelConfig()
 
         self.hidden_size = tc.hidden_size
 
@@ -83,7 +133,23 @@ class Qwen3OmniThinkerLayer(nn.Module):
             and tc.num_experts > 0
             and (layer_idx + 1) % tc.decoder_sparse_step == 0
         )
-        if use_moe:
+        if use_moe and moe_parallel.parallel == "ep":
+            ep_group = moe_parallel.resolve_ep_group(comm_group)
+            self.mlp = ExpertParallelSparseMoeBlock(
+                hidden_size=tc.hidden_size,
+                moe_intermediate_size=tc.moe_intermediate_size,
+                num_experts=tc.num_experts,
+                num_experts_per_tok=tc.num_experts_per_tok,
+                norm_topk_prob=tc.norm_topk_prob,
+                comm_group=ep_group,
+                debug_check_routing=moe_parallel.debug_check_routing,
+                # Counts are identical on every rank, so only rank 0 keeps them.
+                track_expert_load=(
+                    moe_parallel.log_expert_load_every > 0
+                    and (ep_group is None or ep_group.rank == 0)
+                ),
+            )
+        elif use_moe:
             self.mlp = ParallelSparseMoeBlock(
                 hidden_size=tc.hidden_size,
                 moe_intermediate_size=tc.moe_intermediate_size,
@@ -137,12 +203,15 @@ class Qwen3OmniThinkerLayer(nn.Module):
 class Qwen3OmniThinkerTextModel(nn.Module):
     """Inner text model (maps to ``thinker.model.*`` in HF weights)."""
 
-    def __init__(self, config: Qwen3OmniModelConfig, comm_group: CommGroup | None = None):
+    def __init__(
+        self, config: Qwen3OmniModelConfig, comm_group: CommGroup | None = None,
+        moe_parallel: ThinkerMoeParallelConfig | None = None,
+    ):
         super().__init__()
         tc = config.thinker_text
         self.embed_tokens = nn.Embedding(tc.vocab_size, tc.hidden_size)
         self.layers = nn.ModuleList([
-            Qwen3OmniThinkerLayer(config, layer_idx=i, comm_group=comm_group)
+            Qwen3OmniThinkerLayer(config, layer_idx=i, comm_group=comm_group, moe_parallel=moe_parallel)
             for i in range(tc.num_hidden_layers)
         ])
         self.norm = RMSNorm(tc.hidden_size, eps=tc.rms_norm_eps)
@@ -164,7 +233,10 @@ class Qwen3OmniThinkerModel(nn.Module):
     - Layer-N hidden states (``accept_hidden_layer``) for Talker conditioning
     """
 
-    def __init__(self, config: Qwen3OmniModelConfig, comm_group: CommGroup | None = None):
+    def __init__(
+        self, config: Qwen3OmniModelConfig, comm_group: CommGroup | None = None,
+        moe_parallel: ThinkerMoeParallelConfig | None = None,
+    ):
         super().__init__()
         tc = config.thinker_text
 
@@ -172,9 +244,66 @@ class Qwen3OmniThinkerModel(nn.Module):
         self.num_layers = tc.num_hidden_layers
         self.accept_hidden_layer = config.accept_hidden_layer
 
-        self.model = Qwen3OmniThinkerTextModel(config, comm_group=comm_group)
+        self.model = Qwen3OmniThinkerTextModel(config, comm_group=comm_group, moe_parallel=moe_parallel)
 
         self.lm_head = nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
+
+        self._log_expert_load_every = (moe_parallel or ThinkerMoeParallelConfig()).log_expert_load_every
+        self._steps_since_load_log = 0
+        self._discard_expert_load = False
+
+    def _tracked_moe_layers(self) -> list[tuple[int, nn.Module]]:
+        return [
+            (i, layer.mlp) for i, layer in enumerate(self.model.layers)
+            if getattr(layer.mlp, "track_expert_load", False)
+        ]
+
+    @torch.compiler.disable
+    def maybe_log_expert_load(self, synthetic: bool = False) -> None:
+        """Before each Thinker forward: after every N forwards, log EP load and reset it.
+
+        Call from eager code. ``synthetic`` marks a
+        warmup or capture step; its dummy routing is discarded before the
+        next real step. Under CUDA graphs real counts include padding rows.
+        """
+        if not self._log_expert_load_every:
+            return
+        if synthetic:
+            self._discard_expert_load = True
+            return
+        if self._discard_expert_load:
+            self._discard_expert_load = False
+            self._steps_since_load_log = 0
+            for _, mlp in self._tracked_moe_layers():
+                mlp.expert_load.zero_()
+        # Counts forwards already run; this step's forward comes after.
+        steps = self._steps_since_load_log
+        self._steps_since_load_log += 1
+        if steps < self._log_expert_load_every:
+            return
+        self._steps_since_load_log = 1
+        layers = self._tracked_moe_layers()
+        if not layers:
+            return
+        world_size = layers[0][1].comm_group.world_size
+        # (layers, experts) -> (layers, ranks)
+        per_expert = torch.stack([mlp.pop_expert_load() for _, mlp in layers])
+        per_rank = per_expert.view(len(layers), world_size, -1).sum(-1)
+
+        def imbalance(counts: torch.Tensor) -> float:
+            mean = counts.double().mean().item()
+            return counts.max().item() / mean if mean else 1.0
+
+        totals = per_rank.sum(0)
+        worst = max(range(len(layers)), key=lambda j: imbalance(per_rank[j]))
+        hottest = per_expert.sum(0).topk(min(4, per_expert.shape[1]))
+        logger.info(
+            "Thinker EP load over %d steps, %d MoE layers: per-rank slots %s "
+            "(max/mean %.2f); worst layer %d %s (max/mean %.2f); hottest experts %s",
+            steps, len(layers), totals.tolist(), imbalance(totals),
+            layers[worst][0], per_rank[worst].tolist(), imbalance(per_rank[worst]),
+            dict(zip(hottest.indices.tolist(), hottest.values.tolist(), strict=True)),
+        )
 
     def _deepstack_process(
         self, hidden_states: torch.Tensor, visual_embeds: torch.Tensor
