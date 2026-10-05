@@ -1282,11 +1282,13 @@ class Worker:
         for rid, inputs in per_request_inputs.items():
             req_info = self.request_state.get_fwd_info(rid, batch_partition)
             fwd_info[rid] = req_info
+            stream_chunks = {}
+            if chunks := self._stream_chunks_for(rid, node_name, inputs):
+                stream_chunks = chunks
             meta[rid] = InputMetadata(
+                stream_chunks=stream_chunks,
                 dynamic_loop_iter_counts=req_info.dynamic_loop_iter_counts.copy()
             )
-            if chunks := self._stream_chunks_for(rid, node_name, inputs):
-                meta[rid].stream_chunks = chunks
 
         if increment_loop_rids is not None and increment_loop_name is not None:
             for rid in increment_loop_rids:
