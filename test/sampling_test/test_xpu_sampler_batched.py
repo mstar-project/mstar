@@ -28,7 +28,7 @@ def test_batched_sampling_matches_legacy_cpu_rng_calls(device, top_k, top_p):
     actual = sample_tokens(
         logits, temperature=1., top_k=top_k, top_p=top_p,
         seed=seeds, rand_offset=offsets, any_greedy=False,
-        all_top_k_zero=top_k == 0,
+        top_k_zero_count=logits.shape[0] if top_k == 0 else 0,
     )
     legacy = []
     for row in range(logits.shape[0]):
@@ -73,13 +73,14 @@ def test_mixed_settings_are_invariant_to_batch_order_and_padding(device):
     torch.testing.assert_close(actual[greedy], logits[greedy].argmax(dim=-1), atol=0, rtol=0)
 
 
-def test_request_rng_offsets_survive_reordered_decode_batches(device):
+@pytest.mark.parametrize("top_ks", [(32, 32, 32), (0, 32, 0)])
+def test_request_rng_offsets_survive_reordered_decode_batches(device, top_ks):
     logits, _, _ = _inputs(device, batch=3)
     serial, batched = Sampler(device), Sampler(device)
     for sampler in (serial, batched):
         for rid in range(3):
             sampler.add_request(rid)
-            sampler.set_config(rid, temperature=0.8, top_k=32, top_p=0.9)
+            sampler.set_config(rid, temperature=0.8, top_k=top_ks[rid], top_p=0.9)
             sampler._sampling_config[rid].set_seed(777 + rid)
     for order in ([0, 1, 2], [2, 0, 1], [1, 2, 0]):
         expected = torch.cat([serial.sample([rid], logits[rid:rid + 1]) for rid in order])
@@ -105,14 +106,21 @@ def test_unseeded_sampling_advances_default_generator_and_reproduces_after_reset
         generator.set_state(original)
 
 
-def test_explicit_rng_sampling_captures_and_advances_in_xpu_graph(device):
+@pytest.mark.parametrize(
+    ("top_k", "zero_count"),
+    [(0, 4), (32, 0), ([0, 32, 0, 16], 2), ([0, 32, 0, 16], None)],
+)
+def test_explicit_rng_sampling_captures_and_advances_in_xpu_graph(device, top_k, zero_count):
     logits, seeds, offsets = _inputs(device, batch=4)
     stride = logits.shape[1]
     start = offsets.clone()
+    if isinstance(top_k, list):
+        top_k = torch.tensor(top_k, dtype=torch.int32, device=device)
 
     def sample():
         tokens = sample_tokens(
-            logits, temperature=0.8, top_k=32, top_p=0.9,
+            logits, temperature=0.8, top_k=top_k, top_p=0.9,
+            top_k_zero_count=zero_count,
             seed=seeds, rand_offset=offsets,
         )
         offsets.add_(stride)

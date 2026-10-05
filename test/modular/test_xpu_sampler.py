@@ -1,6 +1,7 @@
-"""CPU checks for the batched XPU sampler ABI and host synchronization."""
+"""CPU checks for sampler hints, the batched XPU ABI and host synchronization."""
 
 import sys
+from contextlib import nullcontext
 from types import ModuleType
 from unittest.mock import Mock
 
@@ -32,7 +33,7 @@ def _sample(logits, **overrides):
     options = dict(
         temperature=torch.ones(batch), top_k=torch.zeros(batch, dtype=torch.int32),
         top_p=torch.ones(batch), repetition_penalty=1.0, seen_token_mask=None,
-        run_greedy=True, any_top_k_zero=None, all_top_k_zero=None,
+        run_greedy=True, top_k_zero_count=None,
         seed=torch.arange(batch, dtype=torch.int64) + 100,
         rand_offset=torch.arange(batch, dtype=torch.int64) * logits.shape[1],
     )
@@ -40,7 +41,8 @@ def _sample(logits, **overrides):
     return utils._sample_xpu(logits, **options)
 
 
-def test_explicit_rng_uses_one_batched_call_without_host_reads(kernel, monkeypatch):
+@pytest.mark.parametrize("zero_count", [None, 2])
+def test_explicit_rng_uses_one_batched_call_without_host_reads(kernel, monkeypatch, zero_count):
     logits = torch.tensor([[1., 3., 2.], [4., 2., 3.], [1., 2., 4.]])
     with monkeypatch.context() as guard:
         def forbidden(*args, **kwargs):
@@ -51,6 +53,7 @@ def test_explicit_rng_uses_one_batched_call_without_host_reads(kernel, monkeypat
         tokens = _sample(
             logits, top_k=torch.tensor([0, 2, 0], dtype=torch.int32),
             top_p=torch.tensor([1., 0.8, 0.9]), run_greedy=False,
+            top_k_zero_count=zero_count,
         )
     assert tokens.tolist() == [0, 1, 2]
     kernel.assert_called_once()
@@ -66,8 +69,37 @@ def test_explicit_rng_uses_one_batched_call_without_host_reads(kernel, monkeypat
 
 
 def test_all_top_k_disabled_uses_unfiltered_kernel_parameter(kernel):
-    _sample(torch.ones(2, 8), all_top_k_zero=True)
+    _sample(torch.ones(2, 8), top_k_zero_count=2)
     assert kernel.call_args.args[3] is None
+
+
+def test_no_disabled_top_k_rows_preserve_kernel_parameters(kernel):
+    _sample(torch.ones(2, 8), top_k=torch.tensor([2, 4]), top_k_zero_count=0)
+    torch.testing.assert_close(kernel.call_args.args[3], torch.tensor([2, 4]))
+
+
+@pytest.mark.parametrize("zero_count", [0, 1, 2, None])
+def test_cuda_fast_path_requires_every_top_k_row_disabled(monkeypatch, zero_count):
+    flashinfer = ModuleType("flashinfer")
+    tokens = torch.zeros(2, dtype=torch.int64)
+    flashinfer.sampling = Mock()
+    flashinfer.sampling.top_p_sampling_from_probs.return_value = tokens
+    flashinfer.sampling.top_k_top_p_sampling_from_probs.return_value = tokens
+    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(utils, "fused_temperature_softmax", Mock(return_value=torch.ones(2, 8)))
+    top_k = {0: [2, 4], 1: [0, 4], 2: [0, 0], None: [0, 4]}[zero_count]
+    actual = utils._sample_cuda(
+        torch.ones(2, 8), torch.ones(2), torch.tensor(top_k), torch.ones(2),
+        1.0, None, False, zero_count, None, None,
+    )
+    torch.testing.assert_close(actual, tokens)
+    if zero_count == 2:
+        flashinfer.sampling.top_p_sampling_from_probs.assert_called_once()
+        flashinfer.sampling.top_k_top_p_sampling_from_probs.assert_not_called()
+    else:
+        flashinfer.sampling.top_p_sampling_from_probs.assert_not_called()
+        flashinfer.sampling.top_k_top_p_sampling_from_probs.assert_called_once()
 
 
 def test_mixed_greedy_rows_keep_argmax_tie_behavior(kernel):

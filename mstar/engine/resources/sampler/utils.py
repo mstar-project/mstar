@@ -391,8 +391,7 @@ class Sampler(BaseSampler):
 
         any_rep_pen = any(c.repetition_penalty != 1.0 for c in configs)
         any_greedy = any(c.temperature == 0 for c in configs)
-        any_top_k_zero = any(c.top_k == 0 for c in configs)
-        all_top_k_zero = all(c.top_k == 0 for c in configs)
+        top_k_zero_count = sum(c.top_k == 0 for c in configs)
 
         for rid in request_ids:
             if self._seen_token_mask[rid]._seen_token_mask is None:
@@ -415,8 +414,7 @@ class Sampler(BaseSampler):
             repetition_penalty=r_pen,
             seen_token_mask=seen_mask,
             any_greedy=any_greedy,
-            any_top_k_zero=any_top_k_zero,
-            all_top_k_zero=all_top_k_zero,
+            top_k_zero_count=top_k_zero_count,
             seed=seed,
             rand_offset=rand_offset,
             min_p=min_p,
@@ -461,7 +459,7 @@ def _sample_cuda(
     repetition_penalty: float | torch.Tensor,
     seen_token_mask: torch.Tensor | None,
     run_greedy: bool,
-    all_top_k_zero: bool | None,
+    top_k_zero_count: int | None,
     seed: torch.Tensor | None,
     rand_offset: torch.Tensor | None,
     min_p: torch.Tensor | None = None,
@@ -479,7 +477,7 @@ def _sample_cuda(
         # kernel fuses (optional rep-penalty) + (temperature-scaled softmax) +
         # (argmax → one-hot for greedy rows). FlashInfer's sample-from-probs then
         # deterministically picks argmax on one-hot rows, matching greedy semantics.
-        if all_top_k_zero is True:
+        if top_k_zero_count == logits.shape[0]:
             probs = fused_temperature_softmax(
                 logits, temperature,
                 penalty=repetition_penalty if seen_token_mask is not None else None,
@@ -519,8 +517,7 @@ def _sample_xpu(
     repetition_penalty: float | torch.Tensor,
     seen_token_mask: torch.Tensor | None,
     run_greedy: bool,
-    any_top_k_zero: bool | None,
-    all_top_k_zero: bool | None,
+    top_k_zero_count: int | None,
     seed: torch.Tensor | None,
     rand_offset: torch.Tensor | None,
     min_p: torch.Tensor | None = None,
@@ -583,9 +580,9 @@ def _sample_xpu(
         dim=1,
     ).contiguous()
     kernel_top_k = None
-    if all_top_k_zero is not True:
+    if top_k_zero_count != batch_size:
         kernel_top_k = top_k.to(torch.int64)
-        if any_top_k_zero is not False:
+        if top_k_zero_count != 0:
             kernel_top_k = torch.where(kernel_top_k == 0, logits.shape[1], kernel_top_k)
     sampled = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
     torch.ops._xpu_C.topk_topp_sampler(
@@ -605,8 +602,7 @@ def sample_tokens(
     repetition_penalty: float | torch.Tensor= 1.0,
     seen_token_mask: torch.Tensor | None = None,
     any_greedy: bool | None = None,
-    any_top_k_zero: bool | None = None,
-    all_top_k_zero: bool | None = None,
+    top_k_zero_count: int | None = None,
     seed: torch.Tensor | None = None,
     rand_offset: torch.Tensor | None = None,
     min_p: float | torch.Tensor | None = None,
@@ -623,10 +619,10 @@ def sample_tokens(
         seen_token_mask: [batch_size, vocab_size] bool. None = penalty skipped.
         any_greedy: CPU-side hint. When False, skips the argmax/masked_fill/where
             branch entirely. None = unknown → run the full path.
-        any_top_k_zero: CPU-side hint. When False, skips the `top_k == 0 → vocab`
-            masked_fill. None = unknown → run the full path.
-        all_top_k_zero: CPU-side hint. When True, disables top-k filtering for
-            the entire batch without reading device parameters.
+        top_k_zero_count: CPU-side count of requests with top_k == 0.
+            0 skips zero-to-vocabulary normalization; batch_size disables top-k
+            filtering for the entire batch. Intermediate counts mean mixed
+            rows. None = unknown → use the conservative device path.
         seed: Optional per-request int64 tensor [batch_size].
         rand_offset: Optional per-request int64 tensor [batch_size]. On XPU,
             omit seed/offset to use the default generator eagerly; provide both
@@ -661,7 +657,7 @@ def sample_tokens(
             repetition_penalty,
             seen_token_mask,
             run_greedy,
-            all_top_k_zero,
+            top_k_zero_count,
             seed,
             rand_offset,
             min_p=min_p,
@@ -675,8 +671,7 @@ def sample_tokens(
             repetition_penalty,
             seen_token_mask,
             run_greedy,
-            any_top_k_zero,
-            all_top_k_zero,
+            top_k_zero_count,
             seed,
             rand_offset,
             min_p=min_p,
