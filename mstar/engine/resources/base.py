@@ -60,6 +60,8 @@ class EngineResourceInfo:
     joint_comm_group: JointGroups | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
     kv_dtype: torch.dtype = torch.bfloat16
+    # Whether this logical resource has consumers in another worker instance.
+    needs_remote_transfer: bool = True
     # the specs this one named in `depends_on`, by resource key
     dependencies: "Mapping[str, NodeResourceSpec]" = field(
         default_factory=dict
@@ -166,6 +168,17 @@ class Resource(ABC):
         """
         return ADMIT_OK
 
+    def rollback_admit(self, step: ResourceStep, ctx: StepContext) -> None:
+        """Give back whatever the live reservation for this step took.
+
+        Called on a refused admit, for every resource the step reached including
+        the one that refused.
+
+        Only what was freshly taken. A page retained from a shared prefix, or a
+        lease converted onto a stream, belongs to whoever else holds it.
+        """
+        return
+
     def plan(self, step: ResourceStep, ctx: StepContext) -> Any:
         """ret is immutable and opaque to runner; only gives to `ctx.plan_results`"""
         return None
@@ -175,6 +188,30 @@ class Resource(ABC):
         return
 
     def publish(self, request_id: str) -> "PublishedInfo | None":
+        return None
+
+    def publish_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> "PublishedInfo | None":
+        """Publish after one node step, with context for selective exporters.
+
+        Existing resources remain compatible through ``publish``; resources
+        that need node/walk context can override this method.
+        """
+        del node_name, graph_walk
+        return self.publish(request_id)
+
+    def publish_after_stop(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> "PublishedInfo | None":
+        """Publish state that is useful only when a dynamic loop stops."""
+        del request_id, node_name, graph_walk
         return None
 
     def reset_request(self, rid: str, free: bool=False):
@@ -229,6 +266,12 @@ class Resource(ABC):
 
     def reload(self, rid: str) -> bool:
         """Bring it back. False when it doesn't fit on device yet."""
+        return True
+
+    def can_reload(self, rid: str) -> bool:
+        """Whether the request can be reloaded. If this is False, the Engine
+        will not attempt to reload. If True, it will attempt to reload but still
+        check that the reload was successful."""
         return True
 
     def reclaimable(self, rid: str) -> int:
@@ -314,6 +357,11 @@ class AttentionResource(Resource):
 class PublishedInfo(ABC):
     @abstractmethod
     def update(self, other: "PublishedInfo") -> None:
+        ...
+
+    @abstractmethod
+    def clone(self) -> "PublishedInfo":
+        """Return independent publication metadata for deferred sending."""
         ...
 
 

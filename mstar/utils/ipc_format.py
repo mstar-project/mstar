@@ -44,8 +44,8 @@ class WorkerMessageType(Enum):
 @dataclass
 class NewRequest(MessageBody):
     request_id: str
-    partition_worker_graph_ids: list[str]
-    worker_graph_to_workers: dict[str, list[str]]
+    partition_worker_graph_ids: list[int]
+    worker_graph_to_workers: dict[int, list[str]]
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
 
@@ -59,6 +59,10 @@ class MessageSource(IntEnum):
 class RemoveRequest(MessageBody):
     request_id: str
     source: int = MessageSource.CONDUCTOR
+    # Rank 0 forwarding a removal to its followers stamps the last step it had
+    # broadcast, so they tear the request down at the same point in the step
+    # sequence it did, maintaining KV cache state symmetry.
+    after_tp_seq: int = -1
 
 
 @dataclass
@@ -75,20 +79,23 @@ class InputSignals(MessageBody):
     inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
     partition_name: str = "default"
-    producer_done: set = field(default_factory=set)
+    # Producer partition names. Declared, not a bare ``set``: a bare one is
+    # untyped on the wire, so an empty set a Rust sender writes came back a
+    # list.
+    producer_done: set[str] = field(default_factory=set)
 
 
 @dataclass
 class TensorReceived(MessageBody):
     request_id: str
-    successful_tensors: dict[str, int] # uuid -> graph edge count
-    failed_tensor_ids: list[str] # uuids
+    successful_tensors: dict[int, int] # uuid -> graph edge count
+    failed_tensor_ids: list[int] # uuids
 
 
 @dataclass
 class UnpersistTensors(MessageBody):
     request_id: str
-    uuid_to_ref_count: dict[str, int]
+    uuid_to_ref_count: dict[int, int]
 
 @dataclass
 class StopLoops(MessageBody):
@@ -99,6 +106,76 @@ class StopLoops(MessageBody):
 
 
 @dataclass
+class OffloadDelta:
+    """A rank's offloads and reloads, in the order it made them.
+
+    Ordered so the follower replays the leader's decisions in the same order: a
+    sequence that worked for the leader works for the followers too.
+
+    Holds WIRE request ids, not worker-local handles: a handle is minted per
+    worker, so rank 0's would name different requests on the follower.
+
+    A dataclass of lists rather than a NamedTuple of deques so that the wire codec
+    can automatically encode it. ``pop_left`` is O(n) on a list, which costs nothing
+    at the handful of entries a delta ever holds.
+
+    ``__len__`` is the queue depth, so an empty delta is falsy -- several callers
+    lean on that.
+    """
+
+    # parallel lists: rids[i] was offloaded if is_offload[i], else reloaded
+    rids: list[str] = field(default_factory=list)
+    is_offload: list[bool] = field(default_factory=list)
+
+    @classmethod
+    def new(cls) -> "OffloadDelta":
+        return cls()
+
+    def add_offloaded(self, rid: str):
+        self.rids.append(rid)
+        self.is_offload.append(True)
+
+    def add_reloaded(self, rid: str):
+        self.rids.append(rid)
+        self.is_offload.append(False)
+
+    def __len__(self):
+        return len(self.rids)
+
+    def peek_left(self) -> tuple[str, bool] | None:
+        if not len(self):
+            return
+        return (self.rids[0], self.is_offload[0])
+
+    def pop_left(self) -> tuple[str, bool] | None:
+        if not len(self):
+            return None
+        return (self.rids.pop(0), self.is_offload.pop(0))
+
+    def copy(self) -> "OffloadDelta":
+        """An independent queue holding the same moves.
+
+        One per follower: each replays at its own pace, popping as it goes.
+        """
+        return OffloadDelta(list(self.rids), list(self.is_offload))
+
+    def take(self) -> "OffloadDelta":
+        """Hand the queue over and leave this one empty.
+
+        Copies and clears rather than rebinding, so a holder of this delta (the
+        engine keeps its journal in a dict) sees it emptied.
+        """
+        taken = self.copy()
+        self.rids.clear()
+        self.is_offload.clear()
+        return taken
+
+    def extend(self, other: "OffloadDelta") -> None:
+        self.rids.extend(other.rids)
+        self.is_offload.extend(other.is_offload)
+
+
+@dataclass
 class ScheduleTPNode(MessageBody):
     node_name: str
     graph_walk: str
@@ -106,6 +183,7 @@ class ScheduleTPNode(MessageBody):
     speculative: bool = False
     spec_seq: int = -1
     spec_from_seq: int = -1
+    resident_delta: OffloadDelta = field(default_factory=OffloadDelta.new)
 
 
 @dataclass
@@ -146,11 +224,11 @@ class NewRequestConductor(MessageBody):
 @dataclass
 class WorkerGraphsDone(MessageBody):
     request_id: str
-    worker_graph_ids: list[str]
+    worker_graph_ids: list[int]
     is_first_tp_rank: bool
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_token_counts: dict[str, int] = field(default_factory=dict) # name to token counts
-    output_signal_names: int = field(default=0)
+    output_signal_names: list[str] = field(default_factory=list)
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)

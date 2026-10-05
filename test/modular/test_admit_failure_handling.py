@@ -35,6 +35,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.worker import worker as worker_mod
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
 
 
@@ -94,39 +95,45 @@ def test_postprocess_runs_on_a_step_that_admitted():
 # --- worker: every admit failure is re-queued ------------------------------
 
 
-class _Queue:
+class _Runtime:
+    """The runtime owns the ready queues, so the push-back lands here."""
+
     def __init__(self):
         self.pushed_back: list[str] = []
 
-    def push_back_node(self, request_id, node):
-        del node
-        self.pushed_back.append(request_id)
+    def push_back_node(self, node_name, rids, wg_ids):
+        del node_name, wg_ids
+        self.pushed_back.extend(rids)
 
 
 class _FakeWorker:
     """Binds the two handlers onto stubs for their collaborators."""
 
     _handle_admit_failure = Worker._handle_admit_failure
+    _push_back_batch = Worker._push_back_batch
 
     def __init__(self):
-        self.queue = _Queue()
-        self.worker_graphs_manager = SimpleNamespace(queues={"wg": self.queue})
+        self._graph_runtime = _Runtime()
         self.held: list[str] = []
         self.scheduler = SimpleNamespace(hold_requests=self.held.extend)
         self.offload_calls: list[str] = []
 
-    def _handle_allocation_failure(self, batch, node_batch):
-        self.offload_calls.append(node_batch.node_name)
+    @property
+    def queue(self):
+        # The assertions read .pushed_back; keep that name pointing at
+        # whoever owns the ready queues now.
+        return self._graph_runtime
+
+    def _handle_allocation_failure(self, batch, node_batch, referenced_rids=frozenset()):
+        self.offload_calls.append((node_batch.node_name, referenced_rids))
         # the real one push-backs and holds; stand in for both
-        for rid in batch.node_objects:
-            self.queue.push_back_node(rid, None)
-        self.scheduler.hold_requests(list(batch.node_objects))
+        self._push_back_batch(batch)
+        self.scheduler.hold_requests(list(batch.request_to_worker_graph))
 
 
 def _batches(reason):
-    batch = SimpleNamespace(
+    batch = ScheduledBatch(
         node_name="node", graph_walk="walk",
-        node_objects={"r0": object(), "r1": object()},
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
     node_batch = SimpleNamespace(node_name="node", admit_error=reason)
@@ -146,9 +153,12 @@ def test_offloading_requeues_without_evicting():
 
 def test_allocation_failure_still_evicts():
     worker = _FakeWorker()
-    worker._handle_admit_failure(*_batches(_alloc_failed()))
+    worker._handle_admit_failure(
+        *_batches(_alloc_failed()), referenced_rids=frozenset({"spec_rid"}),
+    )
 
-    assert worker.offload_calls == ["node"]
+    # the set has to reach the handler: it is what the teardown flush spares
+    assert worker.offload_calls == [("node", frozenset({"spec_rid"}))]
     # exactly one push-back per request: the delegation must not double up
     assert sorted(worker.queue.pushed_back) == ["r0", "r1"]
     assert sorted(worker.held) == ["r0", "r1"]
@@ -158,12 +168,23 @@ class _HoldingWorker:
     """Binds the real allocation handler onto a worker with nothing to evict."""
 
     _handle_allocation_failure = Worker._handle_allocation_failure
+    _push_back_batch = Worker._push_back_batch
+    _is_tp_follower_node = Worker._is_tp_follower_node
 
     def __init__(self):
-        self.queue = _Queue()
-        self.worker_graphs_manager = SimpleNamespace(queues={"wg": self.queue})
+        self._graph_runtime = _Runtime()
         self.scheduler = SimpleNamespace(hold_requests=lambda rids: None)
         self._hold_logged = {}
+        # not a sharded node, so this rank runs its own OOM recovery
+        self.parallel_nodes = set()
+        self.parallel_leader_nodes = set()
+        self._in_flight_rids: set[str] = set()
+
+    def _apply_removes_whose_step_landed(self):
+        pass
+
+    def _apply_pending_removes_safe_to_drop(self, in_flight_rids):
+        del in_flight_rids
 
     def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None):
         # no victim
@@ -253,6 +274,9 @@ class _FakeExecEngine:
         self._fail_on = fail_on
         # ordered log, so the test can assert admit-all-then-run
         self.events: list[tuple[str, str]] = []
+        # which rids were driven with `set_launch` — the real path signals
+        # `launch_started_event` there, and the worker fences on it
+        self.launch_signals: list[str] = []
         self._runner = self
         self._device = torch.device("cpu")
         # the per-request path's slots; no fence, so no CUDA event is recorded
@@ -286,10 +310,13 @@ class _FakeExecEngine:
         lease, running_batched, step, set_launch,
     ):
         del batch, submodule_mgmt, inputs, req_info, lease, running_batched
-        del set_launch
         rid = request_ids[0]
         assert step is not None, "the step admitted for this rid must reach it"
         assert tuple(ctx.request_ids) == (rid,), "each rid drives its own ctx"
+        if set_launch:
+            # stands in for `_forward` releasing `launch_started_event`
+            self.launch_signals.append(rid)
+            self.events.append(("launch", rid))
         self.events.append(("run", rid))
         self.run_slots.append(ctx.slot)
         return {rid: {"token": 1}}, step
@@ -317,7 +344,11 @@ def test_per_request_admits_every_rid_before_running_any():
     out = engine._exec_per_request(_exec_batch(["a", "b"]))
 
     assert [e for e in engine.events if e[0] != "declare"] == [
-        ("admit", "a"), ("admit", "b"), ("run", "a"), ("run", "b"),
+        # the launch signal lands after BOTH admits, not after its own rid's.
+        # ``Worker._await_admit_settled`` fences on it and then reads
+        # ``admit_error``, so anything that could still refuse has to have run.
+        ("admit", "a"), ("admit", "b"), ("launch", "a"), ("run", "a"),
+        ("run", "b"),
     ]
     assert set(out) == {"a", "b"}
 
@@ -335,6 +366,27 @@ def test_per_request_runs_nothing_when_a_later_rid_fails_admit():
     assert not any(kind == "run" for kind, _ in engine.events)
     assert out == {"a": {}, "b": {}}
     assert isinstance(batch.admit_error, AllocationFailed)
+
+
+def test_a_refused_batch_never_signals_the_launch():
+    """``launch_started_event`` is the worker's admit fence: it waits on that,
+    then reads ``admit_error`` to decide whether to speculate on N+1. So the
+    error has to be written before anything signals.
+
+    Here nothing signals at all — the refusal returns from the admit loop before
+    the drive loop is reached, and ``_execute_on_gpu_thread``'s ``finally`` does
+    it instead, well after ``register_admit_error``. If a future change signals
+    from inside the admit loop, the worker reads ``admit_error=None``, builds and
+    broadcasts a yield-away batch for N+1, and then evicts underneath it — the
+    asymmetry that guard exists to prevent.
+    """
+    engine = _FakeExecEngine(fail_on="b")
+    batch = _exec_batch(["a", "b"])
+
+    engine._exec_per_request(batch)
+
+    assert isinstance(batch.admit_error, AllocationFailed)
+    assert engine.launch_signals == []
 
 
 def test_per_request_rotates_slots_within_the_batch():

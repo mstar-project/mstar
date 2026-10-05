@@ -89,6 +89,11 @@ class Model(ABC):
     def get_supported_modalities(self):
         pass
 
+    def get_served_model_name(self) -> str:
+        """The ``model`` field sent to an OpenAI-compatible server. Defaults to
+        the HF id; a server that only knows a short alias overrides it."""
+        return self.get_hf_url()
+
     def get_tokenizer(self):
         """Lazy-load the model's HF tokenizer for per-chunk re-tokenization in
         ITL aggregation (matches sglang.bench_serving --accept-length path).
@@ -157,6 +162,27 @@ class Orpheus(Model):
 
     def get_supported_modalities(self):
         return {RequestType.T2S}
+
+
+class Kokoro(Model):
+    """Kokoro-82M TTS via ``/v1/audio/speech`` (M* or Kokoro-FastAPI)."""
+
+    def get_hf_url(self):
+        return "hexgrad/Kokoro-82M"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2S}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {"voice": self.config.get("voice", "af_heart")}
+
+    def get_tokenizer(self):
+        # Audio-only output: nothing to re-tokenize, and the checkpoint has no HF tokenizer.
+        return None
+
+    def get_served_model_name(self) -> str:
+        # M* ignores the field; Kokoro-FastAPI accepts only "kokoro" (or OpenAI voice-model aliases).
+        return "kokoro"
 
 
 class Qwen3Omni(Model):
@@ -233,13 +259,38 @@ class Qwen3Omni(Model):
 
 
 class Qwen3TTS(Model):
-    """Qwen3-TTS CustomVoice benchmark metadata for native M* requests."""
+    """Qwen3-TTS CustomVoice benchmark metadata (0.6B by default).
+
+    ``/v1/audio/speech`` requests carry the same ``voice`` and ``language``
+    for every engine so the Talker prefill is identical across systems.
+    """
+
+    HF_URL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
     def get_hf_url(self):
-        return "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+        return self.HF_URL
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {"voice": "vivian", "language": "English"}
 
     def get_supported_modalities(self):
         return {RequestType.T2S}
+
+
+class Qwen3TTS1p7B(Qwen3TTS):
+    HF_URL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+
+
+class Qwen3TTSVoiceDesign(Qwen3TTS):
+    """VoiceDesign has no built-in speakers; the voice is the instruction."""
+
+    HF_URL = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {
+            "language": "English",
+            "instructions": "A clear, friendly adult female voice with a neutral accent.",
+        }
 
 
 class Pi05(Model):
@@ -326,8 +377,11 @@ class HiggsAudio(Model):
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
+    KOKORO = "kokoro"
     QWEN3OMNI = "qwen3omni"
     QWEN3TTS = "qwen3_tts"
+    QWEN3TTS_1P7B = "qwen3_tts_1p7b"
+    QWEN3TTS_VOICEDESIGN = "qwen3_tts_voicedesign"
     PI05 = "pi05"
     VJEPA2AC = "vjepa2ac"
     WHISPER_LARGE = "whisper_large"
@@ -338,10 +392,16 @@ class ModelType(Enum):
             return Bagel(**kwargs)
         if self == ModelType.ORPHEUS:
             return Orpheus(**kwargs)
+        if self == ModelType.KOKORO:
+            return Kokoro(**kwargs)
         if self == ModelType.QWEN3OMNI:
             return Qwen3Omni(**kwargs)
         if self == ModelType.QWEN3TTS:
             return Qwen3TTS(**kwargs)
+        if self == ModelType.QWEN3TTS_1P7B:
+            return Qwen3TTS1p7B(**kwargs)
+        if self == ModelType.QWEN3TTS_VOICEDESIGN:
+            return Qwen3TTSVoiceDesign(**kwargs)
         if self == ModelType.PI05:
             return Pi05(**kwargs)
         if self == ModelType.VJEPA2AC:

@@ -28,8 +28,15 @@ class RaggedAttnManager(AttentionResource):
         config = spec.config
         if info.joint_comm_group is not None:
             config.shard(info.joint_comm_group.world_size)
+        dtype = config.dtype if config.dtype is not None else info.kv_dtype
+        if dtype is None:
+            raise ValueError(
+                f"ragged attention {spec.resource_key!r}: no activation dtype. Set "
+                "RaggedAttentionConfig.dtype on a node without a KV-backed attention "
+                "(the engine has no KV dtype to fall back on)."
+            )
         return FlashInferRaggedManager(
             device=info.device,
-            dtype=info.kv_dtype,
+            dtype=dtype,
             config=config,
         )
