@@ -889,6 +889,10 @@ class Worker:
             self._graph_runtime.set_walk(
                 request_id, body.partition_name, body.request_info.graph_walk,
             )
+            for _rid, _iters in self._graph_runtime.get_dynamic_loop_iters(
+                [request_id], partition=body.partition_name,
+            ):
+                body.request_info.dynamic_loop_iter_counts.update(_iters)
             self.request_state.update_request_info(
                 request_id, current_fwd_info=body.request_info,
                 partition_name=body.partition_name
@@ -2596,12 +2600,6 @@ class Worker:
             range_pop(synchronize=False)
             range_push("worker.postprocess.check_stop", synchronize=False)
 
-        per_request_info = batch_N.node_batch.per_request_info
-        for rid, new_iters in self._graph_runtime.get_dynamic_loop_iters(
-            list(per_request_info), partition=batch_N.partition,
-        ):
-            per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
-
         # Check for stops. Prematerialising pulls sampled tokens to the host,
         # so this can carry a device transfer as well as the stop logic.
         _t_stop = _time.perf_counter() if self._phase_period else 0.0
@@ -2741,6 +2739,12 @@ class Worker:
             self._phase_record(
                 "worker.postprocess.route", _time.perf_counter() - _t_route,
             )
+
+        per_request_info = batch_N.node_batch.per_request_info
+        for rid, new_iters in self._graph_runtime.get_dynamic_loop_iters(
+            list(per_request_info), partition=batch_N.partition,
+        ):
+            per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
 
         # Normally empty: cleanup_consumed_inputs ran above and took them. Not
         # empty if a completion ever precedes it, and then nobody else will.
@@ -3595,11 +3599,6 @@ class Worker:
                 node_batch = self._build_executing_batch(batch)
                 batch_partition = self.request_state.get_partition_for_node(batch.node_name)
 
-                for request_id, new_iters in self._graph_runtime.get_dynamic_loop_iters(
-                    list(node_batch.per_request_info), partition=batch_partition,
-                ):
-                    node_batch.per_request_info[request_id] \
-                        .dynamic_loop_iter_counts.update(new_iters)
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 
