@@ -16,6 +16,7 @@ import argparse
 import io
 import json
 import math
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -144,7 +145,10 @@ def main() -> None:
     if args.json:
         report["worst_psnr_db"] = None if math.isinf(worst) else worst
         Path(args.json).write_text(json.dumps(report, indent=1))
+    # Exit non-zero on FAIL: a probe that only prints its verdict reports success
+    # to whatever runs it, which is how a batch of noise once passed for a clean run.
+    return 0 if worst >= args.threshold else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

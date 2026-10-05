@@ -29,8 +29,8 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.flux2_klein.config import DENOISE_LOOP, Flux2KleinConfig
-from mstar.model.flux2_klein.flux2_klein_model import IMAGE_GEN_WALK, Flux2KleinModel
-from mstar.model.flux2_klein.submodules import LATENTS, TEXT_EMBEDS
+from mstar.model.flux2_klein.flux2_klein_model import IMAGE_EDIT_WALK, IMAGE_GEN_WALK, Flux2KleinModel
+from mstar.model.flux2_klein.submodules import IMAGE_INPUTS, LATENTS, REF_LATENTS, TEXT_EMBEDS
 from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
@@ -78,17 +78,19 @@ def model() -> Flux2KleinModel:
 
 @pytest.fixture(scope="module")
 def subs(model) -> dict:
-    return {name: model.get_submodule(name, device=DEVICE) for name in ("text_encoder", "dit", "vae_decoder")}
+    return {name: model.get_submodule(name, device=DEVICE)
+            for name in ("text_encoder", "dit", "vae_encoder", "vae_decoder")}
 
 
 def _eng(rids) -> ModelInputsFromEngine:
     return ModelInputsFromEngine(request_ids=list(rids), per_request_info={})
 
 
-def _info(rid: str, k: int, seed: int) -> CurrentForwardPassInfo:
+def _info(rid: str, k: int, seed: int, walk: str = IMAGE_GEN_WALK, ref_grids=()) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
-        request_id=rid, graph_walk=IMAGE_GEN_WALK, fwd_index=k, random_seed=seed, max_tokens=0,
-        step_metadata={"height": HEIGHT, "width": WIDTH, "num_inference_steps": STEPS, "ref_grids": []},
+        request_id=rid, graph_walk=walk, fwd_index=k, random_seed=seed, max_tokens=0,
+        step_metadata={"height": HEIGHT, "width": WIDTH, "num_inference_steps": STEPS,
+                       "ref_grids": [list(g) for g in ref_grids]},
         dynamic_loop_iter_counts={DENOISE_LOOP: k},
     )
 
@@ -115,8 +117,14 @@ def _encode(model, subs, batched: bool) -> list[torch.Tensor]:
                 [TEXT_EMBEDS][0] for i, (i_ids, i_mask) in enumerate(zip(ids, masks, strict=True))]
 
 
-def _trajectory(subs, embeds: list[torch.Tensor], prefix: str, batched: bool, seeds=SEEDS) -> list[list[torch.Tensor]]:
-    """Latents after every step for each row: ``[step][row]``; one stacked forward per step or one per row."""
+def _trajectory(subs, embeds: list[torch.Tensor], prefix: str, batched: bool, seeds=SEEDS,
+                walk: str = IMAGE_GEN_WALK, refs: list[torch.Tensor] | None = None,
+                ref_grids=()) -> list[list[torch.Tensor]]:
+    """Latents after every step for each row: ``[step][row]``; one stacked forward per step or one per row.
+
+    ``refs`` supplies each row's reference latents for the edit walk, where the denoise
+    step runs over ``[txt | img | ref]`` tokens and a leak would cross rows through the
+    reference block as readily as through the image one."""
     dit = subs["dit"]
     rids = [f"{prefix}{i}" for i in range(len(embeds))]
     latents: list[torch.Tensor | None] = [None] * len(embeds)
@@ -126,18 +134,21 @@ def _trajectory(subs, embeds: list[torch.Tensor], prefix: str, batched: bool, se
             rows = []
             for i, rid in enumerate(rids):
                 inputs = {TEXT_EMBEDS: [embeds[i]]}
+                if refs is not None:
+                    inputs[REF_LATENTS] = [refs[i]]
                 if latents[i] is not None:
                     inputs[LATENTS] = [latents[i]]
-                rows.append(dit.prepare_inputs(IMAGE_GEN_WALK, _info(rid, k, seeds[i]), inputs))
+                rows.append(dit.prepare_inputs(
+                    walk, _info(rid, k, seeds[i], walk=walk, ref_grids=ref_grids), inputs))
             if batched:
-                kwargs = dit.preprocess(IMAGE_GEN_WALK, _eng(rids), rows)
-                out = dit.forward_batched(IMAGE_GEN_WALK, _eng(rids), **kwargs)
+                kwargs = dit.preprocess(walk, _eng(rids), rows)
+                out = dit.forward_batched(walk, _eng(rids), **kwargs)
                 latents = [out[rid][LATENTS][0] for rid in rids]
             else:
                 latents = []
                 for rid, row in zip(rids, rows, strict=True):
-                    kwargs = dit.preprocess(IMAGE_GEN_WALK, _eng([rid]), [row])
-                    latents.append(dit.forward(IMAGE_GEN_WALK, _eng([rid]), **kwargs)[LATENTS][0])
+                    kwargs = dit.preprocess(walk, _eng([rid]), [row])
+                    latents.append(dit.forward(walk, _eng([rid]), **kwargs)[LATENTS][0])
             steps.append(list(latents))
     for rid in rids:
         dit.cleanup_request(rid)
@@ -209,3 +220,84 @@ def test_vae_decode_rows_match_single_requests(model, subs, single):
         print(f"row {i}: VAE decode in a batch of {len(PROMPTS)} vs alone = {psnr:.2f} dB, "
               f"max_abs={_max_abs(img, ref):.0f}")
         assert psnr >= MIN_PSNR_DB, f"row {i}: {psnr:.2f} dB < {MIN_PSNR_DB}"
+
+
+# ----------------------------------------------------------------------
+# Edit walk
+#
+# The denoise step for an edit runs over ``[txt | img | ref]`` tokens, so a
+# batched edit has a conditioning block the text-to-image walk does not: a row
+# could pick up a neighbour's reference as readily as its latents. The rows here
+# share a reference GRID (they must, to batch at all — ``KleinShape`` keys on it)
+# but carry different reference CONTENT, which is what makes a leak visible.
+# ----------------------------------------------------------------------
+
+
+def _reference_latents(model, subs, count: int) -> tuple[list[torch.Tensor], tuple]:
+    """One distinct reference per row, encoded the way the edit walk encodes them."""
+    encoder = subs["vae_encoder"]
+    grid = model.config.latent_grid(HEIGHT, WIDTH)
+    gen = torch.Generator().manual_seed(1234)
+    refs = []
+    with torch.inference_mode():
+        for i in range(count):
+            # float [3, H, W] in [0, 1] -- what Flux2KleinModel.load_image returns
+            pixels = torch.rand(3, HEIGHT, WIDTH, generator=gen)
+            rid = f"ref{i}"
+            node = encoder.prepare_inputs(
+                IMAGE_EDIT_WALK, _info(rid, 0, i, walk=IMAGE_EDIT_WALK, ref_grids=(grid,)),
+                {IMAGE_INPUTS: [pixels]},
+            )
+            out = encoder.forward(IMAGE_EDIT_WALK, _eng([rid]), **node.tensor_inputs)
+            refs.append(out[REF_LATENTS][0])
+    assert len({r.shape for r in refs}) == 1, "rows must share a reference grid to batch"
+    return refs, (grid,)
+
+
+@pytest.fixture(scope="module")
+def edit_single(model, subs) -> dict:
+    """Each edit row run alone: the baseline a batched row must reproduce."""
+    embeds = _encode(model, subs, batched=False)
+    refs, ref_grids = _reference_latents(model, subs, len(PROMPTS))
+    steps = _trajectory(subs, embeds, "es", batched=False,
+                        walk=IMAGE_EDIT_WALK, refs=refs, ref_grids=ref_grids)
+    return {"embeds": embeds, "refs": refs, "ref_grids": ref_grids, "steps": steps}
+
+
+def test_edit_denoise_rows_are_independent_of_their_neighbours(subs, edit_single):
+    """Same batch size, rows in another order: every row must come back bit for bit.
+
+    Permuting the references as well as the prompts is the point — if a row read a
+    neighbour's reference block, reordering the batch would change its output."""
+    perm = [3, 1, 0, 2]
+    embeds, refs, grids = edit_single["embeds"], edit_single["refs"], edit_single["ref_grids"]
+    straight = _trajectory(subs, embeds, "eo", batched=True,
+                           walk=IMAGE_EDIT_WALK, refs=refs, ref_grids=grids)
+    shuffled = _trajectory(subs, [embeds[j] for j in perm], "ep", batched=True,
+                           seeds=[SEEDS[j] for j in perm], walk=IMAGE_EDIT_WALK,
+                           refs=[refs[j] for j in perm], ref_grids=grids)
+    for k, (a, b) in enumerate(zip(straight, shuffled, strict=True)):
+        worst = max(_max_abs(a[j], b[perm.index(j)]) for j in range(len(perm)))
+        print(f"edit dit step {k}, permuted batch vs batch: max_abs={worst:.3e}")
+        for j in range(len(perm)):
+            assert torch.equal(a[j], b[perm.index(j)]), \
+                f"edit step {k}: row {j} depends on its neighbours"
+
+
+def test_edit_denoise_rows_match_single_requests(model, subs, edit_single):
+    """A row inside a batch of four vs the same request alone, through to the image.
+
+    This is the contract the served edit probe measures end to end; it broke in the
+    engine's loop-counter handling without any single-request test noticing."""
+    steps = _trajectory(subs, edit_single["embeds"], "eb", batched=True,
+                        walk=IMAGE_EDIT_WALK, refs=edit_single["refs"],
+                        ref_grids=edit_single["ref_grids"])
+    for k, (batched_rows, single_rows) in enumerate(zip(steps, edit_single["steps"], strict=True)):
+        per_row = [f"{_max_abs(b, s):.1e}" for b, s in zip(batched_rows, single_rows, strict=True)]
+        print(f"edit dit step {k}, batch of {len(PROMPTS)} vs alone, max_abs per row: {per_row}")
+    images = _decode(model, subs, steps[-1], batched=False)
+    singles = _decode(model, subs, edit_single["steps"][-1], batched=False)
+    psnrs = [_psnr(img, ref) for img, ref in zip(images, singles, strict=True)]
+    for i, psnr in enumerate(psnrs):
+        print(f"edit row {i} (seed {SEEDS[i]}): image PSNR batched-trajectory vs alone = {psnr:.2f} dB")
+    assert min(psnrs) >= MIN_BATCH_PSNR_DB, f"edit batch-size numerics beyond kernel selection: {psnrs}"
