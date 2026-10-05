@@ -226,13 +226,25 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
             self.config.scheduler, int(fwd_info.step_metadata["num_inference_steps"]), bucket_key.image_tokens,
         )
 
+    def seed_to_device(self, graph_walk: str) -> bool:
+        # pack_latents is a reshape + permute, so it is value-identical run after the
+        # copy rather than before it (measured: test_diffusion_noise_stager.py). That
+        # lets the draw go straight into the stager's pinned buffer, skipping both the
+        # host memcpy and the pageable copy's host stall. Return False to fall back.
+        del graph_walk
+        return True
+
     def seed_latents(self, fwd_info, bucket_key: KleinShape, generator: torch.Generator) -> torch.Tensor:
         # randn_tensor parity: drawn in the packed [C, h, w] layout in bf16 on the CPU
         # generator, then packed row-major to tokens.
         h, w = bucket_key.grid
-        noise = torch.randn(
-            (1, self.config.transformer.in_channels, h, w), generator=generator, dtype=self.transformer.dtype,
-        )
+        shape = (1, self.config.transformer.in_channels, h, w)
+        if self.seed_to_device(fwd_info.graph_walk):
+            noise = self.noise_stager(self.transformer.dtype).randn_to_device(
+                shape, fwd_info.random_seed, self.get_device(),
+            )
+        else:
+            noise = torch.randn(shape, generator=generator, dtype=self.transformer.dtype)
         return pack_latents(noise)[0]
 
     def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: KleinShape) -> dict[str, torch.Tensor]:

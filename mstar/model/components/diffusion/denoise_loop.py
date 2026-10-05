@@ -55,6 +55,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
+from mstar.model.components.diffusion.noise import NoiseStager
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # Per-key derived tensors (rotary tables, ...) built on first use and never
         # evicted: a captured graph reads them at fixed addresses.
         self._layouts: dict[Hashable, Any] = {}
+        # Pinned staging rings for the seeded noise, one per dtype, built on first
+        # use (a stager allocates nothing until it stages something).
+        self._noise_stagers: dict[torch.dtype, NoiseStager] = {}
         # One callable per attention label for the life of a binding; see
         # :meth:`ragged_for`.
         self._ragged_fns: dict[str, RaggedAttentionCallable] = {}
@@ -150,6 +154,41 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     ) -> torch.Tensor:
         """Initial noise for one request, ``[L, C]`` on the CPU generator's device."""
         raise NotImplementedError
+
+    def seed_to_device(self, graph_walk: str) -> bool:
+        """Whether :meth:`seed_loop_back` returns tensors already on the device.
+
+        False by default: the base stages the CPU draw itself, which costs one host
+        memcpy and asks nothing of the model. A model whose seeding is layout-only
+        after the draw -- a reshape, a permute -- can override this to draw straight
+        into the stager's pinned buffer (:meth:`noise_stager`) and skip that memcpy.
+        A model doing real host work on the noise must not.
+        """
+        del graph_walk
+        return False
+
+    def noise_stager(self, dtype: torch.dtype) -> NoiseStager:
+        """This node's pinned staging ring for ``dtype``, built on first use.
+
+        A benign race between the plan and GPU threads can build two and keep one;
+        a stager holds no buffers until it stages something, so that costs nothing.
+        """
+        stager = self._noise_stagers.get(dtype)
+        if stager is None:
+            stager = self._noise_stagers[dtype] = NoiseStager(dtype)
+        return stager
+
+    def stage_seed(self, tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Seed tensor on ``device``, copied from pinned memory without stalling.
+
+        ``tensor.to(device)`` would copy from pageable host memory, which blocks the
+        calling thread until it retires -- and this runs on the GPU thread, where
+        that stalls the pre-plan and the overlap with the previous step's
+        postprocess. See :mod:`mstar.model.components.diffusion.noise`.
+        """
+        if tensor.device == device:
+            return tensor
+        return self.noise_stager(tensor.dtype).to_device(tensor, device)
 
     def seed_loop_back(
         self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, generator: torch.Generator,
@@ -310,10 +349,12 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         Past iteration 0 a missing edge is a routing bug: raise rather than reseed."""
         if k == 0:
             generator = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
-            return {
-                name: tensor.to(device)
-                for name, tensor in self.seed_loop_back(fwd_info, bucket_key, generator).items()
-            }
+            seeds = self.seed_loop_back(fwd_info, bucket_key, generator)
+            if self.seed_to_device(fwd_info.graph_walk):
+                # The model drew straight onto the device through a stager; staging
+                # again would copy a device tensor out to the host and back.
+                return dict(seeds)
+            return {name: self.stage_seed(tensor, device) for name, tensor in seeds.items()}
         missing = [name for name in self.loop_back_names if not inputs.get(name)]
         if missing:
             raise RuntimeError(
