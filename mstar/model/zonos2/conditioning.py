@@ -192,7 +192,11 @@ def resolve_speaking_rate_bucket(
             raise ValueError(
                 f"speaking_rate_bucket must be in [0, {num_buckets - 1}], got {bucket}."
             )
-        return bucket
+        ranges = _speaking_rate_bucket_ranges(config)
+        return _check_rate_bucket(
+            config, bucket, ranges, f"speaking_rate_bucket {bucket}",
+            _neutral_speaking_rate_bytes_per_second(ranges),
+        )
 
     ranges = _speaking_rate_bucket_ranges(config)
     if ranges and len(ranges) != num_buckets:
@@ -202,19 +206,39 @@ def resolve_speaking_rate_bucket(
         )
 
     if speaking_rate is not None:
-        return _speaking_rate_bucket_for_rate(
-            _finite_number("speaking_rate", speaking_rate),
-            num_buckets=num_buckets, ranges=ranges,
+        rate = _finite_number("speaking_rate", speaking_rate)
+        bucket = _speaking_rate_bucket_for_rate(rate, num_buckets=num_buckets, ranges=ranges)
+        return _check_rate_bucket(
+            config, bucket, ranges, f"speaking_rate {rate:g}",
+            _neutral_speaking_rate_bytes_per_second(ranges),
         )
 
     assert speed is not None
     speed_value = _finite_number("speed", speed)
     if speed_value <= 0:
         raise ValueError("speed must be positive.")
-    return _speaking_rate_bucket_for_rate(
-        _neutral_speaking_rate_bytes_per_second(ranges) * speed_value,
-        num_buckets=num_buckets,
-        ranges=ranges,
+    neutral = _neutral_speaking_rate_bytes_per_second(ranges)
+    bucket = _speaking_rate_bucket_for_rate(
+        neutral * speed_value, num_buckets=num_buckets, ranges=ranges,
+    )
+    return _check_rate_bucket(config, bucket, ranges, f"speed {speed_value:g}", neutral)
+
+
+def _check_rate_bucket(
+    config: Zonos2Config, bucket: int, ranges: list[tuple[float, float | None]],
+    asked: str, neutral: float,
+) -> int:
+    """Reject a bucket above ``max_speaking_rate_bucket``; speech garbles there."""
+    top = config.max_speaking_rate_bucket
+    if top is None or bucket <= top:
+        return bucket
+    limit = ""
+    if ranges and top < len(ranges) and ranges[top][1] is not None:
+        high = ranges[top][1]
+        limit = f" (below {high:g} bytes/s, speed {high / neutral:.2f})"
+    raise ValueError(
+        f"{asked} asks for speaking-rate bucket {bucket}; this server allows at most "
+        f"bucket {top}{limit}, as faster buckets garble speech."
     )
 
 

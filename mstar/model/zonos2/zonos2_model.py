@@ -26,6 +26,7 @@ from __future__ import annotations
 import html
 import importlib.util
 import logging
+import math
 import os
 import re
 import unicodedata
@@ -528,11 +529,12 @@ class Zonos2Model(Model):
         )
         # Spoken form is never shorter than written, so reject what cannot fit before NeMo runs.
         overhead = self._prompt_builder.build("", **build_kwargs).shape[0]
-        self._check_prompt_fits(prompt, overhead + len(prompt.encode("utf-8")))
+        frame_budget = self._request_frame_budget(kwargs)
+        self._check_prompt_fits(prompt, overhead + len(prompt.encode("utf-8")), frame_budget)
 
         prompt = self._normalize_text(prompt, kwargs.get("language"), flags)
         frames = self._prompt_builder.build(prompt, **build_kwargs)  # (num_frames, n_codebooks + 1)
-        self._check_prompt_fits(prompt, frames.shape[0])
+        self._check_prompt_fits(prompt, frames.shape[0], frame_budget)
 
         out: NameToTensorList = {"text_inputs": [frames]}
         if speaker_embedding is not None:
@@ -606,21 +608,42 @@ class Zonos2Model(Model):
             if value <= 0:
                 raise ValueError(f"{key} must be at least 1, got {value}.")
 
-    def _check_prompt_fits(self, text: str, num_frames: int) -> None:
-        """Reject a prompt that leaves no room in the trained context for audio.
+    @staticmethod
+    def _request_frame_budget(kwargs: dict) -> int | None:
+        """The request's own frame budget, if it set one; already validated."""
+        for key in ("max_output_tokens", "max_tokens"):
+            if kwargs.get(key) is not None:
+                return kwargs[key]
+        return None
 
+    def _check_prompt_fits(
+        self, text: str, num_frames: int, frame_budget: int | None = None,
+    ) -> None:
+        """Reject text whose prompt plus estimated speech overflows the context.
+
+        Generation stops when the context is full, so text past it would be cut
+        silently. A smaller ``frame_budget`` caps the speech the request needs.
         Two spare positions, so the context stop lands in the decode loop, not prefill.
         """
-        limit = self.config.max_position_embeddings
-        budget = limit - 2
-        if num_frames > budget:
-            n_bytes = len(text.encode("utf-8"))
-            raise ValueError(
-                f"Text is {n_bytes} bytes ({num_frames} prompt frames); at most "
-                f"{max(n_bytes - (num_frames - budget), 0)} bytes fit in the model's "
-                f"{limit}-position context with room to speak. Split long text "
-                "into shorter requests."
-            )
+        cfg = self.config
+        limit = cfg.max_position_embeddings
+        room = limit - 2
+        n_bytes = len(text.encode("utf-8"))
+        overhead = num_frames - n_bytes
+        speech = math.ceil(cfg.speech_frames_per_byte * n_bytes) + cfg.speech_frames_base
+        if frame_budget is not None:
+            speech = min(speech, frame_budget)
+        if num_frames + speech <= room:
+            return
+        fit = math.floor((room - overhead - cfg.speech_frames_base) / (1 + cfg.speech_frames_per_byte))
+        if frame_budget is not None:
+            fit = max(fit, room - overhead - frame_budget)
+        raise ValueError(
+            f"Text is {n_bytes} bytes and needs about {speech} frames of speech; at most "
+            f"{max(fit, 0)} bytes fit with their speech in the model's {limit}-position "
+            "context. Split long text into shorter requests, or set max_output_tokens "
+            "to cap the audio."
+        )
 
     def _validate_reference_clip(self, clip: torch.Tensor) -> None:
         """Reject a clip the speaker encoder cannot embed, or one that is too long.

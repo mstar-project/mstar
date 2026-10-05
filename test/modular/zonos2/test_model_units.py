@@ -504,18 +504,34 @@ def test_speaker_encoder_rejects_short_clip_with_clear_error():
 
 
 # -- prompt length vs the trained context -------------------------------------
-def test_prompt_that_leaves_no_room_to_speak_is_rejected():
-    model = _clone_model(max_position_embeddings=100)
+def test_text_whose_speech_cannot_fit_is_rejected():
+    model = _clone_model(max_position_embeddings=1000)
 
-    def frames(n):
-        return model.process_prompt("a" * n, ["text"], ["audio"])["text_inputs"][0]
+    def frames(n, **kw):
+        return model.process_prompt("a" * n, ["text"], ["audio"], **kw)["text_inputs"][0]
 
     overhead = frames(1).shape[0] - 1
-    fits = 100 - 2 - overhead
-    assert frames(fits).shape[0] + 2 == 100
+    fits = (1000 - 2 - overhead - 240) // 7  # 6 frames of speech per byte, plus 240
+    frames(fits)
     with pytest.raises(ValueError, match=f"at most {fits} bytes fit") as exc:
         frames(fits + 1)
-    assert "100-position context" in str(exc.value)
+    assert "1000-position context" in str(exc.value)
+
+
+def test_a_frame_budget_caps_the_speech_a_text_needs():
+    model = _clone_model(max_position_embeddings=1000)
+    overhead = model.process_prompt("a", ["text"], ["audio"])["text_inputs"][0].shape[0] - 1
+    n = 1000 - 2 - overhead - 50  # prompt plus a 50-frame budget fills the context
+    model.process_prompt("a" * n, ["text"], ["audio"], max_output_tokens=50)
+    with pytest.raises(ValueError, match=f"at most {n} bytes fit"):
+        model.process_prompt("a" * (n + 1), ["text"], ["audio"], max_output_tokens=50)
+
+
+def test_release_context_fits_about_840_bytes():
+    model = _clone_model(max_position_embeddings=6144)  # the release params.json
+    model.process_prompt("a" * 800, ["text"], ["audio"])
+    with pytest.raises(ValueError, match="Split long text"):
+        model.process_prompt("a" * 900, ["text"], ["audio"])
 
 
 # -- per-request knobs at the API boundary ------------------------------------
@@ -575,6 +591,30 @@ def test_bad_speaking_rate_values_are_rejected(kwargs, match):
     model = _clone_model(speaking_rate_num_buckets=3)
     with pytest.raises(ValueError, match=match):
         _prompt(model, speaking_rate_enabled=True, **kwargs)
+
+
+_RELEASE_RATES = ("0-8", "8-11", "11-14", "14-17", "17-21", "21-28", "28-40", "40+")
+
+
+@pytest.mark.parametrize("kwargs, ok", [
+    ({"speed": 1.0}, True), ({"speed": 0.1}, True), ({"speed": 1.4}, True),
+    ({"speed": 1.5}, False), ({"speed": 2.0}, False), ({"speed": 1e308}, False),
+    ({"speaking_rate": 27.9}, True), ({"speaking_rate": 28}, False),
+    ({"speaking_rate_bucket": 5}, True), ({"speaking_rate_bucket": 6}, False),
+])
+def test_speaking_rates_that_garble_are_rejected(kwargs, ok):
+    model = _clone_model(speaking_rate_num_buckets=8, speaking_rate_buckets=_RELEASE_RATES)
+    if ok:
+        _prompt(model, speaking_rate_enabled=True, **kwargs)
+    else:
+        with pytest.raises(ValueError, match="at most bucket 5 \\(below 28 bytes/s, speed 1.47\\)"):
+            _prompt(model, speaking_rate_enabled=True, **kwargs)
+
+
+def test_rate_cap_can_be_lifted():
+    model = _clone_model(speaking_rate_num_buckets=8, speaking_rate_buckets=_RELEASE_RATES,
+                         max_speaking_rate_bucket=None)
+    _prompt(model, speaking_rate_enabled=True, speed=2.0)
 
 
 def test_speed_is_ignored_unless_speaking_rate_is_enabled():

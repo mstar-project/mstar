@@ -114,6 +114,14 @@ class Zonos2Config:
     text_normalization_time_budget_s: float = 2.0
     # The largest repetition_window a request may ask for; it sets the ring width.
     max_repetition_window: int = 256
+    # Speech length estimate, frames = per_byte * text bytes + base. Measured on the
+    # release: every uncut sample in every rate bucket fell under it. Text whose
+    # speech cannot fit in the context gets a 400 instead of a silent cut.
+    speech_frames_per_byte: float = 6.0
+    speech_frames_base: int = 240
+    # The fastest speaking-rate bucket a request may ask for. On the release,
+    # buckets 6 and 7 (28+ bytes/s, speed > ~1.47) garble 42% and 79% of short texts.
+    max_speaking_rate_bucket: int | None = 5
 
     # ---- Text-column conditioning tokens ---------------------------
     # The conditioning tokens occupy the tail of the text vocabulary in this

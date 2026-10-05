@@ -270,9 +270,10 @@ Zonos2 environment requirements
   ``repetition_window`` (at most ``max_repetition_window``, 256), ``repetition_codebooks``,
   ``ignore_eos`` and ``seed``. ``max_output_tokens`` (or ``max_tokens``) is the frame budget
   and must be at least 1. ``speed``, ``speaking_rate`` and ``speaking_rate_bucket`` take
-  effect only with ``speaking_rate_enabled: true``, as in the reference; each maps to the
-  nearest of the checkpoint's rate buckets, so values past the end buckets act like them,
-  and speech degrades toward the ends (``speed: 2`` is already garbled).
+  effect only with ``speaking_rate_enabled: true``, as in the reference; each maps to one
+  of the checkpoint's rate buckets. Rates above bucket 5 (28 bytes/s, about ``speed: 1.47``)
+  get a 400, as they garble short texts; ``max_speaking_rate_bucket`` in the serving YAML
+  sets the cap (``null`` lifts it).
 - **Sampling is required.** The model needs sampling and the repetition penalty: greedy or
   near-greedy settings (``temperature: 0``, a tiny ``top_p``, ``min_p`` near 1) give a few
   seconds of non-speech, and turning the penalty off (``repetition_window: 0`` or
@@ -284,9 +285,11 @@ Zonos2 environment requirements
   400. Zonos2 has no SSML support: a prompt starting with ``<speak`` has its tags removed
   and its words read.
 - **Text length.** The model's context is 6144 frames: one per UTF-8 byte of (normalized)
-  text, plus the generated audio (~86 frames/s). Generation stops when the context is full:
-  ~70 s of speech after a short prompt, less after a long one. Text too long to leave room
-  for audio gets a 400. Split long text into sentences or paragraphs.
+  text, plus the generated audio (~86 frames/s, about 4.5–6 frames per byte of text).
+  Generation stops when the context is full, so text whose estimated speech
+  (6 frames per byte + 240) cannot fit gets a 400 rather than being cut off: about 840
+  bytes at most. A smaller ``max_output_tokens`` lowers the estimate to that budget.
+  Split long text into sentences or paragraphs.
 - **Pinned downloads.** The checkpoint (``Zyphra/ZONOS2``) and the speaker encoder, whose
   hub code runs under ``trust_remote_code``, download at fixed commits:
   ``checkpoint_revision`` and ``speaker_encoder_revision`` in ``Zonos2Config``. An upstream
