@@ -587,6 +587,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
+        # Warmup and capture pass no request states; their routing is dummy.
+        self.model.maybe_log_expert_load(synthetic=engine_inputs.per_request_states is None)
         device = self.get_device()
         # Concatenate across requests
         input_embeds = torch.cat([

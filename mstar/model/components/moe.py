@@ -667,6 +667,14 @@ class ExpertParallelSparseMoeBlock(nn.Module):
 
     The signature matches :class:`ParallelSparseMoeBlock`. When
     ``world_size == 1`` the forward is identical to :class:`SparseMoeBlock`.
+
+    Two debug knobs, both off by default and both CUDA-graph safe:
+
+    * ``debug_check_routing``: all-gather ``selected_experts`` and
+      device-assert every rank picked the same experts. Temporary; costs one
+      extra collective per layer.
+    * ``track_expert_load``: accumulate per-expert slot counts in the
+      ``expert_load`` buffer; read and reset it with :meth:`pop_expert_load`.
     """
 
     def __init__(
@@ -678,6 +686,8 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         norm_topk_prob: bool = True,
         router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
+        debug_check_routing: bool = False,
+        track_expert_load: bool = False,
     ) -> None:
         super().__init__()
         if comm_group is None:
@@ -690,6 +700,13 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         self.moe_intermediate_size = moe_intermediate_size
         self.num_local_experts = divide(num_experts, comm_group.world_size)
         self.expert_start = comm_group.rank * self.num_local_experts
+        self.debug_check_routing = debug_check_routing
+        self.track_expert_load = track_expert_load
+        if track_expert_load:
+            # Routing is replicated, so every rank counts every expert.
+            self.register_buffer(
+                "expert_load", torch.zeros(num_experts, dtype=torch.int64), persistent=False,
+            )
 
         self.gate = router if router is not None else TopKRouter(
             hidden_size=hidden_size,
@@ -721,7 +738,28 @@ class ExpertParallelSparseMoeBlock(nn.Module):
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
         self._attach_weight_loaders()
+        if self.track_expert_load:
+            # to_empty leaves the buffer uninitialised.
+            self.expert_load.zero_()
         return result
+
+    def pop_expert_load(self) -> torch.Tensor:
+        """Return per-expert slot counts since the last pop, and reset them.
+
+        Shape ``(num_experts,)``; rank ``r`` owns ``[r*E_local, (r+1)*E_local)``.
+        Syncs the device, so call it from eager code, never inside a forward.
+        """
+        counts = self.expert_load.to("cpu", copy=True)
+        self.expert_load.zero_()
+        return counts
+
+    def _check_routing_agrees(self, selected_experts: torch.Tensor) -> None:
+        gathered = self.comm_group.all_gather(selected_experts.contiguous(), dim=0)
+        gathered = gathered.view(self.comm_group.world_size, *selected_experts.shape)
+        torch._assert_async(
+            (gathered == selected_experts).all(),
+            "EP routing disagrees across ranks: top-k expert ids differ",
+        )
 
     def forward(
         self,
@@ -734,6 +772,12 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
         routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
+
+        if self.track_expert_load:
+            ids = selected_experts.flatten()
+            self.expert_load.index_add_(0, ids, torch.ones_like(ids, dtype=torch.int64))
+        if self.debug_check_routing and self.comm_group.world_size > 1:
+            self._check_routing_agrees(selected_experts)
 
         if self.comm_group.world_size == 1:
             out = _dispatch(
