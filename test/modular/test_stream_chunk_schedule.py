@@ -134,3 +134,29 @@ def test_chunk_info_matches_chunk():
     chunks = _drive(LeftContextChunkPolicy(chunk=4, left_context=1), total_items=10)
     for c in chunks:
         assert c.info == (c.start_offset, c.context_items, c.num_items, c.is_final)
+
+
+def test_primed_stream_delivers_its_lead_as_first_window_context():
+    policy = ScheduledLeftContextChunkPolicy(schedule=(1, 3), chunk=5, left_context=6)
+    buffer = StreamBuffer(request_id="r", edge_name="codec_tokens", from_partition="Talker", policy=policy)
+    buffer.prime_context(4)   # four reference frames lead the stream
+    for i in range(4 + 9):
+        buffer.pre_read_register(f"t{i}")
+        buffer.put(f"t{i}", torch.tensor([i]))
+    windows = []
+    while buffer.has_chunk_ready():
+        chunk = buffer.pop_chunk()
+        windows.append((chunk.context_items, chunk.data["data"].flatten().tolist()))
+    # the lead is context only; every generated item (4..12) is new exactly once
+    assert windows[:3] == [(4, [0, 1, 2, 3, 4]), (5, [0, 1, 2, 3, 4, 5, 6, 7]), (6, list(range(2, 13)))]
+    assert [i for context, items in windows for i in items[context:]] == list(range(4, 13))
+
+
+def test_prime_is_bounded_and_only_for_context_policies():
+    policy = ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3)
+    with pytest.raises(ValueError):
+        policy.prime(4)
+    policy.prime(0)
+    with pytest.raises(NotImplementedError):
+        FixedChunkPolicy(chunk_size=3).prime(1)
+    FixedChunkPolicy(chunk_size=3).prime(0)
