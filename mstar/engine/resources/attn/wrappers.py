@@ -10,8 +10,10 @@ CUDA graph mode requires:
 - The same wrapper object must be used during both capture and replay
 
 Adapted from VoxServe's flashinfer_utils.py for our KV cache layout:
-  [num_layers, max_pages, 2, page_size, num_kv_heads, head_dim]
-(VoxServe uses [n_pages, 2, page_size, n_heads, head_dim] without layer dim.)
+  [num_layers, 2, max_pages, page_size, num_kv_heads, head_dim]
+so that one layer is a contiguous (k_cache, v_cache) pair, which is what both
+FlashInfer and FlashAttention take. (VoxServe uses [n_pages, 2, page_size,
+n_heads, head_dim]: K/V paired, and no layer dim.)
 """
 
 import logging
@@ -189,13 +191,18 @@ class FlashInferPrefillWrapper:
             self._qo_indptr_buf = qo_indptr
 
     @torch.compiler.disable
-    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+    def run(
+        self,
+        q: torch.Tensor,
+        kv_cache_layer: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
         """Run planned batched prefill attention.
 
         Args:
             q: [total_tokens, num_qo_heads, head_dim]
-            kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
-                (single layer slice of the full KV cache)
+            kv_cache_layer: ``(k_cache, v_cache)`` for one layer, each
+                [max_pages, page_size, num_kv_heads, head_dim]. FlashInfer
+                takes the pair directly, so the split layout needs no re-pairing.
         Returns:
             output: [total_tokens, num_qo_heads, head_dim]
         """
@@ -319,12 +326,17 @@ class FlashInferDecodeWrapper:
         self.dtype = dtype
 
     @torch.compiler.disable
-    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+    def run(
+        self,
+        q: torch.Tensor,
+        kv_cache_layer: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
         """Run planned batched decode attention.
 
         Args:
             q: [n_req, num_qo_heads, head_dim]
-            kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
+            kv_cache_layer: ``(k_cache, v_cache)``, each
+                [max_pages, page_size, num_kv_heads, head_dim]
         Returns:
             output: [n_req, num_qo_heads, head_dim]
         """

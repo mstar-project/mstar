@@ -1927,8 +1927,8 @@ class KVManager(AttentionResource):
         self._default_layer_idx = 0
 
     @torch.compiler.disable
-    def layer_view(self, layer_idx: int=None) -> torch.Tensor:
-        """layer pages as needed by attention kernel
+    def layer_view(self, layer_idx: int=None) -> tuple[torch.Tensor, torch.Tensor]:
+        """layer pages as needed by attention kernel, as ``(k_cache, v_cache)``
 
         handed to `AttentionManager::run`. in `kv_manager` so storage mechanics
         are opaque to layers"""

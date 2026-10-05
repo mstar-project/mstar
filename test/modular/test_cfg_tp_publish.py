@@ -129,7 +129,7 @@ def test_tp2_kv_managers_transfer_each_published_rank_shard(tmp_path):
             assert producer.admit(step, ctx).ok
             producer.commit(step, ctx)
             page = producer._streams[request_id]["cfg_text"].page_indices[0]
-            producer.kv_cache.tensor[:, page].fill_(rank + 1)
+            producer.kv_cache.tensor[:, :, page].fill_(rank + 1)
             merge_publish_info(published, {"kv": producer.publish(request_id)})
 
         rank_shards = published["kv"]
@@ -147,7 +147,7 @@ def test_tp2_kv_managers_transfer_each_published_rank_shard(tmp_path):
             stream = consumer._streams[request_id]["cfg_text"]
             assert stream.stored_len == 4
             page = stream.page_indices[0]
-            actual = consumer.kv_cache.tensor[:, page, :, :4]
+            actual = consumer.kv_cache.tensor[:, :, page, :4]
             assert torch.all(actual == rank + 1)
     finally:
         for manager in consumers + producers:

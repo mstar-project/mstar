@@ -88,17 +88,24 @@ def _view(rid: str, pages: list[int], prefix: int, fresh: int, generation: int =
     )
 
 
-def _layer_tensor(fill: float = 0.0) -> torch.Tensor:
-    """A KV layer whose every slot is a distinct number, so a gather that
-    picked the wrong page or the wrong offset shows up as a value mismatch."""
+def _layer_tensor(fill: float = 0.0) -> tuple[torch.Tensor, torch.Tensor]:
+    """A KV layer as ``(k_cache, v_cache)`` — what ``layer_view`` hands a
+    backend — whose every slot is a distinct number, so a gather that picked
+    the wrong page or the wrong offset shows up as a value mismatch."""
     n = MAX_PAGES * 2 * PAGE_SIZE * NUM_KV_HEADS * HEAD_DIM
-    return (torch.arange(n, dtype=torch.float32) + fill).reshape(
-        MAX_PAGES, 2, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM
+    both = (torch.arange(n, dtype=torch.float32) + fill).reshape(
+        2, MAX_PAGES, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM
     )
+    return both[0], both[1]
 
 
-def _expected_prefix(layer: torch.Tensor, pages: list[int], prefix_len: int, kv: int):
-    rows = layer[pages][:, kv].reshape(-1, NUM_KV_HEADS, HEAD_DIM)
+def _expected_prefix(
+    layer: tuple[torch.Tensor, torch.Tensor],
+    pages: list[int],
+    prefix_len: int,
+    kv: int,
+):
+    rows = layer[kv][pages].reshape(-1, NUM_KV_HEADS, HEAD_DIM)
     return rows[:prefix_len]
 
 
@@ -185,7 +192,8 @@ class TestPrefixGather:
 
         # ...but the same (stream, layer) is served from the cache, which is
         # the point: the pages are read once, not once per denoise step
-        layer.mul_(-1)
+        for half in layer:  # (k, v) are views on one tensor; flip both
+            half.mul_(-1)
         (again,) = self._planned(manager, [_view("r0", [0], prefix=3, fresh=2)])
         cached_k, _ = manager._prefix_kv(again, 0, layer)
         assert cached_k is first_k
@@ -198,7 +206,8 @@ class TestPrefixGather:
         (segment,) = self._planned(manager, [_view("r0", [0], prefix=3, fresh=2)])
         stale, _ = manager._prefix_kv(segment, 0, layer)
 
-        layer.mul_(-1)
+        for half in layer:  # (k, v) are views on one tensor; flip both
+            half.mul_(-1)
         (moved,) = self._planned(
             manager, [_view("r0", [0], prefix=3, fresh=2, generation=1)]
         )

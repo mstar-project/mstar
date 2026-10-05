@@ -115,7 +115,7 @@ class XPUPagedAttentionManager(AttentionManager):
         self,
         q: torch.Tensor,
         label: str | None = None,
-        kv_cache_layer: torch.Tensor | None = None,
+        kv_cache_layer: tuple[torch.Tensor, torch.Tensor] | None = None,
         k: torch.Tensor | None = None,
         v: torch.Tensor | None = None,
         layer_idx: int | None = None,
@@ -130,7 +130,7 @@ class XPUPagedAttentionManager(AttentionManager):
         self,
         q: torch.Tensor,
         label: str,
-        kv_cache_layer: torch.Tensor,
+        kv_cache_layer: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         import vllm_xpu_kernels._C  # noqa: F401
         import vllm_xpu_kernels._xpu_C  # noqa: F401
@@ -139,10 +139,11 @@ class XPUPagedAttentionManager(AttentionManager):
         )
 
         plan = self._current_plans[label]
+        k_cache, v_cache = kv_cache_layer
         output = flash_attn_varlen_func(
             q,
-            kv_cache_layer[:, 0],
-            kv_cache_layer[:, 1],
+            k_cache,
+            v_cache,
             max_seqlen_q=plan.max_q,
             cu_seqlens_q=plan.cu_q,
             max_seqlen_k=plan.max_k,

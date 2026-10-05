@@ -137,7 +137,7 @@ class _Node:
         for offset, position in enumerate(positions):
             slot = resident + offset
             page = view.page_idxs[slot // PAGE_SIZE]
-            self.kv.kv_cache.tensor[:, page, :, slot % PAGE_SIZE] = (
+            self.kv.kv_cache.tensor[:, :, page, slot % PAGE_SIZE] = (
                 float(position) + 0.5
             )
 
@@ -145,9 +145,7 @@ class _Node:
         """Every slot this request would attend over, in order."""
         stream = self.kv._streams[rid]["main"]
         return torch.stack([
-            self.kv.kv_cache.tensor[
-                :, stream.page_indices[at // PAGE_SIZE], :, at % PAGE_SIZE
-            ].clone()
+            self.kv.kv_cache.tensor[:, :, stream.page_indices[at // PAGE_SIZE], at % PAGE_SIZE].clone()
             for at in range(stream.stored_len)
         ])
 

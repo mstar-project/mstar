@@ -360,7 +360,7 @@ class FlashInferCrossManager(CrossAttentionManager):
 
     def run(
         self, q: torch.Tensor, label: str | None = None,
-        kv_cache_layer: torch.Tensor | None = None,
+        kv_cache_layer: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """One layer's cross attention. ``kv_cache_layer`` is a layer of the
         *context* cache; nothing is written to it here."""
@@ -370,7 +370,8 @@ class FlashInferCrossManager(CrossAttentionManager):
 
     @torch.compiler.disable
     def _attend(
-        self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor,
+        self, q: torch.Tensor, label: str,
+        kv_cache_layer: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         o = self._current_plan_states[label].run(q, kv_cache_layer)
         if o.dtype != q.dtype:

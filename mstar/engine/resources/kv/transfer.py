@@ -467,8 +467,12 @@ class ShmKVTransferEngine(KVTransferEngine):
         path = f"{self._path(request_id, label)}_{uuid.uuid4().hex}.pt"
         tmp_path = f"{path}.tmp"
         if chunk_pages:
+            # The snapshot stays [layer, page, kv, token, ...] even though the
+            # cache splits K/V ahead of the pages, so a chunk of it drops
+            # straight onto a `chunk_view` on the way back in (see `_retrieve`).
             packed = (
-                self._kv_cache.tensor[:, list(chunk_pages)]
+                self._kv_cache.tensor[:, :, list(chunk_pages)]
+                .movedim(1, 2)
                 .detach()
                 .cpu()
                 .contiguous()

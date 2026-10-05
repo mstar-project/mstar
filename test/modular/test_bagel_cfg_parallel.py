@@ -151,7 +151,9 @@ def _kv_cache(tensor: torch.Tensor) -> KVCache:
         max_seq_len=tensor.shape[1] * tensor.shape[3],
     )
     cache = KVCache(config, torch.device("cpu"), tensor.dtype)
-    cache.tensor.copy_(tensor)
+    # the fixtures describe pages, [layer, page, kv, token, ...]; the cache
+    # splits K/V ahead of the pages, so swap those two on the way in
+    cache.tensor.copy_(tensor.movedim(1, 2))
     return cache
 
 
@@ -176,12 +178,12 @@ def test_shm_kv_transfer_copies_only_requested_page_ranges(tmp_path):
         ])
     consumer.read_batched_async(info, reads)
 
-    torch.testing.assert_close(destination_cache.tensor[:, 0], source[:, 1])
+    torch.testing.assert_close(destination_cache.tensor[:, :, 0], source[:, 1])
     torch.testing.assert_close(
-        destination_cache.tensor[:, 2, :, :2],
+        destination_cache.tensor[:, :, 2, :2],
         source[:, 3, :, :2],
     )
-    assert torch.count_nonzero(destination_cache.tensor[:, 1]) == 0
+    assert torch.count_nonzero(destination_cache.tensor[:, :, 1]) == 0
 
 
 def test_shm_kv_transfer_requires_deployment_directory():
@@ -214,7 +216,8 @@ def test_shm_publication_refreshes_when_seq_len_changes(tmp_path):
     ) == refreshed
     torch.testing.assert_close(
         torch.load(refreshed.path, weights_only=True),
-        source_cache.tensor,
+        # the snapshot is page-major; the cache splits K/V ahead of the pages
+        source_cache.tensor.movedim(1, 2),
     )
     producer.remove_request("request")
     assert not Path(info.path).exists()
@@ -298,7 +301,8 @@ def test_shm_publication_refreshes_when_reset_generation_changes(tmp_path):
     assert producer.owns_transfer_info(refreshed, "request", "main")
     torch.testing.assert_close(
         torch.load(refreshed.path, weights_only=True),
-        source_cache.tensor,
+        # the snapshot is page-major; the cache splits K/V ahead of the pages
+        source_cache.tensor.movedim(1, 2),
     )
     producer.remove_request("request")
     assert not Path(info.path).exists()
@@ -316,12 +320,12 @@ def test_shm_earlier_descriptor_keeps_its_snapshot_after_republish(tmp_path):
         consumer_cache, "consumer", str(tmp_path),
     )
 
-    producer_cache.tensor[:, 0].fill_(1)
+    producer_cache.tensor[:, :, 0].fill_(1)
     earlier = producer.get_kv_transfer_info(
         request_id="request", label="main", page_indices=[0],
         seq_len=4, reset_generation=0,
     )
-    producer_cache.tensor[:, 1].fill_(2)
+    producer_cache.tensor[:, :, 1].fill_(2)
     later = producer.get_kv_transfer_info(
         request_id="request", label="main", page_indices=[1],
         seq_len=4, reset_generation=1,
@@ -331,11 +335,11 @@ def test_shm_earlier_descriptor_keeps_its_snapshot_after_republish(tmp_path):
     assert consumer.read_batched_async(
         earlier, [KVReadInfo(0, 0, 0, 0, 4)],
     ) is None
-    assert torch.all(consumer_cache.tensor[:, 0] == 1)
+    assert torch.all(consumer_cache.tensor[:, :, 0] == 1)
     assert consumer.read_batched_async(
         later, [KVReadInfo(0, 0, 1, 0, 4)],
     ) is None
-    assert torch.all(consumer_cache.tensor[:, 0] == 2)
+    assert torch.all(consumer_cache.tensor[:, :, 0] == 2)
 
     producer.shutdown()
     assert not Path(earlier.path).exists()
@@ -356,7 +360,7 @@ def test_shm_repeated_prefill_stores_only_changed_tail_pages(tmp_path):
     publications = []
     for token in range(1, 13):
         page, offset = divmod(token - 1, 4)
-        producer_cache.tensor[:, page, :, offset].fill_(token)
+        producer_cache.tensor[:, :, page, offset].fill_(token)
         publications.append(producer.get_kv_transfer_info(
             request_id="request",
             label="main",
@@ -376,8 +380,8 @@ def test_shm_repeated_prefill_stores_only_changed_tail_pages(tmp_path):
         latest, [KVReadInfo(0, page, page, 0, 4) for page in range(3)],
     ) is None
     torch.testing.assert_close(
-        consumer_cache.tensor[:, :3],
-        producer_cache.tensor[:, :3],
+        consumer_cache.tensor[:, :, :3],
+        producer_cache.tensor[:, :, :3],
     )
 
     consumer_cache.tensor.zero_()
@@ -386,14 +390,14 @@ def test_shm_repeated_prefill_stores_only_changed_tail_pages(tmp_path):
         [KVReadInfo(0, 0, 0, 0, 4), KVReadInfo(0, 1, 1, 0, 2)],
     ) is None
     torch.testing.assert_close(
-        consumer_cache.tensor[:, 0],
-        producer_cache.tensor[:, 0],
+        consumer_cache.tensor[:, :, 0],
+        producer_cache.tensor[:, :, 0],
     )
     torch.testing.assert_close(
-        consumer_cache.tensor[:, 1, :, :2],
-        producer_cache.tensor[:, 1, :, :2],
+        consumer_cache.tensor[:, :, 1, :2],
+        producer_cache.tensor[:, :, 1, :2],
     )
-    assert torch.count_nonzero(consumer_cache.tensor[:, 1, :, 2:]) == 0
+    assert torch.count_nonzero(consumer_cache.tensor[:, :, 1, 2:]) == 0
 
     producer.remove_request("request")
     assert all(not Path(chunk.path).exists() for chunk in latest.chunks)
@@ -525,7 +529,7 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
     assert "FileNotFoundError" in broken_again.reason.message
     assert healthy.ok and healthy.ready
     torch.testing.assert_close(
-        manager.kv_cache.tensor[:, healthy_page, :, :1],
+        manager.kv_cache.tensor[:, :, healthy_page, :1],
         healthy_kv[:, 0, :, :1],
     )
 
@@ -598,7 +602,7 @@ def test_same_reset_generation_retrieves_only_appended_kv(tmp_path):
     page = manager._streams["request"]["main"].page_indices[0]
     assert first.ok and first.ready
     torch.testing.assert_close(
-        manager.kv_cache.tensor[:, page, :, :2],
+        manager.kv_cache.tensor[:, :, page, :2],
         first_source[:, 0, :, :2],
     )
 
@@ -616,11 +620,11 @@ def test_same_reset_generation_retrieves_only_appended_kv(tmp_path):
     )
     assert appended.ok and appended.ready
     torch.testing.assert_close(
-        manager.kv_cache.tensor[:, page, :, :2],
+        manager.kv_cache.tensor[:, :, page, :2],
         first_source[:, 0, :, :2],
     )
     torch.testing.assert_close(
-        manager.kv_cache.tensor[:, page, :, 2],
+        manager.kv_cache.tensor[:, :, page, 2],
         appended_source[:, 0, :, 2],
     )
 
@@ -653,7 +657,7 @@ def test_remote_reset_generation_replaces_same_length_cached_kv(tmp_path):
     page = manager._streams["request"]["main"].page_indices[0]
     assert second.ok and second.ready
     torch.testing.assert_close(
-        manager.kv_cache.tensor[:, page, :, :2],
+        manager.kv_cache.tensor[:, :, page, :2],
         second_source[:, 0, :, :2],
     )
 

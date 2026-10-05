@@ -109,11 +109,11 @@ def _stream(mgr: KVManager, rid: str, label: str = "main"):
 def _paint(mgr: KVManager, pages: list[int], base: float) -> None:
     """Give every page a distinct value, so a copy can be checked exactly."""
     for i, page in enumerate(pages):
-        mgr.kv_cache.tensor[:, page] = base + i
+        mgr.kv_cache.tensor[:, :, page] = base + i
 
 
 def _snapshot(mgr: KVManager, pages: list[int]) -> torch.Tensor:
-    return mgr.kv_cache.tensor[:, pages].clone()
+    return mgr.kv_cache.tensor[:, :, pages].clone()
 
 
 def _scribble(mgr: KVManager) -> None:

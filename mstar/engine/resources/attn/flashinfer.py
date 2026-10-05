@@ -214,7 +214,7 @@ class FlashInferManager(AttentionManager):
 
     def run(
         self, q: torch.Tensor, label: str | None = None,
-        kv_cache_layer: torch.Tensor | None = None,
+        kv_cache_layer: tuple[torch.Tensor, torch.Tensor] | None = None,
         k: torch.Tensor | None = None,
         v: torch.Tensor | None = None,
         layer_idx: int | None = None,
@@ -230,7 +230,8 @@ class FlashInferManager(AttentionManager):
 
     @torch.compiler.disable
     def _attend(
-        self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor,
+        self, q: torch.Tensor, label: str,
+        kv_cache_layer: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         o = self._current_plan_states[label].run(q, kv_cache_layer)
         if o.dtype != q.dtype:

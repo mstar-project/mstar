@@ -44,8 +44,8 @@ class CPUPagePool:
         # be async
         self.cpu_kv_cache = torch.zeros(
             config.num_layers,
+            2,  # K and V, ahead of the pages — see KVCache.__init__
             max_cpu_pages,
-            2,  # K and V
             config.page_size,
             config.num_kv_heads,
             config.head_dim,
@@ -102,9 +102,10 @@ class CPUPagePool:
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for gpu_idx, cpu_idx in zip(gpu_page_indices, cpu_pages, strict=True):
-                # every layer of the page at once: cpu[:, cpu] = gpu[:, gpu]
-                self.cpu_kv_cache[:, cpu_idx].copy_(
-                    gpu_kv_cache[:, gpu_idx], non_blocking=True
+                # every layer and both halves of the page at once:
+                # cpu[:, :, cpu] = gpu[:, :, gpu]
+                self.cpu_kv_cache[:, :, cpu_idx].copy_(
+                    gpu_kv_cache[:, :, gpu_idx], non_blocking=True
                 )
 
         self.offloaded.setdefault(rid, {})[label] = OffloadedStream(
@@ -140,8 +141,8 @@ class CPUPagePool:
             for cpu_idx, gpu_idx in zip(
                 state.cpu_page_indices, gpu_page_indices, strict=True
             ):
-                gpu_kv_cache[:, gpu_idx].copy_(
-                    self.cpu_kv_cache[:, cpu_idx], non_blocking=True
+                gpu_kv_cache[:, :, gpu_idx].copy_(
+                    self.cpu_kv_cache[:, :, cpu_idx], non_blocking=True
                 )
 
         self.page_allocator.free(state.cpu_page_indices)

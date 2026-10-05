@@ -60,8 +60,8 @@ def _kv_scatter_nhd_eager(
     page_idx: torch.Tensor, cache_idx: torch.Tensor,
 ) -> None:
     layer = cache[layer_idx]
-    layer[page_idx, 0, cache_idx] = k.to(cache.dtype)
-    layer[page_idx, 1, cache_idx] = v.to(cache.dtype)
+    layer[0, page_idx, cache_idx] = k.to(cache.dtype)
+    layer[1, page_idx, cache_idx] = v.to(cache.dtype)
 
 
 class KVCache:
@@ -76,8 +76,15 @@ class KVCache:
     ):
         self.config = cfg
         if cfg.layout == KVLayout.NHD:
+            # K/V splits on dim 1, ahead of the pages, so that
+            # ``tensor[layer, 0]`` and ``tensor[layer, 1]`` are each a
+            # contiguous [max_num_pages, page_size, num_kv_heads, head_dim] --
+            # the one shape both FlashInfer's ``(k_cache, v_cache)`` tuple form
+            # and FlashAttention's paged k_cache/v_cache accept, so no backend
+            # needs a re-pairing copy. Still one allocation, so ``data_ptr``
+            # and ``nbytes`` address the whole cache for RDMA registration.
             self.tensor = torch.zeros(
-                cfg.num_layers, cfg.max_num_pages, 2,
+                cfg.num_layers, 2, cfg.max_num_pages,
                 cfg.page_size, cfg.num_kv_heads, cfg.head_dim,
                 dtype=dtype, device=device,
             ).contiguous()
@@ -124,13 +131,18 @@ class KVCache:
 
         ``base_ptr`` addresses a remote cache with this same layout/config;
         it defaults to this cache's own storage.
+
+        The two chunks are a whole K half apart, not adjacent: K/V splits
+        ahead of the pages, so the stride between them is
+        ``max_num_pages * page_size * num_kv_heads * head_dim``. Both ends of
+        a transfer must agree on the layout for the pointers to mean anything.
         """
         if self.layout != KVLayout.NHD:
             raise NotImplementedError(
                 f"chunk_ptrs is not implemented for layout {self.layout}."
             )
 
-        layer_stride, page_stride, kv_stride, token_stride = self.tensor.stride()[:4]
+        layer_stride, kv_stride, page_stride, token_stride = self.tensor.stride()[:4]
         element_size = self.tensor.element_size()
 
         # token_stride = num_kv_heads * head_dim
@@ -149,15 +161,21 @@ class KVCache:
         ]
         return ptrs, nbytes
 
-    def layer_view(self, layer_idx: int) -> torch.Tensor:
-        """One layer's pages, in this cache's layout — what an attention
-        kernel consumes. NHD: [max_num_pages, 2, page_size, num_kv_heads,
-        head_dim]."""
+    def layer_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """One layer's pages as ``(k_cache, v_cache)`` — what an attention
+        kernel consumes. NHD: each is a contiguous [max_num_pages, page_size,
+        num_kv_heads, head_dim].
+
+        A pair rather than one K/V-paired tensor because that is what both
+        backends take directly: FlashInfer accepts the tuple form, and
+        FlashAttention has no paired form at all.
+        """
         if self.layout != KVLayout.NHD:
             raise NotImplementedError(
                 f"layer_view is not implemented for layout {self.layout}."
             )
-        return self.tensor[layer_idx]
+        layer = self.tensor[layer_idx]
+        return layer[0], layer[1]
 
     def read_tokens(
         self, layer_idx: int,
@@ -170,7 +188,9 @@ class KVCache:
             raise NotImplementedError(
                 f"read_tokens is not implemented for layout {self.layout}."
             )
-        return self.tensor[layer_idx][page_idx, :, cache_idx]
+        # the gather lands [2, num_tokens, ...] now that K/V leads the pages;
+        # moved back so the documented token-major shape still holds
+        return self.tensor[layer_idx][:, page_idx, cache_idx].movedim(0, 1)
 
     def write_tokens(
         self, layer_idx: int,
@@ -208,8 +228,8 @@ class KVCache:
         src = torch.as_tensor(src_pages, dtype=torch.long, device=self.device)
         dst = torch.as_tensor(dst_pages, dtype=torch.long, device=self.device)
         # The gather is materialized before the scatter, so pages may appear
-        # in both src and dst.
-        self.tensor[:, dst] = self.tensor[:, src]
+        # in both src and dst. Pages are dim 2 now, behind K/V.
+        self.tensor[:, :, dst] = self.tensor[:, :, src]
 
     def chunk_view(
         self, layer_idx: int, page_idx: int,
@@ -227,4 +247,4 @@ class KVCache:
 
         if tensor is None:
             tensor = self.tensor
-        return tensor[layer_idx, page_idx, :, token_start:token_end]
+        return tensor[layer_idx, :, page_idx, token_start:token_end]

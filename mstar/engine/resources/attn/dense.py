@@ -206,7 +206,10 @@ class DenseAttentionManager(AttentionManager):
         )
 
     def _prefix_kv(
-        self, segment: DenseSegment, layer_idx: int, kv_cache_layer: torch.Tensor
+        self,
+        segment: DenseSegment,
+        layer_idx: int,
+        kv_cache_layer: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """This segment's frozen prefix for one layer, gathered out of the
         pages on first use and held until the stream moves under it."""
@@ -226,10 +229,10 @@ class DenseAttentionManager(AttentionManager):
             return cached
 
         cfg = self._kv_config
-        # [n_pages, 2, page_size, num_kv_heads, head_dim] -> the prefix's rows
-        pages = kv_cache_layer[segment.pages]
-        k_pref = pages[:, 0].reshape(-1, cfg.num_kv_heads, cfg.head_dim)
-        v_pref = pages[:, 1].reshape(-1, cfg.num_kv_heads, cfg.head_dim)
+        # each [n_pages, page_size, num_kv_heads, head_dim] -> the prefix's rows
+        k_cache, v_cache = kv_cache_layer
+        k_pref = k_cache[segment.pages].reshape(-1, cfg.num_kv_heads, cfg.head_dim)
+        v_pref = v_cache[segment.pages].reshape(-1, cfg.num_kv_heads, cfg.head_dim)
         # the gather already copied; the slice keeps the trailing slots of the
         # last page out, and `clone` keeps the whole page span from being held
         cached = (
@@ -241,7 +244,7 @@ class DenseAttentionManager(AttentionManager):
     @torch.compiler.disable
     def run(
         self, q: torch.Tensor, label: str | None = None,
-        kv_cache_layer: torch.Tensor | None = None,
+        kv_cache_layer: tuple[torch.Tensor, torch.Tensor] | None = None,
         k: torch.Tensor | None = None,
         v: torch.Tensor | None = None,
         layer_idx: int | None = None,
