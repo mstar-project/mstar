@@ -7,8 +7,8 @@ module selects the next token.
 Supports per-request sampling parameters (different temperature/top_k/top_p
 for each request in a batch) via tensor parameters.
 
-With explicit seed and offset tensors, XPU sampling keeps parameters and RNG
-state on device and uses masking for mixed greedy and sampled requests.
+Supports CUDA and XPU graph capture with explicit device seed/offset tensors
+after warmup. Uses masking for mixed greedy and sampled requests.
 
 Usage:
     from mstar.engine.resources.sampler.utils import sample_tokens
