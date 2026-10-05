@@ -86,9 +86,19 @@ def _eng(rids) -> ModelInputsFromEngine:
     return ModelInputsFromEngine(request_ids=list(rids), per_request_info={})
 
 
+# The dit node keys per-request state by rid_handle, not by request_id, and only
+# builds the schedule/bucket_key when that state is empty. Sharing a handle across
+# rows or across tests would pin the first bucket_key seen -- a t2i key carries no
+# ref_grids, so an edit row would denoise without its reference tokens and still
+# match another row doing the same wrong thing. Derive a distinct handle per rid.
+def _handle(rid: str) -> int:
+    return abs(hash(rid)) % (1 << 30)
+
+
 def _info(rid: str, k: int, seed: int, walk: str = IMAGE_GEN_WALK, ref_grids=()) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
-        request_id=rid, graph_walk=walk, fwd_index=k, random_seed=seed, max_tokens=0,
+        request_id=rid, rid_handle=_handle(rid), graph_walk=walk, fwd_index=k,
+        random_seed=seed, max_tokens=0,
         step_metadata={"height": HEIGHT, "width": WIDTH, "num_inference_steps": STEPS,
                        "ref_grids": [list(g) for g in ref_grids]},
         dynamic_loop_iter_counts={DENOISE_LOOP: k},
@@ -151,7 +161,7 @@ def _trajectory(subs, embeds: list[torch.Tensor], prefix: str, batched: bool, se
                     latents.append(dit.forward(walk, _eng([rid]), **kwargs)[LATENTS][0])
             steps.append(list(latents))
     for rid in rids:
-        dit.cleanup_request(rid)
+        dit.cleanup_request(_handle(rid))  # the key prepare_inputs stored under
     return steps
 
 

@@ -98,9 +98,20 @@ def model() -> Flux2KleinModel:
     return m
 
 
-def _fwd_info(meta: dict, k: int, seed: int, ref_grids=(), walk: str = IMAGE_GEN_WALK) -> CurrentForwardPassInfo:
+# The dit node keys its per-request state by rid_handle, NOT by request_id, and the
+# schedule/bucket_key are only built when that state is empty. Sharing one handle
+# across tests therefore pins the FIRST test's bucket_key for every later one -- a
+# t2i key has no ref_grids, so the edit tests would silently denoise without their
+# reference tokens and still "pass" anything that compares two such runs. Each test
+# takes its own handle, and cleans up by it.
+_NOISE_RID, _T2I_RID, _EDIT_RID, _MULTI_RID = 10, 11, 12, 13
+
+
+def _fwd_info(meta: dict, k: int, seed: int, ref_grids=(), walk: str = IMAGE_GEN_WALK,
+              rid_handle: int = 0) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
-        request_id="oracle", graph_walk=walk, fwd_index=k, random_seed=seed, max_tokens=0,
+        request_id="oracle", rid_handle=rid_handle, graph_walk=walk, fwd_index=k,
+        random_seed=seed, max_tokens=0,
         step_metadata={"height": meta["height"], "width": meta["width"], "num_inference_steps": meta["steps"],
                        "ref_grids": [list(g) for g in ref_grids]},
         dynamic_loop_iter_counts={DENOISE_LOOP: k},
@@ -138,13 +149,13 @@ def test_text_encoder_matches_oracle(model, meta):
 
 def test_initial_noise_matches_oracle(model, meta):
     dit: KleinDenoiseSubmodule = model.get_submodule("dit", device=DEVICE)
-    node_inputs = dit.prepare_inputs(IMAGE_GEN_WALK, _fwd_info(meta, 0, meta["seed"]),
+    node_inputs = dit.prepare_inputs(IMAGE_GEN_WALK, _fwd_info(meta, 0, meta["seed"], rid_handle=_NOISE_RID),
                                      {TEXT_EMBEDS: [torch.zeros(1, 512, model.config.transformer.joint_attention_dim)]})
     expected = torch.load(ORACLE_DIR / "t2i" / "latents_init.pt")[0]
     diff = (node_inputs.tensor_inputs[LATENTS].cpu().float() - expected.float()).abs().max().item()
     print(f"initial noise max_abs={diff:.3e}")
     assert diff <= NOISE_MAX_ABS
-    dit.cleanup_request("oracle")
+    dit.cleanup_request(_NOISE_RID)
 
 
 def test_denoise_trajectory_and_image_match_oracle(model, meta):
@@ -159,7 +170,7 @@ def test_denoise_trajectory_and_image_match_oracle(model, meta):
         latents = None
         worst = 0.0
         for k in range(meta["steps"]):
-            node_inputs = dit.prepare_inputs(IMAGE_GEN_WALK, _fwd_info(meta, k, meta["seed"]),
+            node_inputs = dit.prepare_inputs(IMAGE_GEN_WALK, _fwd_info(meta, k, meta["seed"], rid_handle=_T2I_RID),
                                              {**inputs, **({LATENTS: [latents]} if latents is not None else {})})
             kwargs = dit.preprocess(IMAGE_GEN_WALK, _engine_inputs(), [node_inputs])
             latents = dit.forward(IMAGE_GEN_WALK, _engine_inputs(), **kwargs)[LATENTS][0]
@@ -176,7 +187,7 @@ def test_denoise_trajectory_and_image_match_oracle(model, meta):
     psnr = _psnr(image, expected_image)
     print(f"final image PSNR={psnr:.2f} dB")
     assert psnr >= MIN_PSNR_DB
-    dit.cleanup_request("oracle")
+    dit.cleanup_request(_T2I_RID)
 
 
 def test_edit_trajectory_and_image_match_oracle(model, meta):
@@ -204,7 +215,8 @@ def test_edit_trajectory_and_image_match_oracle(model, meta):
         inputs = {TEXT_EMBEDS: [embeds], REF_LATENTS: [ref_latents]}
         latents, worst = None, 0.0
         for k in range(meta["steps"]):
-            info = _fwd_info(meta, k, meta["edit_seed"], ref_grids=ref_grids, walk=IMAGE_EDIT_WALK)
+            info = _fwd_info(meta, k, meta["edit_seed"], ref_grids=ref_grids, walk=IMAGE_EDIT_WALK,
+                             rid_handle=_EDIT_RID)
             node_inputs = dit.prepare_inputs(IMAGE_EDIT_WALK, info,
                                              {**inputs, **({LATENTS: [latents]} if latents is not None else {})})
             kwargs = dit.preprocess(IMAGE_EDIT_WALK, _engine_inputs(), [node_inputs])
@@ -218,7 +230,7 @@ def test_edit_trajectory_and_image_match_oracle(model, meta):
             IMAGE_EDIT_WALK, _engine_inputs(), latents=latents[None],
             grid=model.config.latent_grid(meta["height"], meta["width"]),
         )["image_output"][0][0].cpu()
-    dit.cleanup_request("oracle")
+    dit.cleanup_request(_EDIT_RID)
     psnr = _psnr(image, _load_png(ORACLE_DIR / "edit" / "image.png"))
     print(f"edit image PSNR={psnr:.2f} dB")
     assert psnr >= MIN_PSNR_DB
@@ -248,7 +260,8 @@ def test_multi_reference_edit_matches_oracle(model, meta):
         inputs = {TEXT_EMBEDS: [embeds], REF_LATENTS: [ref_latents]}
         latents, worst = None, 0.0
         for k in range(meta["steps"]):
-            info = _fwd_info(meta, k, meta["edit_multi_seed"], ref_grids=ref_grids, walk=IMAGE_EDIT_WALK)
+            info = _fwd_info(meta, k, meta["edit_multi_seed"], ref_grids=ref_grids, walk=IMAGE_EDIT_WALK,
+                             rid_handle=_MULTI_RID)
             node_inputs = dit.prepare_inputs(IMAGE_EDIT_WALK, info,
                                              {**inputs, **({LATENTS: [latents]} if latents is not None else {})})
             kwargs = dit.preprocess(IMAGE_EDIT_WALK, _engine_inputs(), [node_inputs])
@@ -262,7 +275,7 @@ def test_multi_reference_edit_matches_oracle(model, meta):
             IMAGE_EDIT_WALK, _engine_inputs(), latents=latents[None],
             grid=model.config.latent_grid(meta["height"], meta["width"]),
         )["image_output"][0][0].cpu()
-    dit.cleanup_request("oracle")
+    dit.cleanup_request(_MULTI_RID)
     psnr = _psnr(image, _load_png(ORACLE_DIR / "edit_multi" / "image.png"))
     print(f"multi-ref edit image PSNR={psnr:.2f} dB (references {[tuple(g) for g in ref_grids]})")
     assert psnr >= MIN_PSNR_DB
