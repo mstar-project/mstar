@@ -268,6 +268,12 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             logits.index_fill_(-1, self._begin_suppress_ids, float("-inf"))
         return logits
 
+    def _detect_language(self, logits: torch.Tensor) -> torch.Tensor:
+        """The most likely language token per row. Detection is a
+        classification, so it takes the argmax whatever temperature the
+        request decodes with, as HF and openai-whisper do."""
+        return self._restrict_to_languages(logits).argmax(dim=-1)
+
     def _restrict_to_languages(self, logits: torch.Tensor) -> torch.Tensor:
         """Language detection: only the ``<|xx|>`` tokens may be sampled."""
         if self._language_mask is None:
@@ -329,10 +335,18 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             else:
                 tensor_inputs["ts_rules"] = torch.tensor(inactive_state(), dtype=torch.long, device=device)
         else:
-            state = self.request_state(fwd_info.request_id)
+            state = self.request_state(fwd_info.rid_handle)
             # The learned position table caps prompt + transcript at
-            # max_target_positions, and check_stop reads this back.
-            state.add("prompt_len", state.get("prompt_len", 0) + seq_len)
+            # max_target_positions, and check_stop reads this back. Set per
+            # walk rather than added up, the worker runs prepare_inputs again
+            # after an AllocationFailed retry. The prompt walk after language
+            # detection follows the one-token detection prompt.
+            if graph_walk == PREFILL_PROMPT_WALK:
+                state.add("prompt_len", state.get("detect_len", 0) + seq_len)
+            else:
+                state.add("prompt_len", seq_len)
+                if graph_walk == DETECT_LANGUAGE_WALK:
+                    state.add("detect_len", seq_len)
             # Timestamps are on when the prompt omits <|notimestamps|>. The
             # detection walk's prompt ends at <|sot|> and says nothing yet.
             prompt = token_ids.tolist() + tensor_inputs.get("prompt_tail", token_ids[:0]).tolist()
@@ -360,7 +374,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         with ``<|notimestamps|>`` (word timing never uses timestamp tokens),
         the transcript's text tokens, end-of-text."""
         device = self.get_device()
-        state = self.request_state(fwd_info.request_id)
+        state = self.request_state(fwd_info.rid_handle)
         generated = [int(t) for part in inputs["transcript"] for t in part.reshape(-1).tolist()]
         language = state.get("language")
         if generated and self.config.language_of(generated[0]) is not None:
@@ -519,14 +533,14 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
 
         logits = self.decoder.lm_head(hidden)
         if graph_walk == DETECT_LANGUAGE_WALK:
-            logits = self._restrict_to_languages(logits)
+            new_tokens = self._detect_language(logits)
         else:
             logits = self._apply_suppress(
                 logits, is_first_token=graph_walk in FIRST_TOKEN_WALKS,
             )
             if ts_rules is not None:
                 logits = self.timestamp_rules.apply(logits, ts_rules)
-        new_tokens = sampler.sample(engine_inputs.request_ids, logits=logits)
+            new_tokens = sampler.sample(engine_inputs.request_ids, logits=logits)
         if ts_rules is None:
             return new_tokens, None
         return new_tokens, self.timestamp_rules.advance(ts_rules, new_tokens)
@@ -633,7 +647,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         decoded_tokens = request_info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
         # prompt + first token + decoded tokens must fit the position table
-        prompt_len = self.request_state(request_id).get("prompt_len", 0)
+        prompt_len = self.request_state(request_info.rid_handle).get("prompt_len", 0)
         positions_left = self.config.max_target_positions - prompt_len - 1 - decoded_tokens
         if (not ignore_eos and token == self.config.eos_token_id) or \
                 decoded_tokens >= request_info.max_tokens or positions_left <= 0:
