@@ -1359,6 +1359,7 @@ class Worker:
             per_request_input_metadata=per_request_input_metadata,
             request_walks=batch.request_walks,
             chunk_ranges=batch.chunk_ranges,
+            incomplete_node_rids=batch.incomplete_node_rids,
         )
         for rid in unresolved:
             # Reported the way a per-rid stage reports: left in
@@ -1419,6 +1420,7 @@ class Worker:
         per_request_input_metadata: dict[int, InputMetadata] | None = None,
         request_walks: dict[int, str] | None = None,
         chunk_ranges: dict[int, tuple[int, int]] | None = None,
+        incomplete_node_rids: set[int] | None = None,
     ) -> ExecutingBatch:
         """One step's batch, with the step context the engine drives it through.
 
@@ -1437,6 +1439,7 @@ class Worker:
             stream_partition_done_rids=stream_partition_done_rids,
             per_request_input_metadata=per_request_input_metadata or {},
             chunk_ranges=chunk_ranges or {},
+            incomplete_node_rids=set(incomplete_node_rids or ()),
             step_context=StepContext(
                 request_ids=tuple(request_ids),
                 graph_walk=graph_walk,
@@ -1476,6 +1479,9 @@ class Worker:
                 node_batch.request_ids, [ctx.walk_of(r) for r in node_batch.request_ids],
             )
             walks, walk_idx = rows.walks, rows.walk_idx
+        chunks = node_batch.chunk_ranges
+        chunk_starts = [chunks.get(r, (-1, -1))[0] for r in node_batch.request_ids] if chunks else []
+        chunk_ends = [chunks.get(r, (-1, -1))[1] for r in node_batch.request_ids] if chunks else []
         for worker in workers:
             self.communicator.send(
                 worker, msg=WorkerMessage(
@@ -1490,6 +1496,11 @@ class Worker:
                         resident_delta=resident_delta.copy(),
                         walks=walks,
                         walk_idx=walk_idx,
+                        chunk_starts=chunk_starts,
+                        chunk_ends=chunk_ends,
+                        incomplete_node_rids=[
+                            self._rid_str(r) for r in node_batch.incomplete_node_rids
+                        ],
                     )
                 )
             )
@@ -2149,6 +2160,7 @@ class Worker:
             per_request_input_metadata=input_meta,
             request_walks=request_walks,
             chunk_ranges=chunk_ranges,
+            incomplete_node_rids=incomplete_node_rids,
         )
         return Speculation(
             scheduled_batch=spec_batch,
@@ -2607,6 +2619,7 @@ class Worker:
             request_walks={
                 r: head.walks[w] for r, w in head_walk_idx.items()
             } if head.walks else None,
+            **self.scheduler.tp_chunks(head),
         )
 
     # How many "no speculative head from step s" seqs a follower remembers.

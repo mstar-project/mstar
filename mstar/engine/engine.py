@@ -248,8 +248,10 @@ class ExecutingBatch:
     # this step reports the partition done
     stream_partition_done_rids: set[str] = field(default_factory=set)
 
-    # rid -> [start, end) of a chunked row's input this step
+    # rid -> [start, end) of a chunked row's input this step, and the rows
+    # whose node needs another chunk
     chunk_ranges: Mapping[int, tuple[int, int]] = field(default_factory=dict)
+    incomplete_node_rids: set[int] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None

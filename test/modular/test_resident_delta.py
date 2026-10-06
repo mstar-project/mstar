@@ -619,6 +619,7 @@ class _Leader:
 def _node_batch():
     return SimpleNamespace(
         node_name="node", graph_walk="walk", request_ids=("r0",),
+        chunk_ranges={}, incomplete_node_rids=set(),
         step_context=StepContext(
             request_ids=("r0",), graph_walk="walk", slot=0, capture=False,
         ),
