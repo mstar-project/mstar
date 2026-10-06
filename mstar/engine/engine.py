@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Callable, Mapping
@@ -27,6 +27,7 @@ from mstar.engine.resources import (
     PublishedInfo,
     Resource,
     ResourceReqConfig,
+    SamplerStep,
     SlotLease,
     StepContext,
     StepRunner,
@@ -246,6 +247,9 @@ class ExecutingBatch:
     # this step reports the partition done
     stream_partition_done_rids: set[str] = field(default_factory=set)
 
+    # rid -> [start, end) of a chunked row's input this step
+    chunk_ranges: Mapping[int, tuple[int, int]] = field(default_factory=dict)
+
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
@@ -363,6 +367,22 @@ class ExecutingBatch:
             self.set_slot(slot_lease.slot)
 
 
+def _keep_only_final_chunk_samples(
+    step: SubmoduleStep, rids: list, inputs: list[NodeInputs],
+) -> None:
+    """A non-final chunk's sampled token is dropped, so its sampler state is not committed."""
+    non_final = {
+        rid for rid, inp in zip(rids, inputs, strict=False)
+        if not getattr(inp, "is_final_chunk", True)
+    }
+    if not non_final:
+        return
+    for key, sub in step.steps.items():
+        if isinstance(sub, SamplerStep):
+            kept = frozenset(rids) if sub.kept_rids is None else sub.kept_rids
+            step.steps[key] = replace(sub, kept_rids=kept - non_final)
+
+
 class Engine:
     def __init__(
         self, graph_runtime: GraphRuntime,
@@ -376,6 +396,8 @@ class Engine:
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
+        # (rid, node) -> a chunked row's whole input, prepared on its first chunk
+        self._chunk_inputs: dict[tuple[int, str], NodeInputs] = {}
 
         # node -> (offloaded, reloaded) since the last ``take_resident_delta``.
         # Only a TP leader drains this, to replicate its resident set onto the
@@ -703,7 +725,15 @@ class Engine:
         node_inputs: list[NodeInputs] = []
         for rid in batch.request_ids:
             walk = batch.step_context.walk_of(rid)
+            chunk = batch.chunk_ranges.get(rid)
             try:
+                if chunk is not None:
+                    req_inputs = self._prepare_chunk(batch, rid, walk, chunk)
+                    if req_inputs is None:
+                        batch.skipped_rids.add(rid)
+                    else:
+                        node_inputs.append(req_inputs)
+                    continue
                 req_inputs = submodule.prepare_inputs(
                     graph_walk=walk,
                     fwd_info=batch.per_request_info_wrapped[rid],
@@ -735,6 +765,39 @@ class Engine:
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
         )
+
+    def _prepare_chunk(
+        self, batch: ExecutingBatch, rid: int, walk: str, chunk: tuple[int, int],
+    ) -> NodeInputs | None:
+        """One chunk of a row's input, cut from the whole input prepared once
+        on its first chunk and kept until the last one lands
+        (``release_chunk_inputs``). A chunked row skips the prefix cache."""
+        submodule = self._submodules[batch.node_name].submodule
+        key = (rid, batch.node_name)
+        full = self._chunk_inputs.get(key)
+        if full is None:
+            full = submodule.prepare_inputs(
+                graph_walk=walk,
+                fwd_info=batch.per_request_info_wrapped[rid],
+                inputs=batch.per_request_input_tensors.get(rid, {}),
+                resources=self._submodules[batch.node_name].resources,
+                is_final_stream_chunk=rid in batch.final_stream_rids,
+                input_metadata=batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA),
+            )
+            if full is None:
+                return None
+            self._chunk_inputs[key] = full
+        start, end = chunk
+        part = submodule.split_inputs(
+            walk, batch.per_request_info_wrapped[rid], full, start, end,
+        )
+        part.graph_walk = walk
+        part.chunk_start = start
+        part.chunk_total = full.input_seq_len
+        return part
+
+    def release_chunk_inputs(self, rid: int, node_name: str) -> None:
+        self._chunk_inputs.pop((rid, node_name), None)
 
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
@@ -1052,6 +1115,7 @@ class Engine:
             # the submodule declared no step (a node owning no resources);
             # there is nothing to admit, and the forward still runs
             return ADMIT_OK, None
+        _keep_only_final_chunk_samples(step, rids, inputs)
         # admit reads the step's ctx, so bind it before the sweep rather than
         # in `_drive_step`
         step.set_ctx(ctx)
@@ -1563,6 +1627,12 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
+    def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
+        return self._submodules[node_name].submodule.max_batch_tokens(graph_walk)
+
+    def supports_chunked_prefill(self, node_name: str, graph_walk: str) -> bool:
+        return self._submodules[node_name].submodule.supports_chunked_prefill(graph_walk)
+
     def declares_input_sequence_len(self, node_name: str) -> bool:
         """Whether the node's submodule reports row lengths before prepare."""
         impl = type(self._submodules[node_name].submodule).get_input_sequence_len
@@ -2008,6 +2078,8 @@ class Engine:
 
     def remove_request(self, request_id: str) -> None:
         self._runner.remove_request(request_id)
+        for key in [key for key in self._chunk_inputs if key[0] == request_id]:
+            del self._chunk_inputs[key]
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
 
