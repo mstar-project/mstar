@@ -309,10 +309,16 @@ Worker scheduling
        worker main loop (speculate, await_gpu, submit_spec, ...).
    * - ``MSTAR_KV_DEBUG_ASSERTS``
      - ``0``
-     - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
-       ``remove_request``, check the KV page bookkeeping (free list, owner
+     - ``1``: after every ``admit``, ``commit``, ``reset_request``,
+       ``release_kv`` and ``remove_request``, check the KV page bookkeeping (free list, owner
        counts, seals) against the streams holding the pages. Walks every
        live stream; tests and debugging only.
+   * - ``MSTAR_KV_RELEASE_AT_COMPLETION``
+     - ``0``
+     - ``1``: the conductor tells a request's workers to give back its KV
+       pages and reservation when the request completes (``RELEASE_KV``),
+       not when the client has read its outputs and the request is removed.
+       Read once, by the conductor.
 
 Compilation
 -----------

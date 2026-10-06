@@ -53,6 +53,11 @@ from mstar.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
+# Read once. Off: a finished request's KV pages are freed by the REMOVE_REQUEST
+# that waits for its outputs to be read. On: its workers are also sent
+# RELEASE_KV the moment it completes, to free them then.
+_KV_RELEASE_AT_COMPLETION = os.environ.get("MSTAR_KV_RELEASE_AT_COMPLETION", "0") == "1"
+
 
 class DeadWorkerError(RuntimeError):
     """A worker process exited. Raised out of ``Conductor.run`` so the
@@ -1270,6 +1275,19 @@ class Conductor:
                 )
             )
         )
+
+        # Every walk of the request is done, so nothing on a worker reads its KV
+        # pages again; they need not wait for the client to read the outputs.
+        # The hard RemoveRequest below still follows and clears the rest.
+        if _KV_RELEASE_AT_COMPLETION:
+            for worker_id in self._request_workers(request_data):
+                self.communicator.send(
+                    worker_id,
+                    WorkerMessage(
+                        message_type=WorkerMessageType.RELEASE_KV,
+                        body=RemoveRequest(request_id),
+                    ),
+                )
 
         # Unpersist anything still held, with correct ref counts, so producers
         # reclaim it as the final reads ACK — before the hard teardown.
