@@ -38,6 +38,11 @@ class BatchBuildRequest:
     # The caller's own rows (a speculation merge's continuing ones) and their walk.
     pre_existing_batch_size: int = 0
     pre_existing_walk: str | None = None
+    # Token budget for the step; None for none. With it, each row's remaining
+    # tokens, and the rows that may be cut into chunks.
+    max_batch_tokens: int | None = None
+    row_tokens: dict[int, int] = field(default_factory=dict)
+    chunkable: set[int] = field(default_factory=set)
     # `Engine.capture_group` for one rid of this (node, walk).
     capture_group: Callable[[int], Any] = lambda _: None
 
@@ -48,6 +53,8 @@ class BatchBuildResult(NamedTuple):
     backlog: "ScheduledBatch | None" = None
     # Popped rows handed back to their ready queues: rid -> worker graph id.
     returned: dict[int, int] | None = None
+    # Rows cut short this step: rid -> tokens to run.
+    chunk_tokens: dict[int, int] | None = None
 
 
 def off_group_rids(
@@ -157,6 +164,7 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             batch, request.capture_group,
             exclude_rids=request.blocked_rids, anchor=request.capture_group_of,
         )
+        backlogged = set() if request.backlog is None else set(request.backlog.request_to_worker_graph)
         walk = _single_walk(batch, request)
         if walk is None:
             max_bs, left_out = _compose_walks(batch, exclude, request)
@@ -167,19 +175,80 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         if max_bs is not None and max_bs <= 0:
             return BatchBuildResult(None, backlog=batch)  # the caller's rows fill it
         scheduled, remainder = batch.split_off_first(max_bs, exclude_rids=exclude)
-        if remainder is None:
-            return BatchBuildResult(scheduled)
-        give_back = {
-            rid for rid in remainder.request_to_worker_graph
-            if rid in fresh_rids and rid not in exclude
-        } if had_backlog else set()
-        if not give_back:
-            return BatchBuildResult(scheduled, backlog=remainder)
-        parked, returned = remainder.split_off_first(None, exclude_rids=give_back)
-        return BatchBuildResult(
-            scheduled, backlog=parked,
-            returned=dict(returned.request_to_worker_graph) if returned else None,
+        # A fresh row the cap pushed out goes back to its ready queue only on
+        # a step that served a backlog; with none it parks, as main did. The
+        # token budget below does the same for the rows it drops, so both
+        # kinds of leftover accumulate into `returned`.
+        returned: dict[int, int] | None = None
+        if remainder is not None and had_backlog:
+            give_back = {
+                rid for rid in remainder.request_to_worker_graph
+                if rid in fresh_rids and rid not in exclude
+            }
+            if give_back:
+                remainder, back = remainder.split_off_first(
+                    None, exclude_rids=give_back,
+                )
+                returned = dict(back.request_to_worker_graph) if back else None
+
+        if scheduled is None or request.max_batch_tokens is None:
+            return BatchBuildResult(scheduled, backlog=remainder, returned=returned)
+
+        take, dropped = fill_token_budget(
+            list(scheduled.request_to_worker_graph), request.row_tokens,
+            request.chunkable, request.max_batch_tokens,
         )
+        chunk_tokens = {
+            rid: n for rid, n in take.items() if n < request.row_tokens.get(rid, n)
+        }
+        if dropped:
+            # a fresh row that missed the budget goes back to its queue; a backlogged one stays parked
+            scheduled, out = scheduled.split_off_first(None, exclude_rids=dropped)
+            back, fresh_out = out.split_off_first(
+                None, exclude_rids=set(out.request_to_worker_graph) - backlogged,
+            )
+            if back is not None:
+                remainder = back if remainder is None else _merged(remainder, back)
+            if fresh_out is not None:
+                # accumulated, not replaced: the cap may already have given rows back
+                returned = (returned or {}) | dict(fresh_out.request_to_worker_graph)
+        return BatchBuildResult(
+            scheduled, backlog=remainder, returned=returned, chunk_tokens=chunk_tokens,
+        )
+
+
+def fill_token_budget(
+    rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
+) -> tuple[dict[int, int], set[int]]:
+    """Max-min fair share of ``budget`` over ``rids``: rows under an equal share
+    go in whole, the rest split what is left (chunkable rows) or sit out.
+    Never empty while a row exists: the first row runs over budget if it must.
+    Returns (rid -> tokens taken, rids left out)."""
+    take: dict[int, int] = {}
+    left = budget
+    pending = list(rids)
+    while pending:
+        share = left // len(pending)
+        fits = [rid for rid in pending if tokens.get(rid, 0) <= share]
+        if not fits:
+            break
+        for rid in fits:
+            take[rid] = tokens.get(rid, 0)
+            left -= take[rid]
+        pending = [rid for rid in pending if rid not in take]
+    dropped: set[int] = set()
+    share = left // len(pending) if pending else 0
+    for rid in pending:
+        if rid in chunkable and share >= 1:
+            take[rid] = share
+        else:
+            dropped.add(rid)
+    if not take and rids:
+        head = rids[0]
+        need = tokens.get(head, 0)
+        take[head] = min(need, max(budget, 1)) if head in chunkable else need
+        dropped.discard(head)
+    return take, dropped
 
 
 def _single_walk(batch: "ScheduledBatch", request: BatchBuildRequest) -> str | None:
