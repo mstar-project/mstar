@@ -144,7 +144,7 @@ class FlashInferManager(AttentionManager):
         self.reset_default_cursors()
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
-            "preplan requires a cuda graph step: an eager wrapper shares its "
+            "preplan requires a captured graph step: an eager wrapper shares its "
             "workspace with the captured one on the same slot"
         )
         assert not (self._preplanned and ctx.is_preplan), (
@@ -236,4 +236,3 @@ class FlashInferManager(AttentionManager):
         if o.dtype != q.dtype:
             o = o.to(q.dtype)
         return o
-

@@ -32,7 +32,7 @@ class RaggedAttentionConfig:
     # default would derive it from the padded one (see `padded_head_dim`).
     sm_scale: float | None = None
 
-    # Per-request ceiling sizing a CUDA-graph bucket: a capture at batch size
+    # Per-request ceiling sizing an accelerator graph bucket: a capture at batch size
     # `bs` gets `bs` times this. A "segment" is an independently-attending
     # span, not a request — a request carrying several images contributes
     # several.
@@ -98,7 +98,7 @@ class RaggedAttentionSpec(NodeResourceSpec):
         an image that cannot build FA3 pins FA2 here.
 
         The two ceilings are here rather than on the model because they size
-        CUDA-graph buckets, which is a deployment's memory/coverage trade.
+        accelerator graph buckets, which is a deployment's memory/coverage trade.
         """
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend

@@ -561,17 +561,17 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
-    def set_speculatively_scheduled(
+    def set_in_flight(
         self, node: str, wg_id: int, rids: list[int],
-        speculatively_scheduled: bool
+        in_flight: bool,
     ):
         pass
 
     @abstractmethod
-    def is_speculatively_scheduled(
+    def is_in_flight(
         self, node: str, wg_id: int, rid: int,
     ) -> bool:
-        """Whether this rid's node is marked speculatively scheduled.
+        """Whether this rid's node is marked in flight.
 
         The flag must SURVIVE node completion: its rids are still in flight
         for the speculative N+1 step, so the node must stay out of the ready

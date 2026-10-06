@@ -447,7 +447,7 @@ def test_preplan_promotes_on_the_next_plan():
 def test_preplan_requires_a_capture_slot():
     """Eager wrappers share one workspace per label with the in-flight forward."""
     mgr = manager()
-    with pytest.raises(AssertionError, match="preplan requires a cuda graph step"):
+    with pytest.raises(AssertionError, match="preplan requires a captured graph step"):
         mgr.plan(step(8), ctx(["r0"], is_preplan=True))
 
 

@@ -554,7 +554,8 @@ def test_a_speculative_completion_does_not_report_the_partition_done(tmp_path):
     # Not speculative: the flag rides through as the stream reported it.
     assert mesh.run(rid, uuids=[])["conductor"][0].body.partition_done
 
-    mesh.rt.set_speculatively_scheduled("only", WG_ID, [rid], True)
+    # mesh.rt is the raw PyO3 GraphRuntime, not the RustGraphRuntime wrapper.
+    mesh.rt.set_in_flight("only", WG_ID, [rid], True)
     body = mesh.run(rid, uuids=[])["conductor"][0].body
     assert not body.partition_done, "a speculative pass reported done"
 

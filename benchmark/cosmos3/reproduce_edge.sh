@@ -15,7 +15,7 @@ set -eu
 
 # --------------------------------------------------------------------------
 # Serve M* (this repo): configs/cosmos3_edge.yaml serves the generator walks and
-# the reasoner on one GPU. Denoise CUDA graphs are captured for the 480p tier.
+# the reasoner on one GPU. Denoise accelerator graphs are captured for the 480p tier.
 #   usage: serve_mstar <gpu> <port>
 # --------------------------------------------------------------------------
 serve_mstar() {

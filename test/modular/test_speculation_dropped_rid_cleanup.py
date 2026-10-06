@@ -65,7 +65,7 @@ def test_dropped_rid_gets_its_own_edges_back():
             ),
         ),
     )
-    worker._set_speculative_flag = lambda batch, value: None
+    worker._set_in_flight_flag = lambda batch, value: None
     worker._settle_speculation = (
         lambda spec, success, dropped_rids=frozenset():
         Worker._settle_speculation(worker, spec, success, dropped_rids)

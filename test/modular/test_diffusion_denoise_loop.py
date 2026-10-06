@@ -2,7 +2,7 @@
 
 Structural behaviour only — no weights, no GPU: seeded noise at iteration 0, the step
 index from the engine's loop counter, the async-overshoot veto, equal-shape batching,
-stacked preprocess and per-row outputs, the stop boundary, the CUDA-graph bucket key
+stacked preprocess and per-row outputs, the stop boundary, the accelerator graph bucket key
 and the ragged-attention step declaration.
 """
 

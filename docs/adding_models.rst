@@ -1686,7 +1686,7 @@ iteration. The step index is the engine's loop counter
 The ``dit`` node subclasses ``DenoiseLoopSubmodule`` (``denoise_loop.py``), which owns
 the engine contract — seeded initial noise, per-request schedules, equal-key request
 batching (``can_batch``), stacked ``forward_batched``, ``check_stop`` at the request's own
-step count, the ragged-attention ``declare_step`` and one CUDA-graph bucket per
+step count, the ragged-attention ``declare_step`` and one accelerator graph bucket per
 ``bucket_key`` with the Euler update inside the graph — and asks the model for:
 
 .. code-block:: python
@@ -1703,7 +1703,7 @@ step count, the ragged-attention ``declare_step`` and one CUDA-graph bucket per
         def attention_segments(self, key): return (("main", self.num_tokens(key)),)
 
 ``bucket_key`` is whatever has to match for two rows to share a forward, and it is also
-the CUDA-graph bucket key — shape, but equally a knob like whether CFG is on.
+the accelerator graph bucket key — shape, but equally a knob like whether CFG is on.
 
 A multi-step scheduler that carries solver state between iterations (wan22's UniPC, with
 ``unipc_model_outputs`` and ``unipc_last_sample``) names it in ``SOLVER_STATE``; those

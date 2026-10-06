@@ -489,7 +489,7 @@ def test_the_ring_only_moves_on_the_committing_pass():
 
 def test_generate_frame_clones_the_denoised_latent():
     """``x0 = self._denoise_pass(...).clone()`` -- the ``.clone()`` is
-    load-bearing. Both passes run inside one CUDA-graph capture, so the denoise
+    load-bearing. Both passes run inside one accelerator graph capture, so the denoise
     pass's output buffer is a block in the graph's private pool that nothing
     downstream holds: the cache pass's first allocation can land on it and
     stomp the latent, with the address baked into the graph. The copy must land

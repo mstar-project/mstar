@@ -962,7 +962,7 @@ class CodecSubmodule(ARNodeSubmodule):
     Windows follow the model's ``ScheduledLeftContextChunkPolicy``: a ramp of
     small chunks, then ``chunk_frames`` new frames behind ``left_context_frames``
     of context (a voice clone's reference tail is the first window's context).
-    Each distinct window size is a CUDA-graph bucket; a shorter window is
+    Each distinct window size is an accelerator graph bucket; a shorter window is
     zero-padded up to the next bucket and trimmed after.
 
     The decoder's transformer needs the whole window, but the conv stack after

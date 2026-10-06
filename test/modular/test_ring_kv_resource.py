@@ -19,7 +19,7 @@ failures corrupt video.
 CPU-only and allocation-free at test scale: the geometry is 3 layers of 4 frames
 at 128 tokens, not 24 x 17 x 512. The one GPU test is the capture test, which
 cannot be anything else — the property it pins (``session_idx`` is *read* at
-replay, not baked at capture) only exists inside a CUDA graph.
+replay, not baked at capture) only exists inside an accelerator graph.
 """
 
 from __future__ import annotations
@@ -301,7 +301,7 @@ def test_paged_overrides_still_work_on_a_paged_config():
 
 
 def test_two_capture_configs_can_each_open_and_claim():
-    """CUDA-graph capture, verbatim: `DummyRowPool.ensure` keys its rid pool by
+    """Accelerator graph capture, verbatim: `DummyRowPool.ensure` keys its rid pool by
     ``f"{config_idx}_slot{slot}"``, so each capture config opens its own dummy
     rid, and none is ever `remove_request`-ed. Waypoint declares two configs
     (prime + rollout).
@@ -1033,7 +1033,7 @@ def test_get_state_covers_one_world_and_is_cloned_not_aliased():
 
 def test_load_state_copies_into_one_span_of_the_fixed_allocation():
     """A `load_state` that assigned a fresh tensor would detach every captured
-    CUDA graph from the pointer it baked, and nothing would raise. Writing into
+    accelerator graph from the pointer it baked, and nothing would raise. Writing into
     a *span* rather than the whole buffer is the second half of that: every
     other resident world has to come through untouched, or restoring one
     session resets its neighbours."""
