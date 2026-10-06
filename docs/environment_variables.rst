@@ -160,7 +160,8 @@ model, so they are named for it.
      - ``0``
      - BAGEL: accelerator graph capture of the ViT block loop, over the node's
        ragged attention resource (see :doc:`adding_models`). Requires the
-       deployment option ``model_kwargs.accelerator_graph`` to be true.
+       deployment option ``model_kwargs.accelerator_graph`` to be true;
+       BAGEL defaults this option to false (see :doc:`models`).
        Off by default: capture costs one graph per (batch size, token bucket)
        and the eager flash-attn path is already fast. The win is removing
        per-layer launch overhead on small images.

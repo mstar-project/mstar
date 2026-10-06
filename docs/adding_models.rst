@@ -574,10 +574,14 @@ A layer binds the key as it binds any other resource, then attends through the r
 The step is an ordinary ``AttentionStep``, and its ``segments`` are the entire layout.
 There is no cache to read the layout off, so a label that carries no segment in the
 declaration cannot be attended: the forward raises, rather than silently reusing the
-previous step's plan. Because the tower is normally captured as a piecewise region, that
+previous step's plan. When the tower is captured as a piecewise region, that
 declaration lives in the region's ``declare_step``, and names no ``KVStep``. See
 ``mstar/model/bagel/submodules.py``, region ``"vit_block_loop"``, and `Piecewise accelerator
 graphs (capturing an inner loop)`_.
+
+BAGEL disables graph capture by default. The optional ViT region requires both
+``model_kwargs.accelerator_graph: true`` and ``MSTAR_VIT_ACCELERATOR_GRAPH=1``.
+See :doc:`models` and :doc:`environment_variables`.
 
 .. note::
 
