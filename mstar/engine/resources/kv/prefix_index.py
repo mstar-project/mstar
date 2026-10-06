@@ -7,6 +7,9 @@ lookup. A hit re-stamps a page without pushing it again, so a leaf keeps one hea
 entry however often it is read, and an entry that surfaces under an older stamp
 is pushed back under the page's own.
 
+The pages eviction could reach are kept as the arena reports owners added and
+dropped (see `evictable`), so asking for them is not a walk over every page indexed.
+
 Every caller holds the manager's lock, so none of this takes one of its own.
 """
 
@@ -29,8 +32,14 @@ class PrefixIndex:
         self._stamp: list[int] = [0] * num_pages
         self._leaves: list[tuple[int, int]] = []
         self._clock = 0
-        self._evictable: frozenset[int] = frozenset()
-        self._evictable_at: int | None = None
+        # a page has an owner besides the index, as of the arena's last word
+        self._shared: list[bool] = [False] * num_pages
+        # how many of a page's children have a shared page at or below them
+        self._busy: list[int] = [0] * num_pages
+        # the pages eviction could reach, and a frozen copy of them for whoever asks
+        self._evictable: set[int] = set()
+        self._frozen: frozenset[int] | None = frozenset()
+        arena.owner_hook = self._owners_changed
 
     def lookup(self, keys: Sequence[bytes]) -> list[int]:
         """Walk ``keys`` from the root and stop at the first one not indexed."""
@@ -61,7 +70,11 @@ class PrefixIndex:
         self._parent[page] = parent
         self._children[page] = 0
         self._stamp[page] = self._clock
+        self._shared[page] = False
+        self._busy[page] = 0
         self._arena.seal([page])
+        # the arena reports this one: the page is shared (its request still owns it),
+        # which keeps it, and every page above it that is not already kept, out of the set
         self._arena.retain([page])
         if parent is not None:
             self._children[parent] += 1
@@ -89,16 +102,23 @@ class PrefixIndex:
         it is held by someone else: eviction takes leaves only, and that one is
         never a leaf it can drop.
 
-        Kept until a page's owners change, the index's own inserts and removals
-        included: a request waiting at the head of the admission queue asks on
-        every scheduling pass, and the walk is over every page indexed.
+        Kept as the arena reports a page's owners changing, rather than walked
+        for: a request waiting at the head of the admission queue asks on every
+        scheduling pass, and the walk is over every page indexed. With the free
+        list empty every page a request is granted evicts one and every page it
+        fills is inserted, so the owners change between nearly every two asks.
         """
-        if self._evictable_at != self._arena.owner_changes:
-            self._evictable = self._find_evictable()
-            self._evictable_at = self._arena.owner_changes
-        return self._evictable
+        if self._frozen is None:
+            self._frozen = frozenset(self._evictable)
+        return self._frozen
+
+    def evictable_count(self, leasing: Sequence[int] = ()) -> int:
+        """``len(evictable())`` less the ``leasing`` pages in it, without making the set."""
+        pages = self._evictable
+        return len(pages) - len(pages.intersection(leasing))
 
     def _find_evictable(self) -> frozenset[int]:
+        """The set by walking every page indexed: what the one kept has to equal."""
         pinned: set[int] = set()
         for page in self._by_key.values():
             if self._arena.num_owners[page] > 1:
@@ -110,6 +130,50 @@ class PrefixIndex:
             page for page in self._by_key.values()
             if self._arena.num_owners[page] == 1 and page not in pinned
         )
+
+    def _owners_changed(self, pages: list[int]) -> None:
+        """The arena's word that ``pages`` have gained or lost an owner."""
+        owners = self._arena.num_owners
+        for page in pages:
+            if self._key[page] is not None and (owners[page] > 1) != self._shared[page]:
+                self._share(page, owners[page] > 1)
+
+    def _share(self, page: int, shared: bool) -> None:
+        """``page`` has gained or lost an owner besides the index.
+
+        A page with another owner is out of the set, and so is every page above it
+        for as long as any page below it has one: eviction takes leaves only, and the
+        index's own reference is all that is left of a page nobody else holds.
+        ``_busy`` counts, for each page, the children with a shared page at or below
+        them, so one above is let back in when the last of them is. That count moves
+        only when this page is the first or the last shared one in its subtree, and
+        the walk up stops at the first page that was kept out, or stays out, for some
+        other reason.
+        """
+        busy = self._busy
+        was = self._shared[page] or busy[page] > 0
+        self._shared[page] = shared
+        while True:
+            held = self._shared[page] or busy[page] > 0
+            self._classify(page)
+            if held == was:
+                return
+            page = self._parent[page]
+            if page is None:
+                return
+            was = self._shared[page] or busy[page] > 0
+            busy[page] += 1 if held else -1
+
+    def _classify(self, page: int) -> None:
+        """Put ``page`` in the set, or take it out, by whether it or a page below it is shared."""
+        pages = self._evictable
+        if self._shared[page] or self._busy[page] > 0:
+            if page in pages:
+                pages.remove(page)
+                self._frozen = None
+        elif page not in pages:
+            pages.add(page)
+            self._frozen = None
 
     def pages(self) -> list[int]:
         """Every page the index is holding a reference to."""
@@ -150,6 +214,11 @@ class PrefixIndex:
         return None
 
     def _remove(self, page: int) -> None:
+        # a leaf, and only the index holds it: nothing above it was kept out by it
+        if self._shared[page]:
+            self._share(page, False)
+        self._evictable.discard(page)
+        self._frozen = None
         del self._by_key[self._key[page]]
         self._key[page] = None
         parent = self._parent[page]

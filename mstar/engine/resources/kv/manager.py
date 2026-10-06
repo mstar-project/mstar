@@ -2,6 +2,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from itertools import islice
@@ -81,9 +82,11 @@ class PageArena:
     allocator: PageAllocator
     num_owners: list[int] = field(init=False, repr=False)
     sealed: list[bool] = field(init=False, repr=False)
-    # bumped as owners are added or dropped, for `PrefixIndex.evictable` to keep its answer by;
-    # `acquire` hands out free pages, which the index never holds, so it does not count
+    # bumped as owners are added or dropped, for what the manager keeps about the pool to be
+    # kept by; `acquire` hands out free pages, which the index never holds, so it does not count
     owner_changes: int = field(default=0, init=False, repr=False)
+    # told which pages gained or lost an owner, as they do: the index keeps its evictable pages by it
+    owner_hook: Callable[[list[int]], None] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.num_owners = [0] * self.allocator.max_num_pages
@@ -100,6 +103,8 @@ class PageArena:
         for page in pages:
             self.num_owners[page] += 1
         self.owner_changes += 1
+        if self.owner_hook is not None:
+            self.owner_hook(pages)
 
     def seal(self, pages: list[int]) -> None:
         for page in pages:
@@ -117,6 +122,8 @@ class PageArena:
                 self.sealed[page] = False
                 freed.append(page)
         self.owner_changes += 1
+        if self.owner_hook is not None:
+            self.owner_hook(pages)
         self.allocator.free(freed)
 
     def copy_pages(self, src: list[int], dst: list[int]) -> None:
@@ -2309,8 +2316,12 @@ class KVManager(AttentionResource):
     def _supply(self, leasing: list[int] = ()) -> int:
         """Pages an allocation can still get: the free ones, and the cached ones
         eviction reaches, less any about to be leased."""
-        evictable = self._index.evictable() if self._index is not None else frozenset()
-        return self._arena.num_free + len(evictable) - len(evictable.intersection(leasing))
+        if _DEBUG_ASSERTS and self._index is not None:
+            assert self._index.evictable() == self._index._find_evictable(), (
+                f"KV {self.name}: the evictable pages kept by the index are not the ones walking it finds"
+            )
+        cached = self._index.evictable_count(leasing) if self._index is not None else 0
+        return self._arena.num_free + cached
 
     def _outstanding(self) -> int:
         """Pages admitted requests may still take.
