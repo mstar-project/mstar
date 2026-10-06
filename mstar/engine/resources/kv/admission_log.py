@@ -9,7 +9,11 @@ Events: ``reserve`` (a request was admitted), ``wait`` (it could not be: logged
 when the reason changes, not every time it asks again), ``refuse`` (it can
 never fit), ``grant_deferred`` (a page grant was held back as unsafe),
 ``release`` (an admitted request was removed; ``reserved_s`` is how long it
-held its reservation).
+held its reservation), ``kv_release`` (a finished request gave its pages and its
+reservation back before it was removed, when the conductor sends RELEASE_KV:
+``held`` pages given back, of which ``freed`` went to the free list and the rest
+stay cached by the index; ``claim`` and ``reserved_s`` as for ``release``, which
+is then not logged for that request).
 """
 
 from __future__ import annotations

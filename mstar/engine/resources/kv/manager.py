@@ -571,6 +571,9 @@ class KVManager(AttentionResource):
         self._cheap_refusals = True
         # CUDA-graph padding rows, which `_capacity` has to count the pages of
         self._padding: set[int] = set()
+        # requests that gave their pages back at completion (`release_kv`), until `remove_request`:
+        # none of them is admitted, leased for or granted a page again
+        self._released: set[str] = set()
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
@@ -670,6 +673,8 @@ class KVManager(AttentionResource):
             return len(stream.lease) * self.config.page_size
 
     def _lease(self, rid: str, stream: CacheStream, rooted: list[bytes]) -> None:
+        if rid in self._released:
+            return
         # one key short, so a fully cached prompt still leaves a token to run
         matched = self._index.lookup(rooted)[:len(rooted) - 1]
         if not matched:
@@ -933,6 +938,8 @@ class KVManager(AttentionResource):
         graph_walk: str,
         published: PublishedKVInfo | None
     ) -> AdmitOutcome:
+        if rid in self._released:
+            return AdmitOutcome(ok=False, ready=False, reason=self._released_error(rid))
         # one pool decides for each request, and the rest follow it
         if self._decides:
             gated = self._gate(rid, node_name, graph_walk)
@@ -1070,6 +1077,13 @@ class KVManager(AttentionResource):
         # one critical section so the read-of-stored_len then alloc is atomic
         # against a concurrent reset/remove/commit on another thread
         with self._lock:
+            if self._released:
+                # a finished request asks for pages it gave back; refused before anything moves
+                for segment in step.segments:
+                    if segment.request_id in self._released:
+                        return AdmitOutcome(
+                            ok=False, reason=self._released_error(segment.request_id),
+                        )
             if self._peak and self._world_size > 1:
                 self._seen.update(ctx.request_ids)
             # before anything moves, so a refusal leaves nothing to unwind, and
@@ -1819,7 +1833,8 @@ class KVManager(AttentionResource):
             # request and build its descriptor in this one critical section.
             streams = self._streams.get(request_id)
             overrides = self._overrides.get(request_id)
-            if streams is None or overrides is None:
+            # a released request has no pages to name
+            if streams is None or overrides is None or request_id in self._released:
                 return None
             labels = overrides.get_publish_labels(
                 node_name, graph_walk, list(streams), final=final,
@@ -1908,10 +1923,7 @@ class KVManager(AttentionResource):
         with self._lock:
             if self._alog is not None and rid in self._reserved:
                 self._log_release(rid)
-            if rid in self._streams:
-                for stream in self._streams[rid].values():
-                    self._release_lease(stream)
-                    self._arena.release(stream.page_indices)
+            self._release_streams(rid)
             if self._cpu_pool is not None:
                 self._cpu_pool.remove_request(rid)
             self._streams.pop(rid, None)
@@ -1922,6 +1934,63 @@ class KVManager(AttentionResource):
             self._rooted.pop(rid, None)
             self._opened.pop(rid, None)
             self._padding.discard(rid)
+            self._released.discard(rid)
+            self._forget_admission(rid)
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
+
+    def _release_streams(self, rid: str) -> int:
+        """Give back what every stream of ``rid`` holds, and the leases `admit`
+        never converted. Returns how many page references that was."""
+        held = 0
+        for stream in self._streams.get(rid, {}).values():
+            self._release_lease(stream)
+            self._arena.release(stream.page_indices)
+            held += len(stream.page_indices)
+        return held
+
+    def release_kv(self, rid: str) -> None:
+        """Give back the pages and the room of a request that is done, ahead of
+        `remove_request`, which waits for the client to read its outputs.
+
+        What the pool keeps for the request after this is what `remove_request`
+        still has to clear: its streams (now empty), overrides, transfer
+        snapshots and host-side state. That finds no page to free and no
+        reservation to log. Pages the prefix index co-owns stay indexed, and
+        are evictable once nothing else holds them. Every later admit, lease
+        and grant for the request is refused, so a late step cannot take pages
+        for a request that is not going to run.
+        """
+        with self._lock:
+            streams = self._streams.get(rid)
+            if streams is None or rid in self._released:
+                return
+            # marked first, so nothing starts a read while the ones begun are waited on
+            self._released.add(rid)
+            reading = [s.read_future for s in streams.values() if s.read_future is not None]
+        # drain in-flight reads outside the lock; see reset_request
+        if reading:
+            wait(reading)
+        with self._lock:
+            streams = self._streams.get(rid)
+            if streams is None:
+                return
+            held = sum(len(stream.page_indices) for stream in streams.values())
+            free = self._arena.num_free
+            self._release_streams(rid)
+            freed = self._arena.num_free - free
+            for stream in streams.values():
+                # no page, and no length for the next reader of the stream to trust
+                stream.reset(freed=True)
+                stream.read_future = None
+                stream.read_pending = False
+            if self._cpu_pool is not None:
+                self._cpu_pool.remove_request(rid)
+            reserved = self._reserved.pop(rid, None)
+            self._wait_drop(rid)
+            self._rooted.pop(rid, None)
+            if self._alog is not None:
+                self._log_kv_release(rid, held, freed, reserved)
             self._forget_admission(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
@@ -1987,6 +2056,17 @@ class KVManager(AttentionResource):
             )
             assert not crowded, (
                 f"pages still being written into, but not owned alone: {crowded}"
+            )
+
+            again = sorted(
+                rid for rid in self._released
+                if rid in self._reserved or rid in self._waiting or any(
+                    stream.page_indices or stream.lease
+                    for stream in self._streams.get(rid, {}).values()
+                )
+            )
+            assert not again, (
+                f"requests that gave their pages back hold pages or room again: {again}"
             )
 
             # a guessed reservation, or a request nothing counts, may take room the
@@ -2139,7 +2219,10 @@ class KVManager(AttentionResource):
         keys: a bound as loose as ``max_seq_len`` would hold back or refuse
         requests that fit, so the rest run as they always have.
         """
-        if overrides is None or overrides.max_tokens is None or rid in self._reserved:
+        if (
+            overrides is None or overrides.max_tokens is None
+            or rid in self._reserved or rid in self._released
+        ):
             return False
         slots = overrides.prompt_slots or {}
         keys = overrides.prefix_keys or {}
@@ -2835,6 +2918,12 @@ class KVManager(AttentionResource):
             label=label, request_id=rid,
         )
 
+    def _released_error(self, rid: str) -> AdmitRuntimeError:
+        return AdmitRuntimeError(
+            f"KV {self.name}: request {rid} gave its pages back at completion "
+            "and is not admitted or given pages again"
+        )
+
     def _forget_admission(self, rid: str) -> None:
         self._reserved_epoch += 1
         self._plan_drop(rid)
@@ -2854,6 +2943,18 @@ class KVManager(AttentionResource):
     def _log_release(self, rid: str) -> None:
         self._log(
             "release", rid, held=self._held_fresh(rid), claim=self._reserved[rid].pages,
+            reserved_s=time.monotonic() - self._reserved_at.get(rid, time.monotonic()),
+        )
+
+    def _log_kv_release(
+        self, rid: str, held: int, freed: int, reserved: Reservation | None,
+    ) -> None:
+        """``held`` pages given back, of which ``freed`` went to the free list and
+        the rest stay cached by the index. Logged once the room is taken back, so
+        ``supply`` is what it is left with."""
+        self._log(
+            "kv_release", rid, held=held, freed=freed,
+            claim=None if reserved is None else reserved.pages,
             reserved_s=time.monotonic() - self._reserved_at.get(rid, time.monotonic()),
         )
 
@@ -2975,6 +3076,8 @@ class KVManager(AttentionResource):
         self, request_id: str, label: str, seq_len: int
     ) -> AllocResult:
         with self._lock:
+            if request_id in self._released:
+                return AllocResult(success=False, error=self._released_error(request_id))
             self._ensure_label(request_id, label)
             stream = self._streams[request_id][label]
             if stream.offloaded:
