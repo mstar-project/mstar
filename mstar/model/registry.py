@@ -77,6 +77,10 @@ HF_MODELS: dict[str, dict] = {
     # trained for chunked streaming, served by the same class.
     "qwen3_asr": {"model_path_hf": "Qwen/Qwen3-ASR-1.7B"},
     "qwen3_asr_realtime": {"model_path_hf": "Qwen/Qwen3-ASR-0.6B"},
+    # Qwen3-TTS 12 Hz family: one class, the variant is read from config.json.
+    # CustomVoice = built-in speakers (1.7B also takes style instructions),
+    # VoiceDesign = voice described by an instruction, Base = voice cloned
+    # from reference audio.
     "qwen3_tts": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"},
     "qwen3_tts_1p7b": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"},
     "qwen3_tts_voicedesign": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"},
@@ -94,6 +98,11 @@ HF_MODELS: dict[str, dict] = {
     # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
     # only; the A14B MoE variants are a separate follow-up.
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
+    # Waypoint owns a variant -> Hub repository mapping. None is intentional:
+    # it lets WaypointModel distinguish the registry default from an explicit
+    # local path or Hub ID, then select the 720P or 360P repository named by the
+    # YAML `variant`. TAEHV is resolved independently from config.ae_uri.
+    "waypoint": {"model_path_hf": None},
     # Whisper works for any size (dims and token ids come from the
     # checkpoint's configs). ``whisper_large`` pins large-v3, the standard
     # ASR-benchmark checkpoint. ``whisper_large_v3_turbo`` is the 4-decoder-
