@@ -61,6 +61,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_file
+from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer
 from mstar.model.whisper.config import (
@@ -244,15 +245,32 @@ class WhisperModel(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args
-        model_kwargs = model_kwargs or {}
+        kw = checked_request_kwargs(model_kwargs or {})
         return {
             SAMPLER: SamplingReqConfig(
                 # ASR default is greedy (temperature 0 -> argmax).
-                temperature=model_kwargs.get("temperature", 0.0),
-                top_p=model_kwargs.get("top_p", 1.0),
-                ignore_eos=model_kwargs.get("ignore_eos", False),
+                temperature=kw.get("temperature", 0.0),
+                top_p=kw.get("top_p", 1.0),
+                ignore_eos=kw.get("ignore_eos", False),
             )
         }
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """The caches are sized for ``MAX_CONCURRENT_REQUESTS`` decoders at
+        once (12 cross-attention pages and 4 self-attention pages each), so a
+        deployment has to say how many requests it admits. Past the cache the
+        extra requests stall instead of queueing."""
+        cap = config.get("max_concurrent_requests")
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+            raise ValueError(
+                f"{config_path}: set max_concurrent_requests (a positive int, at most "
+                f"{self.MAX_CONCURRENT_REQUESTS} for the default caches)"
+            )
+        if cap > self.MAX_CONCURRENT_REQUESTS:
+            raise ValueError(
+                f"{config_path}: max_concurrent_requests={cap} exceeds the "
+                f"{self.MAX_CONCURRENT_REQUESTS} requests the decoder caches hold"
+            )
 
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
@@ -264,7 +282,7 @@ class WhisperModel(Model):
         # A longer prompt (``<|startofprev|>`` context) is accounted per
         # request in the decoder's ``check_stop``.
         limit = self.config.max_target_positions - 4
-        return min(model_kwargs.get("max_output_tokens", limit), limit)
+        return min(checked_request_kwargs(model_kwargs).get("max_output_tokens", limit), limit)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         def emit_first_token() -> list[GraphEdge]:
@@ -512,10 +530,15 @@ class WhisperModel(Model):
         # bottleneck: torch's intra-op pool spun a whole core per thread.)
         window = waveform[: self.config.n_samples].contiguous()
 
-        language = kwargs.get("language")
-        task = kwargs.get("task", "transcribe")
-        timestamps = bool(kwargs.get("timestamps", False))
-        prev_tokens = self.prompt_tokens(kwargs.get("initial_prompt"))
+        kw = checked_request_kwargs(kwargs)
+        language = kw.get("language")
+        if language is not None:
+            self.config.language_token(language)  # raises for a code the model lacks
+        task = kw.get("task", "transcribe")
+        if task not in self.config.task_to_id:
+            raise ValueError(f"Whisper task must be one of {sorted(self.config.task_to_id)}, got {task!r}")
+        timestamps = bool(kw.get("timestamps", False))
+        prev_tokens = self.prompt_tokens(kw.get("initial_prompt"))
         prompt_ids = self.config.decoder_prompt_ids(
             language=language, task=task, timestamps=timestamps, prev_tokens=prev_tokens,
         )
