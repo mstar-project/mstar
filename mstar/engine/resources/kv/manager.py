@@ -2,12 +2,13 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any
 
+import numpy as np
 import torch
 
 from mstar.distributed.communication import JointGroups
@@ -45,6 +46,7 @@ from mstar.engine.resources.kv.plan import (
     build_paged_indptrs,
     group_by_plan_label,
 )
+from mstar.engine.resources.kv.plan_table import ABSENT, PlanTable, plan_entries
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
@@ -64,6 +66,10 @@ logger = logging.getLogger(__name__)
 # Off by default: `assert_pages_conserved` walks every stream of every live
 # request after each admit, commit, reset and remove.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
+
+# On by default: a plan is rebuilt from what each admitted request's streams changed since
+# the last one (`PlanTable`) rather than from every stream. "0" reads them all, as before.
+_PLAN_CACHE = os.environ.get("MSTAR_KV_PLAN_CACHE", "1") != "0"
 
 # admitted, but its reservation does not fit yet: the scheduler asks again
 _WAIT = AdmitOutcome(ok=True, ready=False)
@@ -286,12 +292,35 @@ class PlanState:
     delays a release in the plan.
     """
     key: tuple
-    entries: list[PlanEntry]
-    held: list[int]
-    need: list[int]
+    # None until asked for (`all_entries`) where the plan is kept as arrays
+    entries: list[PlanEntry] | None
+    held: Sequence[int]
+    need: Sequence[int]
     held_total: int
     # only built for the peak fit
     planner: PeakPlanner | None = None
+    # where the plan is kept as arrays (`PlanTable`): what the entries are made of, as of the
+    # build; ``held`` and ``need`` again with a slot more, for a candidate; and the sum of ``need``
+    rows: tuple[np.ndarray, ...] | None = None
+    spare: tuple[np.ndarray, np.ndarray] | None = None
+    need_total: int | None = None
+
+    def all_entries(self) -> list[PlanEntry]:
+        if self.entries is None:
+            self.entries = plan_entries(*self.rows)
+        return self.entries
+
+    def owed(self) -> int:
+        """Pages the admitted requests may still take."""
+        return sum(self.need) if self.need_total is None else self.need_total
+
+    def with_candidate(self, cand: PlanEntry) -> tuple[Sequence[int], Sequence[int]]:
+        """``held`` and ``need`` with ``cand`` after the admitted requests."""
+        if self.spare is None:
+            return [*self.held, cand.held], [*self.need, cand.need]
+        held, need = self.spare
+        held[-1], need[-1] = cand.held, cand.need
+        return held, need
 
 
 @dataclass
@@ -499,6 +528,11 @@ class KVManager(AttentionResource):
         self._alog = open_log(name)
         # decisions that are not the summed test in arrival order, or that are logged
         self._planned = self._peak or self._backfill or self._alog is not None
+        # whether a plan is rebuilt from what changed in the requests' streams (see `_plan_state`)
+        self._plan_cache = _PLAN_CACHE and self._planned
+        self._plan_table = PlanTable()
+        # the admitted requests whose row in it is out of date: touched since it was set
+        self._plan_dirty: set[str] = set()
         # bumped as what is reserved changes; with the arena's counters it says
         # whether a plan, or a refusal, still describes the pool
         self._reserved_epoch = 0
@@ -633,6 +667,7 @@ class KVManager(AttentionResource):
             return
         self._arena.retain(matched)
         stream.lease = matched
+        self._plan_touch(rid)
         self._lent(rid, len(matched))
 
     def _lent(self, rid: str, pages: int) -> None:
@@ -642,6 +677,7 @@ class KVManager(AttentionResource):
         if reserved is not None:
             reserved.pages -= pages
             self._reserved_epoch += 1
+            self._plan_touch(rid)
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
@@ -661,6 +697,7 @@ class KVManager(AttentionResource):
                 self._lent(rid, keep - len(stream.lease))
                 self._arena.release(stream.lease[keep:])
                 stream.lease = stream.lease[:keep] or None
+                self._plan_touch(rid)
 
     def _index_filled_pages(
         self, segment: Segment, stream: CacheStream, ctx: StepContext,
@@ -954,6 +991,7 @@ class KVManager(AttentionResource):
                         self._arena.release(stream.page_indices)
                     stream.reset(freed=drop)
                     stream.forget_chain()
+                    self._plan_touch(rid)
                 if not own and remote_reset_generation is not None:
                     stream.remote_reset_generation = remote_reset_generation
                 if not own and stream.chain is not None:
@@ -962,6 +1000,7 @@ class KVManager(AttentionResource):
                 new_len = seq_info.seq_len
                 hits = stream.hits
                 self._take_local_match(stream, new_len, rooted.get(label))
+                self._plan_touch(rid)
                 self._lent(rid, stream.hits - hits)
                 old_len = stream.stored_len
                 if new_len <= old_len:
@@ -1043,6 +1082,7 @@ class KVManager(AttentionResource):
                     # took, so the step writes the stream from 0
                     self._lent(segment.request_id, -len(stream.lease))
                     self._release_lease(stream)
+                    self._plan_touch(segment.request_id)
                 if (
                     stream.lease is not None
                     and not stream.gate_lease
@@ -1061,6 +1101,7 @@ class KVManager(AttentionResource):
                     stream.chain.cursor = len(stream.lease)
                     stream.lease = None
                     stream.converted = True
+                    self._plan_touch(segment.request_id)
                 self._report_admission(segment, stream)
             if ctx.is_preplan:
                 # a preplan that was promoted or abandoned already cleared
@@ -1333,6 +1374,7 @@ class KVManager(AttentionResource):
                 stream = self._streams.get(rid, {}).pop(label, None)
                 if stream is not None:
                     self._arena.release(stream.page_indices)
+                    self._plan_touch(rid)
             self._preplan_new_labels = []
             for rid, label in self._preplan_marked:
                 stream = self._streams.get(rid, {}).get(label)
@@ -1390,6 +1432,7 @@ class KVManager(AttentionResource):
                     # pool's copies included)
                     if policy is not None:
                         self._apply_retention(stream, policy)
+                        self._plan_touch(segment.request_id)
             # post-forks copy what this step just wrote, so they land after the
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
@@ -1518,7 +1561,9 @@ class KVManager(AttentionResource):
                     f"release_oldest on request {request_id!r} label {label!r} while its "
                     "pages are offloaded or in transfer"
                 )
-            return self._release_oldest_locked(stream, num_tokens)
+            released = self._release_oldest_locked(stream, num_tokens)
+            self._plan_touch(request_id)
+            return released
 
     # Eviction
 
@@ -1653,6 +1698,7 @@ class KVManager(AttentionResource):
                 stream.hits = 0
                 # Offload changes residency, not logical stream contents.
                 stream.reset(content_reset=False)
+                self._plan_touch(rid)
             return freed, {claim.label for claim in moved}
 
     def _abandon_claims(self, rid: str, labels: list[str]) -> None:
@@ -1717,6 +1763,7 @@ class KVManager(AttentionResource):
                 stream.released = state.released
                 stream.protected_prefix = state.protected_prefix
                 stream.offloaded = False
+                self._plan_touch(rid)
         # sync outside the lock: orders the reload H2D copies before attention
         # reads them, but the pages are already assigned so it touches no
         # shared state
@@ -1836,6 +1883,7 @@ class KVManager(AttentionResource):
                 stream.reset(freed=drop)
                 # a stale cursor or generated key would misfile what the rerun writes
                 stream.forget_chain()
+                self._plan_touch(rid)
             for label, stream in self._streams.get(rid, {}).items():
                 self._seed_keys(rid, label, stream)
             if _DEBUG_ASSERTS:
@@ -1996,6 +2044,7 @@ class KVManager(AttentionResource):
     def _ensure_label(self, rid: str, label: str) -> CacheStream:
             if label not in self._streams[rid]:
                 self._streams[rid][label] = CacheStream()
+                self._plan_touch(rid)
                 self._seed_keys(rid, label, self._streams[rid][label])
             return self._streams[rid][label]
 
@@ -2161,10 +2210,12 @@ class KVManager(AttentionResource):
             # a guess proves nothing unservable: at worst it waits for an empty pool
             need = capacity - held
         if self._planned:
-            if head != rid and self._ruled_out(rid, need, hit):
+            # the peak test sizes the request in `_ruled_out` and again in `_admissible`: once will do
+            cand = self._plan_entry(rid, need, lent=len(hit)) if self._plan_cache and self._peak else None
+            if head != rid and self._ruled_out(rid, need, hit, cand):
                 self._refused[rid] = self._refusal_key(head)
                 return _WAIT
-            if not self._admissible(rid, head, need, hit):
+            if not self._admissible(rid, head, need, hit, cand):
                 return _WAIT
         elif self._outstanding() + need > self._supply(leasing=hit):
             return _WAIT
@@ -2174,6 +2225,7 @@ class KVManager(AttentionResource):
         reservation.pages = need
         self._reserved[rid] = reservation
         self._reserved_epoch += 1
+        self._plan_add(rid)
         self._wait_drop(rid)
         self._rooted.pop(rid, None)
         if self._planned:
@@ -2250,6 +2302,7 @@ class KVManager(AttentionResource):
                 continue
             self._reserved[rid] = self._reservation(rid)
             self._reserved_epoch += 1
+            self._plan_add(rid)
             self._wait_drop(rid)
             self._rooted.pop(rid, None)
             if _DEBUG_ASSERTS and self._leads:
@@ -2380,7 +2433,9 @@ class KVManager(AttentionResource):
             )
         return kept[1]
 
-    def _ruled_out(self, rid: str, need: int, hit: list[int]) -> bool:
+    def _ruled_out(
+        self, rid: str, need: int, hit: list[int], cand: PlanEntry | None = None,
+    ) -> bool:
         """Whether ``rid``, behind the head, surely cannot be admitted for ``need`` pages.
 
         Said from what is kept, without the plan, so a long queue of requests
@@ -2405,7 +2460,8 @@ class KVManager(AttentionResource):
         if not self._peak:
             return need > self._room()
         plan = self._plan_state()
-        cand = self._plan_entry(rid, need, lent=len(hit))
+        if cand is None:
+            cand = self._plan_entry(rid, need, lent=len(hit))
         return plan.planner.exceeds(cand, self._supply(leasing=hit) + plan.held_total)
 
     def _refusal_key(self, head: str | None) -> tuple:
@@ -2469,6 +2525,70 @@ class KVManager(AttentionResource):
             growth=growth, rounds=rounds,
         )
 
+    def _plan_touch(self, rid: str) -> None:
+        """Say that what ``rid``'s plan row is made of may have moved: its pages (held,
+        leased or lent), its reservation, or the streams it has. Called wherever those are
+        written; the stored length is not one of them, as it is read each time (`PlanTable`).
+        """
+        if self._plan_cache:
+            self._plan_dirty.add(rid)
+
+    def _plan_add(self, rid: str) -> None:
+        """``rid`` has reserved: a row for it, after the others, as `_reserved` has it."""
+        if self._plan_cache:
+            if rid not in self._plan_table:
+                self._plan_table.append(rid)
+            self._plan_dirty.add(rid)
+
+    def _plan_drop(self, rid: str) -> None:
+        """``rid`` is gone, or never reserved: no row."""
+        if self._plan_cache:
+            self._plan_dirty.discard(rid)
+            if rid in self._plan_table:
+                self._plan_table.drop(rid)
+
+    def _plan_row(self, rid: str) -> tuple[int, int, int, list[tuple[object, int, int]]]:
+        """What `_plan_entry` reads of ``rid`` that only moves where `_plan_touch` is called:
+        ``held``, ``claim``, ``now`` and the streams of its decode labels with their prompt
+        and decode tokens."""
+        streams = self._streams.get(rid, {})
+        page_size = self.config.page_size
+        now = 0
+        decoding = []
+        for label, prompt, decode in self._life(rid):
+            stream = streams.get(label)
+            have = 0
+            if stream is not None:
+                have = len(stream.page_indices) + len(stream.lease or ())
+            now += max(0, -(-prompt // page_size) - have)
+            if decode:
+                decoding.append((ABSENT if stream is None else stream, prompt, decode))
+        return self._held_fresh(rid), self._reserved[rid].pages, now, decoding
+
+    def _plan_fields(self) -> tuple[np.ndarray, ...]:
+        """The fields of every admitted request's `PlanEntry`, read again for those touched."""
+        table = self._plan_table
+        for rid in self._plan_dirty:
+            if rid in table:
+                table.set(rid, *self._plan_row(rid))
+        self._plan_dirty.clear()
+        if _DEBUG_ASSERTS:
+            self._assert_plan_table(table)
+        return table.fields()
+
+    def _assert_plan_table(self, table: PlanTable) -> None:
+        """Each row of the table is the entry counted afresh, for the same requests in the same order."""
+        assert table.rids == list(self._reserved), (
+            f"KV {self.name}: the plan has rows for {table.rids}, and {list(self._reserved)} are reserved"
+        )
+        kept = plan_entries(*table.fields())
+        for rid, entry in zip(table.rids, kept, strict=True):
+            fresh = self._plan_entry(rid, self._reserved[rid].pages)
+            assert entry == fresh, (
+                f"KV {self.name}: the plan row kept for {rid}, {entry}, is not what counting "
+                f"it afresh gives, {fresh}: something that moves it did not say so"
+            )
+
     def _plan_state(self) -> PlanState:
         """The admitted requests as a plan, kept until the reserved set, the free
         pages or a page's owners change."""
@@ -2476,6 +2596,8 @@ class KVManager(AttentionResource):
         state = self._plan
         if state is not None and state.key == key:
             return state
+        if self._plan_cache:
+            return self._plan_from_table(key)
         entries = [self._plan_entry(rid, res.pages) for rid, res in self._reserved.items()]
         state = PlanState(
             key=key, entries=entries, held=[e.held for e in entries],
@@ -2485,6 +2607,31 @@ class KVManager(AttentionResource):
             state.planner = PeakPlanner(
                 entries, self._supply() + state.held_total, self.config.page_size,
             )
+        self._plan = state
+        return state
+
+    def _plan_from_table(self, key: tuple) -> PlanState:
+        """`_plan_state` for a plan kept as arrays: the same plan, from the rows the
+        requests touched since the last build instead of from every request.
+
+        The arrays are the table's own: it changes only as the reserved set does, which
+        moves the key, so they are what this plan was made from for as long as it is kept.
+        """
+        held, claim, now, growth, rounds = self._plan_fields()
+        table = self._plan_table
+        # one slot past the requests, for a candidate (`PlanState.with_candidate`)
+        held_x, need_x = table.with_spare()
+        state = PlanState(
+            key=key, entries=None, held=held, need=need_x[:-1], held_total=table.held_total,
+            need_total=table.need_total, spare=(held_x, need_x),
+        )
+        if self._peak:
+            state.planner = PeakPlanner.from_arrays(
+                held, claim, now, growth, rounds,
+                self._supply() + state.held_total, self.config.page_size,
+            )
+        else:
+            state.rows = (held, claim, now, growth, rounds)
         self._plan = state
         return state
 
@@ -2505,11 +2652,13 @@ class KVManager(AttentionResource):
                 self._plan_entry(head, claim, lent=len(hit)), supply + plan.held_total,
             )
         else:
-            shadow = shadow_sum(plan.entries, supply, claim)
+            shadow = shadow_sum(plan.all_entries(), supply, claim)
         self._shadow = (key, shadow)
         return shadow
 
-    def _admissible(self, rid: str, head: str, need: int, hit: list[int]) -> bool:
+    def _admissible(
+        self, rid: str, head: str, need: int, hit: list[int], cand: PlanEntry | None = None,
+    ) -> bool:
         """Whether ``rid`` may reserve ``need`` pages now.
 
         Fits the pool by the summed test, or by the peak test and a safe state
@@ -2521,19 +2670,18 @@ class KVManager(AttentionResource):
             self._asked_at.setdefault(rid, time.monotonic())
         supply = self._supply(leasing=hit)
         plan = self._plan_state()
-        cand = self._plan_entry(rid, need, lent=len(hit))
+        if cand is None:
+            cand = self._plan_entry(rid, need, lent=len(hit))
         capacity = supply + plan.held_total
         why = None
         if self._peak:
             planned = plan.planner.peak_from(cand)
             if planned > capacity:
                 why = "peak"
-            elif not banker_safe(
-                supply, [*plan.held, cand.held], [*plan.need, cand.need],
-            ):
+            elif not banker_safe(supply, *plan.with_candidate(cand)):
                 why = "unsafe"
         else:
-            planned = plan.held_total + sum(plan.need) + need
+            planned = plan.held_total + plan.owed() + need
             if planned > capacity:
                 why = "sum"
         if why is None and rid != head:
@@ -2594,6 +2742,12 @@ class KVManager(AttentionResource):
         started = time.perf_counter_ns() if self._alog is not None else 0
         shared = self._world_size > 1
         supply = self._supply()
+        reserved = self._reserved.get(rid) if self._plan_cache else None
+        if reserved is not None and max(0, reserved.pages - self._held_fresh(rid), n) <= supply:
+            # the request can finish on what is free, grant and all, and gives all it holds
+            # back; so a state that was safe is safe after it, and one that was not is
+            # not this test's to mend. Either way, no refusal
+            return None
         held, need, at = [], [], 0
         for other, res in self._reserved.items():
             if shared and other != rid and other not in self._seen:
@@ -2627,6 +2781,7 @@ class KVManager(AttentionResource):
 
     def _forget_admission(self, rid: str) -> None:
         self._reserved_epoch += 1
+        self._plan_drop(rid)
         for per_rid in (
             self._refused, self._shape, self._asked_at, self._reserved_at, self._wait_state,
         ):
@@ -2809,6 +2964,7 @@ class KVManager(AttentionResource):
                     )
                 stream.page_indices.extend(new_pages)
                 stream.generation += 1
+                self._plan_touch(request_id)
         return AllocResult()
 
     ### Submodule-level functionality

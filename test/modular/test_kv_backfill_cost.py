@@ -324,8 +324,8 @@ def test_a_cheap_refusal_is_never_of_a_request_the_full_test_admits(monkeypatch,
     checked = []
     ruled_out = kv._ruled_out
 
-    def checking(rid, need, hit):
-        answer = ruled_out(rid, need, hit)
+    def checking(rid, need, hit, *cand):
+        answer = ruled_out(rid, need, hit, *cand)
         if answer:
             kept = {
                 name: dict(getattr(kv, name))

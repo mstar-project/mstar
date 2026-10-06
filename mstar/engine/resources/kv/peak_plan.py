@@ -119,6 +119,45 @@ class PeakPlanner:
         self.held_total = sum(e.held for e in self.entries)
         self._glance: tuple[list[int], list[int], list[int]] | None = None
 
+    @classmethod
+    def from_arrays(
+        cls, held: np.ndarray, claim: np.ndarray, now: np.ndarray,
+        growth: np.ndarray, rounds: np.ndarray, capacity: int, page_size: int,
+    ) -> PeakPlanner:
+        """The planner for the set whose `PlanEntry` fields are these int64 arrays,
+        one slot a request, with every answer the list constructor gives for them.
+
+        For a set kept as arrays, so no entry is made to build it: it has no ``entries``.
+        """
+        self = cls.__new__(cls)
+        self.capacity = capacity
+        self.page_size = page_size
+        cap = np.maximum(claim, held)
+        base = held + now
+        if np.count_nonzero(rounds) == len(rounds):
+            self.frozen = 0
+            self._base, self._cap, self._growth, self._rounds = base, cap, growth, rounds
+        else:
+            live = rounds > 0
+            self.frozen = int(np.minimum(cap, base)[~live].sum())
+            self._base = base[live]
+            self._cap = cap[live]
+            self._growth = growth[live]
+            self._rounds = rounds[live]
+        # `np.unique(np.concatenate(([0], rounds - 1)))`: sorted by Python's, which is quicker for what is a few dozen
+        self.times = np.array(sorted({0, *(self._rounds - 1).tolist()}), dtype=np.int64)
+        # `_usage(times)`, in fewer calls
+        steps = (self.times + (page_size - 1)) // page_size
+        grown = np.multiply.outer(self._growth, steps)
+        grown += self._base[:, None]
+        np.minimum(grown, self._cap[:, None], out=grown)
+        alive = np.greater.outer(self._rounds, self.times)
+        self.usage = self.frozen + grown.sum(axis=0, where=alive)
+        self._later = np.maximum.accumulate(self.usage[::-1])[::-1]
+        self.held_total = int(held.sum())
+        self._glance = None
+        return self
+
     # ── usage ───────────────────────────────────────────────────────────
 
     def _usage(self, ts: np.ndarray) -> np.ndarray:
