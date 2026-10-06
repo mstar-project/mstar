@@ -447,6 +447,7 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """durable state outward publish
 
@@ -463,7 +464,8 @@ class StepRunner:
             per_key: dict[str, PublishedInfo] = {}
             for key, resource in publishers:
                 info = resource.publish_for_step(
-                    rid, node_name=node_name, graph_walk=graph_walk,
+                    rid, node_name=node_name,
+                    graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,
                 )
                 if info is not None:
                     per_key[key] = info
@@ -475,6 +477,7 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """Publish resources configured for the end of a dynamic loop."""
         order = self._sweep(self._node_publish_order, self._publish_order, node_name)
@@ -486,7 +489,8 @@ class StepRunner:
             per_key: dict[str, PublishedInfo] = {}
             for key, resource in publishers:
                 info = resource.publish_after_stop(
-                    rid, node_name=node_name, graph_walk=graph_walk,
+                    rid, node_name=node_name,
+                    graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,
                 )
                 if info is not None:
                     per_key[key] = info

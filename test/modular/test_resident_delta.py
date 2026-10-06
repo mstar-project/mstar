@@ -26,7 +26,7 @@ sys.path.insert(0, ".")
 
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
-from mstar.engine.resources.step import FULL_ADMIT_OK
+from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
 from mstar.utils.ipc_format import (
     OffloadDelta,
     RemoveRequest,
@@ -619,6 +619,9 @@ class _Leader:
 def _node_batch():
     return SimpleNamespace(
         node_name="node", graph_walk="walk", request_ids=("r0",),
+        step_context=StepContext(
+            request_ids=("r0",), graph_walk="walk", slot=0, capture=False,
+        ),
     )
 
 

@@ -492,7 +492,7 @@ def _spec(rt, node, rid):
     return sorted(
         (s.node_name, s.graph_walk, s.is_new_loop_iter, s.loop_name,
          tuple(s.output_signals))
-        for s in rt.speculate_node(node, WALK, rid)
+        for s in (rt.speculate_node(node, [WALK], [rid]) or (None, []))[1]
     )
 
 

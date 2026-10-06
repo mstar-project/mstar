@@ -525,6 +525,34 @@ pub struct GraphRuntime {
         Some(out)
     }
 
+    /// ``speculate_node`` for one walk and its sample rid.
+    fn speculate_walk(
+        &mut self, node_name: &str, graph_walk: &str, sample_rid: u32,
+    ) -> Vec<(String, String, bool, Option<String>, Vec<String>)> {
+        let Some(wg) = self.owner_of(node_name, graph_walk) else {
+            return vec![];
+        };
+        let Some(source) = self.nid(wg, node_name) else { return vec![] };
+        let Some(spec_nodes) = self.spec_targets(wg, source, sample_rid) else {
+            return vec![];
+        };
+        let g = self.graphs[wg as usize].clone();
+        spec_nodes
+            .into_iter()
+            .filter(|sn| {
+                // The DESTINATION opts out of async scheduling. Mirrors the
+                // source-side check the caller already made; without it a
+                // structurally ineligible destination is picked here and then
+                // dropped per rid.
+                g.node(sn.node).async_enabled
+                    && self.async_checker.can_speculate(
+                        g.node(source).name, g.node(sn.node).name,
+                    )
+            })
+            .map(|sn| self.spec_output(&g, graph_walk, &sn))
+            .collect()
+    }
+
     /// The target, plus its output edge names.
     ///
     /// The names ride along because a speculated batch never goes through
@@ -2020,33 +2048,24 @@ impl GraphRuntime {
 
     /// Which nodes could run next, after the current node's outputs land.
     ///
-    /// Filters for async eligibility; the per-rid loop-completion filter lives
-    /// in prep_spec_rids.
+    /// Takes one sample rid per walk in the batch; the first walk with a
+    /// target wins. Filters for async eligibility; the per-rid
+    /// loop-completion filter lives in prep_spec_rids.
     fn speculate_node(
-        &mut self, node_name: &str, graph_walk: &str, sample_rid: u32,
-    ) -> Vec<(String, String, bool, Option<String>, Vec<String>)> {
-        let Some(wg) = self.owner_of(node_name, graph_walk) else {
-            return vec![];
-        };
-        let Some(source) = self.nid(wg, node_name) else { return vec![] };
-        let Some(spec_nodes) = self.spec_targets(wg, source, sample_rid) else {
-            return vec![];
-        };
-        let g = self.graphs[wg as usize].clone();
-        spec_nodes
-            .into_iter()
-            .filter(|sn| {
-                // The DESTINATION opts out of async scheduling. Mirrors the
-                // source-side check the caller already made; without it a
-                // structurally ineligible destination is picked here and then
-                // dropped per rid.
-                g.node(sn.node).async_enabled
-                    && self.async_checker.can_speculate(
-                        g.node(source).name, g.node(sn.node).name,
-                    )
-            })
-            .map(|sn| self.spec_output(&g, graph_walk, &sn))
-            .collect()
+        &mut self, node_name: &str, graph_walks: Vec<String>, sample_rids: Vec<u32>,
+    ) -> PyResult<Option<(String, Vec<(String, String, bool, Option<String>, Vec<String>)>)>> {
+        if graph_walks.len() != sample_rids.len() {
+            return Err(PyValueError::new_err(
+                "speculate_node: graph_walks and sample_rids differ in length",
+            ));
+        }
+        for (walk, rid) in graph_walks.into_iter().zip(sample_rids) {
+            let out = self.speculate_walk(node_name, &walk, rid);
+            if !out.is_empty() {
+                return Ok(Some((walk, out)));
+            }
+        }
+        Ok(None)
     }
 
     /// The loop context of a target chosen elsewhere.

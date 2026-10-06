@@ -458,16 +458,19 @@ class RustGraphRuntime(GraphRuntime):
     # --------- Speculation ----------
 
     def speculate_node(
-        self, node_name: str, graph_walk: str, sample_rid: int,
-    ) -> list[SpeculationOutput]:
-        return [
+        self, node_name: str, graph_walks: list[str], sample_rids: list[int],
+    ) -> tuple[str, list[SpeculationOutput]] | None:
+        found = self._rust.speculate_node(node_name, graph_walks, sample_rids)
+        if found is None:
+            return None
+        walk, targets = found
+        return walk, [
             SpeculationOutput(
                 node_name=n, graph_walk=w,
                 is_new_loop_iter=new_iter, loop_name=loop_name,
                 output_signals=tuple(signals),
             )
-            for n, w, new_iter, loop_name, signals
-            in self._rust.speculate_node(node_name, graph_walk, sample_rid)
+            for n, w, new_iter, loop_name, signals in targets
         ]
 
     def get_spec_target(

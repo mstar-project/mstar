@@ -759,6 +759,11 @@ def test_an_unread_loop_back_is_not_routed():
     assert [e.name for e in routing.persist] == ["new_token"]
 
 
+def _spec_targets(runtime, node, walk, rid):
+    found = runtime.speculate_node(node, [walk], [rid])
+    return [] if found is None else found[1]
+
+
 # --- speculate_node -----------------------------------------------------------
 
 def test_speculate_node_finds_the_downstream_target():
@@ -770,7 +775,7 @@ def test_speculate_node_finds_the_downstream_target():
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
 
-    out = runtime.speculate_node("prefill", "decode", rid)
+    out = _spec_targets(runtime, "prefill", "decode", rid)
     assert [o.node_name for o in out] == ["ar_decode"]
     assert out[0].graph_walk == "decode"
 
@@ -784,7 +789,7 @@ def test_speculate_node_skips_a_target_that_opted_out_of_async():
     wgio = runtime._queues[0].per_request_queues[rid]
     wgio.nodes["ar_decode"].enable_async_scheduling = False
 
-    assert runtime.speculate_node("prefill", "decode", rid) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
 
 
 def test_speculate_node_refuses_a_parallel_target_without_tp_async():
@@ -802,7 +807,7 @@ def test_speculate_node_refuses_a_parallel_target_without_tp_async():
         parallel_leader_nodes={"ar_decode"},
         tp_async_nodes=set(),  # feature off
     )
-    assert runtime.speculate_node("prefill", "decode", rid) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
 
     # Even with TP async on, a TRANSITION into the parallel node is refused:
     # only a same-node loop-back qualifies.
@@ -811,7 +816,19 @@ def test_speculate_node_refuses_a_parallel_target_without_tp_async():
         parallel_leader_nodes={"ar_decode"},
         tp_async_nodes={"ar_decode"},
     )
-    assert runtime.speculate_node("prefill", "decode", rid) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
+
+
+def test_speculate_node_takes_the_first_walk_with_a_target():
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+
+    walk, out = runtime.speculate_node("prefill", ["decode", "decode"], [rid + 999, rid])
+    assert walk == "decode"
+    assert [o.node_name for o in out] == ["ar_decode"]
 
 
 def test_speculate_node_returns_nothing_for_an_unknown_rid():
@@ -819,7 +836,7 @@ def test_speculate_node_returns_nothing_for_an_unknown_rid():
         _make_ar_walk_graph(), 0, "decode",
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
-    assert runtime.speculate_node("prefill", "decode", rid + 999) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid + 999) == []
 
 
 # --- prep_spec_rids -----------------------------------------------------------

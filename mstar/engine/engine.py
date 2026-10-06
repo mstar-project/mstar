@@ -701,9 +701,10 @@ class Engine:
         submodule = self._submodules[batch.node_name].submodule
         node_inputs: list[NodeInputs] = []
         for rid in batch.request_ids:
+            walk = batch.step_context.walk_of(rid)
             try:
                 req_inputs = submodule.prepare_inputs(
-                    graph_walk=batch.step_context.graph_walk,
+                    graph_walk=walk,
                     fwd_info=batch.per_request_info_wrapped[rid],
                     inputs=batch.per_request_input_tensors.get(rid, {}),
                     resources=self._submodules[batch.node_name].resources,
@@ -715,10 +716,11 @@ class Engine:
                 )
                 if req_inputs is not None:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
+                    req_inputs.graph_walk = walk
             except Exception as error:
                 logger.exception(
                     "prepare_inputs failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, batch.step_context.graph_walk,
+                    rid, batch.node_name, walk,
                 )
                 batch.register_failure(rid, error)
                 continue
@@ -737,12 +739,11 @@ class Engine:
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
     ) -> None:
         """Key what this step generated, from the stop check's host copy."""
-        walk = batch.step_context.graph_walk
         for rid in batch.request_ids:
             per_rid = outputs.get(rid)
             if isinstance(per_rid, dict):
                 self._runner.extend_prefix_chains(
-                    rid, batch.node_name, walk, per_rid,
+                    rid, batch.node_name, batch.step_context.walk_of(rid), per_rid,
                 )
 
     def _skip_cached_prefix(
@@ -753,7 +754,7 @@ class Engine:
         Only the keyed walk is probed, and only when `split_inputs` can cut its
         inputs; a guided walk writes two labels from one input, so it is skipped.
         """
-        walk = batch.step_context.graph_walk
+        walk = batch.step_context.walk_of(rid)
         if walk not in self._keyed_walks.get(batch.node_name, ()):
             return inputs
         assert isinstance(inputs, ARNodeInputs) and inputs.custom_pos_ids is None, (
@@ -1377,6 +1378,7 @@ class Engine:
                 else publish_request_ids,
                 node_name=batch.node_name,
                 graph_walk=batch.step_context.graph_walk,
+                request_walks=batch.step_context.request_walks,
             )
             for rid, info in batch.per_request_info.items():
                 if rid not in published:
@@ -1397,6 +1399,7 @@ class Engine:
             request_ids,
             node_name=batch.node_name,
             graph_walk=batch.step_context.graph_walk,
+            request_walks=batch.step_context.request_walks,
         )
         for rid in request_ids:
             rid_published = published.get(rid, {})
