@@ -176,6 +176,15 @@ class AdmitOutcome(NamedTuple):
 # step; nothing reads identity, so hand back one instance rather than build it.
 ADMIT_OK = AdmitOutcome(ok=True, ready=True)
 
+# What a pool's admission gate answers a request it holds back until what it asked
+# for fits. Each equals any other `AdmitOutcome(ok=True, ready=False)`, so a caller
+# that reads `ok` and `ready` sees no difference; only identity says it was the
+# gate, and which wait. BEHIND: the request is neither the head of the queue nor in
+# the backfill window, so only the front of the queue moving can change the answer.
+# WAIT: it is the head, or in the window, and the pool moving can change it too.
+ADMIT_WAIT = AdmitOutcome(ok=True, ready=False)
+ADMIT_WAIT_BEHIND = AdmitOutcome(ok=True, ready=False)
+
 
 class FullAdmitOutcome(NamedTuple):
     """What the runner answers with: one resource's outcome, plus which

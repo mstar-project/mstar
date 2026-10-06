@@ -51,6 +51,8 @@ from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
     ADMIT_OK,
+    ADMIT_WAIT,
+    ADMIT_WAIT_BEHIND,
     AdmitFailedReason,
     AdmitOutcome,
     AdmitRuntimeError,
@@ -71,7 +73,8 @@ _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 # the last one (`PlanTable`) rather than from every stream. "0" reads them all, as before.
 _PLAN_CACHE = os.environ.get("MSTAR_KV_PLAN_CACHE", "1") != "0"
 
-# admitted, but its reservation does not fit yet: the scheduler asks again
+# admitted, but its reservation does not fit yet: the scheduler asks again. The gate's
+# own waits, which it may stop asking over (ADMIT_WAIT, ADMIT_WAIT_BEHIND), are told apart
 _WAIT = AdmitOutcome(ok=True, ready=False)
 
 
@@ -2150,7 +2153,7 @@ class KVManager(AttentionResource):
         that an eviction could undo before its prefill runs.
         """
         if self._backfill and self._behind_the_window(rid):
-            return _WAIT
+            return ADMIT_WAIT_BEHIND
         overrides = self._overrides.get(rid)
         if not self._gated(rid, overrides):
             return None
@@ -2162,10 +2165,10 @@ class KVManager(AttentionResource):
                 self._opened[rid] = self._labels_opened(self._overrides[rid])
             head = self._head()
             if head != rid and (not self._backfill or rid not in self._eligible()):
-                return _WAIT
+                return ADMIT_WAIT_BEHIND
             if self._planned and self._refused.get(rid) == self._refusal_key(head):
                 # nothing it was refused over has moved: skip the probe and the plan
-                return _WAIT
+                return ADMIT_WAIT
             label = self._probe_label(rid, node_name, graph_walk)
             keys = None
             if label is not None and rid not in self._rooted:
@@ -2214,11 +2217,11 @@ class KVManager(AttentionResource):
             cand = self._plan_entry(rid, need, lent=len(hit)) if self._plan_cache and self._peak else None
             if head != rid and self._ruled_out(rid, need, hit, cand):
                 self._refused[rid] = self._refusal_key(head)
-                return _WAIT
+                return ADMIT_WAIT
             if not self._admissible(rid, head, need, hit, cand):
-                return _WAIT
+                return ADMIT_WAIT
         elif self._outstanding() + need > self._supply(leasing=hit):
-            return _WAIT
+            return ADMIT_WAIT
         if hit:
             self._lease(rid, stream, rooted)
             stream.gate_lease = True
