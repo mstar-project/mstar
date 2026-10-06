@@ -310,6 +310,7 @@ def _tone(seconds: float, sr: int = 24000) -> torch.Tensor:
     (torch.cat([torch.zeros(3 * 24000), _tone(0.2), torch.zeros(3 * 24000)]), r"has 0\.\d+ s of sound"),
     # the trim is relative to the clip's peak, so it keeps all of these
     (torch.zeros(10 * 24000), "silent"),
+    (torch.full((5 * 24000,), 0.05), "silent"),  # a DC offset is not sound
     (1e-4 * torch.randn(5 * 24000, generator=torch.Generator().manual_seed(0)), "silent"),
 ])
 def test_process_prompt_rejects_unusable_reference(wav, message):

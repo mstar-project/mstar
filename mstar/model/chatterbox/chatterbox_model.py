@@ -107,7 +107,7 @@ MAX_REFERENCE_SECONDS = 30.0
 # STFT (under 12.5 ms) or clone noise (40 ms gave WER 1.0)
 MIN_REFERENCE_SECONDS = 0.5
 # The trim is relative to the clip's own peak, so it keeps all of a silent one;
-# a clip that never reaches -60 dBFS is refused instead
+# a clip that never swings past -60 dBFS around its mean is refused instead
 MIN_REFERENCE_PEAK = 1e-3
 # Bounds S3Gen time per chunk; the reference uses 10 (Turbo 2)
 MAX_CFM_TIMESTEPS = 100
@@ -604,8 +604,6 @@ class ChatterboxModel(Model):
         max_len = int(MAX_REFERENCE_SECONDS * S3GEN_SR)
         if wav.numel() > max_len:
             wav = wav[:max_len]
-        if wav.abs().max() < MIN_REFERENCE_PEAK:
-            raise ValueError("Reference audio is silent (its peak is below -60 dBFS)")
         # the same trim the voice encoder applies before its STFT
         sound = trim_silence(resample(wav, S3GEN_SR, S3_SR), top_db=20.0).numel() / S3_SR
         if sound < MIN_REFERENCE_SECONDS:
@@ -613,6 +611,8 @@ class ChatterboxModel(Model):
                 f"Reference audio has {sound:.2f} s of sound once silence is trimmed; "
                 f"at least {MIN_REFERENCE_SECONDS} s is needed"
             )
+        if (wav - wav.mean()).abs().max() < MIN_REFERENCE_PEAK:
+            raise ValueError("Reference audio is silent (it never swings past -60 dBFS)")
         if self.config.is_turbo:
             if wav.numel() < 5 * S3GEN_SR:
                 raise ValueError("Chatterbox-Turbo needs a reference clip longer than 5 s")
