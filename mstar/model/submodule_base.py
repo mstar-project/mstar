@@ -188,6 +188,16 @@ class NodeInputs:
     # The request's real walk, stamped by the engine; None on capture templates
     graph_walk: str | None = None
 
+    # Set by the engine on a chunk of a split input: where it starts, and the
+    # whole input's length. None means not chunked.
+    chunk_start: int = 0
+    chunk_total: int | None = None
+
+    @property
+    def is_final_chunk(self) -> bool:
+        return self.chunk_total is None or \
+            self.chunk_start + self.input_seq_len >= self.chunk_total
+
     def clone(self):
         """Copy with tensors cloned, so a capture template can be reused.
 
@@ -534,6 +544,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
         None (the default) means the walk has a single capture.
         """
         del graph_walk, per_request_info, per_request_input_metadata, kwargs
+        return None
+
+    def supports_chunked_prefill(self, graph_walk: str) -> bool:
+        """Whether this walk's inputs may be split across forward passes
+        (``split_inputs``); such a walk must also report ``get_input_sequence_len``."""
+        del graph_walk
+        return False
+
+    def max_batch_tokens(self, graph_walk: str) -> int | None:
+        """Token cap for one step of this walk; None for no cap."""
+        del graph_walk
         return None
 
     def get_input_sequence_len(

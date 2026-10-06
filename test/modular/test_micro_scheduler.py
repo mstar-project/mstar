@@ -33,6 +33,7 @@ from mstar.graph.runtime.base import (
     ReadyNodeSpec,
     RequestWalks,
 )
+from mstar.model.submodule_base import InputSeqLenInfo
 from mstar.utils.containers import ParallelList
 from mstar.worker.batch_builder import (
     BaseBatchBuilder,
@@ -229,6 +230,13 @@ class _Engine:
         if isinstance(self._max_bs, dict):
             return self._max_bs.get(graph_walk)
         return self._max_bs
+
+    def get_max_batch_tokens(self, node_name, graph_walk):
+        del node_name, graph_walk
+
+    def supports_chunked_prefill(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return False
 
     def capture_group(self, node_name, graph_walk, rid, fwd_info):
         del node_name, graph_walk, fwd_info
@@ -1284,3 +1292,44 @@ def test_a_parked_row_is_measured_once_and_checked_once_per_pass():
     assert len(engine.measured) == 2, "b0 once, b1 once though it waited two passes"
     assert engine.checked == ["b0"], "one check per row, with its length"
     assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b1"]
+
+
+# ── chunked prefill ─────────────────────────────────────────────────────
+
+
+class _ChunkingEngine(_SizedEngine):
+    """A 4-token budget; ``p0``'s walk can be chunked and it is 10 tokens long."""
+
+    def __init__(self, **kw):
+        super().__init__(too_big=(), **kw)
+
+    def get_max_batch_tokens(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return 4
+
+    def supports_chunked_prefill(self, node_name, graph_walk):
+        del node_name
+        return graph_walk == "prefill"
+
+    def input_sequence_len(self, node_name, graph_walk, request_info, inputs):
+        del node_name, request_info, inputs
+        return InputSeqLenInfo(10 if graph_walk == "prefill" else 1)
+
+
+def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+
+    first = _next_batch(sched, manager)
+    assert first.chunk_ranges == {"p0": (0, 2)}
+    assert first.incomplete_node_rids == {"p0"}
+
+    # the chunk lands; the worker advances it and readies the node again
+    sched.advance_chunk("p0", NODE, 2)
+    manager.queues["wg0"]._ready.update({"p0": {NODE}, "d0": {NODE}, "d1": {NODE}})
+    second = _next_batch(sched, manager)
+    assert second.chunk_ranges == {"p0": (2, 4)}
+
+    sched.advance_chunk("p0", NODE, 10)
+    assert ("p0", NODE) not in sched.chunk_progress, "the last chunk ends the progress"

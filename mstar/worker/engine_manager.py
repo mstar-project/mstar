@@ -16,6 +16,7 @@ from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model
 from mstar.utils.streams import reset_device_scheduling
+from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,26 @@ def _refuse_unskippable_resources(
             "which the model keyed for prefix reuse; either drop the stream "
             "or give the resource the prefix hooks"
         )
+
+
+def _refuse_unsupported_chunking(
+    submodules: dict, model: Model, parallel_groups: WorkerParallelGroups,
+) -> None:
+    """A chunked walk must report row lengths, and chunking under TP/SP is not supported yet."""
+    for walk, section in model.get_graph_walk_graphs().items():
+        for node in section.get_nodes():
+            submodule = submodules.get(node)
+            if submodule is None or not submodule.supports_chunked_prefill(walk):
+                continue
+            if type(submodule).get_input_sequence_len is NodeSubmodule.get_input_sequence_len:
+                raise ValueError(
+                    f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
+                    "report get_input_sequence_len"
+                )
+            if parallel_groups.get_instance_world_size_for_node(node) > 1:
+                raise NotImplementedError(
+                    f"{type(model).__name__}: chunked prefill of {node!r} under TP/SP"
+                )
 
 
 def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
@@ -205,6 +226,7 @@ class EngineManager:
             node_dtype = submodule.get_autocast_dtype() or autocast_dtype
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
+        _refuse_unsupported_chunking(submodules, model, parallel_groups)
 
         engine = Engine(
             graph_runtime=graph_runtime,
