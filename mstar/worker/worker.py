@@ -29,7 +29,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_torch_config
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AllocationFailed, StepContext
+from mstar.engine.resources import AllocationFailed, GrantDeferred, StepContext
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -1736,11 +1736,23 @@ class Worker:
         Every admit failure needs the push-back; only an ``AllocationFailed``
         also needs an eviction. ``RequestOffloading`` means the rid is already
         on its way to the host, so evicting anything else is wasted work — the
-        retry is gated on ``check_ready`` reloading it.
+        retry is gated on ``check_ready`` reloading it. A ``GrantDeferred``
+        names the one request whose page grant is unsafe until another has
+        progressed: only it is held, since holding the whole batch would hold
+        the request that has to progress along with it, and nothing is
+        offloaded, as no page is short.
         """
         reason = node_batch.admit_error
         if isinstance(reason, AllocationFailed):
             self._handle_allocation_failure(batch, node_batch)
+            return
+        if isinstance(reason, GrantDeferred):
+            self._push_back_batch(batch)
+            self.scheduler.hold_requests([reason.request_id])
+            logger.debug(
+                "Grant deferred node=%s walk=%s: holding %s, re-queued %d requests",
+                batch.node_name, batch.graph_walk, reason.request_id, len(batch),
+            )
             return
 
         self._push_back_batch(batch)

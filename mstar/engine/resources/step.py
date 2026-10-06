@@ -146,6 +146,18 @@ class RequestOffloading(AdmitFailedReason):
     request_id: str
 
 @dataclass
+class GrantDeferred(AdmitFailedReason):
+    """A page grant that would leave the admitted requests with no way to finish.
+
+    Not an `AllocationFailed`: pages are free, and nothing needs evicting or
+    offloading. The grant is unsafe until another request has progressed, so
+    the caller holds only ``request_id``, which the others are not to wait
+    behind, and re-drives the rest of the batch.
+    """
+    label: str
+    request_id: str
+
+@dataclass
 class AdmitRuntimeError(AdmitFailedReason):
     """A resource cannot serve this request at all.
 

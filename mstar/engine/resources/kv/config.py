@@ -4,6 +4,7 @@ Kept free of the manager and its kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -73,9 +74,41 @@ class KVConfig(ABC):
         """
 
 
+_ADMISSION_CHOICES = {
+    "admission_fit": ("sum", "peak"),
+    "admission_order": ("fifo", "backfill"),
+    "backfill_protect": ("easy",),
+}
+# the environment variable that overrides each key, for flipping a deployment's
+# mode without editing its YAML
+_ADMISSION_ENV = {
+    "admission_fit": "MSTAR_KV_ADMISSION_FIT",
+    "admission_order": "MSTAR_KV_ADMISSION_ORDER",
+}
+
+
 @dataclass(kw_only=True)
 class PagedKVConfig(KVConfig):
-    """Fixed-size pages, appended to as a sequence grows. The default."""
+    """Fixed-size pages, appended to as a sequence grows. The default.
+
+    How a request is admitted against the pool (the defaults are the summed
+    reservations in strict arrival order, the pool's original behavior):
+
+    ``admission_fit``: ``sum`` admits a request only if everything admitted
+    could take all it reserved at once; ``peak`` admits it if the set's
+    projected footprint, round by round, stays within the pool, and guards each
+    page grant so the admitted requests can always finish.
+
+    ``admission_order``: ``fifo`` lets nothing pass the request that has waited
+    longest; ``backfill`` lets a request behind it be admitted if it fits and
+    does not delay it, by ``backfill_protect`` (``easy``: it must be gone
+    before the head could start, or fit in the room the head leaves spare).
+
+    Each of the first two is overridden by an environment variable, which wins
+    over the YAML: ``MSTAR_KV_ADMISSION_FIT`` and ``MSTAR_KV_ADMISSION_ORDER``.
+    The environment is read where the cache is built, so it reaches every
+    model's paged pool, in each worker process that inherits it.
+    """
 
     max_seq_len: int
     max_num_pages: int = 2048
@@ -86,6 +119,9 @@ class PagedKVConfig(KVConfig):
     # folded into the root, not checked at match time
     prefix_cache_salt: str = ""
     prefix_cache: bool = True
+    admission_fit: str = "sum"
+    admission_order: str = "fifo"
+    backfill_protect: str = "easy"
 
     def apply_yaml_overrides(
         self,
@@ -95,8 +131,11 @@ class PagedKVConfig(KVConfig):
         cpu_offload_pages: int | None = None,
         prefix_cache_salt: str | None = None,
         prefix_cache: bool | None = None,
+        admission_fit: str | None = None,
+        admission_order: str | None = None,
+        backfill_protect: str | None = None,
     ) -> None:
-        """How much cache this deployment gets, and how it is cut up."""
+        """How much cache this deployment gets, how it is cut up, and how it admits."""
         for name, value in (
             ("max_num_pages", max_num_pages),
             ("page_size", page_size),
@@ -104,9 +143,34 @@ class PagedKVConfig(KVConfig):
             ("cpu_offload_pages", cpu_offload_pages),
             ("prefix_cache_salt", prefix_cache_salt),
             ("prefix_cache", prefix_cache),
+            ("admission_fit", admission_fit),
+            ("admission_order", admission_order),
+            ("backfill_protect", backfill_protect),
         ):
             if value is not None:
                 setattr(self, name, value)
+        self.resolved_admission()
+
+    def resolved_admission(self) -> tuple[str, str]:
+        """``(fit, order)`` as the pool is to run them: the environment, then the config.
+
+        A value that names no mode is an error, as a typo in a YAML key is:
+        it would otherwise leave the pool on a mode its operator did not pick.
+        """
+        for name, choices in _ADMISSION_CHOICES.items():
+            if getattr(self, name) not in choices:
+                raise ValueError(
+                    f"{name} must be one of {choices}; got {getattr(self, name)!r}"
+                )
+        resolved = []
+        for name, env in _ADMISSION_ENV.items():
+            value = os.environ.get(env) or getattr(self, name)
+            if value not in _ADMISSION_CHOICES[name]:
+                raise ValueError(
+                    f"{env} must be one of {_ADMISSION_CHOICES[name]}; got {value!r}"
+                )
+            resolved.append(value)
+        return resolved[0], resolved[1]
 
 
 @dataclass(frozen=True)
