@@ -632,11 +632,18 @@ class MicroScheduler:
             if entries else None
         if backlogged is None and not fresh:
             return None
+        walk_caps = {
+            walk: self._remaining_capacity(
+                self._max_batch_size(node_walk[0], walk), pre_existing_batch_size,
+            )
+            for walk in self._walks_of_key.get(node_walk, ())
+        }
         return self._build_and_schedule(request_state, BatchBuildRequest(
             node_name=node_walk[0], graph_walk=node_walk[1],
             backlog=backlogged, fresh=fresh or None, blocked_rids=blocked,
             max_batch_size=remaining,
             capture_group_of=capture_group_of,
+            walk_caps=walk_caps,
         ))
 
     @staticmethod
