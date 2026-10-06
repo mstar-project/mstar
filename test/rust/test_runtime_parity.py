@@ -31,6 +31,11 @@ from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.graph.runtime import rust as rust_runtime
 
 
+def _spec_targets(runtime, node, walk, rid):
+    found = runtime.speculate_node(node, [walk], [rid])
+    return [] if found is None else found[1]
+
+
 def _ingest_block(rids, specs) -> ColumnarEdgeSpecs:
     """(rids, EdgeSpecs) as the columnar block ``ingest_inputs_batch`` takes.
 
@@ -295,11 +300,11 @@ def test_handle_recycling_agrees(pair):
 def test_speculation_agrees(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
-    out = rt.speculate_node("prefill", WALK, rid)
+    out = _spec_targets(rt, "prefill", WALK, rid)
     assert [(o.node_name, o.is_new_loop_iter, o.loop_name) for o in out] == [
         ("ar_decode", False, "ar_loop")
     ]
-    back = rt.speculate_node("ar_decode", WALK, rid)
+    back = _spec_targets(rt, "ar_decode", WALK, rid)
     assert [(o.node_name, o.is_new_loop_iter) for o in back] == [
         ("ar_decode", True)
     ]
@@ -479,7 +484,7 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
         lambda rt, r: rt.pop_rids("prefill", WALK, [r], check_ready=True),
         id="pop_rids_checked"),
     pytest.param(
-        lambda rt, r: rt.speculate_node("prefill", WALK, r),
+        lambda rt, r: _spec_targets(rt, "prefill", WALK, r),
         id="speculate_node"),
     pytest.param(
         lambda rt, r: rt.get_spec_target("prefill", "ar_decode", WALK, r),
@@ -698,7 +703,7 @@ def test_a_target_that_refuses_async_is_never_speculated(opted_out):
     got speculated into, to be dropped again per rid.
     """
     rid = _admit(opted_out)
-    assert opted_out.speculate_node("prefill", WALK, rid) == []
+    assert _spec_targets(opted_out, "prefill", WALK, rid) == []
 
 
 def test_the_per_request_sharding_config_agrees(pair):
@@ -1269,7 +1274,7 @@ def test_the_speculation_target_reports_its_output_signals(pair):
     outputs, and decode is almost entirely speculated."""
     rt, _book, _store = pair
     rid = _admit(rt)
-    out = rt.speculate_node("prefill", WALK, rid)
+    out = _spec_targets(rt, "prefill", WALK, rid)
     assert [o.node_name for o in out] == ["ar_decode"]
     # ar_decode's own edges, sorted and deduped -- it sends `token` to itself
     # and to the loop output, so a raw edge list would repeat it.
@@ -1575,7 +1580,7 @@ def test_speculation_names_the_innermost_enclosing_loop(nested):
     outer one reads the wrong counters."""
     rt, _book, _store = nested
     rid = _admit(rt)
-    out = rt.speculate_node("denoiser", WALK, rid)
+    out = _spec_targets(rt, "denoiser", WALK, rid)
     assert [(o.node_name, o.loop_name) for o in out] == [
         ("denoiser", "denoise_loop")
     ]

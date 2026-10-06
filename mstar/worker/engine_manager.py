@@ -72,6 +72,17 @@ def _refuse_unskippable_resources(
         )
 
 
+def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
+    """A combined walk batches its walks together, so it must not split them by capture key."""
+    for (node, _), combined in model.combined_walk_of().items():
+        submodule = submodules.get(node)
+        if submodule is not None and submodule.split_batches_by_capture_key(combined):
+            raise ValueError(
+                f"{type(model).__name__}: {node!r} splits its combined walk "
+                f"{combined!r} by capture key"
+            )
+
+
 def _refuse_unknown_walks(model: Model) -> None:
     """Refuse a declared stream that names a walk the model never runs.
 
@@ -164,6 +175,7 @@ class EngineManager:
             # fp32, say) says so; otherwise it takes the engine's.
             node_dtype = submodule.get_autocast_dtype() or autocast_dtype
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
+        _refuse_split_combined_walks(submodules, model)
 
         engine = Engine(
             graph_runtime=graph_runtime,

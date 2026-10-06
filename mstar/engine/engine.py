@@ -743,7 +743,6 @@ class Engine:
         submodule = mgmt.submodule
         node_inputs: list[NodeInputs] = []
         # hoisted out of the per-request loop: the same for every row
-        walk = batch.step_context.graph_walk
         prepare = submodule.prepare_inputs
         resources = mgmt.resources
         wrapped = batch.per_request_info_wrapped
@@ -751,10 +750,15 @@ class Engine:
         metadata = batch.per_request_input_metadata
         final_rids = batch.final_stream_rids
         # only a keyed walk probes the prefix cache (see _skip_cached_prefix);
-        # read leniently, as the probe itself was only reached per prepared row
-        keyed = getattr(self, "_keyed_walks", None)
-        probe_prefix = bool(keyed) and walk in keyed.get(batch.node_name, ())
+        # read leniently, as the probe itself was only reached per prepared row.
+        # The lookups hoist but the test cannot: under a combined walk each row
+        # has its own walk, so a mixed step would probe for the wrong one.
+        keyed_walks = (getattr(self, "_keyed_walks", None) or {}).get(
+            batch.node_name, (),
+        )
         for rid in batch.request_ids:
+            walk = batch.step_context.walk_of(rid)
+            probe_prefix = walk in keyed_walks
             try:
                 req_inputs = prepare(
                     graph_walk=walk,
@@ -769,10 +773,11 @@ class Engine:
                 )
                 if req_inputs is not None and probe_prefix:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
+                    req_inputs.graph_walk = walk
             except Exception as error:
                 logger.exception(
                     "prepare_inputs failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, batch.step_context.graph_walk,
+                    rid, batch.node_name, walk,
                 )
                 batch.register_failure(rid, error)
                 continue
@@ -804,10 +809,13 @@ class Engine:
         keys = self._runner.prefix_chain_keys(batch.node_name)
         if not keys:
             return
-        walk = batch.step_context.graph_walk
-        if host_rows is not None:
+        # The batch call takes one walk for every row, so it is only right when
+        # the step is not a combined walk; a mixed step falls through to the
+        # per-row loop, which keys each row under its own walk.
+        if host_rows is not None and not batch.step_context.request_walks:
             self._runner.extend_prefix_chains_batch(
-                batch.request_ids, batch.node_name, walk, host_rows, outputs,
+                batch.request_ids, batch.node_name,
+                batch.step_context.graph_walk, host_rows, outputs,
                 keys=keys,
             )
             return
@@ -815,7 +823,8 @@ class Engine:
             per_rid = outputs.get(rid)
             if isinstance(per_rid, dict):
                 self._runner.extend_prefix_chains(
-                    rid, batch.node_name, walk, per_rid, keys=keys,
+                    rid, batch.node_name, batch.step_context.walk_of(rid), per_rid,
+                    keys=keys,
                 )
 
     def _skip_cached_prefix(
@@ -826,7 +835,7 @@ class Engine:
         Only the keyed walk is probed, and only when `split_inputs` can cut its
         inputs; a guided walk writes two labels from one input, so it is skipped.
         """
-        walk = batch.step_context.graph_walk
+        walk = batch.step_context.walk_of(rid)
         if walk not in self._keyed_walks.get(batch.node_name, ()):
             return inputs
         assert isinstance(inputs, ARNodeInputs) and inputs.custom_pos_ids is None, (
@@ -1463,6 +1472,7 @@ class Engine:
                 rids,
                 node_name=batch.node_name,
                 graph_walk=batch.step_context.graph_walk,
+                request_walks=batch.step_context.request_walks,
             )
             for rid, info in batch.per_request_info.items():
                 if rid not in published:
@@ -1509,6 +1519,7 @@ class Engine:
             request_ids,
             node_name=batch.node_name,
             graph_walk=batch.step_context.graph_walk,
+            request_walks=batch.step_context.request_walks,
         )
         for rid in request_ids:
             rid_published = published.get(rid, {})
