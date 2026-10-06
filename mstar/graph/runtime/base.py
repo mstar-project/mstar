@@ -740,13 +740,13 @@ class GraphRuntime(ABC):
     @abstractmethod
     def speculate_node(
         self, node_name: str,
-        graph_walk: str,
-        sample_rid: int,
-    ) -> list[SpeculationOutput]:
+        graph_walks: list[str],
+        sample_rids: list[int],
+    ) -> tuple[str, list[SpeculationOutput]] | None:
         """
-        Returns a list of nodes that are ready for speculation, checking
-        against whether the node is async enabled (known internally), as
-        well as whether the node is TP async compatible.
+        The nodes ready for speculation, checking against whether the node is
+        async enabled (known internally) and TP async compatible. Takes one
+        sample rid per walk; returns the first walk with a target and its targets.
         """
         pass
 

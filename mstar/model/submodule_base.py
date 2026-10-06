@@ -185,6 +185,9 @@ class NodeInputs:
     # it. 0 for a submodule whose inputs aren't sequence-shaped.
     input_seq_len: int = 0
 
+    # The request's real walk, stamped by the engine; None on capture templates
+    graph_walk: str | None = None
+
     def clone(self):
         """Copy with tensors cloned, so a capture template can be reused.
 

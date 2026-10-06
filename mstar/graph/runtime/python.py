@@ -637,8 +637,17 @@ class PythonGraphRuntime(GraphRuntime):
 
     def speculate_node(
         self, node_name: str,
-        graph_walk: str,
-        sample_rid: int,
+        graph_walks: list[str],
+        sample_rids: list[int],
+    ) -> tuple[str, list[SpeculationOutput]] | None:
+        for walk, rid in zip(graph_walks, sample_rids, strict=True):
+            out = self._speculate_walk(node_name, walk, rid)
+            if out:
+                return walk, out
+        return None
+
+    def _speculate_walk(
+        self, node_name: str, graph_walk: str, sample_rid: int,
     ) -> list[SpeculationOutput]:
         wg_id = self.get_worker_graph_id_for_node(node_name, graph_walk)
         wgio = self._queues[wg_id].per_request_queues.get(sample_rid)

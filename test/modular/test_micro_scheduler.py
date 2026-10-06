@@ -80,12 +80,12 @@ class _Runtime:
 
     def _scan(self, exclude_rids, target, exclude_target):
         target_node, target_walk = target if target is not None else (None, None)
-        walk = self._manager._walk
         for queue in self._manager.queues.values():
             for rid, node_names in queue.get_ready_node_names().items():
                 if rid in exclude_rids \
                         or rid not in self._manager.per_request_info:
                     continue
+                walk = self._manager.walk_of(rid)
                 for node_name in node_names:
                     if target_node is not None and node_name != target_node:
                         continue
@@ -117,7 +117,10 @@ class _Runtime:
         return "wg0"
 
     def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):
-        del graph_walk
+        self._manager.pops.append((graph_walk, list(request_ids)))
+        assert all(self._manager.walk_of(r) == graph_walk for r in request_ids), (
+            "pop_rids resolves one worker graph per walk"
+        )
         queue = self._manager.queues["wg0"]
         if check_ready:
             ready = queue.get_ready_node_names()
@@ -156,10 +159,13 @@ class _Runtime:
 class _Manager:
     """Stands in for RequestStateManager: one worker graph, one node."""
 
-    def __init__(self, rids, node=NODE, walk=WALK):
+    def __init__(self, rids, node=NODE, walk=WALK, walks=None):
         self.queues = {"wg0": _Queue(rids, node)}
         self.per_request_info = dict.fromkeys(rids, object())
         self._walk = walk
+        # rid -> real walk, overriding ``walk``
+        self.walks = dict(walks or {})
+        self.pops: list = []
         self.runtime = _Runtime(self)
         # (rid, node) pairs marked in flight
         self.in_flight: set = set()
@@ -175,8 +181,11 @@ class _Manager:
         return "default"
 
     def get_graph_walk(self, rid, partition):
-        del rid, partition
-        return self._walk
+        del partition
+        return self.walk_of(rid)
+
+    def walk_of(self, rid):
+        return self.walks.get(rid, self._walk)
 
     def get_fwd_info(self, rid, partition):
         del rid, partition
@@ -992,3 +1001,104 @@ def test_returned_rows_are_no_longer_in_flight():
     _next_batch(sched, manager)
 
     assert ("r1", NODE) not in manager.in_flight
+
+
+# ── combined walks ──────────────────────────────────────────────────────
+
+MIXED = "mixed"
+
+
+def _combined_scheduler(engine: _Engine) -> MicroScheduler:
+    return MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda name: engine),
+        parallel_leader_nodes={NODE},
+        combined_walk_of={(NODE, "prefill"): MIXED, (NODE, WALK): MIXED},
+    )
+
+
+def test_a_combined_walk_batches_its_walks_together():
+    sched = _combined_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["p0", "d0", "d1"], walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == MIXED
+    assert batch.request_walks == {"p0": "prefill", "d0": WALK, "d1": WALK}
+    assert sorted(walk for walk, _ in manager.pops) == ["decode", "prefill"]
+
+
+def test_a_combined_batch_of_one_walk_keeps_its_real_label():
+    """A pure-decode step still replays the decode captures."""
+    sched = _combined_scheduler(_Engine(max_bs=8))
+
+    batch = _next_batch(sched, _Manager(["d0", "d1"]))
+
+    assert batch.graph_walk == WALK
+    assert batch.request_walks == {}
+
+
+def test_the_backlog_and_round_robin_key_on_the_combined_walk():
+    sched = _combined_scheduler(_Engine(max_bs=2))
+    manager = _Manager(["p0", "d0", "d1"], walks={"p0": "prefill"})
+
+    first = _next_batch(sched, manager)
+    assert set(sched.backlog) == {(NODE, MIXED)}
+    assert (NODE, MIXED) in sched.node_and_walk_to_last_batch_num
+    second = _next_batch(sched, manager)
+
+    assert len(first) + len(second) == 3
+    assert second.walk_of("d1") == WALK
+
+
+def test_a_real_walk_target_takes_its_combined_walks_rows():
+    """The speculation merge names the walk it continues; fresh rows of the
+    other constituent walk ride along."""
+    sched = _combined_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager, target=(NODE, WALK))
+
+    assert set(batch.request_to_worker_graph) == {"p0", "d0"}
+
+
+def test_excluding_a_real_walk_excludes_its_combined_walk():
+    sched = _combined_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
+
+    assert not _has_ready(sched, manager, exclude_target=(NODE, "prefill"))
+    assert _next_batch(sched, manager, exclude_target=(NODE, WALK)) is None
+
+
+def test_a_split_keeps_each_halfs_walks():
+    batch = _batch(["p0", "d0", "d1"], walk=MIXED)
+    batch.request_walks = {"p0": "prefill", "d0": WALK, "d1": WALK}
+
+    first, rest = batch.split_off_first(2)
+
+    assert first.request_walks == {"p0": "prefill", "d0": WALK}
+    assert rest.request_walks == {"d1": WALK}
+
+
+def test_a_follower_pops_each_walk_of_a_combined_head():
+    sched = _combined_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
+    sched.runtime = manager.runtime
+
+    popped = sched.pop_ready_rids(
+        manager, NODE, MIXED, ["p0", "d0"], request_walks=["prefill", WALK],
+    )
+
+    assert set(popped.wg_ids) == {"p0", "d0"}
+    assert popped.request_walks == {"p0": "prefill", "d0": WALK}
+
+
+def test_a_follower_pop_is_all_or_none_across_walks():
+    sched = _combined_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["p0"], walks={"p0": "prefill", "d0": WALK})
+    manager.per_request_info["d0"] = object()  # known, but its node is not ready
+    sched.runtime = manager.runtime
+
+    assert sched.pop_ready_rids(
+        manager, NODE, MIXED, ["p0", "d0"], request_walks=["prefill", WALK],
+    ) is None
+    assert "p0" in manager.queues["wg0"].get_ready_node_names()

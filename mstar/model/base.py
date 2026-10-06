@@ -446,6 +446,35 @@ class Model(ABC):
         """
         return type(self).__name__
 
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        """``{node: {combined_walk: {constituent walks}}}``: walks the scheduler may batch together."""
+        return {}
+
+    def combined_walk_of(self) -> dict[tuple[str, str], str]:
+        """``(node, real walk) -> combined walk``, validated."""
+        walks = self.get_graph_walk_graphs()
+        out: dict[tuple[str, str], str] = {}
+        for node, combined in self.get_combined_graph_walks().items():
+            for name, members in combined.items():
+                if name in walks:
+                    raise ValueError(
+                        f"{type(self).__name__}: combined walk {name!r} of {node!r} "
+                        "reuses the name of a real walk"
+                    )
+                for walk in members:
+                    if walk not in walks or node not in walks[walk].get_nodes():
+                        raise ValueError(
+                            f"{type(self).__name__}: combined walk {name!r} names "
+                            f"{walk!r}, which is not a walk of node {node!r}"
+                        )
+                    if (node, walk) in out:
+                        raise ValueError(
+                            f"{type(self).__name__}: walk {walk!r} of {node!r} is in "
+                            f"both {out[(node, walk)]!r} and {name!r}"
+                        )
+                    out[(node, walk)] = name
+        return out
+
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
         """Which input tensor keys which ``(resource, label)`` cache stream.
 
