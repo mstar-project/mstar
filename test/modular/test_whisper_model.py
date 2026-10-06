@@ -794,3 +794,60 @@ def test_decoder_prefill_selects_each_request_last_row_itself():
     batch = sub.preprocess(DETECT_LANGUAGE_WALK, _engine_inputs(["a"]), [detect])
     assert batch["row_lens"].tolist() == [1] and batch["input_ids"].tolist() == [SOT]
 
+
+
+# --------------------------------------------------------------------------
+# pre_plan serve-config key
+# --------------------------------------------------------------------------
+
+
+def _resolve_pre_plan(model_config: dict, env: dict) -> bool:
+    """``Worker.__init__``'s resolution, over an explicit env dict.
+
+    Kept in step with worker.py by the source check below.
+    """
+    env_value = env.get("MSTAR_PRE_PLAN_SPEC")
+    return (
+        env_value == "1" if env_value is not None
+        else bool(model_config.get("pre_plan", True))
+    )
+
+
+@pytest.mark.parametrize("config,env,expected", [
+    # absent in most configs: pre-planning stays on, as it was before the key
+    ({}, {}, True),
+    # a config can turn it off, or ask for it explicitly
+    ({"pre_plan": False}, {}, False),
+    ({"pre_plan": True}, {}, True),
+    # an explicit env var wins either way, so an A/B needs no config edit
+    ({"pre_plan": False}, {"MSTAR_PRE_PLAN_SPEC": "1"}, True),
+    ({"pre_plan": True}, {"MSTAR_PRE_PLAN_SPEC": "0"}, False),
+    ({}, {"MSTAR_PRE_PLAN_SPEC": "0"}, False),
+])
+def test_pre_plan_config_defers_to_an_explicit_env_var(config, env, expected):
+    assert _resolve_pre_plan(config, dict(env)) == expected
+
+
+def test_only_turbo_turns_pre_plan_off():
+    """Pre-planning hides host planning behind GPU work, so it wins on a deep
+    decoder and loses on turbo's 4 layers. The other ASR configs must stay on
+    the default; flipping them was measured as a regression."""
+    root = Path(__file__).parents[2]
+    turbo = yaml.safe_load((root / "configs/whisper_large_v3_turbo.yaml").read_text())
+    assert turbo["pre_plan"] is False
+    for name in ("whisper_large", "whisper_large_tp2", "qwen3_asr", "qwen3_asr_realtime"):
+        cfg = yaml.safe_load((root / f"configs/{name}.yaml").read_text())
+        assert "pre_plan" not in cfg, f"{name} should stay on the pre_plan default"
+
+
+def test_the_resolution_under_test_matches_the_worker():
+    """Guards the duplicated logic above: if the worker's rule changes, this
+    fails rather than letting the test keep asserting the old one."""
+    root = Path(__file__).parents[2]
+    src = (root / "mstar/worker/worker.py").read_text()
+    assert '_env_pre_plan = os.environ.get("MSTAR_PRE_PLAN_SPEC")' in src
+    assert 'else bool(model_config.get("pre_plan", True))' in src
+    # and the engine takes the resolved answer rather than re-reading the env
+    engine = (root / "mstar/engine/engine.py").read_text()
+    assert "preplan_enabled = self.enable_pre_plan" in engine
+    assert 'os.environ.get("MSTAR_PRE_PLAN_SPEC"' not in engine

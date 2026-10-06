@@ -113,6 +113,7 @@ class EngineManager:
         graph_runtime: GraphRuntime,
         enable_nvtx: bool = False,
         enable_prof: bool=False,
+        enable_pre_plan: bool = True,
     ) -> "EngineManager":
         """Build the engine and load this worker's nodes into it.
 
@@ -168,6 +169,7 @@ class EngineManager:
             graph_runtime=graph_runtime,
             autocast_dtype=autocast_dtype,
             enable_nvtx=enable_nvtx,
+            enable_pre_plan=enable_pre_plan,
             enable_profile=enable_prof,
         )
         engine.load_model(

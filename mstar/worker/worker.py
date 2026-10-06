@@ -238,6 +238,23 @@ class Worker:
         self.device = device
         self.enable_nvtx = enable_nvtx
 
+        # ``pre_plan:`` in the serve yaml, with MSTAR_PRE_PLAN_SPEC overriding
+        # it so an A/B needs no config edit. Resolved once here and handed to
+        # the engine, which needs the same answer for its slot count.
+        #
+        # TODO: per-model is the coarse form. Whether a step pre-plans is
+        # already decided per (node, walk) by ``StepRunner._preplan_keys_for``;
+        # only the plan thread and the slot count are per-worker. Pre-planning
+        # hides host planning behind GPU work, so it wins on a deep decoder
+        # (large-v3 32 layers, qwen3-asr 28) and loses on a shallow one
+        # (turbo's 4), where the step is too short to hide in and the extra
+        # thread is just GIL contention.
+        _env_pre_plan = os.environ.get("MSTAR_PRE_PLAN_SPEC")
+        self._enable_pre_plan = (
+            _env_pre_plan == "1" if _env_pre_plan is not None
+            else bool(model_config.get("pre_plan", True))
+        )
+
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads
         # record into it too; run() owns the periodic flush.
@@ -339,6 +356,7 @@ class Worker:
             model=model,
             enable_nvtx=self.enable_nvtx,
             enable_prof=self.enable_prof,
+            enable_pre_plan=self._enable_pre_plan,
         )
 
         self.request_state = RequestStateManager(
@@ -3315,9 +3333,10 @@ class Worker:
         # on prev_advance_event (signaled right after advance_seq_lens(N) on
         # the GPU thread, ~tens of µs into replay)
         #
-        # Default ON. Set MSTAR_PRE_PLAN_SPEC=0 to fall back to the
-        # double-buffer-without-pre-plan baseline.
-        pre_plan_spec = os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1"
+        # Default ON; `pre_plan:` in the serve yaml or MSTAR_PRE_PLAN_SPEC=0
+        # falls back to the double-buffer-without-pre-plan baseline. Resolved
+        # in __init__ so the engine sees the same answer.
+        pre_plan_spec = self._enable_pre_plan
         # How long the submitter holds off the GIL waiting for the GPU thread
         # to reach the launch. submit_spec often sits on this cap, but raising
         # it to 8ms did not help; tunable for another look.
