@@ -1069,6 +1069,42 @@ def test_a_walk_joins_when_it_costs_nothing():
     assert batch.graph_walk == MIXED and len(batch) == 3
 
 
+def test_a_one_walk_step_takes_its_walks_cap_not_the_combined_walks():
+    """Decode-only steps replay the decode graphs, so a smaller mixed cap (the
+    packed captures') must not hold them back."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 4, WALK: 8, "prefill": 4}))
+    manager = _Manager([f"d{i}" for i in range(6)])
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == WALK and len(batch) == 6
+
+
+def test_a_mixed_step_takes_the_combined_walks_cap():
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 4, WALK: 8, "prefill": 8}))
+    manager = _Manager(["p0"] + [f"d{i}" for i in range(6)], walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == MIXED and len(batch) == 4
+
+
+def test_a_merge_counts_the_continuing_rows_walk():
+    """Six continuing decode rows: a prompt joining them would make a mixed
+    step past its cap of 4, so it waits and has first claim next time."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 4, WALK: 8, "prefill": 8}))
+    assert sched.room_for_continuing((NODE, WALK)) == 8
+
+    merged = _next_batch(
+        sched, _Manager(["p0"], walks={"p0": "prefill"}),
+        target=(NODE, WALK), pre_existing_batch_size=6,
+    )
+
+    assert merged is None
+    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p0"]
+    assert sched.room_for_continuing((NODE, WALK)) == 3
+
+
 
 def test_a_relabelled_step_routes_with_its_own_walks_outputs():
     """The merged batch keeps its first walk's output names; a step that turns
