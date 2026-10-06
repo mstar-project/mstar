@@ -207,7 +207,9 @@ class _Engine:
         self.checked = []
 
     def get_max_batch_size(self, node_name, graph_walk):
-        del node_name, graph_walk
+        del node_name
+        if isinstance(self._max_bs, dict):
+            return self._max_bs.get(graph_walk)
         return self._max_bs
 
     def capture_group(self, node_name, graph_walk, rid, fwd_info):
@@ -1102,3 +1104,29 @@ def test_a_follower_pop_is_all_or_none_across_walks():
         manager, NODE, MIXED, ["p0", "d0"], request_walks=["prefill", WALK],
     ) is None
     assert "p0" in manager.queues["wg0"].get_ready_node_names()
+
+
+def test_a_walk_that_would_shrink_the_step_waits_its_turn():
+    """Six decode rows fit a decode step of 8; taking the prompt would cap the
+    step at its walk's 2. It is left out, and runs first next step."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 2}))
+    rids = [f"d{i}" for i in range(3)] + ["p0"] + [f"d{i}" for i in range(3, 6)]
+    manager = _Manager(rids, walks={"p0": "prefill"})
+
+    first = _next_batch(sched, manager)
+    assert first.graph_walk == WALK and len(first) == 6
+    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p0"]
+
+    manager.queues["wg0"]._ready.update({f"d{i}": {NODE} for i in range(6)})
+    second = _next_batch(sched, manager)
+    assert second.graph_walk == MIXED and len(second) == 2
+    assert next(iter(second.request_to_worker_graph)) == "p0"
+
+
+def test_a_walk_joins_when_it_costs_nothing():
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 4}))
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == MIXED and len(batch) == 3
