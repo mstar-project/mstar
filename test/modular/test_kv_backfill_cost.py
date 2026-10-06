@@ -3,12 +3,22 @@
 The scheduler asks readiness of every request still waiting, on every pass. Under
 ``backfill`` each one used to be worked out in full, and a pool with a thousand
 requests waiting spent more time answering that than running them. The pool now
-looks only at the first ``backfill_window`` of them.
+looks only at the first ``backfill_window`` of them, and says no to one the room
+left rules out without working out its plan.
+
+Here the cost is measured as the time of one pass, and the answers are checked
+against the pool working every request in the window out in full: the cheap
+refusals are a shortcut, and must never change who is admitted, or when.
+
+``MSTAR_KV_BACKFILL_BENCH=1 pytest -s -k microbenchmark`` prints the per-pass cost
+at a few queue lengths; it asserts nothing.
 """
 
 from __future__ import annotations
 
+import os
 import random
+import statistics
 import sys
 import time
 from types import SimpleNamespace
@@ -33,7 +43,7 @@ from test_kv_admission_peak import (
 )
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 
 SEED = 20261006
@@ -66,21 +76,136 @@ def _manager(
     return kv
 
 
+# ── a pool under pressure ───────────────────────────────────────────────
+
+POOL = 2048
+HEADROOM = 8
+
+
+def _pressed_pool(fit: str, reserved: int, waiting: int, seed: int = 7, **config):
+    """``reserved`` requests admitted and prefilled, whose reservations leave
+    ``HEADROOM`` pages of the pool and are only at the start of what they will
+    decode, and ``waiting`` that run too long to fit in what is left, by the
+    peak or by the sum.
+
+    Returns the pool and the reserved rids.
+    """
+    rng = random.Random(seed)
+    kv = _manager(POOL, fit=fit, order="backfill", **config)
+    claim, extra = divmod(POOL - 1 - HEADROOM, reserved)
+    held = []
+    for i in range(reserved):
+        # a prompt of two pages (three, for the few that take up what does not divide
+        # evenly), and the rest of the reservation is decode, still to come, as long for all
+        prompt = (2 + (i < extra)) * PAGE_SIZE - rng.randrange(0, PAGE_SIZE // 2)
+        _ingest(kv, f"r{i}", prompt, (claim - 2) * PAGE_SIZE)
+        assert _ready(kv, f"r{i}").ready, f"r{i} was not admitted into an empty pool"
+        held.append((f"r{i}", prompt))
+    for rid, prompt in held:
+        assert _prefill(kv, rid, prompt).ok
+
+    # a request that runs as long as the reserved ones, and so is there when they have all grown
+    longest = (claim + 1) * PAGE_SIZE
+
+    def arrive(j: int) -> str:
+        _ingest(kv, f"w{j}", rng.randrange(80, 200), rng.randrange(longest, longest + 200))
+        return f"w{j}"
+
+    queue = [arrive(j) for j in range(waiting)]
+    # let the pool settle: whatever fits is let in, and put back, so the queue is of what does not
+    for settle in range(100):
+        let_in = [rid for rid in queue if _ready(kv, rid).ready]
+        if not let_in:
+            break
+        for rid in let_in:
+            kv.remove_request(rid)
+            queue.remove(rid)
+        queue += [arrive(waiting + 1000 * (settle + 1) + k) for k in range(len(let_in))]
+    else:
+        raise AssertionError("the pool kept letting the queue in")
+    assert len(kv._reserved) == reserved and len(kv._waiting) == waiting
+    return kv, [rid for rid, _ in held]
+
+
+def _one_pass(kv: KVManager, queue: list[str]) -> float:
+    """The scheduler's pass over the queue: readiness for each, in arrival order. Microseconds."""
+    started = time.perf_counter_ns()
+    for rid in queue:
+        kv._gate(rid, NODE, PREFILL)
+    return (time.perf_counter_ns() - started) / 1e3
+
+
+def _timed_passes(kv: KVManager, reserved: list[str], passes: int, seed: int = 1) -> list[float]:
+    """Each pass follows a step that grants a page to one reserved request, as a busy pool's do."""
+    rng = random.Random(seed)
+    times = []
+    for _ in range(passes):
+        assert _run(kv, {rng.choice(reserved): PAGE_SIZE}).ok
+        times.append(_one_pass(kv, list(kv._waiting)))
+    return times
+
+
 class _Counted:
     """Counts the calls to what a pool does in full for a request."""
 
     def __init__(self, kv: KVManager):
         self.full = 0
-        admissible = kv._admissible
+        self.ruled_out = 0
+        admissible, ruled_out = kv._admissible, kv._ruled_out
 
         def counting_admissible(*args, **kwargs):
             self.full += 1
             return admissible(*args, **kwargs)
 
-        kv._admissible = counting_admissible
+        def counting_ruled_out(*args, **kwargs):
+            answer = ruled_out(*args, **kwargs)
+            self.ruled_out += answer
+            return answer
+
+        kv._admissible, kv._ruled_out = counting_admissible, counting_ruled_out
 
 
-# ── the pool's own answers ─────────────────────────────────────────────
+@pytest.mark.parametrize(("fit", "order"), FIT_AND_ORDER)
+def test_a_pass_over_a_long_queue_costs_what_the_window_does(monkeypatch, fit, order):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
+    kv, reserved = _pressed_pool(fit, reserved=170, waiting=1500)
+    window = kv._window_size
+    counted = _Counted(kv)
+
+    times = _timed_passes(kv, reserved, passes=5)
+
+    median_ms = statistics.median(times) / 1e3
+    print(
+        f"\n{fit}+{order}: {len(kv._reserved)} reserved, {len(kv._waiting)} waiting, window {window}: "
+        f"{median_ms:.2f} ms per pass (worst {max(times) / 1e3:.2f}); "
+        f"{counted.full / 5:.0f} full evaluations and {counted.ruled_out / 5:.0f} refused cheaply per pass"
+    )
+    assert median_ms < 20, f"a pass over {len(kv._waiting)} waiting took {median_ms:.1f} ms"
+    assert counted.full <= 5 * (window + 4), f"{counted.full} full evaluations in 5 passes"
+    assert counted.ruled_out > 0, "nothing was refused from the room, so what is kept was not used"
+
+
+@pytest.mark.parametrize(("fit", "order"), FIT_AND_ORDER)
+def test_a_pass_costs_no_more_for_a_longer_queue_than_the_window_covers(monkeypatch, fit, order):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
+    costs = {}
+    for waiting in (300, 1500):
+        kv, reserved = _pressed_pool(fit, reserved=64, waiting=waiting)
+        counted = _Counted(kv)
+        costs[waiting] = (statistics.median(_timed_passes(kv, reserved, passes=5)), counted.full)
+
+    print(f"\n{fit}+{order}: per pass, by queue length: {costs}")
+    # 5x the queue, and 128 of it in full either way: the rest costs a lookup each
+    assert costs[1500][1] <= costs[300][1] + 4
+    assert costs[1500][0] < 6 * costs[300][0] and costs[1500][0] < 20_000
+
+
+@pytest.mark.parametrize(("fit", "order"), FIT_AND_ORDER)
+def test_a_default_window_looks_at_128(fit, order):
+    assert _manager(16, fit=fit, order=order)._window_size == 128
+
+
+# ── the answers are the pool's own ─────────────────────────────────────
 
 
 def _queue_run(kv: KVManager, seed: int, ops: int) -> tuple[list, dict]:
@@ -153,6 +278,70 @@ def _queue_run(kv: KVManager, seed: int, ops: int) -> tuple[list, dict]:
         if kv._peak:
             assert kv._admitted_are_safe()
     return log, seen
+
+
+def _same_answers(fit: str, order: str, window: int, seed: int) -> None:
+    """The same run with the cheap refusals on and off: the same requests admitted at the same passes."""
+    answers = {}
+    for cheap in (True, False):
+        kv = _manager(24, fit=fit, order=order, backfill_window=window)
+        kv._cheap_refusals = cheap
+        counted = _Counted(kv)
+        log, seen = _queue_run(kv, SEED + seed, ops=2400)
+        answers[cheap] = (log, seen, counted)
+
+    (log_on, seen, on), (log_off, seen_off, off) = answers[True], answers[False]
+    print(f"\n{fit}+{order} window {window} seed {seed}: {seen}; "
+          f"full evaluations {on.full} with the cheap refusals, {off.full} without; "
+          f"{on.ruled_out} requests refused cheaply")
+    assert log_on == log_off, "the cheap refusals changed who was admitted, or when"
+    assert seen == seen_off and seen["admitted"] > 40 and seen["finished"] > 20
+    assert off.ruled_out == 0 and on.ruled_out > 0, "the run never refused a request cheaply"
+    assert on.full < off.full
+
+
+@pytest.mark.parametrize(("fit", "order"), FIT_AND_ORDER)
+@pytest.mark.parametrize("window", [3, 128])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_the_cheap_refusals_change_nobody_s_admission(monkeypatch, fit, order, window, seed):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
+    _same_answers(fit, order, window, seed)
+
+
+@pytest.mark.parametrize(("fit", "order"), FIT_AND_ORDER)
+@pytest.mark.parametrize("window", [3, 128])
+def test_the_kept_counts_are_what_counting_afresh_gives_all_through_a_run(monkeypatch, fit, order, window):
+    """With the debug assertions on, each use of what is kept is checked against counting afresh."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    _same_answers(fit, order, window, seed=7)
+
+
+@pytest.mark.parametrize(("fit", "order"), FIT_AND_ORDER)
+def test_a_cheap_refusal_is_never_of_a_request_the_full_test_admits(monkeypatch, fit, order):
+    """Each time it refuses, ask the full test too, on a pool that is left as it was."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _manager(24, fit=fit, order=order, backfill_window=16)
+    checked = []
+    ruled_out = kv._ruled_out
+
+    def checking(rid, need, hit):
+        answer = ruled_out(rid, need, hit)
+        if answer:
+            kept = {
+                name: dict(getattr(kv, name))
+                for name in ("_refused", "_wait_state", "_asked_at")
+            }
+            head = kv._head()
+            assert not kv._admissible(rid, head, need, hit), f"{rid} was refused, and fits"
+            for name, was in kept.items():
+                setattr(kv, name, was)
+            checked.append(rid)
+        return answer
+
+    kv._ruled_out = checking
+    _queue_run(kv, SEED + 9, ops=2400)
+
+    assert len(checked) > 50
 
 
 # ── configuration ───────────────────────────────────────────────────────
@@ -285,6 +474,47 @@ def test_a_small_window_never_leaves_requests_stuck(monkeypatch, fit, order, win
     _finish(kv)
 
 
+# ── the room ────────────────────────────────────────────────────────────
+
+
+def test_the_room_is_kept_through_grants_and_taken_again_when_pages_come_free():
+    kv = _manager(32, fit="sum", order="backfill")
+    _ingest(kv, "a", prompt=100, max_tokens=60)
+    assert _ready(kv, "a").ready and kv._reserved["a"].pages == 10
+    assert kv._room() == 31 - 10
+
+    # pages granted to a reserved request come off the supply and off what it is owed
+    assert _prefill(kv, "a", 100).ok
+    assert kv._room() == 31 - 10
+    kept = kv._room_at
+    assert kv._alloc("a", "main", 7 * PAGE_SIZE).success
+    assert kv._room() == 31 - 10 and kv._room_at is kept, "a grant inside a reservation moved the room"
+
+    # pages taken by something not counted are not: what is kept is above what there is, which
+    # is safe, and a request it fails to rule out is refused by the full test
+    kv.ingest_request("u", KVReqConfig())
+    assert kv._alloc("u", "main", 3 * PAGE_SIZE).success
+    assert kv._room() == 31 - 10 and kv._supply() - kv._outstanding() == 31 - 10 - 3
+    assert kv._room_at is kept
+    _ingest(kv, "big", prompt=100, max_tokens=60 + 12 * PAGE_SIZE)
+    assert not _ready(kv, "big").ready
+
+    # and taken again once they are given back, which is when it can have risen
+    kv.remove_request("u")
+    assert kv._room_at is kept and kv._room() == 31 - 10 and kv._room_at is not kept
+    kv.remove_request("a")
+    assert kv._room() == 31, "a released reservation did not return its room"
+
+
+def test_the_room_falls_when_a_request_is_reserved():
+    kv = _manager(32, fit="sum", order="backfill")
+    _ingest(kv, "a", prompt=100, max_tokens=60)
+    _ingest(kv, "b", prompt=40, max_tokens=24)
+    assert kv._room() == 31
+    assert _ready(kv, "a").ready and kv._room() == 21
+    assert _ready(kv, "b").ready and kv._room() == 21 - 4
+
+
 # ── the log ─────────────────────────────────────────────────────────────
 
 
@@ -369,3 +599,24 @@ def test_what_the_padding_rows_keep_is_counted_out_of_the_capacity(monkeypatch):
 
     kv.remove_request(-1)
     assert kv._capacity() == 31
+
+
+# ── the microbenchmark ──────────────────────────────────────────────────
+
+
+@pytest.mark.skipif(
+    os.environ.get("MSTAR_KV_BACKFILL_BENCH") != "1",
+    reason="prints a table; MSTAR_KV_BACKFILL_BENCH=1 to run",
+)
+def test_microbenchmark_of_a_pass_over_the_queue(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
+    print("\nper pass over the queue (median of 7, each after a page grant):")
+    for fit in ("sum", "peak"):
+        for reserved in (64, 170):
+            for waiting in (100, 500, 1500):
+                kv, held = _pressed_pool(fit, reserved, waiting)
+                times = _timed_passes(kv, held, passes=7)
+                print(
+                    f"  {fit:4s} reserved={len(kv._reserved):4d} waiting={len(kv._waiting):5d}: "
+                    f"{statistics.median(times):10.0f} us"
+                )

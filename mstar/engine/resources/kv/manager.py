@@ -512,6 +512,13 @@ class KVManager(AttentionResource):
         # again), so a pass over a long queue does not walk it.
         self._window_size = cfg.resolved_backfill_window()
         self._window: dict[str, None] | None = {}
+        # the most a request behind the head could be admitted with, and what it was taken at
+        self._room_at: tuple[tuple, int] | None = None
+        # `_outstanding`, and what it was taken at
+        self._owed: tuple[tuple, int] | None = None
+        # off, the cheap refusals are not made and every request in the window is worked out
+        # in full: what the tests compare the answers against
+        self._cheap_refusals = True
         # CUDA-graph padding rows, which `_capacity` has to count the pages of
         self._padding: set[int] = set()
 
@@ -2147,6 +2154,9 @@ class KVManager(AttentionResource):
             # a guess proves nothing unservable: at worst it waits for an empty pool
             need = capacity - held
         if self._planned:
+            if head != rid and self._ruled_out(rid, need, hit):
+                self._refused[rid] = self._refusal_key(head)
+                return _WAIT
             if not self._admissible(rid, head, need, hit):
                 return _WAIT
         elif self._outstanding() + need > self._supply(leasing=hit):
@@ -2303,7 +2313,28 @@ class KVManager(AttentionResource):
         return self._arena.num_free + len(evictable) - len(evictable.intersection(leasing))
 
     def _outstanding(self) -> int:
-        """Pages admitted requests may still take."""
+        """Pages admitted requests may still take.
+
+        Where the pool backfills it is asked for by every request in the window,
+        so it is kept until the reserved set, the pages free or a page's owners
+        move, which is when the pages any request holds can have.
+        """
+        if not self._backfill:
+            return self._outstanding_afresh()
+        arena = self._arena
+        key = (self._reserved_epoch, arena.num_free, arena.owner_changes)
+        kept = self._owed
+        if kept is not None and kept[0] == key:
+            if _DEBUG_ASSERTS:
+                assert kept[1] == self._outstanding_afresh(), (
+                    f"KV {self.name}: the pages owed, kept at {kept[0]}, are no longer {kept[1]}"
+                )
+            return kept[1]
+        owed = self._outstanding_afresh()
+        self._owed = (key, owed)
+        return owed
+
+    def _outstanding_afresh(self) -> int:
         return sum(
             max(0, res.pages - self._held_fresh(rid))
             for rid, res in self._reserved.items()
@@ -2312,6 +2343,59 @@ class KVManager(AttentionResource):
     # Admission by peak and by backfill. Only reached when the pool is set to
     # either, or is logging its decisions; the summed test in arrival order
     # (above, and in `_try_reserve`) is what runs otherwise.
+
+    def _room(self) -> int:
+        """Pages left to admit into once what the admitted may still take is
+        set aside: an upper bound on the ``need`` any request behind the head can
+        be admitted with, as the head's protection only takes room away.
+
+        A page granted to an admitted request takes one from the supply and one
+        from what it is owed, so the room stays put through every grant that
+        stays within a reservation. It is taken again when the reserved set
+        changes (a request is reserved, released or lent pages) or a page's
+        owners do (pages freed, or cached pages that can now be evicted). Over
+        any other change it can only have fallen since: a request that is not
+        counted, or one past its reservation, took pages the room still counts.
+        So what is kept is never below what there is, and the most it can do is
+        have a request worked out in full that could have been refused.
+        """
+        key = (self._reserved_epoch, self._arena.owner_changes)
+        kept = self._room_at
+        if kept is None or kept[0] != key:
+            kept = self._room_at = (key, self._supply() - self._outstanding())
+        if _DEBUG_ASSERTS:
+            assert kept[1] >= self._supply() - self._outstanding(), (
+                f"KV {self.name}: the room kept at {kept[0]}, {kept[1]}, is below what there is"
+            )
+        return kept[1]
+
+    def _ruled_out(self, rid: str, need: int, hit: list[int]) -> bool:
+        """Whether ``rid``, behind the head, surely cannot be admitted for ``need`` pages.
+
+        Said from what is kept, without the plan, so a long queue of requests
+        that do not fit costs each of them little. Never true of one that the
+        full test (`_admissible`) would admit; it is left to say so for the
+        rest, and to say why one that waits does.
+
+        Summed, ``need`` is over the room. By peak, the set with ``rid`` added
+        is over the pool at a round the planner checks without a pass (see
+        `PeakPlanner.exceeds`).
+
+        A pool that logs has the full test write the row a request's first
+        wait is, so it is only a request that has one that is ruled out here,
+        and then without another.
+        """
+        if not (self._backfill and self._cheap_refusals):
+            return False
+        if self._alog is not None:
+            state = self._wait_state.get(rid)
+            if state is None or state[0]:
+                return False
+        if not self._peak:
+            return need > self._room()
+        plan = self._plan_state()
+        cand = self._plan_entry(rid, need, lent=len(hit))
+        return plan.planner.exceeds(cand, self._supply(leasing=hit) + plan.held_total)
 
     def _refusal_key(self, head: str | None) -> tuple:
         """What a refusal depended on: the reserved set, the pages free, who owns
