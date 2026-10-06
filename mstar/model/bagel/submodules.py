@@ -113,7 +113,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         vit_pos_embed: nn.Module,
         vit_patch_size: int,
         vit_max_num_patch_per_side: int,
-        accelerator_graph: bool = True,
+        accelerator_graph: bool = False,
     ):
         super().__init__()
         self.vit_model = vit_model

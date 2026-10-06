@@ -105,8 +105,16 @@ Notes
 Accelerator graph capture
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-BAGEL, Waypoint and Cosmos3 enable their supported accelerator graph captures
-by default. To disable capture for these models, set this deployment option:
+BAGEL disables accelerator graph capture by default. To enable capture, set
+this deployment option:
+
+.. code-block:: yaml
+
+   model_kwargs:
+     accelerator_graph: true
+
+Waypoint and Cosmos3 enable their supported accelerator graph captures by
+default. To disable capture for these models, set this deployment option:
 
 .. code-block:: yaml
 
@@ -116,7 +124,7 @@ by default. To disable capture for these models, set this deployment option:
 Restart the server after changing this option. Model ``torch.compile`` settings
 are separate from the graph capture switch.
 
-For BAGEL, this also disables the optional ViT block loop capture. Optional
+For BAGEL, the switch also controls the optional ViT block loop capture. Optional
 ViT capture is enabled separately with ``MSTAR_VIT_ACCELERATOR_GRAPH=1`` and
 also requires ``accelerator_graph: true``.
 

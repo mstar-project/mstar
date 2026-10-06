@@ -29,7 +29,7 @@ def model_factory(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(
     ("options", "enabled"),
-    [({}, True), ({"accelerator_graph": False}, False),
+    [({}, False), ({"accelerator_graph": False}, False),
      ({"accelerator_graph": True}, True)],
 )
 def test_model_resolves_graph_switch(model_factory, options, enabled):
@@ -75,7 +75,7 @@ def test_disabled_llm_capture_skips_template_allocation(device_type, node_name):
 def test_enabled_cuda_capture_keeps_existing_recipes(monkeypatch):
     module = LLMSubmodule.__new__(LLMSubmodule)
     nn.Module.__init__(module)
-    module.config = load_bagel_config({})
+    module.config = load_bagel_config({"accelerator_graph": True})
     zeros = torch.zeros
     monkeypatch.setattr(
         torch, "zeros",

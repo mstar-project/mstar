@@ -65,7 +65,7 @@ class BagelModelConfig:
     cfg_renorm_min: float = 0.0
     think_mode: bool = False
     # Deployment switch for all CUDA/XPU captures, including optional ViT regions.
-    accelerator_graph: bool = True
+    accelerator_graph: bool = False
 
     # Sampling defaults (per-request overridable via model_kwargs)
     temperature: float = 0.6  # 0 = greedy (argmax), >0 = sampling
