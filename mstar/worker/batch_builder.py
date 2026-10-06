@@ -27,7 +27,7 @@ class BatchBuildRequest:
     fresh: "ScheduledBatch | None" = None
     # Rows of `backlog` that cannot run this step; they stay parked.
     blocked_rids: set[int] = field(default_factory=set)
-    # Rows left in the step once the caller's own are counted; None is uncapped.
+    # Rows left in the step once the caller's own are counted (> 0); None is uncapped.
     max_batch_size: int | None = None
     # The rid whose capture group the step must share, else its first row's.
     capture_group_of: int | None = None
@@ -111,11 +111,6 @@ class FIFOBatchBuilder(BaseBatchBuilder):
 
     def build_batch(self, request: BatchBuildRequest) -> BatchBuildResult:
         max_bs = request.max_batch_size
-        if max_bs is not None and max_bs <= 0:
-            # the caller already holds a full batch
-            return BatchBuildResult(
-                None, backlog=_merged(request.backlog, request.fresh),
-            )
         batch = _merged(request.backlog, request.fresh)
         if batch is None:
             return BatchBuildResult(None)
