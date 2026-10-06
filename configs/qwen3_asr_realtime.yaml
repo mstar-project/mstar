@@ -1,5 +1,7 @@
 model: "qwen3_asr_realtime"
 max_seq_len: 65536
+# Realtime steps are short (one chunk of audio so far), 1024 pages hold them.
+max_concurrent_requests: 64
 resources:
   kv_cache:
     max_num_pages: 1024
