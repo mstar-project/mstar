@@ -8,7 +8,9 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 from __future__ import annotations
 
 import logging
+import time as _time
 from collections.abc import Collection, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
@@ -19,7 +21,7 @@ from mstar.engine.resources.step import (
     FullAdmitOutcome,
     SubmoduleStep,
 )
-from mstar.utils.profiler import range_pop, range_push
+from mstar.utils.profiler import phase_record, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,23 @@ class StepRunner:
         # the step whose pre-plan is staged across the pre-planning resources,
         # as `_step_key` describes it; None when nothing is staged
         self._staged: tuple | None = None
+
+    @contextmanager
+    def _span(self, name: str):
+        """One NVTX range plus one MSTAR_PHASE_TIMING sample, same name.
+
+        The per-resource keys are what make `pre_plan` legible: a single
+        aggregate hides which resource owns the step's planning cost.
+        """
+        if self._nvtx:
+            range_push(name)
+        t0 = _time.perf_counter()
+        try:
+            yield
+        finally:
+            phase_record(name, _time.perf_counter() - t0)
+            if self._nvtx:
+                range_pop()
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
@@ -322,13 +341,8 @@ class StepRunner:
         self._drop_stale_preplan(step)
         ready = True
         for key in self._keys_for(step):
-            if self._nvtx:
-                range_push(f"res.admit.{key}")
-            try:
+            with self._span(f"res.admit.{key}"):
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
-            finally:
-                if self._nvtx:
-                    range_pop()
             if not outcome.ok:
                 logger.warning(
                     "Admit for resource %s failed with error: %s",
@@ -351,13 +365,8 @@ class StepRunner:
         results = step.ctx.plan_results
         results.clear()
         for key in self._keys_for(step):
-            if self._nvtx:
-                range_push(f"res.plan.{key}")
-            try:
+            with self._span(f"res.plan.{key}"):
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
-            finally:
-                if self._nvtx:
-                    range_pop()
         return results
 
     def pre_admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
@@ -367,13 +376,8 @@ class StepRunner:
         state as already reserved and no-op"""
         ready = True
         for key in self._preplan_keys_for(step):
-            if self._nvtx:
-                range_push(f"res.pre_admit.{key}")
-            try:
+            with self._span(f"res.pre_admit.{key}"):
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
-            finally:
-                if self._nvtx:
-                    range_pop()
             if not outcome.ok:
                 logger.warning(
                     "Admit for pre-planning resource %s failed with error: %s",
@@ -391,13 +395,8 @@ class StepRunner:
         in `ctx.plan_results` for the dependents in this same subset."""
         results = step.ctx.plan_results
         for key in self._preplan_keys_for(step):
-            if self._nvtx:
-                range_push(f"res.pre_plan.{key}")
-            try:
+            with self._span(f"res.pre_plan.{key}"):
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
-            finally:
-                if self._nvtx:
-                    range_pop()
         self._staged = self._step_key(step)
         return results
 

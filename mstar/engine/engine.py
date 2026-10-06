@@ -48,7 +48,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
 )
 from mstar.profile.worker import ExecTimings
-from mstar.utils.profiler import mark, range_pop, range_push
+from mstar.utils.profiler import mark, phase_record, range_pop, range_push
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -636,9 +636,18 @@ class Engine:
         """
         if self._enable_nvtx:
             range_push(f"engine.prepare_inputs.bs{len(batch.request_ids)}")
+        # Keyed by node and walk, not batch size: the mean over a mixed run is
+        # two populations (an encoder window costs orders of magnitude more
+        # than a decode token) and tells you about neither.
+        _t0 = time.perf_counter()
         try:
             self._prepare_inputs(batch)
         finally:
+            phase_record(
+                "engine.prepare_inputs."
+                f"{batch.node_name}.{batch.step_context.graph_walk}",
+                time.perf_counter() - _t0,
+            )
             if self._enable_nvtx:
                 range_pop()
 
@@ -671,10 +680,15 @@ class Engine:
             else:
                 node_inputs.append(req_inputs)
 
+        _t_reg = time.perf_counter()
         batch.register_prepare_batch(node_inputs)
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
+        )
+        phase_record(
+            f"engine.prepare_inputs.register.{batch.node_name}",
+            time.perf_counter() - _t_reg,
         )
 
     def extend_prefix_chains(
