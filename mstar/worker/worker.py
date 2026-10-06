@@ -2943,8 +2943,10 @@ class Worker:
         # and taken from the GRAPH, so a model returning a tensor under a name
         # no edge carries cannot change what gets routed. Stale outputs are
         # dropped by complete_and_route_batch itself.
-        signals = batch_N.batch.output_signals if not batch_N.batch.request_walks \
-            else self._graph_runtime.get_output_signals(batch_N.node_name, graph_walk)
+        batch = batch_N.batch
+        signals = batch.output_signals if not batch.request_walks \
+            else batch.walk_output_signals.get(graph_walk) \
+            or self._graph_runtime.get_output_signals(batch_N.node_name, graph_walk)
         # One store call for the batch rather than one per request, and the
         # flat columns come back already built: the manager fills them as it
         # mints, so nothing is keyed by request and signal only to be taken

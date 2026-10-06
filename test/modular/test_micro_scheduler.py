@@ -135,6 +135,7 @@ class _Runtime:
         return PopRidsOutput(
             wg_ids=ParallelList(rids, wg_ids),
             input_edges=_edge_block(rids),
+            output_signals=(f"out_{graph_walk}",),
         )
 
     def get_nodes(self, node_name, rids, wg_ids):
@@ -1130,3 +1131,21 @@ def test_a_walk_joins_when_it_costs_nothing():
     batch = _next_batch(sched, manager)
 
     assert batch.graph_walk == MIXED and len(batch) == 3
+
+
+
+def test_a_relabelled_step_routes_with_its_own_walks_outputs():
+    """The merged batch keeps its first walk's output names; a step that turns
+    out to be one walk must route with that walk's, or a decode row loses its
+    loop-back edge."""
+    sched = _combined_scheduler(_Engine(max_bs=8, not_ready={"p0"}))
+    backlogged = _batch(["p0"], walk=MIXED)
+    backlogged.request_walks = {"p0": "prefill"}
+    backlogged.output_signals = ["out_prefill"]
+    backlogged.walk_output_signals = {"prefill": ["out_prefill"]}
+    sched.backlog[(NODE, MIXED)] = backlogged
+
+    batch = _next_batch(sched, _Manager(["d0", "d1"]))
+
+    assert batch.graph_walk == WALK
+    assert list(batch.output_signals) == [f"out_{WALK}"]
