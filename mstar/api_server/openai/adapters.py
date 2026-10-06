@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
 from mstar.model.multimodal import PromptPart
+from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
     from mstar.api_server.openai.protocol import (
@@ -381,6 +382,35 @@ class Qwen3OmniAdapter(OpenAIAdapter):
             input_modalities=["text"],
             output_modalities=["text", "audio"],
             model_kwargs=mk,
+        )
+
+
+class Qwen3_5Adapter(OpenAIAdapter):
+    """Qwen3.5: text-and-image chat, text out.
+
+    Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
+    ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus two
+    non-OpenAI fields via ``extra_body``:
+
+    * ``repetition_penalty`` — the sampler applies it over the prompt's tokens
+      as well as the generated ones.
+    * ``enable_thinking`` (default true) — the chat template opens a
+      ``<think>`` block. Set it false for short answers.
+    """
+
+    supports_chat = True
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
+        mk = _passthrough(req)
+        _apply_sampling(req, mk)
+        return SubmitArgs(
+            text=text,
+            file_paths=file_paths or None,
+            input_modalities=in_mods,
+            output_modalities=["text"],
+            model_kwargs=mk,
+            prompt_parts=parts,
         )
 
 
@@ -991,6 +1021,11 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "whisper_large": WhisperAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
 }
+
+# One key per size; every size takes the same adapter.
+ADAPTER_REGISTRY.update({
+    f"qwen3_5_{size}b": Qwen3_5Adapter() for size in QWEN_3_5_DENSE_SIZES
+})
 
 
 def get_adapter(model_name: str) -> OpenAIAdapter | None:
