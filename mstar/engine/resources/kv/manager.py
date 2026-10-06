@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+import time
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from typing import Any
@@ -14,6 +15,7 @@ from mstar.engine.resources.base import (
     EngineResourceInfo,
     PublishedInfo,
 )
+from mstar.engine.resources.kv.admission_log import open_log
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -24,6 +26,14 @@ from mstar.engine.resources.kv.config import (
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import fingerprint, page_key
+from mstar.engine.resources.kv.peak_plan import (
+    PeakPlanner,
+    PlanEntry,
+    banker_safe,
+    easy_allows,
+    footprint,
+    shadow_sum,
+)
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     KVPlanOutput,
@@ -41,6 +51,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
     AdmitRuntimeError,
     AllocationFailed,
+    GrantDeferred,
     RequestOffloading,
     Segment,
     StepContext,
@@ -257,6 +268,25 @@ class Reservation:
 
 
 @dataclass
+class PlanState:
+    """The admitted requests as a plan sees them, for as long as nothing moves.
+
+    Built when a request asks to be admitted and the reserved set, the free
+    pages or the owners of a page have changed since the last build; ``key`` is
+    what that was taken at. Rounds left are as of the build, so they run up to a
+    page's worth of tokens late until the next page is granted, which only
+    delays a release in the plan.
+    """
+    key: tuple
+    entries: list[PlanEntry]
+    held: list[int]
+    need: list[int]
+    held_total: int
+    # only built for the peak fit
+    planner: PeakPlanner | None = None
+
+
+@dataclass
 class AdmissionDeferred(AdmitFailedReason):
     """A step carries a request that has not reserved, and its turn hasn't come.
 
@@ -453,6 +483,30 @@ class KVManager(AttentionResource):
         # label -> the walk prepare probes it on
         self._prefill_walks: dict[str, str] = {}
 
+        # how this pool admits: the environment, then the config. The defaults
+        # (sum, fifo) take none of the paths below.
+        self._fit, self._order = cfg.resolved_admission()
+        self._peak = self._fit == "peak"
+        self._backfill = self._order == "backfill"
+        self._alog = open_log(name)
+        # decisions that are not the summed test in arrival order, or that are logged
+        self._planned = self._peak or self._backfill or self._alog is not None
+        # bumped as what is reserved changes; with the arena's counters it says
+        # whether a plan, or a refusal, still describes the pool
+        self._reserved_epoch = 0
+        self._plan: PlanState | None = None
+        self._shadow: tuple[tuple, tuple[int, int] | None] | None = None
+        # rid -> the state a request was last refused in: asked again in it, the answer is no
+        self._refused: dict[str, tuple] = {}
+        # rid -> (label, prompt tokens, decode tokens), as `_reservation` counts them
+        self._shape: dict[str, list[tuple[str, int, int]]] = {}
+        # under TP, the requests a step has reached on this rank: what every rank agrees on
+        self._seen: set[str] = set()
+        # telemetry only: when each request first asked, reserved, and what it last waited on
+        self._asked_at: dict[str, float] = {}
+        self._reserved_at: dict[str, float] = {}
+        self._wait_state: dict[str, tuple] = {}
+
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
         return cls(
@@ -565,6 +619,7 @@ class KVManager(AttentionResource):
         reserved = self._reserved.get(rid)
         if reserved is not None:
             reserved.pages -= pages
+            self._reserved_epoch += 1
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
@@ -943,6 +998,8 @@ class KVManager(AttentionResource):
         # one critical section so the read-of-stored_len then alloc is atomic
         # against a concurrent reset/remove/commit on another thread
         with self._lock:
+            if self._peak and self._world_size > 1:
+                self._seen.update(ctx.request_ids)
             # before anything moves, so a refusal leaves nothing to unwind, and
             # before the lease converts, as a request is sized off the lease it holds
             if not ctx.capture:
@@ -1768,6 +1825,8 @@ class KVManager(AttentionResource):
                 if stream.read_future is not None:
                     wait([stream.read_future])
         with self._lock:
+            if self._alog is not None and rid in self._reserved:
+                self._log_release(rid)
             if rid in self._streams:
                 for stream in self._streams[rid].values():
                     self._release_lease(stream)
@@ -1781,6 +1840,7 @@ class KVManager(AttentionResource):
             self._waiting.pop(rid, None)
             self._rooted.pop(rid, None)
             self._opened.pop(rid, None)
+            self._forget_admission(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -1862,7 +1922,13 @@ class KVManager(AttentionResource):
                     for rid, res in self._reserved.items() if held[rid] > res.pages
                 }
                 assert not over, f"requests took more pages than they reserved: {over}"
-                if self._leads:
+                if self._leads and self._peak:
+                    assert self._admitted_are_safe(), (
+                        f"admitted requests cannot all finish: {self._outstanding()} "
+                        f"pages are owed, {self._supply()} are free or evictable, and "
+                        "no order of finishing them is covered"
+                    )
+                elif self._leads:
                     outstanding, supply = self._outstanding(), self._supply()
                     assert outstanding <= supply, (
                         f"admitted requests may still take {outstanding} pages, but "
@@ -2000,9 +2066,10 @@ class KVManager(AttentionResource):
         """Hold ``rid`` back until what it may take fits, in the order requests
         first asked. None once it has reserved.
 
-        Nothing passes the head, so short requests never starve a long one. The
-        head's hit is leased as it is admitted, not credited off a lookup that
-        an eviction could undo before its prefill runs.
+        Nothing passes the head, so short requests never starve a long one
+        (unless the pool backfills: then one that does not delay the head may).
+        The head's hit is leased as it is admitted, not credited off a lookup
+        that an eviction could undo before its prefill runs.
         """
         overrides = self._overrides.get(rid)
         if not self._gated(rid, overrides):
@@ -2011,7 +2078,11 @@ class KVManager(AttentionResource):
             if rid not in self._overrides or rid in self._reserved:
                 return None
             self._waiting.setdefault(rid, None)
-            if next(iter(self._waiting)) != rid:
+            head = next(iter(self._waiting))
+            if head != rid and not self._backfill:
+                return _WAIT
+            if self._planned and self._refused.get(rid) == self._refusal_key(head):
+                # nothing it was refused over has moved: skip the probe and the plan
                 return _WAIT
             label = self._probe_label(rid, node_name, graph_walk)
             keys = None
@@ -2031,10 +2102,11 @@ class KVManager(AttentionResource):
         self, rid: str, stream: CacheStream | None = None,
         rooted: list[bytes] | None = None,
     ) -> AdmitOutcome | None:
-        """Reserve for ``rid`` if it heads the queue and fits, leasing its hit
-        on ``stream`` as it does. None once it has reserved."""
+        """Reserve for ``rid`` if it heads the queue (or backfills) and fits,
+        leasing its hit on ``stream`` as it does. None once it has reserved."""
         self._waiting.setdefault(rid, None)
-        if next(iter(self._waiting)) != rid:
+        head = next(iter(self._waiting))
+        if head != rid and not self._backfill:
             return _WAIT
         hit = []
         if stream is not None and rooted and self._leasable(stream):
@@ -2047,21 +2119,29 @@ class KVManager(AttentionResource):
             if reservation.exact:
                 del self._waiting[rid]
                 self._rooted.pop(rid, None)
+                if self._alog is not None:
+                    self._log("refuse", rid, is_head=head == rid, need=need + held, capacity=capacity)
                 return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                     f"KV {self.name}: request {rid} needs {need + held} pages, "
                     f"and the pool has {capacity} for requests"
                 ))
             # a guess proves nothing unservable: at worst it waits for an empty pool
             need = capacity - held
-        if self._outstanding() + need > self._supply(leasing=hit):
+        if self._planned:
+            if not self._admissible(rid, head, need, hit):
+                return _WAIT
+        elif self._outstanding() + need > self._supply(leasing=hit):
             return _WAIT
         if hit:
             self._lease(rid, stream, rooted)
             stream.gate_lease = True
         reservation.pages = need
         self._reserved[rid] = reservation
+        self._reserved_epoch += 1
         del self._waiting[rid]
         self._rooted.pop(rid, None)
+        if self._planned:
+            self._reserved_at[rid] = time.monotonic()
         return None
 
     def _reserve_new(self, ctx: StepContext) -> AdmissionDeferred | None:
@@ -2083,12 +2163,18 @@ class KVManager(AttentionResource):
                     )
                 continue
             self._reserved[rid] = self._reservation(rid)
+            self._reserved_epoch += 1
             self._waiting.pop(rid, None)
             self._rooted.pop(rid, None)
             if _DEBUG_ASSERTS and self._leads:
-                assert self._outstanding() <= self._supply(), (
-                    f"KV {self.name}: {rid} was admitted into room this rank does not have"
-                )
+                if self._peak:
+                    assert self._admitted_are_safe(), (
+                        f"KV {self.name}: {rid} was admitted into room this rank does not have"
+                    )
+                else:
+                    assert self._outstanding() <= self._supply(), (
+                        f"KV {self.name}: {rid} was admitted into room this rank does not have"
+                    )
         return None
 
     def _probe_label(self, rid: str, node_name: str, graph_walk: str) -> str | None:
@@ -2146,6 +2232,248 @@ class KVManager(AttentionResource):
         return sum(
             max(0, res.pages - self._held_fresh(rid))
             for rid, res in self._reserved.items()
+        )
+
+    # Admission by peak and by backfill. Only reached when the pool is set to
+    # either, or is logging its decisions; the summed test in arrival order
+    # (above, and in `_try_reserve`) is what runs otherwise.
+
+    def _refusal_key(self, head: str | None) -> tuple:
+        """What a refusal depended on: the reserved set, the pages free, who owns
+        which, and who heads the queue. Asked again with all of it unchanged,
+        a request gets the same answer, so it is not worked out again."""
+        arena = self._arena
+        return (self._reserved_epoch, arena.num_free, arena.owner_changes, head)
+
+    def _life(self, rid: str) -> list[tuple[str, int, int]]:
+        """``(label, prompt tokens, decode tokens)`` for each label ``rid`` opens
+        here, counted as `_reservation` counts them. Fixed once the request is
+        ingested, so kept."""
+        life = self._shape.get(rid)
+        if life is None:
+            overrides = self._overrides[rid]
+            page_size, cap = self.config.page_size, self.config.max_seq_len
+            slots = overrides.prompt_slots or {}
+            life = []
+            for label in self._labels_opened(overrides):
+                if label in slots:
+                    decodes = label in (overrides.decode_labels or ())
+                    life.append((
+                        label, slots[label],
+                        min(overrides.max_tokens, cap) if decodes else 0,
+                    ))
+                else:
+                    keys = overrides.prefix_keys[label]
+                    tail = (overrides.prefix_tail or {}).get(label) or ()
+                    prompt = (len(keys) - (1 if tail else 0)) * page_size + len(tail)
+                    decode = min(prompt + overrides.max_tokens, cap) - prompt
+                    life.append((label, prompt, max(0, decode)))
+            self._shape[rid] = life
+        return life
+
+    def _plan_entry(self, rid: str, claim: int, lent: int = 0) -> PlanEntry:
+        """``rid`` as the plan sees it: what it holds, may take, takes at once
+        (its prompt, not yet allocated, less ``lent`` pages the index will lend),
+        and how many decode rounds it has left on how many labels.
+
+        The rounds are the longest any decode label has left of its tokens, by
+        the stream's committed length. A request still to prefill has all of them.
+        """
+        streams = self._streams.get(rid, {})
+        page_size = self.config.page_size
+        now = growth = rounds = 0
+        for label, prompt, decode in self._life(rid):
+            stream = streams.get(label)
+            have = stored = 0
+            if stream is not None:
+                have = len(stream.page_indices) + len(stream.lease or ())
+                stored = stream.stored_len
+            now += max(0, -(-prompt // page_size) - have)
+            if decode:
+                left = decode - max(0, stored - prompt)
+                if left > 0:
+                    growth += 1
+                    rounds = max(rounds, left)
+        return PlanEntry(
+            held=self._held_fresh(rid), claim=claim, now=max(0, now - lent),
+            growth=growth, rounds=rounds,
+        )
+
+    def _plan_state(self) -> PlanState:
+        """The admitted requests as a plan, kept until the reserved set, the free
+        pages or a page's owners change."""
+        key = self._refusal_key(None)[:3]
+        state = self._plan
+        if state is not None and state.key == key:
+            return state
+        entries = [self._plan_entry(rid, res.pages) for rid, res in self._reserved.items()]
+        state = PlanState(
+            key=key, entries=entries, held=[e.held for e in entries],
+            need=[e.need for e in entries], held_total=sum(e.held for e in entries),
+        )
+        if self._peak:
+            state.planner = PeakPlanner(
+                entries, self._supply() + state.held_total, self.config.page_size,
+            )
+        self._plan = state
+        return state
+
+    def _head_shadow(self, head: str) -> tuple[int, int] | None:
+        """When the head of the queue could start, and the room it leaves then."""
+        key = (*self._refusal_key(head), self._rooted.get(head) is not None)
+        if self._shadow is not None and self._shadow[0] == key:
+            return self._shadow[1]
+        rooted = self._rooted.get(head)
+        hit = []
+        if rooted and self._index is not None:
+            hit = self._index.peek(rooted)[:len(rooted) - 1]
+        claim = min(max(0, self._reservation(head).pages - len(hit)), self._capacity())
+        plan = self._plan_state()
+        supply = self._supply(leasing=hit)
+        if self._peak:
+            shadow = plan.planner.shadow(
+                self._plan_entry(head, claim, lent=len(hit)), supply + plan.held_total,
+            )
+        else:
+            shadow = shadow_sum(plan.entries, supply, claim)
+        self._shadow = (key, shadow)
+        return shadow
+
+    def _admissible(self, rid: str, head: str, need: int, hit: list[int]) -> bool:
+        """Whether ``rid`` may reserve ``need`` pages now.
+
+        Fits the pool by the summed test, or by the peak test and a safe state
+        with it added; and, behind the head, only if the head is not delayed.
+        """
+        logged = self._alog is not None
+        started = time.perf_counter_ns() if logged else 0
+        if logged:
+            self._asked_at.setdefault(rid, time.monotonic())
+        supply = self._supply(leasing=hit)
+        plan = self._plan_state()
+        cand = self._plan_entry(rid, need, lent=len(hit))
+        capacity = supply + plan.held_total
+        why = None
+        if self._peak:
+            planned = plan.planner.peak_from(cand)
+            if planned > capacity:
+                why = "peak"
+            elif not banker_safe(
+                supply, [*plan.held, cand.held], [*plan.need, cand.need],
+            ):
+                why = "unsafe"
+        else:
+            planned = plan.held_total + sum(plan.need) + need
+            if planned > capacity:
+                why = "sum"
+        if why is None and rid != head:
+            rounds = max(1, cand.rounds)
+            cost = footprint(cand, rounds - 1, self.config.page_size) if self._peak else need
+            if not easy_allows(rounds, cost, self._head_shadow(head)):
+                why = "easy"
+        if why is None:
+            self._refused.pop(rid, None)
+            self._wait_state.pop(rid, None)
+            if logged:
+                self._log(
+                    "reserve", rid, is_head=rid == head, planned_peak=planned,
+                    plan_capacity=capacity, need=need, hit=len(hit),
+                    waited_s=time.monotonic() - self._asked_at.pop(rid, time.monotonic()),
+                    planner_us=(time.perf_counter_ns() - started) / 1e3,
+                )
+            return True
+        self._refused[rid] = self._refusal_key(head)
+        if logged:
+            state = (rid == head, why)
+            if self._wait_state.get(rid) != state:
+                self._wait_state[rid] = state
+                self._log(
+                    "wait", rid, is_head=rid == head, why=why, planned_peak=planned,
+                    plan_capacity=capacity, need=need,
+                    planner_us=(time.perf_counter_ns() - started) / 1e3,
+                )
+        return False
+
+    def _admitted_are_safe(self) -> bool:
+        """Whether the admitted requests, as they stand, can finish one after another."""
+        held = [self._held_fresh(rid) for rid in self._reserved]
+        need = [max(0, res.pages - h) for res, h in zip(self._reserved.values(), held)]
+        return banker_safe(self._supply(), held, need)
+
+    def _defer_grant(self, rid: str, label: str, n: int) -> GrantDeferred | None:
+        """Refuse ``n`` pages for ``rid`` if, once granted, the admitted requests
+        could no longer all finish. None if the grant is safe.
+
+        A safe state always has a request that can finish with what is free, and
+        a grant to that request keeps it safe, so the request that has to
+        progress is never the one refused. A grant for more pages than are free
+        is refused too, if the state was safe: the others hold what it needs,
+        and it waits for them, where an allocation failure would offload someone
+        or hold its whole batch.
+
+        A state that was already unsafe is not this test's to mend: something
+        the admitted requests do not account for (a request nothing counts, a
+        guess that ran over) took the pages, and the grant goes to the paths
+        that answer a shortage of pages, as it does when the pool admits by the
+        summed test.
+
+        Under TP each rank answers off the requests a step has reached on it,
+        which every rank agrees on: a request not yet reached holds nothing, so
+        leaving it out only loosens the test.
+        """
+        started = time.perf_counter_ns() if self._alog is not None else 0
+        shared = self._world_size > 1
+        supply = self._supply()
+        held, need, at = [], [], 0
+        for other, res in self._reserved.items():
+            if shared and other != rid and other not in self._seen:
+                continue
+            if other == rid:
+                at = len(held)
+            pages = self._held_fresh(other)
+            held.append(pages)
+            need.append(max(0, res.pages - pages))
+        owed = need[at]
+        held[at] += n
+        need[at] = max(0, owed - n)
+        if banker_safe(supply - n, held, need):
+            return None
+        held[at] -= n
+        need[at] = owed
+        if not banker_safe(supply, held, need):
+            return None
+        if self._alog is not None:
+            self._log(
+                "grant_deferred", rid, label=label, pages=n,
+                planner_us=(time.perf_counter_ns() - started) / 1e3,
+            )
+        return GrantDeferred(
+            message=(
+                f"KV {self.name}: {n} pages for request {rid}, label {label}, would "
+                "leave the admitted requests unable to all finish; not before another progresses"
+            ),
+            label=label, request_id=rid,
+        )
+
+    def _forget_admission(self, rid: str) -> None:
+        self._reserved_epoch += 1
+        for per_rid in (
+            self._refused, self._shape, self._asked_at, self._reserved_at, self._wait_state,
+        ):
+            per_rid.pop(rid, None)
+        self._seen.discard(rid)
+
+    def _log(self, event: str, rid: str, **fields) -> None:
+        self._alog.write(
+            event, self.name, rid=rid, fit=self._fit, order=self._order,
+            supply=self._supply(), n_reserved=len(self._reserved),
+            n_waiting=len(self._waiting), **fields,
+        )
+
+    def _log_release(self, rid: str) -> None:
+        self._log(
+            "release", rid, held=self._held_fresh(rid), claim=self._reserved[rid].pages,
+            reserved_s=time.monotonic() - self._reserved_at.get(rid, time.monotonic()),
         )
 
     def _check_ready(
@@ -2277,6 +2605,10 @@ class KVManager(AttentionResource):
             num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
             num_new_pages = num_pages_needed - len(stream.page_indices)
             if num_new_pages > 0:
+                if self._peak and self._leads and request_id in self._reserved:
+                    deferred = self._defer_grant(request_id, label, num_new_pages)
+                    if deferred is not None:
+                        return AllocResult(success=False, error=deferred)
                 new_pages = self._arena.acquire(num_new_pages)
                 if new_pages is None and self._index is not None:
                     # cached pages are the only ones that can be given back
