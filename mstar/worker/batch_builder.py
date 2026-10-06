@@ -33,6 +33,10 @@ class BatchBuildRequest:
     capture_group_of: int | None = None
     # Under a combined walk: real walk -> rows left for a step of that walk.
     walk_caps: dict[str, int | None] = field(default_factory=dict)
+    # Under a combined walk: rows left for a step mixing walks.
+    mixed_cap: int | None = None
+    # The walk of the caller's own rows, if it holds any; always in the step.
+    pre_existing_walk: str | None = None
     # `Engine.capture_group` for one rid of this (node, walk).
     capture_group: Callable[[int], Any] = lambda _: None
 
@@ -111,9 +115,10 @@ class FIFOBatchBuilder(BaseBatchBuilder):
     """Backlog first, then fresh rows, in arrival order, up to the cap; one
     capture group per step. Everything past the cap stays in the backlog.
 
-    Under a combined walk a step's cap is the smallest of its walks' caps, so
-    a walk is left out of the step when that schedules more rows; the oldest
-    row's walk is always in, so a row left out is reached once it is oldest.
+    Under a combined walk a step of one walk takes that walk's cap and a mixed
+    step the smallest of its walks' and the combined walk's, so a walk is left
+    out of the step when that schedules more rows; the oldest row's walk is
+    always in, so a row left out is reached once it is oldest.
     """
 
     def build_batch(self, request: BatchBuildRequest) -> BatchBuildResult:
@@ -127,7 +132,10 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             exclude_rids=request.blocked_rids, anchor=request.capture_group_of,
         )
         if request.walk_caps and batch.request_walks:
-            max_bs, left_out = _compose_walks(batch, exclude, max_bs, request.walk_caps)
+            max_bs, left_out = _compose_walks(
+                batch, exclude, max_bs, request.walk_caps,
+                request.mixed_cap, request.pre_existing_walk,
+            )
             if max_bs is not None and max_bs <= 0:
                 return BatchBuildResult(None, backlog=batch)  # the caller's rows fill it
             exclude = exclude | left_out
@@ -137,16 +145,21 @@ class FIFOBatchBuilder(BaseBatchBuilder):
 
 def _compose_walks(
     batch: "ScheduledBatch", exclude: set[int], max_bs: int | None,
-    walk_caps: dict[str, int | None],
+    walk_caps: dict[str, int | None], mixed_cap: int | None,
+    pre_existing_walk: str | None,
 ) -> tuple[int | None, set[int]]:
     """The cap and left-out rows of the walk set, grown in order of first
-    appearance, that schedules the most rows; ties keep more walks."""
+    appearance after the caller's own walk, that schedules the most rows;
+    ties keep more walks."""
     rows = [rid for rid in batch.request_to_worker_graph if rid not in exclude]
-    order = list(dict.fromkeys(batch.walk_of(rid) for rid in rows))
+    held = [pre_existing_walk] if pre_existing_walk is not None else []
+    order = list(dict.fromkeys([*held, *(batch.walk_of(rid) for rid in rows)]))
     best: tuple[int, int | None, set[str]] | None = None
     for k in range(1, len(order) + 1):
         walks = set(order[:k])
         caps = [walk_caps.get(w) for w in walks] + [max_bs]
+        if len(walks) > 1:
+            caps.append(mixed_cap)
         cap = min((c for c in caps if c is not None), default=None)
         n = sum(1 for rid in rows if batch.walk_of(rid) in walks)
         n = n if cap is None else min(n, cap)

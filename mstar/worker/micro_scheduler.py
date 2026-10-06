@@ -524,6 +524,8 @@ class MicroScheduler:
 
         if self.sched_type != SchedulingType.ROUND_ROBIN:
             raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
+        # a targeted merge's pre-existing rows are of the target's own walk
+        pre_existing_walk = target[1] if target is not None and pre_existing_batch_size else None
         target = None if target is None else self._key(*target)
         exclude_target = None if exclude_target is None else self._key(*exclude_target)
         scan = True
@@ -550,6 +552,7 @@ class MicroScheduler:
                 max_batch_size=max_batch_size,
                 pre_existing_batch_size=pre_existing_batch_size,
                 capture_group_of=capture_group_of,
+                pre_existing_walk=pre_existing_walk,
             )
             if scheduled is not None:
                 return scheduled
@@ -625,6 +628,7 @@ class MicroScheduler:
         max_batch_size: int | None,
         pre_existing_batch_size: int,
         capture_group_of: int | None,
+        pre_existing_walk: str | None = None,
     ) -> ScheduledBatch | None:
         """One step for ``node_walk`` out of its backlog and its ready
         ``entries``, composed by the batch builder."""
@@ -657,6 +661,10 @@ class MicroScheduler:
             max_batch_size=remaining,
             capture_group_of=capture_group_of,
             walk_caps=walk_caps,
+            mixed_cap=self._remaining_capacity(
+                self._max_batch_size(*node_walk), pre_existing_batch_size,
+            ) if walk_caps else None,
+            pre_existing_walk=pre_existing_walk,
         ))
 
     def _room_left(
@@ -666,10 +674,17 @@ class MicroScheduler:
         """What is left of ``node_walk``'s cap once the caller's own rows are
         counted. None stays None: an uncapped node takes the whole ready set."""
         if max_batch_size is None:
-            max_batch_size = self._max_batch_size(*node_walk)
-        if max_batch_size is None:
-            return None
-        return max(max_batch_size - pre_existing_batch_size, 0)
+            max_batch_size = self._key_cap(node_walk)
+        remaining = self._remaining_capacity(max_batch_size, pre_existing_batch_size)
+        return None if remaining is None else max(remaining, 0)
+
+    @staticmethod
+    def _remaining_capacity(
+        max_batch_size: int | None, pre_existing: int,
+    ) -> int | None:
+        """What is left of the cap once the caller's own rows are counted.
+        None stays None: an uncapped node takes the whole ready set."""
+        return None if max_batch_size is None else max_batch_size - pre_existing
 
     def _capture_group(
         self, request_state: RequestStateManager,
@@ -830,6 +845,23 @@ class MicroScheduler:
             k: v for k, v in self.backlog.items() if len(v) > 0
         }
 
+    def _key_cap(self, key: tuple[str, str]) -> int | None:
+        """A key's cap. A combined key takes its largest walk's: a step of one
+        walk replays that walk's graphs, and the builder caps mixed steps."""
+        walks = self._walks_of_key.get(key)
+        if not walks:
+            return self._max_batch_size(*key)
+        caps = [self._max_batch_size(key[0], walk) for walk in walks]
+        return None if None in caps else max(caps)
+
+    def _walk_set_cap(self, key: tuple[str, str], walks: set[str]) -> int | None:
+        """The cap of a ``key`` step holding ``walks``: one walk's own, or for
+        a mixed step the smallest of its walks' and the combined walk's."""
+        caps = [self._max_batch_size(key[0], walk) for walk in walks]
+        if len(walks) > 1:
+            caps.append(self._max_batch_size(*key))
+        return min((cap for cap in caps if cap is not None), default=None)
+
     def _max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """The engine's cap for this (node, walk), if it has one. A combined
         walk's cap is the model's to declare, via its captures or max_batch_size."""
@@ -891,9 +923,13 @@ class MicroScheduler:
     def room_for_continuing(self, target: tuple[str, str]) -> int | None:
         """How many of a speculative batch's own rids fit in ``target``'s step
         beside its backlog; see ``BaseBatchBuilder.room_for_continuing``."""
-        target = self._key(*target)
+        key = self._key(*target)
+        backlog = self.backlog.get(key)
+        walks = {target[1]}
+        if backlog is not None and key != target:
+            walks |= {backlog.walk_of(rid) for rid in backlog.request_to_worker_graph}
         return self.batch_builder.room_for_continuing(
-            self._max_batch_size(*target), self.backlog.get(target),
+            self._walk_set_cap(key, walks), backlog,
         )
 
     def has_ready_excluding(
