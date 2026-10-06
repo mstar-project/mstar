@@ -5,6 +5,8 @@ Not a test (pytest does not collect it). Run from the repository root:
     .venv/bin/python test/modular/bench_kv_admission_cost.py                 # the table
     .venv/bin/python test/modular/bench_kv_admission_cost.py --profile       # cProfile of one config
     .venv/bin/python test/modular/bench_kv_admission_cost.py --audit         # what moves owner_changes
+    .venv/bin/python test/modular/bench_kv_admission_cost.py --per-token     # every request one token a pass
+    .venv/bin/python test/modular/bench_kv_admission_cost.py --diff A.json B.json   # same decisions?
 
 The pool is the one a BAGEL run leaves: 2048 pages of 128 tokens, the prefix index
 holding about 1500 of them from many short independent prompts (most evictable), the
@@ -20,6 +22,10 @@ the pool fits by peak or backfills) or, for the summed test in arrival order tha
 admission-control defaults to, one call of ``_try_reserve``. The ``reserve`` columns
 are the decisions that admitted, which is what ``planner_us`` is logged for: they
 come right after something moved, so what a pool keeps between asks is cold for them.
+
+Each result carries a digest of everything the pool decided (who was let in at each pass,
+which grants were refused, every call of the decisions above), so two runs of the same
+seed, with a setting changed, can be shown to have decided the same: ``--diff``.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from __future__ import annotations
 import argparse
 import collections
 import cProfile
+import hashlib
 import json
 import multiprocessing
 import os
@@ -100,6 +107,9 @@ class Pool:
         self.queue: list[str] = []
         self.meta: dict[str, tuple[int, int]] = {}
         self.deferred = 0
+        # of what was decided, in order: see `--diff`
+        self.digest = hashlib.blake2b(digest_size=8)
+        self.decided = 0
         self._populate()
         self._admit_reserved()
         for _ in range(n_waiting):
@@ -137,7 +147,8 @@ class Pool:
         assert _prefill(kv, rid, len(tokens)).ok
         if self.args.decode_keys:
             self._sample(rid, 1)
-        self.running[rid] = {"left": self.rng.randint(1, self.args.max_life_pages)}
+        left = self.rng.randint(1, self.args.max_life_pages)
+        self.running[rid] = {"left": left, "tokens": left * PAGE}
 
     def _sample(self, rid: str, n: int) -> None:
         self.kv.extend_prefix_chain(
@@ -178,6 +189,11 @@ class Pool:
         self.meta[rid] = (len(tokens), pages)
         self.queue.append(rid)
 
+    def decide(self, *what) -> None:
+        """Put what the pool decided into the digest."""
+        self.digest.update(repr(what).encode())
+        self.decided += 1
+
     # one scheduler tick -------------------------------------------------
 
     def grant(self) -> None:
@@ -189,7 +205,9 @@ class Pool:
         if info["left"] <= 0:
             self.finish(rid)
             return
-        if not _run(self.kv, {rid: PAGE}).ok:
+        ok = _run(self.kv, {rid: PAGE}).ok
+        self.decide("grant", rid, ok)
+        if not ok:
             self.deferred += 1
             return
         if self.args.decode_keys:
@@ -197,6 +215,7 @@ class Pool:
         info["left"] -= 1
 
     def finish(self, rid: str) -> None:
+        self.decide("finish", rid)
         self.kv.remove_request(rid)
         del self.running[rid]
 
@@ -206,6 +225,7 @@ class Pool:
         for rid in self.queue:
             if _ready(self.kv, rid).ready:
                 let_in.append(rid)
+        self.decide("pass", let_in)
         for rid in let_in:
             self.queue.remove(rid)
             tokens_len = self.meta.pop(rid)[0]
@@ -213,9 +233,37 @@ class Pool:
             self._arrive()
         return len(let_in)
 
+    def advance_tokens(self) -> None:
+        """What a decode loop does between two passes: one step, every request that runs one
+        token on (so the committed length of each moves, and a page is granted when a token
+        starts a new one), and a request that ran its course leaves.
+
+        A step is refused for the request the pool names, which is held for the pass; the
+        rest run again, as the worker answers a refusal.
+        """
+        for rid in [r for r, info in self.running.items() if info["tokens"] <= 0]:
+            self.finish(rid)
+        batch = list(self.running)
+        while batch:
+            outcome = _run(self.kv, {rid: 1 for rid in batch})
+            self.decide("step", tuple(batch), outcome.ok)
+            if outcome.ok:
+                break
+            self.deferred += 1
+            held = getattr(outcome.reason, "request_id", None)
+            if held not in batch:
+                return
+            batch.remove(held)
+        for rid in batch:
+            self.running[rid]["tokens"] -= 1
+            if self.args.decode_keys:
+                self._sample(rid, 1)
+
     def advance(self, grants: float) -> None:
         """What decode does between two passes: pages granted, and a request that ran its
         course (what a stop token is) leaves."""
+        if self.args.per_token:
+            return self.advance_tokens()
         for _ in range(int(grants) + (self.rng.random() < grants - int(grants))):
             self.grant()
         for rid in [r for r, info in self.running.items() if info["left"] <= 0]:
@@ -232,8 +280,9 @@ class Pool:
 class Probe:
     """Times what a pool does per decision, on the instance, leaving the pool as it is."""
 
-    def __init__(self, kv: KVManager):
+    def __init__(self, kv: KVManager, pool: Pool | None = None):
         self.kv = kv
+        self.pool = pool
         self.rows: dict[str, list[tuple[float, bool]]] = collections.defaultdict(list)
         self.enabled = True
         for name, kind in (
@@ -251,6 +300,8 @@ class Probe:
             took = (time.perf_counter_ns() - started) / 1e3
             admitted = answer is None if kind == "try_reserve" else bool(answer) and kind == "admissible"
             self.rows[kind].append((took, admitted))
+            if self.pool is not None:
+                self.pool.decide(kind, args[0], bool(answer) if kind != "try_reserve" else answer is None)
             return answer
         return wrapper
 
@@ -299,7 +350,7 @@ def run_config(job: tuple) -> dict:
     grants = args.grants_per_pass if args.grants_per_pass is not None else n_reserved / PAGE
     for _ in range(args.warmup):
         pool.tick(grants)
-    probe = Probe(kv)
+    probe = Probe(kv, pool)
     logged_from = _flush_log(kv)
     start = {
         "free": kv._arena.num_free, "indexed": len(kv._index._by_key),
@@ -331,6 +382,7 @@ def run_config(job: tuple) -> dict:
         "try_reserve": _summary(probe.rows["try_reserve"]),
         "pass_p50": _pct(pass_us, 0.5), "pass_p99": _pct(pass_us, 0.99),
         "arena_owner_changes": kv._arena.owner_changes,
+        "decided": {"n": pool.decided, "digest": pool.digest.hexdigest()},
         "logged_reserve": {
             "n": len(planner_us), "p50": _pct(planner_us, 0.5), "p99": _pct(planner_us, 0.99),
         },
@@ -366,6 +418,8 @@ PROFILED = [
     "_plan_state", "_plan_entry", "__init__", "peak_from", "banker_safe", "_head_shadow",
     "shadow", "_outstanding", "_outstanding_afresh", "_room", "exceeds", "easy_allows",
     "footprint", "_held_fresh", "_refusal_key", "_gate", "_reservation", "_lease", "peek",
+    "_plan_from_table", "_plan_fields", "_plan_row", "fields", "from_arrays", "with_candidate",
+    "_defer_grant",
 ]
 
 
@@ -518,6 +572,10 @@ def _parse() -> argparse.Namespace:
                         "one decoded token per request per pass")
     p.add_argument("--max-life-pages", type=int, default=12,
                    help="pages a request decodes before it stops, drawn from 1..this")
+    p.add_argument("--per-token", action="store_true",
+                   help="every admitted request runs one token a pass, in one batched step, as a "
+                        "decode loop does, instead of a page granted at a time to one of them: "
+                        "the committed lengths move every pass, and the plan's key does not")
     p.add_argument("--no-decode-keys", dest="decode_keys", action="store_false",
                    help="do not index the pages a request generates")
     p.add_argument("--seed", type=int, default=20261006)
@@ -531,11 +589,31 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--scope", choices=["decision", "pass"], default="decision",
                    help="what --profile covers: the decisions alone, or whole passes over the queue")
     p.add_argument("--audit", action="store_true", help="what ticks owner_changes, for the first of each")
+    p.add_argument("--diff", nargs=2, metavar=("A.json", "B.json"),
+                   help="whether two runs decided the same, config by config; runs nothing")
     return p.parse_args()
+
+
+def diff(first: str, second: str) -> int:
+    """Whether the two runs' digests of what was decided agree in every config. The exit code."""
+    with open(first) as a, open(second) as b:
+        runs = json.load(a), json.load(b)
+    key = lambda r: (r["fit"], r["order"], r["n_reserved"], r["n_waiting"])  # noqa: E731
+    left, right = ({key(r): r for r in run} for run in runs)
+    differ = [k for k in left.keys() | right.keys() if (
+        k not in left or k not in right or left[k].get("decided") != right[k].get("decided")
+    )]
+    for k in sorted(differ):
+        print(f"DIFFERENT {k}: {left.get(k, {}).get('decided')} vs {right.get(k, {}).get('decided')}")
+    print(f"{len(left.keys() | right.keys()) - len(differ)} of {len(left.keys() | right.keys())} "
+          f"configs decided the same; {sum(r['decided']['n'] for r in left.values())} decisions in the first")
+    return 1 if differ else 0
 
 
 def main() -> None:
     args = _parse()
+    if args.diff:
+        sys.exit(diff(*args.diff))
     torch.set_num_threads(1)
     manager_mod.KVTransferManager = _StubTransfer
     for name in ("MSTAR_KV_ADMISSION_FIT", "MSTAR_KV_ADMISSION_ORDER", "MSTAR_KV_BACKFILL_WINDOW"):
@@ -561,7 +639,7 @@ def main() -> None:
         results = [run_config(job) for job in jobs]
     print(f"times in microseconds; {args.passes} passes per config after {args.warmup} warm-up, "
           f"background {args.background_pages} pages, shared-prefix share {args.shared_frac}, "
-          f"decode keys {args.decode_keys}, log {args.log}")
+          f"decode keys {args.decode_keys}, log {args.log}, per token {args.per_token}")
     print_table(results)
     if args.json:
         with open(args.json, "w") as out:
