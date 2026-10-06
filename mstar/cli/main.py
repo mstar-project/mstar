@@ -145,7 +145,7 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    print(client.transcribe(\"speech.wav\", language=\"en\"))")
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
-    if model in ("bagel", "qwen3_omni", "orpheus", "cosmos3", "cosmos3_super",
+    if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
                  "whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
