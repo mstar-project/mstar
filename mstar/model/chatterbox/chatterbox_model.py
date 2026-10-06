@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -252,6 +253,59 @@ class ChatterboxModel(Model):
     # -----------------------------------------------------------------------
     # Resources
     # -----------------------------------------------------------------------
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse a request cap the T3 KV pool cannot hold.
+
+        Nothing preempts a stream once the pool is full: the requests wait on
+        each other until they time out. So ``max_concurrent_requests`` requests
+        at full text and ``max_new_tokens_limit`` speech tokens must fit, next to
+        the sink page and the pages the captured decode's padding rows keep
+        between replays.
+        """
+        cap = config.get("max_concurrent_requests")
+        if cap is None:
+            logger.warning(
+                "%s sets no max_concurrent_requests: a burst of long requests can fill "
+                "the T3 KV cache and stall until the requests time out", config_path,
+            )
+            return
+        kv = next(s for s in self.get_node_resources() if s.resource_key == T3_KV).config
+        overrides = (config.get("resources") or {}).get(T3_KV) or {}
+        page_size = int(overrides.get("page_size", kv.page_size))
+        max_num_pages = int(overrides.get("max_num_pages", kv.max_num_pages))
+        need = 1 + int(cap) * self._request_kv_pages(page_size) + self._padding_kv_pages()
+        if need > max_num_pages:
+            raise ValueError(
+                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) at "
+                f"max_new_tokens_limit={self.config.max_new_tokens_limit or self.config.t3.max_speech_tokens} "
+                f"need {need} pages of resources.{T3_KV}, which has {max_num_pages}; "
+                "raise max_num_pages or lower one of the other two"
+            )
+
+    def _request_kv_pages(self, page_size: int) -> int:
+        """Pages one request can hold at full text and the token limit, per
+        stream (CFG keeps a conditional and an unconditional one): the prompt
+        (conditioning, text, the speech BOS, twice where T3 repeats it) and a
+        token per decode step, the step that runs past the stop included."""
+        t3 = self.config.t3
+        limit = self.config.max_new_tokens_limit or t3.max_speech_tokens
+        bos = 2 if t3.duplicate_bos_in_prefill else 1
+        tokens = t3.cond_len + self.config.max_text_tokens + bos + limit
+        streams = 1 if self.config.is_turbo else 2
+        return streams * -(-tokens // page_size)
+
+    def _padding_kv_pages(self) -> int:
+        """Pages the captured decode's padding rows keep between replays: a page
+        per stream for every row but the first (a batch that drops a request
+        keeps its bucket), per capture (guided and unguided) and per graph slot
+        (the engine double-buffers because the KV cache pre-plans)."""
+        from mstar.model.chatterbox.submodules import T3Submodule
+
+        rows = T3Submodule.DECODE_CAPTURE_BATCH_SIZES[-1] - 1
+        streams = 1 if self.config.is_turbo else 3  # guided rows hold 2 streams, unguided 1
+        slots = max(2, int(os.environ.get("MSTAR_NUM_SLOTS", "2")))  # as the engine reads it
+        return slots * rows * streams
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         t3 = self.config.t3

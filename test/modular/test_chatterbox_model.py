@@ -155,7 +155,9 @@ def test_registry_graph_and_yaml_are_consistent(key, repo, yaml_name):
     serving = yaml.safe_load((CONFIGS / yaml_name).read_text(encoding="utf-8"))
     assert serving["model"] == key
     apply_yaml_overrides(specs, serving)
-    assert kv.config.page_size == 64 and kv.config.max_num_pages == 1536
+    # the pool the yaml sizes (and validate_config_yaml checks) is the one built
+    assert kv.config.page_size == 64
+    assert kv.config.max_num_pages == serving["resources"][T3_KV]["max_num_pages"]
 
     worker_graphs = model.get_worker_graphs(str(CONFIGS / yaml_name))
     by_walk = {next(iter(wg.graph_walks)): wg for wg in worker_graphs}
@@ -499,18 +501,39 @@ def test_max_new_tokens_limit_bounds_requests_and_the_default():
 
 
 @pytest.mark.parametrize("name", ["chatterbox", "chatterbox_multilingual", "chatterbox_turbo"])
-def test_shipped_yaml_fits_its_request_cap_in_the_kv_pool(name):
-    # Nothing preempts a stream once the pool is full, so max_concurrent_requests
-    # requests at full text and max_new_tokens_limit speech tokens must fit it.
-    cfg = yaml.safe_load((Path(__file__).parents[2] / "configs" / f"{name}.yaml").read_text())
-    config = ChatterboxConfig.from_variant(name)
-    limit = cfg["model_kwargs"]["max_new_tokens_limit"]
-    kv = cfg["resources"]["t3_kv"]
-    # conditioning + text + start token + speech tokens, per stream
-    tokens = config.t3.cond_len + config.max_text_tokens + 1 + limit
-    streams = 1 if config.is_turbo else 2  # CFG keeps a conditional and an unconditional stream
-    pages = streams * -(-tokens // kv["page_size"])
-    assert cfg["max_concurrent_requests"] * pages <= kv["max_num_pages"]
+def test_shipped_yaml_fits_its_request_cap_in_the_kv_pool(name, caplog):
+    path = Path(__file__).parents[2] / "configs" / f"{name}.yaml"
+    cfg = yaml.safe_load(path.read_text())
+    model = _make_model(name)
+    model.config.max_new_tokens_limit = cfg["model_kwargs"]["max_new_tokens_limit"]
+    model.validate_config_yaml(cfg, str(path))
+    # every request at the T3 table's 4096 tokens would not fit
+    model.config.max_new_tokens_limit = None
+    with pytest.raises(ValueError, match="raise max_num_pages"):
+        model.validate_config_yaml(cfg, str(path))
+    # without a cap nothing bounds the pool: started, with a warning
+    model.validate_config_yaml({k: v for k, v in cfg.items() if k != "max_concurrent_requests"}, str(path))
+    assert "sets no max_concurrent_requests" in caplog.text
+
+
+def test_kv_fit_counts_the_padding_rows_and_the_sink_page(monkeypatch):
+    model = _make_model()
+    model.config.max_new_tokens_limit = 1000
+    # 50 pages a request; padding rows 1-31 of the 32-row bucket, x 3 streams x 2 slots
+    assert model._request_kv_pages(64) == 50 and model._padding_kv_pages() == 186
+    cfg = {"max_concurrent_requests": 30, "resources": {"t3_kv": {"page_size": 64, "max_num_pages": 1687}}}
+    model.validate_config_yaml(cfg, "x.yaml")
+    cfg["resources"]["t3_kv"]["max_num_pages"] = 1686
+    with pytest.raises(ValueError, match="need 1687 pages"):
+        model.validate_config_yaml(cfg, "x.yaml")
+    turbo = _make_model("turbo")
+    turbo.config.max_new_tokens_limit = 1000
+    assert turbo._request_kv_pages(64) == 30 and turbo._padding_kv_pages() == 62
+    # T3 repeats the speech BOS, so 34 + 512 + 2 + 989 tokens take a 25th page
+    model.config.max_new_tokens_limit = 989
+    assert model._request_kv_pages(64) == 2 * 25
+    monkeypatch.setenv("MSTAR_NUM_SLOTS", "3")
+    assert model._padding_kv_pages() == 3 * 31 * 3
 
 
 # ---------------------------------------------------------------------------

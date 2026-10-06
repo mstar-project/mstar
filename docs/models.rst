@@ -291,9 +291,10 @@ Chatterbox notes
   ``temperature`` (up to 5)/``top_p``/``top_k``/``min_p``/``repetition_penalty``
   (up to 2; the bounds are the reference demo's), ``seed``, ``n_cfm_timesteps``
   (S3Gen Euler steps, 10; Turbo 2), ``max_new_tokens`` (up to the deployment's
-  ``model_kwargs: max_new_tokens_limit``, 1000 in the shipped configs, which
-  size the KV cache so ``max_concurrent_requests`` requests of that length
-  always fit; raise it together with ``max_num_pages`` or a lower cap),
+  ``model_kwargs: max_new_tokens_limit``, 1000 in the shipped configs; with
+  ``max_concurrent_requests`` set, the server refuses to start unless that
+  many requests of that length fit the KV cache, so raise it together with
+  ``max_num_pages`` or a lower cap),
   ``ignore_eos`` (T3 decodes all ``max_new_tokens``
   past the stop token, for fixed-length benchmarks; the speech tokens among
   them are vocoded, but T3 keeps emitting stop and control tokens after the
