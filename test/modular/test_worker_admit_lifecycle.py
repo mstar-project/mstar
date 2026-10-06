@@ -96,6 +96,7 @@ def _worker():
     w._reads_done_sent = set()
     w._in_flight_rids = set()
     w._pending_removes = set()
+    w._pending_releases = set()
     w._last_active = {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
