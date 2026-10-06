@@ -185,7 +185,7 @@ class WhisperModel(Model):
         concurrency = self.MAX_CONCURRENT_REQUESTS
         # Sequences cap at max_target_positions (448) = 4 pages per request, and
         # the decode captures' padding rows hold one page each on first use.
-        kv_config = KVConfig(
+        kv_config = PagedKVConfig(
             num_layers=self.config.decoder_layers,
             num_kv_heads=self.config.decoder_attention_heads,
             head_dim=self.config.head_dim,
@@ -197,7 +197,7 @@ class WhisperModel(Model):
         )
         # The fixed 30 s window is max_source_positions (1500) tokens = 12
         # pages per request.
-        context_kv_config = KVConfig(
+        context_kv_config = PagedKVConfig(
             num_layers=self.config.decoder_layers,
             num_kv_heads=self.config.decoder_attention_heads,
             head_dim=self.config.head_dim,
