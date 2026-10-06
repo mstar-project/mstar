@@ -1,5 +1,6 @@
 import functools
 import logging
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
@@ -9,12 +10,18 @@ from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AdmitRuntimeError
-from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime
+from mstar.engine.resources.step import FULL_ADMIT_WAIT, FULL_ADMIT_WAIT_BEHIND
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, ReadyNodeSpec
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
 
 logger = logging.getLogger(__name__)
+
+# Read once. On, a free scan does not ask again a request whose admission gate answered
+# "wait" while what that answer depends on has not moved (see `_ParkScan`); off, it asks
+# every request every time.
+_SCHED_PARK = os.environ.get("MSTAR_SCHED_PARK", "0") == "1"
 
 # A rid a TP follower is told about but has already removed. Wire messages
 # carry string rids, so a head from the leader can name a request this rank
@@ -134,6 +141,48 @@ class PopReadyResult(NamedTuple):
     output_signals: tuple[str, ...]
 
 
+class _ParkScan:
+    """What a free scan over one (node, walk) needs to skip the requests parked on it.
+
+    A request is parked as ``(node, walk, tier, key)``: an admission gate answered it
+    "wait" when the pool's keys for ``tier`` (0 behind the front of the queue, 1 at it;
+    `Engine.admission_keys`) read ``key``. Asked again with them unmoved it would be
+    answered the same, so the scan goes past it.
+
+    ``keys`` is what they read now: taken when the scan reached this node, and again after
+    every ask that was not a wait, as an admission moves them. A key is stored as it was
+    before the ask, never after, so a pool that moved while the scan ran makes the stored key
+    older than the answer: the request is asked again at the next scan, and may be skipped
+    for the rest of this one, as if the pool had moved just after it was asked.
+    """
+
+    __slots__ = ("parked", "keys_of", "node", "walk", "keys")
+
+    def __init__(self, parked, keys_of, node, walk, keys):
+        self.parked = parked
+        self.keys_of = keys_of
+        self.node = node
+        self.walk = walk
+        self.keys = keys
+
+    def holds(self, rid) -> bool:
+        held = self.parked.get(rid)
+        return (
+            held is not None and held[3] == self.keys[held[2]]
+            and held[0] == self.node and held[1] == self.walk
+        )
+
+    def note(self, rid, outcome) -> None:
+        """Park ``rid`` if the engine's answer is a gate's wait; forget it if it is not."""
+        if outcome is FULL_ADMIT_WAIT_BEHIND:
+            self.parked[rid] = (self.node, self.walk, 0, self.keys[0])
+        elif outcome is FULL_ADMIT_WAIT:
+            self.parked[rid] = (self.node, self.walk, 1, self.keys[1])
+        else:
+            self.parked.pop(rid, None)
+            self.keys = self.keys_of(self.node)
+
+
 class MicroScheduler:
     """
     Simple MVP scheduler: scans all worker graph queues for ready nodes,
@@ -185,6 +234,11 @@ class MicroScheduler:
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
+        # rid -> (node, walk, tier, key) for a request an admission gate answered "wait", and
+        # what `admission_keys` read then (see `_ParkScan`). Only the two free scans read it:
+        # the TP follow and the backlog ask every time
+        self._park = _SCHED_PARK
+        self._parked: dict[int, tuple] = {}
         # Rids with a deferred remove; stop initiating new work for them.
         # Shared by reference with Worker._pending_removes.
         self.pending_removes: set[int] = set()
@@ -435,11 +489,14 @@ class MicroScheduler:
             wg_id = self.runtime.get_worker_graph_id_for_node(
                 spec.node_name, spec.graph_walk,
             )
+            park = self._park_scan(spec)
             for rid in spec.rids:
+                if park is not None and park.holds(rid):
+                    continue
                 fwd_info = request_state.get_fwd_info(rid, node_partition)
                 # check if the node is ready on the engine level
                 # (e.g., for AR, whether the kv cache is read in)
-                if not self._check_ready(spec.node_name, rid, fwd_info):
+                if not self._check_ready(spec.node_name, rid, fwd_info, park):
                     continue
                 node_name_to_requests.setdefault(spec.node_name, []).append(
                     ReadyNodeEntry(rid, wg_id, spec.graph_walk)
@@ -802,23 +859,47 @@ class MicroScheduler:
             node_partition = request_state.get_partition_for_node(
                 spec.node_name
             )
+            park = self._park_scan(spec)
             for rid in spec.rids:
+                if park is not None and park.holds(rid):
+                    continue
                 fwd_info = request_state.get_fwd_info(
                     rid, node_partition
                 )
-                if self._check_ready(spec.node_name, rid, fwd_info):
+                if self._check_ready(spec.node_name, rid, fwd_info, park):
                     return True
         return False
 
+    def _park_scan(self, spec: ReadyNodeSpec) -> _ParkScan | None:
+        """What a free scan over ``spec`` skips parked requests with; None where it asks
+        every one: the park is off, or the node's engine has no pool that decides."""
+        if not self._park:
+            return None
+        keys_of = getattr(
+            self.engine_manager.get_engine(spec.node_name), "admission_keys", None,
+        )
+        if keys_of is None:
+            return None
+        keys = keys_of(spec.node_name)
+        if keys is None:
+            return None
+        return _ParkScan(self._parked, keys_of, spec.node_name, spec.graph_walk, keys)
+
     def _check_ready(
         self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
+        park: _ParkScan | None = None,
     ) -> bool:
         """Engine-level readiness, with a terminal failure taken out of the
         scan. Retryable not-ready (an in-flight KV read, a reload that doesn't
         fit) just comes back False; an ``AdmitRuntimeError`` never will, so the
-        rid is parked for the worker to fail instead of rescanned forever."""
+        rid is parked for the worker to fail instead of rescanned forever.
+
+        Only a free scan passes ``park``, which keeps the answer a gate's wait
+        for the scan to skip; every other caller asks without one."""
         engine = self.engine_manager.get_engine(node_name)
         outcome = engine.check_ready(node_name, rid, fwd_info)
+        if park is not None:
+            park.note(rid, outcome)
         if isinstance(outcome.reason, AdmitRuntimeError):
             logger.error(
                 "Request %s cannot be served on node %s by resource %s: %s",
@@ -843,6 +924,7 @@ class MicroScheduler:
         self.failed_rids.update(rids)
         for rid in rids:
             self._drop_backlogged_rid(rid)
+            self._parked.pop(rid, None)
 
     def clear_rid(self, rid: int, rid_str: str) -> None:
         """Forget all per-request scheduler state; called on REMOVE_REQUEST.
@@ -853,6 +935,7 @@ class MicroScheduler:
         self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)
+        self._parked.pop(rid, None)
         self.clear_wire_rid(rid_str)
 
     def clear_wire_rid(self, rid_str: str) -> None:
