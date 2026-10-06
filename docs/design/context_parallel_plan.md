@@ -6,7 +6,7 @@ Opt-in per `node_groups` entry with `cp_size`. The default `cp_size: 1` keeps th
 
 - **Status:** draft for review. No code is written. Pinned to M* commit `33baea08`. Lives on branch `cp-rfc`.
 - **Area:** `engine/resources/{kv,attn,position,sampler}`, `distributed`, `model/base`, `model/qwen3_omni`. No worker, conductor or Rust runtime change.
-- **Related:** chunked prefill plan ([chunked_prefill_plan.md](chunked_prefill_plan.md), branch `chunked-prefill-2`), issue #210 (prefix KV reuse), PR #198 (windowed generation), vLLM DCP and PCP (`vllm/v1/attention/ops/{dcp,pcp}.py`), arXiv 2411.01783 (ring attention for 1M-token prefill).
+- **Related:** chunked prefill plan ([chunked_prefill_plan.md](https://github.com/mstar-project/mstar/blob/chunked-prefill-2/docs/design/chunked_prefill_plan.md), branch `chunked-prefill-2`), issue #210 (prefix KV reuse), PR #198 (windowed generation), vLLM DCP and PCP (`vllm/v1/attention/ops/{dcp,pcp}.py`), arXiv 2411.01783 (ring attention for 1M-token prefill).
 - **Background notes:** `~/context-parallelism/notes/01..06` (vLLM survey, cost model, M* extension points, model survey, decision log, phase plan) and `08`, `09` (caveat surveys, 45 and 78 items).
 
 Notation:
@@ -292,7 +292,7 @@ The followers get no new wire data. `ScheduleTPNode` ([ipc_format.py](../../msta
 
 Three features compose with no new work:
 
-1. **Chunked prefill** ([chunked_prefill_plan.md](chunked_prefill_plan.md)). A chunk is a prefill with `stored_len > 0`, so it uses §4.4. Inside a chunk, `split_inputs` composes: the chunk first, then zigzag. `ChunkProgress` is per rank and identical by determinism.
+1. **Chunked prefill** ([chunked_prefill_plan.md](https://github.com/mstar-project/mstar/blob/chunked-prefill-2/docs/design/chunked_prefill_plan.md)). A chunk is a prefill with `stored_len > 0`, so it uses §4.4. Inside a chunk, `split_inputs` composes: the chunk first, then zigzag. `ChunkProgress` is per rank and identical by determinism.
 2. **Speculation** (TP async follow). The flags travel on `ScheduleTPNode` unchanged. A CP decode step adds one lockstep collective per layer, as the TP all-reduce does.
 3. **Prefix caching** (#210). Off at world size > 1 today. Under CP a cached prefix is a set of per-rank page lists under one hash, with `effective_page = cp * I_tok` tokens (vLLM `kv_cache_utils.py` lines 718 to 800). The per-rank refcount of #210 does not change.
 
