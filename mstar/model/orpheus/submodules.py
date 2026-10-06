@@ -48,6 +48,13 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
+    MAX_BATCH_TOKENS = 512
+
+    def supports_chunked_prefill(self, graph_walk: str) -> bool:
+        return graph_walk == "prefill"
+
+    def max_batch_tokens(self, graph_walk: str) -> int | None:
+        return self.MAX_BATCH_TOKENS if graph_walk in ("prefill", "mixed") else None
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -200,6 +207,9 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     ):
         # Metadata-only: rebind output name for graph routing. EOS check
         # moved to check_stop so the GPU thread doesn't sync on .item() here.
+        inputs = kwargs.get("inputs")
+        if inputs is not None and not inputs.is_final_chunk:
+            outputs.pop("new_token", None)  # only the last chunk's token is real
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
