@@ -52,6 +52,8 @@ PLANNED = {("peak", "backfill"), ("sum", "backfill"), ("peak", "fifo")}
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    # the plan is kept as rows here whatever MSTAR_KV_PLAN_CACHE the suite runs under
+    monkeypatch.setattr(manager_mod, "_PLAN_CACHE", True)
     for name in (
         "MSTAR_KV_ADMISSION_FIT", "MSTAR_KV_ADMISSION_ORDER", "MSTAR_KV_BACKFILL_WINDOW",
         "MSTAR_STEP_TELEMETRY_DIR",
