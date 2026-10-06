@@ -372,6 +372,20 @@ class WhisperModel(Model):
         edge.tensor_info = list(tensor_info)
         return edge
 
+    @staticmethod
+    def _prefill_step_metadata(kwargs: dict) -> dict:
+        """What the decoder's ``prepare_inputs`` needs about the forced prompt.
+
+        ``step_metadata`` is per step, so each prefill walk restates it from
+        the conductor metadata, which carries it for the request's lifetime.
+        """
+        return {
+            "is_prefill": True,
+            "language": kwargs.get("language_token"),
+            "task": kwargs.get("task_token"),
+            "timestamps": kwargs.get("timestamps", False),
+        }
+
     def get_initial_forward_pass_args(
         self,
         partition_name: str,
@@ -384,6 +398,15 @@ class WhisperModel(Model):
         # is to be detected. It is held back for the second prefill walk.
         prompt_tail = input_signals.get("prompt_tail", [])
         detect = bool(prompt_tail)
+        kwargs = model_kwargs or {}
+        # The same three settings ``process_prompt`` built the forced prompt
+        # from, resolved to token ids here and carried on the metadata. The
+        # decoder used to recover them by reading the prompt tensor back with
+        # ``.tolist()``, which is a D2H sync inside ``prepare_inputs`` on the
+        # GPU thread — at prefill it blocks on the encoder's queued window.
+        # Detection leaves the language token unknown by construction; the
+        # align walk takes it off the transcript instead (``_prepare_alignment``).
+        language = kwargs.get("language")
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
@@ -394,7 +417,14 @@ class WhisperModel(Model):
                 # for the align walk: how much of the window carries audio,
                 # and whether the request asked for word timestamps at all
                 "audio_frames": input_signals.get("audio_frames", []),
-                "word_timestamps": (model_kwargs or {}).get("timestamps") == "word",
+                "word_timestamps": kwargs.get("timestamps") == "word",
+                "language_token": (
+                    None if language is None else self.config.language_token(language)
+                ),
+                "task_token": self.config.task_token(kwargs.get("task", "transcribe")),
+                # as ``process_prompt`` reads it: any truthy value (True,
+                # "word", "segment") means the prompt omits <|notimestamps|>
+                "timestamps": bool(kwargs.get("timestamps", False)),
             },
         )
         inputs = [
@@ -405,7 +435,7 @@ class WhisperModel(Model):
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": True},
+            step_metadata=self._prefill_step_metadata(full_metadata.kwargs),
         )
 
     def get_partition_forward_pass_args(
@@ -436,7 +466,7 @@ class WhisperModel(Model):
                     full_metadata=metadata,
                     inputs=inputs,
                     unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]) + list(ts_rules),
-                    step_metadata={"is_prefill": True},
+                    step_metadata=self._prefill_step_metadata(metadata.kwargs),
                 )
             metadata.is_prefill = False
             metadata.graph_walk = DECODE_WALK
