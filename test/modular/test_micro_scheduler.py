@@ -33,6 +33,12 @@ from mstar.graph.runtime.base import (
     ReadyNodeSpec,
 )
 from mstar.utils.containers import ParallelList
+from mstar.worker.batch_builder import (
+    BaseBatchBuilder,
+    BatchBuildRequest,
+    BatchBuildResult,
+    FIFOBatchBuilder,
+)
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 
 
@@ -759,3 +765,61 @@ def test_a_submodule_that_does_not_opt_in_is_never_split():
 
 def test_a_walk_without_a_capture_is_never_split():
     assert _capture_group(captured=()) is None
+
+
+# ── pluggable batch builder ─────────────────────────────────────────────
+
+
+class _ReturnOddBuilder(BaseBatchBuilder):
+    """Runs the even-numbered rids and hands the odd ones back to the queue."""
+
+    def __init__(self):
+        self.requests: list[BatchBuildRequest] = []
+
+    def build_batch(self, request):
+        self.requests.append(request)
+        batch = request.fresh
+        odd = {rid for rid in batch.request_to_worker_graph if int(rid[1:]) % 2}
+        scheduled, returned = batch.split_off_first(None, exclude_rids=odd)
+        return BatchBuildResult(scheduled, returned=returned.request_to_worker_graph)
+
+
+def test_the_scheduler_runs_the_configured_builder():
+    sched = _scheduler(_Engine(max_bs=8))
+    builder = sched.batch_builder = _ReturnOddBuilder()
+    manager = _Manager(["r0", "r1", "r2", "r3"])
+
+    batch = _next_batch(sched, manager, capture_group_of="r2")
+
+    assert list(batch.request_to_worker_graph) == ["r0", "r2"]
+    (request,) = builder.requests
+    assert (request.node_name, request.graph_walk) == (NODE, WALK)
+    assert request.max_batch_size == 8
+    assert request.capture_group_of == "r2"
+
+
+def test_returned_rows_go_back_to_their_ready_queue_not_the_backlog():
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.batch_builder = _ReturnOddBuilder()
+    manager = _Manager(["r0", "r1", "r2", "r3"])
+
+    _next_batch(sched, manager)
+
+    assert not sched.backlog
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"r1", "r3"}
+
+
+def test_fifo_puts_the_backlog_ahead_of_fresh_rows():
+    """Not reachable through `get_next_batch` yet, which serves a backlog on
+    its own; a builder handed both must still keep arrival order."""
+    builder = FIFOBatchBuilder()
+    result = builder.build_batch(BatchBuildRequest(
+        node_name=NODE, graph_walk=WALK,
+        backlog=_batch(["b0", "b1"]),
+        fresh=_batch(["f0", "f1"]),
+        max_batch_size=3,
+    ))
+
+    assert list(result.scheduled.request_to_worker_graph) == ["b0", "b1", "f0"]
+    assert list(result.backlog.request_to_worker_graph) == ["f1"]
+    assert result.returned is None
