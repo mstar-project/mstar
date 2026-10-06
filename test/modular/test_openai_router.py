@@ -434,6 +434,22 @@ def test_speech_refuses_a_format_it_cannot_produce(client_and_stub, body):
     assert stub.last_submit is None  # refused before any work was submitted
 
 
+@pytest.mark.parametrize("ref,message", [
+    ("/etc/passwd", "paths on the server are refused"),
+    ("file:///etc/passwd", "paths on the server are refused"),
+    (123, "got int"),
+    ({"url": "x"}, "got dict"),
+])
+def test_chatterbox_adapter_refuses_a_bad_ref_audio(ref, message, tmp_path):
+    # refused as a client error (ValueError) before anything is opened
+    from mstar.api_server.openai import adapters
+    from mstar.api_server.openai.protocol import SpeechRequest
+
+    req = SpeechRequest.model_validate({"model": "chatterbox", "input": "hi", "ref_audio": ref})
+    with pytest.raises(ValueError, match=message):
+        adapters.ChatterboxAdapter().speech_to_request(req, tmp_path)
+
+
 @pytest.mark.parametrize("fmt,magic", [("mp3", None), ("flac", b"fLaC"), ("opus", b"OggS")])
 def test_speech_encodes_the_requested_container(client_and_stub, fmt, magic):
     pytest.importorskip("soundfile")

@@ -546,6 +546,8 @@ class KokoroAdapter(OpenAIAdapter):
 def _refuse_server_path(ref: str, upload_dir: Path) -> None:
     """A plain path must name a file the server stored itself, under
     ``upload_dir``; checked before anything is opened, so it cannot probe the disk."""
+    if not isinstance(ref, str):
+        raise ValueError(f"ref_audio must be a data URL or an http(s) URL, got {type(ref).__name__}")
     if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
         return
     if not Path(ref).resolve().is_relative_to(Path(upload_dir).resolve()):
