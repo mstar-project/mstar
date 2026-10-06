@@ -63,8 +63,10 @@ def _chunk_kwargs(model_kwargs: dict, index: int) -> dict:
     kwargs = dict(model_kwargs)
     kwargs.pop("sentence_chunking", None)
     seed = kwargs.get("seed")
-    if isinstance(seed, int) and not isinstance(seed, bool):
-        kwargs["seed"] = seed + index
+    if isinstance(seed, int) and not isinstance(seed, bool) and index:
+        # the conductor's seed is an int64: a seed near the top wraps instead of overflowing
+        seed += index
+        kwargs["seed"] = seed - 2**63 if seed >= 2**63 else seed
     return kwargs
 
 
