@@ -19,7 +19,7 @@ Notation:
 Sections:
 
 - Design: [0 Decision log](#0-decision-log) · [1 Rules and invariants](#1-design-rules-and-invariants) · [2 Mesh](#2-configuration-and-mesh) · [3 KV ownership](#3-kv-ownership) · [4 Attention](#4-attention) · [5 Model API](#5-model-facing-api) · [6 Followers and graphs](#6-followers-and-cuda-graphs)
-- Review: [7 Interactions](#7-interactions-with-other-work) · [8 Checks](#8-correctness-checks) · [9 Caveats](#9-caveats) · [10 Delivery](#10-delivery-plan-and-follow-ups) · [11 Acceptance](#11-benchmark-acceptance) · [12 Non-goals](#12-non-goals)
+- Review: [7 Interactions](#7-interactions-with-other-work) · [8 Checks](#8-correctness-checks) · [9 Caveats](#9-caveats) · [10 Plan](#10-implementation-plan-and-follow-ups) · [11 Acceptance](#11-benchmark-acceptance) · [12 Non-goals](#12-non-goals)
 
 ---
 
@@ -30,9 +30,9 @@ Sections:
 | 1 | `cp_size` is a third mesh axis next to `tp_size` and `sp_size`. `tp*sp` divides the heads and `cp` divides the tokens. "CP carved out of TP" is phase 2. | [§2](#2-configuration-and-mesh) |
 | 2 | KV ownership is interleaved by token through one pure class, `CPLayout`, with the knob `cp_interleave_tokens` (default 1). Every rank reserves the per-rank maximum page count, so the allocator state stays symmetric. | [§3](#3-kv-ownership) |
 | 3 | One merge primitive for all row types: all-gather `(O, LSE)` and merge by log-sum-exp. Decode is local paged attention plus this merge. | [§4.1](#41-lse-merge), [§4.2](#42-decode) |
-| 4 | Prefill all-gathers the new K/V and divides the Q rows into zigzag chunks. A prefill over resident context passes Q (pass-Q) in v1. Pass-KV and ring are later implementations of the same interface. | [§4.3](#43-prefill-of-a-fresh-prompt), [§4.4](#44-prefill-over-resident-context), [§4.5](#45-cost-model-and-levers) |
+| 4 | Prefill all-gathers the new K/V and divides the Q rows into zigzag chunks. A prefill over resident context selects pass-Q or pass-KV by a cost rule. Both ship in v1 behind one interface. Ring is a later implementation of the same interface. | [§4.3](#43-prefill-of-a-fresh-prompt), [§4.4](#44-prefill-over-resident-context), [§4.6](#46-pass-q-and-pass-kv-implementation) |
 | 5 | A CP-capable model slices its inputs, declares the global span, and samples after rank 0 broadcasts the last hidden rows. Every rank samples from the same seed. | [§5](#5-model-facing-api) |
-| 6 | The CP degree is fixed per instance and equal on the prefill and decode sides. No conductor or Rust change beyond the instance size `tp*sp*cp`. Five features are asserted off in v1. | [§7](#7-interactions-with-other-work), [§10](#10-delivery-plan-and-follow-ups) |
+| 6 | The CP degree is fixed per instance and equal on the prefill and decode sides. No conductor or Rust change beyond the instance size `tp*sp*cp`. Five features are asserted off in v1. | [§7](#7-interactions-with-other-work), [§10](#10-implementation-plan-and-follow-ups) |
 
 ---
 
@@ -213,9 +213,9 @@ Zigzag balances the causal FLOPs to within one chunk. It puts the last chunk on 
 
 ### 4.4 Prefill over resident context
 
-This path serves `stored_len > 0` and ships in v1, in PR 3. A prefill that extends a stream with resident tokens must also attend to the resident pages. Examples are the thinker's second text prefill after the modality walks, a multi-turn chat, and every chunk after the first one under chunked prefill. Each rank holds only a subset of the resident pages. A single causal kernel call over a partial page list infers the query position from the local key count. That position is wrong, and the kernel gives an incorrect result with no error.
+This path serves `stored_len > 0`. A prefill that extends a stream with resident tokens must also attend to the resident pages. Examples are the thinker's second text prefill after the modality walks, a multi-turn chat, and every chunk after the first one under chunked prefill. Each rank holds only a subset of the resident pages. A single causal kernel call over a partial page list infers the query position from the local key count. That position is wrong, and the kernel gives an incorrect result with no error.
 
-The correct method has three parts. vLLM DCP uses the same method.
+The pass-Q method has three parts. vLLM DCP uses the same method. [§4.6](#46-pass-q-and-pass-kv-implementation) gives the pass-KV alternative and the rule that selects between them.
 
 1. **Part A.** All-gather the new Q rows across CP in the same collective as K and V. Run non-causal paged attention of all `T` new Q rows against the local resident pages, with LSE. Every rank holds a different slice of the resident keys, so every rank must see every new query. A rank that runs only its local Q chunk here gives each query `1/cp` of the resident context.
 2. **Part B.** Run causal ragged attention of the local Q chunk against the all-gathered new K/V, with LSE. This is the same call as in [§4.3](#43-prefill-of-a-fresh-prompt).
@@ -246,18 +246,49 @@ Pass-Q is cheaper than pass-KV when `T / L < Hkv_l / Hq_l`. For the thinker that
 
 Decode at `B = 8` with a 32K context: CP2 saves about 2.5 ms of KV reads per step and pays about 0.7 ms of all-gather latency. The 12 ms of expert reads stay. The net win is about 12 % of the step. At `B = 1` CP decode loses. The break-even is between 75K and 0.3M resident tokens per instance.
 
-The model motivates these levers. Each lever has a v1 choice and a trigger to revisit it in [§10](#10-delivery-plan-and-follow-ups).
+The model motivates these levers. Each lever has a v1 choice and a trigger to revisit it in [§10](#10-implementation-plan-and-follow-ups).
 
 | Lever | Cost term | v1 choice | Trigger to revisit |
 |---|---|---|---|
-| Pass-Q or pass-KV for resident context | the `T / L` rule | pass-Q only | an MLA model, or a measured second-turn `T / L` above `Hkv_l / Hq_l` |
+| Pass-Q or pass-KV for resident context | the `T / L` rule | both, selected per step by the rule ([§4.6](#46-pass-q-and-pass-kv-implementation)) | PR 5 measures the crossover |
 | Ring or all-gather for the new K/V | overlap of the gather with compute | all-gather, no overlap (0.6 % at 64K) | gather above about 20 % of a prefill step, or a 1M-token target |
-| Replicated prefill threshold | empty shards and gather overhead at small `T` | `T < 2 * cp * P` | PR 4 measurement |
-| Interleave `I_tok` | write-scatter cost, empty shards, prefix-cache granularity | 1 (vLLM default) | PR 4 sweep over 1, `P`, `4P` |
+| Replicated prefill threshold | empty shards and gather overhead at small `T` | `T < 2 * cp * P` | PR 5 measurement |
+| Interleave `I_tok` | write-scatter cost, empty shards, prefix-cache granularity | 1 (vLLM default) | PR 5 sweep over 1, `P`, `4P` |
 | CP degree per instance | short-prompt loss of about 6 % from the floor | fixed per instance | short prompts dominate a `cp > 1` instance. Dense models first. |
 | Sink-page writes | `(cp-1)/cp` of the scatter bandwidth (0.1 % at 64K) | accept | a profile shows the scatter above 5 % of a layer |
 
-These are pen-and-paper values. PR 4 measures them.
+These are pen-and-paper values. PR 5 measures them.
+
+### 4.6 Pass-Q and pass-KV implementation
+
+Both methods for resident context are implementations of one interface behind `AttentionCallable`. The interface takes the local Q rows, the gathered new K/V, the view and the cache. It returns the full `O` for the local rows (I4).
+
+```python
+# mstar/distributed/cp/attention.py
+class CPAttention(Protocol):
+    def prefill(self, q_local, k_new, v_new, view, kv) -> Tensor      # full O for the local Q rows
+
+class PassQ(CPAttention):   ...   # §4.4: Parts A, B, C
+class PassKV(CPAttention):  ...   # below: chunked resident gather, then Part B
+
+def select_method(T_total: int, L_total: int, Hq_l: int, Hkv_l: int) -> type[CPAttention]:
+    # pass-Q iff 2 * T_total * Hq_l < L_total * Hkv_l ; batch totals, so every rank selects the same method (I2)
+```
+
+**Pass-KV for resident context.** The resident K/V travels instead of Q. The method has four steps per layer.
+
+1. Divide the global resident range `[0, stored_len)` into fixed chunks of `C` tokens. The chunk count is a function of `stored_len`, so it is identical on every rank (I2). The last chunk is padded to `C`.
+2. Per chunk, each rank gathers its owned rows from the paged cache into a contiguous workspace. This needs a gather kernel from the paged cache (M* has only `read_tokens` today). The ranks then all-gather the workspace across CP, and one precomputed index restores the global order.
+3. Run non-causal ragged attention of the local Q chunk rows against the full chunk K/V, with LSE. Merge online with the running `(O, LSE)` of the stream.
+4. Run Part B of [§4.4](#44-prefill-over-resident-context) over the gathered new K/V and merge. No Part C is necessary, because no Q left the rank.
+
+The workspace holds one chunk of full K/V per rank, `C * Hkv_l * D * 4` bytes, and its size does not depend on the rank. `C` is a knob with a default of `4096` tokens. A larger `C` means fewer collectives and more transient memory.
+
+**Selection.** The policy runs one time per prefill step from the batch totals of `T` and `L`. Thus one method runs per step, and every rank selects the same method with no exchange. Pass-Q moves `2 * T * Hq_l * D * 2` bytes per rank and pass-KV moves `L * Hkv_l * D * 4` bytes per rank, both times `(cp-1)/cp`. For the thinker, pass-Q wins when the step adds less than one eighth of the resident length.
+
+A decode step, a modality-walk prefill and a short second turn select pass-Q. A long second turn after a short first turn selects pass-KV. An MLA model, with one latent KV head, selects pass-KV at every ratio.
+
+**Shared parts.** Both methods use the same ragged wrapper, the same merge and the same gathered new K/V. Both report `lse = -inf` for a stream with no resident tokens, so the collectives stay unconditional per stream. Ring pass-KV is a later implementation of `CPAttention` that replaces the all-gather in step 2 with point-to-point exchange and overlaps it with step 3.
 
 ---
 
@@ -304,7 +335,7 @@ Three features compose with no new work.
 2. **Speculation** (TP async follow). The flags travel on `ScheduleTPNode` unchanged. A CP decode step adds one lockstep collective per layer, as the TP all-reduce does.
 3. **Prefix caching** (#210). Under CP a cached prefix is a set of per-rank page lists under one hash, with a hit granularity of `cp * I_tok` tokens. The per-rank refcount of #210 does not change.
 
-Five features are asserted off in v1. Each has a follow-up in [§10](#10-delivery-plan-and-follow-ups).
+Five features are asserted off in v1. Each has a follow-up in [§10](#10-implementation-plan-and-follow-ups).
 
 1. **Windowed generation** (#198). A release of the oldest pages shifts every later logical page and its owner. The fix is a per-stream logical base offset.
 2. **PD disaggregation.** Equal `cp` on both sides keeps the per-rank pull unchanged. But the conductor merges publish info from the first instance rank only, and CP page lists differ by rank. The fix is to publish the list of every rank. A different `cp` on the two sides needs a re-interleave.
@@ -344,45 +375,32 @@ Non-owned rows go to a sink page. That trades `(cp-1)/cp` of the scatter bandwid
 
 ---
 
-## 10. Delivery plan and follow-ups
+## 10. Implementation plan and follow-ups
 
-The estimates assume one engineer with 2 to 4 GPUs on one node. The total is about 3 weeks to a measured CP2 and CP4 thinker.
+One PR per row. Each PR keeps the invariants of [§1](#1-design-rules-and-invariants) and the checks of [§8](#8-correctness-checks) that exist at that point.
 
-**PR 1. Mesh, groups, LSE (2 days, no behavior change).**
-- `cp_size` in YAML and `WorkerGraph`. `cp_group` on the group classes. `head_shard_size` at every head-degree site. Every `[tp, sp]` loop gets `cp`. `_broadcast_tokens` over the joint group.
-- `return_lse` on both wrappers. `mstar/distributed/cp/{layout,merge}.py` with unit tests.
-- Done when: no code path reads `cp_size > 1`, check 4 passes, and the current TP2 and TP2×SP2 tests do not change.
-
-**PR 2. KV ownership and decode CP (5 days).**
-- `CPLayout` in the allocator, the views and the plans. Symmetric reservation. `SINK_PAGE` row for empty shards. Assertions for the five features that are off.
-- The decode merge path. Replicated prefill as the only prefill mode. `configs/qwen3omni_thinker_cp2.yaml`.
-- Done when: checks 1 to 3 pass, the TP1-vs-CP2 protocol passes on short prompts, and CUDA-graph decode replays with the all-gather inside.
-
-**PR 3. Prefill CP (7 days).**
-- Zigzag chunks, the K/V gather, the ragged prefill wrapper.
-- Thinker input slice, `cp_rows` in the step declaration, explicit positions for generic models, the last-hidden-row broadcast, the `thinker_states` all-gather.
-- The pass-Q path of [§4.4](#44-prefill-over-resident-context) behind a `CPAttention` interface. Pass-KV and ring are later implementations of the same interface.
-- Done when: check 5 passes on 16K and 32K text prompts for `cp2`, `cp4` and `tp2*cp2`.
-
-**PR 4. Measurement (2 days).**
-- Time to first token at 4K to 64K for TP1, TP2, TP4, CP2, CP4 and TP2×CP2. Time per output token at `B` in 1, 8 and 32. Capacity in 32K sessions. `I_tok` in 1, `P` and `4P`.
-- Done when: the table gives the prompt length at which CP2 and CP4 beat TP2 on this hardware, and the default `I_tok`.
+| PR | Scope | Done when |
+|---|---|---|
+| 1. Mesh, groups, LSE | `cp_size` axis, `head_shard_size` at every head-degree site, three-axis agreement checks, `return_lse`, `CPLayout` and the merge with unit tests | check 4 passes and the current TP2 and TP2×SP2 tests do not change |
+| 2. KV ownership and decode CP | `CPLayout` in the allocator and the plans, symmetric reservation, sink page, decode merge path, replicated prefill as the only prefill mode, assertions for the features that are off | checks 1 to 3 pass and CUDA-graph decode replays with the all-gather inside |
+| 3. Prefill CP with pass-Q | zigzag chunks, K/V gather, ragged wrapper, thinker slice, span and sample, `CPAttention` with `PassQ` | check 5 passes on 16K and 32K text prompts |
+| 4. Pass-KV and the policy | paged-cache gather kernel, fixed-chunk workspace, chunk loop with online merge, `PassKV`, `select_method` | check 5 passes with each method forced, and the two methods agree |
+| 5. Measurement | time to first token, time per output token, capacity in 32K sessions, `I_tok` sweep, the pass-Q/pass-KV crossover | the table gives the prompt length at which CP2 and CP4 beat TP2, and the defaults for `I_tok` and `C` |
 
 **Follow-ups, in priority order, each with its trigger from [§4.5](#45-cost-model-and-levers):**
 
-1. *Pass-KV for resident context and the pass-Q/pass-KV policy.* Trigger: the first MLA model on a CP node, or a measured second-turn `T / L` above `Hkv_l / Hq_l`. Prerequisites: a gather kernel from the paged cache into a contiguous workspace (M* has only `read_tokens`). A workspace with a size from the global `stored_len`, so that every rank gathers the same bytes (I2). A chunk loop with an online LSE merge.
-2. *Ring pass-KV and pass-Q* behind the same interface. Trigger: a measured all-gather above about 20 % of a prefill step, or a 1M-token target that exceeds the transient memory. Prerequisites: all of item 1, plus point-to-point send and receive (M* has `all_gather` and `all_to_all` only), a second CUDA stream with events, and double-buffered K/V.
-3. *Fused merge and compaction before the K/V write.* Trigger: a profile shows the merge or the sink scatter above 5 % of a layer. With `I_tok = 1` the owned rows of the gathered buffer are a strided view, so the compaction is free.
-4. *Length-based CP degree* (two node groups plus a conductor predicate). Trigger: short requests dominate a `cp > 1` instance. Dense models are the first candidates, because the thinker's floor keeps the short-prompt loss near 6 %.
-5. *CP carved from TP*, *PD with different `cp`*, *prefix cache under CP* (with #210), *windowed generation under CP* (with #198).
-6. *CP prefill CUDA-graph capture* (lowest priority). Trigger: a profile shows launch latency above 5 % of a CP prefill step, after items 1 to 5.
-7. *Cheaper `lm_head` on the critical path* (low priority, a TP item). The thinker's `lm_head` reads about 310 MB per rank per step at TP2, about 0.12 ms. Trigger: a profile shows `lm_head` above 5 % of a decode step.
+1. *Ring pass-KV and pass-Q* behind the same interface. Trigger: a measured all-gather above about 20 % of a prefill step, or a 1M-token target that exceeds the transient memory. Prerequisites: point-to-point send and receive (M* has `all_gather` and `all_to_all` only), a second CUDA stream with events, and double-buffered K/V.
+2. *Fused merge and compaction before the K/V write.* Trigger: a profile shows the merge or the sink scatter above 5 % of a layer. With `I_tok = 1` the owned rows of the gathered buffer are a strided view, so the compaction is free.
+3. *Length-based CP degree* (two node groups plus a conductor predicate). Trigger: short requests dominate a `cp > 1` instance. Dense models are the first candidates, because the thinker's floor keeps the short-prompt loss near 6 %.
+4. *CP carved from TP*, *PD with different `cp`*, *prefix cache under CP* (with #210), *windowed generation under CP* (with #198).
+5. *CP prefill CUDA-graph capture* (lowest priority). Trigger: a profile shows launch latency above 5 % of a CP prefill step, after items 1 to 4.
+6. *Cheaper `lm_head` on the critical path* (low priority, a TP item). The thinker's `lm_head` reads about 310 MB per rank per step at TP2, about 0.12 ms. Trigger: a profile shows `lm_head` above 5 % of a decode step.
 
 ---
 
 ## 11. Benchmark acceptance
 
-Two predictions from the cost model are the acceptance checks for PR 4.
+Two predictions from the cost model are the acceptance checks for PR 5.
 
 - Thinker geometry: 48 layers, `Hq = 32`, `Hkv = 4`, `D = 128`. Hardware: one 8×H100 node.
 - Prediction 1: CP2 prefill is about 1.9× faster than the TP1-equivalent compute above about 24K tokens.
@@ -393,7 +411,7 @@ Two predictions from the cost model are the acceptance checks for PR 4.
 
 ## 12. Non-goals
 
-1. Ring attention (pass-KV, pass-Q) in v1. No point-to-point primitive exists, and the all-gather is safe under CUDA graphs. It is a follow-up behind the same interface.
+1. Ring attention in v1. No point-to-point primitive exists, and the all-gather is safe under CUDA graphs. It is a follow-up behind the `CPAttention` interface.
 2. CP on non-autoregressive nodes (DiT, encoders). Ulysses SP covers them.
 3. Sliding-window, Mamba, linear-attention or attention-sink layers under CP. No in-tree AR model has them, and vLLM asserts them off too.
 4. Changes to conductor routing or to the Rust runtime. The instance abstraction absorbs the new axis.
