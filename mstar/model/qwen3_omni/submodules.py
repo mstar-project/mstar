@@ -44,6 +44,7 @@ from mstar.model.qwen3_omni.config import (
     TALKER_SAMPLER,
     THINKER_ATTN,
     THINKER_KV,
+    THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
     Qwen3OmniModelConfig,
@@ -546,19 +547,22 @@ class ThinkerSubmodule(ARNodeSubmodule):
         per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
+        row_walks = [inp.graph_walk or graph_walk for inp in inputs]
         kept_rids = None
         if graph_walk != "thinker_decode":
-            # only the last prefill's token survives `postprocess`
+            # decode rows, and the last prefill, keep their token through `postprocess`
             info = per_request_info or {}
             kept_rids = frozenset(
-                rid for rid in request_ids
-                if rid in info and info[rid].step_metadata.get("is_last_prefill", False)
+                rid for rid, walk in zip(request_ids, row_walks, strict=True)
+                if walk == "thinker_decode" or (
+                    rid in info and info[rid].step_metadata.get("is_last_prefill", False)
+                )
             )
-        prefill_tokens = {}
-        if graph_walk == "prefill_text":
-            prefill_tokens={
-                rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
-            }
+        prefill_tokens = {
+            rid: inp.input_ids
+            for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
+            if walk == "prefill_text"
+        }
 
         pos_advance = None
         if graph_walk == "prefill_vision":
@@ -766,7 +770,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
         return len(model_inputs) > 1
 
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    # past 4 for thinker_mixed, whose decode rows ride in these captures
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     # prefill_vision buckets are larger than text/audio because video
     # produces many vision tokens per request.  Capture only bs=1
@@ -800,7 +805,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             ),
             PackedCudaGraphConfig(
                 capture_graph_walk="prefill_text",
-                replay_graph_walks=["prefill_text", "prefill_audio"],
+                replay_graph_walks=["prefill_text", "prefill_audio", THINKER_MIXED],
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,
                     input_ids=torch.zeros((n,), dtype=torch.long, device=device),
@@ -881,7 +886,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         """
 
         is_prefill = graph_walk in (
-            "prefill_text", "prefill_audio", "prefill_vision",
+            "prefill_text", "prefill_audio", "prefill_vision", THINKER_MIXED,
         )
 
         # prefill_vision: reassemble per-layer deepstack tensors from
