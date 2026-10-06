@@ -1,8 +1,8 @@
 model: "chatterbox_multilingual"
 # cond (34) + text (<= 512) + speech (<= 4096) tokens per stream
 max_seq_len: 4680
-# A CFG request at full text and the default 1000 speech tokens holds 2 x 25
-# pages, so 30 always fit on device; more would stall decode on a full pool.
+# A CFG request at full text and max_new_tokens_limit speech tokens holds
+# 2 x 25 pages, so 30 always fit on device; more would stall decode on a full pool.
 max_concurrent_requests: 30
 resources:
   t3_kv:
@@ -16,7 +16,8 @@ node_groups:
   - node_names: [s3gen]
     ranks: [0]
     graph_walks: [s3gen_chunk, s3gen_chunk_voice]
-# model_kwargs:
+model_kwargs:
+  max_new_tokens_limit: 1000   # sized with max_concurrent_requests to fit t3_kv
 #   default_language: en           # language_id used when a request gives none (23 codes, see docs)
 #   voices_dir: /path/to/preset/wavs   # voice="<name>" loads <name>.wav
 #   watermark: true                     # Perth watermark on every output

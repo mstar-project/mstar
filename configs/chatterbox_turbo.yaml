@@ -1,8 +1,8 @@
 model: "chatterbox_turbo"
 # cond (376) + text (<= 512) + speech (<= 4096) tokens; single stream (no CFG)
 max_seq_len: 5000
-# A request at full text and the default 1000 speech tokens holds 30 pages,
-# so 50 always fit on device; more would stall decode on a full pool.
+# A request at full text and max_new_tokens_limit speech tokens holds 30
+# pages, so 50 always fit on device; more would stall decode on a full pool.
 max_concurrent_requests: 50
 resources:
   t3_kv:
@@ -16,3 +16,5 @@ node_groups:
   - node_names: [s3gen]
     ranks: [0]
     graph_walks: [s3gen_chunk, s3gen_chunk_voice]
+model_kwargs:
+  max_new_tokens_limit: 1000   # sized with max_concurrent_requests to fit t3_kv

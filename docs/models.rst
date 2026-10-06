@@ -286,11 +286,15 @@ Chatterbox notes
   deployment's ``model_kwargs: voices_dir``), and in ``extra_body``
   ``ref_audio`` (data URL of a reference clip, 5-30 s, cloning; an http(s)
   URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``; paths on the
-  server are refused), ``exaggeration`` (0-1, emotion intensity, default 0.5),
-  ``cfg_weight`` (default 0.5; 0 disables guidance and halves the T3 work),
-  ``temperature``/``top_p``/``top_k``/``min_p``/``repetition_penalty``,
-  ``seed``, ``n_cfm_timesteps`` (S3Gen Euler steps, 10; Turbo 2),
-  ``max_new_tokens``, ``ignore_eos`` (T3 decodes all ``max_new_tokens``
+  server are refused), ``exaggeration`` (0-2, emotion intensity, default 0.5),
+  ``cfg_weight`` (0-1, default 0.5; 0 disables guidance and halves the T3 work),
+  ``temperature`` (up to 5)/``top_p``/``top_k``/``min_p``/``repetition_penalty``
+  (up to 2; the bounds are the reference demo's), ``seed``, ``n_cfm_timesteps``
+  (S3Gen Euler steps, 10; Turbo 2), ``max_new_tokens`` (up to the deployment's
+  ``model_kwargs: max_new_tokens_limit``, 1000 in the shipped configs, which
+  size the KV cache so ``max_concurrent_requests`` requests of that length
+  always fit; raise it together with ``max_num_pages`` or a lower cap),
+  ``ignore_eos`` (T3 decodes all ``max_new_tokens``
   past the stop token, for fixed-length benchmarks; the speech tokens among
   them are vocoded, but T3 keeps emitting stop and control tokens after the
   end of speech and those are dropped, so the audio is shorter than

@@ -484,6 +484,35 @@ def test_generation_kwargs_accept_boundary_values():
     assert set(out) == {TEXT_INPUTS}
 
 
+def test_max_new_tokens_limit_bounds_requests_and_the_default():
+    model = _make_model()
+    model.config.max_new_tokens_limit = 1000
+    assert model.resolve_generation_kwargs({"max_new_tokens": 1000})["max_new_tokens"] == 1000
+    with pytest.raises(ValueError, match="over this deployment's limit of 1000"):
+        model.resolve_generation_kwargs({"max_new_tokens": 1001})
+    with pytest.raises(ValueError, match="over this deployment's limit"):
+        model.process_prompt("hello", ["text"], ["audio"], max_new_tokens=4096)
+    # a limit under the default lowers the default instead of refusing every request
+    model.config.max_new_tokens_limit = 300
+    assert model.resolve_generation_kwargs({})["max_new_tokens"] == 300
+    assert model.get_max_output_tokens() == 300
+
+
+@pytest.mark.parametrize("name", ["chatterbox", "chatterbox_multilingual", "chatterbox_turbo"])
+def test_shipped_yaml_fits_its_request_cap_in_the_kv_pool(name):
+    # Nothing preempts a stream once the pool is full, so max_concurrent_requests
+    # requests at full text and max_new_tokens_limit speech tokens must fit it.
+    cfg = yaml.safe_load((Path(__file__).parents[2] / "configs" / f"{name}.yaml").read_text())
+    config = ChatterboxConfig.from_variant(name)
+    limit = cfg["model_kwargs"]["max_new_tokens_limit"]
+    kv = cfg["resources"]["t3_kv"]
+    # conditioning + text + start token + speech tokens, per stream
+    tokens = config.t3.cond_len + config.max_text_tokens + 1 + limit
+    streams = 1 if config.is_turbo else 2  # CFG keeps a conditional and an unconditional stream
+    pages = streams * -(-tokens // kv["page_size"])
+    assert cfg["max_concurrent_requests"] * pages <= kv["max_num_pages"]
+
+
 # ---------------------------------------------------------------------------
 # conductor state machine
 # ---------------------------------------------------------------------------

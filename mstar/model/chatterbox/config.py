@@ -409,6 +409,10 @@ class ChatterboxConfig:
     # Serving limits
     max_text_tokens: int = 512
     voice_cache_size: int = 64
+    # Largest max_new_tokens a request may ask for (None = the T3 table). A
+    # deployment sets it with max_concurrent_requests so those requests always
+    # fit the KV pool: nothing preempts a stream once the pool is full.
+    max_new_tokens_limit: int | None = None
 
     # S3Gen streaming: the first waveform chunk is synthesised once
     # ``stream_first_chunk_tokens`` speech tokens exist (about 0.23 s on an

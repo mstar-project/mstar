@@ -146,6 +146,7 @@ class ChatterboxModel(Model):
         s3gen_max_batch_size: int | None = None,
         t3_dtype: str | None = None,
         default_language: str | None = None,
+        max_new_tokens_limit: int | None = None,
         **kwargs: Any,
     ) -> None:
         del kwargs
@@ -199,6 +200,10 @@ class ChatterboxModel(Model):
             self.config.t3_prefill_graphs = bool(t3_prefill_graphs)
         if default_language is not None:
             self.config.default_language = str(default_language)
+        if max_new_tokens_limit is not None:
+            self.config.max_new_tokens_limit = _integer(
+                "max_new_tokens_limit", max_new_tokens_limit, low=1, high=self.config.t3.max_speech_tokens,
+            )
         if s3gen_max_batch_size is not None:
             if int(s3gen_max_batch_size) < 1:
                 raise ValueError("s3gen_max_batch_size must be at least 1")
@@ -321,6 +326,17 @@ class ChatterboxModel(Model):
         temperature = _number(
             "temperature", mk.get("temperature", g.temperature), low=0.0, high=MAX_TEMPERATURE,
         )
+        limit = self.config.max_new_tokens_limit or self.config.t3.max_speech_tokens
+        max_new_tokens = _integer(
+            "max_new_tokens",
+            mk.get("max_new_tokens", mk.get("max_output_tokens", min(g.max_new_tokens, limit))),
+            low=1, high=self.config.t3.max_speech_tokens,
+        )
+        if max_new_tokens > limit:
+            raise ValueError(
+                f"max_new_tokens={max_new_tokens} is over this deployment's limit of {limit} "
+                "(max_new_tokens_limit, sized with max_concurrent_requests to fit the KV cache)"
+            )
         knobs = {
             "temperature": temperature if do_sample else 0.0,
             "top_p": _number("top_p", mk.get("top_p", g.top_p), low=0.0, high=1.0),
@@ -339,11 +355,7 @@ class ChatterboxModel(Model):
             "exaggeration": _number(
                 "exaggeration", mk.get("exaggeration", g.exaggeration), low=0.0, high=MAX_EXAGGERATION,
             ),
-            "max_new_tokens": _integer(
-                "max_new_tokens",
-                mk.get("max_new_tokens", mk.get("max_output_tokens", g.max_new_tokens)),
-                low=1, high=self.config.t3.max_speech_tokens,
-            ),
+            "max_new_tokens": max_new_tokens,
             "n_cfm_timesteps": _integer(
                 "n_cfm_timesteps", mk.get("n_cfm_timesteps", g.n_cfm_timesteps),
                 low=1, high=MAX_CFM_TIMESTEPS,
