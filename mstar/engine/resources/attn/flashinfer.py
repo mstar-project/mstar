@@ -61,7 +61,9 @@ class FlashInferManager(AttentionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
-    def _cg_wrapper(self, lease: SlotLease, label: str, num_rows: int) -> AttentionWrapper:
+    def _cg_wrapper(
+        self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
+    ) -> AttentionWrapper:
         """The captured-graph wrapper for one (bucket, slot, label).
 
         Built on the first plan for that key rather than up front: which labels
@@ -91,7 +93,7 @@ class FlashInferManager(AttentionManager):
             **self._wrapper_kv_kwargs,
             "max_num_pages": num_rows * self._kv_config.max_num_pages,
         }
-        if bucket.bs == bucket.num_tokens:
+        if bucket.bs == bucket.num_tokens and not force_prefill:
             wrapper = FlashInferDecodeWrapper(
                 workspace_buffer=buffer,
                 batch_size=num_rows,
@@ -171,9 +173,9 @@ class FlashInferManager(AttentionManager):
             indptrs = kv_out.cpu_indptrs
             if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
-                wrapper = self._cg_wrapper(lease, label, num_rows)
+                wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)
             else:
-                is_decode = bool(
+                is_decode = not ctx.force_prefill and bool(
                     indptrs.qo_indptr[-1] == len(indptrs.qo_indptr) - 1
                 )
                 wrapper = self._eager_wrapper(label, is_decode, ctx.slot)

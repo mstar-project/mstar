@@ -191,6 +191,10 @@ def _stop_recording_to_pool(device, pool) -> None:
         pass
 
 
+def _is_packed(config: CudaGraphConfig) -> bool:
+    return config.get_config_type() == CudaGraphConfigType.FLASH_INFER_PACKED
+
+
 class DummyRowPool:
     """The padding rows captured replays pad onto.
 
@@ -562,6 +566,7 @@ class CudaGraphRunner:
                 slot=spec.slot,
                 capture=True,
                 slot_lease=lease,
+                force_prefill=_is_packed(config),
             ))
 
         engine_inputs.step = step
@@ -825,6 +830,10 @@ class CudaGraphRunner:
         return self.select_bucket(
             graph_walk, bs, num_tokens, cg_key_info
         ) is not None
+
+    def is_packed(self, lease: SlotLease) -> bool:
+        """Whether ``lease`` replays a packed capture."""
+        return _is_packed(self._buckets[lease.bucket].config)
 
     def lease_slot(
         self, graph_walk: str, bs: int,
@@ -1361,6 +1370,7 @@ class PiecewiseCudaGraphRunner:
             slot=slot,
             capture=capture,
             slot_lease=SlotLease(slot=slot, bucket=bucket),
+            force_prefill=self._config.get_config_type() == PiecewiseConfigType.PACKED,
         )
         ctx.set_padded_rids(tuple(request_ids))
         step.set_ctx(ctx)
