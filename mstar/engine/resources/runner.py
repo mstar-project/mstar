@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Collection, Mapping
 from time import perf_counter
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import ResourceReqConfig
@@ -21,6 +21,9 @@ from mstar.engine.resources.step import (
     SubmoduleStep,
 )
 from mstar.utils.profiler import PHASE_PERIOD, phase_record, range_pop, range_push
+
+if TYPE_CHECKING:
+    from mstar.model.submodule_base import InputSeqLenInfo
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +341,7 @@ class StepRunner:
     def admit_retrieve(
         self, rid: str, node_name: str, graph_walk: str,
         published: Mapping[str, PublishedInfo] | None = None,
+        seq_len_info: InputSeqLenInfo | None = None,
     ) -> FullAdmitOutcome:
         """bring published state in
 
@@ -364,6 +368,11 @@ class StepRunner:
                 )
                 return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
+            # no room yet is not-ready: the scheduler retries the row later
+            if ready and seq_len_info is not None and not self._resources[key].has_room(
+                rid, node_name, graph_walk, seq_len_info.get_admit_segment_len(key),
+            ):
+                ready = False
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
 

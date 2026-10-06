@@ -23,6 +23,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     InputMetadata,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -91,6 +92,14 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             input_ids=inputs["text_inputs"][0],
             input_seq_len=inputs["text_inputs"][0].shape[0]
         )
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        if "text_inputs" not in inputs:
+            return None
+        return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
 
     def declare_step(
         self, graph_walk: str,
