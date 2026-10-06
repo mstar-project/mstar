@@ -58,6 +58,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     InputMetadata,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -386,6 +387,22 @@ class ThinkerSubmodule(ARNodeSubmodule):
             vision_embeds,
             self._vision_eos_embed
         ], dim=0)
+
+    # multimodal spans carry a start and an end sentinel around the embeds
+    _EMBED_INPUTS = {"prefill_audio": "audio_embeds", "prefill_vision": "vision_embeds"}
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        if graph_walk == "thinker_decode":
+            return InputSeqLenInfo(1)
+        if graph_walk == "prefill_text" and "text_inputs" in inputs:
+            return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+        name = self._EMBED_INPUTS.get(graph_walk)
+        if name is not None and name in inputs:
+            return InputSeqLenInfo(inputs[name][0].shape[0] + 2)
+        return None
 
     def prepare_inputs(
         self,
