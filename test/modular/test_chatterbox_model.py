@@ -406,6 +406,12 @@ def test_generation_kwargs_defaults_and_turbo_guards():
     ({"max_output_tokens": 0}, r"max_new_tokens=0 is outside"),
     ({"temperature": -1}, r"temperature=-1.0 is outside"),
     ({"temperature": float("nan")}, "temperature must be a finite number"),
+    # finite in float64 but past fp32 / int32, which fails the sampler for the whole batch
+    ({"temperature": 1e39}, r"temperature=1e\+39 is outside \[0.0, 5.0\]"),
+    ({"repetition_penalty": 1e39}, r"repetition_penalty=1e\+39 is outside"),
+    ({"top_k": 2**31}, r"top_k=2147483648 is outside"),
+    ({"cfg_weight": 1.5}, r"cfg_weight=1.5 is outside \[0.0, 1.0\]"),
+    ({"exaggeration": 1e39}, r"exaggeration=1e\+39 is outside \[0.0, 2.0\]"),
     ({"top_p": 1.5}, r"top_p=1.5 is outside"),
     ({"top_k": -3}, r"top_k=-3 is outside"),
     ({"min_p": 2.0}, r"min_p=2.0 is outside"),
@@ -448,6 +454,12 @@ def test_generation_kwargs_accept_boundary_values():
     assert knobs["temperature"] == 0.0 and knobs["n_cfm_timesteps"] == 100
     assert knobs["watermark"] is False and knobs["ignore_eos"] is True
     assert model.resolve_generation_kwargs({"max_new_tokens": 4096})["max_new_tokens"] == 4096
+    top = model.resolve_generation_kwargs({
+        "temperature": 5, "repetition_penalty": 2, "cfg_weight": 1, "exaggeration": 2,
+        "top_k": model.config.t3.speech_vocab_size,
+    })
+    assert (top["temperature"], top["repetition_penalty"]) == (5.0, 2.0)
+    assert (top["cfg_weight"], top["exaggeration"]) == (1.0, 2.0)
     # other request fields ride along in the same kwargs and are left alone
     out = model.process_prompt("hello", ["text"], ["audio"], voice="default", language_id=None, seed=7)
     assert set(out) == {TEXT_INPUTS}

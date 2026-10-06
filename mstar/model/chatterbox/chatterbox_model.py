@@ -109,6 +109,12 @@ MIN_REFERENCE_SECONDS = 0.5
 MAX_CFM_TIMESTEPS = 100
 # Sentence chunking adds the chunk index to the seed, so leave int64 headroom
 MAX_SEED = 2**62
+# The reference demo's slider maxima. Far past them T3 runs to max_new_tokens,
+# and a value that overflows the sampler's fp32 row fails the whole batch.
+MAX_TEMPERATURE = 5.0
+MAX_REPETITION_PENALTY = 2.0
+MAX_CFG_WEIGHT = 1.0
+MAX_EXAGGERATION = 2.0
 
 
 class ChatterboxModel(Model):
@@ -309,18 +315,27 @@ class ChatterboxModel(Model):
         mk = dict(model_kwargs or {})
         g = self.config.generation
         do_sample = _flag("do_sample", mk.get("do_sample", True))
-        temperature = _number("temperature", mk.get("temperature", g.temperature), low=0.0)
+        temperature = _number(
+            "temperature", mk.get("temperature", g.temperature), low=0.0, high=MAX_TEMPERATURE,
+        )
         knobs = {
             "temperature": temperature if do_sample else 0.0,
             "top_p": _number("top_p", mk.get("top_p", g.top_p), low=0.0, high=1.0),
-            "top_k": _integer("top_k", mk.get("top_k", g.top_k), low=0),
+            # the sampler's top-k row is int32
+            "top_k": _integer(
+                "top_k", mk.get("top_k", g.top_k), low=0, high=self.config.t3.speech_vocab_size,
+            ),
             "min_p": _number("min_p", mk.get("min_p", g.min_p), low=0.0, high=1.0),
             "repetition_penalty": _number(
                 "repetition_penalty", mk.get("repetition_penalty", g.repetition_penalty),
-                low=0.0, low_open=True,
+                low=0.0, high=MAX_REPETITION_PENALTY, low_open=True,
             ),
-            "cfg_weight": _number("cfg_weight", mk.get("cfg_weight", g.cfg_weight), low=0.0),
-            "exaggeration": _number("exaggeration", mk.get("exaggeration", g.exaggeration), low=0.0),
+            "cfg_weight": _number(
+                "cfg_weight", mk.get("cfg_weight", g.cfg_weight), low=0.0, high=MAX_CFG_WEIGHT,
+            ),
+            "exaggeration": _number(
+                "exaggeration", mk.get("exaggeration", g.exaggeration), low=0.0, high=MAX_EXAGGERATION,
+            ),
             "max_new_tokens": _integer(
                 "max_new_tokens",
                 mk.get("max_new_tokens", mk.get("max_output_tokens", g.max_new_tokens)),
