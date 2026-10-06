@@ -213,3 +213,8 @@ class FullAdmitOutcome(NamedTuple):
 FULL_ADMIT_OK = FullAdmitOutcome(ADMIT_OK)
 # admitted, but something it needs has not landed yet: retry, don't fail
 FULL_ADMIT_NOT_READY = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False))
+# not ready only because a pool's admission gate holds the request back (see ADMIT_WAIT),
+# and by no other resource: equal to FULL_ADMIT_NOT_READY, told apart by identity. WAIT_BEHIND
+# if every gate that held it back had it behind the front of the queue
+FULL_ADMIT_WAIT = FullAdmitOutcome(ADMIT_WAIT)
+FULL_ADMIT_WAIT_BEHIND = FullAdmitOutcome(ADMIT_WAIT_BEHIND)

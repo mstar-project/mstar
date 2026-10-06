@@ -14,8 +14,12 @@ from typing import Any
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
+    ADMIT_WAIT,
+    ADMIT_WAIT_BEHIND,
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
+    FULL_ADMIT_WAIT,
+    FULL_ADMIT_WAIT_BEHIND,
     FullAdmitOutcome,
     SubmoduleStep,
 )
@@ -243,8 +247,17 @@ class StepRunner:
         answers for an unrecognised node with the default `["main"]`, so the
         node ends up gated on — and able to allocate against — another node's
         cache.
+
+        Not ready only because admission gates held the request back, and for
+        no other reason, answers `FULL_ADMIT_WAIT` (`FULL_ADMIT_WAIT_BEHIND` if
+        each had it behind the front of the queue): equal to the plain answer,
+        and what a caller may stop asking over while `admission_keys` stands.
+        Any other resource not being ready makes it the plain one.
         """
         ready = True
+        # the gates' answer, as long as no other reason has held the step back
+        waited = None
+        gates_only = True
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
         ):
@@ -258,8 +271,18 @@ class StepRunner:
                     key, outcome.reason.message
                 )
                 return FullAdmitOutcome(outcome, key)
-            ready = ready and outcome.ready
-        return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
+            if outcome.ready:
+                continue
+            ready = False
+            if outcome is ADMIT_WAIT:
+                waited = FULL_ADMIT_WAIT
+            elif outcome is ADMIT_WAIT_BEHIND:
+                waited = waited or FULL_ADMIT_WAIT_BEHIND
+            else:
+                gates_only = False
+        if ready:
+            return FULL_ADMIT_OK
+        return waited if gates_only else FULL_ADMIT_NOT_READY
 
 
 
