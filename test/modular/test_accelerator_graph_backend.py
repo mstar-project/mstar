@@ -1,7 +1,13 @@
 import pytest
 import torch
 
-from mstar.engine.accelerator_graph_backend import AcceleratorGraphBackend
+from mstar.engine.accelerator_graph_backend import (
+    AcceleratorGraphBackend,
+    CUDAGraphBackend,
+    XPUGraphBackend,
+    get_accelerator_graph_backend,
+    supports_accelerator_graphs,
+)
 from mstar.engine.accelerator_graph_runner import (
     capture_into_graph,
     capture_with_static_outputs,
@@ -10,12 +16,52 @@ from mstar.engine.accelerator_graph_runner import (
 
 def test_backend_rejects_non_accelerator_device():
     with pytest.raises(ValueError, match="unsupported"):
-        AcceleratorGraphBackend(torch.device("cpu"))
+        get_accelerator_graph_backend(torch.device("cpu"))
+    assert not supports_accelerator_graphs(torch.device("cpu"))
+
+
+def test_backend_interface_requires_an_implementation():
+    with pytest.raises(TypeError, match="abstract"):
+        AcceleratorGraphBackend(torch.device("xpu"))
+
+
+@pytest.mark.parametrize(
+    ("device_type", "backend_type", "graph_type"),
+    [
+        ("cuda", CUDAGraphBackend, "CUDAGraph"),
+        ("xpu", XPUGraphBackend, "XPUGraph"),
+    ],
+)
+def test_backend_dispatches_without_initializing_hardware(
+    monkeypatch, device_type, backend_type, graph_type,
+):
+    runtime = getattr(torch, device_type)
+    graph = object()
+    monkeypatch.setattr(runtime, graph_type, lambda: graph)
+    monkeypatch.setattr(runtime, "is_available", lambda: False)
+
+    def initialize(*args, **kwargs):
+        pytest.fail("selecting a graph backend must not initialize hardware")
+
+    monkeypatch.setattr(runtime, "_lazy_init", initialize)
+    device = torch.device(device_type, 0)
+    backend = get_accelerator_graph_backend(device)
+    assert isinstance(backend, backend_type)
+    assert backend.device == device
+    assert supports_accelerator_graphs(device)
+    assert not backend.is_available()
+    assert backend.create_graph() is graph
+
+
+@pytest.mark.parametrize("backend_type", [CUDAGraphBackend, XPUGraphBackend])
+def test_concrete_backend_rejects_wrong_device(backend_type):
+    with pytest.raises(ValueError, match="requires"):
+        backend_type(torch.device("cpu"))
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is unavailable")
 def test_xpu_graph_backend_replays_with_updated_static_input():
-    backend = AcceleratorGraphBackend(torch.device("xpu:0"))
+    backend = get_accelerator_graph_backend(torch.device("xpu:0"))
     backend.set_device()
     static_input = torch.ones(16, device=backend.device)
     static_output = torch.empty_like(static_input)
@@ -51,7 +97,7 @@ def graph_device(request):
 
 
 def test_runner_capture_recovers_after_failed_capture(graph_device):
-    backend = AcceleratorGraphBackend(graph_device)
+    backend = get_accelerator_graph_backend(graph_device)
     value = torch.ones(8, device=graph_device)
     pool = backend.graph_pool_handle()
     stream = backend.current_stream()
@@ -90,7 +136,7 @@ def test_sampler_buffers_stage_on_accelerator(graph_device):
 
 
 def test_shared_pool_region_outputs_survive_other_graph_replays(graph_device):
-    backend = AcceleratorGraphBackend(graph_device)
+    backend = get_accelerator_graph_backend(graph_device)
     value = torch.ones(8, device=graph_device)
     pool = backend.graph_pool_handle()
     graphs, outputs = [], []

@@ -13,7 +13,10 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
-from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
+from mstar.engine.accelerator_graph_backend import (
+    get_accelerator_graph_backend,
+    supports_accelerator_graphs,
+)
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     PiecewiseAcceleratorGraphRunner,
@@ -566,7 +569,7 @@ class Engine:
         # ``PiecewiseAcceleratorGraphRunner``): its captured-memory footprint becomes
         # the largest region's rather than the sum over regions.
         memory_pool = None
-        if configs and getattr(self._device, "type", None) in {"cuda", "xpu"}:
+        if configs and supports_accelerator_graphs(self._device):
             backend = get_accelerator_graph_backend(self._device)
             if backend.is_available():
                 memory_pool = backend.graph_pool_handle()

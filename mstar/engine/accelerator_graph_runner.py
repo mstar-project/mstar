@@ -12,6 +12,7 @@ from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
     get_accelerator_graph_backend,
+    supports_accelerator_graphs,
 )
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
@@ -133,9 +134,7 @@ def capture_into_graph(run, pool, device, autocast_dtype):
     except BaseException:
         if isinstance(pool, AcceleratorGraphPool):
             pool.failed_graph = graph
-        backend.device_module.set_stream(prev_stream)
-        backend.synchronize()
-        _stop_recording_to_pool(device, pool)
+        backend.recover_failed_capture(pool, prev_stream)
         raise
     backend.synchronize()
     if isinstance(pool, AcceleratorGraphPool):
@@ -186,23 +185,6 @@ def fail_if_graphs_required(missing: list[str]) -> None:
         "accelerator graph capture failed for " + ", ".join(missing)
         + " and accelerator graphs are required"
     )
-
-
-def _stop_recording_to_pool(device, pool) -> None:
-    device = torch.device(device)
-    if isinstance(pool, AcceleratorGraphPool):
-        pool = pool.handle
-    end = getattr(torch._C, f"_{device.type}_endAllocateToPool", None)
-    if end is None:
-        return
-    index = device.index
-    if index is None:
-        index = getattr(torch, device.type).current_device()
-    try:
-        end(index, pool)
-    except RuntimeError:
-        # the capture failed before the allocator started recording
-        pass
 
 
 class DummyRowPool:
@@ -311,7 +293,7 @@ class AcceleratorGraphRunner:
         self._device = device
         self._graph_backend = (
             get_accelerator_graph_backend(device)
-            if device is not None and device.type in {"cuda", "xpu"}
+            if device is not None and supports_accelerator_graphs(device)
             else None
         )
         self._autocast_dtype = autocast_dtype
@@ -1118,7 +1100,7 @@ class PiecewiseAcceleratorGraphRunner:
         self._device = device
         self._graph_backend = (
             get_accelerator_graph_backend(device)
-            if device is not None and device.type in {"cuda", "xpu"}
+            if device is not None and supports_accelerator_graphs(device)
             else None
         )
         self._autocast_dtype = autocast_dtype

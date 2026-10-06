@@ -968,9 +968,14 @@ walks, by returning ``False`` from ``can_batch`` in those cases.
 
 **Accelerator graphs.** A submodule declares the shapes it can capture in
 ``get_accelerator_graph_configs(self, device, tp_world_size=1) -> list[AcceleratorGraphConfig]``.
-The default is an empty list, which means eager execution. The backend in
-``mstar/engine/accelerator_graph_backend.py`` selects ``torch.cuda.CUDAGraph`` for
-``device.type == "cuda"`` and ``torch.xpu.XPUGraph`` for ``device.type == "xpu"``.
+The default is an empty list, which means eager execution.
+``AcceleratorGraphBackend`` in ``mstar/engine/accelerator_graph_backend.py`` is
+an abstract interface for graph capture, streams, pools and capture recovery.
+``get_accelerator_graph_backend(device)`` selects ``CUDAGraphBackend`` or
+``XPUGraphBackend`` from a registry. Those implementations create
+``torch.cuda.CUDAGraph`` and ``torch.xpu.XPUGraph``, respectively.
+To add another backend, implement the interface and register its device type
+in ``_GRAPH_BACKENDS``; the runners use that registry to check capture support.
 Declare configs only for devices whose kernels and resources support capture.
 The graph-captured token sampler currently uses FlashInfer on CUDA; XPU forwards
 that sample tokens use the eager path. BAGEL's XPU ``image_gen_cfg`` capture does not

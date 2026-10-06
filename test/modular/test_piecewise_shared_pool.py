@@ -5,7 +5,7 @@ import inspect
 import pytest
 import torch
 
-from mstar.engine.accelerator_graph_backend import AcceleratorGraphBackend
+from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
 from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 
 
@@ -23,7 +23,7 @@ def test_two_runners_share_the_pool_handle(device_type):
     from unittest import mock
 
     device = torch.device(device_type)
-    backend = AcceleratorGraphBackend(device)
+    backend = get_accelerator_graph_backend(device)
     if not backend.is_available():
         pytest.skip(f"{device_type} is unavailable")
     pool = backend.graph_pool_handle()
