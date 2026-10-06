@@ -71,6 +71,8 @@ class ScheduledBatch:
     tp_seq: int = -1
     # rid -> real walk, set iff ``graph_walk`` is a combined walk
     request_walks: dict[int, str] = field(default_factory=dict)
+    # real walk -> its output edge names, under a combined walk
+    walk_output_signals: dict[str, list[str]] = field(default_factory=dict)
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
@@ -91,7 +93,12 @@ class ScheduledBatch:
         walks = {self.request_walks[rid] for rid in self.request_to_worker_graph}
         if len(walks) == 1:
             self.graph_walk = walks.pop()
+            # the merged batch kept its first walk's names, which may not be this walk's
+            self.output_signals = self.walk_output_signals.get(
+                self.graph_walk, self.output_signals,
+            )
             self.request_walks = {}
+            self.walk_output_signals = {}
 
     def merge(self, other: "ScheduledBatch") -> None:
         """Fold ``other``'s requests in, ours first — they have waited longer."""
@@ -104,6 +111,7 @@ class ScheduledBatch:
         self.request_to_worker_graph.update(other.request_to_worker_graph)
         self.input_edges.extend(other.input_edges)
         self.request_walks.update(other.request_walks)
+        self.walk_output_signals.update(other.walk_output_signals)
 
     def split_off_first(
         self, bs: int | None, exclude_rids: set[int] | None = None
@@ -138,6 +146,7 @@ class ScheduledBatch:
             input_edges=self.input_edges.select_rids(set(taken)),
             output_signals=self.output_signals,
             request_walks=self._walks_for(taken),
+            walk_output_signals=self.walk_output_signals,
         ), ScheduledBatch(
             node_name=self.node_name,
             graph_walk=self.graph_walk,
@@ -147,6 +156,7 @@ class ScheduledBatch:
             input_edges=self.input_edges.select_rids(set(left)),
             output_signals=self.output_signals,
             request_walks=self._walks_for(left),
+            walk_output_signals=self.walk_output_signals,
         )
 
     def _walks_for(self, rids: list[int]) -> dict[int, str]:
@@ -831,6 +841,8 @@ class MicroScheduler:
                 input_edges=popped.input_edges,
                 output_signals=popped.output_signals,
                 request_walks={} if walk == graph_walk else dict.fromkeys(batch_rids, walk),
+                walk_output_signals={} if walk == graph_walk
+                else {walk: list(popped.output_signals)},
             )
             if batch is None:
                 batch = part
