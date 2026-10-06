@@ -21,6 +21,8 @@ class LinearAttnVariant(Enum):
     GDN = "gdn"
     # Kimi delta attention: diagonal decay per K channel. Kimi Linear, GLM-5.3.
     KDA = "kda"
+    # Mamba-2 / SSD: per-head scalar decay exp(dt * A), grouped B/C. Nemotron-H.
+    MAMBA2 = "mamba2"
 
 
 class LinearAttnBackend(Enum):
@@ -45,6 +47,10 @@ class LinearAttnConfig:
     # `GDNManager.run` where it cannot (the SM90 chunked prefill). Qwen3.5 needs
     # it (HF and vLLM both pass it) and skipping it diverges silently.
     qk_l2norm: bool = True
+
+    # Mamba-2 only: clamp on dt after softplus, as HF's ``time_step_limit``
+    # (Nemotron-H leaves it open: (0, inf)).
+    time_step_limit: tuple[float, float] = (0.0, float("inf"))
 
 
 @dataclass

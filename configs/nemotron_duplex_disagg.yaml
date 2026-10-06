@@ -1,0 +1,32 @@
+# NVIDIA NemotronLabs VoiceChat-11B — disaggregated duplex layout.
+#
+# Each streaming consumer runs on its own GPU / worker thread so the
+# frame-synchronous decode loop, the talker loop, and the codec run in a
+# pipeline instead of serializing on one GPU thread. The colocated single-GPU
+# layout (configs/nemotron_duplex.yaml) also works and produces identical
+# output; this layout trades GPUs for pipeline parallelism / throughput.
+# Encoder + LLM share rank 0 (the encoder runs once up front, then the LLM
+# decode loop consumes its frames — no interleaving between them).
+#
+#   rank 0: conformer_encoder (Encoder) + nano_llm (LLM)
+#   rank 1: eartts_talker     (Talker)
+#   rank 2: audio_codec       (Codec)
+model: "nemotron_duplex"
+max_seq_len: 12288
+
+node_groups:
+  - node_names:
+      - conformer_encoder
+      - nano_llm
+    ranks:
+      - 0
+
+  - node_names:
+      - eartts_talker
+    ranks:
+      - 1
+
+  - node_names:
+      - audio_codec
+    ranks:
+      - 2
