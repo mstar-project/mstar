@@ -1333,7 +1333,7 @@ class Engine:
         if host_rows is not None:
             try:
                 batched = submodule.check_stop_batched(
-                    batch.request_ids, batch.per_request_info, host_rows,
+                    batch.request_ids, batch.per_request_info_wrapped, host_rows,
                 )
             except Exception:
                 logger.debug(
