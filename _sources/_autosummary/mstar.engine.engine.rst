@@ -25,6 +25,7 @@ mstar.engine.engine
    
       Engine
       ExecutingBatch
+      ForwardPassInfoWrapper
       SubmoduleManagement
    
    

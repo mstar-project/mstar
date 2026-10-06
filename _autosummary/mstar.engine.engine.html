@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 06, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -666,6 +666,11 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.ExecutingBatch.stream_partition_done_rids"><code class="docutils literal notranslate"><span class="pre">ExecutingBatch.stream_partition_done_rids</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.ForwardPassInfoWrapper"><code class="docutils literal notranslate"><span class="pre">ForwardPassInfoWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.ForwardPassInfoWrapper.info"><code class="docutils literal notranslate"><span class="pre">ForwardPassInfoWrapper.info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.ForwardPassInfoWrapper.metadata"><code class="docutils literal notranslate"><span class="pre">ForwardPassInfoWrapper.metadata</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.SubmoduleManagement"><code class="docutils literal notranslate"><span class="pre">SubmoduleManagement</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.SubmoduleManagement.cuda_graph_runner"><code class="docutils literal notranslate"><span class="pre">SubmoduleManagement.cuda_graph_runner</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.SubmoduleManagement.forward"><code class="docutils literal notranslate"><span class="pre">SubmoduleManagement.forward</span></code></a></li>
@@ -713,7 +718,10 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.engine.ExecutingBatch" title="mstar.engine.engine.ExecutingBatch"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ExecutingBatch</span></code></a>(node_name, per_request_info, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.engine.SubmoduleManagement" title="mstar.engine.engine.SubmoduleManagement"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SubmoduleManagement</span></code></a>(submodule, forward, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.engine.ForwardPassInfoWrapper" title="mstar.engine.engine.ForwardPassInfoWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ForwardPassInfoWrapper</span></code></a>(info, metadata)</p></td>
+<td><p>Stop-gap solution: the dynamic loop iters in CurrentForwardPassInfo may be used in two places at once: in _postprocess_batch (for batch N), and in the forward pass for batch N+1, which require different iterations.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.engine.SubmoduleManagement" title="mstar.engine.engine.SubmoduleManagement"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SubmoduleManagement</span></code></a>(submodule, forward, ...)</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -1506,6 +1514,37 @@ the next one.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.engine.ForwardPassInfoWrapper">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.engine.</span></span><span class="sig-name descname"><span class="pre">ForwardPassInfoWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">metadata</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/engine.html#ForwardPassInfoWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.engine.ForwardPassInfoWrapper" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Stop-gap solution: the dynamic loop iters in CurrentForwardPassInfo may
+be used in two places at once: in _postprocess_batch (for batch N), and
+in the forward pass for batch N+1, which require different iterations.
+The InputMetadata is built per executing batch, so its value is guaranteed
+to be up-to-date.</p>
+<p>TODO: the long-term solution is to maybe move the dynamic loop iters off
+of CurrentForwardPassInfo entirely.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>info</strong> (<a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>)</p></li>
+<li><p><strong>metadata</strong> (<a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.InputMetadata" title="mstar.model.submodule_base.InputMetadata"><em>InputMetadata</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.engine.ForwardPassInfoWrapper.info">
+<span class="sig-name descname"><span class="pre">info</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><span class="pre">CurrentForwardPassInfo</span></a></span><a class="headerlink" href="#mstar.engine.engine.ForwardPassInfoWrapper.info" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.engine.ForwardPassInfoWrapper.metadata">
+<span class="sig-name descname"><span class="pre">metadata</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.InputMetadata" title="mstar.model.submodule_base.InputMetadata"><span class="pre">InputMetadata</span></a></span><a class="headerlink" href="#mstar.engine.engine.ForwardPassInfoWrapper.metadata" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.engine.SubmoduleManagement">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.engine.</span></span><span class="sig-name descname"><span class="pre">SubmoduleManagement</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">submodule:</span> <span class="pre">mstar.model.submodule_base.NodeSubmodule,</span> <span class="pre">forward:</span> <span class="pre">Callable,</span> <span class="pre">forward_batched:</span> <span class="pre">Callable,</span> <span class="pre">joint_comm_group:</span> <span class="pre">mstar.distributed.communication.JointGroups,</span> <span class="pre">resources:</span> <span class="pre">dict[str,</span> <span class="pre">mstar.engine.resources.base.Resource],</span> <span class="pre">cuda_graph_runner:</span> <span class="pre">mstar.engine.cuda_graph_runner.CudaGraphRunner</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">piecewise_runners:</span> <span class="pre">dict[str,</span> <span class="pre">mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/engine.html#SubmoduleManagement"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.engine.SubmoduleManagement" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
@@ -1746,6 +1785,11 @@ same length.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.ExecutingBatch.stream_partition_done_rids"><code class="docutils literal notranslate"><span class="pre">ExecutingBatch.stream_partition_done_rids</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.ForwardPassInfoWrapper"><code class="docutils literal notranslate"><span class="pre">ForwardPassInfoWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.ForwardPassInfoWrapper.info"><code class="docutils literal notranslate"><span class="pre">ForwardPassInfoWrapper.info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.ForwardPassInfoWrapper.metadata"><code class="docutils literal notranslate"><span class="pre">ForwardPassInfoWrapper.metadata</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.SubmoduleManagement"><code class="docutils literal notranslate"><span class="pre">SubmoduleManagement</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.SubmoduleManagement.cuda_graph_runner"><code class="docutils literal notranslate"><span class="pre">SubmoduleManagement.cuda_graph_runner</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.SubmoduleManagement.forward"><code class="docutils literal notranslate"><span class="pre">SubmoduleManagement.forward</span></code></a></li>
@@ -1795,7 +1839,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 04, 2026.
+  Last updated on Oct 06, 2026.
   <br/>
 </p>
   </div>

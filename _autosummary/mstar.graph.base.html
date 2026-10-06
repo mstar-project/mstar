@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 06, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -872,7 +872,7 @@
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.graph.base.GraphNode">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.graph.base.</span></span><span class="sig-name descname"><span class="pre">GraphNode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">name:</span> <span class="pre">str,</span> <span class="pre">input_names:</span> <span class="pre">set[str],</span> <span class="pre">outputs:</span> <span class="pre">list[mstar.graph.base.GraphEdge],</span> <span class="pre">consumes_stream:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False,</span> <span class="pre">enable_async_scheduling:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True,</span> <span class="pre">_speculatively_scheduled:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False,</span> <span class="pre">_streaming_inputs:</span> <span class="pre">set[str]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">_managing_registry:</span> <span class="pre">'GraphStateRegistry</span> <span class="pre">|</span> <span class="pre">None'</span> <span class="pre">=</span> <span class="pre">None</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/graph/base.html#GraphNode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.graph.base.GraphNode" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.graph.base.</span></span><span class="sig-name descname"><span class="pre">GraphNode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">name:</span> <span class="pre">str,</span> <span class="pre">input_names:</span> <span class="pre">set[str],</span> <span class="pre">outputs:</span> <span class="pre">list[mstar.graph.base.GraphEdge],</span> <span class="pre">consumes_stream:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False,</span> <span class="pre">enable_async_scheduling:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True,</span> <span class="pre">_in_flight:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False,</span> <span class="pre">_streaming_inputs:</span> <span class="pre">set[str]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">_managing_registry:</span> <span class="pre">'GraphStateRegistry</span> <span class="pre">|</span> <span class="pre">None'</span> <span class="pre">=</span> <span class="pre">None</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/graph/base.html#GraphNode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.graph.base.GraphNode" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.graph.base.GraphSection" title="mstar.graph.base.GraphSection"><code class="xref py py-class docutils literal notranslate"><span class="pre">GraphSection</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -882,7 +882,7 @@
 <li><p><strong>outputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><em>GraphEdge</em></a><em>]</em>)</p></li>
 <li><p><strong>consumes_stream</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>enable_async_scheduling</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
-<li><p><strong>_speculatively_scheduled</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>_in_flight</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>_streaming_inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 <li><p><strong>_managing_registry</strong> (<a class="reference internal" href="#mstar.graph.base.GraphStateRegistry" title="mstar.graph.base.GraphStateRegistry"><em>GraphStateRegistry</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
@@ -1964,7 +1964,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 04, 2026.
+  Last updated on Oct 06, 2026.
   <br/>
 </p>
   </div>

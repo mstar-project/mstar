@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 06, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -611,6 +611,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata"><code class="docutils literal notranslate"><span class="pre">InputMetadata</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata.dynamic_loop_iter_counts"><code class="docutils literal notranslate"><span class="pre">InputMetadata.dynamic_loop_iter_counts</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata.stream_chunks"><code class="docutils literal notranslate"><span class="pre">InputMetadata.stream_chunks</span></code></a></li>
 </ul>
 </li>
@@ -703,7 +704,7 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.ARNodeSubmodule" title="mstar.model.submodule_base.ARNodeSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.InputMetadata" title="mstar.model.submodule_base.InputMetadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputMetadata</span></code></a>([stream_chunks])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.InputMetadata" title="mstar.model.submodule_base.InputMetadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputMetadata</span></code></a>([stream_chunks, ...])</p></td>
 <td><p>What the worker knows about one request's inputs to this step.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.LazyRequestStates" title="mstar.model.submodule_base.LazyRequestStates"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LazyRequestStates</span></code></a>(submodule, rids)</p></td>
@@ -842,16 +843,25 @@ of them says for itself how they are cut, or refuses to be cut at all.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.InputMetadata">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">InputMetadata</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">stream_chunks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">mappingproxy({})</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#InputMetadata"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.InputMetadata" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">InputMetadata</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">stream_chunks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">mappingproxy({})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dynamic_loop_iter_counts</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">mappingproxy({})</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#InputMetadata"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.InputMetadata" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
 <p>What the worker knows about one request’s inputs to this step.</p>
 <p>Per step, unlike the per-request <code class="docutils literal notranslate"><span class="pre">CurrentForwardPassInfo</span></code>. Build it with
 keywords: fields get added here rather than as new hook arguments.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>stream_chunks</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamChunkInfo" title="mstar.streaming.stream_buffer.StreamChunkInfo"><em>StreamChunkInfo</em></a><em>]</em>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>stream_chunks</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamChunkInfo" title="mstar.streaming.stream_buffer.StreamChunkInfo"><em>StreamChunkInfo</em></a><em>]</em>)</p></li>
+<li><p><strong>dynamic_loop_iter_counts</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
 </dd>
 </dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.InputMetadata.dynamic_loop_iter_counts">
+<span class="sig-name descname"><span class="pre">dynamic_loop_iter_counts</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Mapping</span><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.InputMetadata.dynamic_loop_iter_counts" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.InputMetadata.stream_chunks">
 <span class="sig-name descname"><span class="pre">stream_chunks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Mapping</span><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamChunkInfo" title="mstar.streaming.stream_buffer.StreamChunkInfo"><span class="pre">StreamChunkInfo</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.InputMetadata.stream_chunks" title="Link to this definition">#</a></dt>
@@ -1673,6 +1683,7 @@ transfer yet.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata"><code class="docutils literal notranslate"><span class="pre">InputMetadata</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata.dynamic_loop_iter_counts"><code class="docutils literal notranslate"><span class="pre">InputMetadata.dynamic_loop_iter_counts</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.InputMetadata.stream_chunks"><code class="docutils literal notranslate"><span class="pre">InputMetadata.stream_chunks</span></code></a></li>
 </ul>
 </li>
@@ -1776,7 +1787,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 04, 2026.
+  Last updated on Oct 06, 2026.
   <br/>
 </p>
   </div>

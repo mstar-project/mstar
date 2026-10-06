@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 04, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 06, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1185,7 +1185,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Whether this node is currently speculatively being executed: if so, we</span>
     <span class="c1"># don't want to queue it in a "ready" queue because it's already being</span>
     <span class="c1"># executed, but we do want to update everything else as normal.</span>
-    <span class="n">_speculatively_scheduled</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Set while a batch carrying this node is in flight (speculative or not):</span>
+    <span class="c1"># gates ready-queue adds so the node is not double-queued underneath it.</span>
+    <span class="n">_in_flight</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="n">_streaming_inputs</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">set</span><span class="p">)</span>
 
@@ -1864,25 +1866,25 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry.register_ingested_input">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">register_ingested_input</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_edge</span><span class="p">:</span> <span class="n">GraphEdge</span><span class="p">):</span>
         <span class="n">node</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">[</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">next_node</span><span class="p">]</span>
-        <span class="c1"># If node._speculatively_scheduled, the node is already executing as</span>
-        <span class="c1"># a spec batch. We don't want to double-queue it (either for the</span>
+        <span class="c1"># If node._in_flight, the node is already executing as part of a</span>
+        <span class="c1"># batch. We don't want to double-queue it (either for the</span>
         <span class="c1"># current iter via ``ready_names`` or for the next iter via</span>
         <span class="c1"># ``ready_next_iter`` — both eventually feed the scheduler) so we</span>
         <span class="c1"># gate every queue add on the flag.</span>
         <span class="k">if</span> <span class="n">node</span><span class="o">.</span><span class="n">ready_signals</span><span class="o">.</span><span class="n">is_ready</span><span class="p">:</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">_speculatively_scheduled</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">_in_flight</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">ready_names</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">ready_for_streaming</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">node</span><span class="o">.</span><span class="n">ready_signals</span><span class="o">.</span><span class="n">is_ready_for_streaming</span><span class="p">:</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">_speculatively_scheduled</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">_in_flight</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">ready_for_streaming</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">node</span><span class="o">.</span><span class="n">ready_next_iter</span><span class="o">.</span><span class="n">is_ready</span><span class="p">:</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">_speculatively_scheduled</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">_in_flight</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">ready_next_iter</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">ready_streaming_next_iter</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">node</span><span class="o">.</span><span class="n">ready_next_iter</span><span class="o">.</span><span class="n">is_ready_for_streaming</span><span class="p">:</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">_speculatively_scheduled</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">node</span><span class="o">.</span><span class="n">_in_flight</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">ready_streaming_next_iter</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">)</span></div>
 
 
@@ -1991,7 +1993,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 04, 2026.
+  Last updated on Oct 06, 2026.
   <br/>
 </p>
   </div>
