@@ -15,6 +15,7 @@ import sys
 
 sys.path.insert(0, ".")
 
+import numpy as np
 import pytest
 
 from mstar.engine.resources.kv.peak_plan import (
@@ -344,3 +345,31 @@ def test_a_planner_for_nothing_but_a_candidate_is_its_own_footprint(rounds):
 
     # a candidate always runs a round, so rounds=0 is read as 1
     assert planner.peak_from(cand) == footprint(cand._replace(rounds=max(1, rounds)), max(1, rounds) - 1, 2)
+
+
+def _from_arrays(entries: list[PlanEntry], capacity: int, page_size: int) -> PeakPlanner:
+    fields = [np.array([e[k] for e in entries], dtype=np.int64) for k in range(5)]
+    return PeakPlanner.from_arrays(*fields, capacity, page_size)
+
+
+def test_a_planner_built_from_arrays_is_the_one_built_from_entries():
+    """Same structure, so every answer: peak, a candidate, the glance, the shadow, the usage at a round."""
+    rng = random.Random(SEED + 11)
+    for trial in range(TRIALS):
+        entries, page_size = _entries(rng, 12)
+        capacity = rng.randrange(0, 80)
+        listed = PeakPlanner(entries, capacity, page_size)
+        arrays = _from_arrays(entries, capacity, page_size)
+        where = f"trial {trial}: {entries} page_size={page_size}"
+        assert arrays.frozen == listed.frozen and arrays.held_total == listed.held_total, where
+        assert arrays.times.tolist() == listed.times.tolist(), where
+        assert arrays.usage.tolist() == listed.usage.tolist(), where
+        assert arrays.peak() == listed.peak(), where
+        for _ in range(4):
+            cand = _candidate(rng)
+            start = rng.randrange(0, 70)
+            assert arrays.peak_from(cand) == listed.peak_from(cand), f"{where} + {cand}"
+            assert arrays.peak_from(cand, start) == listed.peak_from(cand, start), f"{where} + {cand}"
+            assert arrays.exceeds(cand, capacity) == listed.exceeds(cand, capacity), f"{where} + {cand}"
+            assert arrays.shadow(cand) == listed.shadow(cand), f"{where} + {cand}"
+            assert arrays.usage_at(start) == listed.usage_at(start), where
