@@ -547,6 +547,7 @@ class WaypointModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         del partition_name, input_modalities
         if output_modalities != ["video_frame"]:

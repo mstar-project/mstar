@@ -1479,6 +1479,7 @@ class Cosmos3Model(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         # The windowed decoder partition starts idle on its decode walk for
         # every request — text ones included, which is why this comes before

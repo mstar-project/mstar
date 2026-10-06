@@ -68,6 +68,8 @@ class StepRunner:
         # is a real CUDA call even with no profiler attached.
         self._nvtx = enable_nvtx
         self._resources: dict[str, Resource] = dict(resources)
+        # Budget overflows owed to a session, read at its next ingest
+        self._session_errors: dict[str, str] = {}
         self._order = topo_sort(self._resources) # only toposort once to minimize cpu time on python
         self._preplan_order = [
             res for res in self._order if self._resources[res].supports_preplan
@@ -219,16 +221,85 @@ class StepRunner:
     def ingest_request(
         self, rid: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
+        session_id: str | None = None,
     ) -> None:
-        """open state on all resources; `overrides` are per-resource"""
+        """open state on all resources; `overrides` are per-resource
+
+        A request in a session also takes on whatever that session's resources
+        already hold (`adopt_session_state`).
+        """
         for key in self._order:
-            self._resources[key].ingest_request(
+            resource = self._resources[key]
+            resource.ingest_request(
                 rid, None if overrides is None else overrides.get(key)
             )
+            if session_id is not None and resource.session_config is not None:
+                resource.adopt_session_state(rid, session_id)
 
-    def remove_request(self, rid: str) -> None:
+    def remove_request(self, rid: str, session_id: str | None = None) -> None:
+        """drop the request's state, or hand it back to its session
+
+        A session resource keeps what the request built; every other resource
+        frees as usual. The session's budget is applied once the whole handover
+        is done, so a clear can take every resource together.
+        """
         for key in self._order:
-            self._resources[key].remove_request(rid)
+            resource = self._resources[key]
+            if session_id is None or resource.session_config is None:
+                resource.remove_request(rid)
+                continue
+            resource.retain_session_state(rid, session_id)
+        if session_id is not None:
+            self._enforce_session_budget(session_id)
+
+    def _enforce_session_budget(self, session_id: str) -> None:
+        """Bring the session within every resource's budget.
+
+        A clear is the whole session's, not one resource's: what the others
+        hold addresses the state being dropped (the position counters over a
+        KV cache), so clearing one alone would leave the next request placing
+        its tokens past a context that is no longer there.
+        """
+        for key in self.session_resource_keys():
+            resource = self._resources[key]
+            cfg = resource.session_config
+            if cfg.max_state is None:
+                continue
+            held = resource.session_state_size(session_id)
+            if held <= cfg.max_state:
+                continue
+            logger.warning(
+                "Session %s holds %d of resource %s, over its budget of %d; "
+                "dropping it", session_id, held, key, cfg.max_state,
+            )
+            self._clear_session(session_id)
+            # the client is told rather than silently served from an empty
+            # context it thinks still holds its conversation
+            self._session_errors[session_id] = (
+                f"session {session_id} exceeded its state budget for "
+                f"resource {key!r} ({held} > {cfg.max_state}) and was cleared"
+            )
+            return  # nothing is left to be over budget
+
+    def _clear_session(self, session_id: str) -> None:
+        for key in self.session_resource_keys():
+            self._resources[key].clear_session_state(session_id)
+
+    def remove_session(self, session_id: str) -> None:
+        """free everything every resource holds for the session"""
+        self._session_errors.pop(session_id, None)
+        for key in self.session_resource_keys():
+            self._resources[key].remove_session(session_id)
+
+    def take_session_error(self, session_id: str) -> str | None:
+        """The budget overflow owed to this session, consumed once."""
+        return self._session_errors.pop(session_id, None)
+
+    def session_resource_keys(self) -> list[str]:
+        return [
+            key for key in self._order
+            if self._resources[key].session_config is not None
+        ]
 
     def admit_retrieve(
         self, rid: str, node_name: str, graph_walk: str,

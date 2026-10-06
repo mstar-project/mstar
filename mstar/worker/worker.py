@@ -64,8 +64,10 @@ from mstar.utils.ipc_format import (
     ReadsDone,
     RemoveRequest,
     ScheduleTPNode,
+    SessionTornDown,
     SetupDone,
     StopLoops,
+    TeardownSession,
     TensorReceived,
     TPNoSpeculation,
     UnpersistTensors,
@@ -76,6 +78,7 @@ from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_pu
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.sessions import WorkerSessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -435,7 +438,11 @@ class Worker:
 
         # step seq -> rids rank 0 released after that step, held until this rank
         # has consumed it. See ``_removal_step_reached``.
-        self._removes_awaiting_step: dict[int, list[str]] = {}
+        # seq -> the removals parked for it. The whole body, not just the
+        # rid: a replayed removal must still carry what it was asked to do
+        # (end_session, say), or the follower tears the request down
+        # without the session it was supposed to take with it.
+        self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
 
         # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
         # behind an in-flight GPU step; _draining_rids have stopped reading and
@@ -447,6 +454,7 @@ class Worker:
         self._draining_rids: set[str] = set()
         self._reads_done_sent: set[str] = set()
 
+        self._sessions = WorkerSessionManager(is_leaving=self._rid_is_leaving)
         # Let the scheduler see deferred removes so it stops initiating new work
         # for those rids (shared by reference — mutations are visible to both).
         self.scheduler.pending_removes = self._pending_removes
@@ -599,6 +607,10 @@ class Worker:
         if body.request_id in self._draining_rids:
             # Being torn down (out-of-order NEW after DRAIN); don't start reads.
             return
+        if self._sessions.hold_if_not_ready(body, self._rid(body.request_id)):
+            return
+        session = body.request_info.session
+        session_id = None if session is None else session.session_id
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         # The one place a handle is minted; a request with several partitions
         # on this worker gets the same one for each. Everything below keys on it.
@@ -616,9 +628,18 @@ class Worker:
             self._last_active[(request_id, node_name)] = now
 
         self.request_state.add_request(request_id, body.request_info)
+        self._sessions.bind(request_id, session_id)
         self.engine_manager.add_request(
             request_id, body.request_info.resource_configs,
+            session_id=session_id,
         )
+        if session_id is not None:
+            # A budget overflow the session owes this request: it was
+            # cleared rather than truncated, so say so instead of continuing
+            # from a context that is no longer what the client built.
+            error = self.engine_manager.take_session_error(session_id)
+            if error is not None:
+                self._fail_requests({request_id: error})
         self.tensor_manager.register_request(
             request_id, self._graph_runtime.get_sharding_config(request_id),
         )
@@ -677,7 +698,7 @@ class Worker:
                 # would park a stamped teardown for good.
                 self._removes_awaiting_step.setdefault(
                     body.after_tp_seq, []
-                ).append(body.request_id)
+                ).append(body)
                 return
 
         # Async-scheduling deferral: if this rid is currently held by an
@@ -696,6 +717,8 @@ class Worker:
             return
         if request_id in self._in_flight_rids:
             self._pending_removes.add(request_id)
+            if body.end_session:
+                self._sessions.defer_end_session(request_id)
             return
 
         # If we are the TP leader for this request, signal the followers to
@@ -721,6 +744,7 @@ class Worker:
                             # broadcast up to here; followers must do it in the
                             # same gap between steps
                             after_tp_seq=self._tp_broadcast_seq - 1,
+                            end_session=body.end_session,
                         )
                     )
                 )
@@ -733,7 +757,15 @@ class Worker:
         self._draining_rids.discard(body.request_id)
         self._pending_drains.discard(body.request_id)
         self._reads_done_sent.discard(body.request_id)
-        self.engine_manager.remove_request(request_id)
+        session_id = self._sessions.release(request_id)
+        # end_session frees the session's own state alongside the request's;
+        # otherwise the session keeps what this request built.
+        self.engine_manager.remove_request(
+            request_id, end_session=body.end_session,
+        )
+        if body.end_session and session_id is not None:
+            self._sessions.forget_session(session_id)
+            self._ack_session_torn_down(session_id)
         self.request_state.remove_request(request_id)
         self.tensor_manager.force_cleanup_request(request_id)
         self.profile_info.pop_request(request_id)
@@ -844,6 +876,53 @@ class Worker:
             self._begin_drain(rid)
         for rid in list(self._draining_rids):
             self._complete_drain_if_ready(rid)
+
+    def _teardown_session(self, body: TeardownSession) -> None:
+        """Free everything this worker holds for a session, then ACK.
+
+        Deferred while any of the session's requests is still on its way out:
+        that request's removal would otherwise hand its state back to a session
+        that no longer exists.
+        """
+        session_id = body.session_id
+        if self._sessions.requests_still_leaving(session_id):
+            self._sessions.hold_teardown(session_id)
+            return
+        self._sessions.forget_session(session_id)
+        self.engine_manager.remove_session(session_id)
+        self._ack_session_torn_down(session_id)
+
+    def _rid_is_leaving(self, rid: int) -> bool:
+        """Whether this rid handle is still on its way out: held by an
+        in-flight step, a deferred removal, or still registered here."""
+        return (
+            rid in self._in_flight_rids
+            or rid in self._pending_removes
+            or rid in self.request_state.per_request_info
+        )
+
+    def _apply_pending_sessions(self) -> None:
+        """Admit held requests, then finish held teardowns whose session is free.
+
+        Ingests first: a teardown that ran ahead of a held request would free
+        the state that request is waiting for and then admit it into a session
+        that no longer exists.
+        """
+        for body in self._sessions.take_held_ingests():
+            self._add_new_request(body)
+        for session_id in self._sessions.ready_teardowns():
+            self._teardown_session(TeardownSession(session_id=session_id))
+
+    def _ack_session_torn_down(self, session_id: str) -> None:
+        self.communicator.send(
+            "conductor",
+            ConductorMessage(
+                message_type=ConductorMessageType.SESSION_TORN_DOWN,
+                body=SessionTornDown(
+                    session_id=session_id, entity_id=self.worker_id,
+                ),
+            ),
+        )
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
@@ -1001,6 +1080,8 @@ class Worker:
                 self._register_tp_follow(message.body)
             elif message.message_type == WorkerMessageType.TP_NO_SPEC:
                 self._register_tp_nospec(message.body)
+            elif message.message_type == WorkerMessageType.TEARDOWN_SESSION:
+                self._teardown_session(message.body)
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
@@ -3060,9 +3141,10 @@ class Worker:
             return
         reached = self.scheduler.last_consumed_tp_seq
         for seq in sorted(s for s in self._removes_awaiting_step if s <= reached):
-            for rid in self._removes_awaiting_step.pop(seq):
-                self._remove_request(RemoveRequest(
-                    request_id=rid, source=MessageSource.SELF,
+            for parked in self._removes_awaiting_step.pop(seq):
+                # replace, not a fresh body: every field it carried survives
+                self._remove_request(replace(
+                    parked, source=MessageSource.SELF, after_tp_seq=-1,
                 ))
 
     def _apply_pending_removes_safe_to_drop(
@@ -3076,6 +3158,7 @@ class Worker:
             self._pending_removes.discard(rid)
             self._remove_request(RemoveRequest(
                 request_id=self._rid_str(rid), source=MessageSource.SELF,
+                end_session=self._sessions.ends_session(rid),
             ))
 
     def _drop_failed_rids(
@@ -3418,6 +3501,8 @@ class Worker:
                 # ever fail them.
                 self._fail_requests(self.scheduler.take_admit_errors())
                 self._apply_pending_drains(self._in_flight_rids)
+                if self._sessions.has_pending:
+                    self._apply_pending_sessions()
 
                 # 1. CPU preamble — overlaps with GPU(N).
                 # synchronize=False on every range so torch.cuda.synchronize()

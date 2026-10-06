@@ -27,6 +27,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.model.multimodal import PromptPart
+from mstar.model.sessions import RequestSession, SessionsConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -440,6 +441,14 @@ class Model(ABC):
         """
         return type(self).__name__
 
+    def get_sessions_config(self) -> SessionsConfig | None:
+        """Declare persistent-session support, or None to refuse sessions.
+
+        Names the resources whose state survives a request teardown and lives
+        for the session, plus the deployment-facing caps (concurrency, TTL).
+        """
+        return None
+
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
         """Which input tensor keys which ``(resource, label)`` cache stream.
 
@@ -491,8 +500,10 @@ class Model(ABC):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        session: RequestSession | None = None,
     ) -> ForwardPassArgs:
-        pass
+        """Open a request on one partition. Called with keywords only, so an
+        implementation that ignores an argument can take ``**kwargs``."""
 
     @abstractmethod
     def process_prompt(
@@ -502,6 +513,7 @@ class Model(ABC):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
+        session: RequestSession | None = None,
         **kwargs,
     ) -> "NameToTensorList | ProcessPromptOutput":
         """Tokenize prompt and produce initial tensors for the request.
@@ -524,6 +536,11 @@ class Model(ABC):
             prompt_parts: Ordered text/attachment sequence as written.
                 ``None`` from entrypoints with no ordering to preserve; see
                 :func:`mstar.model.multimodal.parts_from_modalities`.
+            session: The session this request runs in, or None outside one.
+                A model that renders a chat envelope reads ``resumed`` here:
+                a resuming turn is appended to state that already holds the
+                conversation, so re-rendering a system prompt or a leading BOS
+                would inject it mid-conversation.
             **kwargs: Model-specific parameters (e.g., from model_kwargs).
 
         Returns:

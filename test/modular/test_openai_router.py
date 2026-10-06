@@ -22,6 +22,8 @@ np = pytest.importorskip("numpy")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from mstar.api_server.sessions import SessionRegistry  # noqa: E402
+
 
 class _Chunk:
     def __init__(self, modality, data, metadata=None):
@@ -40,6 +42,9 @@ class _StubAPI:
         self.model_name = model_name
         self.model = _StubModel()
         self.upload_dir = Path(tempfile.mkdtemp())
+        # every APIServer has one, enabled or not: the chat route asks it what
+        # session a request names (a None config = this model supports none)
+        self.sessions = SessionRegistry(None, teardown=lambda sid: None)
         self.last_submit = None
         self._chunks: dict = {}
         self.next_chunks: list = []

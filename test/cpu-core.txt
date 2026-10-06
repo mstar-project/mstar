@@ -4,6 +4,19 @@ test/modular/test_admit_failure_handling.py
 test/modular/test_micro_scheduler.py
 test/modular/test_worker_drain.py
 test/modular/test_ragged_attention_cpu.py
+test/modular/test_sessions_config.py
+test/modular/test_session_registry.py
+test/modular/test_session_routes.py
+test/modular/test_openai_chat_sessions.py
+test/modular/test_session_resource_state.py
+test/modular/test_conductor_sessions.py
+test/modular/test_worker_sessions.py
+test/modular/test_worker_session_manager.py
+test/modular/test_submodule_session_state.py
+test/modular/test_engine_session_state.py
+test/modular/test_api_server_sessions.py
+test/modular/test_session_continuation.py
+test/modular/test_kv_session_state.py
 test/modular/test_rid_handles.py
 test/modular/test_tensor_uuid.py
 test/modular/test_shm_tensor_comm.py
@@ -32,3 +45,4 @@ test/modular/test_bagel_cfg_parallel.py
 test/modular/test_kv_publish_retrieve.py
 test/modular/test_parallel_groups.py
 test/modular/test_preplan_error_paths.py
+test/modular/test_generate_ws.py

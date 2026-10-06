@@ -44,6 +44,16 @@ NDJSON stream.
    * - ``request_id``
      - *(uuid)*
      - Optional client-supplied id; the server generates one when omitted.
+   * - ``start_session`` / ``resume_session`` / ``end_session``
+     - ``false``
+     - Run this request in a persistent session, so the state it builds is kept
+       for the next request in that session. See :doc:`sessions`.
+   * - ``session_id``
+     - *(uuid)*
+     - The session to start with this id, or the one to resume.
+   * - ``session_timeout_s``
+     - *(deployment)*
+     - This session's TTL, capped by the deployment's maximum.
 
 A non-streaming response groups outputs by modality, each payload base64-encoded:
 
@@ -160,6 +170,9 @@ Convenience wrappers:
      - The ``voice`` ids the served speech model accepts (``GET /v1/audio/voices``).
    * - ``stream(**kw)``
      - Sugar for ``generate(stream=True, ...)``.
+   * - ``end_session(id)`` / ``sessions()``
+     - End a persistent session, or list the ones the server holds. See
+       :doc:`sessions`.
    * - ``health()``
      - ``True`` if the server is healthy.
 
@@ -171,7 +184,8 @@ Result and event types live in ``mstar.client``:
 - ``AudioBuffer`` — decoded PCM with ``.sample_rate``; ``.to_wav(path)``, ``.to_numpy()``,
   ``len(...)``.
 - Stream events — ``TextChunk(text)``, ``ImageChunk(data)`` (``.save(path)``),
-  ``AudioChunk(pcm, sample_rate)``, and ``VideoFrameChunk(data, metadata)``. A
+  ``AudioChunk(pcm, sample_rate)``, ``SessionInfo(session_id)`` (first event of a
+  session request), and ``VideoFrameChunk(data, metadata)``. A
   video-frame chunk validates its width, height, fps, pixel format and frame range;
   ``.to_numpy()`` returns a zero-copy ``[frame_count, height, width, 3]`` uint8 view.
   Raw ``video_frame`` requests require ``stream=True``. The SDK asks for the binary

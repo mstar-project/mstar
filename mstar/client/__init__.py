@@ -6,6 +6,7 @@ from mstar.client.types import (
     AudioChunk,
     GenerateResult,
     ImageChunk,
+    SessionInfo,
     StreamEvent,
     TextChunk,
     VideoFrameChunk,
@@ -18,6 +19,7 @@ __all__ = [
     "TextChunk",
     "ImageChunk",
     "AudioChunk",
+    "SessionInfo",
     "VideoFrameChunk",
     "StreamEvent",
 ]

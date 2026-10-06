@@ -21,6 +21,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "qwen3_tts_1p7b": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "qwen3_tts_voicedesign": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "qwen3_tts_base": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "test_text_session": ("mstar.model.test_text_session.model", "TextSessionModel"),
     "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
@@ -77,6 +78,9 @@ HF_MODELS: dict[str, dict] = {
     "qwen3_tts_1p7b": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"},
     "qwen3_tts_voicedesign": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"},
     "qwen3_tts_base": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"},
+    # BAGEL's LLM on its own, text in and text out, with its KV held across a
+    # persistent session. The deployment that exercises session semantics.
+    "test_text_session": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
     # V-JEPA 2 standard (encoder + masked predictor).  Default is ViT-L @ 256
     # (~300M); the same class loads vitl/h/g at 256 or 384 by reading
     # config.json.

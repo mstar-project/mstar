@@ -19,8 +19,13 @@ from unittest import mock
 import pytest
 from fastapi import HTTPException
 
-from mstar.api_server.entrypoint import APIServer, DeadConductorError, PendingRequest
+from mstar.api_server.entrypoint import (
+    APIServer,
+    DeadConductorError,
+    PendingRequest,
+)
 from mstar.api_server.request_types import APIServerMessage
+from mstar.api_server.sessions import SessionRegistry
 from mstar.conductor.conductor import (
     Conductor,
     DeadWorkerError,
@@ -104,6 +109,9 @@ def _conductor(procs, inbox=()):
     c._next_liveness_check = 0.0
     c.requests = {}
     c.draining = {}
+    c.sessions = {}
+    c.session_teardowns = {}
+    c.request_sessions = {}
     c.waiting_queue = []
     return c
 
@@ -332,6 +340,9 @@ def _api_server(conductor_proc, inbox=()):
     server.fatal_error = None
     server.on_fatal = None
     server._liveness_interval_s = 0.0
+    server.sessions = SessionRegistry(None, teardown=lambda _sid: None)
+    server._next_session_sweep = 0.0
+    server._session_sweep_interval_s = 1.0
     server.communicator = SimpleNamespace(get_all_new_messages=_inbox(inbox))
     server.preprocess_worker = SimpleNamespace(
         get_profile_updates=lambda: [], get_result_chunks=lambda: []

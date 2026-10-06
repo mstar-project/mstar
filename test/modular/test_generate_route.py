@@ -3,6 +3,7 @@ import json
 from fastapi.testclient import TestClient
 
 from mstar.api_server import entrypoint
+from mstar.api_server.sessions import SessionRegistry
 
 
 def test_generate_rejects_malformed_model_kwargs(monkeypatch):
@@ -33,6 +34,9 @@ def test_generate_rejects_non_object_model_kwargs(monkeypatch):
 
 def test_generate_does_not_mislabel_downstream_json_errors(monkeypatch):
     class FailingServer:
+        # sessions are off, so the route's session resolution is a no-op
+        sessions = SessionRegistry(None, teardown=lambda _sid: None)
+
         def submit_request(self, **kwargs):
             raise json.JSONDecodeError("downstream failure", "{}", 0)
 

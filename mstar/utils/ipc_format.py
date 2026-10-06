@@ -39,6 +39,7 @@ class WorkerMessageType(Enum):
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
     TP_NO_SPEC = "tp_no_spec"
+    TEARDOWN_SESSION = "teardown_session"
 
 
 @dataclass
@@ -63,6 +64,8 @@ class RemoveRequest(MessageBody):
     # broadcast, so they tear the request down at the same point in the step
     # sequence it did, maintaining KV cache state symmetry.
     after_tp_seq: int = -1
+    # Tear the request's session down with it, and ACK SESSION_TORN_DOWN.
+    end_session: bool = False
 
 
 @dataclass
@@ -176,6 +179,14 @@ class OffloadDelta:
 
 
 @dataclass
+class TeardownSession(MessageBody):
+    """Free everything a session holds. Sent to every worker that ran it; each
+    ACKs with SESSION_TORN_DOWN once its state is gone."""
+    session_id: str
+    source: int = MessageSource.CONDUCTOR
+
+
+@dataclass
 class ScheduleTPNode(MessageBody):
     node_name: str
     graph_walk: str
@@ -209,6 +220,8 @@ class ConductorMessageType(Enum):
     ABORT_REQUEST = "abort_request"
     FAIL_REQUESTS = "fail_requests"
     READS_DONE = "reads_done"
+    TEARDOWN_SESSION = "teardown_session"
+    SESSION_TORN_DOWN = "session_torn_down"
 
 
 @dataclass
@@ -219,6 +232,12 @@ class NewRequestConductor(MessageBody):
     initial_output_modalities: list[str]
     input_metadata: dict[str, list[dict]]
     model_kwargs: dict
+    # The session this request belongs to, as the API server validated it:
+    # which one, whether it continues state that is already there, and whether
+    # it is the last request in it.
+    session_id: str | None = None
+    resumed: bool = False
+    end_session: bool = False
 
 
 @dataclass
@@ -255,6 +274,14 @@ class ReadsDone(MessageBody):
     start none — the conductor's gate before sending the hard RemoveRequest."""
     request_id: str
     entity_id: str
+
+
+@dataclass
+class SessionTornDown(MessageBody):
+    """A worker (or the conductor, to the API server) confirming a session's
+    state is gone. The API server holds a tombstone until it arrives."""
+    session_id: str
+    entity_id: str = ""
 
 
 @dataclass

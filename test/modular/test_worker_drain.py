@@ -15,6 +15,7 @@ from mstar.utils.ipc_format import (
     RemoveRequest,
 )
 from mstar.worker.rid_table import RidTable
+from mstar.worker.sessions import WorkerSessionManager
 from mstar.worker.worker import Worker
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -48,6 +49,7 @@ def _worker(
             SimpleNamespace(groups=[]) if r in known_rids else None
         ),
     )
+    w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
     w._last_active = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
@@ -65,7 +67,8 @@ def _worker(
         remove_request=lambda rid: None,
     )
     w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid: None, evictable_nodes=lambda: [],
+        remove_request=lambda rid, end_session=False: None,
+        evictable_nodes=lambda: [],
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.tensor_manager = SimpleNamespace(
@@ -268,16 +271,21 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w.request_state = SimpleNamespace(
         per_request_info={}, add_request=_state_add,
     )
+    w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: ["n"],
-        add_request=lambda rid, cfgs: seen.setdefault("engine", rid),
+        add_request=lambda rid, cfgs, session_id=None: seen.setdefault(
+            "engine", rid,
+        ),
     )
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, cfg: seen.setdefault("tensors", rid),
         start_read_tensors=lambda rid, inputs, graph_walk: [],
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
+    info = SimpleNamespace(
+        resource_configs={}, graph_walk="g", partition_name="p", session=None,
+    )
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={},

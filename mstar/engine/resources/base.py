@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         PiecewiseCudaGraphConfig,
     )
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.model.sessions import SessionResourceConfig
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,39 @@ class Resource(ABC):
 
     def remove_request(self, rid: str):
         return
+
+    # Session lifecycle
+
+    # set by the engine at load; None means this resource is cleared with the request
+    session_config: "SessionResourceConfig | None" = None
+
+    def adopt_session_state(self, rid: str, session_id: str) -> None:
+        """Hand the session's held state to ``rid``, if the session holds any.
+
+        Called at ingest, after ``ingest_request``, so the request starts where
+        the session's last request left off.
+        """
+        return
+
+    def retain_session_state(self, rid: str, session_id: str) -> None:
+        """Take ``rid``'s state back into the session instead of freeing it.
+
+        Called in place of ``remove_request`` when the request belonged to a
+        live session.
+        """
+        return
+
+    def remove_session(self, session_id: str) -> None:
+        """Free everything the session holds. The session is over."""
+        return
+
+    def session_state_size(self, session_id: str) -> int:
+        """What the session holds, in this resource's own units."""
+        return 0
+
+    def clear_session_state(self, session_id: str) -> None:
+        """Drop the session's state but keep the session itself alive."""
+        self.remove_session(session_id)
 
     def admit_retrieve(
         self, rid: str,

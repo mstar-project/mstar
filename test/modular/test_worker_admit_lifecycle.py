@@ -23,6 +23,7 @@ from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
 from mstar.utils.ipc_format import NewRequest, RemoveRequest
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.sessions import WorkerSessionManager
 from mstar.worker.worker import Worker
 
 WG_ID = 0
@@ -80,8 +81,8 @@ def _worker():
     w.request_state = RequestStateManager(node_to_partition=node_to_partition)
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: [NODE],
-        add_request=lambda rid, cfgs: None,
-        remove_request=lambda rid: None,
+        add_request=lambda rid, cfgs, session_id=None: None,
+        remove_request=lambda rid, end_session=False: None,
     )
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: None,
@@ -98,6 +99,7 @@ def _worker():
     w._pending_removes = set()
     w._last_active = {}
     w.streaming_buffers = {}
+    w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
     w._unprocessed_messages = {}
     w.enable_nvtx = False
     return w

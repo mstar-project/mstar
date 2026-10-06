@@ -41,11 +41,13 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
 )
 from mstar.graph.runtime.base import GraphRuntime
+from mstar.model.sessions import SessionResourceConfig
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
     InputMetadata,
     LazyRequestStates,
+    LazySessionStates,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -56,6 +58,7 @@ from mstar.utils.profiler import mark, range_pop, range_push
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
+    from mstar.model.sessions import SessionsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +375,8 @@ class Engine:
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
+        # rid -> the session it belongs to, for the resources that hold state
+        self._request_sessions: dict[str, str] = {}
 
         # node -> (offloaded, reloaded) since the last ``take_resident_delta``.
         # Only a TP leader drains this, to replicate its resident set onto the
@@ -395,6 +400,7 @@ class Engine:
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
         model: "Model | None" = None,
+        sessions_config: "SessionsConfig | None" = None,
     ):
         self._device = device
         if kv_cache_type is None:
@@ -462,6 +468,7 @@ class Engine:
         )
 
         self._open_prefix_caches(specs_by_key, model)
+        self._open_session_state(specs_by_key, sessions_config)
 
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and
@@ -618,6 +625,57 @@ class Engine:
             )
             runners[label] = runner
         return runners
+
+    def _open_session_state(self, specs_by_key, sessions_config) -> None:
+        """Mark the resources whose state lives for a session, not a request.
+
+        A resource built against one of them (the position counters over a KV
+        cache) is marked too: its state addresses the state that is being kept,
+        so leaving it behind would put the next request's positions at 0 over
+        pages the session still holds.
+        """
+        if sessions_config is None:
+            return
+        unknown = sorted(sessions_config.resources.keys() - specs_by_key.keys())
+        if unknown:
+            raise ValueError(
+                f"sessions config holds state for resource(s) {unknown}, "
+                f"which this model does not declare; it declares "
+                f"{sorted(specs_by_key)}"
+            )
+        derived: dict[str, "SessionResourceConfig"] = {}
+        for key, resource in self._resources.items():
+            cfg = sessions_config.resources.get(key)
+            if cfg is None:
+                continue
+            if type(resource).retain_session_state is Resource.retain_session_state:
+                # it would inherit the no-op hooks and silently hold nothing
+                raise ValueError(
+                    f"resource {key!r} is named in the sessions config but "
+                    f"{type(resource).__name__} does not implement the session "
+                    "hooks, so it would hold nothing across a session"
+                )
+            resource.session_config = cfg
+        # one pass is enough: a dependency chain deeper than resource ->
+        # dependent (positions over KV) does not exist today
+        for key, resource in self._resources.items():
+            if resource.session_config is not None:
+                continue
+            if type(resource).retain_session_state is Resource.retain_session_state:
+                # nothing durable to hold (attention plans per step), so it
+                # keeps its ordinary per-request teardown
+                continue
+            if any(
+                self._resources.get(dep) is not None
+                and self._resources[dep].session_config is not None
+                for dep in resource.depends_on()
+            ):
+                derived[key] = SessionResourceConfig()
+                resource.session_config = derived[key]
+        logger.info(
+            "Session state held by %s%s", self._runner.session_resource_keys(),
+            f" (derived from a dependency: {sorted(derived)})" if derived else "",
+        )
 
     def _open_prefix_caches(self, specs_by_key, model) -> None:
         """Root each resource's cache in the weights, the preprocessing, and the
@@ -1139,6 +1197,9 @@ class Engine:
             # padding rows get their own states, like their cache streams:
             # the submodule indexes this by step id, not by real rid
             per_request_states=LazyRequestStates(submodule, rids),
+            per_session_states=LazySessionStates(
+                submodule, rids, self._request_sessions,
+            ),
             captured=lease is not None,
             step=step,
             per_request_input_metadata=batch.per_request_input_metadata,
@@ -1892,13 +1953,34 @@ class Engine:
     def add_request(
         self, request_id: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
+        session_id: str | None = None,
     ) -> None:
-        self._runner.ingest_request(request_id, overrides)
+        if session_id is not None:
+            self._request_sessions[request_id] = session_id
+        self._runner.ingest_request(request_id, overrides, session_id=session_id)
 
-    def remove_request(self, request_id: str) -> None:
-        self._runner.remove_request(request_id)
+    def remove_request(self, request_id: str, end_session: bool = False) -> None:
+        """Drop the request. Its session keeps whatever it built, unless
+        ``end_session`` says the session is over too."""
+        session_id = self._request_sessions.pop(request_id, None)
+        self._runner.remove_request(request_id, session_id=session_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
+        if end_session and session_id is not None:
+            self.remove_session(session_id)
+
+    def remove_session(self, session_id: str) -> None:
+        """Free everything the session holds, resources and submodules alike."""
+        for rid, sid in list(self._request_sessions.items()):
+            if sid == session_id:
+                self._request_sessions.pop(rid, None)
+        self._runner.remove_session(session_id)
+        for submodule_mgmt in self._submodules.values():
+            submodule_mgmt.submodule.cleanup_session(session_id)
+
+    def take_session_error(self, session_id: str) -> str | None:
+        """The budget overflow this session owes its next request, if any."""
+        return self._runner.take_session_error(session_id)
 
     def shutdown(self):
         for resource in self._resources.values():

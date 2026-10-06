@@ -53,11 +53,25 @@ class RequestFailed:
 
 
 @dataclass
+class SessionTornDown:
+    """The conductor confirming a session's state is gone everywhere.
+
+    The API server refuses every request naming the session until this
+    arrives, then forgets it. The per-worker ACKs this aggregates are
+    ``ipc_format.SessionTornDown``.
+    """
+    session_id: str
+
+
+@dataclass
 class APIServerMessage:
     """Envelope for messages received by the API server."""
-    # "result_tensors" | "request_complete" | "request_failed" | "setup_done"
+    # "result_tensors" | "request_complete" | "request_failed"
+    # | "session_torn_down" | "setup_done"
     message_type: str
-    body: ResultTensors | RequestComplete | RequestFailed | None = None  # None for setup_done
+    body: (
+        ResultTensors | RequestComplete | RequestFailed | SessionTornDown | None
+    ) = None  # None for setup_done
 
 
 @dataclass
@@ -84,3 +98,9 @@ class PreprocessInput:
 
     # Ordered text/attachment sequence, when the entrypoint preserved it.
     prompt_parts: list[PromptPart] | None = None
+
+    # The validated session this request belongs to: which one, whether it
+    # continues state already there, and whether it ends the session.
+    session_id: str | None = None
+    resumed: bool = False
+    end_session: bool = False

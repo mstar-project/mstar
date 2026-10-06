@@ -58,6 +58,10 @@ def _conductor(requests, drain_ttl_s=120.0):
     )
     c.requests = dict(requests)
     c.draining = {}
+    c.sessions = {}
+    c.session_teardowns = {}
+    c.request_sessions = {}
+    c._session_teardown_deadlines = deque()
     c._drain_ttl_s = drain_ttl_s
     c._early_reads_done = {}
     c._early_abort_requests = set()

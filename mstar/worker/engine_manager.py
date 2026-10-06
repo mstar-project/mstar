@@ -14,6 +14,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model
+from mstar.model.sessions import apply_sessions_yaml_overrides
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,9 @@ class EngineManager:
         """
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, model_config)
+        sessions_config = apply_sessions_yaml_overrides(
+            model.get_sessions_config(), model_config
+        )
         _refuse_uncacheable_positions(specs, model)
         _refuse_unskippable_resources(specs, model)
         _refuse_unknown_walks(model)
@@ -178,6 +182,7 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            sessions_config=sessions_config,
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
@@ -195,13 +200,23 @@ class EngineManager:
     def add_request(
         self, request_id: str,
         resource_configs: dict[str, ResourceReqConfig] | None = None,
+        session_id: str | None = None,
     ) -> None:
         """Open resource state for a request, on the per-resource configs the
-        conductor resolved for it (``Model.get_request_resource_configs``)."""
-        self.engine.add_request(request_id, resource_configs)
+        conductor resolved for it (``Model.get_request_resource_configs``).
 
-    def remove_request(self, request_id: str) -> None:
-        self.engine.remove_request(request_id)
+        A request in a session also takes on the state that session holds.
+        """
+        self.engine.add_request(request_id, resource_configs, session_id=session_id)
+
+    def remove_request(self, request_id: str, end_session: bool = False) -> None:
+        self.engine.remove_request(request_id, end_session=end_session)
+
+    def remove_session(self, session_id: str) -> None:
+        self.engine.remove_session(session_id)
+
+    def take_session_error(self, session_id: str) -> str | None:
+        return self.engine.take_session_error(session_id)
 
     def evictable_nodes(self) -> list[str]:
         """Nodes whose state can be reclaimed. The worker keeps the per-request
