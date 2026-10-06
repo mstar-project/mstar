@@ -38,9 +38,9 @@ from mstar.conductor.request_info import (
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    PagedKVConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     RaggedAttentionConfig,
@@ -53,6 +53,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_file
+from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.qwen3_asr.config import (
     ASR_TEXT_TAG,
     ATTN,
@@ -174,12 +175,12 @@ class Qwen3ASRModel(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args
-        model_kwargs = model_kwargs or {}
+        kw = checked_request_kwargs(model_kwargs)
         return {
             SAMPLER: SamplingReqConfig(
-                temperature=model_kwargs.get("temperature", 0.0),
-                top_p=model_kwargs.get("top_p", 1.0),
-                ignore_eos=model_kwargs.get("ignore_eos", False),
+                temperature=kw.get("temperature", 0.0),
+                top_p=kw.get("top_p", 1.0),
+                ignore_eos=kw.get("ignore_eos", False),
             )
         }
 
@@ -187,8 +188,22 @@ class Qwen3ASRModel(Model):
     # Model ABC: graph walk definitions
     # -------------------------------------------------------------------
 
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Requests past the cap wait in the conductor instead of fighting for
+        KV pages. A 20 min file takes about 122 pages of 128 tokens, so the
+        page count, not the cap, bounds how many long files decode at once."""
+        cap = config.get("max_concurrent_requests")
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+            raise ValueError(f"{config_path}: set max_concurrent_requests to a positive int")
+        pages = (config.get("resources") or {}).get("kv_cache", {}).get("max_num_pages", self.KV_PAGES)
+        if cap > pages:
+            raise ValueError(
+                f"{config_path}: max_concurrent_requests={cap} but kv_cache.max_num_pages={pages}, "
+                "every admitted request needs at least one page"
+            )
+
     def get_max_output_tokens(self, **model_kwargs):
-        return model_kwargs.get("max_output_tokens", self.config.max_new_tokens)
+        return checked_request_kwargs(model_kwargs).get("max_output_tokens", self.config.max_new_tokens)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = Sequential([
@@ -370,8 +385,9 @@ class Qwen3ASRModel(Model):
         # the serving bottleneck). The prompt only needs the frame count.
         num_frames = self.log_mel.num_frames(waveform.numel())
         num_audio_tokens = self.config.audio.tokens_for_frames(num_frames)
-        context = kwargs.get("initial_prompt") or prompt or ""
-        language = self.config.language_name(kwargs.get("language"))
+        kw = checked_request_kwargs(kwargs)
+        context = kw.get("initial_prompt") or prompt or ""
+        language = self.config.language_name(kw.get("language"))
         ids = self.prompt_ids(
             num_audio_tokens, context=context, language=language,
             assistant_prefix=kwargs.get("assistant_prefix") or "",
