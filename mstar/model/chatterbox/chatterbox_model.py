@@ -105,6 +105,9 @@ MAX_REFERENCE_SECONDS = 30.0
 # Sound left after the voice encoder's silence trim; shorter clips crash its
 # STFT (under 12.5 ms) or clone noise (40 ms gave WER 1.0)
 MIN_REFERENCE_SECONDS = 0.5
+# The trim is relative to the clip's own peak, so it keeps all of a silent one;
+# a clip that never reaches -60 dBFS is refused instead
+MIN_REFERENCE_PEAK = 1e-3
 # Bounds S3Gen time per chunk; the reference uses 10 (Turbo 2)
 MAX_CFM_TIMESTEPS = 100
 # The conductor's seed is an int64; sentence chunking wraps its per-chunk seeds into it
@@ -505,6 +508,9 @@ class ChatterboxModel(Model):
                 return decoder.get_all_samples().data[0].float()
             except RuntimeError as decode_exc:
                 raise ValueError(f"Could not decode the reference audio: {decode_exc}") from decode_exc
+        if wav.numel() == 0:
+            # before the resampler, which cannot reshape an empty clip
+            raise ValueError("Reference audio is empty")
         if sr != S3GEN_SR:
             wav = resample(wav, sr, S3GEN_SR)
         return wav
@@ -532,6 +538,8 @@ class ChatterboxModel(Model):
         max_len = int(MAX_REFERENCE_SECONDS * S3GEN_SR)
         if wav.numel() > max_len:
             wav = wav[:max_len]
+        if wav.abs().max() < MIN_REFERENCE_PEAK:
+            raise ValueError("Reference audio is silent (its peak is below -60 dBFS)")
         # the same trim the voice encoder applies before its STFT
         sound = trim_silence(resample(wav, S3GEN_SR, S3_SR), top_db=20.0).numel() / S3_SR
         if sound < MIN_REFERENCE_SECONDS:

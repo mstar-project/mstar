@@ -287,7 +287,7 @@ def test_process_prompt_turbo_rejects_short_reference():
     with pytest.raises(ValueError, match="longer than 5 s"):
         model.process_prompt(
             "hello", ["text", "audio"], ["audio"],
-            tensors={"audio_inputs": [torch.zeros(3 * 24000)]},
+            tensors={"audio_inputs": [_tone(3.0)]},
         )
 
 
@@ -306,6 +306,9 @@ def _tone(seconds: float, sr: int = 24000) -> torch.Tensor:
     (_tone(0.3), "s of sound once silence is trimmed"),
     # 6.2 s long, but the encoder's trim keeps only the burst (frame-rounded)
     (torch.cat([torch.zeros(3 * 24000), _tone(0.2), torch.zeros(3 * 24000)]), r"has 0\.\d+ s of sound"),
+    # the trim is relative to the clip's peak, so it keeps all of these
+    (torch.zeros(10 * 24000), "silent"),
+    (1e-4 * torch.randn(5 * 24000, generator=torch.Generator().manual_seed(0)), "silent"),
 ])
 def test_process_prompt_rejects_unusable_reference(wav, message):
     with pytest.raises(ValueError, match=message):
@@ -330,6 +333,20 @@ def test_undecodable_reference_is_a_client_error(tmp_path):
     bad.write_bytes(b"hello world" * 100)
     with pytest.raises(ValueError, match="Could not decode the reference audio"):
         ChatterboxModel._decode_audio(str(bad))
+
+
+def test_empty_reference_is_a_client_error(tmp_path):
+    pytest.importorskip("soundfile")
+    import wave
+
+    # a header and no frames, at a rate that needs resampling
+    path = tmp_path / "empty.wav"
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+    with pytest.raises(ValueError, match="Reference audio is empty"):
+        ChatterboxModel._decode_audio(str(path))
 
 
 @pytest.mark.parametrize("prompt,inputs,outputs,kwargs,message", [
