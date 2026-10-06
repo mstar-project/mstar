@@ -328,6 +328,20 @@ def _decoder_submodule(cfg: WhisperModelConfig) -> WhisperDecoderSubmodule:
     return sub
 
 
+def _fwd(rid_handle: int, wire: str = "wire", **step_metadata):
+    """Stand-in for ``CurrentForwardPassInfo``.
+
+    ``step_metadata`` is where a prefill walk reads the prompt settings the
+    route resolved — the real object always has the dict, so a stub without
+    one is the fake drifting from what it stands in for.
+    """
+    return type("F", (), {
+        "request_id": wire,
+        "rid_handle": rid_handle,
+        "step_metadata": dict(step_metadata),
+    })()
+
+
 def test_decoder_declares_context_span_only_on_encoder_walks():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
@@ -352,14 +366,15 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     from mstar.model.whisper.components.timestamps import FIRST_TOKEN, TimestampRules, inactive_state
 
     sub.timestamp_rules = TimestampRules(cfg)
-    fwd = type("F", (), {"request_id": "wire-ts", "rid_handle": 1})()
+    fwd = _fwd(1, "wire-ts", language=EN, task=TRANSCRIBE, timestamps=True)
     ctx = {"encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)]}
     # a prompt without <|notimestamps|> turns the rules on, so the first token must be a timestamp
     row = sub.prepare_inputs(PREFILL_WALK, fwd, {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE])], **ctx})
-    assert sub.request_state(1)["timestamps"] is True
+    assert sub.request_state(1)["language"] == EN
+    assert sub.request_state(1)["task"] == TRANSCRIBE
     assert row.tensor_inputs["ts_rules"].tolist() == [1, FIRST_TOKEN, cfg.timestamp_begin - 1, cfg.timestamp_begin + 51]
     # a plain prompt: inactive row
-    plain = type("F", (), {"request_id": "wire-plain", "rid_handle": 2})()
+    plain = _fwd(2, "wire-plain", language=EN, task=TRANSCRIBE, timestamps=False)
     row2 = sub.prepare_inputs(PREFILL_WALK, plain, {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE, NOTS])], **ctx})
     assert row2.tensor_inputs["ts_rules"].tolist() == inactive_state()
     batch = sub.preprocess(PREFILL_WALK, _engine_inputs([1, 2]), [row, row2])
@@ -381,15 +396,18 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     (decode_cfg,) = sub.get_cuda_graph_configs(torch.device("cpu"))
     assert decode_cfg.single_request_inputs.tensor_inputs["ts_rules"].tolist() == inactive_state()
     # language detection never applies the rules
-    detect = sub.prepare_inputs(DETECT_LANGUAGE_WALK, type("F", (), {"request_id": "wire-d", "rid_handle": 6})(),
-                                {"text_inputs": [torch.tensor([SOT])], **ctx})
+    detect = sub.prepare_inputs(
+        DETECT_LANGUAGE_WALK,
+        _fwd(6, "wire-d", language=None, task=TRANSCRIBE, timestamps=True),
+        {"text_inputs": [torch.tensor([SOT])], **ctx},
+    )
     assert detect.tensor_inputs["ts_rules"].tolist() == inactive_state()
 
 
 def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
-    fwd = type("F", (), {"request_id": "wire-r0", "rid_handle": 3})()
+    fwd = _fwd(3, "wire-r0", language=DE, task=TRANSCRIBE, timestamps=False)
     # prepare_inputs reads the module device, so give it a parameter
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
     row = sub.prepare_inputs(
@@ -568,11 +586,59 @@ def test_state_machine_language_detection():
     ]
     # the detection step's (inactive) rule state is dropped, not routed
     assert set(map(id, second.unpersist_tensors)) == {id(lang), id(tail), id(stale_rules)}
-    assert second.step_metadata == {"is_prefill": True}
+    # the second prefill restates the settings; the language is still unknown
+    assert second.step_metadata == {
+        "is_prefill": True, "language": None,
+        "task": model.config.task_token("transcribe"), "timestamps": False,
+    }
 
     third = model.get_partition_forward_pass_args("default", second.full_metadata, {"new_token": [object()]})
     assert third.full_metadata.graph_walk == DECODE_WALK and not third.full_metadata.is_prefill
     assert model.get_partition_forward_pass_args("default", third.full_metadata, {}).request_done
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"language": "en"},
+    {"language": "de", "task": "translate"},
+    {"language": "en", "timestamps": True},
+    {"language": "de", "task": "translate", "timestamps": True},
+    {"timestamps": True},                 # detection
+    {},                                   # detection, no timestamps
+    {"language": "en", "timestamps": "word"},
+])
+def test_route_metadata_agrees_with_the_prompt_it_was_built_beside(kwargs):
+    """The decoder reads the prompt settings off ``step_metadata`` rather than
+    scanning the prompt tensor, which was a D2H sync. The two are now derived
+    independently from the same request kwargs, so what used to be true by
+    construction needs holding here: the metadata must say exactly what the
+    prompt says.
+    """
+    model = _make_model()
+    wave = torch.randn(8_000)
+    out = model.process_prompt(
+        None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, **kwargs,
+    )
+    args = model.get_initial_forward_pass_args(
+        "default", ["audio", "text"], ["text"],
+        {k: list(v) for k, v in out.items()}, model_kwargs=kwargs,
+    )
+    meta = args.step_metadata
+    prompt = out["text_inputs"][0].tolist()
+    prompt += out["prompt_tail"][0].tolist() if "prompt_tail" in out else []
+
+    # timestamps on <=> the prompt omits <|notimestamps|>, which is what the
+    # submodule used to test the prompt for
+    assert meta["timestamps"] is (model.config.no_timestamps_token_id not in prompt)
+    # the language token, or None exactly when it is being detected
+    assert meta["language"] == (
+        None if kwargs.get("language") is None
+        else model.config.language_token(kwargs["language"])
+    )
+    assert (meta["language"] is None) is ("prompt_tail" in out)
+    if meta["language"] is not None:
+        assert meta["language"] in prompt
+    assert meta["task"] == model.config.task_token(kwargs.get("task", "transcribe"))
+    assert meta["task"] in prompt
 
 
 def test_process_prompt_builds_window_and_prompts():
@@ -687,7 +753,7 @@ def test_decoder_prefill_selects_each_request_last_row_itself():
     assert sub._last_rows(hidden, torch.tensor([4, 1, 2])).flatten().tolist() == [3.0, 4.0, 6.0]
     # a language-detection prompt is a single token: still its own last row
     assert sub._last_rows(hidden[:1], torch.tensor([1])).flatten().tolist() == [0.0]
-    fwd = type("F", (), {"request_id": "wire-a", "rid_handle": 5})()
+    fwd = _fwd(5, "wire-a", language=None, task=TRANSCRIBE, timestamps=False)
     detect = sub.prepare_inputs(DETECT_LANGUAGE_WALK, fwd, {
         "text_inputs": [torch.tensor([SOT])], "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
     })

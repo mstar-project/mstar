@@ -334,17 +334,26 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             # max_target_positions, and check_stop reads this back. Set per
             # walk, not added: a batch whose admit fails is prepared again.
             state.add("prompt_lens", {**state.get("prompt_lens", {}), graph_walk: seq_len})
-            # Timestamps are on when the prompt omits <|notimestamps|>. The
-            # detection walk's prompt ends at <|sot|> and says nothing yet.
-            prompt = token_ids.tolist() + tensor_inputs.get("prompt_tail", token_ids[:0]).tolist()
-            timestamps = graph_walk != DETECT_LANGUAGE_WALK and self.config.no_timestamps_token_id not in prompt
-            # the align walk rebuilds the forced prompt from these
-            for tok in prompt:
-                if self.config.language_of(tok) is not None:
-                    state.add("language", tok)
-                elif tok in self.config.task_to_id.values():
-                    state.add("task", tok)
-            state.add("timestamps", timestamps)
+            # The route resolved these from the request's kwargs, which is
+            # where they came from in the first place: scanning the prompt
+            # tensor for them meant a ``.tolist()`` here, and a D2H on the GPU
+            # thread waits out everything queued ahead of it — at prefill, the
+            # encoder's whole 30 s window.
+            meta = fwd_info.step_metadata
+            # The detection walk's prompt ends at <|sot|> and has settled
+            # nothing yet, so it decodes with the rules off either way.
+            timestamps = (
+                graph_walk != DETECT_LANGUAGE_WALK and bool(meta.get("timestamps"))
+            )
+            # the align walk rebuilds the forced prompt from these. The
+            # language is None exactly when it is being detected, and that walk
+            # reads it off the transcript instead (see ``_prepare_alignment``).
+            language = meta.get("language")
+            if language is not None:
+                state.add("language", language)
+            task = meta.get("task")
+            if task is not None:
+                state.add("task", task)
             row = rule_state([], self.config) if timestamps else inactive_state()
             tensor_inputs["ts_rules"] = torch.tensor(row, dtype=torch.long, device=device)
 
