@@ -53,6 +53,8 @@ class ThinkerMoeParallelConfig:
     debug_check_routing: bool = False
     # Log per-rank EP slot counts every N Thinker steps; 0 is off.
     log_expert_load_every: int = 0
+    # Skip CUDA-graph padding rows in the routed experts; TP and EP alike.
+    mask_padding: bool = False
 
     def __post_init__(self):
         if self.parallel not in ("tp", "ep"):
@@ -101,6 +103,7 @@ class Qwen3OmniThinkerLayer(nn.Module):
         super().__init__()
         tc = config.thinker_text
         moe_parallel = moe_parallel or ThinkerMoeParallelConfig()
+        self.is_moe = False
 
         self.hidden_size = tc.hidden_size
 
@@ -133,6 +136,7 @@ class Qwen3OmniThinkerLayer(nn.Module):
             and tc.num_experts > 0
             and (layer_idx + 1) % tc.decoder_sparse_step == 0
         )
+        self.is_moe = use_moe
         if use_moe and moe_parallel.parallel == "ep":
             ep_group = moe_parallel.resolve_ep_group(comm_group)
             self.mlp = ExpertParallelSparseMoeBlock(
@@ -171,12 +175,14 @@ class Qwen3OmniThinkerLayer(nn.Module):
         hidden_states: torch.Tensor,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
+        token_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: [tokens, hidden_size]
             cos_sin_3d: (cos, sin) for 3D MRoPE, each [tokens, head_dim].
             mrope_section: section sizes for interleaved 3D MRoPE.
+            token_valid: [tokens] bool; False rows are padding the MoE skips.
 
         Returns:
             hidden_states: [tokens, hidden_size]
@@ -194,7 +200,10 @@ class Qwen3OmniThinkerLayer(nn.Module):
         # Post-attention norm + MLP/MoE + residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if token_valid is not None and self.is_moe:
+            hidden_states = self.mlp(hidden_states, token_valid=token_valid)
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -248,7 +257,9 @@ class Qwen3OmniThinkerModel(nn.Module):
 
         self.lm_head = nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
 
-        self._log_expert_load_every = (moe_parallel or ThinkerMoeParallelConfig()).log_expert_load_every
+        moe_parallel = moe_parallel or ThinkerMoeParallelConfig()
+        self._log_expert_load_every = moe_parallel.log_expert_load_every
+        self.mask_padding = moe_parallel.mask_padding
         self._steps_since_load_log = 0
         self._discard_expert_load = False
 
@@ -320,6 +331,7 @@ class Qwen3OmniThinkerModel(nn.Module):
         mrope_section: Optional[list[int]] = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         label: str = "main",
+        num_valid_tokens: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
@@ -328,6 +340,8 @@ class Qwen3OmniThinkerModel(nn.Module):
             cos_sin_3d: (cos, sin) for 3D MRoPE, each [tokens, head_dim].
             mrope_section: section sizes for interleaved 3D MRoPE,
                 e.g. [24, 20, 20].
+            num_valid_tokens: ``(1,)`` real token count; rows past it are
+                CUDA-graph padding. Used only under ``mask_padding``.
             label: the plan key every layer runs against. The stream's
                 stored length and position counter advance when the runner
                 commits the declared step (vision prefill declares its
@@ -344,6 +358,10 @@ class Qwen3OmniThinkerModel(nn.Module):
         # Capture input embeddings BEFORE any transformer layers
         layer_0_embed = hidden_states.clone()
         layer_n_hidden = None
+        token_valid = None
+        if self.mask_padding and num_valid_tokens is not None:
+            positions = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+            token_valid = positions < num_valid_tokens
 
         # The label and layer index are cursors on the shared resources: bind
         # the label once, advance the index per layer. Passing them as
@@ -355,6 +373,7 @@ class Qwen3OmniThinkerModel(nn.Module):
                 hidden_states,
                 cos_sin_3d=cos_sin_3d,
                 mrope_section=mrope_section,
+                token_valid=token_valid,
             )
 
             # add visual features to the hidden states of first several layers

@@ -643,6 +643,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 for i, t in enumerate(deepstack_list):
                     extra_inputs[f"deepstack_{i}"] = t
 
+        if self.model.mask_padding:
+            # A replay stages these real rows at the head of the bucket; the
+            # captured MoE skips the rest. A fill kernel, so no H2D copy.
+            extra_inputs["num_valid_tokens"] = torch.full(
+                (1,), input_embeds.shape[0], dtype=torch.int64, device=device,
+            )
+
         return {
             "input_embeds": input_embeds,
             "cos_3d": cos_3d,
@@ -721,6 +728,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             mrope_section=mrope_section,
             deepstack_visual_embeds=deepstack,
             label="main",
+            num_valid_tokens=kwargs.get("num_valid_tokens"),
         )
 
         result: NameToTensorList = {}
@@ -889,6 +897,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             mrope_section=mrope_section,
             deepstack_visual_embeds=deepstack,
             label="main",
+            num_valid_tokens=kwargs.get("num_valid_tokens"),
         )
 
         request_ids = engine_inputs.request_ids
