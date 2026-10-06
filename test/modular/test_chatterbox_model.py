@@ -1,6 +1,7 @@
 """CPU contract tests for the Chatterbox model: registry, graph, partitions,
 prompt processing, the conductor state machine and the T3 step declaration.
-No weights are loaded; the model object is built without ``__init__``."""
+No weights are loaded: the model object is built without ``__init__``, or with
+the checkpoint lookup and the tokenizer stubbed (``_no_checkpoint``)."""
 
 import json
 import sys
@@ -76,6 +77,17 @@ def _make_model(variant: str = "chatterbox", voices_dir=None) -> ChatterboxModel
     model._submodule_cache = {}
     model._shared = {}
     return model
+
+
+@pytest.fixture(autouse=True)
+def _no_checkpoint(monkeypatch, tmp_path):
+    """``__init__`` resolves the checkpoint snapshot for its tokenizer; without a
+    cached one that downloads the whole repo. The config tests here need
+    neither."""
+    monkeypatch.setattr(
+        "mstar.model.chatterbox.chatterbox_model.resolve_snapshot", lambda *args, **kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr(ChatterboxModel, "_build_text_tokenizer", lambda self: _TokenizerStub())
 
 
 def _step_context(graph_walk: str, request_ids: list[str]) -> StepContext:
