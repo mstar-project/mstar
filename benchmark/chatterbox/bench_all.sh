@@ -93,9 +93,15 @@ case ${1:-} in
   mstar)
     cfg=$2 c=$3 out=$RESULTS/mstar_$(basename "${cfg%.yaml}")${RUN_TAG:+_$RUN_TAG}_c$c
     mkdir -p "$out"
-    # same preset voices as the TTS server, appended as model_kwargs to a copy of the config;
+    # same preset voices as the TTS server, merged into a copy of the config's model_kwargs;
     # EXTRA_MODEL_KWARGS (indented "  key: value" lines) adds deployment knobs, RUN_TAG names the run
-    { cat "$MSTAR/$cfg"; printf 'model_kwargs:\n  voices_dir: %s\n%s' "$VOICES_DIR" "${EXTRA_MODEL_KWARGS:-}"; } > "$out/config.yaml"
+    python - "$MSTAR/$cfg" "$out/config.yaml" "$VOICES_DIR" "${EXTRA_MODEL_KWARGS:-}" <<'EOF'
+import sys, yaml
+src, dst, voices, extra = sys.argv[1:]
+cfg = yaml.safe_load(open(src))
+cfg["model_kwargs"] = {**(cfg.get("model_kwargs") or {}), "voices_dir": voices, **(yaml.safe_load(extra) or {})}
+yaml.safe_dump(cfg, open(dst, "w"), sort_keys=False)
+EOF
     cd "$MSTAR"
     # shellcheck disable=SC2086  # SERVE_EXTRA_ARGS is a list of extra mstar-serve flags (e.g. --log-level DEBUG)
     start_group "$out/server.log" mstar-serve --config "$out/config.yaml" --port "$PORT" \
