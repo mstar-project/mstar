@@ -73,6 +73,9 @@ class StepContext:
     _padded_request_ids: Sequence[int] | None = None
     # rid -> real walk under a combined ``graph_walk``; empty otherwise
     request_walks: Mapping[int, str] = field(default_factory=dict)
+    # plan prefill attention even when every row is one token: a packed
+    # capture's forward reads per-row token offsets
+    force_prefill: bool = False
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)

@@ -1630,6 +1630,7 @@ class Engine:
         )
         if lease is not None:
             batch.lease_slot(lease)
+            batch.step_context.force_prefill = cg_runner.is_packed(lease)
         return lease
 
     def can_pre_plan(self, node_name: str) -> bool:
