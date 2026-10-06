@@ -24,6 +24,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     Dispatches on graph_walk:
       - prefill: embed text tokens, fill KV cache
       - decode: embed previous token, generate next audio token
+      - mixed: prefill and decode rows in one batch
     """
 
     def __init__(
@@ -53,6 +54,8 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             ),
             PackedCudaGraphConfig(
                 capture_graph_walk="prefill",
+                # a mixed batch is packed rows too, decode rows one token long
+                replay_graph_walks=["prefill", "mixed"],
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=lambda n: ARNodeInputs(
                     input_ids=torch.zeros(
@@ -83,11 +86,10 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ):
-        prefill_tokens = {}
-        if graph_walk == "prefill":
-            prefill_tokens = {
-                rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
-            }
+        prefill_tokens = {
+            rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
+            if (inp.graph_walk or graph_walk) == "prefill"
+        }
         return SubmoduleStep(
             segments=[
                 Segment(
@@ -128,7 +130,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         emb = self.embed_tokens(text_inputs)
         hidden = self.language_model(emb, label="main")
 
-        if graph_walk == "prefill":
+        if graph_walk != "decode":
             hidden = attn.select_last_hidden(hidden)
 
         logits = self.lm_head(hidden)
