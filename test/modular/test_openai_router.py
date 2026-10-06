@@ -157,6 +157,24 @@ def test_audio_speech(client_and_stub):
     assert stub.last_submit["model_kwargs"]["voice"] == "tara"
 
 
+@pytest.mark.parametrize("exc,status", [
+    (ValueError("ref_audio must be a data URL or an http(s) URL"), 400),  # the request's fault
+    (OSError("No space left on device"), 500),  # the server's
+])
+def test_speech_maps_adapter_errors(client_and_stub, monkeypatch, exc, status):
+    from mstar.api_server.openai import adapters
+
+    def raising(self, req, upload_dir):
+        raise exc
+
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    monkeypatch.setattr(adapters.OrpheusAdapter, "speech_to_request", raising)
+    r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": "hi", "voice": "tara"})
+    assert r.status_code == status and str(exc) in r.json()["error"]["message"]
+    assert stub.last_submit is None
+
+
 def test_images(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"

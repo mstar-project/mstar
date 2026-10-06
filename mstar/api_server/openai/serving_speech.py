@@ -82,7 +82,11 @@ def list_voices(api) -> VoiceList | None:
 
 async def create_speech(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
     # blocking work (base64 decode, file write, an allowed remote fetch) off the loop
-    args = await asyncio.to_thread(adapter.speech_to_request, req, api.upload_dir)
+    try:
+        args = await asyncio.to_thread(adapter.speech_to_request, req, api.upload_dir)
+    except ValueError as exc:
+        # the adapter refused the request's fields (a bad data URL, a server path)
+        raise HTTPException(status_code=400, detail=str(exc)) from None
     request_id = rid("speech")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
     fmt = (req.response_format or "wav").lower()
