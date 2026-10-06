@@ -38,7 +38,7 @@ from mstar.conductor.request_info import (
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
+    PagedKVConfig,
     KVSpec,
     NodeResourceSpec,
     PositionConfig,
@@ -133,7 +133,7 @@ class Qwen3ASRModel(Model):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         text = self.config.text
         audio = self.config.audio
-        kv_config = KVConfig(
+        kv_config = PagedKVConfig(
             num_layers=text.num_hidden_layers,
             num_kv_heads=text.num_key_value_heads,
             head_dim=text.head_dim,
