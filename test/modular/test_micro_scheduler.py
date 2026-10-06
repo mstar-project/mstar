@@ -1365,3 +1365,19 @@ def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
     )
 
     assert merged.chunk_ranges == {"p0": chunk}
+
+
+def test_a_follower_runs_the_leaders_chunks():
+    """The leader alone sizes chunks; a follower takes them off the head."""
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.register_tp_follow(ScheduleTPNode(
+        node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1"],
+        chunk_starts=[4, -1], chunk_ends=[8, -1], incomplete_node_rids=["t0"],
+    ))
+
+    batch = _next_batch(sched, _Manager(["t0", "t1"]))
+
+    assert batch.chunk_ranges == {"t0": (4, 8)}
+    assert batch.incomplete_node_rids == {"t0"}

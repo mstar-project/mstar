@@ -188,6 +188,11 @@ class ScheduleTPNode(MessageBody):
     # means every rid runs graph_walk
     walks: list[str] = field(default_factory=list)
     walk_idx: list[int] = field(default_factory=list)
+    # per request_ids entry, the chunk this step runs ([start, end), -1 when
+    # not chunked; empty when none is), and the rows that need another chunk
+    chunk_starts: list[int] = field(default_factory=list)
+    chunk_ends: list[int] = field(default_factory=list)
+    incomplete_node_rids: list[str] = field(default_factory=list)
 
 
 @dataclass

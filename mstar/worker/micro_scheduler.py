@@ -353,6 +353,20 @@ class MicroScheduler:
             for r in message.request_ids
         ]
 
+    def tp_chunks(self, message: ScheduleTPNode) -> dict:
+        """The leader's chunk ranges and incomplete rows, keyed by this rank's handles."""
+        rids = self.tp_rids(message)
+        ranges = {
+            rid: (start, end)
+            for rid, start, end in zip(rids, message.chunk_starts, message.chunk_ends, strict=False)
+            if start >= 0
+        }
+        incomplete = {
+            handle for r in message.incomplete_node_rids
+            if (handle := self.rid_of(r)) is not None
+        }
+        return {"chunk_ranges": ranges, "incomplete_node_rids": incomplete}
+
     def register_tp_follow(
         self, message: ScheduleTPNode
     ):
@@ -518,6 +532,7 @@ class MicroScheduler:
             tp_seq=first_tp_node.spec_seq,
             request_walks=request_walks,
             walk_output_signals=walk_signals,
+            **self.tp_chunks(first_tp_node),
         )
 
 
