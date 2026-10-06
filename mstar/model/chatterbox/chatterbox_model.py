@@ -1018,7 +1018,11 @@ def _flag(name: str, value: Any) -> bool:
 
 def _number(name: str, value: Any, *, low: float | None = None, high: float | None = None) -> float:
     """A finite number in [low, high]."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    try:
+        finite = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+    except OverflowError:  # an int past the float range
+        finite = False
+    if not finite:
         raise ValueError(f"{name} must be a finite number, got {value!r}")
     value = float(value)
     if (low is not None and value < low) or (high is not None and value > high):

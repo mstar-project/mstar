@@ -438,6 +438,7 @@ def test_generation_kwargs_defaults_and_turbo_guards():
     ({"max_output_tokens": 0}, r"max_new_tokens=0 is outside"),
     ({"temperature": -1}, r"temperature=-1.0 is outside"),
     ({"temperature": float("nan")}, "temperature must be a finite number"),
+    ({"cfg_weight": 10**400}, "cfg_weight must be a finite number"),  # past float64: not an OverflowError
     # finite in float64 but past fp32 / int32, which fails the sampler for the whole batch
     ({"temperature": 1e39}, r"temperature=1e\+39 is outside \[0.0, 5.0\]"),
     ({"repetition_penalty": 1e39}, r"repetition_penalty=1e\+39 is outside"),
