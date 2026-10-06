@@ -2170,14 +2170,22 @@ class Worker:
         (``_clear_in_flight_flag``), on paths with no stage to settle.
         """
         batch = speculation.scheduled_batch
-        rids = list(batch.request_to_worker_graph) if success else []
+        # flagged per worker graph: a combined walk's rows span several
+        by_wg: dict[int, list[int]] = {}
+        if success:
+            for rid, wg_id in batch.request_to_worker_graph.items():
+                by_wg.setdefault(wg_id, []).append(rid)
+        groups = list(by_wg.items())
+        first_wg, first_rids = groups[0] if groups else (None, [])
         self._graph_runtime.commit_speculation(
             speculation.spec_id, success, list(dropped_rids),
             # Keeps these nodes off the ready queue while the step is in flight.
-            node=batch.node_name if rids else None,
-            wg_id=batch.request_to_worker_graph[rids[0]] if rids else None,
-            scheduled_rids=rids,
+            node=batch.node_name if first_rids else None,
+            wg_id=first_wg,
+            scheduled_rids=first_rids,
         )
+        for wg_id, rids in groups[1:]:
+            self._graph_runtime.set_in_flight(batch.node_name, wg_id, rids, True)
         give_back = (
             speculation.consumed_streaming_edges.items() if not success
             else [
@@ -2678,13 +2686,12 @@ class Worker:
     # Postprocessing
     # ------------------------------------------------------------------
     def _set_in_flight_flag(self, batch: ScheduledBatch, value: bool) -> None:
-        rids = list(batch.request_to_worker_graph)
-        if not rids:
-            return
-        self._graph_runtime.set_in_flight(
-            batch.node_name, batch.request_to_worker_graph[rids[0]],
-            rids, value,
-        )
+        # one call per worker graph: a combined walk's rows span several
+        by_wg: dict[int, list[int]] = {}
+        for rid, wg_id in batch.request_to_worker_graph.items():
+            by_wg.setdefault(wg_id, []).append(rid)
+        for wg_id, rids in by_wg.items():
+            self._graph_runtime.set_in_flight(batch.node_name, wg_id, rids, value)
 
     def _clear_in_flight_flag(self, batch: ScheduledBatch) -> None:
         self._set_in_flight_flag(batch, False)
