@@ -33,6 +33,9 @@ class WorkerMessageType(Enum):
     NEW_REQUEST = "new_request"
     DRAIN_REQUEST = "drain_request"
     REMOVE_REQUEST = "remove_request"
+    # Body: RemoveRequest. Gives back the KV pages of a request the conductor
+    # has finished, ahead of the REMOVE_REQUEST that follows it.
+    RELEASE_KV = "release_kv"
     INPUT_SIGNALS = "input_signals"
     UNPERSIST_TENSORS = "unpersist"
     TENSOR_RECEIVED = "tensor_received"
