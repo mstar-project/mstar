@@ -109,6 +109,13 @@ threads sleep. Shrinking the pool instead (``OMP_NUM_THREADS=1`` or
 ``torch.set_num_threads(1)`` in the process) is not recommended: it was in
 place during several unexplained request hangs in our runs.
 
+Every ASR config sets ``max_concurrent_requests``. Whisper's decoder caches
+hold 64 requests (12 cross-attention pages and 4 self-attention pages each),
+and the model refuses a config that admits more. Requests past the cap wait
+in the conductor. Qwen3-ASR's cap is checked against ``kv_cache.max_num_pages``,
+and since a 20 minute file takes about 122 pages the page count is what bounds
+how many long files decode at once.
+
 Both decode loops hand a window's tokens to the client in one message when
 the loop ends (``Loop.accumulated_outputs``) rather than one message per
 token. At concurrency 32 the per-token messages and their acknowledgements
