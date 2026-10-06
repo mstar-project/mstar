@@ -2,15 +2,14 @@ model: "chatterbox"
 # cond (34) + text (<= 512) + speech (<= 4096) tokens per stream
 max_seq_len: 4680
 # A CFG request at full text and max_new_tokens_limit speech tokens holds
-# 2 x 25 pages; 30 such requests, the captured decode's padding rows (186
-# pages) and the sink page fit in 1687 (checked at startup). A full pool would
-# stall decode.
+# 2 x 25 pages; 30 such requests and the sink page fit in 1536 (checked at
+# startup). A full pool would stall decode.
 max_concurrent_requests: 30
 resources:
   t3_kv:
     # 30 layers x 16 kv heads x 64 dims x bf16 = 120 KB per token and stream
     page_size: 64
-    max_num_pages: 1687
+    max_num_pages: 1536
 node_groups:
   - node_names: [voice_encoder, T3]
     ranks: [0]

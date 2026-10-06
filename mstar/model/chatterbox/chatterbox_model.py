@@ -32,7 +32,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-import os
 from pathlib import Path
 from typing import Any
 
@@ -264,8 +263,7 @@ class ChatterboxModel(Model):
         Nothing preempts a stream once the pool is full: the requests wait on
         each other until they time out. So ``max_concurrent_requests`` requests
         at full text and ``max_new_tokens_limit`` speech tokens must fit, next to
-        the sink page and the pages the captured decode's padding rows keep
-        between replays.
+        the sink page (which a captured decode's padding rows also run against).
         """
         cap = config.get("max_concurrent_requests")
         if cap is None:
@@ -278,7 +276,7 @@ class ChatterboxModel(Model):
         overrides = (config.get("resources") or {}).get(T3_KV) or {}
         page_size = int(overrides.get("page_size", kv.page_size))
         max_num_pages = int(overrides.get("max_num_pages", kv.max_num_pages))
-        need = 1 + int(cap) * self._request_kv_pages(page_size) + self._padding_kv_pages()
+        need = 1 + int(cap) * self._request_kv_pages(page_size)
         if need > max_num_pages:
             raise ValueError(
                 f"{config_path}: {cap} concurrent requests (max_concurrent_requests) at "
@@ -298,18 +296,6 @@ class ChatterboxModel(Model):
         tokens = t3.cond_len + self.config.max_text_tokens + bos + limit
         streams = 1 if self.config.is_turbo else 2
         return streams * -(-tokens // page_size)
-
-    def _padding_kv_pages(self) -> int:
-        """Pages the captured decode's padding rows keep between replays: a page
-        per stream for every row but the first (a batch that drops a request
-        keeps its bucket), per capture (guided and unguided) and per graph slot
-        (the engine double-buffers because the KV cache pre-plans)."""
-        from mstar.model.chatterbox.submodules import T3Submodule
-
-        rows = T3Submodule.DECODE_CAPTURE_BATCH_SIZES[-1] - 1
-        streams = 1 if self.config.is_turbo else 3  # guided rows hold 2 streams, unguided 1
-        slots = max(2, int(os.environ.get("MSTAR_NUM_SLOTS", "2")))  # as the engine reads it
-        return slots * rows * streams
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         t3 = self.config.t3

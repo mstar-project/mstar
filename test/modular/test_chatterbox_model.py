@@ -535,24 +535,21 @@ def test_shipped_yaml_fits_its_request_cap_in_the_kv_pool(name, caplog):
     assert "sets no max_concurrent_requests" in caplog.text
 
 
-def test_kv_fit_counts_the_padding_rows_and_the_sink_page(monkeypatch):
+def test_kv_fit_counts_the_requests_and_the_sink_page():
     model = _make_model()
     model.config.max_new_tokens_limit = 1000
-    # 50 pages a request; padding rows 1-31 of the 32-row bucket, x 3 streams x 2 slots
-    assert model._request_kv_pages(64) == 50 and model._padding_kv_pages() == 186
-    cfg = {"max_concurrent_requests": 30, "resources": {"t3_kv": {"page_size": 64, "max_num_pages": 1687}}}
+    assert model._request_kv_pages(64) == 50  # 25 pages for each of the two CFG streams
+    cfg = {"max_concurrent_requests": 30, "resources": {"t3_kv": {"page_size": 64, "max_num_pages": 1501}}}
     model.validate_config_yaml(cfg, "x.yaml")
-    cfg["resources"]["t3_kv"]["max_num_pages"] = 1686
-    with pytest.raises(ValueError, match="need 1687 pages"):
+    cfg["resources"]["t3_kv"]["max_num_pages"] = 1500
+    with pytest.raises(ValueError, match="need 1501 pages"):
         model.validate_config_yaml(cfg, "x.yaml")
     turbo = _make_model("turbo")
     turbo.config.max_new_tokens_limit = 1000
-    assert turbo._request_kv_pages(64) == 30 and turbo._padding_kv_pages() == 62
+    assert turbo._request_kv_pages(64) == 30
     # T3 repeats the speech BOS, so 34 + 512 + 2 + 989 tokens take a 25th page
     model.config.max_new_tokens_limit = 989
     assert model._request_kv_pages(64) == 2 * 25
-    monkeypatch.setenv("MSTAR_NUM_SLOTS", "3")
-    assert model._padding_kv_pages() == 3 * 31 * 3
 
 
 # ---------------------------------------------------------------------------
