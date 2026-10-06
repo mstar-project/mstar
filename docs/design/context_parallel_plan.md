@@ -6,7 +6,7 @@ Opt-in per `node_groups` entry with `cp_size`. The default `cp_size: 1` keeps th
 
 - **Status:** draft for review. No code is written. Pinned to M* commit `33baea08`. Lives on branch `cp-rfc`.
 - **Area:** `engine/resources/{kv,attn,position,sampler}`, `distributed`, `model/base`, `model/qwen3_omni`. No worker, conductor or Rust runtime change.
-- **Related:** chunked prefill plan ([chunked_prefill_plan.md](docs/design/chunked_prefill_plan.md), branch `chunked-prefill-2`), issue #210 (prefix KV reuse), PR #198 (windowed generation), vLLM DCP and PCP (`vllm/v1/attention/ops/{dcp,pcp}.py`), arXiv 2411.01783 (ring attention for 1M-token prefill).
+- **Related:** chunked prefill plan ([chunked_prefill_plan.md](chunked_prefill_plan.md), branch `chunked-prefill-2`), issue #210 (prefix KV reuse), PR #198 (windowed generation), vLLM DCP and PCP (`vllm/v1/attention/ops/{dcp,pcp}.py`), arXiv 2411.01783 (ring attention for 1M-token prefill).
 - **Background notes:** `~/context-parallelism/notes/01..06` (vLLM survey, cost model, M* extension points, model survey, decision log, phase plan) and `08`, `09` (caveat surveys, 45 and 78 items).
 
 Notation:
@@ -64,7 +64,7 @@ node_groups:
     cp_size: 2        # TP groups {0,1},{2,3}; CP groups {0,2},{1,3}
 ```
 
-`WorkerGraph` ([base.py](mstar/model/base.py), lines 69 to 130) gets `cp_size`, `_cp_ranks` and `_cp_comm_size`, in the same form as `_sp_ranks`. `tp_size` is still rewritten to the instance size. Thus `ShardingGroup`, the conductor and `rust/src/graph/shard.rs` do not change.
+`WorkerGraph` ([base.py](../../mstar/model/base.py), lines 69 to 130) gets `cp_size`, `_cp_ranks` and `_cp_comm_size`, in the same form as `_sp_ranks`. `tp_size` is still rewritten to the instance size. Thus `ShardingGroup`, the conductor and `rust/src/graph/shard.rs` do not change.
 
 `get_sharding_config` (`base.py`, lines 347 to 397) validates `cp_enabled_nodes` in the same way as `sp_enabled_nodes`. A CP node declares no `shard_dim` entries. Its signals are replicated, and each rank cuts its own slice locally.
 
@@ -92,16 +92,16 @@ class JointGroups:
     def broadcast(self, tensor, src=0): # tp, then sp, then cp
 ```
 
-`GlobalParallelConfig` ([communication.py](mstar/distributed/communication.py), lines 371 to 437) builds `world_cp_groups` from `wg._cp_ranks`. It adds them to the sorted `new_group` schedule, so every rank creates the groups in the same order. Line 379 tests `cp_size > 1` together with `tp` and `sp`.
+`GlobalParallelConfig` ([communication.py](../../mstar/distributed/communication.py), lines 371 to 437) builds `world_cp_groups` from `wg._cp_ranks`. It adds them to the sorted `new_group` schedule, so every rank creates the groups in the same order. Line 379 tests `cp_size > 1` together with `tp` and `sp`.
 
 ### 2.3 Call sites that change
 
 | Site | Today | With CP |
 |---|---|---|
-| `KVConfig.shard()` at [manager.py](mstar/engine/resources/kv/manager.py) line 310 and [attn/base.py](mstar/engine/resources/attn/base.py) line 60 | `joint_comm_group.world_size` | `head_shard_size` |
-| `get_piecewise_cuda_graph_configs` at [engine.py](mstar/engine/engine.py) line 512 | joint world size as head degree | `head_shard_size` |
-| `agree_across_ranks` ([cuda_graph_runner.py](mstar/engine/cuda_graph_runner.py) lines 47 to 49), `post_warmup_validate`, `_verify_tp_async_sched_agrees` ([worker.py](mstar/worker/worker.py) lines 1651 to 1680) | loop over `[tp_group, sp_group]` | loop over `[tp_group, sp_group, cp_group]` |
-| `BaseSampler._broadcast_tokens` ([sampler/utils.py](mstar/engine/resources/sampler/utils.py) lines 268 to 279) | TP group | joint group |
+| `KVConfig.shard()` at [manager.py](../../mstar/engine/resources/kv/manager.py) line 310 and [attn/base.py](../../mstar/engine/resources/attn/base.py) line 60 | `joint_comm_group.world_size` | `head_shard_size` |
+| `get_piecewise_cuda_graph_configs` at [engine.py](../../mstar/engine/engine.py) line 512 | joint world size as head degree | `head_shard_size` |
+| `agree_across_ranks` ([cuda_graph_runner.py](../../mstar/engine/cuda_graph_runner.py) lines 47 to 49), `post_warmup_validate`, `_verify_tp_async_sched_agrees` ([worker.py](../../mstar/worker/worker.py) lines 1651 to 1680) | loop over `[tp_group, sp_group]` | loop over `[tp_group, sp_group, cp_group]` |
+| `BaseSampler._broadcast_tokens` ([sampler/utils.py](../../mstar/engine/resources/sampler/utils.py) lines 268 to 279) | TP group | joint group |
 
 The `head_shard_size` line is the one line that must not be wrong. If `cp` is part of the head degree, `KVConfig.shard()` divides the heads by `cp` and drops heads with no error. The same number reaches the piecewise CUDA-graph configs. The caveat survey (`notes/08`, items 3 and 27) found both sites.
 
@@ -136,31 +136,31 @@ PR 4 measures `I_tok` in 1, `P` and `4P` on three values: the write-scatter time
 
 ### 3.2 `KVManager` changes
 
-All six changes are in [manager.py](mstar/engine/resources/kv/manager.py).
+All six changes are in [manager.py](../../mstar/engine/resources/kv/manager.py).
 
 | Function | Lines | Change |
 |---|---|---|
 | `_alloc` | 1754 to 1792 | Reserve `layout.reserve_pages(L)` per stream on every rank. Use the first `local_pages(L)`. At most one page per stream per rank is idle. |
-| `_sequence_views` | 881 to 900 | `length = local_len(stored_len + span)` and `page_idxs = page_indices[:local_pages]`. `SequenceView` ([plan.py](mstar/engine/resources/kv/plan.py) lines 65 to 78) gets `global_length`, `global_to_compute` and `q_rows`. `to_compute` becomes the local Q-row count. |
+| `_sequence_views` | 881 to 900 | `length = local_len(stored_len + span)` and `page_idxs = page_indices[:local_pages]`. `SequenceView` ([plan.py](../../mstar/engine/resources/kv/plan.py) lines 65 to 78) gets `global_length`, `global_to_compute` and `q_rows`. `to_compute` becomes the local Q-row count. |
 | `_compute_plan_state` | 901 to 954 | Compute the global index `g` per token as today. Owned tokens map through `local_index(g)` to `(page, offset)`. Non-owned tokens get `token_to_page = SINK_PAGE` and `token_to_cache = 0`. |
 | `_decode_plan_state` | 955 to 979 | The owner of the new token is `owner_of_token(stored_len)`. Other ranks write to `SINK_PAGE`. One H2D copy, as today. |
 | `_assert_symmetric_free_pages` | 1609 to 1633 | Add the CP group. The assertion stays strict. `assert_pages_conserved` (lines 1545 to 1606, debug only) indexes with `local_pages(stored_len)`. |
-| `KVConfig` | [config.py](mstar/engine/resources/kv/config.py) lines 41 to 110 | Carries `cp_size`, `cp_rank`, `cp_interleave_tokens`. `max_num_pages` stays a per-rank knob. |
+| `KVConfig` | [config.py](../../mstar/engine/resources/kv/config.py) lines 41 to 110 | Carries `cp_size`, `cp_rank`, `cp_interleave_tokens`. `max_num_pages` stays a per-rank knob. |
 
 ### 3.3 Position ids
 
-`PositionManager._build_pos_ids` ([position/manager.py](mstar/engine/resources/position/manager.py) lines 333 to 343) emits one contiguous range per view. Under CP prefill the local rows are two chunks. Thus the manager turns `q_rows` into explicit positions through the current `PositionStep.pos_ids` override. The counters advance by the global `Segment.span` (lines 282 to 318) and stay symmetric. The thinker uses `custom_pos_ids`, which `split_inputs` already cuts.
+`PositionManager._build_pos_ids` ([position/manager.py](../../mstar/engine/resources/position/manager.py) lines 333 to 343) emits one contiguous range per view. Under CP prefill the local rows are two chunks. Thus the manager turns `q_rows` into explicit positions through the current `PositionStep.pos_ids` override. The counters advance by the global `Segment.span` (lines 282 to 318) and stay symmetric. The thinker uses `custom_pos_ids`, which `split_inputs` already cuts.
 
 ### 3.4 Why every rank reserves the maximum
 
-Exact per-rank page counts differ by up to one page per stream per rank. The free-page totals then differ. A request can then fail allocation on one rank and pass on another. `_handle_allocation_failure` ([worker.py](mstar/worker/worker.py) lines 1581 to 1639) assumes that every rank raises on the same batch. TP-async speculation also voids heads from each rank's own admission verdict. A different verdict on one rank stops the next collective.
+Exact per-rank page counts differ by up to one page per stream per rank. The free-page totals then differ. A request can then fail allocation on one rank and pass on another. `_handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py) lines 1581 to 1639) assumes that every rank raises on the same batch. TP-async speculation also voids heads from each rank's own admission verdict. A different verdict on one rank stops the next collective.
 
 The alternative is exact counts plus an `all_reduce(min)` on admission. That adds a collective to the scheduler path. The reservation of the maximum costs one page per stream per rank and keeps every current symmetry assertion strict.
 
 ### 3.5 Forks, offload, prefix cache
 
 - Forks (`_reserve_fork`, `_apply_fork`, lines 1681 to 1752) copy local pages to local pages. Both streams start at logical token 0, so ownership matches. Only the copy count changes, to the reserved page count.
-- Offload (lines 1268 to 1471, [cpu_page_pool.py](mstar/engine/resources/kv/cpu_page_pool.py)) is per rank. Victim selection uses a wall-clock LRU and is already uncoordinated across TP ranks (`worker.py` lines 1594 to 1606). Under CP the per-rank `reclaimable()` values also differ. CP nodes require `cpu_offload_pages == 0` in v1.
+- Offload (lines 1268 to 1471, [cpu_page_pool.py](../../mstar/engine/resources/kv/cpu_page_pool.py)) is per rank. Victim selection uses a wall-clock LRU and is already uncoordinated across TP ranks (`worker.py` lines 1594 to 1606). Under CP the per-rank `reclaimable()` values also differ. CP nodes require `cpu_offload_pages == 0` in v1.
 - `enable_prefix_cache` (lines 407 to 427) keys off `_world_size`, which is the joint size and already includes `cp`.
 
 ---
@@ -181,20 +181,20 @@ def cp_all_gather_merge(cp_group, o_local, lse_local) -> Tensor[B, H, D]:
     # all_gather both along a new leading dim into a static buffer, then merge_partial_attention
 ```
 
-- `run(q, kv, return_lse=False)` on both wrappers ([wrappers.py](mstar/engine/resources/attn/wrappers.py) lines 146 to 202 and 281 to 331). FlashInfer 0.6.18 supports `return_lse=True` on both paged wrappers with the natural-log base.
+- `run(q, kv, return_lse=False)` on both wrappers ([wrappers.py](../../mstar/engine/resources/attn/wrappers.py) lines 146 to 202 and 281 to 331). FlashInfer 0.6.18 supports `return_lse=True` on both paged wrappers with the natural-log base.
 - The LSE stays in fp32 from the kernel to the merge. vLLM commit f05603fa28 crashed when it packed the LSE into bf16.
 - The manager checks the log base of the kernel one time at startup against a small reference. vLLM commit 5b4cb69523 corrected a base mismatch that corrupted the softmax denominator with no error.
 - Every CP rank ends with the full merged `O` for its `Hq_l` heads. That is the input that the row-parallel `o_proj` expects. The TP all-reduce in `o_proj` does not change.
 
 ### 4.2 Decode
 
-`FlashInferManager.run` ([flashinfer.py](mstar/engine/resources/attn/flashinfer.py) lines 206 to 239) gets one branch when `cp_group.world_size > 1`.
+`FlashInferManager.run` ([flashinfer.py](../../mstar/engine/resources/attn/flashinfer.py) lines 206 to 239) gets one branch when `cp_group.world_size > 1`.
 
 1. `o, lse = wrapper.run(q, kv, return_lse=True)`.
 2. A row with zero local KV gets one `SINK_PAGE` in the plan, so the kernel never sees an empty row. Such rows are streams with fewer than `cp` tokens and CUDA-graph padding rows. The plan sets their `lse` to `-inf` from its `local_length == 0` mask. This is vLLM's `mask_dcp_empty_shards_` (`ops/dcp.py` lines 72 to 96).
 3. `o = cp_all_gather_merge(cp_group, o, lse)`. The all-gather target is a static buffer per bucket, because a captured graph bakes the address. vLLM commit 9fd737badc made the same correction.
 
-The all-gather moves `cp * B * Hq_l * (D + 1) * 2` bytes per layer per step. That is a few hundred KB. The CUDA graph replays the all-gather in the same way as the SP all-gather ([sequence_parallel.py](mstar/model/components/distributed/sequence_parallel.py) lines 109 to 121).
+The all-gather moves `cp * B * Hq_l * (D + 1) * 2` bytes per layer per step. That is a few hundred KB. The CUDA graph replays the all-gather in the same way as the SP all-gather ([sequence_parallel.py](../../mstar/model/components/distributed/sequence_parallel.py) lines 109 to 121).
 
 ### 4.3 Prefill, `stored_len == 0`
 
@@ -209,7 +209,7 @@ def ragged_rows(chunks) -> (qo_indptr, kv_indptr)
     # each chunk is a row with kv_len = chunk_end, so the end-aligned causal mask is exact
 ```
 
-Per layer, inside `AttentionCallable.__call__` ([convenience.py](mstar/engine/resources/convenience.py) lines 52 to 70):
+Per layer, inside `AttentionCallable.__call__` ([convenience.py](../../mstar/engine/resources/convenience.py) lines 52 to 70):
 
 1. `k_full, v_full = gather_new_kv(...)`. Q, K and V travel in one `gather_sequence` call.
 2. `kv.write_kv(k_full, v_full)`. The plan from §3.2 sends non-owned rows to `SINK_PAGE`.
@@ -223,7 +223,7 @@ Zigzag balances the causal FLOPs to within one chunk. It puts the last chunk on 
 
 This path ships in v1, in PR 3. The `stored_len == 0` assertion exists only in PR 2, where replicated prefill is the only prefill mode.
 
-A prefill that extends a stream with resident tokens must also attend to the resident pages. Examples are the thinker's second `prefill_text` after the modality walks ([qwen3_omni_model.py](mstar/model/qwen3_omni/qwen3_omni_model.py) lines 836 to 875), a multi-turn chat, and every chunk after the first one under chunked prefill. Each rank holds only a subset of the resident pages. The FlashInfer end-aligned causal mask computes the query position from `kv_len - qo_len`. Over a partial page list that position is wrong, and the kernel gives an incorrect result with no error.
+A prefill that extends a stream with resident tokens must also attend to the resident pages. Examples are the thinker's second `prefill_text` after the modality walks ([qwen3_omni_model.py](../../mstar/model/qwen3_omni/qwen3_omni_model.py) lines 836 to 875), a multi-turn chat, and every chunk after the first one under chunked prefill. Each rank holds only a subset of the resident pages. The FlashInfer end-aligned causal mask computes the query position from `kv_len - qo_len`. Over a partial page list that position is wrong, and the kernel gives an incorrect result with no error.
 
 The correct method has three parts. vLLM uses the same method in `flash_attn.py` lines 1547 to 1700.
 
@@ -254,11 +254,11 @@ Decode at `B = 8` with a 32K context: CP2 saves about 2.5 ms of KV reads per ste
 
 ## 5. Model-facing API
 
-A CP-capable `ARNodeSubmodule` does three things in prefill. Decode needs none of them. The thinker ([qwen3_omni/submodules.py](mstar/model/qwen3_omni/submodules.py)) is the reference, and it joins `cp_enabled_nodes`.
+A CP-capable `ARNodeSubmodule` does three things in prefill. Decode needs none of them. The thinker ([qwen3_omni/submodules.py](../../mstar/model/qwen3_omni/submodules.py)) is the reference, and it joins `cp_enabled_nodes`.
 
 ### 5.1 Slice the inputs per rank
 
-`prepare_inputs` (lines 376 to 540) builds the full `ARNodeInputs` as today. For a CP prefill that is not in replicated mode, it then keeps `split_inputs(start, end)` for the two chunks of this rank, concatenated. Positions, deepstack tensors and `mrope_pos_advance` stay global, because `split_inputs` cuts them with the rows. The thinker overrides `split_inputs` to cut its `tensor_inputs`, which the base class refuses to do ([submodule_base.py](mstar/model/submodule_base.py) lines 679 to 686).
+`prepare_inputs` (lines 376 to 540) builds the full `ARNodeInputs` as today. For a CP prefill that is not in replicated mode, it then keeps `split_inputs(start, end)` for the two chunks of this rank, concatenated. Positions, deepstack tensors and `mrope_pos_advance` stay global, because `split_inputs` cuts them with the rows. The thinker overrides `split_inputs` to cut its `tensor_inputs`, which the base class refuses to do ([submodule_base.py](../../mstar/model/submodule_base.py) lines 679 to 686).
 
 ### 5.2 Declare the global span
 
@@ -280,11 +280,11 @@ Decode needs no hidden broadcast, because every CP rank holds the full hidden st
 
 1. Every branch that guards a collective derives its condition from the step declaration or the KV plan, never from a local tensor shape. "This rank has resident pages" differs per rank. "This stream has resident tokens" does not.
 2. `zigzag_chunks`, `CPLayout` and the replicated-prefill threshold are pure functions of `(T, stored_len, cp, P, I_tok)`. Every rank knows all five values.
-3. The decode buckets capture the all-gather of §4.2. `_buckets_captured_everywhere` ([cuda_graph_runner.py](mstar/engine/cuda_graph_runner.py) lines 487 to 512) already ANDs the capture result across the joint group, which §2 extends to the CP axis.
+3. The decode buckets capture the all-gather of §4.2. `_buckets_captured_everywhere` ([cuda_graph_runner.py](../../mstar/engine/cuda_graph_runner.py) lines 487 to 512) already ANDs the capture result across the joint group, which §2 extends to the CP axis.
 4. Padding rows read garbage from `SINK_PAGE`. Their LSE is finite garbage that affects only their own rows. The NaN and infinity guard in the merge is mandatory, so that a `NaN` cannot pass through `max`.
 5. CP prefill runs eager in v1. `PREFILL_TOKEN_BUCKETS` stop at 2048 tokens, so long prompts run eager today. A graph saves 5 to 10 µs per kernel launch, which is below 0.1 % of a 64K prefill.
 
-The followers get no new wire data. `ScheduleTPNode` ([ipc_format.py](mstar/utils/ipc_format.py) lines 105 to 111) carries the node, the walk, the request ids and the speculation flags. A follower computes its chunk layout and its page ownership from those values and its own rank.
+The followers get no new wire data. `ScheduleTPNode` ([ipc_format.py](../../mstar/utils/ipc_format.py) lines 105 to 111) carries the node, the walk, the request ids and the speculation flags. A follower computes its chunk layout and its page ownership from those values and its own rank.
 
 ---
 
@@ -292,14 +292,14 @@ The followers get no new wire data. `ScheduleTPNode` ([ipc_format.py](mstar/util
 
 Three features compose with no new work:
 
-1. **Chunked prefill** ([chunked_prefill_plan.md](docs/design/chunked_prefill_plan.md)). A chunk is a prefill with `stored_len > 0`, so it uses §4.4. Inside a chunk, `split_inputs` composes: the chunk first, then zigzag. `ChunkProgress` is per rank and identical by determinism.
+1. **Chunked prefill** ([chunked_prefill_plan.md](chunked_prefill_plan.md)). A chunk is a prefill with `stored_len > 0`, so it uses §4.4. Inside a chunk, `split_inputs` composes: the chunk first, then zigzag. `ChunkProgress` is per rank and identical by determinism.
 2. **Speculation** (TP async follow). The flags travel on `ScheduleTPNode` unchanged. A CP decode step adds one lockstep collective per layer, as the TP all-reduce does.
 3. **Prefix caching** (#210). Off at world size > 1 today. Under CP a cached prefix is a set of per-rank page lists under one hash, with `effective_page = cp * I_tok` tokens (vLLM `kv_cache_utils.py` lines 718 to 800). The per-rank refcount of #210 does not change.
 
 Five features are asserted off in v1. Each has a named follow-up in §10.
 
 1. **Windowed generation** (#198). `_release_oldest_locked` (`manager.py` lines 1208 to 1220) deletes the front of `page_indices`. That shifts every later logical page and its owner. The fix is a per-stream logical base offset. In v1, `retention is None` on CP nodes.
-2. **PD disaggregation.** Equal `cp` on both sides keeps the per-rank pull ([transfer.py](mstar/engine/resources/kv/transfer.py) lines 323 to 363) unchanged. But the conductor merges `resource_publish_info` from the first instance rank only ([conductor.py](mstar/conductor/conductor.py) lines 1283 to 1296), and CP page lists differ by rank. The fix is to publish the list of every rank. A different `cp` on the two sides needs a re-interleave. vLLM requires that one degree divides the other (`base_worker.py` lines 2485 to 2492).
+2. **PD disaggregation.** Equal `cp` on both sides keeps the per-rank pull ([transfer.py](../../mstar/engine/resources/kv/transfer.py) lines 323 to 363) unchanged. But the conductor merges `resource_publish_info` from the first instance rank only ([conductor.py](../../mstar/conductor/conductor.py) lines 1283 to 1296), and CP page lists differ by rank. The fix is to publish the list of every rank. A different `cp` on the two sides needs a re-interleave. vLLM requires that one degree divides the other (`base_worker.py` lines 2485 to 2492).
 3. **Other attention backends.** `attn/dense.py` line 178 asserts `view.start == 0`. `attn/xpu.py` pads with `SINK_PAGE`. `attn/cross.py` holds replicated encoder KV. CP nodes require FlashInfer. Cross-attention labels stay replicated.
 4. **Multi-token decode** (`span > 1` on a paged step). No model does it today. The new tokens can belong to different owners and need §4.4.
 5. **Ulysses SP with CP on an AR node.** The two compose in principle. SP on an AR paged node is unused today (Cosmos3 only), so `sp*cp > 1` on an AR node is rejected.
@@ -408,7 +408,7 @@ The estimates assume one engineer with 2 to 4 GPUs on one node. The total is abo
 **Prerequisites for pass-KV (follow-ups 1 and 2).** Two different mechanisms carry the name.
 
 - *Chunked all-gather pass-KV for resident context* (vLLM MLA style, `mla_attention.py` lines 3027 to 3110). It uses the current all-gather only. It needs four parts:
-  - (a) A gather kernel from the paged cache into a contiguous workspace. vLLM has `cp_gather_cache`. M* has only `read_tokens` in [cache.py](mstar/engine/resources/kv/cache.py).
+  - (a) A gather kernel from the paged cache into a contiguous workspace. vLLM has `cp_gather_cache`. M* has only `read_tokens` in [cache.py](../../mstar/engine/resources/kv/cache.py).
   - (b) A workspace with a size from the global `stored_len` in fixed chunks, so that every rank gathers the same bytes.
   - (c) A chunk loop that runs ragged attention per chunk and merges by LSE online.
   - (d) The policy object that selects pass-Q or pass-KV from `(T, L, Hq_l, Hkv_l)`.
@@ -422,7 +422,7 @@ The `CPAttention` interface from decision D4 lands in PR 3 with the pass-Q path 
 
 Two predictions from the cost model are the acceptance checks for PR 4.
 
-- Thinker geometry: 48 layers, `Hq = 32`, `Hkv = 4`, `d = 128`, from the HF `config.json` of Qwen3-Omni-30B-A3B. The dataclass defaults in [qwen3_omni/config.py](mstar/model/qwen3_omni/config.py) lines 41 to 71 are placeholders that the loader overrides.
+- Thinker geometry: 48 layers, `Hq = 32`, `Hkv = 4`, `d = 128`, from the HF `config.json` of Qwen3-Omni-30B-A3B. The dataclass defaults in [qwen3_omni/config.py](../../mstar/model/qwen3_omni/config.py) lines 41 to 71 are placeholders that the loader overrides.
 - Hardware: one 8×H100 node, Slurm partitions `team1` or `guest`.
 - Prediction 1: CP2 prefill is about 1.9× faster than the TP1-equivalent compute above about 24K tokens.
 - Prediction 2: decode CP is slower than TP at `B = 1`. The break-even is between 75K and 0.3M resident tokens per instance, as the two cost models give different constants.
