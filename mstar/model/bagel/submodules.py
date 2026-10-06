@@ -40,6 +40,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -888,6 +889,16 @@ class LLMSubmodule(ARNodeSubmodule):
             }
 
         return node_inputs
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        if graph_walk == "prefill_text":
+            return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
+        if graph_walk == "decode":
+            return InputSeqLenInfo(1)
+        return None
 
     def declare_step(
         self,
