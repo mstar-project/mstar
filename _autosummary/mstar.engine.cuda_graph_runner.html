@@ -210,14 +210,11 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_transcriptions.html">mstar.api_server.openai.serving_transcriptions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
@@ -253,6 +250,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -279,6 +277,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear.html">mstar.model.components.linear</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear_attn.html">mstar.model.components.linear_attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.moe.html">mstar.model.components.moe</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.norm.html">mstar.model.components.norm</a></li>
@@ -326,6 +325,11 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
@@ -364,10 +368,12 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.streams.html">mstar.utils.streams</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -989,8 +995,9 @@ earlier node’s graphs already baked in.</p>
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.CudaGraphRunner.release">
 <span class="sig-name descname"><span class="pre">release</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">lease</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">real_bs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#CudaGraphRunner.release"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.release" title="Link to this definition">#</a></dt>
 <dd><p>Return the padding rows to their at-rest state after a step.</p>
-<p>Their pages stay resident (<code class="docutils literal notranslate"><span class="pre">free=False</span></code>), so the next step’s plan for
-this slot allocates nothing for the tail.</p>
+<p>Padding rows (<cite>is_padding_row</cite>) run against SINK_PAGE and the recurrent
+pool’s sink slot, so nothing stays resident: padding must never compete
+with real requests for storage.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1151,7 +1158,7 @@ to pre-plan keeps a single slot.</p>
 <li><p><strong>graph</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.cuda.graphs.CUDAGraph.html#torch.cuda.graphs.CUDAGraph" title="(in PyTorch v2.14)"><em>CUDAGraph</em></a>)</p></li>
 <li><p><strong>static_inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
 <li><p><strong>static_input_keys</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
-<li><p><strong>static_outputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p></li>
+<li><p><strong>static_outputs</strong> (<a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput" title="mstar.model.submodule_base.BatchedModelOutput"><em>BatchedModelOutput</em></a>)</p></li>
 <li><p><strong>dummy_rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 <li><p><strong>dummy_metadata</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a><em>]</em>)</p></li>
 <li><p><strong>config_idx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
@@ -1190,7 +1197,7 @@ to pre-plan keeps a single slot.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.CudaGraphSlot.static_outputs">
-<span class="sig-name descname"><span class="pre">static_outputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphSlot.static_outputs" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">static_outputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput" title="mstar.model.submodule_base.BatchedModelOutput"><span class="pre">BatchedModelOutput</span></a></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphSlot.static_outputs" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>

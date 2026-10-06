@@ -34,6 +34,7 @@ mstar.model.components
    diffusion
    distributed
    linear
+   linear_attn
    mlp
    moe
    norm

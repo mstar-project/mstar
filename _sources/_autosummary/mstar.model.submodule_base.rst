@@ -19,6 +19,8 @@ mstar.model.submodule\_base
    
       ARNodeInputs
       ARNodeSubmodule
+      BatchedModelOutput
+      HostRows
       InputMetadata
       LazyRequestStates
       ModelInputsFromEngine

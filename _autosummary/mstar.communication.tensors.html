@@ -210,14 +210,11 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_transcriptions.html">mstar.api_server.openai.serving_transcriptions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
@@ -253,6 +250,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -279,6 +277,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear.html">mstar.model.components.linear</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear_attn.html">mstar.model.components.linear_attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.moe.html">mstar.model.components.moe</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.norm.html">mstar.model.components.norm</a></li>
@@ -326,6 +325,11 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
@@ -364,10 +368,12 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.streams.html">mstar.utils.streams</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -639,6 +645,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.needs_cpu_tensor"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.needs_cpu_tensor</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.register_for_send"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.register_for_send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.register_for_send_uuids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.start_read_tensors()</span></code></a></li>
@@ -667,6 +674,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.has_inflight_reads"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.has_inflight_reads()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.increment_ref"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.increment_ref()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.increment_ref_batch_uniform"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.increment_ref_batch_uniform()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.needs_cpu_tensor"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.needs_cpu_tensor</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.pending"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.pending</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.read_finished"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.read_finished</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.refresh_shm_placement"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.refresh_shm_placement()</span></code></a></li>
@@ -1109,6 +1117,14 @@ uuids avoids rebuilding one per tensor.</p>
 </ul>
 </dd>
 </dl>
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.communication.tensors.SharedMemoryCommunicationManager.needs_cpu_tensor">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">needs_cpu_tensor</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.needs_cpu_tensor" title="Link to this definition">#</a></dt>
+<dd><p>Whether this transport sends from host memory, so the store keeps
+the producer’s host copies (<code class="docutils literal notranslate"><span class="pre">cpu_tensors</span></code>) for the send to reuse.
+False for transports that read device memory (TCP / RDMA).</p>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.tensors.SharedMemoryCommunicationManager.register_for_send">
 <span class="sig-name descname"><span class="pre">register_for_send</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tensor_infos</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">skip_cuda_sync</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#SharedMemoryCommunicationManager.register_for_send"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.register_for_send" title="Link to this definition">#</a></dt>
@@ -1448,6 +1464,14 @@ safety hold on a stored output batch always is.</p>
 </dl>
 </dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.needs_cpu_tensor">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">needs_cpu_tensor</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.needs_cpu_tensor" title="Link to this definition">#</a></dt>
+<dd><p>Whether this transport sends from host memory, so the store keeps
+the producer’s host copies (<code class="docutils literal notranslate"><span class="pre">cpu_tensors</span></code>) for the send to reuse.
+False for transports that read device memory (TCP / RDMA).</p>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.pending">
 <span class="sig-name descname"><span class="pre">pending</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.communication.tensors.FutureAndPointers" title="mstar.communication.tensors.FutureAndPointers"><span class="pre">FutureAndPointers</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.pending" title="Link to this definition">#</a></dt>
@@ -1622,8 +1646,11 @@ and <code class="docutils literal notranslate"><span class="pre">refresh_shm_pla
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info">
-<span class="sig-name descname"><span class="pre">store_and_return_tensor_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tensors</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">skip_cuda_sync</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.store_and_return_tensor_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
+<span class="sig-name descname"><span class="pre">store_and_return_tensor_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tensors</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">skip_cuda_sync</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cpu_tensors</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.store_and_return_tensor_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info" title="Link to this definition">#</a></dt>
+<dd><p>Store one request’s outputs and return their descriptors.</p>
+<p><code class="docutils literal notranslate"><span class="pre">cpu_tensors</span></code> mirrors <code class="docutils literal notranslate"><span class="pre">tensors</span></code> with host copies the caller already
+made; they are kept only if <code class="docutils literal notranslate"><span class="pre">needs_cpu_tensor</span></code>.</p>
+<dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
@@ -1631,6 +1658,7 @@ and <code class="docutils literal notranslate"><span class="pre">refresh_shm_pla
 <li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>skip_cuda_sync</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>cpu_tensors</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1641,7 +1669,7 @@ and <code class="docutils literal notranslate"><span class="pre">refresh_shm_pla
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info_batch">
-<span class="sig-name descname"><span class="pre">store_and_return_tensor_info_batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">signals</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">skip_cuda_sync</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.store_and_return_tensor_info_batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info_batch" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">store_and_return_tensor_info_batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">signals</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">skip_cuda_sync</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cpu_tensors</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.store_and_return_tensor_info_batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info_batch" title="Link to this definition">#</a></dt>
 <dd><p>Store a whole output batch and return the columns routing needs.</p>
 <p>One pass: the flat columns are filled as the uuids are minted, so no
 per-request or per-signal dict is built to be taken apart again. The
@@ -1654,6 +1682,9 @@ descriptors, since building columns for it would only add work.</p>
 <p>Outputs under a name no signal carries are not stored at all: no edge
 will ever read them, and a stored tensor nothing references is only
 freed when its request is torn down.</p>
+<p><code class="docutils literal notranslate"><span class="pre">cpu_tensors</span></code> mirrors <code class="docutils literal notranslate"><span class="pre">outputs</span></code> with host copies the caller already
+made (e.g. the stop check’s), matched as in <code class="docutils literal notranslate"><span class="pre">_host_copies_by_tensor</span></code>;
+kept only if <code class="docutils literal notranslate"><span class="pre">needs_cpu_tensor</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1663,6 +1694,7 @@ freed when its request is torn down.</p>
 <li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>skip_cuda_sync</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>cpu_tensors</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1910,6 +1942,7 @@ file-transport consumer cannot read an arena producer.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.needs_cpu_tensor"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.needs_cpu_tensor</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.register_for_send"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.register_for_send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.register_for_send_uuids()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.SharedMemoryCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager.start_read_tensors()</span></code></a></li>
@@ -1938,6 +1971,7 @@ file-transport consumer cannot read an arena producer.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.has_inflight_reads"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.has_inflight_reads()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.increment_ref"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.increment_ref()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.increment_ref_batch_uniform"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.increment_ref_batch_uniform()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.needs_cpu_tensor"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.needs_cpu_tensor</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.pending"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.pending</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.read_finished"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.read_finished</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.refresh_shm_placement"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.refresh_shm_placement()</span></code></a></li>

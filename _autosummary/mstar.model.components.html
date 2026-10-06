@@ -210,14 +210,11 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_transcriptions.html">mstar.api_server.openai.serving_transcriptions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
@@ -253,6 +250,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -279,6 +277,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear.html">mstar.model.components.linear</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear_attn.html">mstar.model.components.linear_attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.moe.html">mstar.model.components.moe</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.norm.html">mstar.model.components.norm</a></li>
@@ -326,6 +325,11 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
@@ -364,10 +368,12 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.streams.html">mstar.utils.streams</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -629,8 +635,18 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.FusedGatedMLP.forward"><code class="docutils literal notranslate"><span class="pre">FusedGatedMLP.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GDNProjLayout"><code class="docutils literal notranslate"><span class="pre">GDNProjLayout</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GDNProjLayout.FUSED"><code class="docutils literal notranslate"><span class="pre">GDNProjLayout.FUSED</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GDNProjLayout.SPLIT"><code class="docutils literal notranslate"><span class="pre">GDNProjLayout.SPLIT</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedDecoderLayer"><code class="docutils literal notranslate"><span class="pre">GatedDecoderLayer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedDecoderLayer.forward"><code class="docutils literal notranslate"><span class="pre">GatedDecoderLayer.forward()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedDeltaNet"><code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedDeltaNet.bind_resources"><code class="docutils literal notranslate"><span class="pre">GatedDeltaNet.bind_resources()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedDeltaNet.forward"><code class="docutils literal notranslate"><span class="pre">GatedDeltaNet.forward()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedMLP"><code class="docutils literal notranslate"><span class="pre">GatedMLP</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -653,6 +669,12 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNorm"><code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNorm.extra_repr"><code class="docutils literal notranslate"><span class="pre">RMSNorm.extra_repr()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNorm.forward"><code class="docutils literal notranslate"><span class="pre">RMSNorm.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNorm.forward_residual"><code class="docutils literal notranslate"><span class="pre">RMSNorm.forward_residual()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNormGated"><code class="docutils literal notranslate"><span class="pre">RMSNormGated</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNormGated.extra_repr"><code class="docutils literal notranslate"><span class="pre">RMSNormGated.extra_repr()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNormGated.forward"><code class="docutils literal notranslate"><span class="pre">RMSNormGated.forward()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.SparseMoeBlock"><code class="docutils literal notranslate"><span class="pre">SparseMoeBlock</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1094,6 +1116,22 @@ registered hooks while the latter silently ignores them.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.components.GDNProjLayout">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.</span></span><span class="sig-name descname"><span class="pre">GDNProjLayout</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/linear_attn.html#GDNProjLayout"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.GDNProjLayout" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/enum.html#enum.Enum" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Enum</span></code></a></p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.components.GDNProjLayout.FUSED">
+<span class="sig-name descname"><span class="pre">FUSED</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'fused'</span></span><a class="headerlink" href="#mstar.model.components.GDNProjLayout.FUSED" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.components.GDNProjLayout.SPLIT">
+<span class="sig-name descname"><span class="pre">SPLIT</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'split'</span></span><a class="headerlink" href="#mstar.model.components.GDNProjLayout.SPLIT" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.components.GatedDecoderLayer">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.</span></span><span class="sig-name descname"><span class="pre">GatedDecoderLayer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">self_attn</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mlp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_layernorm</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">post_attention_layernorm</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/decoder_layer.html#GatedDecoderLayer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.GatedDecoderLayer" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
@@ -1130,6 +1168,61 @@ registered hooks while the latter silently ignores them.</p>
 <li><p><strong>hidden_states</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>adarms_cond</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 </ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.components.GatedDeltaNet">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.</span></span><span class="sig-name descname"><span class="pre">GatedDeltaNet</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_k_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_v_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_k_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_v_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">conv_kernel_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">GDNProjLayout.SPLIT</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">proj_bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">conv_bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rms_norm_eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-6</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">linear_attn_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'linear_attn'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">state_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'gdn_state'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/linear_attn.html#GatedDeltaNet"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.GatedDeltaNet" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_k_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_v_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>head_k_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>head_v_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>conv_kernel_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>layout</strong> (<a class="reference internal" href="#mstar.model.components.GDNProjLayout" title="mstar.model.components.GDNProjLayout"><em>GDNProjLayout</em></a>)</p></li>
+<li><p><strong>proj_bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>conv_bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>rms_norm_eps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>linear_attn_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>state_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.GatedDeltaNet.bind_resources">
+<span class="sig-name descname"><span class="pre">bind_resources</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resources</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/linear_attn.html#GatedDeltaNet.bind_resources"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.GatedDeltaNet.bind_resources" title="Link to this definition">#</a></dt>
+<dd><p>Resolve the resources this layer calls. See
+<code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>resources</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.GatedDeltaNet.forward">
+<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/linear_attn.html#GatedDeltaNet.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.GatedDeltaNet.forward" title="Link to this definition">#</a></dt>
+<dd><p>The label and layer index are cursors set by the caller running the
+stack (<code class="docutils literal notranslate"><span class="pre">mix.bind_step</span></code> once, then <code class="docutils literal notranslate"><span class="pre">mix.set_layer_idx</span></code> per layer),
+as in <code class="docutils literal notranslate"><span class="pre">Attention.forward</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>hidden_states</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
@@ -1384,6 +1477,84 @@ registered hooks while the latter silently ignores them.</p>
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.RMSNorm.forward_residual">
+<span class="sig-name descname"><span class="pre">forward_residual</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">residual</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/norm.html#RMSNorm.forward_residual"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.RMSNorm.forward_residual" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">r</span> <span class="pre">=</span> <span class="pre">hidden_states</span> <span class="pre">+</span> <span class="pre">residual</span></code>; returns <code class="docutils literal notranslate"><span class="pre">(norm(r),</span> <span class="pre">r)</span></code>.</p>
+<p>Keeps add and norm together so inductor fuses them, rather than folding
+the add into the producing GEMM as an <code class="docutils literal notranslate"><span class="pre">addmm</span></code> (an extra copy of
+<code class="docutils literal notranslate"><span class="pre">residual</span></code>). Under TP <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code> is a row-parallel partial sum
+that <code class="docutils literal notranslate"><span class="pre">comm_group</span></code> reduces in the same fused kernel.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hidden_states</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>residual</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.components.RMSNormGated">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.</span></span><span class="sig-name descname"><span class="pre">RMSNormGated</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-6</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/norm.html#RMSNormGated"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.RMSNormGated" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
+<p>RMSNorm scaled by a SiLU gate, for the delta-net family.</p>
+<p>Normalizes first, then gates (order matters). The weight is <code class="docutils literal notranslate"><span class="pre">[head_v_dim]</span></code>,
+so this runs per head over <code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">num_v_heads,</span> <span class="pre">head_v_dim]</span></code>. Kept apart
+from <code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code> because its casts follow HF’s for parity, not FlashInfer’s.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>eps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.RMSNormGated.extra_repr">
+<span class="sig-name descname"><span class="pre">extra_repr</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/norm.html#RMSNormGated.extra_repr"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.RMSNormGated.extra_repr" title="Link to this definition">#</a></dt>
+<dd><p>Return the extra representation of the module.</p>
+<p>To print customized extra information, you should re-implement
+this method in your own modules. Both single-line and multi-line
+strings are acceptable.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.RMSNormGated.forward">
+<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gate</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/norm.html#RMSNormGated.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.RMSNormGated.forward" title="Link to this definition">#</a></dt>
+<dd><p>Define the computation performed at every call.</p>
+<p>Should be overridden by all subclasses.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Although the recipe for forward pass needs to be defined within
+this function, one should call the <code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code> instance afterwards
+instead of this since the former takes care of running the
+registered hooks while the latter silently ignores them.</p>
+</div>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hidden_states</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>gate</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
@@ -1581,16 +1752,19 @@ expert.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.linear.html#module-mstar.model.components.linear" title="mstar.model.components.linear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">linear</span></code></a></p></td>
 <td><p>Non-distributed fused linear projections.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.mlp.html#module-mstar.model.components.mlp" title="mstar.model.components.mlp"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mlp</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.linear_attn.html#module-mstar.model.components.linear_attn" title="mstar.model.components.linear_attn"><code class="xref py py-obj docutils literal notranslate"><span class="pre">linear_attn</span></code></a></p></td>
+<td><p>Gated delta-net mixer — the linear-attention counterpart to <code class="docutils literal notranslate"><span class="pre">Attention</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.mlp.html#module-mstar.model.components.mlp" title="mstar.model.components.mlp"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mlp</span></code></a></p></td>
 <td><p>MLP and SwiGLU-style GatedMLP.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.moe.html#module-mstar.model.components.moe" title="mstar.model.components.moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">moe</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.moe.html#module-mstar.model.components.moe" title="mstar.model.components.moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">moe</span></code></a></p></td>
 <td><p>Mixture-of-Experts blocks.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.norm.html#module-mstar.model.components.norm" title="mstar.model.components.norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">norm</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.norm.html#module-mstar.model.components.norm" title="mstar.model.components.norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">norm</span></code></a></p></td>
 <td><p>RMSNorm and AdaRMSNorm.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.qwen3_lm.html#module-mstar.model.components.qwen3_lm" title="mstar.model.components.qwen3_lm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">qwen3_lm</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.qwen3_lm.html#module-mstar.model.components.qwen3_lm" title="mstar.model.components.qwen3_lm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">qwen3_lm</span></code></a></p></td>
 <td><p>Dense Qwen3 causal language model from the shared components.</p></td>
 </tr>
 </tbody>
@@ -1677,8 +1851,18 @@ expert.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.FusedGatedMLP.forward"><code class="docutils literal notranslate"><span class="pre">FusedGatedMLP.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GDNProjLayout"><code class="docutils literal notranslate"><span class="pre">GDNProjLayout</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GDNProjLayout.FUSED"><code class="docutils literal notranslate"><span class="pre">GDNProjLayout.FUSED</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GDNProjLayout.SPLIT"><code class="docutils literal notranslate"><span class="pre">GDNProjLayout.SPLIT</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedDecoderLayer"><code class="docutils literal notranslate"><span class="pre">GatedDecoderLayer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedDecoderLayer.forward"><code class="docutils literal notranslate"><span class="pre">GatedDecoderLayer.forward()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedDeltaNet"><code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedDeltaNet.bind_resources"><code class="docutils literal notranslate"><span class="pre">GatedDeltaNet.bind_resources()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedDeltaNet.forward"><code class="docutils literal notranslate"><span class="pre">GatedDeltaNet.forward()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.GatedMLP"><code class="docutils literal notranslate"><span class="pre">GatedMLP</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1701,6 +1885,12 @@ expert.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNorm"><code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNorm.extra_repr"><code class="docutils literal notranslate"><span class="pre">RMSNorm.extra_repr()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNorm.forward"><code class="docutils literal notranslate"><span class="pre">RMSNorm.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNorm.forward_residual"><code class="docutils literal notranslate"><span class="pre">RMSNorm.forward_residual()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNormGated"><code class="docutils literal notranslate"><span class="pre">RMSNormGated</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNormGated.extra_repr"><code class="docutils literal notranslate"><span class="pre">RMSNormGated.extra_repr()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.RMSNormGated.forward"><code class="docutils literal notranslate"><span class="pre">RMSNormGated.forward()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.SparseMoeBlock"><code class="docutils literal notranslate"><span class="pre">SparseMoeBlock</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

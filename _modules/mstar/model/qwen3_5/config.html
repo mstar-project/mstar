@@ -7,7 +7,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>mstar.api_server.openai.router &#8212; M* v0.2.1 Documentation</title>
+    <title>mstar.model.qwen3_5.config &#8212; M* v0.2.1 Documentation</title>
   
   
   
@@ -403,7 +403,7 @@ mermaid.initialize(
 
 window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/api_server/openai/router';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/model/qwen3_5/config';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../../../../genindex.html" />
     <link rel="search" title="Search" href="../../../../search.html" />
@@ -563,14 +563,11 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_transcriptions.html">mstar.api_server.openai.serving_transcriptions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
@@ -606,6 +603,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -632,6 +630,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.linear.html">mstar.model.components.linear</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.linear_attn.html">mstar.model.components.linear_attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.moe.html">mstar.model.components.moe</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.norm.html">mstar.model.components.norm</a></li>
@@ -679,6 +678,11 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
@@ -717,10 +721,12 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.streams.html">mstar.utils.streams</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -810,7 +816,7 @@ window.runMermaid = runMermaid;</script>
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/api_server/openai/router.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/model/qwen3_5/config.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -887,290 +893,202 @@ window.runMermaid = runMermaid;</script>
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <h1>Source code for mstar.api_server.openai.router</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""FastAPI routes for the OpenAI-compatible API.</span>
+  <h1>Source code for mstar.model.qwen3_5.config</h1><div class="highlight"><pre>
+<span></span><span class="sd">"""Qwen3.5's text and vision configs, read off the HF ``config.json``.</span>
 
-<span class="sd">Endpoints stay model-agnostic: each looks up the loaded model's adapter, checks</span>
-<span class="sd">the surface is supported, and delegates to a serving handler. The native</span>
-<span class="sd">``/generate`` endpoint is unaffected.</span>
+<span class="sd">Field names mirror HF's so ``from_hf`` can splat the checkpoint's own dict.</span>
 <span class="sd">"""</span>
-
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">fields</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">APIRouter</span><span class="p">,</span> <span class="n">Request</span><span class="p">,</span> <span class="n">WebSocket</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">fastapi.responses</span><span class="w"> </span><span class="kn">import</span> <span class="n">JSONResponse</span><span class="p">,</span> <span class="n">StreamingResponse</span>
+<span class="n">LINEAR_ATTENTION</span> <span class="o">=</span> <span class="s2">"linear_attention"</span>
+<span class="n">FULL_ATTENTION</span> <span class="o">=</span> <span class="s2">"full_attention"</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
-    <span class="n">serving_chat</span><span class="p">,</span>
-    <span class="n">serving_images</span><span class="p">,</span>
-    <span class="n">serving_realtime</span><span class="p">,</span>
-    <span class="n">serving_speech</span><span class="p">,</span>
-    <span class="n">serving_transcriptions</span><span class="p">,</span>
-    <span class="n">serving_videos</span><span class="p">,</span>
-<span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">now</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai.adapters</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_adapter</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai.protocol</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
-    <span class="n">ChatCompletionRequest</span><span class="p">,</span>
-    <span class="n">ImageGenerationRequest</span><span class="p">,</span>
-    <span class="n">ModelCard</span><span class="p">,</span>
-    <span class="n">ModelList</span><span class="p">,</span>
-    <span class="n">SpeechRequest</span><span class="p">,</span>
-    <span class="n">TranscriptionRequest</span><span class="p">,</span>
-    <span class="n">VideoGenerationRequest</span><span class="p">,</span>
-<span class="p">)</span>
-
-<span class="n">router</span> <span class="o">=</span> <span class="n">APIRouter</span><span class="p">()</span>
+<span class="c1"># resource keys this model declares</span>
+<span class="n">KV_CACHE</span> <span class="o">=</span> <span class="s2">"kv_cache"</span>
+<span class="n">ATTN</span> <span class="o">=</span> <span class="s2">"attn"</span>
+<span class="n">GDN_STATE</span> <span class="o">=</span> <span class="s2">"gdn_state"</span>
+<span class="n">LINEAR_ATTN</span> <span class="o">=</span> <span class="s2">"linear_attn"</span>
+<span class="n">ROPE</span> <span class="o">=</span> <span class="s2">"rope"</span>
+<span class="n">SAMPLER</span> <span class="o">=</span> <span class="s2">"sampler"</span>
+<span class="c1"># the ViT tower's cacheless attention, on the `vision_encoder` node</span>
+<span class="n">VISION_ATTN</span> <span class="o">=</span> <span class="s2">"vision_attn"</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_api</span><span class="p">():</span>
-    <span class="c1"># The server runs either as the package module (console scripts ``mstar`` /</span>
-    <span class="c1"># ``mstar-serve``) or as ``__main__`` (``python mstar/api_server/entrypoint.py``,</span>
-    <span class="c1"># used by the test/*/launch_server_*.sh scripts). main() sets ``api_server``</span>
-    <span class="c1"># on whichever module it runs in, so resolve the live instance from both —</span>
-    <span class="c1"># via sys.modules (importing would re-execute the entrypoint module).</span>
-    <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<div class="viewcode-block" id="Qwen3_5VisionConfig">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5VisionConfig">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Qwen3_5VisionConfig</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The ViT tower's own config, read off ``config.json``'s ``vision_config``."""</span>
 
-    <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"mstar.api_server.entrypoint"</span><span class="p">,</span> <span class="s2">"__main__"</span><span class="p">):</span>
-        <span class="n">mod</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">modules</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
-        <span class="n">api</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="s2">"api_server"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="k">if</span> <span class="n">mod</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">api</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">api</span>
-    <span class="k">return</span> <span class="kc">None</span>
+    <span class="n">depth</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">intermediate_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">num_heads</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">in_channels</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">patch_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">temporal_patch_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">spatial_merge_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">num_position_embeddings</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">out_hidden_size</span><span class="p">:</span> <span class="nb">int</span>
+
+    <span class="n">hidden_act</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"gelu_pytorch_tanh"</span>
+    <span class="n">rope_theta</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">10_000.0</span>
+    <span class="c1"># Kept only so a checkpoint that sets it fails loudly: `[]` on every</span>
+    <span class="c1"># released size and unread by transformers' Qwen3.5 (live in Qwen3-VL).</span>
+    <span class="n">deepstack_visual_indexes</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">head_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">num_grid_per_side</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The learned position table is a square grid."""</span>
+        <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_position_embeddings</span><span class="o">**</span><span class="mf">0.5</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">merge_unit</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">spatial_merge_size</span><span class="o">**</span><span class="mi">2</span>
+
+<div class="viewcode-block" id="Qwen3_5VisionConfig.from_hf">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5VisionConfig.from_hf">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_hf</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"Qwen3_5VisionConfig"</span><span class="p">:</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_hf_or_none</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2"> has no `vision_config`"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">config</span></div>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_error</span><span class="p">(</span><span class="n">status</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">message</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">type_</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"invalid_request_error"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">JSONResponse</span><span class="p">:</span>
-    <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span>
-        <span class="n">status_code</span><span class="o">=</span><span class="n">status</span><span class="p">,</span>
-        <span class="n">content</span><span class="o">=</span><span class="p">{</span><span class="s2">"error"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"message"</span><span class="p">:</span> <span class="n">message</span><span class="p">,</span> <span class="s2">"type"</span><span class="p">:</span> <span class="n">type_</span><span class="p">,</span> <span class="s2">"code"</span><span class="p">:</span> <span class="n">status</span><span class="p">}},</span>
-    <span class="p">)</span>
+<div class="viewcode-block" id="Qwen3_5VisionConfig.from_hf_or_none">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5VisionConfig.from_hf_or_none">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_hf_or_none</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"Qwen3_5VisionConfig | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""None when the checkpoint is text-only."""</span>
+        <span class="n">path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">path</span><span class="o">.</span><span class="n">is_dir</span><span class="p">():</span>
+            <span class="n">path</span> <span class="o">=</span> <span class="n">path</span> <span class="o">/</span> <span class="s2">"config.json"</span>
+        <span class="n">raw</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">path</span><span class="o">.</span><span class="n">read_text</span><span class="p">())</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"vision_config"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">raw</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">merged</span> <span class="o">=</span> <span class="p">{</span><span class="o">**</span><span class="n">raw</span><span class="p">,</span> <span class="o">**</span><span class="n">raw</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"rope_parameters"</span><span class="p">,</span> <span class="p">{})}</span>
+        <span class="n">known</span> <span class="o">=</span> <span class="p">{</span><span class="n">f</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="bp">cls</span><span class="p">)}</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">merged</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">known</span><span class="p">})</span></div>
+</div>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_resolve</span><span class="p">(</span><span class="n">require</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""Return (api, model_name, adapter, error_response). ``error`` is non-None</span>
-<span class="sd">    when the loaded model can't serve ``require`` (e.g. 'supports_chat')."""</span>
-    <span class="n">api</span> <span class="o">=</span> <span class="n">_api</span><span class="p">()</span>
-    <span class="k">if</span> <span class="n">api</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">_error</span><span class="p">(</span><span class="mi">503</span><span class="p">,</span> <span class="s2">"Server not ready"</span><span class="p">,</span> <span class="s2">"server_error"</span><span class="p">)</span>
-    <span class="n">adapter</span> <span class="o">=</span> <span class="n">get_adapter</span><span class="p">(</span><span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">adapter</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">api</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">_error</span><span class="p">(</span>
-            <span class="mi">404</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"Model </span><span class="si">{</span><span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="si">!r}</span><span class="s2"> has no OpenAI-compatible adapter; use POST /generate"</span><span class="p">,</span> <span class="s2">"model_not_found"</span>
+
+<div class="viewcode-block" id="Qwen3_5Config">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5Config">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Qwen3_5Config</span><span class="p">:</span>
+    <span class="n">num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">intermediate_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># per layer, LINEAR_ATTENTION or FULL_ATTENTION</span>
+    <span class="n">layer_types</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+
+    <span class="c1"># full-attention layers</span>
+    <span class="n">num_attention_heads</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">num_key_value_heads</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span>
+
+    <span class="c1"># gated delta net layers</span>
+    <span class="n">linear_num_key_heads</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">linear_num_value_heads</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">linear_key_head_dim</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">linear_value_head_dim</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">linear_conv_kernel_dim</span><span class="p">:</span> <span class="nb">int</span>
+
+    <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">rms_norm_eps</span><span class="p">:</span> <span class="nb">float</span>
+    <span class="n">max_position_embeddings</span><span class="p">:</span> <span class="nb">int</span>
+
+    <span class="n">attn_output_gate</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">tie_word_embeddings</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">eos_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># multimodal sentinels, at the root of `config.json`, not `text_config`</span>
+    <span class="n">vision_start_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">vision_end_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">image_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">video_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">rope_theta</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">10_000.0</span>
+    <span class="n">mrope_section</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">mrope_interleaved</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">partial_rotary_factor</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
+    <span class="n">mtp_num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">mamba_ssm_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"float32"</span>
+    <span class="c1"># Filled from the tokenizer at model construction; see `stop_token_ids`.</span>
+    <span class="n">extra_stop_token_ids</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
+
+<div class="viewcode-block" id="Qwen3_5Config.from_hf">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5Config.from_hf">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_hf</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"Qwen3_5Config"</span><span class="p">:</span>
+        <span class="n">path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">path</span><span class="o">.</span><span class="n">is_dir</span><span class="p">():</span>
+            <span class="n">path</span> <span class="o">=</span> <span class="n">path</span> <span class="o">/</span> <span class="s2">"config.json"</span>
+        <span class="n">raw</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">path</span><span class="o">.</span><span class="n">read_text</span><span class="p">())</span>
+        <span class="n">tc</span> <span class="o">=</span> <span class="n">raw</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"text_config"</span><span class="p">,</span> <span class="n">raw</span><span class="p">)</span>
+        <span class="c1"># root first so `text_config` wins shared names; rope one level down</span>
+        <span class="n">merged</span> <span class="o">=</span> <span class="p">{</span><span class="o">**</span><span class="n">raw</span><span class="p">,</span> <span class="o">**</span><span class="n">tc</span><span class="p">,</span> <span class="o">**</span><span class="n">tc</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"rope_parameters"</span><span class="p">,</span> <span class="p">{})}</span>
+        <span class="n">known</span> <span class="o">=</span> <span class="p">{</span><span class="n">f</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="bp">cls</span><span class="p">)}</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">merged</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">known</span><span class="p">})</span></div>
+
+
+    <span class="c1"># Derived</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">eos_token_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""What ``config.json`` names; one id or several."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">eos_token_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">frozenset</span><span class="p">()</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
+            <span class="k">return</span> <span class="nb">frozenset</span><span class="p">({</span><span class="bp">self</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">})</span>
+        <span class="k">return</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">stop_token_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Every id that ends generation — wider than ``eos_token_ids``.</span>
+
+<span class="sd">        Chat turns end on ``&lt;|im_end|&gt;``, but ``config.json`` names only</span>
+<span class="sd">        ``&lt;|endoftext|&gt;``, so the model adds the tokenizer's eos via</span>
+<span class="sd">        ``extra_stop_token_ids``; without it every reply runs to the budget.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">eos_token_ids</span> <span class="o">|</span> <span class="nb">frozenset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">extra_stop_token_ids</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">linear_layer_indices</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layer_types</span><span class="p">)</span> <span class="k">if</span> <span class="n">t</span> <span class="o">==</span> <span class="n">LINEAR_ATTENTION</span><span class="p">]</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">full_layer_indices</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layer_types</span><span class="p">)</span> <span class="k">if</span> <span class="n">t</span> <span class="o">==</span> <span class="n">FULL_ATTENTION</span><span class="p">]</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">rotary_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Only part of each head is rotated; mrope_section covers half of it."""</span>
+        <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">partial_rotary_factor</span><span class="p">)</span>
+
+<div class="viewcode-block" id="Qwen3_5Config.resource_layer_index">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.config.html#mstar.model.qwen3_5.config.Qwen3_5Config.resource_layer_index">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resource_layer_index</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Where a stack layer sits among *its own* resource's layers.</span>
+
+<span class="sd">        The KV cache holds only full-attention layers and the recurrent pool</span>
+<span class="sd">        only linear ones; a stack index would read another layer's state.</span>
+<span class="sd">        """</span>
+        <span class="n">same</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">linear_layer_indices</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_types</span><span class="p">[</span><span class="n">layer_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">LINEAR_ATTENTION</span>
+            <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">full_layer_indices</span>
         <span class="p">)</span>
-    <span class="k">if</span> <span class="ow">not</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="n">require</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
-        <span class="k">return</span> <span class="n">api</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">_error</span><span class="p">(</span>
-            <span class="mi">404</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"Model </span><span class="si">{</span><span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="si">!r}</span><span class="s2"> does not support this endpoint"</span>
-        <span class="p">)</span>
-    <span class="k">return</span> <span class="n">api</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="kc">None</span>
-
-
-<div class="viewcode-block" id="list_models">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.list_models">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"/v1/models"</span><span class="p">)</span>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">list_models</span><span class="p">():</span>
-    <span class="n">api</span> <span class="o">=</span> <span class="n">_api</span><span class="p">()</span>
-    <span class="n">name</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">model_name</span> <span class="k">if</span> <span class="n">api</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="s2">"unknown"</span>
-    <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">ModelList</span><span class="p">(</span><span class="n">data</span><span class="o">=</span><span class="p">[</span><span class="n">ModelCard</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="n">name</span><span class="p">,</span> <span class="n">created</span><span class="o">=</span><span class="n">now</span><span class="p">())])</span><span class="o">.</span><span class="n">model_dump</span><span class="p">())</span></div>
-
-
-
-<div class="viewcode-block" id="chat_completions">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.chat_completions">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/chat/completions"</span><span class="p">)</span>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">chat_completions</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">ChatCompletionRequest</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_chat"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">err</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">serving_chat</span><span class="o">.</span><span class="n">create_chat_completion</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
-    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — surface as an OpenAI error envelope</span>
-        <span class="n">default_status</span> <span class="o">=</span> <span class="mi">400</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span> <span class="k">else</span> <span class="mi">500</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="n">default_status</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">request</span><span class="o">.</span><span class="n">stream</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">StreamingResponse</span><span class="p">(</span>
-            <span class="n">result</span><span class="p">,</span> <span class="n">media_type</span><span class="o">=</span><span class="s2">"text/event-stream"</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">}</span>
-        <span class="p">)</span>
-    <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">result</span><span class="p">)</span></div>
-
-
-
-<div class="viewcode-block" id="audio_speech">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.audio_speech">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/audio/speech"</span><span class="p">)</span>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">audio_speech</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">SpeechRequest</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_speech"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">err</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="k">return</span> <span class="k">await</span> <span class="n">serving_speech</span><span class="o">.</span><span class="n">create_speech</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
-    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="mi">500</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span></div>
-
-
-
-<div class="viewcode-block" id="audio_transcriptions">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.audio_transcriptions">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/audio/transcriptions"</span><span class="p">)</span>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">audio_transcriptions</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
-    <span class="c1"># Multipart (audio file + the OpenAI fields), parsed manually like</span>
-    <span class="c1"># images/edits so unknown fields flow through as model_kwargs.</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_transcriptions"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">err</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="n">form</span> <span class="o">=</span> <span class="k">await</span> <span class="n">request</span><span class="o">.</span><span class="n">form</span><span class="p">()</span>
-        <span class="n">upload</span> <span class="o">=</span> <span class="n">form</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"file"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">upload</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">upload</span><span class="p">,</span> <span class="s2">"read"</span><span class="p">):</span>
-            <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="s2">"audio/transcriptions requires a 'file' upload"</span><span class="p">)</span>
-        <span class="n">limit</span> <span class="o">=</span> <span class="n">serving_transcriptions</span><span class="o">.</span><span class="n">MAX_UPLOAD_BYTES</span>
-        <span class="k">if</span> <span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">upload</span><span class="p">,</span> <span class="s2">"size"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">limit</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">413</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"audio/transcriptions accepts files up to </span><span class="si">{</span><span class="n">limit</span><span class="w"> </span><span class="o">//</span><span class="w"> </span><span class="mi">2</span><span class="o">**</span><span class="mi">20</span><span class="si">}</span><span class="s2"> MiB"</span><span class="p">)</span>
-        <span class="n">audio_bytes</span> <span class="o">=</span> <span class="k">await</span> <span class="n">upload</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">audio_bytes</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="s2">"audio/transcriptions received an empty 'file'"</span><span class="p">)</span>
-        <span class="n">fields</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">form</span><span class="o">.</span><span class="n">multi_items</span><span class="p">():</span>
-            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="s2">"filename"</span><span class="p">):</span>
-                <span class="k">continue</span>
-            <span class="c1"># OpenAI clients send list fields as repeated ``name[]`` keys.</span>
-            <span class="k">if</span> <span class="n">key</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s2">"[]"</span><span class="p">):</span>
-                <span class="n">fields</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">key</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">],</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
-                <span class="k">continue</span>
-            <span class="k">try</span><span class="p">:</span>
-                <span class="n">fields</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
-            <span class="k">except</span> <span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">JSONDecodeError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">):</span>
-                <span class="n">fields</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span>
-        <span class="k">try</span><span class="p">:</span>
-            <span class="n">req</span> <span class="o">=</span> <span class="n">TranscriptionRequest</span><span class="p">(</span><span class="o">**</span><span class="n">fields</span><span class="p">)</span>
-        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — pydantic validation</span>
-            <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">))</span>
-        <span class="k">return</span> <span class="k">await</span> <span class="n">serving_transcriptions</span><span class="o">.</span><span class="n">create_transcription</span><span class="p">(</span>
-            <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">audio_bytes</span><span class="p">,</span>
-            <span class="nb">getattr</span><span class="p">(</span><span class="n">upload</span><span class="p">,</span> <span class="s2">"filename"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span> <span class="n">raw_request</span><span class="o">=</span><span class="n">request</span><span class="p">,</span>
-        <span class="p">)</span>
-    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
-        <span class="n">default_status</span> <span class="o">=</span> <span class="mi">400</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span> <span class="k">else</span> <span class="mi">500</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="n">default_status</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span></div>
-
-
-
-<div class="viewcode-block" id="realtime">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.realtime">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">websocket</span><span class="p">(</span><span class="s2">"/v1/realtime"</span><span class="p">)</span>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">realtime</span><span class="p">(</span><span class="n">websocket</span><span class="p">:</span> <span class="n">WebSocket</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""OpenAI Realtime API, transcription intent (``?intent=transcription``):</span>
-<span class="sd">    streaming speech-to-text with partial results. See ``serving_realtime``."""</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_realtime_transcription"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="c1"># 1008 is policy violation, the served model has no such endpoint</span>
-        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">accept</span><span class="p">()</span>
-        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">close</span><span class="p">(</span><span class="n">code</span><span class="o">=</span><span class="mi">1008</span><span class="p">,</span> <span class="n">reason</span><span class="o">=</span><span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="nb">bytes</span><span class="p">(</span><span class="n">err</span><span class="o">.</span><span class="n">body</span><span class="p">))[</span><span class="s2">"error"</span><span class="p">][</span><span class="s2">"message"</span><span class="p">])</span>
-        <span class="k">return</span>
-    <span class="n">intent</span> <span class="o">=</span> <span class="n">websocket</span><span class="o">.</span><span class="n">query_params</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"intent"</span><span class="p">,</span> <span class="s2">"transcription"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">intent</span> <span class="o">!=</span> <span class="s2">"transcription"</span><span class="p">:</span>
-        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">accept</span><span class="p">()</span>
-        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">close</span><span class="p">(</span><span class="n">code</span><span class="o">=</span><span class="mi">1008</span><span class="p">,</span> <span class="n">reason</span><span class="o">=</span><span class="sa">f</span><span class="s2">"unsupported intent </span><span class="si">{</span><span class="n">intent</span><span class="si">!r}</span><span class="s2">; use intent=transcription"</span><span class="p">)</span>
-        <span class="k">return</span>
-    <span class="k">await</span> <span class="n">serving_realtime</span><span class="o">.</span><span class="n">RealtimeTranscription</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">websocket</span><span class="p">)</span><span class="o">.</span><span class="n">run</span><span class="p">()</span></div>
-
-
-
-<div class="viewcode-block" id="audio_voices">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.audio_voices">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"/v1/audio/voices"</span><span class="p">)</span>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">audio_voices</span><span class="p">():</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_speech"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">err</span>
-    <span class="n">voices</span> <span class="o">=</span> <span class="n">serving_speech</span><span class="o">.</span><span class="n">list_voices</span><span class="p">(</span><span class="n">api</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">voices</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">404</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"Model </span><span class="si">{</span><span class="n">model_name</span><span class="si">!r}</span><span class="s2"> does not publish a voice list"</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">voices</span><span class="o">.</span><span class="n">model_dump</span><span class="p">())</span></div>
-
-
-
-<div class="viewcode-block" id="images_generations">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.images_generations">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/images/generations"</span><span class="p">)</span>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">images_generations</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">ImageGenerationRequest</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_images"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">err</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">serving_images</span><span class="o">.</span><span class="n">create_images</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
-    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
-        <span class="c1"># a malformed request (adapter / model validation) is the client's error, not the server's</span>
-        <span class="n">default_status</span> <span class="o">=</span> <span class="mi">400</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span> <span class="k">else</span> <span class="mi">500</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="n">default_status</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">result</span><span class="p">)</span></div>
-
-
-
-<div class="viewcode-block" id="videos_generations">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.videos_generations">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/videos/generations"</span><span class="p">)</span>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">videos_generations</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">VideoGenerationRequest</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_videos"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">err</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">serving_videos</span><span class="o">.</span><span class="n">create_videos</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
-    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
-        <span class="n">default_status</span> <span class="o">=</span> <span class="mi">400</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span> <span class="k">else</span> <span class="mi">500</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="n">default_status</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="p">(</span><span class="n">request</span><span class="o">.</span><span class="n">model_extra</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"stream_video"</span><span class="p">):</span>
-        <span class="c1"># A windowed request delivering each window as it lands: NDJSON lines</span>
-        <span class="c1"># (see serving_videos._stream_ndjson) instead of one JSON body.</span>
-        <span class="k">return</span> <span class="n">StreamingResponse</span><span class="p">(</span>
-            <span class="n">result</span><span class="p">,</span> <span class="n">media_type</span><span class="o">=</span><span class="s2">"application/x-ndjson"</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">}</span>
-        <span class="p">)</span>
-    <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">result</span><span class="p">)</span></div>
-
-
-
-<div class="viewcode-block" id="images_edits">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.images_edits">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/images/edits"</span><span class="p">)</span>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">images_edits</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
-    <span class="c1"># Multipart (image file + prompt + passthrough fields), parsed manually so</span>
-    <span class="c1"># arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_images"</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">err</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="n">form</span> <span class="o">=</span> <span class="k">await</span> <span class="n">request</span><span class="o">.</span><span class="n">form</span><span class="p">()</span>
-        <span class="n">image</span> <span class="o">=</span> <span class="n">form</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"image"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">image</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="s2">"read"</span><span class="p">):</span>
-            <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="s2">"images/edits requires an 'image' file upload"</span><span class="p">)</span>
-        <span class="n">image_bytes</span> <span class="o">=</span> <span class="k">await</span> <span class="n">image</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
-        <span class="n">prompt</span> <span class="o">=</span> <span class="n">form</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"prompt"</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">""</span>
-        <span class="n">known</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"image"</span><span class="p">,</span> <span class="s2">"prompt"</span><span class="p">,</span> <span class="s2">"model"</span><span class="p">,</span> <span class="s2">"n"</span><span class="p">,</span> <span class="s2">"size"</span><span class="p">,</span> <span class="s2">"response_format"</span><span class="p">}</span>
-        <span class="n">extra</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">form</span><span class="o">.</span><span class="n">multi_items</span><span class="p">():</span>
-            <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">known</span> <span class="ow">or</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="s2">"filename"</span><span class="p">):</span>
-                <span class="k">continue</span>
-            <span class="k">try</span><span class="p">:</span>
-                <span class="n">extra</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
-            <span class="k">except</span> <span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">JSONDecodeError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">):</span>
-                <span class="n">extra</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span>
-        <span class="k">if</span> <span class="n">form</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"size"</span><span class="p">):</span>
-            <span class="n">extra</span><span class="p">[</span><span class="s2">"size"</span><span class="p">]</span> <span class="o">=</span> <span class="n">form</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"size"</span><span class="p">)</span>  <span class="c1"># the adapter maps "WxH" to the model's width / height</span>
-        <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">serving_images</span><span class="o">.</span><span class="n">create_image_edit</span><span class="p">(</span>
-            <span class="n">api</span><span class="p">,</span>
-            <span class="n">model_name</span><span class="p">,</span>
-            <span class="n">adapter</span><span class="p">,</span>
-            <span class="n">prompt</span><span class="o">=</span><span class="n">prompt</span><span class="p">,</span>
-            <span class="n">image_bytes</span><span class="o">=</span><span class="n">image_bytes</span><span class="p">,</span>
-            <span class="n">image_filename</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="s2">"filename"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
-            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">extra</span><span class="p">,</span>
-            <span class="n">raw_request</span><span class="o">=</span><span class="n">request</span><span class="p">,</span>
-        <span class="p">)</span>
-    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
-        <span class="n">default_status</span> <span class="o">=</span> <span class="mi">400</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span> <span class="k">else</span> <span class="mi">500</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="n">default_status</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">result</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="n">same</span><span class="o">.</span><span class="n">index</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">)</span></div>
+</div>
 
 </pre></div>
 

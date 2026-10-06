@@ -19,6 +19,7 @@ mstar.model.components.norm
    
       AdaRMSNorm
       RMSNorm
+      RMSNormGated
    
    
 

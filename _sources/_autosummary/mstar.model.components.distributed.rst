@@ -30,6 +30,7 @@ mstar.model.components.distributed
    attention
    embedding
    linear
+   linear_attn
    mlp
    sequence_parallel
 

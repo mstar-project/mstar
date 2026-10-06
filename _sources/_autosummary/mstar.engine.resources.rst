@@ -31,7 +31,9 @@ mstar.engine.resources
    base
    convenience
    kv
+   linear_attn
    position
+   recurrent
    rms_norm
    runner
    sampler

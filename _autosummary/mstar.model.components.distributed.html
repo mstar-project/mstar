@@ -210,14 +210,11 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_transcriptions.html">mstar.api_server.openai.serving_transcriptions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
@@ -253,6 +250,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
@@ -279,6 +277,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4 current active"><a class="current reference internal" href="#">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear.html">mstar.model.components.linear</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear_attn.html">mstar.model.components.linear_attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.moe.html">mstar.model.components.moe</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.norm.html">mstar.model.components.norm</a></li>
@@ -326,6 +325,11 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
@@ -364,10 +368,12 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.streams.html">mstar.utils.streams</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -602,6 +608,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear.weight_loader()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.KVColumnParallelLinear"><code class="docutils literal notranslate"><span class="pre">KVColumnParallelLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.KVColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">KVColumnParallelLinear.weight_loader()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.MergedColumnParallelLinear"><code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.MergedColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear.weight_loader()</span></code></a></li>
 </ul>
@@ -619,6 +629,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelCrossAttention.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.set_layer_idx()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedDeltaNet"><code class="docutils literal notranslate"><span class="pre">ParallelGatedDeltaNet</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedMLP"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLP</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedMLP.forward"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLP.forward()</span></code></a></li>
 </ul>
@@ -712,6 +723,54 @@ registered hooks while the latter silently ignores them.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.components.distributed.ColumnParallelLinear.weight_loader">
 <span class="sig-name descname"><span class="pre">weight_loader</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">param</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loaded_weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loaded_shard_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/linear.html#ColumnParallelLinear.weight_loader"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.ColumnParallelLinear.weight_loader" title="Link to this definition">#</a></dt>
+<dd><p>Copy this rank’s slice of <code class="docutils literal notranslate"><span class="pre">loaded_weight</span></code> into <code class="docutils literal notranslate"><span class="pre">param</span></code>.</p>
+<p>For plain ColumnParallelLinear there’s a single shard so
+<code class="docutils literal notranslate"><span class="pre">loaded_shard_id</span></code> must be None. Subclasses (<code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code>,
+<code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code>) override to dispatch by shard id.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>param</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.parameter.Parameter.html#torch.nn.parameter.Parameter" title="(in PyTorch v2.14)"><em>Parameter</em></a>) – the destination parameter (<code class="docutils literal notranslate"><span class="pre">self.weight</span></code> or
+<code class="docutils literal notranslate"><span class="pre">self.bias</span></code>).</p></li>
+<li><p><strong>loaded_weight</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – the full-checkpoint tensor — shape
+<code class="docutils literal notranslate"><span class="pre">(output_size,</span> <span class="pre">input_size)</span></code> for weight, <code class="docutils literal notranslate"><span class="pre">(output_size,)</span></code>
+for bias.</p></li>
+<li><p><strong>loaded_shard_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.KVColumnParallelLinear">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.distributed.</span></span><span class="sig-name descname"><span class="pre">KVColumnParallelLinear</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">comm_group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">total_num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/linear.html#KVColumnParallelLinear"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.KVColumnParallelLinear" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="mstar.model.components.distributed.linear.html#mstar.model.components.distributed.linear.ColumnParallelLinear" title="mstar.model.components.distributed.linear.ColumnParallelLinear"><code class="xref py py-class docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code></a></p>
+<p>One K or V projection, sharded by head, replicated when heads run out.</p>
+<p>For models whose checkpoint keeps <code class="docutils literal notranslate"><span class="pre">k_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">v_proj</span></code> apart rather than
+fused into a QKV block. <code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code> already handles this case,
+but only for the fused layout.</p>
+<p>The replication is not an optimization — it is what keeps the model and the
+KV cache agreeing. <code class="docutils literal notranslate"><span class="pre">KVConfig.shard</span></code> gives every rank one whole head once
+<code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">&gt;=</span> <span class="pre">total_num_kv_heads</span></code>, so a plain column shard, which would hand
+each rank a <em>fraction</em> of a head, would silently disagree with the cache it
+writes into.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>comm_group</strong> (<em>CommGroup</em>)</p></li>
+<li><p><strong>input_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>head_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>total_num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.KVColumnParallelLinear.weight_loader">
+<span class="sig-name descname"><span class="pre">weight_loader</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">param</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loaded_weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loaded_shard_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/linear.html#KVColumnParallelLinear.weight_loader"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.KVColumnParallelLinear.weight_loader" title="Link to this definition">#</a></dt>
 <dd><p>Copy this rank’s slice of <code class="docutils literal notranslate"><span class="pre">loaded_weight</span></code> into <code class="docutils literal notranslate"><span class="pre">param</span></code>.</p>
 <p>For plain ColumnParallelLinear there’s a single shard so
 <code class="docutils literal notranslate"><span class="pre">loaded_shard_id</span></code> must be None. Subclasses (<code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code>,
@@ -930,6 +989,33 @@ Override to reshape for a model-specific pool layout.</p>
 </dl>
 </dd></dl>
 
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.ParallelGatedDeltaNet">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.distributed.</span></span><span class="sig-name descname"><span class="pre">ParallelGatedDeltaNet</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_k_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_v_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_k_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_v_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">conv_kernel_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">GDNProjLayout.SPLIT</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">proj_bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">conv_bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rms_norm_eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-6</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">linear_attn_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'linear_attn'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">state_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'gdn_state'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/linear_attn.html#ParallelGatedDeltaNet"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.ParallelGatedDeltaNet" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="mstar.model.components.linear_attn.html#mstar.model.components.linear_attn.GatedDeltaNet" title="mstar.model.components.linear_attn.GatedDeltaNet"><code class="xref py py-class docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code></a></p>
+<p><code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code> over one rank’s heads.</p>
+<p>Takes the checkpoint’s (total) head counts and divides them here.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_k_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_v_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>head_k_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>head_v_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>conv_kernel_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>layout</strong> (<a class="reference internal" href="mstar.model.components.html#mstar.model.components.GDNProjLayout" title="mstar.model.components.GDNProjLayout"><em>GDNProjLayout</em></a>)</p></li>
+<li><p><strong>proj_bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>conv_bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>rms_norm_eps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>linear_attn_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>state_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>comm_group</strong> (<em>CommGroup</em><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py class">
@@ -1268,10 +1354,13 @@ registered hooks while the latter silently ignores them.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.distributed.linear.html#module-mstar.model.components.distributed.linear" title="mstar.model.components.distributed.linear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">linear</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.distributed.mlp.html#module-mstar.model.components.distributed.mlp" title="mstar.model.components.distributed.mlp"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mlp</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.distributed.linear_attn.html#module-mstar.model.components.distributed.linear_attn" title="mstar.model.components.distributed.linear_attn"><code class="xref py py-obj docutils literal notranslate"><span class="pre">linear_attn</span></code></a></p></td>
+<td><p>The gated delta-net mixer, sharded across tensor-parallel ranks.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.distributed.mlp.html#module-mstar.model.components.distributed.mlp" title="mstar.model.components.distributed.mlp"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mlp</span></code></a></p></td>
 <td><p>TP-aware SwiGLU MLPs (parallel counterparts of <code class="docutils literal notranslate"><span class="pre">mstar.model.components.GatedMLP</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.distributed.sequence_parallel.html#module-mstar.model.components.distributed.sequence_parallel" title="mstar.model.components.distributed.sequence_parallel"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sequence_parallel</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.distributed.sequence_parallel.html#module-mstar.model.components.distributed.sequence_parallel" title="mstar.model.components.distributed.sequence_parallel"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sequence_parallel</span></code></a></p></td>
 <td><p>Ulysses sequence parallelism — model-agnostic primitives.</p></td>
 </tr>
 </tbody>
@@ -1331,6 +1420,10 @@ registered hooks while the latter silently ignores them.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear.weight_loader()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.KVColumnParallelLinear"><code class="docutils literal notranslate"><span class="pre">KVColumnParallelLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.KVColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">KVColumnParallelLinear.weight_loader()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.MergedColumnParallelLinear"><code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.MergedColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear.weight_loader()</span></code></a></li>
 </ul>
@@ -1348,6 +1441,7 @@ registered hooks while the latter silently ignores them.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelCrossAttention.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.set_layer_idx()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedDeltaNet"><code class="docutils literal notranslate"><span class="pre">ParallelGatedDeltaNet</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedMLP"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLP</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedMLP.forward"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLP.forward()</span></code></a></li>
 </ul>
