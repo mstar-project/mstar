@@ -1,5 +1,8 @@
 model: "whisper_large_v3_turbo"
 max_seq_len: 448
+# The decoder caches are sized for 64 requests at once (12 cross-attention
+# pages and 4 self-attention pages each). More than that would stall.
+max_concurrent_requests: 64
 resources:
   kv_cache:
     cpu_offload_pages: 128
