@@ -80,7 +80,7 @@ def _refuse_unskippable_resources(
 def _refuse_unsupported_chunking(
     submodules: dict, model: Model, parallel_groups: WorkerParallelGroups,
 ) -> None:
-    """A chunked walk must report row lengths, and chunking under TP/SP is not supported yet."""
+    """A chunked walk must report row lengths, and chunking under SP is not supported yet."""
     for walk, section in model.get_graph_walk_graphs().items():
         for node in section.get_nodes():
             submodule = submodules.get(node)
@@ -91,9 +91,9 @@ def _refuse_unsupported_chunking(
                     f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
                     "report get_input_sequence_len"
                 )
-            if parallel_groups.get_instance_world_size_for_node(node) > 1:
+            if parallel_groups.get_sp_config_for_node(node).world_size > 1:
                 raise NotImplementedError(
-                    f"{type(model).__name__}: chunked prefill of {node!r} under TP/SP"
+                    f"{type(model).__name__}: chunked prefill of {node!r} under SP"
                 )
 
 

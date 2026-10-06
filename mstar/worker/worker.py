@@ -1577,6 +1577,7 @@ class Worker:
             per_request_input_metadata=per_request_input_metadata,
             request_walks=batch.request_walks,
             chunk_ranges=batch.chunk_ranges,
+            incomplete_node_rids=batch.incomplete_node_rids,
         )
         for rid in unresolved:
             # Reported the way a per-rid stage reports: left in
@@ -1637,6 +1638,7 @@ class Worker:
         per_request_input_metadata: dict[int, InputMetadata] | None = None,
         request_walks: dict[int, str] | None = None,
         chunk_ranges: dict[int, tuple[int, int, int]] | None = None,
+        incomplete_node_rids: set[int] | None = None,
     ) -> ExecutingBatch:
         """One step's batch, with the step context the engine drives it through.
 
@@ -1655,6 +1657,7 @@ class Worker:
             stream_partition_done_rids=stream_partition_done_rids,
             per_request_input_metadata=per_request_input_metadata or {},
             chunk_ranges=chunk_ranges or {},
+            incomplete_node_rids=set(incomplete_node_rids or ()),
             step_context=StepContext(
                 request_ids=tuple(request_ids),
                 graph_walk=graph_walk,
@@ -1696,6 +1699,11 @@ class Worker:
                 node_batch.request_ids, [ctx.walk_of(r) for r in node_batch.request_ids],
             )
             walks, walk_idx = rows.walks, rows.walk_idx
+        chunks = node_batch.chunk_ranges
+        unchunked = (-1, -1, -1)
+        chunk_starts = [chunks.get(r, unchunked)[0] for r in node_batch.request_ids] if chunks else []
+        chunk_ends = [chunks.get(r, unchunked)[1] for r in node_batch.request_ids] if chunks else []
+        chunk_totals = [chunks.get(r, unchunked)[2] for r in node_batch.request_ids] if chunks else []
         for worker in workers:
             self.communicator.send(
                 worker, msg=WorkerMessage(
@@ -1712,6 +1720,12 @@ class Worker:
                         walk_idx=walk_idx,
                         prefix_hits=prefix_hits,
                         page_trails=page_trails,
+                        chunk_starts=chunk_starts,
+                        chunk_ends=chunk_ends,
+                        chunk_totals=chunk_totals,
+                        incomplete_node_rids=[
+                            self._rid_str(r) for r in node_batch.incomplete_node_rids
+                        ],
                     )
                 )
             )
@@ -2482,6 +2496,7 @@ class Worker:
             per_request_input_metadata=input_meta,
             request_walks=request_walks,
             chunk_ranges=chunk_ranges,
+            incomplete_node_rids=incomplete_node_rids,
         )
         return Speculation(
             scheduled_batch=spec_batch,
@@ -2888,7 +2903,13 @@ class Worker:
         head_rids = self.scheduler.tp_rids(head)
         head_walk_idx = dict(zip(head_rids, head.walk_idx, strict=True)) if head.walks else None
         in_batch = batch_N.request_to_worker_graph
-        continuing = [r for r in head_rids if r in in_batch]
+        # N's rows that need another chunk loop back on nothing of N's: their
+        # next chunk is cut from the input held since their first. N's chunk
+        # state came from the leader, so every rank splits them out the same.
+        mid_prefill = {
+            r for r in head_rids if r in in_batch and r in batch_N.incomplete_node_rids
+        }
+        continuing = [r for r in head_rids if r in in_batch and r not in mid_prefill]
         fresh = [r for r in head_rids if r not in in_batch]
         if not continuing:
             return None
@@ -2986,6 +3007,9 @@ class Worker:
             if rid in prep_inputs:
                 new_request_to_worker_graph[rid] = prep_wg[rid]
                 per_request_inputs[rid] = prep_inputs[rid]
+            elif rid in mid_prefill:
+                new_request_to_worker_graph[rid] = in_batch[rid]
+                per_request_inputs[rid] = {}
             else:
                 new_request_to_worker_graph[rid] = fresh_wg[rid]
                 per_request_inputs[rid] = fresh_inputs[rid]
@@ -2999,7 +3023,7 @@ class Worker:
             "Follow-speculating: %s %s (seq %d from %d)",
             head.node_name, head_rids, head.spec_seq, head.spec_from_seq,
         )
-        return self._assemble_speculation(
+        speculation = self._assemble_speculation(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, continuing,
@@ -3007,7 +3031,11 @@ class Worker:
             request_walks={
                 r: head.walks[w] for r, w in head_walk_idx.items()
             } if head.walks else None,
+            **self.scheduler.tp_chunks(head),
         )
+        # N's rows, as on the leader: N's settle readies them, not a cleared speculation
+        speculation.continuing_rids.update(mid_prefill)
+        return speculation
 
     # How many "no speculative head from step s" seqs a follower remembers.
     _TP_NOSPEC_KEEP = 1024
