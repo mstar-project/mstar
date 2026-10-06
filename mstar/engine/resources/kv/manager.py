@@ -506,6 +506,8 @@ class KVManager(AttentionResource):
         self._asked_at: dict[str, float] = {}
         self._reserved_at: dict[str, float] = {}
         self._wait_state: dict[str, tuple] = {}
+        # CUDA-graph padding rows, which `_capacity` has to count the pages of
+        self._padding: set[int] = set()
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
@@ -853,6 +855,8 @@ class KVManager(AttentionResource):
             # named more tokens than the stream held.
             self._streams.setdefault(rid, {"main": CacheStream()})
             self._overrides.setdefault(rid, overrides)
+            if self._is_padding(rid):
+                self._padding.add(rid)
             for label, stream in self._streams[rid].items():
                 if stream.chain is None:
                     self._seed_keys(rid, label, stream)
@@ -1840,6 +1844,7 @@ class KVManager(AttentionResource):
             self._waiting.pop(rid, None)
             self._rooted.pop(rid, None)
             self._opened.pop(rid, None)
+            self._padding.discard(rid)
             self._forget_admission(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
@@ -2209,9 +2214,15 @@ class KVManager(AttentionResource):
         sink and what a piecewise region's padding rows keep from capture."""
         padding = sum(
             len(stream.page_indices)
-            for rid, streams in self._streams.items() if self._is_padding(rid)
-            for stream in streams.values()
+            for rid in self._padding
+            for stream in self._streams.get(rid, {}).values()
         )
+        if _DEBUG_ASSERTS:
+            assert padding == sum(
+                len(stream.page_indices)
+                for rid, streams in self._streams.items() if self._is_padding(rid)
+                for stream in streams.values()
+            ), f"KV {self.name}: the padding rows kept are not the ones counted"
         return self.config.max_num_pages - 1 - padding
 
     def _held_fresh(self, rid: str) -> int:
