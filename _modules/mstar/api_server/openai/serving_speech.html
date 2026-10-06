@@ -907,10 +907,16 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">A streaming request only commits to HTTP 200 once its first result chunk has</span>
 <span class="sd">arrived and is not an error; an error chunk before that becomes the HTTP error</span>
 <span class="sd">it carries (the non-streaming path gets the same from ``collect_results``).</span>
+
+<span class="sd">The adapter maps the request before anything is submitted, and that step can</span>
+<span class="sd">decode an uploaded clip or, where the server allows it, fetch one over HTTP.</span>
+<span class="sd">It runs in a worker thread so a slow reference cannot stall the streams the</span>
+<span class="sd">event loop is serving.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPException</span>
@@ -970,7 +976,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="create_speech">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html#mstar.api_server.openai.serving_speech.create_speech">[docs]</a>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">create_speech</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">raw_request</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>  <span class="c1"># noqa: ARG001</span>
-    <span class="n">args</span> <span class="o">=</span> <span class="n">adapter</span><span class="o">.</span><span class="n">speech_to_request</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span>
+    <span class="c1"># blocking work (base64 decode, file write, an allowed remote fetch) off the loop</span>
+    <span class="n">args</span> <span class="o">=</span> <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">to_thread</span><span class="p">(</span><span class="n">adapter</span><span class="o">.</span><span class="n">speech_to_request</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"speech"</span><span class="p">)</span>
     <span class="n">sample_rate</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">get_output_sample_rate</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">)</span> <span class="k">if</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">24000</span>
     <span class="n">fmt</span> <span class="o">=</span> <span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">response_format</span> <span class="ow">or</span> <span class="s2">"wav"</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
