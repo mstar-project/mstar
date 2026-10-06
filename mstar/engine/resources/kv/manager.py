@@ -4,6 +4,7 @@ import threading
 import time
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import Any
 
 import torch
@@ -506,6 +507,11 @@ class KVManager(AttentionResource):
         self._asked_at: dict[str, float] = {}
         self._reserved_at: dict[str, float] = {}
         self._wait_state: dict[str, tuple] = {}
+        # Backfill only. The requests it looks at: the first `_window_size` of `_waiting`,
+        # kept as they are added and dropped (None once a member left, until it is read
+        # again), so a pass over a long queue does not walk it.
+        self._window_size = cfg.resolved_backfill_window()
+        self._window: dict[str, None] | None = {}
         # CUDA-graph padding rows, which `_capacity` has to count the pages of
         self._padding: set[int] = set()
 
@@ -1841,7 +1847,7 @@ class KVManager(AttentionResource):
             self._overrides.pop(rid, None)
             self._transfer.remove_request(rid)
             self._reserved.pop(rid, None)
-            self._waiting.pop(rid, None)
+            self._wait_drop(rid)
             self._rooted.pop(rid, None)
             self._opened.pop(rid, None)
             self._padding.discard(rid)
@@ -2065,7 +2071,11 @@ class KVManager(AttentionResource):
             return False
         slots = overrides.prompt_slots or {}
         keys = overrides.prefix_keys or {}
-        return all(label in slots or keys.get(label) for label in self._labels_opened(overrides))
+        # kept by `_gate` for a request that waits: a pass asks about each of them, and the set is fixed
+        opened = self._opened.get(rid)
+        if opened is None:
+            opened = self._labels_opened(overrides)
+        return all(label in slots or keys.get(label) for label in opened)
 
     def _gate(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
         """Hold ``rid`` back until what it may take fits, in the order requests
@@ -2076,15 +2086,19 @@ class KVManager(AttentionResource):
         The head's hit is leased as it is admitted, not credited off a lookup
         that an eviction could undo before its prefill runs.
         """
+        if self._backfill and self._behind_the_window(rid):
+            return _WAIT
         overrides = self._overrides.get(rid)
         if not self._gated(rid, overrides):
             return None
         with self._lock:
             if rid not in self._overrides or rid in self._reserved:
                 return None
-            self._waiting.setdefault(rid, None)
-            head = next(iter(self._waiting))
-            if head != rid and not self._backfill:
+            self._wait_add(rid)
+            if self._backfill and rid not in self._opened:
+                self._opened[rid] = self._labels_opened(self._overrides[rid])
+            head = self._head()
+            if head != rid and (not self._backfill or rid not in self._eligible()):
                 return _WAIT
             if self._planned and self._refused.get(rid) == self._refusal_key(head):
                 # nothing it was refused over has moved: skip the probe and the plan
@@ -2109,9 +2123,9 @@ class KVManager(AttentionResource):
     ) -> AdmitOutcome | None:
         """Reserve for ``rid`` if it heads the queue (or backfills) and fits,
         leasing its hit on ``stream`` as it does. None once it has reserved."""
-        self._waiting.setdefault(rid, None)
-        head = next(iter(self._waiting))
-        if head != rid and not self._backfill:
+        self._wait_add(rid)
+        head = self._head()
+        if head != rid and (not self._backfill or rid not in self._eligible()):
             return _WAIT
         hit = []
         if stream is not None and rooted and self._leasable(stream):
@@ -2122,7 +2136,7 @@ class KVManager(AttentionResource):
         capacity = self._capacity()
         if need + held > capacity:
             if reservation.exact:
-                del self._waiting[rid]
+                self._wait_drop(rid)
                 self._rooted.pop(rid, None)
                 if self._alog is not None:
                     self._log("refuse", rid, is_head=head == rid, need=need + held, capacity=capacity)
@@ -2143,11 +2157,61 @@ class KVManager(AttentionResource):
         reservation.pages = need
         self._reserved[rid] = reservation
         self._reserved_epoch += 1
-        del self._waiting[rid]
+        self._wait_drop(rid)
         self._rooted.pop(rid, None)
         if self._planned:
             self._reserved_at[rid] = time.monotonic()
         return None
+
+    def _head(self) -> str | None:
+        """The request that has waited longest."""
+        if self._backfill:
+            return next(iter(self._eligible()), None)
+        return next(iter(self._waiting), None)
+
+    def _eligible(self) -> dict[str, None]:
+        """The requests backfill looks at: the first ``backfill_window`` waiting, head first.
+
+        Kept as requests are added to ``_waiting`` and dropped from it; read
+        again from the front of it only once one of these has left.
+        """
+        window = self._window
+        if window is None:
+            window = self._window = dict.fromkeys(islice(self._waiting, self._window_size))
+        if _DEBUG_ASSERTS:
+            assert list(window) == list(islice(self._waiting, self._window_size)), (
+                f"KV {self.name}: the backfill window is not the front of the queue"
+            )
+        return window
+
+    def _behind_the_window(self, rid: str) -> bool:
+        with self._lock:
+            return rid in self._waiting and rid not in self._eligible()
+
+    def _wait_add(self, rid: str) -> None:
+        """Put ``rid`` last in the queue, if it is not in it."""
+        waiting = self._waiting
+        if rid in waiting:
+            return
+        waiting[rid] = None
+        if not self._backfill:
+            return
+        if self._alog is not None:
+            # from when it asked, not from when it came into the window and was first looked at
+            self._asked_at.setdefault(rid, time.monotonic())
+        window = self._window
+        if window is not None and len(window) < self._window_size:
+            # the whole queue was in the window, so this is one more of the first K
+            window[rid] = None
+
+    def _wait_drop(self, rid: str) -> None:
+        """Take ``rid`` out of the queue, if it is in it."""
+        if rid not in self._waiting:
+            return
+        del self._waiting[rid]
+        if self._backfill and self._window is not None and rid in self._window:
+            # the one behind the window takes its place; read from the front when next asked
+            self._window = None
 
     def _reserve_new(self, ctx: StepContext) -> AdmissionDeferred | None:
         """Reserve for a request that reached admit without passing this pool's readiness.
@@ -2169,7 +2233,7 @@ class KVManager(AttentionResource):
                 continue
             self._reserved[rid] = self._reservation(rid)
             self._reserved_epoch += 1
-            self._waiting.pop(rid, None)
+            self._wait_drop(rid)
             self._rooted.pop(rid, None)
             if _DEBUG_ASSERTS and self._leads:
                 if self._peak:

@@ -85,6 +85,7 @@ _ADMISSION_ENV = {
     "admission_fit": "MSTAR_KV_ADMISSION_FIT",
     "admission_order": "MSTAR_KV_ADMISSION_ORDER",
 }
+_BACKFILL_WINDOW_ENV = "MSTAR_KV_BACKFILL_WINDOW"
 
 
 @dataclass(kw_only=True)
@@ -104,10 +105,17 @@ class PagedKVConfig(KVConfig):
     does not delay it, by ``backfill_protect`` (``easy``: it must be gone
     before the head could start, or fit in the room the head leaves spare).
 
-    Each of the first two is overridden by an environment variable, which wins
-    over the YAML: ``MSTAR_KV_ADMISSION_FIT`` and ``MSTAR_KV_ADMISSION_ORDER``.
-    The environment is read where the cache is built, so it reaches every
-    model's paged pool, in each worker process that inherits it.
+    ``backfill_window``: under ``backfill``, only the first this-many requests
+    waiting (the head included, in the order they first asked) are looked at
+    for a place; the rest wait without being asked about, so a long queue costs
+    no more per scheduling pass than a short one. A request behind the window
+    is looked at once enough ahead of it have been admitted.
+
+    Each of the first two, and the window, is overridden by an environment
+    variable, which wins over the YAML: ``MSTAR_KV_ADMISSION_FIT``,
+    ``MSTAR_KV_ADMISSION_ORDER`` and ``MSTAR_KV_BACKFILL_WINDOW``. The
+    environment is read where the cache is built, so it reaches every model's
+    paged pool, in each worker process that inherits it.
     """
 
     max_seq_len: int
@@ -122,6 +130,7 @@ class PagedKVConfig(KVConfig):
     admission_fit: str = "sum"
     admission_order: str = "fifo"
     backfill_protect: str = "easy"
+    backfill_window: int = 128
 
     def apply_yaml_overrides(
         self,
@@ -134,6 +143,7 @@ class PagedKVConfig(KVConfig):
         admission_fit: str | None = None,
         admission_order: str | None = None,
         backfill_protect: str | None = None,
+        backfill_window: int | None = None,
     ) -> None:
         """How much cache this deployment gets, how it is cut up, and how it admits."""
         for name, value in (
@@ -146,10 +156,12 @@ class PagedKVConfig(KVConfig):
             ("admission_fit", admission_fit),
             ("admission_order", admission_order),
             ("backfill_protect", backfill_protect),
+            ("backfill_window", backfill_window),
         ):
             if value is not None:
                 setattr(self, name, value)
         self.resolved_admission()
+        self.resolved_backfill_window()
 
     def resolved_admission(self) -> tuple[str, str]:
         """``(fit, order)`` as the pool is to run them: the environment, then the config.
@@ -171,6 +183,21 @@ class PagedKVConfig(KVConfig):
                 )
             resolved.append(value)
         return resolved[0], resolved[1]
+
+    def resolved_backfill_window(self) -> int:
+        """How many waiting requests backfill looks at: the environment, then the config.
+
+        Not a positive whole number is an error, as a mode that names none is.
+        """
+        raw = os.environ.get(_BACKFILL_WINDOW_ENV)
+        source, value = (_BACKFILL_WINDOW_ENV, raw) if raw else ("backfill_window", self.backfill_window)
+        try:
+            window = int(value)
+        except (TypeError, ValueError):
+            window = 0
+        if isinstance(value, bool) or window < 1 or str(window) != str(value).strip():
+            raise ValueError(f"{source} must be a positive whole number; got {value!r}")
+        return window
 
 
 @dataclass(frozen=True)
