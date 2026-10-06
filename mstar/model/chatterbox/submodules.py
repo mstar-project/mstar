@@ -212,9 +212,14 @@ class T3Submodule(ARNodeSubmodule):
     def _requires_cfg(self, step_metadata: Mapping[str, Any] | None) -> bool:
         return self.supports_cfg and float(self._knob(step_metadata, "cfg_weight")) > 0.0
 
-    def cg_key_info(self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo]):
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs,
+    ):
         """Guidance on or off; a mixed batch matches no capture and runs eagerly."""
-        del graph_walk
+        del graph_walk, per_request_input_metadata, kwargs
         flags = {self._requires_cfg(info.step_metadata) for info in per_request_info.values()}
         return flags.pop() if len(flags) == 1 else None
 

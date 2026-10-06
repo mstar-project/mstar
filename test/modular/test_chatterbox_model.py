@@ -694,6 +694,8 @@ def test_t3_batches_only_one_guidance_mode_and_captures_both():
     assert sub.can_batch(batch, [on, on])
     assert sub.cg_key_info("decode", {"a": _fwd_info("a", 0.5), "b": _fwd_info("b", 0.5)}) is True
     assert sub.cg_key_info("decode", {"a": _fwd_info("a", 0.5), "b": _fwd_info("b", 0.0)}) is None
+    # the engine passes the batch's input metadata too
+    assert sub.cg_key_info("decode", {"a": _fwd_info("a", 0.5)}, per_request_input_metadata={}) is True
 
     configs = sub.get_cuda_graph_configs(torch.device("cpu"))
     batched = [c for c in configs if isinstance(c, BatchedCudaGraphConfig)]
