@@ -147,7 +147,7 @@ def test_a_dropped_speculative_rid_neither_flushes_nor_reports_done():
     )
     # The dropped rid's staged ingest is undone before its chunk goes back.
     worker._graph_runtime = SimpleNamespace(commit_speculation=lambda *a, **kw: None)
-    worker._set_speculative_flag = lambda batch, value: None
+    worker._set_in_flight_flag = lambda batch, value: None
     worker._settle_speculation = (
         lambda spec, success, dropped_rids=frozenset():
         Worker._settle_speculation(worker, spec, success, dropped_rids)

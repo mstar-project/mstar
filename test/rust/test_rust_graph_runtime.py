@@ -211,9 +211,9 @@ def test_node_metadata_is_accepted(runtime):
 
 def test_speculative_flag_rejects_an_unknown_node(runtime):
     rid = _admit(runtime)
-    runtime.set_speculatively_scheduled("prefill", WG_ID, [rid], True)
+    runtime.set_in_flight("prefill", WG_ID, [rid], True)
     with pytest.raises((RuntimeError, ValueError)):
-        runtime.set_speculatively_scheduled("nope", WG_ID, [rid], True)
+        runtime.set_in_flight("nope", WG_ID, [rid], True)
 
 
 # --- coverage of the ABC -----------------------------------------------------
