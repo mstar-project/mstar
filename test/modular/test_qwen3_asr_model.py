@@ -408,4 +408,31 @@ def test_openai_adapter_parses_language_line_and_continues_hypotheses():
     assert ad.parse_transcript("language None<asr_text>", free).language is None
     assert ad.parse_transcript(" plain words ", req).text == "plain words"
     assert ad.parse_transcript(" plain words ", req).language == "en"
-    assert ad.stream_delta("language English<asr_text>") == "" and ad.stream_delta(" Hello") == " Hello"
+    # the stream shows nothing until the language line has closed, then only the text after the tag
+    assert ad.stream_text("language") == "" and ad.stream_text("language English") == ""
+    assert ad.stream_text("language English<asr_text> Hello") == " Hello"
+    assert ad.stream_text(" Hello there") == " Hello there"  # forced language, no line to hide
+
+
+def test_config_yaml_needs_a_concurrency_cap_the_pages_can_hold():
+    model = _make_model()
+    with pytest.raises(ValueError, match="max_concurrent_requests"):
+        model.validate_config_yaml({"model": "qwen3_asr"}, "x.yaml")
+    with pytest.raises(ValueError, match="max_num_pages"):
+        model.validate_config_yaml(
+            {"max_concurrent_requests": 64, "resources": {"kv_cache": {"max_num_pages": 32}}}, "x.yaml",
+        )
+    model.validate_config_yaml(
+        {"max_concurrent_requests": 64, "resources": {"kv_cache": {"max_num_pages": 2048}}}, "x.yaml",
+    )
+
+
+def test_request_kwargs_are_checked_before_the_conductor_reads_them():
+    model = _make_model()
+    assert model.get_max_output_tokens(max_output_tokens="32") == 32
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        model.get_max_output_tokens(max_output_tokens="abc")
+    cfgs = model.get_request_resource_configs({}, {"temperature": "0.5", "ignore_eos": "true"})
+    assert cfgs["sampler"].temperature == 0.5 and cfgs["sampler"].ignore_eos is True
+    with pytest.raises(ValueError, match="top_p"):
+        model.get_request_resource_configs({}, {"top_p": "abc"})
