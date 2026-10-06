@@ -97,6 +97,11 @@ class StepRunner:
             if type(self._resources[key]).admit_retrieve
             is not Resource.admit_retrieve
         ]
+        # Only a paged KV pool gives pages back before its request is removed;
+        # the rest of the resources have nothing to do on a release
+        self._release_order = [
+            key for key in self._order if hasattr(self._resources[key], "release_kv")
+        ]
         # Both sweeps run on behalf of one node and have no step to filter by,
         # so settle each node's share of them up front. `node_resources` must
         # name every node, including one that owns nothing — an absent node
@@ -236,6 +241,11 @@ class StepRunner:
     def remove_request(self, rid: str) -> None:
         for key in self._order:
             self._resources[key].remove_request(rid)
+
+    def release_kv(self, rid: str) -> None:
+        """give a finished request's KV pages back, ahead of `remove_request`"""
+        for key in self._release_order:
+            self._resources[key].release_kv(rid)
 
     def admit_retrieve(
         self, rid: str, node_name: str, graph_walk: str,

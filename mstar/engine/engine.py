@@ -1694,6 +1694,11 @@ class Engine:
     ) -> None:
         self._runner.ingest_request(request_id, overrides)
 
+    def release_kv(self, request_id: str) -> None:
+        """Give back the paged KV pages of a request that is done, and nothing
+        else of it: `remove_request` still follows and clears the rest."""
+        self._runner.release_kv(request_id)
+
     def remove_request(self, request_id: str) -> None:
         self._runner.remove_request(request_id)
         for submodule_mgmt in self._submodules.values():
