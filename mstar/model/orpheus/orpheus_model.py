@@ -95,6 +95,9 @@ class OrpheusModel(Model):
     # Model ABC: graph walk definitions
     # -------------------------------------------------------------------
 
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        return {"LLM": {"mixed": {"prefill", "decode"}}}
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = GraphNode(
             name="LLM",
