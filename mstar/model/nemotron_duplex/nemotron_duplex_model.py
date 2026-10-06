@@ -51,10 +51,10 @@ from mstar.conductor.request_info import CurrentForwardConductorMetadata, Partit
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVReqConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     ResourceReqConfig,
@@ -402,7 +402,7 @@ class NemotronDuplexModel(Model):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         nano = self.config.nano
         eartts = self.config.eartts
-        kv_config = KVConfig(
+        kv_config = PagedKVConfig(
             # Only the ``*`` (attention) layers hold a KV cache; the Mamba and
             # MLP layers do not. The backbone maps global layer -> dense
             # attention index (``NemotronHLLM._attn_cache_idx``).
@@ -448,7 +448,7 @@ class NemotronDuplexModel(Model):
             ),
             KVSpec(
                 resource_key=TALKER_KV, nodes={"eartts_talker"},
-                config=KVConfig(
+                config=PagedKVConfig(
                     num_layers=eartts.num_hidden_layers,
                     num_kv_heads=eartts.num_key_value_heads,
                     head_dim=eartts.kv_head_dim,    # 72 zero-padded to a FlashInfer head dim
