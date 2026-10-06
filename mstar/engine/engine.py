@@ -1453,6 +1453,12 @@ class Engine:
             published=request_info.resource_publish_info,
         )
 
+    def admission_keys(self, node_name: str):
+        """What a ``FULL_ADMIT_WAIT*`` from `check_ready` on this node depends on, or None
+        when no pool on it decides: a request so answered need not be asked again while
+        this reads as it did. See `StepRunner.admission_keys`."""
+        return self._runner.admission_keys(node_name)
+
     def reserve_replay_slot(self, batch: ExecutingBatch) -> SlotLease | None:
         """Lease the slot this batch will replay on, before it is dispatched.
 

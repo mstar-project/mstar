@@ -103,6 +103,9 @@ class StepRunner:
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
+        # node -> the `admission_keys` of the pools in its retrieve sweep that have one;
+        # settled on first ask, as the sweep is fixed
+        self._deciders: dict[str | None, tuple] = {}
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
@@ -284,6 +287,27 @@ class StepRunner:
             return FULL_ADMIT_OK
         return waited if gates_only else FULL_ADMIT_NOT_READY
 
+    def admission_keys(self, node_name: str | None = None):
+        """What a `FULL_ADMIT_WAIT*` from `admit_retrieve` on ``node_name`` depends on:
+        each pool that decides admission on the node gives its `admission_keys`, and these
+        are combined into one ``(behind, front)``: a tuple with each pool's part, or, with
+        the one pool there usually is, its own pair. None when no pool on the node decides,
+        so nothing is to be parked on.
+
+        A pool without ``admission_keys`` (a stub, say) is not one that decides.
+        """
+        gates = self._deciders.get(node_name)
+        if gates is None:
+            gates = self._deciders[node_name] = tuple(
+                gate for key in self._sweep(
+                    self._node_retrieve_order, self._retrieve_order, node_name
+                )
+                if (gate := getattr(self._resources[key], "admission_keys", None)) is not None
+            )
+        keys = [pair for gate in gates if (pair := gate()) is not None]
+        if len(keys) < 2:
+            return keys[0] if keys else None
+        return tuple(pair[0] for pair in keys), tuple(pair[1] for pair in keys)
 
 
     # ── Pre-plan bookkeeping ─────────────────────────────────────────────
