@@ -16,6 +16,7 @@
 # venvs), NUM (requests, default 200). For M* variants: EXTRA_MODEL_KWARGS
 # (extra indented "  key: value" model_kwargs lines) and RUN_TAG (run name suffix, also
 # used by the vllm case); VLLM_EXTRA_ARGS adds flags to bench_chatterbox_vllm.py.
+# SKIP_WER=1 leaves out the Whisper scoring (for nodes without the Whisper weights).
 set -euo pipefail
 
 WS=${WS:-$(cd "$(dirname "$0")/../../.." && pwd)}
@@ -69,7 +70,7 @@ runner() {  # runner <base url> <concurrency> <out dir>
       --profiling-type closed_loop --max-concurrency "$c" \
       --num-requests "$NUM" --num-warmup "$WARMUP" \
       --output-dir "$out/wavs" --local-cache "$out/cache" ) 2>&1 | tee "$out/runner.log"
-  wer "$out/wavs" "$out/wer.json"
+  [ "${SKIP_WER:-0}" = 1 ] || wer "$out/wavs" "$out/wer.json"
 }
 
 wer() {  # wer <wav dir> [out json]
