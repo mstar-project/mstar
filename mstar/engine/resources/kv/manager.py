@@ -92,7 +92,10 @@ class PageArena:
     num_owners: list[int] = field(init=False, repr=False)
     sealed: list[bool] = field(init=False, repr=False)
     # bumped as owners are added or dropped, for what the manager keeps about the pool to be
-    # kept by; `acquire` hands out free pages, which the index never holds, so it does not count
+    # kept by; `acquire` hands out free pages, which the index never holds, so it does not count.
+    # A release counts once its pages are back on the free list, so a reader without the lock
+    # (`KVManager.admission_keys`) that takes this before the free pages never holds a pair
+    # that a later state repeats
     owner_changes: int = field(default=0, init=False, repr=False)
     # told which pages gained or lost an owner, as they do: the index keeps its evictable pages by it
     owner_hook: Callable[[list[int]], None] | None = field(default=None, init=False, repr=False)
@@ -130,10 +133,10 @@ class PageArena:
             if self.num_owners[page] == 0:
                 self.sealed[page] = False
                 freed.append(page)
+        self.allocator.free(freed)
         self.owner_changes += 1
         if self.owner_hook is not None:
             self.owner_hook(pages)
-        self.allocator.free(freed)
 
     def copy_pages(self, src: list[int], dst: list[int]) -> None:
         self.kv_cache.copy_pages(src, dst)
@@ -539,6 +542,9 @@ class KVManager(AttentionResource):
         # bumped as what is reserved changes; with the arena's counters it says
         # whether a plan, or a refusal, still describes the pool
         self._reserved_epoch = 0
+        # bumped as a request leaves the queue, the one way a request moves up it: one that
+        # arrives goes last. What `admission_keys` says of the queue
+        self._queue_epoch = 0
         self._plan: PlanState | None = None
         self._shadow: tuple[tuple, tuple[int, int] | None] | None = None
         # rid -> the state a request was last refused in: asked again in it, the answer is no
@@ -2281,6 +2287,7 @@ class KVManager(AttentionResource):
         if rid not in self._waiting:
             return
         del self._waiting[rid]
+        self._queue_epoch += 1
         if self._backfill and self._window is not None and rid in self._window:
             # the one behind the window takes its place; read from the front when next asked
             self._window = None
@@ -2473,6 +2480,51 @@ class KVManager(AttentionResource):
         a request gets the same answer, so it is not worked out again."""
         arena = self._arena
         return (self._reserved_epoch, arena.num_free, arena.owner_changes, head)
+
+    def admission_keys(self) -> tuple[int, tuple[int, int, int, int]] | None:
+        """What the waits this pool's gate answers depend on, as ``(behind, front)``, for the
+        scheduler to skip asking a request again while it has not moved. None where the pool
+        does not decide, which answers no wait.
+
+        ``behind``, for ``ADMIT_WAIT_BEHIND``: a request that is neither the head nor in the
+        window is held by the queue alone (`_gate` answers before it looks at the pool), and
+        the queue moves it only as a request ahead of it leaves (`_queue_epoch`). One that
+        arrives goes last, and is ahead of no one.
+
+        ``front``, for ``ADMIT_WAIT``: the head, or a request in the window. This is
+        `_refusal_key` with the queue epoch for the head's name, which says as much: who
+        heads the queue, and who is in the window, changes only as a request leaves it. The
+        rest of what the answer is made of moves one of the other three, or is fixed:
+
+        * the request: its config is fixed once it is ingested. What it holds, a lease or a
+          local match, changes through `retain` and `release` of the arena (`owner_changes`).
+        * the reserved set, and what each of them may still take: `_reserved_epoch` ticks as
+          one is reserved, released, or lent pages. What each holds changes by a grant, which
+          takes from the free list (`num_free`), or by a release (`owner_changes`).
+        * the supply, the free pages and the cached ones eviction reaches, which is those two
+          again: the index takes and gives up a page through `retain` and `release`.
+        * the head's hit, the plan, and what the head leaves a request behind it: the same
+          state, read through the same counters.
+
+        The planning pool already answers from `_refused` under this key, so there it says
+        what is relied on. The summed test in arrival order keeps nothing between asks, and
+        for it these are all that ``need > supply - outstanding`` reads.
+
+        Read without the lock, as the scheduler reads it before every scan, and in pieces:
+        a key that moved while it was read is stale, which costs an ask, and what it must
+        never do is match a later state other than the one the ask saw. The counters only
+        rise. The free pages rise only in a `release`, which counts after it has freed, and
+        an ask waits for all of it (the lock is held). So with the count read first and the
+        free pages last, a key that matches again has seen no release since, and the free
+        pages, which only fall otherwise, have not fallen if they match.
+        """
+        if not self._decides:
+            return None
+        arena = self._arena
+        owners = arena.owner_changes
+        reserved = self._reserved_epoch
+        queue = self._queue_epoch
+        return queue, (reserved, arena.num_free, owners, queue)
 
     def _life(self, rid: str) -> list[tuple[str, int, int]]:
         """``(label, prompt tokens, decode tokens)`` for each label ``rid`` opens
