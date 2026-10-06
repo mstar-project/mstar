@@ -2626,9 +2626,10 @@ class KVManager(AttentionResource):
             need_total=table.need_total, spare=(held_x, need_x),
         )
         if self._peak:
+            # no capacity: every ask names the one it is made against (`peak_from` takes none),
+            # with the leased pages it is about to take out of the supply, which a plan has not
             state.planner = PeakPlanner.from_arrays(
-                held, claim, now, growth, rounds,
-                self._supply() + state.held_total, self.config.page_size,
+                held, claim, now, growth, rounds, 0, self.config.page_size,
             )
         else:
             state.rows = (held, claim, now, growth, rounds)
