@@ -42,6 +42,16 @@ def _group(rank, world_size):
 def test_from_yaml_defaults_to_tp():
     assert ThinkerMoeParallelConfig.from_yaml(None) == ThinkerMoeParallelConfig()
     assert ThinkerMoeParallelConfig.from_yaml({}).parallel == "tp"
+    assert not ThinkerMoeParallelConfig.from_yaml({}).mask_padding
+
+
+@pytest.mark.parametrize("parallel", ["tp", "ep"])
+def test_mask_padding_reaches_model(parallel):
+    moe = ThinkerMoeParallelConfig.from_yaml({"parallel": parallel, "mask_padding": True})
+    with torch.device("meta"):
+        model = Qwen3OmniThinkerModel(_config(), comm_group=_group(0, 2), moe_parallel=moe)
+    assert model.mask_padding
+    assert all(layer.is_moe for layer in model.model.layers)
 
 
 @pytest.mark.parametrize("section, match", [
