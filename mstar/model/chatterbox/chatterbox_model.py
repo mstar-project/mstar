@@ -107,8 +107,8 @@ MAX_REFERENCE_SECONDS = 30.0
 MIN_REFERENCE_SECONDS = 0.5
 # Bounds S3Gen time per chunk; the reference uses 10 (Turbo 2)
 MAX_CFM_TIMESTEPS = 100
-# Sentence chunking adds the chunk index to the seed, so leave int64 headroom
-MAX_SEED = 2**62
+# The conductor's seed is an int64; sentence chunking wraps its per-chunk seeds into it
+MAX_SEED = 2**63 - 1
 # The reference demo's slider maxima. Far past them T3 runs to max_new_tokens,
 # and a value that overflows the sampler's fp32 row fails the whole batch.
 MAX_TEMPERATURE = 5.0

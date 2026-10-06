@@ -460,6 +460,8 @@ def test_generation_kwargs_accept_boundary_values():
     })
     assert (top["temperature"], top["repetition_penalty"]) == (5.0, 2.0)
     assert (top["cfg_weight"], top["exaggeration"]) == (1.0, 2.0)
+    # the conductor's seed is an int64
+    model.resolve_generation_kwargs({"seed": 2**63 - 1})
     # other request fields ride along in the same kwargs and are left alone
     out = model.process_prompt("hello", ["text"], ["audio"], voice="default", language_id=None, seed=7)
     assert set(out) == {TEXT_INPUTS}
