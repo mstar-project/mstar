@@ -1,6 +1,4 @@
 model: "bagel"
-model_kwargs:
-  accelerator_graph: true  # Set false to disable graph capture.
 max_seq_len: 8192
 max_concurrent_requests: 1
 
