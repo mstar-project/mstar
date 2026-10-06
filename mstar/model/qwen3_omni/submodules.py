@@ -16,6 +16,7 @@ import functools
 import inspect
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Optional
 
 import torch
@@ -562,6 +563,28 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 }
             )
 
+    MAX_BATCH_TOKENS = 1024
+
+    def supports_chunked_prefill(self, graph_walk: str) -> bool:
+        return graph_walk in ("prefill_text", "prefill_audio")
+
+    def max_batch_tokens(self, graph_walk: str) -> int | None:
+        if graph_walk in ("prefill_text", "prefill_audio", THINKER_MIXED):
+            return self.MAX_BATCH_TOKENS
+        return None
+
+    def split_inputs(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: ARNodeInputs, start: int, end: int,
+    ) -> ARNodeInputs:
+        masks = inputs.tensor_inputs.get("masks_for_talker")
+        cut = super().split_inputs(
+            graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end,
+        )
+        if masks is not None:
+            cut.tensor_inputs = {"masks_for_talker": masks[:, start:end]}  # (2, seq)
+        return cut
+
     def declare_step(
         self, graph_walk: str,
         request_ids: list[str],
@@ -1054,8 +1077,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs
     ):
-        return_token = request_info.graph_walk == "thinker_decode" or \
+        inputs = kwargs.get("inputs")
+        return_token = request_info.graph_walk == "thinker_decode" or (
             request_info.step_metadata.get("is_last_prefill", False)
+            and (inputs is None or inputs.is_final_chunk)
+        )
         if not return_token:
             outputs.pop("new_token", None)
 
