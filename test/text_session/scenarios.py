@@ -123,12 +123,26 @@ def _recall(client, session_id: str) -> str:
     ).text or ""
 
 
+def _snapshot_all(client) -> list[dict]:
+    """``GET /sessions``, retried once if the connection was dropped.
+
+    The server closes an idle keep-alive connection after 5s (uvicorn's
+    default) and these scenarios poll on about that cadence, so a pooled socket
+    can be reset between two reads. Only this read is retried: resending a
+    generation POST could open a second session.
+    """
+    try:
+        return client.sessions()
+    except requests.ConnectionError:
+        return client.sessions()
+
+
 def _held(client) -> list[str]:
-    return [s["session_id"] for s in client.sessions()]
+    return [s["session_id"] for s in _snapshot_all(client)]
 
 
 def _snapshot(client, session_id: str) -> dict | None:
-    for entry in client.sessions():
+    for entry in _snapshot_all(client):
         if entry["session_id"] == session_id:
             return entry
     return None
@@ -154,7 +168,7 @@ def purge(client, when: str) -> None:
     moment to finish first.
     """
     for _ in range(60):
-        entries = client.sessions()
+        entries = _snapshot_all(client)
         if not entries:
             return
         for entry in entries:
@@ -281,7 +295,7 @@ def capacity_evict(client, dep, ck) -> None:
 
     # a session being written to right now is not a candidate, so a deployment
     # whose sessions are all in flight refuses even under `evict`
-    live = [e["session_id"] for e in client.sessions() if not e["closing"]]
+    live = [e["session_id"] for e in _snapshot_all(client) if not e["closing"]]
     flights = [_InFlight(client, s) for s in live]
     what = "a start is refused while every session is in flight"
     with contextlib.ExitStack() as stack:
