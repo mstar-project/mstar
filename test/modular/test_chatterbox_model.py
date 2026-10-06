@@ -320,7 +320,12 @@ def test_process_prompt_accepts_short_but_usable_reference():
 
 
 def test_undecodable_reference_is_a_client_error(tmp_path):
-    pytest.importorskip("torchcodec")
+    # torchcodec raises RuntimeError, not ImportError, on a node without
+    # FFmpeg's shared libraries, which importorskip would not catch
+    try:
+        import torchcodec  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"torchcodec cannot load here: {exc}")
     bad = tmp_path / "ref.wav"
     bad.write_bytes(b"hello world" * 100)
     with pytest.raises(ValueError, match="Could not decode the reference audio"):
