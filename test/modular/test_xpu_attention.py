@@ -189,3 +189,41 @@ def test_xpu_graph_plan_keeps_addresses_stable_across_replans():
     assert replanned.block_table[0, :3].tolist() == [5, 6, 7]
     assert replanned.host_kv_lens.tolist() == [9]
     assert replanned.max_k == _kv_config().max_seq_len
+
+
+def test_xpu_graph_plan_supports_context_past_text_sequence_limit():
+    config = _kv_config()
+    config.max_num_pages = 32
+    manager = XPUPagedAttentionManager(
+        kv_cache="kv", device=torch.device("cpu"), kv_config=config,
+    )
+    lease = SlotLease(
+        slot=0,
+        bucket=BucketKey(graph_walk="image_gen_cfg", bs=1, num_tokens=1),
+    )
+    manager.plan(
+        AttentionStep(causal=False),
+        _ctx([SequenceView("r0", "main", [2], length=3, to_compute=1)], slot_lease=lease),
+    )
+    plan = manager._current_plans["main"]
+    addresses = tuple(
+        getattr(plan, name).data_ptr()
+        for name in ("block_table", "cu_q", "host_kv_lens")
+    )
+    pages = list(range(1, 21))
+    length = len(pages) * config.page_size
+    assert length > config.max_seq_len
+    manager.plan(
+        AttentionStep(causal=False),
+        _ctx([SequenceView("r0", "main", pages, length=length, to_compute=1)], slot_lease=lease),
+    )
+    assert manager._current_plans["main"] is plan
+    assert tuple(
+        getattr(plan, name).data_ptr()
+        for name in ("block_table", "cu_q", "host_kv_lens")
+    ) == addresses
+    assert plan.block_table.shape == (1, config.max_num_pages)
+    assert plan.block_table[0, :len(pages)].tolist() == pages
+    assert not plan.block_table[0, len(pages):].any()
+    assert plan.host_kv_lens.tolist() == [length]
+    assert plan.max_k == config.max_num_pages * config.page_size

@@ -1,7 +1,6 @@
 """Paged attention through vllm-xpu-kernels."""
 
 import functools
-import math
 from dataclasses import dataclass
 
 import torch
@@ -123,12 +122,10 @@ class XPUPagedAttentionManager(AttentionManager):
         views = kv_out.views
         max_blocks = max((len(view.page_idxs) for view in views), default=1)
         if graph_mode:
-            max_blocks = max(
-                max_blocks,
-                math.ceil(
-                    self._kv_config.max_seq_len / self._kv_config.page_size
-                ),
-            )
+            # Multimodal prefixes can exceed the model's text max_seq_len.
+            # A graph must keep room for any context the resident cache can
+            # hold, rather than resize its table when an image edit arrives.
+            max_blocks = self._kv_config.max_num_pages
         block_table = [
             view.page_idxs
             + [SINK_PAGE] * (max_blocks - len(view.page_idxs))
@@ -153,7 +150,7 @@ class XPUPagedAttentionManager(AttentionManager):
             ),
             max_q=max((view.to_compute for view in views), default=0),
             max_k=(
-                self._kv_config.max_seq_len
+                self._kv_config.max_num_pages * self._kv_config.page_size
                 if graph_mode
                 else max(kv_lens, default=0)
             ),

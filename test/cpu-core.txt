@@ -23,6 +23,7 @@ test/modular/test_ring_kv_resource.py
 test/modular/test_accelerator_graph_capture.py
 test/modular/test_accelerator_graph_runtime.py
 test/modular/test_accelerator_graph_backend.py
+test/modular/test_xpu_attention.py
 test/modular/test_binary_framing.py
 test/modular/test_video_frame_protocol.py
 test/modular/test_client_sdk.py
