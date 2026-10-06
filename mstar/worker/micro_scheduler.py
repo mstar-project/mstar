@@ -794,15 +794,11 @@ class MicroScheduler:
         }
 
     def _max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
-        """The engine's cap for this (node, walk), if it has one; a combined
-        walk also takes the smallest cap of its walks."""
-        engine = self.engine_manager.get_engine(node_name)
-        walks = [graph_walk, *self._walks_of_key.get((node_name, graph_walk), ())]
-        caps = [
-            cap for walk in walks
-            if (cap := engine.get_max_batch_size(node_name, walk)) is not None
-        ]
-        return min(caps) if caps else None
+        """The engine's cap for this (node, walk), if it has one. A combined
+        walk's cap is the model's to declare, via its captures or max_batch_size."""
+        return self.engine_manager.get_engine(node_name).get_max_batch_size(
+            node_name, graph_walk
+        )
 
     def _assemble_batch(
         self,
