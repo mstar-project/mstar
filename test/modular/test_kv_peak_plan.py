@@ -121,6 +121,37 @@ def test_a_request_started_later_ages_the_set_by_that_much():
         ), f"trial {trial}: start {start}: {entries} + {cand} page_size={page_size}"
 
 
+def test_a_request_over_the_capacity_at_a_glance_is_over_it_by_the_simulation():
+    """``exceeds`` looks at two rounds and says only what it is sure of; what it says is true."""
+    rng = random.Random(SEED + 7)
+    over = caught = 0
+    for trial in range(4 * TRIALS):
+        entries, page_size = _entries(rng, 12)
+        cand = _candidate(rng)
+        capacity = rng.randrange(0, 80)
+        planner = PeakPlanner(entries, capacity=0, page_size=page_size)
+        brute = _brute_peak_from(entries, cand, 0, page_size)
+        glance = planner.exceeds(cand, capacity)
+        assert not glance or brute > capacity, (
+            f"trial {trial}: capacity {capacity}, peak {brute}: {entries} + {cand} page_size={page_size}"
+        )
+        over += brute > capacity
+        caught += glance
+    # a glance that never said so would be sound and no use
+    assert over > 200 and caught > 0.8 * over, f"it caught {caught} of {over}"
+
+
+def test_a_candidate_that_finishes_is_still_held_to_the_round_it_runs_at_least():
+    """Rounds under 1 count as 1, as in ``peak_from``: a request that has finished and is not
+    removed holds what it has for ever, and a candidate always gets one round."""
+    entries = [PlanEntry(held=6, claim=6, now=0, growth=0, rounds=0)]
+    cand = PlanEntry(held=0, claim=5, now=5, growth=0, rounds=0)
+    planner = PeakPlanner(entries, capacity=0, page_size=16)
+
+    assert planner.peak_from(cand) == 11
+    assert planner.exceeds(cand, 10) and not planner.exceeds(cand, 11)
+
+
 def test_fits_is_the_peak_against_the_capacity():
     entries = [PlanEntry(held=2, claim=8, now=0, growth=1, rounds=96)]
     cand = PlanEntry(held=0, claim=4, now=2, growth=1, rounds=32)

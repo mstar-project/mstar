@@ -31,6 +31,7 @@ A candidate or a head always runs at least one round (``max(1, rounds)``).
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Sequence
 from typing import NamedTuple
 
@@ -116,6 +117,7 @@ class PeakPlanner:
         # the most from each time on
         self._later = np.maximum.accumulate(self.usage[::-1])[::-1]
         self.held_total = sum(e.held for e in self.entries)
+        self._glance: tuple[list[int], list[int], list[int]] | None = None
 
     # ── usage ───────────────────────────────────────────────────────────
 
@@ -161,6 +163,36 @@ class PeakPlanner:
         # once it has gone, the set alone
         peak = max(peak, int(self._later[hi]) if hi < len(self.times) else self.frozen)
         return peak
+
+    def exceeds(self, entry: PlanEntry, capacity: int) -> bool:
+        """Whether ``peak_from(entry)`` is over ``capacity``, when two rounds say so.
+
+        Only ever True when it is: each round looked at is one of the terms
+        ``peak_from`` takes the most of. They are the last round the plan
+        stores before ``entry`` is gone, and the round of most usage up to it
+        (the set's peak, if ``entry`` is still there then): where a request
+        that does not fit is usually over. False means nothing; ask ``peak_from``.
+        Costs a search and a few sums, where ``peak_from`` is a pass over the plan.
+        """
+        if self._glance is None:
+            times, usage = self.times.tolist(), self.usage.tolist()
+            # the index of the most usage at or before each round
+            best, at = [], 0
+            for j, used in enumerate(usage):
+                if used > usage[at]:
+                    at = j
+                best.append(at)
+            self._glance = (times, usage, best)
+        times, usage, best = self._glance
+        # `times[0]` is 0, and `entry` runs at least a round: there is always one before it is gone
+        last = bisect_left(times, max(1, entry.rounds)) - 1
+        cap = max(entry.claim, entry.held)
+        base = entry.held + entry.now
+        for j in (last, best[last]):
+            mine = min(cap, base + entry.growth * (-(-times[j] // self.page_size)))
+            if usage[j] + mine > capacity:
+                return True
+        return False
 
     def fits(self, entry: PlanEntry, capacity: int | None = None) -> bool:
         cap = self.capacity if capacity is None else capacity
