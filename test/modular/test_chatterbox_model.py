@@ -429,14 +429,14 @@ def test_generation_kwargs_defaults_and_turbo_guards():
     # finite in float64 but past fp32 / int32, which fails the sampler for the whole batch
     ({"temperature": 1e39}, r"temperature=1e\+39 is outside \[0.0, 5.0\]"),
     ({"repetition_penalty": 1e39}, r"repetition_penalty=1e\+39 is outside"),
-    ({"top_k": 2**31}, r"top_k=2147483648 is outside"),
+    ({"repetition_penalty": 1e-39}, r"repetition_penalty=1e-39 is outside \[1e-05, 2.0\]"),
     ({"cfg_weight": 1.5}, r"cfg_weight=1.5 is outside \[0.0, 1.0\]"),
     ({"exaggeration": 1e39}, r"exaggeration=1e\+39 is outside \[0.0, 2.0\]"),
     ({"top_p": 1.5}, r"top_p=1.5 is outside"),
     ({"top_k": -3}, r"top_k=-3 is outside"),
     ({"min_p": 2.0}, r"min_p=2.0 is outside"),
     ({"min_p": -0.5}, r"min_p=-0.5 is outside"),
-    ({"repetition_penalty": 0}, r"repetition_penalty=0.0 is outside \(0.0"),
+    ({"repetition_penalty": 0}, r"repetition_penalty=0.0 is outside \[1e-05"),
     ({"repetition_penalty": -1}, "repetition_penalty=-1.0 is outside"),
     ({"cfg_weight": "x"}, "cfg_weight must be a finite number"),
     ({"cfg_weight": -1}, "cfg_weight=-1.0 is outside"),
@@ -482,6 +482,11 @@ def test_generation_kwargs_accept_boundary_values():
     assert (top["cfg_weight"], top["exaggeration"]) == (1.0, 2.0)
     # the conductor's seed is an int64
     model.resolve_generation_kwargs({"seed": 2**63 - 1})
+    # a vanishing temperature samples greedily; a top_k past the vocab keeps the whole vocab
+    assert model.resolve_generation_kwargs({"temperature": 1e-39})["temperature"] == 0.0
+    vocab = model.config.t3.speech_vocab_size
+    top_ks = [model.resolve_generation_kwargs({"top_k": k})["top_k"] for k in (vocab - 1, vocab, 2**31)]
+    assert top_ks == [vocab - 1, vocab, vocab]
     # other request fields ride along in the same kwargs and are left alone
     out = model.process_prompt("hello", ["text"], ["audio"], voice="default", language_id=None, seed=7)
     assert set(out) == {TEXT_INPUTS}

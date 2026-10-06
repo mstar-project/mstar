@@ -288,8 +288,9 @@ Chatterbox notes
   URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``; paths on the
   server are refused), ``exaggeration`` (0-2, emotion intensity, default 0.5),
   ``cfg_weight`` (0-1, default 0.5; 0 disables guidance and halves the T3 work),
-  ``temperature`` (up to 5)/``top_p``/``top_k``/``min_p``/``repetition_penalty``
-  (up to 2; the bounds are the reference demo's), ``seed``, ``n_cfm_timesteps``
+  ``temperature`` (up to 5; under 1e-5 is greedy)/``top_p``/``top_k`` (the
+  whole vocab or more is no filter)/``min_p``/``repetition_penalty`` (up to 2;
+  the upper bounds are the reference demo's), ``seed``, ``n_cfm_timesteps``
   (S3Gen Euler steps, 10; Turbo 2), ``max_new_tokens`` (up to the deployment's
   ``model_kwargs: max_new_tokens_limit``, 1000 in the shipped configs; with
   ``max_concurrent_requests`` set, the server refuses to start unless that

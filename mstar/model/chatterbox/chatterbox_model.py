@@ -119,6 +119,10 @@ MAX_TEMPERATURE = 5.0
 MAX_REPETITION_PENALTY = 2.0
 MAX_CFG_WEIGHT = 1.0
 MAX_EXAGGERATION = 2.0
+# Dividing the logits by a smaller value overflows the same way: a temperature
+# under it samples greedily (vLLM's convention), a penalty under it is refused
+MIN_TEMPERATURE = 1e-5
+MIN_REPETITION_PENALTY = 1e-5
 
 
 class ChatterboxModel(Model):
@@ -380,6 +384,9 @@ class ChatterboxModel(Model):
         temperature = _number(
             "temperature", mk.get("temperature", g.temperature), low=0.0, high=MAX_TEMPERATURE,
         )
+        if temperature < MIN_TEMPERATURE:
+            temperature = 0.0
+        top_k = _integer("top_k", mk.get("top_k", g.top_k), low=0)
         limit = self.config.max_new_tokens_limit or self.config.t3.max_speech_tokens
         max_new_tokens = _integer(
             "max_new_tokens",
@@ -394,14 +401,12 @@ class ChatterboxModel(Model):
         knobs = {
             "temperature": temperature if do_sample else 0.0,
             "top_p": _number("top_p", mk.get("top_p", g.top_p), low=0.0, high=1.0),
-            # the sampler's top-k row is int32
-            "top_k": _integer(
-                "top_k", mk.get("top_k", g.top_k), low=0, high=self.config.t3.speech_vocab_size,
-            ),
+            # the whole vocab is no filter; past it the sampler's int32 row would overflow
+            "top_k": min(top_k, self.config.t3.speech_vocab_size),
             "min_p": _number("min_p", mk.get("min_p", g.min_p), low=0.0, high=1.0),
             "repetition_penalty": _number(
                 "repetition_penalty", mk.get("repetition_penalty", g.repetition_penalty),
-                low=0.0, high=MAX_REPETITION_PENALTY, low_open=True,
+                low=MIN_REPETITION_PENALTY, high=MAX_REPETITION_PENALTY,
             ),
             "cfg_weight": _number(
                 "cfg_weight", mk.get("cfg_weight", g.cfg_weight), low=0.0, high=MAX_CFG_WEIGHT,
@@ -1011,19 +1016,15 @@ def _flag(name: str, value: Any) -> bool:
     return value
 
 
-def _number(
-    name: str, value: Any, *, low: float | None = None, high: float | None = None,
-    low_open: bool = False,
-) -> float:
-    """A finite number in [low, high], or (low, high] when ``low_open``."""
+def _number(name: str, value: Any, *, low: float | None = None, high: float | None = None) -> float:
+    """A finite number in [low, high]."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError(f"{name} must be a finite number, got {value!r}")
     value = float(value)
-    too_low = low is not None and (value <= low if low_open else value < low)
-    if too_low or (high is not None and value > high):
+    if (low is not None and value < low) or (high is not None and value > high):
         lo = "-inf" if low is None else low
         hi = "inf" if high is None else high
-        raise ValueError(f"{name}={value} is outside {'(' if low_open else '['}{lo}, {hi}]")
+        raise ValueError(f"{name}={value} is outside [{lo}, {hi}]")
     return value
 
 
