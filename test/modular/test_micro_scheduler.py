@@ -1223,3 +1223,48 @@ def test_a_relabelled_step_routes_with_its_own_walks_outputs():
 
     assert batch.graph_walk == WALK
     assert list(batch.output_signals) == [f"out_{WALK}"]
+# ── rows without room ───────────────────────────────────────────────────
+
+
+class _SizedEngine(_Engine):
+    """Reports each row's length; ``too_big`` rows have no KV room."""
+
+    def __init__(self, too_big, **kw):
+        super().__init__(**kw)
+        self.too_big = set(too_big)
+
+    def declares_input_sequence_len(self, node_name):
+        del node_name
+        return True
+
+    def input_sequence_len(self, node_name, graph_walk, request_info, inputs):
+        del node_name, graph_walk, request_info
+        return SimpleNamespace(seq_len=len(inputs))
+
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True, seq_len_info=None):
+        if seq_len_info is not None and rid in self.too_big:
+            return FULL_ADMIT_NOT_READY
+        return super().check_ready(node_name, rid, fwd_info, allow_reload)
+
+
+def test_a_row_without_room_sits_out_and_stays_ready():
+    sched = _scheduler(_SizedEngine(too_big={"r1"}, max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["r0", "r1", "r2"])
+
+    batch = _next_batch(sched, manager)
+
+    assert list(batch.request_to_worker_graph) == ["r0", "r2"]
+    assert not sched.backlog
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"r1"}
+
+
+def test_a_backlogged_row_without_room_stays_parked():
+    sched = _scheduler(_SizedEngine(too_big={"b1"}, max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
+
+    batch = _next_batch(sched, _Manager([]))
+
+    assert list(batch.request_to_worker_graph) == ["b0"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b1"]

@@ -28,6 +28,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
     topo_sort,
 )
+from mstar.model.submodule_base import InputSeqLenInfo
 
 
 class _Stub(Resource):
@@ -403,6 +404,22 @@ def test_admit_retrieve_short_circuits_on_failure():
     assert not outcome.ok
     assert isinstance(outcome.reason, AllocationFailed)
     assert sampler.calls == [], "the sweep stops at the first failure"
+
+
+def test_a_resource_without_room_makes_the_row_not_ready():
+    kv = _Stub("kv")
+    kv.has_room = lambda rid, node, walk, segment_len: segment_len <= 8
+    runner = StepRunner({"kv": kv})
+
+    fits = runner.admit_retrieve("r1", "llm", "decode", None, InputSeqLenInfo(8))
+    too_big = runner.admit_retrieve("r1", "llm", "decode", None, InputSeqLenInfo(9))
+    per_resource = runner.admit_retrieve(
+        "r1", "llm", "decode", None, InputSeqLenInfo(9, {"kv": 2}),
+    )
+
+    assert (fits.ok, fits.ready) == (True, True)
+    assert (too_big.ok, too_big.ready) == (True, False), "no room is a retry, not a failure"
+    assert per_resource.ready
 
 
 def test_build_cuda_graph_buffers_reaches_every_resource():

@@ -417,6 +417,7 @@ class Worker:
         # worker; the runtime holds the table where the two meet.
         self.scheduler.runtime = self._graph_runtime
         self.scheduler.rid_of = self._rid
+        self.scheduler.get_tensor = self.tensor_manager.get_tensor
         self.tensor_manager.rid_to_str = self._rid_str
 
         # wire request id -> messages for requests that are not in the queue.

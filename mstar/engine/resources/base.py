@@ -158,6 +158,13 @@ class Resource(ABC):
         """
         return ADMIT_OK
 
+    def has_room(
+        self, rid: str, node_name: str, graph_walk: str, segment_len: int,
+    ) -> bool:
+        """Whether a step adding ``segment_len`` tokens for ``rid`` could be admitted now."""
+        del rid, node_name, graph_walk, segment_len
+        return True
+
     # Step lifecycle
 
     def admit(self, step: ResourceStep, ctx: StepContext) -> AdmitOutcome:
