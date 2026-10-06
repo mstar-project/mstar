@@ -17,10 +17,16 @@ adapter's ``speech_chunk_max_pieces`` chunks is rejected.
 A streaming request only commits to HTTP 200 once its first result chunk has
 arrived and is not an error; an error chunk before that becomes the HTTP error
 it carries (the non-streaming path gets the same from ``collect_results``).
+
+The adapter maps the request before anything is submitted, and that step can
+decode an uploaded clip or, where the server allows it, fetch one over HTTP.
+It runs in a worker thread so a slow reference cannot stall the streams the
+event loop is serving.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 
 from fastapi import HTTPException
@@ -75,7 +81,8 @@ def list_voices(api) -> VoiceList | None:
 
 
 async def create_speech(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
-    args = adapter.speech_to_request(req, api.upload_dir)
+    # blocking work (base64 decode, file write, an allowed remote fetch) off the loop
+    args = await asyncio.to_thread(adapter.speech_to_request, req, api.upload_dir)
     request_id = rid("speech")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
     fmt = (req.response_format or "wav").lower()
