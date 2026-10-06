@@ -918,10 +918,16 @@ class Qwen3ASRAdapter(OpenAIAdapter):
             args.model_kwargs["assistant_prefix"] = prefix
         return args
 
-    def stream_delta(self, text: str) -> str:
-        # the language line and the tag are structure, not speech; they are
-        # short and arrive as whole tokens, so hide them token by token
-        return "" if text.strip().startswith(("language", ASR_TEXT_TAG)) or ASR_TEXT_TAG in text else text
+    def stream_text(self, raw: str) -> str:
+        # A detected language opens the stream as ``language X<asr_text>``.
+        # Hold the text back until the tag has arrived and show what follows
+        # it. A forced language skips the line, so plain text streams as is.
+        if ASR_TEXT_TAG in raw:
+            return raw.split(ASR_TEXT_TAG, 1)[1]
+        head = raw.lstrip()
+        if head.startswith("language") and len(head) < 40 and "\n" not in head:
+            return ""
+        return raw
 
     def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
         raw = text.strip()
