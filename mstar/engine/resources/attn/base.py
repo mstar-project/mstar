@@ -6,6 +6,7 @@ The backends themselves live beside this — `flashinfer`, `cross`, `dense`,
 naming a backend in a spec does not load the others.
 """
 
+import functools
 import logging
 import os
 from typing import NamedTuple
@@ -25,9 +26,19 @@ logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
     AttnBackend.DENSE: PagedKVConfig,
     AttnBackend.FLASHINFER: PagedKVConfig,
+    AttnBackend.FLASH_ATTN: PagedKVConfig,
     AttnBackend.FLEX: RingKVConfig,
     AttnBackend.XPU_PAGED: PagedKVConfig,
 }
+
+
+@functools.cache
+def _warn_flash_attn_fallback(reason: str) -> None:
+    logger.warning(
+        "Attention backend 'flash_attn' requested but flash_attn_3 is "
+        "unavailable (%s); using the 'flashinfer' backend instead.",
+        reason,
+    )
 
 
 class AttentionManager(AttentionResource):
@@ -85,6 +96,28 @@ class AttentionManager(AttentionResource):
                     kv_config=kv_config,
                 )
             _warn_dense_fallback(reason)
+            backend = AttnBackend.FLASHINFER
+
+        if backend == AttnBackend.FLASH_ATTN:
+            # Same degradation as dense: a missing or paged-less flash_attn_3
+            # wheel falls back to the paged FlashInfer backend rather than
+            # refusing to serve. The two are drop-in — identical step
+            # declaration and `requires_kv_write` — so only the per-step host
+            # cost differs.
+            from mstar.engine.resources.attn.flash_attn import (
+                FlashAttnManager,
+                _fa3_paged_unavailable_reason,
+            )
+
+            reason = _fa3_paged_unavailable_reason()
+            if reason is None:
+                return FlashAttnManager(
+                    kv_cache=spec.config.kv_cache,
+                    device=info.device,
+                    dtype=info.kv_dtype,
+                    kv_config=kv_config,
+                )
+            _warn_flash_attn_fallback(reason)
             backend = AttnBackend.FLASHINFER
 
         if backend == AttnBackend.FLASHINFER:

@@ -34,6 +34,7 @@ adapter lifts those into ``language`` / ``segments``.
 """
 
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -46,6 +47,7 @@ from mstar.conductor.request_info import (
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
+    AttnBackend,
     CrossAttentionConfig,
     CrossAttentionSpec,
     KVSpec,
@@ -83,6 +85,25 @@ from mstar.model.whisper.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _self_attn_backend() -> AttnBackend:
+    """``MSTAR_WHISPER_ATTN``: ``flash_attn`` or ``flashinfer`` (default).
+
+    A migration switch, not a tuning knob. FlashInfer plans on the host every
+    step; FlashAttention has no plan stage, which on a 4-layer decoder is most
+    of the step (see `attn/flash_attn.py`). Defaulted to the incumbent so the
+    two can be measured against each other on one build before the default
+    moves, and so this is a no-op until asked for.
+    """
+    name = os.environ.get("MSTAR_WHISPER_ATTN", "flashinfer").strip().lower()
+    try:
+        return AttnBackend(name)
+    except ValueError:
+        raise ValueError(
+            f"MSTAR_WHISPER_ATTN={name!r} is not an attention backend; "
+            f"expected one of {sorted(b.value for b in AttnBackend)}"
+        ) from None
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -211,7 +232,9 @@ class WhisperModel(Model):
             KVSpec(resource_key=KV_CACHE, nodes=nodes, config=kv_config),
             AttentionSpec(
                 resource_key=ATTN, nodes=nodes,
-                config=AttentionConfig(kv_cache=KV_CACHE),
+                config=AttentionConfig(
+                    kv_cache=KV_CACHE, backend=_self_attn_backend(),
+                ),
             ),
             KVSpec(
                 resource_key=CROSS_KV_CACHE, nodes=nodes,
