@@ -46,6 +46,13 @@ class ChunkPolicy(ABC):
         """
         ...
 
+    def allow_partial_input(self) -> bool:
+        """Whether chunks may be popped before the producer's graph walk
+        finishes, i.e. from a chunked prefill's non-final chunks. Default
+        ``False``: the buffer counts only items up to the last one that
+        finished a walk, so the consumer sees what it would unchunked."""
+        return False
+
     def continue_after_producer_done(self) -> bool:
         """Whether the buffer should keep producing (empty) chunks after the
         producer signals done and all buffered items have been consumed.
