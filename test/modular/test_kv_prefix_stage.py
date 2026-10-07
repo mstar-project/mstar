@@ -94,7 +94,7 @@ def _batch(node_name: str = NODE):
         step_context=StepContext(
             request_ids=(RID,), graph_walk=WALK, slot=0, capture=False,
         ),
-        per_request_info={RID: None},
+        per_request_info={RID: None}, per_request_info_wrapped={RID: None},
     )
 
 
