@@ -1161,10 +1161,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 label="main", **kwargs
             )
         if sample_token:
-            qo_indptr_buf = self.node_resources["attn"].qo_indptr_buf("main")
-            assert qo_indptr_buf is not None
-            last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
-            last_hidden = hidden.index_select(0, last_token_indices)
+            last_hidden = self.node_resources["attn"].select_last_hidden(hidden, "main")
             logits = self.lm_head(last_hidden)
             # `_LOGITS` is the private handoff to whichever dispatcher called:
             # the shape of a sampled token is `forward` vs `forward_batched`'s
@@ -1193,10 +1190,7 @@ class LLMSubmodule(ARNodeSubmodule):
         )
 
         if sample_token:
-            qo_indptr_buf = self.node_resources["attn"].qo_indptr_buf("main")
-            assert qo_indptr_buf is not None
-            last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
-            last_hidden = hidden.index_select(0, last_token_indices)
+            last_hidden = self.node_resources["attn"].select_last_hidden(hidden, "main")
             logits = self.lm_head(last_hidden)
             return {_LOGITS: [logits]}
         return {}
