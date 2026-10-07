@@ -31,6 +31,7 @@ from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.model.sessions import (
+    RequestSession,
     SessionResourceConfig,
     SessionsConfig,
 )
@@ -103,17 +104,27 @@ class _Node:
         engine._runner = self.runner
         engine._open_session_state({KV: object(), ROPE: object()}, config)
         self.free_at_start = self.kv._arena.num_free
+        self._started: set[str] = set()
 
     # -- lifecycle, as the worker drives it ------------------------------
 
     def start(self, rid: str, session: str | None = SESSION) -> None:
-        self.runner.ingest_request(rid, session_id=session)
+        # as a client would: the session's first turn starts it, every later
+        # one resumes it
+        request_session = None
+        if session is not None:
+            request_session = RequestSession(
+                session, resumed=session in self._started,
+            )
+            self._started.add(session)
+        self.runner.ingest_request(rid, session=request_session)
 
     def finish(self, rid: str, session: str | None = SESSION) -> None:
         self.runner.remove_request(rid, session_id=session)
 
     def end_session(self, session: str = SESSION) -> None:
         self.runner.remove_session(session)
+        self._started.discard(session)
 
     # -- one step ---------------------------------------------------------
 

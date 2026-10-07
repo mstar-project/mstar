@@ -38,6 +38,9 @@ class WorkerSessionManager:
     _pending_remove_end_session: set[int] = field(default_factory=set)
     # TEARDOWN_SESSIONs waiting on their requests to finish leaving
     _pending_session_teardowns: set[str] = field(default_factory=set)
+    # rid handle -> nodes whose loop ran a speculative step past its stop for
+    # it; handed to the engine at removal. Session requests only.
+    _overshot: dict[int, set[str]] = field(default_factory=dict)
     # NEW_REQUESTs held until their session's previous request has finished
     # leaving, so the resumed request is handed the state that request
     # built rather than an empty stream.
@@ -105,6 +108,17 @@ class WorkerSessionManager:
         self._pending_session_ingests.append(body)
         return True
 
+    def drop_held(self, request_id: str) -> bool:
+        """Forget a held request (by its wire id) that was removed before it
+        could be admitted. True when one was held."""
+        kept = [
+            held for held in self._pending_session_ingests
+            if held.request_id != request_id
+        ]
+        dropped = len(kept) != len(self._pending_session_ingests)
+        self._pending_session_ingests = kept
+        return dropped
+
     def take_held_ingests(self) -> list[NewRequest]:
         """The held requests, for the worker to re-admit. One that is still not
         ready holds itself again."""
@@ -122,6 +136,16 @@ class WorkerSessionManager:
     # Removal
     # ------------------------------------------------------------------
 
+    def note_overshoot(self, request_id: int, node_name: str) -> None:
+        """The request's loop on ``node_name`` ran one speculative step past
+        its stop. Kept for a session request only: no one else continues
+        from the KV that step wrote into."""
+        if request_id in self._rid_session:
+            self._overshot.setdefault(request_id, set()).add(node_name)
+
+    def take_overshot(self, request_id: int) -> frozenset[str]:
+        return frozenset(self._overshot.pop(request_id, ()))
+
     def defer_end_session(self, request_id: int) -> None:
         """Remember that a removal deferred behind a GPU step ends its session,
         so the flag survives being reconstructed later."""
@@ -137,6 +161,7 @@ class WorkerSessionManager:
         worker follows up with ``forget_session``.
         """
         self._pending_remove_end_session.discard(request_id)
+        self._overshot.pop(request_id, None)
         session_id = self._rid_session.pop(request_id, None)
         if session_id is not None:
             self.get_rids(session_id).discard(request_id)
@@ -164,3 +189,4 @@ class WorkerSessionManager:
         for rid in self._session_rids.pop(session_id, set()):
             self._rid_session.pop(rid, None)
             self._pending_remove_end_session.discard(rid)
+            self._overshot.pop(rid, None)

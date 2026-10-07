@@ -102,7 +102,7 @@ def _probe(client, args, prompt, pages, opened) -> int:
         session_id = session_id or result.session_id
         if session_id and not opened:
             opened.append(session_id)
-        held = [s["session_id"] for s in client.sessions()]
+        held = client.session_counts()
         print(f"turn {turn}: ok, session {session_id}, server holds {held}")
 
     print(

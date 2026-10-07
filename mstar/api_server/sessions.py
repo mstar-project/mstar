@@ -11,6 +11,7 @@ the workers just carry it out.
 
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -24,6 +25,11 @@ from mstar.model.sessions import (
 )
 
 logger = logging.getLogger(__name__)
+
+# What a client may name its session: it goes in a URL path
+# (``DELETE /sessions/{id}``), so nothing that needs escaping or reads as a
+# path segment. A minted id is a uuid4, which fits.
+SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
 class SessionError(Exception):
@@ -152,6 +158,15 @@ class SessionRegistry:
             )
         if resume_session and session_id is None:
             raise SessionError(400, "resume_session requires a session_id")
+        if (
+            start_session and session_id is not None
+            and not SESSION_ID_PATTERN.fullmatch(session_id)
+        ):
+            raise SessionError(
+                400,
+                f"session_id {session_id!r} must be 1-128 characters of "
+                "letters, digits, '_' and '-'",
+            )
         try:
             timeout_s = config.resolve_timeout_s(session_timeout_s)
         except ValueError as e:
@@ -323,9 +338,13 @@ class SessionRegistry:
                     f"({sorted(record.active_request_ids)}); wait for it to "
                     "finish or abort it first",
                 )
+            if record.closing:
+                raise SessionError(
+                    409,
+                    f"session {session_id!r} is already being torn down"
+                    + (f": {record.closing_reason}" if record.closing_reason else ""),
+                )
             self._mark_closing_locked(record, "deleted by the client")
-            if record.teardown_asked:
-                return  # one ask, one ACK
             record.teardown_asked = True
         self._teardown(session_id)
 
@@ -390,9 +409,18 @@ class SessionRegistry:
     def torn_down(self, session_id: str) -> None:
         """The conductor confirmed the state is gone; lift the tombstone."""
         with self._lock:
-            record = self._sessions.pop(session_id, None)
+            record = self._sessions.get(session_id)
             if record is None:
                 return
+            if not record.closing:
+                # a late ACK for an earlier session under the same id (a
+                # forced finalize of an old barrier); this one is live
+                logger.warning(
+                    "Ignoring teardown confirmation for live session %s",
+                    session_id,
+                )
+                return
+            del self._sessions[session_id]
             for request_id in record.active_request_ids:
                 self._request_to_session.pop(request_id, None)
         logger.info("Session %s released", session_id)
@@ -408,24 +436,46 @@ class SessionRegistry:
     # ------------------------------------------------------------------
 
     def snapshot(self) -> list[dict]:
+        """Every session, ids included. For tests and in-process callers
+        only: an id is all it takes to resume or delete a session, so the HTTP
+        surface reports ``counts`` and per-id ``describe`` instead."""
+        with self._lock:
+            return [self._describe_locked(r) for r in self._sessions.values()]
+
+    def describe(self, session_id: str) -> dict | None:
+        """One session, for a caller that already holds its id."""
+        with self._lock:
+            record = self._sessions.get(session_id)
+            return None if record is None else self._describe_locked(record)
+
+    def counts(self) -> dict:
+        """How many sessions are live and closing, against the cap."""
+        with self._lock:
+            closing = sum(1 for r in self._sessions.values() if r.closing)
+            return {
+                "live": len(self._sessions) - closing,
+                "closing": closing,
+                "max_concurrent_sessions": (
+                    None if self.config is None
+                    else self.config.max_concurrent_sessions
+                ),
+            }
+
+    def _describe_locked(self, r: SessionRecord) -> dict:
         now = self._clock()
         ttl_mode = (
             self.config.ttl_mode if self.config is not None
             else SessionTTLMode.IDLE
         )
-        with self._lock:
-            return [
-                {
-                    "session_id": r.session_id,
-                    "timeout_s": r.timeout_s,
-                    "age_s": round(now - r.created_at, 3),
-                    "idle_s": round(now - r.last_activity, 3),
-                    "expires_in_s": round(r.deadline(ttl_mode) - now, 3),
-                    "active_request_ids": sorted(r.active_request_ids),
-                    "closing": r.closing,
-                }
-                for r in self._sessions.values()
-            ]
+        return {
+            "session_id": r.session_id,
+            "timeout_s": r.timeout_s,
+            "age_s": round(now - r.created_at, 3),
+            "idle_s": round(now - r.last_activity, 3),
+            "expires_in_s": round(r.deadline(ttl_mode) - now, 3),
+            "active_request_ids": sorted(r.active_request_ids),
+            "closing": r.closing,
+        }
 
     def fail_all(self, reason: str) -> None:
         """Forget every session, for a deployment that is going down."""

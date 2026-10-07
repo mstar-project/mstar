@@ -356,10 +356,13 @@ def test_the_happy_path_removal_carries_end_session_and_opens_the_barrier():
 
     worker_removes = _sent(c, "w0", WorkerMessageType.REMOVE_REQUEST)
     assert [m.body.end_session for m in worker_removes] == [True]
+    # named, for a worker that never admitted the request to tear down
+    assert [m.body.session_id for m in worker_removes] == ["s"]
     # the preprocess worker holds no session state, so it is not asked to
     # end one and is not part of the barrier
     pre_removes = _sent(c, PREPROCESS, WorkerMessageType.REMOVE_REQUEST)
     assert [m.body.end_session for m in pre_removes] == [False]
+    assert [m.body.session_id for m in pre_removes] == [None]
     assert c.session_teardowns["s"].expected_acks == {"w0"}
 
     c._handle_session_torn_down(SessionTornDown("s", "w0"))

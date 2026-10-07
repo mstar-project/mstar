@@ -306,6 +306,9 @@ class APIServer:
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
         )
+        # Teardowns are sent from both the result-drain thread and the HTTP
+        # thread, and a ZMQ socket is single-threaded by contract.
+        self._send_lock = threading.Lock()
 
         # Session tracking. The registry decides what a request may name and
         # when a session is collected; the conductor carries it out.
@@ -330,13 +333,14 @@ class APIServer:
     def _request_session_teardown(self, session_id: str) -> None:
         """Ask the conductor to free a session's state. The registry holds the
         tombstone until ``session_torn_down`` comes back."""
-        self.communicator.send(
-            "conductor",
-            ConductorMessage(
-                message_type=ConductorMessageType.TEARDOWN_SESSION,
-                body=TeardownSession(session_id=session_id),
-            ),
-        )
+        with self._send_lock:
+            self.communicator.send(
+                "conductor",
+                ConductorMessage(
+                    message_type=ConductorMessageType.TEARDOWN_SESSION,
+                    body=TeardownSession(session_id=session_id),
+                ),
+            )
 
     def finalize_setup(self) -> None:
         """Block until the conductor signals that every worker has finished
@@ -1245,9 +1249,13 @@ def _ws_session(server, message: dict, request_id: str) -> SessionRequest:
     moves between the two without changing what it sends.
     """
     flags = {
-        name: bool(message.get(name, False))
+        name: message.get(name, False)
         for name in ("start_session", "resume_session", "end_session")
     }
+    for name, value in flags.items():
+        # not `bool()`: a JSON client sending "false" would start a session
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be a boolean")
     session_id = message.get("session_id")
     if session_id is not None and not isinstance(session_id, str):
         raise ValueError("session_id must be a string")
@@ -1328,17 +1336,9 @@ async def generate_ws(websocket: WebSocket):
                 raise ValueError("model_kwargs must be a JSON object")
             if request_id is None:
                 request_id = str(uuid.uuid4())
+            # the session frame reaches the client as the first chunk of
+            # ``iter_result_chunks``; see ``submit_request``
             session = _ws_session(api_server, message, request_id)
-            if session.session_id is not None:
-                await send({
-                    "request_id": request_id, "modality": "session",
-                    "data": session.session_id.encode("utf-8"),
-                    "metadata": {
-                        "session_id": session.session_id,
-                        "created": session.created,
-                        "end_session": session.end_session,
-                    },
-                }, binary)
             request_id = api_server.submit_request(
                 text=text,
                 file_paths=file_paths or None,
@@ -1588,6 +1588,9 @@ async def generate(
         chunks = await api_server.collect_results(request_id, request)
         outputs: dict[str, list[dict]] = {}
         for chunk in chunks:
+            if chunk.modality == "session":
+                # reported once, as the body's ``session_id`` below
+                continue
             outputs.setdefault(chunk.modality, []).append({
                 "data": base64.b64encode(chunk.data).decode("ascii"),
                 "metadata": chunk.metadata,
@@ -1635,14 +1638,31 @@ async def delete_session(session_id: str):
 
 
 @app.get("/sessions")
-async def list_sessions():
-    """Every session the server holds, live or winding down."""
+async def session_counts():
+    """How many sessions the server holds, live or winding down.
+
+    Counts, not ids: there is no auth, and an id is all it takes to resume or
+    delete a session, so listing them would hand every client's out.
+    """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
     return {
         "sessions_enabled": api_server.sessions.enabled,
-        "sessions": api_server.sessions.snapshot(),
+        **api_server.sessions.counts(),
     }
+
+
+@app.get("/sessions/{session_id}")
+async def describe_session(session_id: str):
+    """One session's state, for a client that already holds its id."""
+    if api_server is None:
+        raise HTTPException(status_code=503, detail="Server not ready")
+    entry = api_server.sessions.describe(session_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"unknown session {session_id!r}",
+        )
+    return entry
 
 
 @app.get("/health")

@@ -67,7 +67,7 @@ def _worker(
         remove_request=lambda rid: None,
     )
     w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid, end_session=False: None,
+        remove_request=lambda rid, end_session=False, **kw: None,
         evictable_nodes=lambda: [],
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
@@ -274,7 +274,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: ["n"],
-        add_request=lambda rid, cfgs, session_id=None: seen.setdefault(
+        add_request=lambda rid, cfgs, session=None: seen.setdefault(
             "engine", rid,
         ),
     )

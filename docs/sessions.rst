@@ -157,7 +157,10 @@ streaming (modality ``"session"``, with ``session_id`` in its metadata), and as
 ``session_id`` in the JSON body otherwise.
 
 ``DELETE /sessions/{id}`` ends a session without a request, and
-``GET /sessions`` lists what the server holds.
+``GET /sessions/{id}`` reports one (its TTL, whether a request is in flight,
+whether it is closing). ``GET /sessions`` gives counts only — live, closing,
+and the cap — never ids: the server has no auth, and an id is all it takes to
+resume or delete a session.
 
 ``/generate/ws`` takes the same five fields on each message, and answers a
 refused session in-band with the status the form route would have given, so a
@@ -189,10 +192,14 @@ Refusals
 
 - ``400`` — the model does not support sessions; ``start_session`` and
   ``resume_session`` together; a session named without either flag; a
-  ``session_timeout_s`` over the deployment's maximum.
+  ``session_timeout_s`` that is not a positive number or is over the
+  deployment's maximum; a ``session_id`` to start with that is not 1-128
+  letters, digits, ``_`` and ``-``.
 - ``404`` — resuming or deleting a session that does not exist.
 - ``409`` — starting a session whose id is taken; resuming or deleting one that
   already has a request in flight, or that is being torn down.
+- ``410`` — resuming a session that outgrew its state budget; its state was
+  dropped when its last request finished (see `Outgrowing the budget`_).
 - ``429`` — the deployment is at ``max_concurrent_sessions``.
 
 From the SDK
@@ -275,6 +282,33 @@ its own role block, and a resuming turn renders the user block and the
 assistant's opener alone. A model that ignores the argument renders as it always
 did.
 
+The other end of the join is the previous reply, and what the KV holds of it
+depends on how it stopped. The token that stopped the decode loop (the EOS for a
+finished reply, the last token for one ``max_output_tokens`` cut) is fed back
+only when a speculative step had already run past the stop, which under async
+scheduling is the common case. The worker records that overshoot per node, and
+when the request hands its state back to a continuing session, the engine sets
+``OVERSHOT_LAST_ITER`` in that node's submodule session state (and clears it for
+a turn that stopped exactly). Which token stopped the loop, and whether it was
+the EOS, is the model's to record: its ``check_stop`` sees the turn's real last
+token exactly once, since an overshooting step's outputs are dropped before the
+stop check.
+
+``TextSessionModel``'s LLM reads both on a resumed turn's first prefill and
+puts back what the KV is missing:
+
+======================  ===================  ===========================
+last reply ended on     its token in the KV  its token not in the KV
+======================  ===================  ===========================
+EOS                     ``\n``               ``<|im_end|>\n``
+a cut                   nothing              the token
+======================  ===================  ===========================
+
+A cut reply is left open rather than closed like a finished one: the KV holds
+the whole reply the client saw and nothing after it, so a next turn asking to
+continue reads as the reply being interrupted rather than finished. The flags are cleared once that prefill has run, not when it is prepared,
+since a step refused at admission is prepared again.
+
 The role label is not cosmetic. Over 20 greedy two-turn chats on that model,
 asked ``What is my name?`` after being told it:
 
@@ -297,9 +331,13 @@ Limits in this version
   second request's inputs into the first; two requests sharing a session's
   resource state would corrupt it.
 - No rollback: a failed request ends its session rather than rewinding it.
-- State parked between a session's requests is not an eviction candidate: the
-  worker's LRU only sees live requests. Size ``max_concurrent_sessions`` times
-  each resource's ``max_state`` against the pool, leaving room for the requests
+- State parked between a session's requests goes to host memory when a running
+  request needs its pages, longest-idle session first and before any cached
+  prefix is evicted, but only for a KV cache with ``cpu_offload_pages``; the
+  next turn brings it back at admission. Without a host pool, and for a resource
+  with no offload (recurrent state), parked state holds its pages until the
+  session ends: size ``max_concurrent_sessions`` times each resource's
+  ``max_state`` against the pool, leaving room for the requests
   ``max_concurrent_requests`` allows, or a full pool will start refusing
   admission. (A session's state does follow its request through an offload
   while that request is running.)
@@ -309,7 +347,7 @@ Limits in this version
   and video generation), and the optional Rust frontend (``--rust-frontend``)
   carries no session fields: it serves its own HTTP surface, so it would need
   the five fields on its ``/generate`` and chat routes, the session chunk in its
-  writers, and new bridge messages for ``GET /sessions`` and
+  writers, and new bridge messages for ``GET /sessions``, ``GET /sessions/{id}`` and
   ``DELETE /sessions/{id}``, which live only in the Python server.
 - Only ``test_text_session`` declares session support. Any other deployment
   refuses sessions until its model opts in.

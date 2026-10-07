@@ -8,12 +8,14 @@ minted id coming back in the response, and the session flags reaching
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 sys.path.insert(0, ".")
 
 from fastapi.testclient import TestClient
 
 from mstar.api_server import entrypoint
+from mstar.api_server.request_types import ResultChunk
 from mstar.api_server.sessions import SessionRegistry
 from mstar.model.sessions import SessionResourceConfig, SessionsConfig
 
@@ -169,16 +171,31 @@ def test_a_refused_submit_releases_the_session_it_claimed(monkeypatch):
 
 # ── /sessions ───────────────────────────────────────────────────────────────
 
-def test_list_sessions_reports_what_the_server_holds(monkeypatch):
+def test_get_sessions_counts_without_naming_anyone(monkeypatch):
+    server = _FakeServer(_config(max_concurrent_sessions=4))
+    client = _client(monkeypatch, server)
+    _generate(client, start_session="true", session_id="secret-id")
+
+    body = client.get("/sessions").json()
+
+    assert body == {
+        "sessions_enabled": True, "live": 1, "closing": 0,
+        "max_concurrent_sessions": 4,
+    }
+    assert "secret-id" not in client.get("/sessions").text
+
+
+def test_get_session_describes_one_its_caller_names(monkeypatch):
     server = _FakeServer(_config())
     client = _client(monkeypatch, server)
     _generate(client, start_session="true", session_id="s")
 
-    body = client.get("/sessions").json()
+    body = client.get("/sessions/s").json()
 
-    assert body["sessions_enabled"] is True
-    assert [s["session_id"] for s in body["sessions"]] == ["s"]
-    assert body["sessions"][0]["active_request_ids"]
+    assert body["session_id"] == "s"
+    assert body["active_request_ids"]
+    assert body["closing"] is False
+    assert client.get("/sessions/other").status_code == 404
 
 
 def test_delete_session_closes_it(monkeypatch):
@@ -211,3 +228,87 @@ def test_delete_with_a_request_in_flight_is_a_409(monkeypatch):
 
     assert response.status_code == 409
     assert server.torn_down == []
+
+
+def test_the_non_streaming_body_reports_the_session_once(monkeypatch):
+    server = _FakeServer(_config())
+
+    async def _collect(request_id, raw_request=None):
+        return [
+            ResultChunk(
+                request_id=request_id, modality="session", data=b"s",
+                metadata={"session_id": "s"},
+            ),
+            ResultChunk(request_id=request_id, modality="text", data=b"ok"),
+        ]
+
+    server.collect_results = _collect
+    response = _generate(
+        _client(monkeypatch, server), start_session="true", session_id="s",
+    )
+
+    body = response.json()
+    assert body["session_id"] == "s"
+    assert set(body["outputs"]) == {"text"}
+
+
+def test_a_second_delete_of_a_closing_session_is_a_409(monkeypatch):
+    server = _FakeServer(_config())
+    client = _client(monkeypatch, server)
+    _generate(client, start_session="true", session_id="s")
+    server.sessions.finish_request(server.submitted[0]["request_id"])
+    assert client.delete("/sessions/s").status_code == 200
+
+    response = client.delete("/sessions/s")
+
+    assert response.status_code == 409
+    assert server.torn_down == ["s"]
+
+
+# ── /generate/ws ────────────────────────────────────────────────────────────
+
+class _WsServer(_FakeServer):
+    """Streams back what ``submit_request`` queues: the session frame it
+    prepends, then the output."""
+
+    upload_dir = Path("/tmp")
+
+    async def iter_result_chunks(self, request_id):
+        session = self.submitted[-1]["session"]
+        if session.session_id is not None:
+            yield ResultChunk(
+                request_id=request_id, modality="session",
+                data=session.session_id.encode(),
+                metadata={"session_id": session.session_id},
+            )
+        yield ResultChunk(request_id=request_id, modality="text", data=b"ok")
+
+
+def _ws_turn(client, **message) -> list[dict]:
+    frames = []
+    with client.websocket_connect("/generate/ws") as ws:
+        ws.send_json({"text": "hi", "request_id": "r0", **message})
+        while True:
+            frame = ws.receive_json()
+            frames.append(frame)
+            if frame.get("finish") or frame.get("error"):
+                return frames
+
+
+def test_a_ws_session_reply_carries_the_session_frame_once(monkeypatch):
+    client = _client(monkeypatch, _WsServer(_config()))
+
+    frames = _ws_turn(client, start_session=True, session_id="s")
+
+    assert [f.get("modality") for f in frames].count("session") == 1
+
+
+def test_a_ws_session_flag_must_be_a_boolean(monkeypatch):
+    server = _WsServer(_config())
+    client = _client(monkeypatch, server)
+
+    [frame] = _ws_turn(client, start_session="false")
+
+    assert "must be a boolean" in frame["error"]
+    assert server.submitted == []
+    assert server.sessions.snapshot() == []

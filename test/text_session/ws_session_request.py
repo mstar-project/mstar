@@ -28,7 +28,7 @@ async def _turn(ws, request_id: str, text: str, **session) -> list[dict]:
     await ws.send(json.dumps({
         "text": text, "request_id": request_id,
         "output_modalities": "text",
-        "model_kwargs": {"max_output_tokens": 32},
+        "model_kwargs": {"max_output_tokens": 32, "top_k": 1},
         **session,
     }))
     frames = []

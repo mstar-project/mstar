@@ -225,3 +225,126 @@ def test_the_config_puts_both_walks_on_rank_zero(model):
     assert {walk for wg in graphs for walk in wg.graph_walks} == set(TEXT_WALKS)
     assert all(set(wg.section.get_nodes()) == {"LLM"} for wg in graphs)
     assert all(wg.ranks == [0] and wg.tp_size == 1 for wg in graphs)
+
+
+# ── the join between one turn and the next ─────────────────────────────────
+
+EOS = 7
+NEWLINE = [9]
+TOKEN = 42
+
+
+def _llm():
+
+    from mstar.model.submodule_base import NodeSubmodule
+    from mstar.model.test_text_session.model import TextSessionLLMSubmodule
+
+    # no weights: only the session bookkeeping is under test
+    sub = TextSessionLLMSubmodule.__new__(TextSessionLLMSubmodule)
+    NodeSubmodule.__init__(sub)
+    sub.eos_token_id = EOS
+    sub.newline_ids = list(NEWLINE)
+    return sub
+
+
+def _info(session=None, walk="decode", max_tokens=100, iters=0):
+    from types import SimpleNamespace
+
+    from mstar.model.higgs_audio.config import SAMPLER
+
+    return SimpleNamespace(
+        session=session, graph_walk=walk, max_tokens=max_tokens,
+        dynamic_loop_iter_counts={"decode_loop": iters},
+        resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)},
+        step_metadata={},
+    )
+
+
+def _end_turn(sub, token, *, in_kv, session="s"):
+    """A turn in ``session`` stops on ``token``; the engine then flags
+    whether a speculative step overshot it."""
+    import torch
+
+    from mstar.model.submodule_base import OVERSHOT_LAST_ITER
+
+    stops = sub.check_stop(
+        "r0", _info(RequestSession(session), max_tokens=10, iters=8),
+        {"new_token": [torch.tensor([token])]},
+    )
+    assert stops == {"decode_loop"}
+    if in_kv:
+        sub.session_state(session).add(OVERSHOT_LAST_ITER, True)
+
+
+@pytest.mark.parametrize("token, in_kv, join", [
+    (EOS, True, NEWLINE),
+    (EOS, False, [EOS, *NEWLINE]),
+    # a cut reply is left open: only its own missing token comes back
+    (TOKEN, True, []),
+    (TOKEN, False, [TOKEN]),
+])
+def test_the_resumed_turn_puts_back_what_the_kv_is_missing(token, in_kv, join):
+    sub = _llm()
+    _end_turn(sub, token, in_kv=in_kv)
+
+    resumed = _info(RequestSession("s", resumed=True), walk="prefill_text")
+
+    assert sub.turn_join(resumed) == join
+
+
+def test_a_turn_that_does_not_resume_renders_no_join():
+    sub = _llm()
+    _end_turn(sub, TOKEN, in_kv=False)
+
+    assert sub.turn_join(_info(RequestSession("s"), walk="prefill_text")) == []
+    assert sub.turn_join(_info(None, walk="prefill_text")) == []
+    assert sub.turn_join(
+        _info(RequestSession("other", resumed=True), walk="prefill_text")
+    ) == []
+
+
+def test_a_step_that_does_not_stop_records_nothing():
+    import torch
+
+    sub = _llm()
+    sub.check_stop(
+        "r0", _info(RequestSession("s")), {"new_token": [torch.tensor([TOKEN])]},
+    )
+
+    assert sub.session_states == {}
+
+
+def test_the_join_leads_the_first_prefill_and_is_cleared_after_it(monkeypatch):
+    import torch
+
+    from mstar.model.bagel.submodules import LLMSubmodule
+    from mstar.model.submodule_base import ARNodeInputs
+
+    def _base_prepare(self, graph_walk, fwd_info, inputs, **kwargs):
+        ids = inputs["text_inputs"][0]
+        return ARNodeInputs(input_ids=ids, input_seq_len=ids.shape[0])
+
+    monkeypatch.setattr(LLMSubmodule, "prepare_inputs", _base_prepare)
+    sub = _llm()
+    _end_turn(sub, TOKEN, in_kv=False)
+    resumed = _info(RequestSession("s", resumed=True), walk="prefill_text")
+    prompt = {"text_inputs": [torch.tensor([1, 2, 3])]}
+
+    # a step refused at admission is prepared again; it renders the join again
+    for _ in range(2):
+        prepared = sub.prepare_inputs("prefill_text", resumed, prompt)
+        assert prepared.input_ids.tolist() == [TOKEN, 1, 2, 3]
+        assert prepared.input_seq_len == 4
+
+    sub.postprocess("r1", resumed, {})
+
+    assert sub.prepare_inputs("prefill_text", resumed, prompt).input_ids.tolist() == [1, 2, 3]
+
+
+def test_the_model_hands_its_llm_the_newline_after_im_end(model):
+    from mstar.model.test_text_session.model import TextSessionLLMSubmodule
+
+    assert model.LLM_SUBMODULE_CLS is TextSessionLLMSubmodule
+    assert model.tokenizer.decode(model._encode_text("\n").tolist()) == "\n"
+    # the turn's EOS is what closes an assistant block in the template
+    assert model.tokenizer.convert_ids_to_tokens(model.eos_token_id) == "<|im_end|>"

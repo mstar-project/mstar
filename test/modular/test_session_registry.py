@@ -129,6 +129,16 @@ def test_a_timeout_over_the_deployment_maximum_is_refused():
     assert e.value.status_code == 400
 
 
+@pytest.mark.parametrize("session_id", ["a/b", "..", "", "x" * 129, "s p"])
+def test_an_id_that_cannot_go_in_a_url_is_refused(session_id):
+    reg, _, _ = _registry()
+
+    with pytest.raises(SessionError, match="session_id") as e:
+        _start(reg, session_id=session_id)
+    assert e.value.status_code == 400
+    assert reg.snapshot() == []
+
+
 # ── start ───────────────────────────────────────────────────────────────────
 
 def test_start_without_an_id_mints_one_and_reports_it():
@@ -305,15 +315,16 @@ def test_note_ending_holds_the_tombstone_before_the_request_finishes():
     assert torn_down == []
 
 
-def test_delete_asks_the_conductor_once_and_holds_the_id():
+def test_a_second_delete_is_a_409_and_asks_the_conductor_once():
     reg, _, torn_down = _registry()
     _start(reg, request_id="r0", session_id="s")
     reg.finish_request("r0")
 
     reg.delete("s")
-    reg.delete("s")
+    with pytest.raises(SessionError, match="already being torn down") as e:
+        reg.delete("s")
 
-    assert torn_down == ["s"]
+    assert (e.value.status_code, torn_down) == (409, ["s"])
     assert reg.snapshot()[0]["closing"] is True
 
 
@@ -347,6 +358,21 @@ def test_the_id_is_usable_again_only_after_the_conductor_acks():
 
     assert _start(reg, request_id="r2", session_id="s").session_id == "s"
     assert len(reg.snapshot()) == 1
+
+
+def test_a_late_ack_does_not_release_a_live_session_that_reused_the_id():
+    reg, _, _ = _registry()
+    _start(reg, request_id="r0", session_id="s")
+    reg.finish_request("r0")
+    reg.delete("s")
+    reg.torn_down("s")
+    _start(reg, request_id="r1", session_id="s")
+
+    # the first session's teardown confirmed a second time
+    reg.torn_down("s")
+
+    assert [e["session_id"] for e in reg.snapshot()] == ["s"]
+    assert reg.session_of("r1") == "s"
 
 
 def test_a_failed_request_takes_its_session_down():

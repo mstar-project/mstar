@@ -177,6 +177,16 @@ class ARNodeInputs(NodeInputs):
         return dict(out)
 
 
+# Set by the engine in a node's session state when the session's last request
+# ended a loop on an overshot step: a speculative iteration already ran past
+# the stop, so the stopping iteration's output was fed back in and its effect
+# is in the node's resource state (for an LLM, the stopping token is in the
+# KV). Absent when the loop stopped exactly, which leaves that output out.
+# What the output was is the model's to record; a model that renders the join
+# between turns reads both on its next first step and clears them.
+OVERSHOT_LAST_ITER = "overshot_last_iter"
+
+
 @dataclass
 class PerRequestState:
     """Engine-owned per-request state a submodule persists across forwards.

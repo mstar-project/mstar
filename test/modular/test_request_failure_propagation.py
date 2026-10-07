@@ -90,6 +90,13 @@ def test_fail_requests_reports_per_rid_errors_once():
     assert w.scheduler.failed_rids == {"r1", "r2"}
 
 
+def test_fail_requests_carries_a_status_only_for_rids_it_reports():
+    w = _worker(known_rids=("r1",))
+    w._fail_requests({"r1": "cleared", "gone": "boom"}, {"r1": 410, "gone": 410})
+    [(_, msg)] = w.sent
+    assert msg.body == FailRequests(errors={"r1": "cleared"}, statuses={"r1": 410})
+
+
 def test_fail_requests_ignores_rids_the_worker_already_dropped():
     """The conductor answers a failure by tearing the request down. It won't
     start one for a request it no longer tracks, so reporting an unknown rid

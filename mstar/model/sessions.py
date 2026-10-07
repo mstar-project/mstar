@@ -6,6 +6,7 @@ release it when the session ends (or its TTL expires).
 """
 
 import logging
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -145,8 +146,8 @@ class SessionsConfig:
         """
         if requested is None:
             return self.default_timeout_s
-        if requested <= 0:
-            raise ValueError("session_timeout_s must be positive")
+        if not math.isfinite(requested) or requested <= 0:
+            raise ValueError("session_timeout_s must be a positive number")
         if requested > self.max_timeout_s:
             raise ValueError(
                 f"session_timeout_s {requested} exceeds this deployment's "

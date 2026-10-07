@@ -144,7 +144,9 @@ class RopeManager(PositionManager):
 
     def ingest_request(self, rid: str, overrides=None):
         del overrides
-        self._counters[rid] = {}
+        # setdefault: a two-partition request is ingested once per partition,
+        # and the second must not wipe counters a session handed the first
+        self._counters.setdefault(rid, {})
 
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)

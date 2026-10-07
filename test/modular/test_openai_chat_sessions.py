@@ -197,3 +197,19 @@ def test_a_sessionless_stream_names_no_session():
 
 async def _drain(stream) -> list[str]:
     return [part async for part in stream]
+
+
+def test_a_refused_submit_releases_the_session_it_claimed():
+    api = _Api(_config())
+
+    def _boom(**kwargs):
+        raise RuntimeError("preprocess exploded")
+
+    api.submit_request = _boom
+
+    with pytest.raises(RuntimeError):
+        _chat(api, start_session=True, session_id="s")
+
+    # the failed request took the session with it, rather than leaving it
+    # busy forever with a request that never ran
+    assert api.torn_down == ["s"]

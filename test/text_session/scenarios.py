@@ -98,8 +98,19 @@ class Checks:
 
 # ── talking to the server ───────────────────────────────────────────────────
 
+# Every session id this run has been handed. The server lists counts, never
+# ids, so the scenarios keep track of their own.
+_OPENED: set[str] = set()
+
+
 def _turn(client, text, tokens=16, **session):
-    return client.generate(text=text, max_output_tokens=tokens, **session)
+    # top_k=1: the recall checks must not hang on the model's sampling default
+    result = client.generate(
+        text=text, max_output_tokens=tokens, top_k=1, **session,
+    )
+    if result.session_id:
+        _OPENED.add(result.session_id)
+    return result
 
 
 def _refused(call) -> int | None:
@@ -123,15 +134,28 @@ def _recall(client, session_id: str) -> str:
     ).text or ""
 
 
-def _held(client) -> list[str]:
-    return [s["session_id"] for s in client.sessions()]
-
-
 def _snapshot(client, session_id: str) -> dict | None:
-    for entry in client.sessions():
-        if entry["session_id"] == session_id:
-            return entry
-    return None
+    """``GET /sessions/{id}``, retried once if the connection was dropped.
+
+    The server closes an idle keep-alive connection after 5s (uvicorn's
+    default) and these scenarios poll on about that cadence, so a pooled socket
+    can be reset between two reads. Only this read is retried: resending a
+    generation POST could open a second session.
+    """
+    try:
+        return client.session(session_id)
+    except requests.ConnectionError:
+        return client.session(session_id)
+
+
+def _snapshot_all(client) -> list[dict]:
+    """Every session this run opened that the server still holds."""
+    entries = [_snapshot(client, s) for s in sorted(_OPENED)]
+    return [entry for entry in entries if entry is not None]
+
+
+def _held(client) -> list[str]:
+    return [s["session_id"] for s in _snapshot_all(client)]
 
 
 def _wait_released(client, session_id: str, timeout: float = 60.0) -> bool:
@@ -139,14 +163,14 @@ def _wait_released(client, session_id: str, timeout: float = 60.0) -> bool:
     confirmed the session's state is gone."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if session_id not in _held(client):
+        if _snapshot(client, session_id) is None:
             return True
         time.sleep(0.25)
     return False
 
 
 def purge(client, when: str) -> None:
-    """End every session the server holds.
+    """End every session this run opened that the server still holds.
 
     The scenarios run one after another against one server and most of them
     count sessions, so each has to start from an empty deployment and leave one
@@ -154,7 +178,7 @@ def purge(client, when: str) -> None:
     moment to finish first.
     """
     for _ in range(60):
-        entries = client.sessions()
+        entries = _snapshot_all(client)
         if not entries:
             return
         for entry in entries:
@@ -281,7 +305,7 @@ def capacity_evict(client, dep, ck) -> None:
 
     # a session being written to right now is not a candidate, so a deployment
     # whose sessions are all in flight refuses even under `evict`
-    live = [e["session_id"] for e in client.sessions() if not e["closing"]]
+    live = [e["session_id"] for e in _snapshot_all(client) if not e["closing"]]
     flights = [_InFlight(client, s) for s in live]
     what = "a start is refused while every session is in flight"
     with contextlib.ExitStack() as stack:
@@ -504,10 +528,14 @@ def main(argv=None) -> int:
     if not client.health():
         print(f"no healthy server at {args.url}")
         return 1
-    held = _held(client)
-    if held:
-        print(f"the server already holds sessions {held}; ending them first")
-    purge(client, "before")
+    counts = client.session_counts()
+    if counts["live"] or counts["closing"]:
+        # their ids are not ours to see, so they can only be waited out
+        print(
+            f"WARNING: the server already holds {counts['live']} live and "
+            f"{counts['closing']} closing sessions this run did not open; "
+            "scenarios that count sessions may misread them"
+        )
 
     print(f"scenario {args.scenario} against {args.config} ({dep})", flush=True)
     ck = Checks()

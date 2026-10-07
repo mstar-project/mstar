@@ -34,17 +34,23 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
         request_id=request_id,
     )
 
-    api.submit_request(
-        text=args.text,
-        file_paths=args.file_paths,
-        input_modalities=args.input_modalities,
-        output_modalities=args.output_modalities,
-        model_kwargs=args.model_kwargs,
-        prompt_parts=args.prompt_parts,
-        streaming=bool(req.stream),
-        request_id=request_id,
-        session=session,
-    )
+    try:
+        api.submit_request(
+            text=args.text,
+            file_paths=args.file_paths,
+            input_modalities=args.input_modalities,
+            output_modalities=args.output_modalities,
+            model_kwargs=args.model_kwargs,
+            prompt_parts=args.prompt_parts,
+            streaming=bool(req.stream),
+            request_id=request_id,
+            session=session,
+        )
+    except Exception as e:
+        if session.session_id is not None:
+            # never reached the engine, so nothing else would release it
+            api.sessions.finish_request(request_id, failed=True, error=str(e))
+        raise
 
     if req.stream:
         return _stream(

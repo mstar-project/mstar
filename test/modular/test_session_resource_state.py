@@ -15,7 +15,7 @@ sys.path.insert(0, ".")
 
 
 from mstar.engine.resources import Resource, StepRunner
-from mstar.model.sessions import SessionResourceConfig
+from mstar.model.sessions import RequestSession, SessionResourceConfig
 
 
 class _Stub(Resource):
@@ -96,10 +96,11 @@ def test_a_sessionless_request_behaves_exactly_as_before():
 def test_only_session_resources_are_asked_to_hold_state():
     runner, res = _runner(session_keys=("kv",))
 
-    runner.ingest_request("r0", session_id="s")
+    runner.ingest_request("r0", session=RequestSession("s"))
     runner.remove_request("r0", session_id="s")
 
-    assert res["kv"].calls == ["ingest:r0", "adopt:r0:s", "retain:r0:s"]
+    # the session's first request has nothing to adopt
+    assert res["kv"].calls == ["ingest:r0", "retain:r0:s"]
     # not a session resource: freed with the request, and never adopted
     assert res["sampler"].calls == ["ingest:r0", "remove:r0"]
 
@@ -108,13 +109,13 @@ def test_the_session_hands_its_state_to_the_next_request():
     runner, res = _runner(session_keys=("kv",))
     kv = res["kv"]
 
-    runner.ingest_request("r0", session_id="s")
+    runner.ingest_request("r0", session=RequestSession("s"))
     kv.requests["r0"] = 12  # the request built some state
     runner.remove_request("r0", session_id="s")
 
     assert kv.sessions == {"s": 12}
 
-    runner.ingest_request("r1", session_id="s")
+    runner.ingest_request("r1", session=RequestSession("s", resumed=True))
 
     assert kv.requests["r1"] == 12
     assert kv.sessions == {}  # held by the request while it runs
@@ -122,7 +123,7 @@ def test_the_session_hands_its_state_to_the_next_request():
 
 def test_remove_session_frees_every_session_resource_and_nothing_else():
     runner, res = _runner(session_keys=("kv", "pos"))
-    runner.ingest_request("r0", session_id="s")
+    runner.ingest_request("r0", session=RequestSession("s"))
     runner.remove_request("r0", session_id="s")
 
     runner.remove_session("s")
@@ -142,7 +143,7 @@ def test_session_resource_keys_names_what_holds_state():
 
 def test_state_within_budget_is_left_alone():
     runner, res = _runner(session_keys=("kv",), max_state=10)
-    runner.ingest_request("r0", session_id="s")
+    runner.ingest_request("r0", session=RequestSession("s"))
     res["kv"].requests["r0"] = 10
 
     runner.remove_request("r0", session_id="s")
@@ -153,7 +154,7 @@ def test_state_within_budget_is_left_alone():
 
 def test_no_budget_means_no_check():
     runner, res = _runner(session_keys=("kv",))
-    runner.ingest_request("r0", session_id="s")
+    runner.ingest_request("r0", session=RequestSession("s"))
     res["kv"].requests["r0"] = 10_000
 
     runner.remove_request("r0", session_id="s")
@@ -163,7 +164,7 @@ def test_no_budget_means_no_check():
 
 def test_going_over_budget_clears_and_owes_the_next_request_an_error():
     runner, res = _runner(session_keys=("kv",), max_state=10)
-    runner.ingest_request("r0", session_id="s")
+    runner.ingest_request("r0", session=RequestSession("s"))
     res["kv"].requests["r0"] = 40
 
     runner.remove_request("r0", session_id="s")
@@ -178,7 +179,7 @@ def test_going_over_budget_clears_and_owes_the_next_request_an_error():
 
 def test_ending_the_session_drops_the_owed_error_too():
     runner, res = _runner(session_keys=("kv",), max_state=1)
-    runner.ingest_request("r0", session_id="s")
+    runner.ingest_request("r0", session=RequestSession("s"))
     res["kv"].requests["r0"] = 40
     runner.remove_request("r0", session_id="s")
 
@@ -191,7 +192,7 @@ def test_a_breach_on_one_resource_clears_every_session_resource():
     # the others' state addresses what is being dropped, so a partial clear
     # would leave the session describing a context it no longer holds
     runner, res = _runner(session_keys=("kv",), derived=("pos",), max_state=10)
-    runner.ingest_request("r0", session_id="s")
+    runner.ingest_request("r0", session=RequestSession("s"))
     res["kv"].requests["r0"] = 40
     res["pos"].requests["r0"] = 40
 
@@ -203,9 +204,30 @@ def test_a_breach_on_one_resource_clears_every_session_resource():
 
 def test_a_cleared_session_is_still_usable():
     runner, res = _runner(session_keys=("kv",), max_state=4)
-    runner.ingest_request("r0", session_id="s")
+    runner.ingest_request("r0", session=RequestSession("s"))
     res["kv"].requests["r0"] = 99
     runner.remove_request("r0", session_id="s")
 
     assert res["kv"].session_state_size("s") <= 4
-    runner.ingest_request("r1", session_id="s")  # never raises
+    runner.ingest_request("r1", session=RequestSession("s", resumed=True))  # never raises
+
+
+def test_only_a_resumed_request_adopts():
+    # whatever is parked under a starting session's id is not its own
+    runner, res = _runner(session_keys=("kv",))
+    res["kv"].sessions["s"] = 7
+
+    runner.ingest_request("r0", session=RequestSession("s"))
+    assert "adopt:r0:s" not in res["kv"].calls
+
+    runner.ingest_request("r1", session=RequestSession("s", resumed=True))
+    assert "adopt:r1:s" in res["kv"].calls
+
+
+def test_session_holds_state_asks_every_session_resource():
+    runner, res = _runner(session_keys=("kv", "pos"))
+    assert runner.session_holds_state("s") is False
+
+    res["pos"].sessions["s"] = 3
+
+    assert runner.session_holds_state("s") is True

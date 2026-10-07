@@ -630,8 +630,7 @@ class Worker:
         self.request_state.add_request(request_id, body.request_info)
         self._sessions.bind(request_id, session_id)
         self.engine_manager.add_request(
-            request_id, body.request_info.resource_configs,
-            session_id=session_id,
+            request_id, body.request_info.resource_configs, session=session,
         )
         if session_id is not None:
             # A budget overflow the session owes this request: it was
@@ -639,7 +638,7 @@ class Worker:
             # from a context that is no longer what the client built.
             error = self.engine_manager.take_session_error(session_id)
             if error is not None:
-                self._fail_requests({request_id: error})
+                self._fail_requests({request_id: error}, {request_id: 410})
         self.tensor_manager.register_request(
             request_id, self._graph_runtime.get_sharding_config(request_id),
         )
@@ -714,6 +713,7 @@ class Worker:
             # it can be non-empty for a rid that never got a handle, and no
             # later message would ever pop it.
             self.scheduler.clear_wire_rid(body.request_id)
+            self._remove_unadmitted_session_request(body)
             return
         if request_id in self._in_flight_rids:
             self._pending_removes.add(request_id)
@@ -745,6 +745,13 @@ class Worker:
                             # same gap between steps
                             after_tp_seq=self._tp_broadcast_seq - 1,
                             end_session=body.end_session,
+                            # a follower may have held the request rather
+                            # than admitted it, and then needs the name
+                            session_id=(
+                                body.session_id
+                                or self._sessions.session_of(request_id)
+                                if body.end_session else None
+                            ),
                         )
                     )
                 )
@@ -757,11 +764,13 @@ class Worker:
         self._draining_rids.discard(body.request_id)
         self._pending_drains.discard(body.request_id)
         self._reads_done_sent.discard(body.request_id)
+        overshot_nodes = self._sessions.take_overshot(request_id)
         session_id = self._sessions.release(request_id)
         # end_session frees the session's own state alongside the request's;
         # otherwise the session keeps what this request built.
         self.engine_manager.remove_request(
             request_id, end_session=body.end_session,
+            overshot_nodes=overshot_nodes,
         )
         if body.end_session and session_id is not None:
             self._sessions.forget_session(session_id)
@@ -779,6 +788,22 @@ class Worker:
 
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
+
+    def _remove_unadmitted_session_request(self, body: RemoveRequest) -> None:
+        """The REMOVE of a resumed request this worker never admitted: held
+        until its session's previous request left, and drained before that.
+
+        Its NEW_REQUEST is dropped (from the hold, or already refused as
+        draining), and a session it was ending still goes, with its ACK; the
+        conductor's barrier would otherwise wait out its TTL.
+        """
+        if self._sessions.drop_held(body.request_id):
+            logger.info(
+                "Dropped held request %s; it was removed before admission",
+                body.request_id,
+            )
+        if body.end_session and body.session_id is not None:
+            self._teardown_session(TeardownSession(session_id=body.session_id))
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
@@ -2748,6 +2773,9 @@ class Worker:
                 batch_N.graph_walk, batch_N.loop_name,
             ) & set(batch_N.node_batch.request_ids)
             for stopped_rid in stopped_rids:
+                # this step took the stopping token as its input, so it is in
+                # the KV now; a session continuing from it needs to know
+                self._sessions.note_overshoot(stopped_rid, batch_N.node_name)
                 outputs.pop(stopped_rid, None)
                 valid_rids.discard(stopped_rid)
                 batch_N.batch.request_to_worker_graph.pop(stopped_rid, None)
@@ -3162,6 +3190,10 @@ class Worker:
             self._remove_request(RemoveRequest(
                 request_id=self._rid_str(rid), source=MessageSource.SELF,
                 end_session=self._sessions.ends_session(rid),
+                session_id=(
+                    self._sessions.session_of(rid)
+                    if self._sessions.ends_session(rid) else None
+                ),
             ))
 
     def _drop_failed_rids(
@@ -3277,10 +3309,13 @@ class Worker:
 
         self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
 
-    def _fail_requests(self, errors: dict[int, str]) -> None:
+    def _fail_requests(
+        self, errors: dict[int, str], statuses: dict[int, int] | None = None,
+    ) -> None:
         """Report requests this worker can no longer serve to the conductor.
 
-        ``errors`` maps request_id -> message. Rids the worker has already
+        ``errors`` maps request_id -> message, and ``statuses`` any HTTP
+        status other than a 500 to fail one with. Rids the worker has already
         torn down are dropped: reporting them would leave a permanent entry
         in ``scheduler.failed_rids`` (the conductor answers a failure with a
         REMOVE_REQUEST, and it won't send one for a request it no longer
@@ -3293,6 +3328,10 @@ class Worker:
         if not errors:
             return
         wire_errors = {self._rid_str(rid): msg for rid, msg in errors.items()}
+        wire_statuses = {
+            self._rid_str(rid): status
+            for rid, status in (statuses or {}).items() if rid in errors
+        }
         for wire_rid, msg in wire_errors.items():
             logger.error("Worker %s failing request %s: %s", self.worker_id, wire_rid, msg)
         # Stop scheduling new work for these rids while the teardown is in
@@ -3302,7 +3341,7 @@ class Worker:
             "conductor",
             ConductorMessage(
                 message_type=ConductorMessageType.FAIL_REQUESTS,
-                body=FailRequests(errors=wire_errors),
+                body=FailRequests(errors=wire_errors, statuses=wire_statuses),
             ),
         )
         # Note: we do not cleanup the request right now; we wait for the conductor

@@ -14,7 +14,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model
-from mstar.model.sessions import apply_sessions_yaml_overrides
+from mstar.model.sessions import RequestSession, apply_sessions_yaml_overrides
 
 logger = logging.getLogger(__name__)
 
@@ -200,17 +200,22 @@ class EngineManager:
     def add_request(
         self, request_id: str,
         resource_configs: dict[str, ResourceReqConfig] | None = None,
-        session_id: str | None = None,
+        session: RequestSession | None = None,
     ) -> None:
         """Open resource state for a request, on the per-resource configs the
         conductor resolved for it (``Model.get_request_resource_configs``).
 
-        A request in a session also takes on the state that session holds.
+        A request resuming a session also takes on the state that session holds.
         """
-        self.engine.add_request(request_id, resource_configs, session_id=session_id)
+        self.engine.add_request(request_id, resource_configs, session=session)
 
-    def remove_request(self, request_id: str, end_session: bool = False) -> None:
-        self.engine.remove_request(request_id, end_session=end_session)
+    def remove_request(
+        self, request_id: str, end_session: bool = False,
+        overshot_nodes: frozenset[str] = frozenset(),
+    ) -> None:
+        self.engine.remove_request(
+            request_id, end_session=end_session, overshot_nodes=overshot_nodes,
+        )
 
     def remove_session(self, session_id: str) -> None:
         self.engine.remove_session(session_id)

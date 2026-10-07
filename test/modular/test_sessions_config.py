@@ -73,6 +73,9 @@ def test_timeout_resolution():
         cfg.resolve_timeout_s(601)
     with pytest.raises(ValueError, match="positive"):
         cfg.resolve_timeout_s(0)
+    # NaN passes both comparisons, and then poisons every deadline it touches
+    with pytest.raises(ValueError, match="positive"):
+        cfg.resolve_timeout_s(float("nan"))
 
 
 # ── the deployment's overrides ──────────────────────────────────────────────

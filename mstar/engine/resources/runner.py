@@ -19,6 +19,7 @@ from mstar.engine.resources.step import (
     FullAdmitOutcome,
     SubmoduleStep,
 )
+from mstar.model.sessions import RequestSession
 from mstar.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -221,20 +222,22 @@ class StepRunner:
     def ingest_request(
         self, rid: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
-        session_id: str | None = None,
+        session: RequestSession | None = None,
     ) -> None:
         """open state on all resources; `overrides` are per-resource
 
-        A request in a session also takes on whatever that session's resources
-        already hold (`adopt_session_state`).
+        A request resuming a session also takes on whatever that session's
+        resources already hold (`adopt_session_state`). One that starts a
+        session adopts nothing, whatever is parked under its id.
         """
+        adopt = session is not None and session.resumed
         for key in self._order:
             resource = self._resources[key]
             resource.ingest_request(
                 rid, None if overrides is None else overrides.get(key)
             )
-            if session_id is not None and resource.session_config is not None:
-                resource.adopt_session_state(rid, session_id)
+            if adopt and resource.session_config is not None:
+                resource.adopt_session_state(rid, session.session_id)
 
     def remove_request(self, rid: str, session_id: str | None = None) -> None:
         """drop the request's state, or hand it back to its session
@@ -294,6 +297,13 @@ class StepRunner:
     def take_session_error(self, session_id: str) -> str | None:
         """The budget overflow owed to this session, consumed once."""
         return self._session_errors.pop(session_id, None)
+
+    def session_holds_state(self, session_id: str) -> bool:
+        """Whether any session resource holds something for the session."""
+        return any(
+            self._resources[key].session_state_size(session_id) > 0
+            for key in self.session_resource_keys()
+        )
 
     def session_resource_keys(self) -> list[str]:
         return [

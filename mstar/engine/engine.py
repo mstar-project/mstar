@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping
 
 import torch
 
@@ -41,9 +41,10 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
 )
 from mstar.graph.runtime.base import GraphRuntime
-from mstar.model.sessions import SessionResourceConfig
+from mstar.model.sessions import RequestSession, SessionResourceConfig
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
+    OVERSHOT_LAST_ITER,
     ARNodeInputs,
     InputMetadata,
     LazyRequestStates,
@@ -1918,21 +1919,64 @@ class Engine:
     def add_request(
         self, request_id: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
-        session_id: str | None = None,
+        session: RequestSession | None = None,
     ) -> None:
-        if session_id is not None:
+        if session is not None:
+            session_id = session.session_id
+            # First ingest only: a request with two partitions here arrives
+            # twice, and the first may already have written session state.
+            if (
+                not session.resumed
+                and request_id not in self._request_sessions
+                and self._session_holds_state(session_id)
+            ):
+                # The API server only reuses an id once its last teardown was
+                # confirmed (or forced), so this is a leftover. Continuing from
+                # it would serve the new session someone else's context.
+                logger.warning(
+                    "Session %s is starting but state is still parked under "
+                    "its id; dropping it", session_id,
+                )
+                self.remove_session(session_id)
             self._request_sessions[request_id] = session_id
-        self._runner.ingest_request(request_id, overrides, session_id=session_id)
+        self._runner.ingest_request(request_id, overrides, session=session)
 
-    def remove_request(self, request_id: str, end_session: bool = False) -> None:
+    def _session_holds_state(self, session_id: str) -> bool:
+        return self._runner.session_holds_state(session_id) or any(
+            session_id in submodule_mgmt.submodule.session_states
+            for submodule_mgmt in self._submodules.values()
+        )
+
+    def remove_request(
+        self, request_id: str, end_session: bool = False,
+        overshot_nodes: Collection[str] = (),
+    ) -> None:
         """Drop the request. Its session keeps whatever it built, unless
-        ``end_session`` says the session is over too."""
+        ``end_session`` says the session is over too.
+
+        ``overshot_nodes`` are the nodes whose loop ran one speculative step past
+        its stop for this request; a continuing session is told so per node
+        (``OVERSHOT_LAST_ITER``), since that step wrote the stopping token.
+        """
         session_id = self._request_sessions.pop(request_id, None)
         self._runner.remove_request(request_id, session_id=session_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
-        if end_session and session_id is not None:
+        if session_id is None:
+            return
+        if end_session:
             self.remove_session(session_id)
+            return
+        for node_name, submodule_mgmt in self._submodules.items():
+            submodule = submodule_mgmt.submodule
+            if node_name in overshot_nodes:
+                submodule.session_state(session_id).add(OVERSHOT_LAST_ITER, True)
+            elif session_id in submodule.session_states:
+                # this turn stopped exactly on its token; a flag an earlier
+                # turn left must not speak for it
+                submodule.session_states[session_id].kwargs.pop(
+                    OVERSHOT_LAST_ITER, None,
+                )
 
     def remove_session(self, session_id: str) -> None:
         """Free everything the session holds, resources and submodules alike."""

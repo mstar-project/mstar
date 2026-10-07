@@ -64,26 +64,26 @@ def main(argv: list[str] | None = None) -> int:
     # --- turn one opens the session -------------------------------------
     first = client.generate(
         text=FIRST, start_session=True, session_timeout_s=300,
-        max_output_tokens=args.max_output_tokens,
+        max_output_tokens=args.max_output_tokens, top_k=1,
     )
     session_id = first.session_id
     if not session_id:
         _say("FAIL", "the server returned no session_id for start_session=True")
         return 1
     _say("turn 1", f"session {session_id}: {first.text!r}")
-    _say("sessions", f"{[s['session_id'] for s in client.sessions()]}")
+    _say("sessions", f"{client.session_counts()}, this one: {client.session(session_id)}")
 
     # --- turn two resumes it; its prompt says nothing about turn one -----
     second = client.generate(
         text=SECOND, resume_session=True, session_id=session_id,
-        max_output_tokens=args.max_output_tokens,
+        max_output_tokens=args.max_output_tokens, top_k=1,
     )
     _say("turn 2", f"{second.text!r}")
     checks["the session carried the number over"] = NUMBER in (second.text or "")
 
     if not args.no_control:
         control = client.generate(
-            text=SECOND, max_output_tokens=args.max_output_tokens,
+            text=SECOND, max_output_tokens=args.max_output_tokens, top_k=1,
         )
         _say("control (no session)", f"{control.text!r}")
         checks["a sessionless request does not know it"] = (
@@ -106,12 +106,12 @@ def main(argv: list[str] | None = None) -> int:
     _say("delete", f"{client.end_session(session_id)}")
     deadline = time.time() + 30
     while time.time() < deadline:
-        if session_id not in [s["session_id"] for s in client.sessions()]:
+        if client.session(session_id) is None:
             break
         time.sleep(0.2)
     # the id is only released once the worker confirms the state is gone
     checks["the id is released after the teardown ack"] = (
-        session_id not in [s["session_id"] for s in client.sessions()]
+        client.session(session_id) is None
     )
     checks["resuming it afterwards is a 404"] = _status_of(
         lambda: client.generate(

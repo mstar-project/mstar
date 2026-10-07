@@ -158,3 +158,158 @@ def test_a_session_resource_the_model_does_not_declare_is_refused():
 
 
 
+
+
+# ── a starting session never inherits what is parked under its id ────────────
+
+class _IngestRunner:
+    def __init__(self, held=()):
+        self.held = set(held)
+        self.calls: list[str] = []
+
+    def session_holds_state(self, session_id):
+        return session_id in self.held
+
+    def ingest_request(self, rid, overrides=None, session=None):
+        self.calls.append(f"ingest:{rid}")
+
+    def remove_session(self, session_id):
+        self.held.discard(session_id)
+        self.calls.append(f"remove_session:{session_id}")
+
+
+class _Submodule:
+    def __init__(self, session_states=()):
+        self.session_states = dict.fromkeys(session_states, object())
+
+    def cleanup_session(self, session_id):
+        self.session_states.pop(session_id, None)
+
+
+def _ingesting_engine(runner, submodule):
+    from types import SimpleNamespace
+
+    engine = Engine.__new__(Engine)
+    engine._runner = runner
+    engine._request_sessions = {}
+    engine._submodules = {"node": SimpleNamespace(submodule=submodule)}
+    return engine
+
+
+@pytest.mark.parametrize("held, states", [(("s",), ()), ((), ("s",))])
+def test_a_starting_session_drops_state_left_under_its_id(held, states):
+    from mstar.model.sessions import RequestSession
+
+    runner, submodule = _IngestRunner(held), _Submodule(states)
+    engine = _ingesting_engine(runner, submodule)
+
+    engine.add_request("r0", session=RequestSession("s"))
+
+    assert runner.calls == ["remove_session:s", "ingest:r0"]
+    assert submodule.session_states == {}
+    assert engine._request_sessions == {"r0": "s"}
+
+
+def test_a_resumed_session_keeps_its_state():
+    from mstar.model.sessions import RequestSession
+
+    runner = _IngestRunner(held=("s",))
+    engine = _ingesting_engine(runner, _Submodule(("s",)))
+
+    engine.add_request("r1", session=RequestSession("s", resumed=True))
+
+    assert runner.calls == ["ingest:r1"]
+
+
+def test_a_second_partition_s_ingest_does_not_clear_the_first_s_state():
+    from mstar.model.sessions import RequestSession
+
+    runner, submodule = _IngestRunner(), _Submodule()
+    engine = _ingesting_engine(runner, submodule)
+    engine.add_request("r0", session=RequestSession("s"))
+    # the first partition has started writing session state
+    submodule.session_states["s"] = object()
+
+    engine.add_request("r0", session=RequestSession("s"))
+
+    assert "s" in submodule.session_states
+    assert runner.calls == ["ingest:r0", "ingest:r0"]
+
+
+# ── telling a continuing session its last token is in the KV ────────────────
+
+class _RemovingRunner:
+    def remove_request(self, rid, session_id=None):
+        pass
+
+    def remove_session(self, session_id):
+        pass
+
+
+class _StatefulSubmodule:
+    def __init__(self):
+        from mstar.model.submodule_base import PerRequestState
+
+        self.session_states: dict[str, PerRequestState] = {}
+
+    def session_state(self, session_id):
+        from mstar.model.submodule_base import PerRequestState
+
+        return self.session_states.setdefault(session_id, PerRequestState())
+
+    def cleanup_request(self, rid):
+        pass
+
+    def cleanup_session(self, session_id):
+        self.session_states.pop(session_id, None)
+
+
+def _removing_engine(*nodes):
+    from types import SimpleNamespace
+
+    engine = Engine.__new__(Engine)
+    engine._runner = _RemovingRunner()
+    engine._request_sessions = {}
+    engine._submodules = {
+        node: SimpleNamespace(submodule=_StatefulSubmodule()) for node in nodes
+    }
+    return engine
+
+
+def _flag(engine, node, session_id="s"):
+    from mstar.model.submodule_base import OVERSHOT_LAST_ITER
+
+    state = engine._submodules[node].submodule.session_states.get(session_id)
+    return None if state is None else state.kwargs.get(OVERSHOT_LAST_ITER)
+
+
+def test_an_overshot_node_tells_its_session_the_token_is_in_the_kv():
+    engine = _removing_engine("LLM", "other")
+    engine._request_sessions["r0"] = "s"
+
+    engine.remove_request("r0", overshot_nodes={"LLM"})
+
+    assert _flag(engine, "LLM") is True
+    # a node that did not overshoot gets no state it never asked for
+    assert engine._submodules["other"].submodule.session_states == {}
+
+
+def test_a_turn_that_stopped_exactly_clears_an_earlier_turn_s_flag():
+    engine = _removing_engine("LLM")
+    engine._request_sessions["r0"] = "s"
+    engine.remove_request("r0", overshot_nodes={"LLM"})
+
+    engine._request_sessions["r1"] = "s"
+    engine.remove_request("r1")
+
+    assert _flag(engine, "LLM") is None
+
+
+def test_a_sessionless_or_ending_request_flags_nothing():
+    engine = _removing_engine("LLM")
+
+    engine.remove_request("r0", overshot_nodes={"LLM"})
+    engine._request_sessions["r1"] = "s"
+    engine.remove_request("r1", end_session=True, overshot_nodes={"LLM"})
+
+    assert engine._submodules["LLM"].submodule.session_states == {}

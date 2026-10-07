@@ -226,9 +226,13 @@ def test_api_server_result_tensors():
 def test_fail_requests_and_empty_collections():
     msg = ConductorMessage(
         message_type=ConductorMessageType.FAIL_REQUESTS,
-        body=FailRequests(errors={"r0": "oom", "r1": "admit rejected"}),
+        body=FailRequests(
+            errors={"r0": "oom", "r1": "admit rejected"}, statuses={"r1": 410},
+        ),
     )
-    assert roundtrip(msg).body.errors == {"r0": "oom", "r1": "admit rejected"}
+    body = roundtrip(msg).body
+    assert body.errors == {"r0": "oom", "r1": "admit rejected"}
+    assert body.statuses == {"r1": 410}
 
     # a body where every optional collection is left at its default
     msg = ConductorMessage(

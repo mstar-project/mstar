@@ -363,3 +363,146 @@ def test_a_fresh_session_leaves_the_counters_at_zero():
     pos.adopt_session_state("r0", "brand-new")
 
     assert pos._counters["r0"] == {}
+
+
+def test_a_second_ingest_keeps_the_adopted_counters():
+    # a two-partition request is ingested once per partition
+    pos = _position_manager()
+    pos.ingest_request("r0")
+    pos._counters["r0"]["main"] = 100
+    pos.retain_session_state("r0", "s")
+
+    pos.ingest_request("r1")
+    pos.adopt_session_state("r1", "s")
+    pos.ingest_request("r1")
+
+    assert pos._counters["r1"] == {"main": 100}
+
+
+# ── idle sessions give their pages back ─────────────────────────────────────
+
+class _FakeCudaStream:
+    def wait_stream(self, other):
+        del other
+
+
+@pytest.fixture
+def _host_copies(monkeypatch):
+    """Lets the host pool run on a CPU-only box: no pinned memory, and the
+    copies run synchronously on no stream at all."""
+    import contextlib
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+    monkeypatch.setattr(torch.cuda, "Stream", _FakeCudaStream)
+    monkeypatch.setattr(torch.cuda, "current_stream", _FakeCudaStream)
+    monkeypatch.setattr(
+        torch.cuda, "stream", lambda stream: contextlib.nullcontext()
+    )
+
+
+def _offloading_manager(max_num_pages: int, cpu_offload_pages: int = 32) -> KVManager:
+    return KVManager(
+        cfg=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
+            max_num_pages=max_num_pages, page_size=PAGE_SIZE,
+            cpu_offload_pages=cpu_offload_pages,
+        ),
+        name="kv", joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+
+
+def _park(kv: KVManager, rid: str, session_id: str, num_pages: int) -> None:
+    kv.ingest_request(rid, KVReqConfig())
+    _grow(kv, rid, num_pages * PAGE_SIZE)
+    kv.retain_session_state(rid, session_id)
+
+
+def test_retain_records_the_idle_session_s_device_pages():
+    kv = _manager()
+    _park(kv, "r0", "s", 3)
+
+    assert kv._idle_session_pages == {"s": 3}
+
+
+def test_adopt_and_remove_take_the_session_off_the_idle_list():
+    kv = _manager()
+    _park(kv, "r0", "s", 3)
+    _park(kv, "r1", "t", 2)
+
+    kv.ingest_request("r2", KVReqConfig())
+    kv.adopt_session_state("r2", "s")
+    kv.remove_session("t")
+
+    assert kv._idle_session_pages == {}
+
+
+def test_a_live_request_offloads_an_idle_session_for_its_pages(_host_copies):
+    # 15 usable pages (one is the sink)
+    kv = _offloading_manager(max_num_pages=16)
+    _park(kv, "r0", "s", 10)
+
+    kv.ingest_request("r1", KVReqConfig())
+    _grow(kv, "r1", 10 * PAGE_SIZE)
+
+    assert kv._pages_held(kv.session_rid("s")) == 0
+    assert kv._idle_session_pages == {"s": 0}
+    # still the session's, just on the host
+    assert kv.session_state_size("s") == 10
+    kv.assert_pages_conserved()
+
+
+def test_the_longest_idle_session_goes_first(_host_copies):
+    kv = _offloading_manager(max_num_pages=16)
+    _park(kv, "r0", "old", 5)
+    _park(kv, "r1", "new", 5)
+
+    kv.ingest_request("r2", KVReqConfig())
+    _grow(kv, "r2", 8 * PAGE_SIZE)
+
+    assert kv._idle_session_pages == {"old": 0, "new": 5}
+    kv.assert_pages_conserved()
+
+
+def test_an_offloaded_session_comes_back_on_reload(_host_copies):
+    kv = _offloading_manager(max_num_pages=16)
+    _park(kv, "r0", "s", 10)
+    kv.ingest_request("r1", KVReqConfig())
+    _grow(kv, "r1", 10 * PAGE_SIZE)
+    kv.remove_request("r1")
+
+    kv.ingest_request("r2", KVReqConfig())
+    kv.adopt_session_state("r2", "s")
+
+    assert "s" not in kv._idle_session_pages
+    assert kv.is_offloaded("r2")
+    assert kv.can_reload("r2")
+    assert kv.reload("r2")
+    assert kv._pages_held("r2") == 10
+    kv.assert_pages_conserved()
+
+
+def test_reload_counts_and_offloads_idle_sessions(_host_copies):
+    kv = _offloading_manager(max_num_pages=16)
+    kv.ingest_request("r0", KVReqConfig())
+    _grow(kv, "r0", 10 * PAGE_SIZE)
+    assert kv.offload("r0") == 10
+    _park(kv, "r1", "s", 10)
+
+    assert kv.can_reload("r0")
+    assert kv.reload("r0")
+    assert kv._idle_session_pages == {"s": 0}
+    kv.assert_pages_conserved()
+
+
+def test_without_a_host_pool_idle_sessions_keep_their_pages():
+    kv = _manager(max_num_pages=16)
+    _park(kv, "r0", "s", 10)
+
+    kv.ingest_request("r1", KVReqConfig())
+    step = KVStep(segments=(Segment("r1", "main", 10 * PAGE_SIZE),))
+    ctx = StepContext(
+        request_ids=("r1",), graph_walk="prefill", slot=0, capture=False,
+    )
+    assert not kv.admit(step, ctx).ok
+    assert kv._idle_session_pages == {"s": 10}

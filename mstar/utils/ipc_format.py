@@ -66,6 +66,10 @@ class RemoveRequest(MessageBody):
     after_tp_seq: int = -1
     # Tear the request's session down with it, and ACK SESSION_TORN_DOWN.
     end_session: bool = False
+    # The session ``end_session`` ends. Named rather than looked up: a worker
+    # that never admitted the request (held, then drained) has no record of
+    # which session it belonged to, and still owes the teardown and its ACK.
+    session_id: str | None = None
 
 
 @dataclass
@@ -292,8 +296,12 @@ class FailRequests(MessageBody):
     (rids, message) pair because per-rid stages (prepare_inputs,
     postprocess) attribute a distinct error to each request, and one
     step can fail several of them for different reasons.
+
+    ``statuses`` gives the HTTP status a request fails with, where it is not
+    a 500 (a session whose state was dropped is a 410).
     """
     errors: dict[str, str]
+    statuses: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass

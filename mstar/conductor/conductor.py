@@ -1321,6 +1321,11 @@ class Conductor:
                     body=RemoveRequest(
                         request_id,
                         end_session=end_session and entity != self.PREPROCESS_WORKER,
+                        session_id=(
+                            session_id
+                            if end_session and entity != self.PREPROCESS_WORKER
+                            else None
+                        ),
                     ),
                 ),
             )
@@ -1418,7 +1423,10 @@ class Conductor:
                 )
                 continue
             logger.error("Request %s failed on a worker: %s", rid, error_message)
-            self._remove_request(rid, request_data, failure_error=error_message)
+            self._remove_request(
+                rid, request_data, failure_error=error_message,
+                failure_status=body.statuses.get(rid, 500),
+            )
 
     def _abort_request(self, request_id: str):
         """Tear down a request the client abandoned, freeing its worker GPU state."""
@@ -1455,7 +1463,7 @@ class Conductor:
 
     def _remove_request(
         self, request_id: str, request_data: RequestData,
-        failure_error: str | None = None,
+        failure_error: str | None = None, failure_status: int = 500,
     ):
         """Begin teardown for an abort/fail: drain every participant's reads,
         then (on the barrier's completion) hard-remove. Shared by the abort
@@ -1477,6 +1485,7 @@ class Conductor:
             expected_acks=participants,
             participants=participants,
             failure_error=failure_error,
+            failure_status=failure_status,
         )
 
     def _process_request_done(

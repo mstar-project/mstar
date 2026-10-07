@@ -413,6 +413,11 @@ class KVManager(AttentionResource):
         # step's admit returns first -- see ``remove_request`` / ``reset_request``.
         self._admit_reserved_pages: dict[tuple[int, str], list[int]] = {}
 
+        # session id -> device pages its parked state holds, longest idle
+        # first. Offloaded (``_offload_idle_sessions``) when a live request
+        # needs the pages; adopting or removing the session takes it out.
+        self._idle_session_pages: dict[str, int] = {}
+
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
         return cls(
@@ -1560,6 +1565,7 @@ class KVManager(AttentionResource):
             return False
         with self._lock:
             evictable = 0 if self._index is None else self._index.num_sole_owned()
+            evictable += sum(self._idle_session_pages.values())
             return self._reload_pages_needed(rid) <= self._arena.num_free + evictable
 
     def reload(self, rid: str) -> bool:
@@ -1573,6 +1579,8 @@ class KVManager(AttentionResource):
         with self._lock:
             labels = self._cpu_pool.labels(rid)
             needed = self._reload_pages_needed(rid)
+            if needed > self._arena.num_free:
+                self._offload_idle_sessions(needed)
             if needed > self._arena.num_free and self._index is not None:
                 # as `_alloc` does: once the pool is all cached pages, nothing
                 # else would ever free one for this request to come back to
@@ -1753,6 +1761,11 @@ class KVManager(AttentionResource):
                     self.name, session_id, rid,
                 )
                 return
+            self._idle_session_pages.pop(session_id, None)
+            # Offloaded parked state is not reloaded here: `check_ready` sees
+            # the request offloaded and reloads it at admission once it fits,
+            # through `Engine.reload_request`, which journals the move for TP
+            # followers. A reload from here would bypass that journal.
             logger.info(
                 "KV %s: %s adopted %d pages from session %s",
                 self.name, rid, self._pages_held(rid), session_id,
@@ -1767,18 +1780,55 @@ class KVManager(AttentionResource):
                 )
 
     def retain_session_state(self, rid: str, session_id: str) -> None:
-        if self._move_streams(rid, self.session_rid(session_id)):
+        with self._lock:
+            if not self._move_streams(rid, self.session_rid(session_id)):
+                return
+            # re-inserted, so the dict stays ordered by how long each has idled
+            self._idle_session_pages.pop(session_id, None)
+            self._idle_session_pages[session_id] = self._pages_held(
+                self.session_rid(session_id)
+            )
             logger.info(
                 "KV %s: session %s keeps %d pages from %s",
                 self.name, session_id, self.session_state_size(session_id), rid,
             )
 
     def remove_session(self, session_id: str) -> None:
+        with self._lock:
+            self._idle_session_pages.pop(session_id, None)
         self.remove_request(self.session_rid(session_id))
 
     def session_state_size(self, session_id: str) -> int:
-        """Device pages the session holds."""
-        return self._pages_held(self.session_rid(session_id))
+        """Pages the session holds, on device and offloaded to host."""
+        rid = self.session_rid(session_id)
+        with self._lock:
+            held = self._pages_held(rid)
+            if self._cpu_pool is not None:
+                held += self._reload_pages_needed(rid)
+            return held
+
+    def _offload_idle_sessions(self, num_free: int) -> None:
+        """Offload idle sessions, longest idle first, until ``num_free``
+        pages are free or none is left to move.
+
+        Caller holds the lock. Does nothing without a host pool. A session
+        whose pages the host pool can't take keeps them; the next one is tried.
+        """
+        if self._cpu_pool is None:
+            return
+        for session_id, held in list(self._idle_session_pages.items()):
+            if self._arena.num_free >= num_free:
+                return
+            if held == 0:
+                continue
+            rid = self.session_rid(session_id)
+            freed = self.offload(rid)
+            self._idle_session_pages[session_id] = self._pages_held(rid)
+            if freed:
+                logger.info(
+                    "KV %s: offloaded idle session %s (%d pages)",
+                    self.name, session_id, freed,
+                )
 
     def _pages_held(self, rid: str) -> int:
         with self._lock:
@@ -2082,6 +2132,11 @@ class KVManager(AttentionResource):
             new_pages: list[int] = []
             if num_new_pages > 0:
                 new_pages = self._arena.acquire(num_new_pages)
+                if new_pages is None and self._idle_session_pages:
+                    # parked state comes back on adoption; a cached page that
+                    # is evicted is gone, so idle sessions go first
+                    self._offload_idle_sessions(num_new_pages)
+                    new_pages = self._arena.acquire(num_new_pages)
                 if new_pages is None and self._index is not None:
                     # cached pages are the only ones that can be given back
                     # without failing a request that is already running

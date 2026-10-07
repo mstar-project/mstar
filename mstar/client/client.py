@@ -277,13 +277,25 @@ class MStarClient:
         resp.raise_for_status()
         return resp.json()
 
-    def sessions(self) -> list[dict]:
-        """Every session the server holds."""
+    def session_counts(self) -> dict:
+        """How many sessions the server holds: ``live``, ``closing`` and
+        ``max_concurrent_sessions``. The server does not list ids."""
         resp = self._session.get(
             f"{self.base_url}/sessions", timeout=self.timeout
         )
         resp.raise_for_status()
-        return resp.json().get("sessions", [])
+        return resp.json()
+
+    def session(self, session_id: str) -> dict | None:
+        """One session's state (``closing``, ``expires_in_s``,
+        ``active_request_ids``, ...), or None once the server has released it."""
+        resp = self._session.get(
+            f"{self.base_url}/sessions/{session_id}", timeout=self.timeout
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
 
     def voices(self) -> list[str]:
         """The ``voice`` ids the served speech model accepts (``GET /v1/audio/voices``)."""

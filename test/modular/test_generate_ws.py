@@ -41,6 +41,23 @@ class _FakeServer:
         return rid
 
     async def iter_result_chunks(self, request_id):
+        # the real ``submit_request`` queues a started or resumed session's
+        # frame ahead of any output
+        session = next(
+            (sub.get("session") for sub in self.submitted
+             if sub["request_id"] == request_id),
+            None,
+        )
+        if session is not None and session.session_id is not None:
+            yield ResultChunk(
+                request_id=request_id, modality="session",
+                data=session.session_id.encode("utf-8"),
+                metadata={
+                    "session_id": session.session_id,
+                    "created": session.created,
+                    "end_session": session.end_session,
+                },
+            )
         for i in range(self.chunks_per_request):
             yield ResultChunk(
                 request_id=request_id, modality="action",

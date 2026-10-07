@@ -34,6 +34,7 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
     w.sent = []
     w.removed = []
     w.removed_sessions = []
+    w.overshot = []
     w.session_errors = {}
     w.communicator = SimpleNamespace(
         send=lambda e, msg=None, m=None: w.sent.append((e, msg if msg is not None else m))
@@ -90,11 +91,12 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
             interned.add(rid)
             w._sessions.bind(rid, session_id)
     w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid, end_session=False: w.removed.append(
-            (rid, end_session)
+        remove_request=lambda rid, end_session=False, overshot_nodes=frozenset(): (
+            w.removed.append((rid, end_session)),
+            w.overshot.append((rid, overshot_nodes)),
         ),
         remove_session=w.removed_sessions.append,
-        add_request=lambda rid, cfgs, session_id=None: None,
+        add_request=lambda rid, cfgs, session=None: None,
         take_session_error=lambda sid: w.session_errors.pop(sid, None),
         evictable_nodes=lambda: [],
     )
@@ -208,6 +210,9 @@ def test_the_tp_leader_forwards_end_session_to_its_followers():
     [forwarded] = _forwarded_removes(w)
     assert forwarded.end_session is True
     assert forwarded.source == MessageSource.TP_RANK_0
+    # named even though the conductor's message did not, for a follower
+    # that held the request rather than admitted it
+    assert forwarded.session_id == "s"
 
 
 # ── standalone teardown ─────────────────────────────────────────────────────
@@ -292,12 +297,13 @@ def test_ingest_binds_the_request_to_its_session():
 def test_ingest_fails_a_request_whose_session_went_over_its_budget():
     w = _worker(known_rids=())
     w.session_errors["s"] = "session s exceeded its state budget"
-    failed = {}
-    w._fail_requests = failed.update
+    failed = []
+    w._fail_requests = lambda errors, statuses=None: failed.append((errors, statuses))
 
     Worker._add_new_request(w, _new_request(session_id="s"))
 
-    assert failed == {"Y": "session s exceeded its state budget"}
+    # 410: the session's state is gone, not the request malformed
+    assert failed == [({"Y": "session s exceeded its state budget"}, {"Y": 410})]
 
 
 def test_a_resumed_ingest_waits_for_the_previous_request_to_hand_state_over():
@@ -341,3 +347,80 @@ def test_ingest_without_a_session_touches_no_session_state():
 
     assert w._sessions.get_rids("s") == set()
     assert w._sessions.session_of("Y") is None
+
+
+# ── a held request removed before it was admitted ──────────────────────────
+
+def _ending(rid="Y", session_id="s"):
+    return RemoveRequest(request_id=rid, end_session=True, session_id=session_id)
+
+
+def test_a_held_request_removed_before_admission_still_ends_its_session():
+    # the previous request is still leaving, so Y is held; the client aborts
+    # Y before it is admitted, and Y was the session's last request
+    w = _worker(known_rids=("X",), sessions={"s": {"X"}})
+    Worker._add_new_request(w, _new_request(session_id="s"))
+    assert w._sessions.has_pending is True
+
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    Worker._remove_request(w, _ending())
+
+    # dropped rather than admitted later into a session that is gone
+    assert w._sessions.has_pending is False
+    assert w.removed_sessions == ["s"]
+    assert _acks(w) == ["s"]
+
+
+def test_a_held_request_drained_before_admission_still_ends_its_session():
+    w = _worker(known_rids=("X",), sessions={"s": {"X"}})
+    Worker._add_new_request(w, _new_request(session_id="s"))
+    w._draining_rids.add("Y")  # the abort's DRAIN, while Y was held
+
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    Worker._apply_pending_sessions(w)  # Y comes out of the hold, refused
+    assert w._sessions.session_of("Y") is None
+
+    Worker._remove_request(w, _ending())
+
+    assert w.removed_sessions == ["s"]
+    assert _acks(w) == ["s"]
+
+
+def test_an_unadmitted_removal_that_ends_nothing_leaves_the_session():
+    w = _worker(known_rids=("X",), sessions={"s": {"X"}})
+    Worker._add_new_request(w, _new_request(session_id="s"))
+
+    Worker._remove_request(w, RemoveRequest(request_id="Y"))
+
+    assert w._sessions.has_pending is False
+    assert w.removed_sessions == []
+    assert _acks(w) == []
+
+
+# ── a decode loop that ran past its stop ───────────────────────────────────
+
+def test_an_overshoot_reaches_the_engine_with_its_session_request():
+    w = _worker(sessions={"s": {"X"}})
+    w._sessions.note_overshoot("X", "LLM")
+
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+
+    assert w.overshot == [("X", frozenset({"LLM"}))]
+
+
+def test_a_removal_with_no_overshoot_names_no_node():
+    w = _worker(sessions={"s": {"X"}})
+
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+
+    assert w.overshot == [("X", frozenset())]
+
+
+def test_an_overshoot_outside_a_session_is_not_kept():
+    # nothing continues from that request's KV
+    w = _worker(known_rids=("X",))
+    w._sessions.note_overshoot("X", "LLM")
+
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+
+    assert w.overshot == [("X", frozenset())]
