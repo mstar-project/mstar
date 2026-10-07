@@ -103,3 +103,17 @@ test/modular/test_recurrent_rollback.py
 test/modular/test_recurrent_slot_blocks.py
 test/modular/test_tp_follower_refusal.py
 test/modular/test_worker_runtime_metadata.py
+test/modular/test_glm5next_comm_api.py
+test/modular/test_glm5next_engine_cpu.py
+test/modular/test_glm5next_kda_resource.py
+test/modular/test_glm5next_kda_spec.py
+test/modular/test_glm5next_kda_tp.py
+test/modular/test_glm5next_kda.py
+test/modular/test_glm5next_mhc.py
+test/modular/test_glm5next_mla_fused.py
+test/modular/test_glm5next_model.py
+test/modular/test_glm5next_mtp_cpu.py
+test/modular/test_glm5next_registry_contract.py
+test/modular/test_glm5next_sinkhorn_fused.py
+test/modular/test_glm5next_step_tokens.py
+test/modular/test_glm5next_submodule.py

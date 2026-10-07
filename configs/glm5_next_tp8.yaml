@@ -1,0 +1,44 @@
+model: "glm5_next"
+# GLM-5.3-Flash on 8 GPUs of 80 GB. The fp8 checkpoint is 306 GB, so weights
+# are ~38 GB/rank at TP8; the KV and KDA budgets below leave headroom for
+# activations, graphs and NCCL. Resolve the checkpoint through the HF cache
+# (HF_HOME) or pass model_kwargs.checkpoint_path.
+max_seq_len: 2048
+# NVLS multicast for the small decode all-reduces; stays on NCCL, with a
+# warning, where NVLink multicast is unavailable.
+tp_allreduce: "symm_multimem"
+# Prefill's all-reduces too: a 4096-token bucket moves 32 MiB per call.
+tp_allreduce_max_kb: 32768
+model_kwargs:
+  # "auto" takes the fused fp8 MoE kernel when one is available, which is
+  # what lets decode capture; "reference" is an eager, uncapturable fallback.
+  moe_quant_kernel: "auto"
+  # Drafts per step from the layer-45 MTP module (greedy requests only);
+  # glm5_next_tp8_mtp.yaml turns it on.
+  mtp_num_draft_tokens: 0
+  # Capture the prefill per (rows, token bucket); an uncaptured shape runs
+  # eager. Adds ~40 s of capture at startup.
+  prefill_graphs: true
+  # A prefill step takes prompts up to the largest captured bucket (4096 tokens),
+  # so a burst runs as captured chunks with decode steps between them.
+  prefill_max_step_tokens: "auto"
+# Per-resource overrides, keyed by what get_node_resources declares.
+resources:
+  kv_cache:
+    # Only the 11 MLA layers are paged, one 512-wide latent per token per
+    # layer: ~11.3 KB/token/rank. 1024 pages x 128 tokens = 64 full-length
+    # requests, plus the sink page, ~1.5 GB/rank. Sized to the slot pool below,
+    # which is the real concurrency limit.
+    max_num_pages: 1025
+    page_size: 128
+  kda_state:
+    # One slot per in-flight request plus the pool's sink, head-sharded
+    # across TP like the KDA layers: ~18.5 MB/slot/rank, ~1.2 GB/rank here.
+    # The 64 real slots are also the decode batch cap, since the captured
+    # buckets are bounded by them.
+    max_slots: 65
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]
