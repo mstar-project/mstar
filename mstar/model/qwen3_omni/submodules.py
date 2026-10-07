@@ -576,8 +576,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             )
         return SubmoduleStep(
             # must match `cg_key_info`, which picked the leased capture
-            cg_key_info=self.DEEPSTACK_KEY if (
-                graph_walk == THINKER_MIXED and pos_advance is not None) else None,
+            cg_key_info=self.DEEPSTACK_KEY if pos_advance is not None else None,
             segments=[
                 Segment(
                     request_id=rid,
@@ -783,12 +782,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     # prefill_vision buckets are larger than text/audio because video
-    # produces many vision tokens per request.  Capture only bs=1
-    # because eager prefill_vision asserts a single request per step
+    # produces many vision tokens per request
     PREFILL_VISION_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-    PREFILL_VISION_CAPTURE_BATCH_SIZES = [1]
-    # mixed steps holding a vision row: coarse batch buckets, padded host-side
-    MIXED_VISION_CAPTURE_BATCH_SIZES = [4, 16, 32]
+    # coarse batch buckets, padded host-side; past 1 for mixed steps
+    PREFILL_VISION_CAPTURE_BATCH_SIZES = [1, 4, 16, 32]
     DEEPSTACK_KEY = "deepstack"
 
     def get_cuda_graph_configs(
@@ -841,21 +838,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
             ),
+            # any step holding a vision row: the packed forward plus deepstack
             PackedCudaGraphConfig(
                 capture_graph_walk="prefill_vision",
-                replay_graph_walks=["prefill_vision"],
+                replay_graph_walks=["prefill_vision", THINKER_MIXED],
+                additional_key_info=self.DEEPSTACK_KEY,
                 capture_token_lengths=self.PREFILL_VISION_TOKEN_BUCKETS,
                 capture_batch_sizes=self.PREFILL_VISION_CAPTURE_BATCH_SIZES,
-                make_node_input=vision_input,
-            ),
-            # a mixed step holding a vision row: the same packed forward, plus
-            # the deepstack features the plain mixed captures do not take
-            PackedCudaGraphConfig(
-                capture_graph_walk="prefill_vision",
-                replay_graph_walks=[THINKER_MIXED],
-                additional_key_info=self.DEEPSTACK_KEY,
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
-                capture_batch_sizes=self.MIXED_VISION_CAPTURE_BATCH_SIZES,
                 make_node_input=vision_input,
             ),
         ]
@@ -866,9 +855,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
         per_request_input_metadata=None,
         **kwargs,
     ):
-        """A mixed step holding a vision row replays the deepstack captures."""
+        """A step holding a vision row replays the deepstack captures."""
         del per_request_input_metadata, kwargs
-        if graph_walk == THINKER_MIXED and any(
+        if graph_walk == "prefill_vision" or graph_walk == THINKER_MIXED and any(
             info.graph_walk == "prefill_vision" for info in per_request_info.values()
         ):
             return self.DEEPSTACK_KEY
