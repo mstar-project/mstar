@@ -102,7 +102,7 @@ class _Mesh:
         self.rt.pop_rids("only", WALK, [rid])
         signals = self.rt.get_output_signals("only", WALK)
         out = self.rt.complete_and_route_batch({
-            "partition": "default", "graph_walk": WALK, "node_name": "only",
+            "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
             "output_signals": signals, "rids": [rid], "wg_ids": [WG_ID],
             "tensors": list(uuids),
             "num_tensors": [
@@ -458,7 +458,7 @@ def _emit_mesh(tmp_path, tp_rank, shard_dim=None):
     rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     rt.pop_rids("only", WALK, [rid])
     out = rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -503,7 +503,7 @@ def _persist_mesh(tmp_path, tp_rank):
     rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     rt.pop_rids("only", WALK, [rid])
     out = rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -555,7 +555,7 @@ def test_a_speculative_completion_does_not_report_the_partition_done(tmp_path):
     assert mesh.run(rid, uuids=[])["conductor"][0].body.partition_done
 
     # mesh.rt is the raw PyO3 GraphRuntime, not the RustGraphRuntime wrapper.
-    mesh.rt.set_in_flight("only", WG_ID, [rid], True)
+    mesh.rt.set_in_flight("only", [rid], [WG_ID], True)
     body = mesh.run(rid, uuids=[])["conductor"][0].body
     assert not body.partition_done, "a speculative pass reported done"
 
@@ -601,7 +601,7 @@ def _fanout_mesh(tmp_path, shard_dim=None):
     rt.ingest_inputs_batch(_one_signal(rid, "prompt", "src"))
     rt.pop_rids("src", WALK, [rid])
     out = rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "src",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "src",
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -683,7 +683,7 @@ def _gather_mesh(tmp_path, src_tp, dest_tp, my_rank=0, shard_dim=0,
     rt.ingest_inputs_batch(_one_signal(rid, "prompt", "src"))
     rt.pop_rids("src", WALK, [rid])
     out = rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "src",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "src",
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -787,7 +787,7 @@ def _iterate(rt, book, rid, uuid, stop_first=False):
     if stop_first:
         rt.stop_loops_batched("default", WALK, "ar_decode", [rid], [["ar_loop"]])
     out = rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "ar_decode",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "ar_decode",
         "output_signals": ["out", "token"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [uuid], "num_tensors": [1, 0],
     })
@@ -854,7 +854,7 @@ def test_an_output_nobody_runs_is_an_error(tmp_path):
     mesh.rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     mesh.rt.pop_rids("only", WALK, [rid])
     out = mesh.rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -885,7 +885,7 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
         mesh.rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     mesh.rt.pop_rids("only", WALK, [keep, doomed])
     out = mesh.rt.complete_and_route_batch({
-        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
         "output_signals": ["kv"], "rids": [keep, doomed],
         "wg_ids": [WG_ID, WG_ID], "tensors": [1, 2], "num_tensors": [1, 1],
     })
@@ -913,3 +913,40 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
         "only the surviving request reports done"
     )
     assert [i.uuid for i in wgds[0].persist_signals["kv"]] == [1]
+
+
+def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
+    """A mixed step routes rows of two walks in one call; each request's
+    worker-graphs-done names its own walk's graph, not the call's first."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    conductor = ZmqCommunicator("conductor", str(tmp_path))
+    wgs = [
+        {"wg_id": wg_id, "graph_walks": [walk],
+         "nodes": [_node("only", ["prompt"], [("out", "", False)])], "loops": []}
+        for wg_id, walk in ((0, "prefill"), (1, "decode"))
+    ]
+    rt = GraphRuntime(
+        worker_graphs=wgs, remote_worker_graphs=[],
+        sharding={"groups": [], "shard_dim": [],
+                  "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rids = [
+        rt.add_request(name, "default", walk, [0, 1], [0, 1], [ME, ME], [1, 1])
+        for name, walk in (("r_prefill", "prefill"), ("r_decode", "decode"))
+    ]
+    for rid in rids:
+        rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
+    rt.pop_walk_rids("only", ["prefill", "decode"], rids, [0, 1])
+
+    out = rt.complete_and_route_batch({
+        "partition": "default", "graph_walk": "prefill", "node_name": "only",
+        "output_signals": ["out"], "rids": rids, "tensors": [], "num_tensors": [0, 0],
+        "walks": ["prefill", "decode"], "rid_walk_idx": [0, 1],
+    })
+    _send(rt, out.completion_id, request_infos=[(rid, None) for rid in rids],
+          new_token_counts=[], stream_tokens_consumed=[], profiling=[])
+
+    done = {m.body.request_id: m.body.worker_graph_ids for m in _collect(conductor)}
+    assert done == {"r_prefill": [0], "r_decode": [1]}

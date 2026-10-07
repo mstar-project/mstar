@@ -335,10 +335,10 @@ class RustGraphRuntime(GraphRuntime):
         self._rust.set_walk(rid, partition, walk)
 
     def set_in_flight(
-        self, node: str, wg_id: int, rids: list[int],
+        self, node: str, rids: list[int], wg_ids: list[int],
         in_flight: bool,
     ):
-        self._rust.set_in_flight(node, wg_id, rids, in_flight)
+        self._rust.set_in_flight(node, rids, wg_ids, in_flight)
 
     def is_in_flight(
         self, node: str, wg_id: int, rid: int,
@@ -380,9 +380,9 @@ class RustGraphRuntime(GraphRuntime):
         return self._rust.has_pending_loop_stop(rid, graph_walk, loop_name)
 
     def pending_loop_stop_rids(
-        self, graph_walk: str, loop_name: str,
+        self, graph_walks: list[str], loop_name: str,
     ) -> set[int]:
-        return set(self._rust.pending_loop_stop_rids(graph_walk, loop_name))
+        return set(self._rust.pending_loop_stop_rids(graph_walks, loop_name))
 
     def clear_pending_loop_stops(self):
         self._rust.clear_pending_loop_stops()
@@ -542,12 +542,12 @@ class RustGraphRuntime(GraphRuntime):
 
     def commit_speculation(
         self, spec_id: int, success: bool, dropped_rids: list[int] = (),
-        node: str | None = None, wg_id: int | None = None,
+        node: str | None = None, wg_ids: list[int] | None = None,
         scheduled_rids: list[int] = (),
     ):
         self._rust.commit_speculation(
             spec_id, success, list(dropped_rids),
-            node, wg_id, list(scheduled_rids),
+            node, wg_ids, list(scheduled_rids),
         )
 
     def prep_spec_rids(
@@ -576,6 +576,8 @@ class RustGraphRuntime(GraphRuntime):
             "rids": list(input.wg_ids.keys),
             "tensors": list(input.tensors),
             "num_tensors": list(input.num_tensors),
+            "walks": input.walks,
+            "rid_walk_idx": input.rid_walk_idx,
         })
         return RouteOutput(
             completion_id=out.completion_id,

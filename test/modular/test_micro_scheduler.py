@@ -165,8 +165,8 @@ class _Runtime:
         for rid in rids:
             queue._ready.setdefault(rid, set()).add(node_name)
 
-    def set_in_flight(self, node_name, wg_id, rids, in_flight):
-        del wg_id
+    def set_in_flight(self, node_name, rids, wg_ids, in_flight):
+        del wg_ids
         for rid in rids:
             if in_flight:
                 self._manager.in_flight.add((rid, node_name))

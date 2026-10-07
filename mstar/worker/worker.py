@@ -2178,22 +2178,14 @@ class Worker:
         (``_clear_in_flight_flag``), on paths with no stage to settle.
         """
         batch = speculation.scheduled_batch
-        # flagged per worker graph: a combined walk's rows span several
-        by_wg: dict[int, list[int]] = {}
-        if success:
-            for rid, wg_id in batch.request_to_worker_graph.items():
-                by_wg.setdefault(wg_id, []).append(rid)
-        groups = list(by_wg.items())
-        first_wg, first_rids = groups[0] if groups else (None, [])
+        rid_to_wg = batch.request_to_worker_graph if success else {}
         self._graph_runtime.commit_speculation(
             speculation.spec_id, success, list(dropped_rids),
             # Keeps these nodes off the ready queue while the step is in flight.
-            node=batch.node_name if first_rids else None,
-            wg_id=first_wg,
-            scheduled_rids=first_rids,
+            node=batch.node_name if rid_to_wg else None,
+            wg_ids=list(rid_to_wg.values()),
+            scheduled_rids=list(rid_to_wg),
         )
-        for wg_id, rids in groups[1:]:
-            self._graph_runtime.set_in_flight(batch.node_name, wg_id, rids, True)
         give_back = (
             speculation.consumed_streaming_edges.items() if not success
             else [
@@ -2698,12 +2690,10 @@ class Worker:
     # Postprocessing
     # ------------------------------------------------------------------
     def _set_in_flight_flag(self, batch: ScheduledBatch, value: bool) -> None:
-        # one call per worker graph: a combined walk's rows span several
-        by_wg: dict[int, list[int]] = {}
-        for rid, wg_id in batch.request_to_worker_graph.items():
-            by_wg.setdefault(wg_id, []).append(rid)
-        for wg_id, rids in by_wg.items():
-            self._graph_runtime.set_in_flight(batch.node_name, wg_id, rids, value)
+        rid_to_wg = batch.request_to_worker_graph
+        self._graph_runtime.set_in_flight(
+            batch.node_name, list(rid_to_wg), list(rid_to_wg.values()), value,
+        )
 
     def _clear_in_flight_flag(self, batch: ScheduledBatch) -> None:
         self._set_in_flight_flag(batch, False)
@@ -2745,11 +2735,9 @@ class Worker:
         # sure to not route their outputs
         valid_rids = set(batch_N.node_batch.request_ids)
         if batch_N.speculative_new_iter:
-            stopped_rids = set()
-            for walk in batch_N.batch.rids_by_walk():
-                stopped_rids |= self._graph_runtime.pending_loop_stop_rids(
-                    walk, batch_N.loop_name,
-                )
+            stopped_rids = self._graph_runtime.pending_loop_stop_rids(
+                list(batch_N.batch.rids_by_walk()), batch_N.loop_name,
+            )
             stopped_rids &= set(batch_N.node_batch.request_ids)
             for stopped_rid in stopped_rids:
                 outputs.pop(stopped_rid, None)
@@ -2903,23 +2891,29 @@ class Worker:
         # Store this batch's output tensors, then hand the runtime their
         # uuids. The store keeps the descriptors, so routing needs no
         # TensorPointerInfo objects.
-        # One store and route per real walk: the runtime keys both on it.
-        routed = []
-        for graph_walk, rids in batch_N.batch.rids_by_walk().items():
-            stored, route_output, signals = self._store_and_route(
-                batch_N, outputs, rids, graph_walk, cpu_outputs,
-            )
-            # Normally empty: cleanup_consumed_inputs ran above and took them. Not
-            # empty if a completion ever precedes it, and then nobody else will.
-            if route_output.freed_inputs.uuids:
-                self.tensor_manager.cleanup_collectable(*route_output.freed_inputs)
+        # One store and route for the step, whatever walks its rows ran.
+        by_walk = batch_N.batch.rids_by_walk()
+        walks = list(by_walk)
+        if len(walks) == 1:
+            rids, rid_walk_idx = by_walk[walks[0]], None
+        else:
+            rids, rid_walk_idx = [], []
+            for i, walk_rids in enumerate(by_walk.values()):
+                rids.extend(walk_rids)
+                rid_walk_idx.extend([i] * len(walk_rids))
+        stored, route_output, signals = self._store_and_route(
+            batch_N, outputs, rids, walks, rid_walk_idx, cpu_outputs,
+        )
+        # Normally empty: cleanup_consumed_inputs ran above and took them. Not
+        # empty if a completion ever precedes it, and then nobody else will.
+        if route_output.freed_inputs.uuids:
+            self.tensor_manager.cleanup_collectable(*route_output.freed_inputs)
 
-            if self.enable_nvtx:
-                range_pop(synchronize=False)
-                range_push("worker.postprocess.register_outputs", synchronize=False)
-            with self._span("worker.postprocess.register_outputs"):
-                self._register_outputs(route_output)
-            routed.append((rids, stored, route_output, signals))
+        if self.enable_nvtx:
+            range_pop(synchronize=False)
+            range_push("worker.postprocess.register_outputs", synchronize=False)
+        with self._span("worker.postprocess.register_outputs"):
+            self._register_outputs(route_output)
         _pp_stage("route_outputs")
 
         per_request_info = batch_N.node_batch.per_request_info
@@ -2947,8 +2941,7 @@ class Worker:
                 batch_N.node_batch.exec_timings,
             )
 
-        for rids, stored, route_output, signals in routed:
-            self._stream_and_send(batch_N, rids, stored, route_output, signals)
+        self._stream_and_send(batch_N, rids, stored, route_output, signals)
 
         _pp_stage("send_outputs")
         if self.enable_nvtx:
@@ -2956,21 +2949,32 @@ class Worker:
 
     def _store_and_route(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput,
-        rids: list[int], graph_walk: str, cpu_outputs,
+        rids: list[int], walks: list[str], rid_walk_idx: list[int] | None, cpu_outputs,
     ):
+        """Store and route ``rids``; ``rids[i]`` ran ``walks[rid_walk_idx[i]]``,
+        or ``walks[0]`` when ``rid_walk_idx`` is None."""
         # Recorded by the pop that scheduled this batch, not asked for again --
         # and taken from the GRAPH, so a model returning a tensor under a name
         # no edge carries cannot change what gets routed. Stale outputs are
-        # dropped by complete_and_route_batch itself.
+        # dropped by complete_and_route_batch itself. Several walks route under
+        # the union of their names; a walk's node ignores the ones it lacks.
         batch = batch_N.batch
-        signals = batch.output_signals if not batch.request_walks \
-            else batch.walk_output_signals.get(graph_walk) \
-            or self._graph_runtime.get_output_signals(batch_N.node_name, graph_walk)
+        graph_walk = walks[0]
+        if not batch.request_walks:
+            signals = batch.output_signals
+        else:
+            signals = list(dict.fromkeys(
+                signal for walk in walks
+                for signal in batch.walk_output_signals.get(walk)
+                or self._graph_runtime.get_output_signals(batch_N.node_name, walk)
+            ))
         # One store call for the batch rather than one per request, and the
         # flat columns come back already built: the manager fills them as it
         # mints, so nothing is keyed by request and signal only to be taken
         # apart again here.
         _t_store = _time.perf_counter() if self._phase_period else 0.0
+        # Any of the walks names the source's TP group: a combined walk's walks
+        # share one (refuse_combined_walks_across_tp_groups).
         # Pass the stop check's host copies so a host-memory transport needn't
         # copy the rows again. They are views of pinned buffers the next step
         # reuses; safe because the sends below are their last reader.
@@ -3011,6 +3015,8 @@ class Worker:
                 ),
                 tensors=flat_uuids,
                 num_tensors=num_tensors,
+                walks=walks if rid_walk_idx is not None else None,
+                rid_walk_idx=rid_walk_idx,
             ),
         )
         if self._phase_period:

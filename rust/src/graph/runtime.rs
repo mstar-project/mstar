@@ -1148,6 +1148,10 @@ pub struct RouteArg {
     #[pyo3(item)] rids: Vec<u32>,
     #[pyo3(item)] tensors: Vec<u64>,
     #[pyo3(item)] num_tensors: Vec<usize>,
+    /// Rows of several walks in one call: `rids[i]` ran `walks[rid_walk_idx[i]]`.
+    /// None, every row ran `graph_walk`.
+    #[pyo3(item)] walks: Option<Vec<String>>,
+    #[pyo3(item)] rid_walk_idx: Option<Vec<u32>>,
 }
 
 /// `RouteOutput`.
@@ -1192,9 +1196,9 @@ pub struct RouteOut {
 /// Routing parked between complete_and_route_batch and send_outputs.
 pub struct Completion {
     pub partition: String,
-    pub graph_walk: String,
     pub node_name: String,
-    pub wg: WgIndex,
+    /// Per rid: the walk it completed in, and that walk's worker graph.
+    pub rid_walk: FxHashMap<u32, (Option<Sym>, WgIndex)>,
     pub routing: FxHashMap<u32, Vec<RoutedEdge>>,
     /// Per rid: the persist signals, taken BEFORE the fanout, as Python's
     /// `to_conductor` is. Persist is orthogonal to routing: every rank reports
@@ -1775,18 +1779,17 @@ impl GraphRuntime {
         self.pending_loop_stops.contains(&(rid, w, l))
     }
 
+    /// Rids with a pending stop of `loop_name` in any of `graph_walks`.
     fn pending_loop_stop_rids(
-        &self, graph_walk: &str, loop_name: &str,
+        &self, graph_walks: Vec<String>, loop_name: &str,
     ) -> Vec<u32> {
-        let (Some(w), Some(l)) = (
-            self.interner.get(graph_walk),
-            self.interner.get(loop_name),
-        ) else {
+        let Some(l) = self.interner.get(loop_name) else {
             return vec![];
         };
+        let walks: Vec<Sym> = graph_walks.iter().filter_map(|w| self.interner.get(w)).collect();
         self.pending_loop_stops
             .iter()
-            .filter(|(_, gw, ln)| *gw == w && *ln == l)
+            .filter(|(_, gw, ln)| *ln == l && walks.contains(gw))
             .map(|(rid, _, _)| *rid)
             .collect()
     }
@@ -2182,17 +2185,15 @@ impl GraphRuntime {
     /// re-queued while the step runs. One node for the batch, so one name.
     #[pyo3(signature = (
         spec_id, success, dropped_rids = Vec::new(),
-        node = None, wg_id = None, scheduled_rids = Vec::new(),
+        node = None, wg_ids = None, scheduled_rids = Vec::new(),
     ))]
     fn commit_speculation(
         &mut self, spec_id: u32, success: bool, dropped_rids: Vec<u32>,
-        node: Option<String>, wg_id: Option<u32>, scheduled_rids: Vec<u32>,
+        node: Option<String>, wg_ids: Option<Vec<u32>>, scheduled_rids: Vec<u32>,
     ) -> PyResult<()> {
         if success {
-            if let (Some(node), Some(wg_id)) = (node, wg_id) {
-                self.set_in_flight(
-                    node, wg_id, scheduled_rids, true,
-                )?;
+            if let (Some(node), Some(wg_ids)) = (node, wg_ids) {
+                self.set_in_flight(node, scheduled_rids, wg_ids, true)?;
             }
         }
         let Some((wg, staged)) = self.staged_specs.remove(&spec_id) else {
@@ -2236,17 +2237,35 @@ impl GraphRuntime {
                  rids * output_signals",
             ));
         }
-        let Some(wg) = self.owner_of(&input.node_name, &input.graph_walk)
-        else {
-            return Err(PyValueError::new_err(format!(
-                "no worker graph for node {:?} in walk {:?}",
-                input.node_name, input.graph_walk
-            )));
-        };
-        let Some(node) = self.nid(wg, &input.node_name) else {
-            return Err(PyValueError::new_err("unknown node"));
-        };
-        let g = self.graphs[wg as usize].clone();
+        // Per walk: its worker graph, the node there, the graph, the walk, and
+        // the local worker graphs live in it (the done-sweep below intersects
+        // each request's registered graphs with these).
+        let walk_names = input.walks.clone().unwrap_or_else(|| vec![input.graph_walk.clone()]);
+        let mut ctxs = Vec::with_capacity(walk_names.len());
+        for walk_name in &walk_names {
+            let Some(wg) = self.owner_of(&input.node_name, walk_name) else {
+                return Err(PyValueError::new_err(format!(
+                    "no worker graph for node {:?} in walk {:?}",
+                    input.node_name, walk_name
+                )));
+            };
+            let Some(node) = self.nid(wg, &input.node_name) else {
+                return Err(PyValueError::new_err("unknown node"));
+            };
+            let walk_sym = self.interner.get(walk_name);
+            let walk_wgs: Vec<WgIndex> = walk_sym
+                .and_then(|w| self.walk_to_local_wgs.get(&w).cloned())
+                .unwrap_or_default();
+            ctxs.push((wg, node, self.graphs[wg as usize].clone(), walk_sym, walk_wgs));
+        }
+        let rid_walk_idx = input.rid_walk_idx.clone().unwrap_or_else(|| vec![0; input.rids.len()]);
+        if rid_walk_idx.len() != input.rids.len()
+            || rid_walk_idx.iter().any(|&w| w as usize >= ctxs.len())
+        {
+            return Err(PyValueError::new_err(
+                "complete_and_route_batch: rid_walk_idx must index walks, one per rid",
+            ));
+        }
         let signals: Vec<Option<Sym>> = input
             .output_signals
             .iter()
@@ -2259,15 +2278,8 @@ impl GraphRuntime {
             .map(|(i, &u)| (u, i))
             .collect();
 
-        // The local worker graphs live in this walk; the done-sweep below
-        // intersects each request's registered graphs with these.
-        let walk_sym = self.interner.get(&input.graph_walk);
-        let walk_wgs: Vec<WgIndex> = walk_sym
-            .and_then(|w| self.walk_to_local_wgs.get(&w).cloned())
-            .unwrap_or_default();
-        let walk = walk_sym.unwrap_or_default();
-
         let mut out = RouteOut::default();
+        let mut rid_walk: FxHashMap<u32, (Option<Sym>, WgIndex)> = FxHashMap::default();
         let mut routing: FxHashMap<u32, Vec<RoutedEdge>> = FxHashMap::default();
         let mut persist: FxHashMap<u32, Vec<(Sym, Vec<TensorRef>)>> =
             FxHashMap::default();
@@ -2285,6 +2297,10 @@ impl GraphRuntime {
         let mut cursor = 0usize;
 
         for (i, &rid) in input.rids.iter().enumerate() {
+            let ctx = &ctxs[rid_walk_idx[i] as usize];
+            let (wg, node, g, walk_sym, walk_wgs) = (ctx.0, ctx.1, &ctx.2, ctx.3, &ctx.4);
+            let walk = walk_sym.unwrap_or_default();
+            rid_walk.insert(rid, (walk_sym, wg));
             // Slice this rid's uuids back out of the flat, rid-major layout.
             let mut by_signal: FxHashMap<Sym, Vec<TensorRef>> =
                 FxHashMap::default();
@@ -2790,9 +2806,8 @@ impl GraphRuntime {
             self.completion_counter,
             Completion {
                 partition: input.partition.clone(),
-                graph_walk: input.graph_walk.clone(),
                 node_name: input.node_name.clone(),
-                wg,
+                rid_walk,
                 routing,
                 persist,
                 completed_wgs,
@@ -3154,7 +3169,6 @@ impl GraphRuntime {
         let c = self.completions.remove(&completion_id).ok_or_else(|| {
             PyValueError::new_err(format!("unknown completion {completion_id}"))
         })?;
-        let g = self.graphs[c.wg as usize].clone();
         let mut plan = SendPlan {
             partition: c.partition.clone(),
             nested: c.nested.clone(),
@@ -3175,7 +3189,8 @@ impl GraphRuntime {
             }
         }
         for (rid, edges) in c.routing {
-            let walk = self.interner.get(&c.graph_walk);
+            let (walk, wg) = c.rid_walk.get(&rid).copied().unwrap_or((None, 0));
+            let g = self.graphs[wg as usize].clone();
             // What the receiver needs to put a sharded arrival back together.
             // Python stamps both in fanout_graph_edges, on the sending side.
             let sharding = self.requests[rid as usize]
@@ -3325,23 +3340,40 @@ impl GraphRuntime {
         }
     }
 
+    /// `rids[i]` runs `node` in worker graph `wg_ids[i]`.
     fn set_in_flight(
         &mut self, node: String,
-        wg_id: u32, rids: Vec<u32>,
+        rids: Vec<u32>, wg_ids: Vec<u32>,
         in_flight: bool,
     ) -> PyResult<()> {
-        let wg = self.wg_index(wg_id).ok_or_else(|| {
-            PyValueError::new_err(format!("unknown worker graph id {wg_id}"))
-        })?;
-        // NOT interner.get(): that is the STRING id, and set_in_flight
-        // wants the node's index within this worker graph. The two id spaces
-        // are both u32, so only the Option here made the mix-up visible.
-        let node_id = self.nid(wg, &node).ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "node {node:?} is not in worker graph {wg_id}"
-            ))
-        })?;
-        for rid in rids {
+        if rids.len() != wg_ids.len() {
+            return Err(PyValueError::new_err(
+                "set_in_flight: rids and wg_ids differ in length",
+            ));
+        }
+        // (worker graph id -> its index, the node's index in it), for the
+        // few distinct graphs a batch spans
+        let mut resolved: Vec<(u32, WgIndex, NodeId)> = Vec::new();
+        for (rid, wg_id) in rids.into_iter().zip(wg_ids) {
+            let (wg, node_id) = match resolved.iter().find(|r| r.0 == wg_id) {
+                Some(&(_, wg, n)) => (wg, n),
+                None => {
+                    let wg = self.wg_index(wg_id).ok_or_else(|| {
+                        PyValueError::new_err(format!("unknown worker graph id {wg_id}"))
+                    })?;
+                    // NOT interner.get(): that is the STRING id, and set_in_flight
+                    // wants the node's index within this worker graph. The two id
+                    // spaces are both u32, so only the Option here made the mix-up
+                    // visible.
+                    let node_id = self.nid(wg, &node).ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "node {node:?} is not in worker graph {wg_id}"
+                        ))
+                    })?;
+                    resolved.push((wg_id, wg, node_id));
+                    (wg, node_id)
+                }
+            };
             if let Some(state) = self.state_mut(wg, rid) {
                 state.set_in_flight(node_id, in_flight);
             }
