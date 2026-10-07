@@ -1,0 +1,53 @@
+model: "glm52"
+# GLM-5.2 TP8 with MTP speculative decoding (glm52_tp8.yaml plus drafting).
+#
+# mtp_num_draft_tokens=k loads the layer-78 draft module (~9.7B extra
+# params) and makes each decode step draft-then-verify: the target forwards
+# k+1 tokens per request, emits accepted+1 (greedy prefix match against the
+# target's own argmax), takes the rejected KV tail back in place, and the
+# draft module proposes the next k. KV grows by one layer plane, the draft
+# module's own cache sharing the trunk's page table.
+#
+# The routed experts run the fused fp8 kernel (moe_quant_kernel: auto), so
+# a decode step (the draft chain, the trunk verify and the MTP pass) replays
+# as one CUDA graph.
+#
+# Limits: greedy only (requests asking for temperature > 0 or a repetition
+# penalty are refused per request), and short context, since MTP and
+# dsa_long_context are mutually exclusive.
+max_seq_len: 2048
+dist_timeout_s: 7200
+tp_allreduce: "symm_multimem"
+tp_allreduce_max_kb: 32768
+# A request holds at most 17 pages with the verify rows: 64 of them fit the
+# pool below, so a decode step never finds it empty.
+max_concurrent_requests: 64
+model_kwargs:
+  # Drafts per step. k=3 was the best of k=2..4 on an 8xH200 node; re-sweep
+  # on other hardware.
+  mtp_num_draft_tokens: 3
+  # glm52_tp8.yaml's speedups; MTP's prefill ignores prefill_last_layer_rows
+  fused_add_rmsnorm: true
+  mla_fused_prep: true
+  dense_fp8: true
+  moe_decode_kernel: true
+  moe_prefill_kernel: true
+  moe_fused_allreduce: true
+  moe_router_kernel: true
+  prefill_token_buckets: [
+    64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
+    832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
+    1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
+  prefill_batched_token_buckets: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
+  prefill_capture_batch_sizes: [1, 4, 16]
+  prefill_max_step_tokens: "auto"
+resources:
+  kv:
+    # One extra layer plane vs glm52_tp8.yaml, 79 in all: ~17.9 GB/rank.
+    max_num_pages: 1536
+    page_size: 128
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

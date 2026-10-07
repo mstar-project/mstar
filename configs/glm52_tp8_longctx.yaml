@@ -1,6 +1,6 @@
 model: "glm52"
 # GLM-5.2 TP8 with the DSA long-context path. Same box shape as
-# glm52_tp8.yaml; the difference is the model_kwargs below.
+# glm52_tp8.yaml, minus its speedups, plus the model_kwargs below.
 #
 # dsa_long_context lifts the context <= index_topk (2048) guard to
 # max_seq_len. Indexer layers then keep a per-request k-store outside the
