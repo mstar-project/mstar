@@ -129,8 +129,12 @@ class PythonGraphRuntime(GraphRuntime):
         sharding_config: ShardingConfig,
         tensor_manager: TensorCommunicationManager,
         communicator: BaseCommunicator | None = None,
+        combined_walk_of: dict[tuple[str, str], str] | None = None,
     ):
         self._my_worker_id = my_worker_id
+        # (node, real walk) -> the combined walk the scheduler batches it under;
+        # a ready-scan target or exclusion may name either
+        self._combined_walk_of = dict(combined_walk_of or {})
         self._communicator = communicator
         # Refcount changes go through the manager rather than the bare store,
         # so a tensor that drops to zero is torn down (shm file, arena slot,
@@ -581,6 +585,14 @@ class PythonGraphRuntime(GraphRuntime):
             walk_output_signals=walk_signals,
         )
 
+    def _names_walk(self, target: tuple[str, str], node_name: str, walk: str) -> bool:
+        """``target`` names this node in this walk, directly or by its
+        combined walk."""
+        return target[0] == node_name and (
+            target[1] == walk
+            or self._combined_walk_of.get((node_name, walk)) == target[1]
+        )
+
     def _scan_ready(
         self, exclude_rids: set[int],
         target: tuple[str, str] | None,
@@ -592,7 +604,7 @@ class PythonGraphRuntime(GraphRuntime):
         caller's to apply, because it can fail a request, which is a scheduling
         decision rather than a graph one.
         """
-        target_node, target_walk = target if target is not None else (None, None)
+        target_node = target[0] if target is not None else None
         for queue in self._queues.values():
             for rid, node_names in queue.get_ready_node_names().items():
                 if rid in exclude_rids or rid not in self._request_info:
@@ -604,10 +616,10 @@ class PythonGraphRuntime(GraphRuntime):
                     if partition is None:
                         continue
                     walk = self.get_walk(rid, partition)
-                    if target_walk is not None and walk != target_walk:
+                    if target is not None and not self._names_walk(target, node_name, walk):
                         continue
                     if exclude_target is not None \
-                            and (node_name, walk) == exclude_target:
+                            and self._names_walk(exclude_target, node_name, walk):
                         continue
                     yield node_name, walk, rid
 

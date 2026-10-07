@@ -752,6 +752,8 @@ class GraphRuntime(ABC):
         level ready-ness separately.
 
         exclude_rids includes failed_rids, pending_removes, and held_until.
+        ``target`` and ``exclude_target`` may name a combined walk, as the
+        runtime's ``combined_walk_of`` maps it.
         """
         pass
 
