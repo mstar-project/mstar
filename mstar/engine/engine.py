@@ -75,6 +75,13 @@ logger = logging.getLogger(__name__)
 # launch queue and block a launch (machine/driver dependent).
 _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 
+# Publish resource state lazily: finalize_batch records a cheap snapshot per
+# request and the worker finishes it only for the requests whose frame or
+# completion carries it. Eager (0) builds the full publication for every
+# request on every step; in a decode loop nothing reads it until the loop
+# stops, and it was a quarter of the gpu thread's host time at batch 32.
+_LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
+
 
 
 def checkpoint_identity(path: str | Path) -> bytes:
@@ -274,6 +281,9 @@ class ExecutingBatch:
     resource_publish_info: dict[str, dict[str, PublishedInfo]] = field(
         default_factory=dict
     )
+    # What finalize_batch snapshotted instead of publishing (MSTAR_LAZY_PUBLISH);
+    # ``Engine.materialize_publish`` turns entries into resource_publish_info.
+    publish_snapshots: dict[str, dict[str, Any]] | None = None
 
     # The next step reads N's outputs, and plans against N's committed state.
     # Two separate dependencies, so two events: whoever prepares N+1 can start
@@ -1378,10 +1388,23 @@ class Engine:
         if self._enable_nvtx:
             range_push("engine.finalize_batch")
         try:
+            rids = (
+                batch.request_ids if publish_request_ids is None
+                else publish_request_ids
+            )
+            if _LAZY_PUBLISH:
+                # Snapshot now, on the gpu thread, so the lengths are this
+                # step's; finish in ``materialize_publish`` for the rids whose
+                # frame or completion carries the publication.
+                batch.publish_snapshots = self._runner.publish_snapshot(
+                    rids,
+                    node_name=batch.node_name,
+                    graph_walk=batch.step_context.graph_walk,
+                )
+                return batch.resource_publish_info
             # Returns rid -> {resource label -> published info}
             published = self._runner.publish(
-                batch.request_ids if publish_request_ids is None
-                else publish_request_ids,
+                rids,
                 node_name=batch.node_name,
                 graph_walk=batch.step_context.graph_walk,
             )
@@ -1393,6 +1416,32 @@ class Engine:
         finally:
             if self._enable_nvtx:
                 range_pop()
+
+    def materialize_publish(
+        self, batch: ExecutingBatch, request_ids: list[int],
+    ) -> None:
+        """Finish the publication ``finalize_batch`` snapshotted, for the rids
+        whose frame or completion carries it. Idempotent per rid."""
+        snaps = batch.publish_snapshots
+        if not snaps:
+            return
+        todo = [
+            rid for rid in request_ids
+            if rid in snaps and rid not in batch.resource_publish_info
+        ]
+        if not todo:
+            return
+        published = self._runner.publish_from_snapshots(
+            snaps, todo,
+            node_name=batch.node_name,
+            graph_walk=batch.step_context.graph_walk,
+        )
+        for rid in todo:
+            per_key = published.get(rid) or {}
+            batch.resource_publish_info[rid] = per_key
+            info = batch.per_request_info.get(rid)
+            if info is not None and per_key:
+                info.update_publish_info(per_key)
 
     def finalize_stopped_requests(
         self,
