@@ -54,6 +54,48 @@ def test_held_chunks_come_back_concatenated_in_order():
     assert acc.release(0, "LLM", {"x": []}) == {"x": []}, "released once"
 
 
+def test_concat_joins_along_the_declared_dim():
+    from mstar.model.submodule_base import ChunkedPrefillOutputPolicy
+
+    acc = ChunkOutputAccumulator()
+    acc.hold(0, "LLM", {"mask": [torch.zeros(2, 3)]})
+
+    out = acc.release(0, "LLM", {"mask": [torch.ones(2, 4)]}, {"mask": ChunkedPrefillOutputPolicy(dim=1)})
+
+    assert out["mask"][0].shape == (2, 7)
+
+
+def test_list_keeps_every_chunk():
+    from mstar.model.submodule_base import ChunkedPrefillOutputMode, ChunkedPrefillOutputPolicy
+
+    acc = ChunkOutputAccumulator()
+    acc.hold(0, "LLM", {"states": [torch.tensor([1.0])]})
+
+    out = acc.release(
+        0, "LLM", {"states": [torch.tensor([2.0])]},
+        {"states": ChunkedPrefillOutputPolicy(mode=ChunkedPrefillOutputMode.LIST)},
+    )
+
+    assert [t.tolist() for t in out["states"]] == [[1.0], [2.0]]
+
+
+def test_concat_joins_each_tensor_of_an_edge_with_its_own():
+    """An edge of several tensors per chunk (one per layer, say) stays several."""
+    acc = ChunkOutputAccumulator()
+    acc.hold(0, "LLM", {"layers": [torch.tensor([1.0]), torch.tensor([10.0])]})
+
+    out = acc.release(0, "LLM", {"layers": [torch.tensor([2.0]), torch.tensor([20.0])]})
+
+    assert [t.tolist() for t in out["layers"]] == [[1.0, 2.0], [10.0, 20.0]]
+
+
+def test_a_final_chunk_with_no_outputs_still_releases_the_held_ones():
+    acc = ChunkOutputAccumulator()
+    acc.hold(0, "LLM", {"states": [torch.tensor([1.0])]})
+
+    assert acc.release(0, "LLM", {})["states"][0].tolist() == [1.0]
+
+
 def test_a_removed_request_leaves_nothing_held():
     acc = ChunkOutputAccumulator()
     acc.hold(0, "LLM", {"states": [torch.tensor([1.0])]})
@@ -127,3 +169,32 @@ def test_the_whole_input_is_kept_until_the_last_chunk_lands():
 
     engine.release_chunk_inputs(0, "LLM")
     assert not engine._chunk_inputs
+
+
+def test_a_step_over_its_token_budget_is_reported(caplog):
+    from types import SimpleNamespace
+
+    from mstar.engine.engine import Engine
+
+    engine = Engine.__new__(Engine)
+    engine._token_budget_overruns = {}
+    submodule = SimpleNamespace(max_batch_tokens=lambda walk: 4)
+    batch = SimpleNamespace(node_name="LLM", step_context=SimpleNamespace(graph_walk="mixed"))
+    over = [SimpleNamespace(input_seq_len=3), SimpleNamespace(input_seq_len=2)]
+
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            engine._check_token_budget(batch, submodule, over)
+        engine._check_token_budget(batch, submodule, over[:1])
+
+    assert engine._token_budget_overruns == {("LLM", "mixed"): 3}
+    assert len(caplog.records) == 2  # the 1st and 2nd overrun; the 4th would be next
+
+
+def test_an_unprepared_row_has_no_length():
+    from mstar.engine.engine import ExecutingBatch
+
+    batch = ExecutingBatch(node_name="LLM", per_request_info={}, step_context=None)
+    batch.input_seq_lens[0] = 7
+
+    assert (batch.seq_len_of(0), batch.seq_len_of(1)) == (7, -1)
