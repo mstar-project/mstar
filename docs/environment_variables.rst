@@ -295,6 +295,15 @@ Worker scheduling
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
        thread.
+   * - ``MSTAR_EARLY_SPEC``
+     - ``1``
+     - Build and pre-plan step N+2 while N+1 runs, between the stop and
+       routing halves of step N's post-processing, so the pre-plan overlaps
+       work the main thread does anyway instead of the next launch. ``0``
+       builds each speculation at the top of the next iteration, after the
+       whole post-processing, which left the plan thread idle during it.
+       Non-parallel (TP1) nodes only; a tensor-parallel node keeps the old
+       order so the followers see heads in the order they settle them.
    * - ``MSTAR_LAZY_PUBLISH``
      - ``1``
      - Publish resource state (KV pages, positions) only for the requests
