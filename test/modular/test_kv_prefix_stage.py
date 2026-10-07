@@ -69,6 +69,9 @@ class _Submodule:
         """The span a step would declare from these inputs."""
         return inputs.input_seq_len
 
+    def max_batch_tokens(self, graph_walk):
+        return None  # NodeSubmodule's default: no token budget
+
 
 def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]):
     engine = Engine.__new__(Engine)
