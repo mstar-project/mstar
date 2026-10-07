@@ -21,7 +21,9 @@ High-level components
 - **Resources** (``mstar/engine/resources/``): the state that a node's compute uses. This
   includes paged KV caches, the attention planned over them (FlashInfer or dense),
   cross-attention over a fixed context, cacheless (ragged) attention for encoder towers
-  that attend within one packed forward, position embeddings, and samplers. A model
+  that attend within one packed forward, recurrent state pools and the linear attention
+  planned over them (gated DeltaNet, for hybrid models whose non-KV layers carry a
+  fixed-size state instead of a growing cache), position embeddings, and samplers. A model
   declares which resources each node needs, and the engine builds them. A node that
   declares no resources receives none. VAE encoders, codec decoders, and projection and
   combine stages are examples.

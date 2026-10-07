@@ -45,6 +45,7 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +384,8 @@ class KVManager(AttentionResource):
 
         # (slot, label) -> KVPlanState, sized for the largest capture bucket
         self._static_plan_states: dict[tuple[int, str], KVPlanState] = {}
+        # copy-only H2D into those, see `_stage_decode_plan_state`
+        self._plan_stager = PinnedStager(torch.long)
         self._cg_max_seq_len = 0
         self._current_plan_states: dict[str, KVPlanState] = {}
         self.reset_default_cursors()
@@ -392,11 +395,8 @@ class KVManager(AttentionResource):
         self._preplan_key = None
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
 
-        # Prior length and epochs for pre-forks applied by a staged step;
-        # facilitates clear_preplan.
-        self._preplan_fork_undo: list[tuple[str, str, int, int, int]] = []
-        # (rid, to_label) for intialized reservations by staged step; cleared_preplan removes
-        # recorded in admit not plan, so separate from above.
+        # (rid, to_label) reservations a staged step made; clear_preplan
+        # releases them. recorded in admit, not plan: forks are not staged.
         self._preplan_new_labels: list[tuple[str, str]] = []
         # (rid, label) marked step_in_flight by a staged step, so an abandoned
         # one does not leave its streams unevictable
@@ -905,6 +905,8 @@ class KVManager(AttentionResource):
                 self._preplan_marked = []
             for (from_label, to_label), extra in forks:
                 for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
                     # checked before the reservation, which is what creates it
                     if (
                         ctx.is_preplan
@@ -922,7 +924,10 @@ class KVManager(AttentionResource):
                             (rid, to_label), []).extend(alloc_res.new_pages)
 
             for segment in step.segments:
-                if segment.span == 0:
+                # A replay's padding rows reserve nothing: they run against
+                # SINK_PAGE (see `_sequence_views`). Pages for them would fail
+                # to allocate on a near-full arena and hold the batch.
+                if segment.span == 0 or ctx.is_padding_row(segment.request_id):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 alloc_res = self._alloc(
@@ -944,6 +949,8 @@ class KVManager(AttentionResource):
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
+                if ctx.is_padding_row(segment.request_id):
+                    continue
                 stream = self._streams.get(
                     segment.request_id, {}
                 ).get(segment.label)
@@ -999,23 +1006,42 @@ class KVManager(AttentionResource):
         for key in [k for k in self._admit_reserved_pages if k[0] == rid]:
             del self._admit_reserved_pages[key]
 
-    def _sequence_views(self, segments: list[Segment]) -> list[SequenceView]:
+    def _sequence_views(
+        self,
+        segments: list[Segment],
+        pending_forks: dict[tuple[str, str], tuple[int, int]] | None = None,
+        ctx: StepContext | None = None,
+    ) -> list[SequenceView]:
         views = []
         page_size = self.kv_cache.page_size
+        pending_forks = pending_forks or {}
         for s in segments:
+            if ctx is not None and ctx.is_padding_row(s.request_id):
+                # A padding row reads and writes SINK_PAGE; the engine
+                # discards its output.
+                views.append(SequenceView(
+                    request_id=s.request_id, label=s.label,
+                    # a sink page per page of span, not one: fewer and its writes spill into the previous row's pages
+                    page_idxs=[SINK_PAGE] * -(-s.span // page_size),
+                    length=s.span, to_compute=s.span,
+                ))
+                continue
             stream = self._streams[s.request_id][s.label]
+            stored_len, generation = pending_forks.get(
+                (s.request_id, s.label), (stream.stored_len, stream.generation)
+            )
             # `page_indices` is a high-water mark, so a stream can hold more
             # pages than its tokens need (a refused admit, a reset that kept
             # its pages). slice to the length or the view addresses token 0
             # into the wrong page and reports the padding as resident context
-            length = s.span + stream.stored_len
+            length = s.span + stored_len
             num_pages = -(-length // page_size)
             views.append(SequenceView(
                 request_id=s.request_id,
                 label=s.label, page_idxs=stream.page_indices[:num_pages],
                 length=length,
                 to_compute=s.span,
-                generation=stream.generation,
+                generation=generation,
             ))
         return views
 
@@ -1076,15 +1102,7 @@ class KVManager(AttentionResource):
         stream, so build it in the same CPU pass the views came from and send
         it over as one H2D.
         """
-        page_size = self.kv_cache.page_size
-        pages: list[int] = []
-        offsets: list[int] = []
-        for view in views:
-            # off the stream's page count, not its logical length: that is what
-            # `build_paged_indptrs` hands attention, so a stream holding more
-            # pages than its length needs stays self-consistent
-            pages.append(view.page_idxs[-1])
-            offsets.append((view.last_page_len(page_size) or page_size) - 1)
+        pages, offsets = self._decode_locations(views)
         locations = torch.tensor(
             [pages, offsets], dtype=torch.long
         ).to(self._device, non_blocking=True)
@@ -1094,11 +1112,53 @@ class KVManager(AttentionResource):
             total_tokens=len(views),
         )
 
+    def _decode_locations(
+        self, views: list[SequenceView],
+    ) -> tuple[list[int], list[int]]:
+        """Each decode row's (page, offset-in-page) for the token it writes.
+
+        Off the stream's page count, not its logical length: that is what
+        `build_paged_indptrs` hands attention, so a stream holding more pages
+        than its length needs stays self-consistent."""
+        page_size = self.kv_cache.page_size
+        pages = [view.page_idxs[-1] for view in views]
+        offsets = [(view.last_page_len(page_size) or page_size) - 1 for view in views]
+        return pages, offsets
+
+    def _stage_decode_plan_state(
+        self, views: list[SequenceView], static_state: KVPlanState,
+        capture_len: int,
+    ) -> KVPlanState:
+        """``_decode_plan_state`` + ``KVPlanState.copy_`` with no device staging
+        tensor; rows past the real tokens get SINK_PAGE / 0."""
+        pages, offsets = self._decode_locations(views)
+        self._plan_stager.copy_(
+            static_state.token_to_page[:capture_len], pages, pad_value=SINK_PAGE,
+        )
+        self._plan_stager.copy_(
+            static_state.token_to_cache[:capture_len], offsets, pad_value=0,
+        )
+        static_state.total_tokens = len(views)
+        return static_state
+
     def _setup_plan_states(
         self, plan_output: dict[str, KVPlanOutput],
         ctx: StepContext, lease,
     ):
         for label, indptrs in plan_output.items():
+            if indptrs.is_decode and lease is not None:
+                # Straight into the captured buffers in one H2D per buffer:
+                # this runs in the pre-plan beside a live graph, where a
+                # device-side copy + fill would slow it (see mstar.utils.h2d).
+                plan_state = self._stage_decode_plan_state(
+                    indptrs.views, self._static_plan_state(lease.slot, label),
+                    lease.bucket.num_tokens,
+                )
+                if ctx.is_preplan:
+                    self._preplan_states[label] = plan_state
+                else:
+                    self._current_plan_states[label] = plan_state
+                continue
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(indptrs.views)
             else:
@@ -1123,6 +1183,38 @@ class KVManager(AttentionResource):
             views=views,
         )
 
+    def _maybe_apply_forks(self, step: KVStep, ctx: StepContext):
+        for (from_label, to_label) in step.pre_forks:
+            for rid in ctx.padded_request_ids:
+                if ctx.is_padding_row(rid):
+                    continue
+                self._apply_fork(rid, from_label, to_label)
+
+    def _pending_fork_state(
+        self, step: KVStep, ctx: StepContext
+    ) -> dict[tuple[str, str], tuple[int, int]]:
+        """``(stored_len, generation)`` each pre-fork will hand its target.
+
+        Staging cannot run the fork (`copy_pages` would race the default
+        stream), so the target's length and bumped generation are read ahead
+        and the copy happens at promotion.
+        """
+        pending: dict[tuple[str, str], tuple[int, int]] = {}
+        with self._lock:
+            for (from_label, to_label) in step.pre_forks:
+                for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
+                    labels = self._streams.get(rid, {})
+                    src = labels.get(from_label)
+                    dst = labels.get(to_label)
+                    if src is None or dst is None:
+                        continue
+                    pending[(rid, to_label)] = (
+                        src.stored_len, dst.generation + 1,
+                    )
+        return pending
+
     def plan(self, step: KVStep, ctx: StepContext) -> dict[str, KVPlanOutput]:
         """
         Returns list of sequence views per plan label
@@ -1136,7 +1228,11 @@ class KVManager(AttentionResource):
             if self._preplan_key == self._plan_key(step, ctx):
                 self._current_plan_states = self._preplan_states
                 res = self._cached_plan_output
-                self._preplan_fork_undo = []
+
+                # Promotion: apply the fork copies staging left undone; see
+                # `_pending_fork_state`.
+                self._maybe_apply_forks(step, ctx)
+
                 self._preplan_new_labels = []
                 self._preplan_marked = []
                 self.clear_preplan()
@@ -1146,13 +1242,20 @@ class KVManager(AttentionResource):
             # pre-planned): it must not be served the staged plan's pages.
             # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
-        undo = self._preplan_fork_undo if ctx.is_preplan else None
-        for (from_label, to_label) in step.pre_forks:
-            for rid in ctx.padded_request_ids:
-                self._apply_fork(rid, from_label, to_label, undo=undo)
+
+        # Forks run ahead of the views, which record length and generation;
+        # staging only reads what the fork will land.
+        if ctx.is_preplan:
+            pending = self._pending_fork_state(step, ctx)
+        else:
+            pending = {}
+            self._maybe_apply_forks(step, ctx)
+
         res = KVPlanOutputs(
             {
-                plan_label: self._plan_output(self._sequence_views(segments))
+                plan_label: self._plan_output(
+                    self._sequence_views(segments, pending, ctx)
+                )
                 for plan_label, segments in group_by_plan_label(
                     step.segments, step.combined_labels
                 ).items()
@@ -1180,24 +1283,9 @@ class KVManager(AttentionResource):
 
     def clear_preplan(self):
         # the staged step is not going to run, so undo what it did to live
-        # state: dropping the cached plan is not enough, the pre-forks already
-        # copied pages and moved lengths
+        # state. the pre-forks need no rewinding — staging only read them —
+        # but admit's reservations are real pages and real streams
         with self._lock:
-            for (
-                rid,
-                label,
-                stored_len,
-                generation,
-                reset_generation,
-            ) in reversed(
-                self._preplan_fork_undo
-            ):
-                stream = self._streams.get(rid, {}).get(label)
-                if stream is not None:
-                    stream.stored_len = stored_len
-                    stream.generation = generation
-                    stream.reset_generation = reset_generation
-            self._preplan_fork_undo = []
             # labels the staged step invented are removed, not rewound to 0:
             # a stream at 0 that nothing asked for is still a stream, and it
             # holds the pages the reservation took
@@ -1223,6 +1311,8 @@ class KVManager(AttentionResource):
             # committed, so there is nothing left to unwind
             self._admit_reserved_pages.clear()
             for segment in step.segments:
+                if ctx.is_padding_row(segment.request_id):
+                    continue  # ran against SINK_PAGE, holds nothing
                 stream = self._streams[segment.request_id][segment.label]
                 # cleared before the `step.commit` test: a step that keeps no
                 # tokens (image_gen, action_gen) still read these pages, and
@@ -1264,6 +1354,8 @@ class KVManager(AttentionResource):
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
                 for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
                     self._apply_fork(rid, from_label, to_label)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
@@ -1913,31 +2005,18 @@ class KVManager(AttentionResource):
         )
 
     def _apply_fork(
-        self, rid: str, from_label: str, to_label: str, undo: list | None = None,
+        self, rid: str, from_label: str, to_label: str,
     ) -> None:
         """Copy a stream onto its fork target, over pages `_reserve_fork` took.
 
         Locked (reentrant): called from plan (pre-forks, else unguarded) and
         from the already-locked commit (post-forks).
-
-        ``undo`` collects each target's prior length and epochs so a preplan
-        that is abandoned can be reversed; see `clear_preplan`.
         """
         with self._lock:
             if from_label not in self._streams[rid]:
                 return
             from_stream = self._streams[rid][from_label]
             to_stream = self._ensure_label(rid, to_label)
-            if undo is not None:
-                undo.append(
-                    (
-                        rid,
-                        to_label,
-                        to_stream.stored_len,
-                        to_stream.generation,
-                        to_stream.reset_generation,
-                    )
-                )
             # sized off the source's length, not either side's page count:
             # both can hold more pages than the fork needs, and a target left
             # over-reserved by a refused admit used to make the copy lopsided

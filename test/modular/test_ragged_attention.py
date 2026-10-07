@@ -225,7 +225,7 @@ def test_graph_mode_pads_fewer_segments():
     w = graph_wrapper()
     w.plan(cu([10, 20]))
     assert w.num_segments == 2
-    assert w._cu_host.tolist() == [0, 10, 30, 30, 30]
+    assert w._qo_indptr_buf.tolist() == [0, 10, 30, 30, 30]
 
 
 def test_graph_mode_rejects_too_many_segments():

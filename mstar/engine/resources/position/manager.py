@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, fields
 import torch
 
 from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, PublishedInfo, Resource
+from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs, SequenceView
 from mstar.engine.resources.position.config import (
@@ -46,13 +47,14 @@ class PositionManager(Resource):
 
     @classmethod
     def build(cls, spec: PositionSpec, info: EngineResourceInfo):
+        # `dependency` hands back the SPEC; its `.config` is the KVConfig
+        kv_spec: KVSpec = info.dependency(spec.config.kv_cache)
         if spec.config.backend == PosBackend.ROPE:
-            kv_config = info.dependency(spec.config.kv_cache).config
             return RopeManager(
                 config=spec.config,
                 device=info.device,
-                max_seq_len=kv_config.max_seq_len,
-                head_dim=kv_config.head_dim,
+                max_seq_len=kv_spec.config.max_seq_len,
+                head_dim=kv_spec.config.head_dim,
                 dtype=info.kv_dtype,
             )
         raise ValueError(f"Unknown position backend {spec.config.backend!r}")
@@ -106,6 +108,9 @@ class RopeManager(PositionManager):
         self._matched: dict[str, int] = {}
 
         self._static_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
+        # Host side of the same addressing, keyed the same way; see
+        # `_pinned_pos_ids_buffer`.
+        self._pinned_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
         # plan label -> ids of this step on device
         # to buffer when capture; to fresh tensor when reager
         self._current_pos_ids: dict[str, torch.Tensor] = {}
@@ -113,8 +118,8 @@ class RopeManager(PositionManager):
         self._preplan_pos_ids: dict[str, torch.Tensor] = {}
         self._preplanned = False
         # (rid, to_label, counter) for each pre-fork applied, so
-        # `clear_preplan` can put the targets back. Mirror to
-        # `KVManager._preplan_fork_undo`
+        # `clear_preplan` can put the targets back. Unlike KV's, these forks are
+        # staged: a counter is host-only, so copying it early races nothing.
         self._preplan_fork_undo: list[tuple[str, str, int | None]] = []
 
     def depends_on(self):
@@ -215,6 +220,12 @@ class RopeManager(PositionManager):
     def supports_preplan(self):
         return True
 
+    @property
+    def force_double_buffer(self):
+        # a slot's pinned host buffer must not be refilled while `_place`'s
+        # non-blocking copy out of it may still be queued
+        return True
+
     def clear_preplan(self):
         # `None` means the label had no counter before the staging, which is
         # not the same as having had 0: restoring 0 leaves behind a label the
@@ -277,7 +288,7 @@ class RopeManager(PositionManager):
         for plan_label, kv_out in plan_outputs.items():
             pos_ids = self._explicit_pos_ids(step, plan_label, len(plan_outputs))
             if pos_ids is None:
-                pos_ids = self._build_pos_ids(kv_out.views)
+                pos_ids = self._build_pos_ids(kv_out.views, plan_label, lease)
             pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
         self._preplanned = ctx.is_preplan
         return pos_ids_out
@@ -333,8 +344,30 @@ class RopeManager(PositionManager):
             return step.pos_ids
         return step.pos_ids.get(plan_label)
 
-    def _build_pos_ids(self, views: list[SequenceView]) -> torch.Tensor:
-        """step positions in KV plan order from stream counters"""
+    def _pinned_pos_ids_buffer(
+        self, key: CGSlotKey, num_tokens: int,
+    ) -> torch.Tensor:
+        """Pinned host staging for one (bucket, slot, label)'s positions.
+
+        Reuse is safe because the runner does not re-lease a slot whose step is
+        in flight, so a buffer is refilled only after its async copy ran.
+        """
+        buffer = self._pinned_pos_ids.get(key)
+        if buffer is None:
+            buffer = self._pinned_pos_ids[key] = torch.empty(
+                num_tokens, dtype=torch.long, pin_memory=True,
+            )
+        return buffer
+
+    def _build_pos_ids(
+        self, views: list[SequenceView], plan_label: str, lease,
+    ) -> torch.Tensor:
+        """step positions in KV plan order from stream counters
+
+        Under a lease these go into pinned memory so `_place`'s `non_blocking`
+        copy is really asynchronous; from pageable memory the host waits. The
+        eager path has no slot to key a buffer by, so allocates plainly.
+        """
         block = self._config.scheme == PosScheme.BLOCK
         pos_ids: list[int] = []
         for view in views:
@@ -343,7 +376,20 @@ class RopeManager(PositionManager):
                 pos_ids.extend([start] * view.to_compute)
             else:
                 pos_ids.extend(range(start, start + view.to_compute))
-        return torch.tensor(pos_ids, dtype=torch.long)
+        if lease is None:
+            return torch.tensor(pos_ids, dtype=torch.long)
+        key = CGSlotKey(
+            bucket=lease.bucket, slot=lease.slot, label=plan_label
+        )
+        buffer = self._pinned_pos_ids_buffer(key, lease.bucket.num_tokens)
+        num_tokens = len(pos_ids)
+        assert num_tokens <= buffer.shape[0], (
+            f"plan label {plan_label!r} carries {num_tokens} tokens but its "
+            f"captured bucket holds {buffer.shape[0]}"
+        )
+        # through the numpy view, to avoid allocating a tensor
+        buffer.numpy()[:num_tokens] = pos_ids
+        return buffer[:num_tokens]
 
     def _place(
         self, pos_ids: torch.Tensor, plan_label: str, lease

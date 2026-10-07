@@ -640,7 +640,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         """
         if self.tensor_store.is_registered(uuid):
             return False
-        tensor = self.tensor_store.get_tensor(uuid)
+        tensor = self._send_source(uuid)
         t0 = time.perf_counter()
         t = tensor.detach().contiguous()
         nbytes = t.numel() * t.element_size()
@@ -677,8 +677,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 # Async D2H into the pinned segment when a copy stream exists
                 # (the caller's single sync covers the batch); blocking
                 # otherwise, so the descriptor can never ship ahead of the bytes.
-                host.copy_(t, non_blocking=self._d2h_stream is not None)
-                queued = True
+                if t.is_cuda:
+                    host.copy_(t, non_blocking=self._d2h_stream is not None)
+                    queued = True
+                else:
+                    # a stored host copy: a memcpy, nothing for the stream
+                    # sync to wait on
+                    host.copy_(t)
             self._arena_locs[uuid] = (seg, off)
             self._arena_ts[uuid] = time.monotonic()
         except BaseException:

@@ -57,6 +57,10 @@ and sampling kernels determine which devices it can capture on; see
    * - ``pi05``
      - ``lerobot/pi05_base``
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
+   * - ``qwen3_5_{0.8,2,4,9,27}b``
+     - ``Qwen/Qwen3.5-4B``
+     - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
+       attention interleaved with full attention, plus a ViT tower.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -150,6 +154,31 @@ OmniVoice notes
 - The backbone is not autoregressive: it fills a fixed canvas of eight codebook
   rows over a few unmasking steps, so there is no KV cache and no per-token
   sampling loop. Serve it with ``mstar serve omnivoice --gpus 0``.
+
+Qwen3.5 (``qwen3_5_*``)
+-----------------------
+
+Text-and-image chat on the Qwen3.5 dense family (five sizes; MoE variants are
+not supported yet; video is refused). Served on both ``POST /generate`` and
+``/v1/chat/completions`` (image parts included). Images may be interleaved with
+text anywhere in the prompt, and prefill follows the order they were written::
+
+    mstar serve qwen3_5_4b --gpus 0
+
+Most layers are gated DeltaNet, so a request holds a recurrent-state slot as
+well as a KV allocation. Set ``gdn_state.max_slots`` in
+``configs/qwen3_5_*.yaml`` to the concurrency you want plus one for the sink;
+CUDA-graph capture and padded replays use the sink, not slots. A slot is
+~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half that in bf16), hence
+not the 256-slot default. The state defaults to the checkpoint's
+``mamba_ssm_dtype`` (fp32 for the released checkpoints, as in vLLM);
+``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
+needs FlashInfer's fused bf16 decode kernel (K = V = 128).
+
+``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
+``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
+a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
+via ``extra_body``.
 
 Kokoro notes
 ------------

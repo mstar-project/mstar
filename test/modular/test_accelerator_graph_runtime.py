@@ -9,6 +9,7 @@ import torch
 
 from mstar.engine.engine import Engine
 from mstar.engine.resources.sampler.utils import sample_cuda_graphable_gpu
+from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.worker import Worker
 
 
@@ -24,15 +25,19 @@ def test_output_copy_uses_worker_device_runtime(monkeypatch, device_type):
         stream=Mock(return_value=nullcontext()),
     )
     monkeypatch.setattr(torch, device_type, runtime)
-    tensor = SimpleNamespace(device=worker.device, dtype=torch.int64, shape=(1,))
+    tensor = SimpleNamespace(
+        device=worker.device, dtype=torch.int64, shape=(1,), numel=lambda: 1,
+    )
     monkeypatch.setattr(torch, "is_tensor", lambda value: value is tensor)
     cpu_tensor = Mock()
     worker._get_pinned_d2h_buffer = Mock(return_value=cpu_tensor)
     host_value = object()
-    outputs = {7: {"token": [tensor, host_value], "metadata": "keep"}}
+    outputs = BatchedModelOutput(
+        per_rid_outputs={7: {"token": [tensor, host_value], "metadata": "keep"}},
+    )
     event = object()
 
-    copied = worker._prematerialize_for_check_stop(outputs, event)
+    copied, host_rows = worker._prematerialize_for_check_stop(outputs, event)
 
     runtime.Stream.assert_called_once_with(device=worker.device)
     side.wait_event.assert_called_once_with(event)
@@ -40,14 +45,17 @@ def test_output_copy_uses_worker_device_runtime(monkeypatch, device_type):
     cpu_tensor.copy_.assert_called_once_with(tensor, non_blocking=True)
     side.synchronize.assert_called_once_with()
     assert copied == {7: {"token": [cpu_tensor, host_value], "metadata": "keep"}}
-    assert outputs[7]["token"][0] is tensor
+    assert host_rows is None
+    assert outputs.per_rid_outputs[7]["token"][0] is tensor
 
 
 def test_cpu_output_copy_needs_no_accelerator_runtime():
     worker = object.__new__(Worker)
     worker.device = torch.device("cpu")
-    outputs = {7: {"token": [torch.tensor([3])]}}
-    assert worker._prematerialize_for_check_stop(outputs, None) is outputs
+    outputs = BatchedModelOutput(per_rid_outputs={7: {"token": [torch.tensor([3])]}})
+    copied, host_rows = worker._prematerialize_for_check_stop(outputs, None)
+    assert copied is outputs.per_rid_outputs
+    assert host_rows is None
 
 
 @pytest.mark.parametrize(

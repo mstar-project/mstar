@@ -1348,6 +1348,24 @@ example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
    with a message describing the migration. Move the block under ``resources:``, keyed by
    the resource name.
 
+Preprocessing threads
+~~~~~~~~~~~~~~~~~~~~~
+
+The API server runs ``load_image`` / ``process_prompt`` with torch's intra-op pool, which
+defaults to one thread per core. For a few small ops per request a small pool is faster,
+especially on a shared node, where an op waits on any of its threads another process has
+descheduled. A model sets its size with ``PREPROCESS_TORCH_THREADS`` on the class (Qwen3.5
+uses 4). A deployment overrides it at the top level of its config; ``null`` keeps torch's
+default:
+
+.. code-block:: yaml
+
+   model: "qwen3_5_4b"
+   preprocess_torch_threads: 4
+
+The setting applies only to the API server process. The conductor and workers keep
+torch's default.
+
 .. _tensor-parallelism:
 
 Tensor parallelism (sharding)

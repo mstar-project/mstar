@@ -157,9 +157,11 @@ def test_shared_pool_region_outputs_survive_other_graph_replays(graph_device):
     torch.testing.assert_close(outputs[1]["x"].cpu(), torch.full((8,), 15.0))
 
 
-def test_worker_output_copy_on_accelerator(graph_device):
+@pytest.mark.parametrize("batched", [False, True])
+def test_worker_output_copy_on_accelerator(graph_device, batched):
     from collections import defaultdict
 
+    from mstar.model.submodule_base import BatchedModelOutput
     from mstar.worker.worker import Worker
 
     worker = object.__new__(Worker)
@@ -167,8 +169,22 @@ def test_worker_output_copy_on_accelerator(graph_device):
     worker._d2h_stream = None
     worker._pinned_d2h_buffers = defaultdict(list)
     value = torch.arange(16, device=graph_device)
+    outputs = BatchedModelOutput(per_rid_outputs={7: {"token": [value]}})
+    if batched:
+        outputs.check_stop_buffers = {"token": value}
+        outputs.row_request_ids = (7, 3)
     event = getattr(torch, graph_device.type).Event()
     event.record()
-    copied = worker._prematerialize_for_check_stop({7: {"token": [value]}}, event)
+    copied, host_rows = worker._prematerialize_for_check_stop(
+        outputs, event, request_ids=[3],
+    )
     assert copied[7]["token"][0].device.type == "cpu"
-    torch.testing.assert_close(copied[7]["token"][0], torch.arange(16))
+    if batched:
+        assert list(copied) == [7, 3]
+        assert host_rows.request_ids == (7, 3)
+        assert host_rows.buffers["token"].device.type == "cpu"
+        torch.testing.assert_close(copied[7]["token"][0], torch.tensor([0]))
+        torch.testing.assert_close(copied[3]["token"][0], torch.tensor([1]))
+    else:
+        assert host_rows is None
+        torch.testing.assert_close(copied[7]["token"][0], torch.arange(16))
