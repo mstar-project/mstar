@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -27,6 +28,7 @@ def _worker(
 ):
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
+    w._phase_period = 0
     w.is_tp_follower = is_follower
     w.sent = []
     w.cleared = []
@@ -100,7 +102,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
         node_batch=SimpleNamespace(request_ids=[7], per_request_info={7: object()}),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
     )
-    outputs = {7: {}}
+    outputs = BatchedModelOutput(per_rid_outputs={7: {}})
     ranges, markers = [], []
 
     def push(name, **kwargs):
@@ -119,7 +121,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     Worker._postprocess_batch(w, pending, outputs)
 
     assert collected == [({}, {})]
-    assert outputs == {}
+    assert outputs.per_rid_outputs == {}
     assert pending.node_batch.request_ids == []
     assert pending.node_batch.per_request_info == {}
     assert pending.batch.request_to_worker_graph == {}

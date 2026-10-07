@@ -685,3 +685,22 @@ def test_a_peer_reads_its_own_half_of_a_sharded_edge(tmp_path):
         assert 7 in ready and len(ready[7]) == 1, f"rank {rank} read nothing"
         got = cons.get_tensor(ready[7][0].tensor_info[0].uuid)
         assert torch.equal(got, expected), f"rank {rank} read the wrong rows"
+
+
+def test_arena_stages_the_stored_host_copy(tmp_path):
+    """A stored host copy is what lands in the arena (a host memcpy, no D2H);
+    it differs from the stored tensor only so the test can tell."""
+    prod = _manager("w0", tmp_path)
+    cons = _manager("w1", tmp_path)
+    assert prod.needs_cpu_tensor
+
+    host = torch.arange(4, dtype=torch.int64)
+    infos = prod.store_and_return_tensor_info(
+        "r1", {"tok": [torch.zeros(4, dtype=torch.int64)]},
+        cpu_tensors={"tok": [host]},
+    )
+    prod.register_for_send("r1", infos["tok"])
+    cons.start_read_tensors(
+        "r1", [GraphEdge(next_node="B", name="tok", tensor_info=infos["tok"])],
+    )
+    assert torch.equal(cons.tensor_store.get_tensor(infos["tok"][0].uuid), host)
