@@ -255,6 +255,10 @@ class ChunkedPrefillOutputMode(Enum):
     CONCAT = "concat"
     # every chunk's tensors in chunk order, for a consumer that takes the pieces
     LIST = "list"
+    # the final chunk's tensors alone; earlier chunks' are dropped, never held.
+    # Not a substitute for dropping a non-final chunk's sampled token in
+    # postprocess: check_stop reads outputs before they are held.
+    FINAL = "final"
 
 
 @dataclass(frozen=True)

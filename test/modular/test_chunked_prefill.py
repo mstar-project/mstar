@@ -198,3 +198,16 @@ def test_an_unprepared_row_has_no_length():
     batch.input_seq_lens[0] = 7
 
     assert (batch.seq_len_of(0), batch.seq_len_of(1)) == (7, -1)
+
+
+def test_final_keeps_only_the_last_chunk_and_holds_nothing_before():
+    from mstar.model.submodule_base import ChunkedPrefillOutputMode, ChunkedPrefillOutputPolicy
+
+    final = {"token": ChunkedPrefillOutputPolicy(mode=ChunkedPrefillOutputMode.FINAL)}
+    acc = ChunkOutputAccumulator()
+    acc.hold(0, "LLM", {"token": [torch.tensor([1])], "states": [torch.tensor([1.0])]}, final)
+
+    assert "token" not in acc._held[(0, "LLM")]
+    out = acc.release(0, "LLM", {"token": [torch.tensor([9])], "states": [torch.tensor([2.0])]}, final)
+    assert out["token"][0].tolist() == [9]
+    assert out["states"][0].tolist() == [1.0, 2.0]

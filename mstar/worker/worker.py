@@ -2989,7 +2989,10 @@ class Worker:
                 continue
             self.scheduler.advance_chunk(rid, node, end)
             if rid in batch.incomplete_node_rids:
-                self.scheduler.chunk_outputs.hold(rid, node, outputs.pop(rid, {}))
+                policies = self.engine_manager.get_engine(node).chunked_prefill_output_policies(
+                    node, batch.walk_of(rid),
+                )
+                self.scheduler.chunk_outputs.hold(rid, node, outputs.pop(rid, {}), policies)
                 wg_id = batch.request_to_worker_graph[rid]
                 batch.discard_rid(rid)
                 self._graph_runtime.push_back_node(node, [rid], [wg_id])
