@@ -153,7 +153,9 @@ class _Node:
         lease = None
         if self.cg is not None:
             lease = self.cg.lease_slot(walk, len(rids), slot=0, num_tokens=num_tokens)
-            assert lease is not None, f"no captured bucket for {walk} bs={len(rids)}"
+            if lease is None:  # fine only for a walk the submodule does not capture
+                walks = {c.capture_graph_walk for c in self.sub.get_cuda_graph_configs(DEVICE)}
+                assert walk not in walks, f"no captured bucket for {walk} bs={len(rids)}"
         step_ids, meta = rids, infos
         if lease is not None:
             inputs = self.cg.pad_inputs(lease, inputs)
@@ -276,3 +278,32 @@ def test_capture_with_fused_mla_prep_matches_eager_and_unfused(tmp_path, monkeyp
         assert len(stream) == MAX_TOKENS and len(set(stream)) > 2, (rid, stream)
         assert stream == streams["eager"][rid], (rid, stream, streams["eager"][rid])
         assert stream == streams[False][rid], (rid, stream, streams[False][rid])
+
+
+# compiled, the dense arm's last token flips at a 0.0117-logit near tie: Inductor's arithmetic,
+# since the eager forward captured matches token for token
+@pytest.mark.parametrize("topk,compiled", [(8, True), (16, False)],
+                         ids=["bucket-selects", "bucket-dense"])
+def test_paged_dsa_capture_matches_eager(tmp_path, monkeypatch, topk, compiled):
+    """DSA at a small index_topk, so decode selects: the captured steps emit the
+    eager tokens. Prefill replays its 16-row bucket, padded, with every row selecting on its
+    own when the bucket is wider than index_topk and dense attention when not; decode is sparse
+    for every row over the serving window, through the slot's re-planned sparse wrapper."""
+    monkeypatch.setattr(CudaGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    if not compiled:
+        monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
+    overrides = dict(dsa_long_context=True, index_topk=topk, index_n_heads=16,
+                     index_head_dim=64, max_seq_len=64)  # the indexer ropes its first 64 dims
+    model, submodule = _load(tmp_path, monkeypatch, False, cfg_overrides=overrides)
+    walks = [c.capture_graph_walk for c in submodule.get_cuda_graph_configs(DEVICE)]
+    assert walks == ["decode", "prefill"]
+    eager = _Node(model, submodule, capture=False, prompts=PROMPTS)
+    eager_streams = eager.generate()
+    eager.close()
+    node = _Node(model, submodule, capture=True, prompts=PROMPTS)
+    assert node.cg.any_graphs and node.cg.dropped_buckets == []
+    captured_streams = node.generate()
+    node.close()
+    for rid, stream in eager_streams.items():
+        assert len(stream) == MAX_TOKENS and len(set(stream)) > 2, (rid, stream)
+        assert captured_streams[rid] == stream, (rid, captured_streams[rid], stream)

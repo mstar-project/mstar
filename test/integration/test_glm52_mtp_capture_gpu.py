@@ -151,3 +151,36 @@ def test_compiled_capture_matches_compiled_plain_decode(tmp_path, monkeypatch):
         streams[k] = node.generate()
         node.close()
     assert streams[3] == streams[0]
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_captured_mtp_on_paged_dsa_matches_plain_decode(tmp_path, monkeypatch, eager_capture, k):
+    """MTP over paged DSA at a small index_topk, so the prefill, every verify row and the
+    seed pass select: captured MTP == eager MTP == plain paged decode, token for token."""
+    monkeypatch.setattr(CudaGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
+    monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2, 4])
+    # the indexer ropes its first 64 dims
+    dsa = dict(dsa_long_context=True, index_topk=8, index_n_heads=16,
+               index_head_dim=64, max_seq_len=64)
+    model, submodule = _load(tmp_path, monkeypatch, fp8=False,
+                             cfg_overrides={**_mtp_cfg(0), **dsa})
+    plain = _Node(model, submodule, capture=False, prompts=PROMPTS)
+    reference = plain.generate()
+    plain.close()
+
+    streams = {}
+    for capture in (False, True):
+        ckpt = tmp_path / f"dsa-k{k}-{int(capture)}"
+        ckpt.mkdir()
+        model, submodule = _load(ckpt, monkeypatch, fp8=False,
+                                 cfg_overrides={**_mtp_cfg(k), **dsa})
+        node = _MtpNode(model, submodule, capture=capture, prompts=PROMPTS)
+        if capture:
+            assert node.cg.any_graphs and node.cg.dropped_buckets == []
+        streams[capture] = node.generate()
+        node.close()
+
+    for rid, ref in reference.items():
+        assert len(ref) == MAX_TOKENS and len(set(ref)) > 2, (rid, ref)
+        assert streams[False][rid] == ref, ("eager", rid, streams[False][rid], ref)
+        assert streams[True][rid] == ref, ("captured", rid, streams[True][rid], ref)

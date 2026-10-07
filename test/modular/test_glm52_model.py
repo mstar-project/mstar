@@ -56,7 +56,6 @@ from mstar.model.glm52.config import (  # noqa: E402
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
-from mstar.model.glm52.dsa import Glm52DsaKStore  # noqa: E402
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 
@@ -335,7 +334,6 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
     # check_stop / preprocess only read self.config; skip nn.Module init.
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
-    sub._dsa_k_store = Glm52DsaKStore()
     sub._token_budget = {}  # no prefill ran: check_stop falls back to the request's max_tokens
     return sub
 
@@ -443,7 +441,7 @@ def test_glm52_preprocess_supplies_eager_last_token_indices():
     sub = _make_submodule(Glm52ModelConfig())
     out = _preprocess(sub, {"r0": 0, "r1": 0}, seq_len=16)
     assert torch.equal(out["last_token_indices"], torch.tensor([15, 31]))
-    assert out["dsa_ctx"] is None
+    assert Glm52LLMSubmodule._dsa_ctx(out) is None
 
 
 def test_glm52_preprocess_positions_continue_from_the_stored_length():
@@ -527,12 +525,15 @@ def test_indexer_exists_only_on_the_dsa_path():
 
 def test_flag_off_layer_refuses_a_dsa_ctx():
     from mstar.model.glm52.components.attention import Glm52MLAAttention
-    from mstar.model.glm52.dsa import Glm52DsaForwardContext
+    from mstar.model.glm52.dsa_paged import Glm52DsaPagedContext
 
     cfg = Glm52ModelConfig.reduced()
     cfg.mla_absorb = True
     attn = Glm52MLAAttention(cfg, layer_idx=0)  # FULL slot, built flag-off
-    ctx = Glm52DsaForwardContext(spans=[], k_store=Glm52DsaKStore(), needs_selection=True)
+    one = torch.ones(1, dtype=torch.int32)
+    ctx = Glm52DsaPagedContext(
+        row_req=one - 1, lens=one, host_lens=[1], kv_table=one[None], index_table=one[None],
+        spans=[(0, 1, 0)], width=1, page_size=8, topk=cfg.index_topk, needs_selection=True)
     with pytest.raises(RuntimeError, match="dsa_long_context"):
         attn(torch.randn(1, cfg.hidden_size), torch.tensor([0]), dsa_ctx=ctx)
 

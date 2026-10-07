@@ -23,8 +23,10 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.glm52.components.indexer import full_indexer_layers
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
+    INDEX_KV_RESOURCE,
     KV_RESOURCE,
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
@@ -81,8 +83,8 @@ class Glm52Model(Model):
             # serve the first N layers of a deeper checkpoint
             self.config.num_hidden_layers = int(kwargs["num_hidden_layers"])
         if kwargs.get("dsa_long_context", False):
-            # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). The
-            # sparse gather reads the paged latent cache, so the naive
+            # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). Sparse
+            # attention reads the paged latent cache, so the naive
             # (mla_absorb=False) backend cannot host it.
             if not self.config.mla_absorb:
                 raise ValueError(
@@ -90,6 +92,9 @@ class Glm52Model(Model):
                     "gathers selected latents from the paged MLA cache"
                 )
             self.config.dsa_long_context = True
+            if "prefill_chunk_tokens" in kwargs:
+                self.config.prefill_chunk_tokens = int(kwargs["prefill_chunk_tokens"])
+            self.config.dsa_shard_prefill = bool(kwargs.get("dsa_shard_prefill", False))
             # Guard + KV sizing move from index_topk to the serving window.
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
         if "moe_quant_kernel" in kwargs:
@@ -132,13 +137,6 @@ class Glm52Model(Model):
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
     def _check_mtp(self, kwargs: dict) -> None:
-        if self.config.dsa_long_context:
-            # the draft loop stays in the short-context regime; k-store sync
-            # and rewind for the sparse path are not written
-            raise ValueError(
-                "mtp_num_draft_tokens and dsa_long_context are mutually "
-                "exclusive: MTP drafting is short-context only"
-            )
         if self._config_variant in ("reduced", "reduced_fp8"):
             from mstar.model.glm52.components.indexer import is_full_indexer_layer
 
@@ -250,7 +248,20 @@ class Glm52Model(Model):
                 resource_key=ATTN_RESOURCE, nodes=nodes,
                 config=AttentionConfig(kv_cache=KV_RESOURCE),
             )
-        return [
+        specs = []
+        if self.config.dsa_long_context:
+            # the indexer's keys as a one-latent MLA cache, one layer per FULL layer
+            d = self.config.index_head_dim
+            specs.append(KVSpec(resource_key=INDEX_KV_RESOURCE, nodes=nodes, config=PagedKVConfig(
+                num_layers=len(full_indexer_layers(self.config)) + (
+                    1 if self.config.mtp_num_draft_tokens > 0 else 0),
+                num_kv_heads=1, head_dim=d,
+                max_seq_len=self.config.max_seq_len, layout=KVLayout.MLA, kv_lora_rank=d,
+                qk_rope_head_dim=0,
+                # replicated like the latent; its qo count only has to shard evenly under TP,
+                # as the attention heads do
+                num_qo_heads=self.config.num_attention_heads)))
+        return specs + [
             KVSpec(resource_key=KV_RESOURCE, nodes=nodes, config=kv),
             attn,
             SamplerSpec(

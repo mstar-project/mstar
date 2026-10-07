@@ -10,7 +10,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import RMSNorm
-from mstar.model.glm52 import mla_prep
+from mstar.model.glm52 import dsa_paged, mla_prep
 from mstar.model.glm52.components.fp8_linear import (
     COLUMN,
     ROW,
@@ -18,10 +18,19 @@ from mstar.model.glm52.components.fp8_linear import (
     dense_fp8_block,
     fp8_block_linear,
 )
-from mstar.model.glm52.components.indexer import Glm52Indexer, is_full_indexer_layer
+from mstar.model.glm52.components.indexer import (
+    Glm52Indexer,
+    index_store_layer,
+    is_full_indexer_layer,
+)
 from mstar.model.glm52.components.rope import Glm52RotaryEmbedding
-from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, Glm52ModelConfig
-from mstar.model.glm52.dsa import Glm52DsaForwardContext
+from mstar.model.glm52.config import (
+    ATTN_RESOURCE,
+    INDEX_KV_RESOURCE,
+    KV_RESOURCE,
+    Glm52ModelConfig,
+)
+from mstar.model.glm52.dsa_paged import Glm52DsaPagedContext
 
 
 def dsa_selection_to_mask(
@@ -114,7 +123,7 @@ class Glm52MLAAttention(nn.Module):
         # forward ever hands the layer a dsa_ctx, so a FULL layer's indexer
         # (replicated, not TP-sharded) would be read and held for nothing;
         # the loader skips its keys to match (Glm52ForCausalLM.load_weights).
-        self.layer_idx = layer_idx  # k-store key + selection provenance
+        self.layer_idx = layer_idx  # selection provenance
         self.dsa_long_context = config.dsa_long_context
         self.indexer = (
             Glm52Indexer(config)
@@ -123,6 +132,11 @@ class Glm52MLAAttention(nn.Module):
             and is_full_indexer_layer(config, layer_idx)
             else None
         )
+        # this FULL layer's layer in the index-key store
+        self.index_layer_idx = (
+            index_store_layer(config, layer_idx) if self.indexer is not None else None)
+        # dsa_shard_prefill: TP ranks split a long prefill's selection (dsa_paged.select)
+        self.dsa_group = comm_group if config.dsa_shard_prefill else None
         # run_attention uses 1/sqrt(padded_head_dim); fold the intended
         # qk_head_dim**-0.5 into q on the padded path. No Yarn -> no mscale.
         self.softmax_scale_boost = math.sqrt(self.padded_head_dim / self.qk_head_dim)
@@ -140,10 +154,12 @@ class Glm52MLAAttention(nn.Module):
         # engine-built, bound once at load (bind_resources)
         self._kv = None
         self._attn = None
+        self._kv_index = None
 
     def bind_resources(self, resources: dict) -> None:
         self._kv = resources[KV_RESOURCE]
         self._attn = resources[ATTN_RESOURCE]
+        self._kv_index = resources.get(INDEX_KV_RESOURCE)
 
     @property
     def cache_layer_idx(self) -> int:
@@ -167,18 +183,18 @@ class Glm52MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         dsa_selection: torch.Tensor | None = None,
-        dsa_ctx: Glm52DsaForwardContext | None = None,
+        dsa_ctx: Glm52DsaPagedContext | None = None,
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``dsa_selection``: optional ``(T, index_topk)`` int rows from
         ``Glm52Indexer.compute_selection`` (-1 = padding).
         """
         if dsa_ctx is not None and not self.mla_absorb:
-            # The sparse gather path reads the paged 576-dim latent cache;
-            # the naive backend stores padded per-head K/V instead. The
-            # naive path stays what it is: the reduced-test parity fallback.
+            # Sparse attention reads the paged 576-dim latent cache; the
+            # naive backend stores padded per-head K/V instead. The naive
+            # path stays what it is: the reduced-test parity fallback.
             raise RuntimeError(
-                "dsa_long_context requires mla_absorb: the sparse gather path "
+                "dsa_long_context requires mla_absorb: sparse attention "
                 "consumes the paged MLA latent cache, which only the absorbed "
                 "backend maintains"
             )
@@ -239,7 +255,7 @@ class Glm52MLAAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        dsa_ctx: Glm52DsaForwardContext | None = None,
+        dsa_ctx: Glm52DsaPagedContext | None = None,
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Run MLA over the compressed latent cache after folding kv_b into Q/O."""
@@ -335,7 +351,7 @@ class Glm52MLAAttention(nn.Module):
         fused: torch.Tensor,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        dsa_ctx: Glm52DsaForwardContext | None,
+        dsa_ctx: Glm52DsaPagedContext | None,
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor:
         """Norms, RoPE, cache write and attention over the latent, op by op."""
@@ -365,10 +381,8 @@ class Glm52MLAAttention(nn.Module):
         # None-guarded here (not just inside _dsa_update) so the default
         # flag-off path never crosses the compiler.disable boundary — dynamo
         # specializes on dsa_ctx=None and folds the branch away.
-        selection = (
-            self._dsa_update(dsa_ctx, hidden_states, q_c, position_ids)
-            if dsa_ctx is not None else None
-        )
+        selection = (None if dsa_ctx is None
+                     else self._dsa_update(dsa_ctx, hidden_states, q_c, position_ids))
 
         q_nope = torch.einsum("thd,hdl->thl", q_nope, self.w_kc)
 
@@ -376,7 +390,7 @@ class Glm52MLAAttention(nn.Module):
             # Identity regime (or DSA off): the paged kernel path.
             latent = torch.cat([kv_c, k_pe], dim=-1).squeeze(1)
             return self._write_and_attend(q_nope, latent, None, q_pe=q_pe)
-        return self._run_sparse_absorbed(dsa_ctx, selection, q_nope, q_pe, kv_c, k_pe)
+        return self._run_sparse(dsa_ctx, selection, q_nope, q_pe, kv_c, k_pe)
 
     def _fused_prep_and_attend(
         self,
@@ -403,102 +417,54 @@ class Glm52MLAAttention(nn.Module):
             cos, sin, q, layer, pages, offsets)
         return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe)
 
-    # Host-side per-request work (dict mutation, python loops over spans):
-    # keep dynamo out of it, same as the cache-manager plan/run methods —
-    # under the engine's warmup torch.compile these run eagerly via the
-    # disable wrapper instead of graph-breaking token by token.
+    # Host-side per-step work (python lists, launches sized on the host): keep dynamo out of
+    # it, same as the cache-manager plan/run methods.
     @torch.compiler.disable
     def _dsa_update(
         self,
-        dsa_ctx: Glm52DsaForwardContext,
+        dsa_ctx: Glm52DsaPagedContext,
         hidden_states: torch.Tensor,
         q_c: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor | None:
-        """Maintain the indexer k-store and return the selection to apply."""
+        """A FULL layer writes its index keys to the store and, when a row needs it, returns
+        each row's selected latent-cache slots; a SHARED layer reuses the last FULL one's."""
         if self.indexer is None:
             if not dsa_ctx.needs_selection:
                 return None
             if dsa_ctx.last_selection is None:
                 raise RuntimeError(
                     f"SHARED layer {self.layer_idx} needs a DSA selection but no "
-                    "FULL layer ran before it — the skip formula guarantees "
-                    "layer 0 is FULL, so the threading order is broken"
-                )
+                    "FULL layer ran before it")
             return dsa_ctx.last_selection
-
         keys = self.indexer.compute_k(hidden_states, position_ids)
-        for span in dsa_ctx.spans:
-            dsa_ctx.k_store.append(
-                span.request_id,
-                self.layer_idx,
-                keys[span.q_start : span.q_start + span.q_len],
-                start_pos=span.ctx_start,
-            )
+        dsa_paged.write_rows(self._kv_index, self.index_layer_idx, keys, dsa_ctx)
         if not dsa_ctx.needs_selection:
             return None
-
-        rows = []
-        for span in dsa_ctx.spans:
-            token_slice = slice(span.q_start, span.q_start + span.q_len)
-            history = dsa_ctx.k_store.history(
-                span.request_id, self.layer_idx, span.ctx_start + span.q_len)
-            rows.append(self.indexer.compute_selection(
-                q_c[token_slice],
-                hidden_states[token_slice],
-                position_ids[token_slice],
-                history,
-            ))
-        selection = torch.cat(rows, dim=0) if len(rows) > 1 else rows[0]
+        q, w = self.indexer.query_and_weights(q_c, hidden_states, position_ids)
+        selection = dsa_paged.select(
+            q, w, self._kv_index.layer_view(self.index_layer_idx), dsa_ctx, self.dsa_group)
         dsa_ctx.last_selection = selection
         dsa_ctx.last_selection_layer = self.layer_idx
         return selection
 
     @torch.compiler.disable
-    def _run_sparse_absorbed(
+    def _run_sparse(
         self,
-        dsa_ctx: Glm52DsaForwardContext,
-        selection: torch.Tensor,
+        dsa_ctx: Glm52DsaPagedContext,
+        slots: torch.Tensor,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
         kv_c: torch.Tensor,
         k_pe: torch.Tensor,
     ) -> torch.Tensor:
-        """Sparse absorbed MLA: gather the selected latents, dense MQA over them."""
-        latent_cache = self._kv.layer_view(self.cache_layer_idx)
-        page_size = self._kv.config.page_size
-        latent = torch.cat([kv_c, k_pe], dim=-1).squeeze(1)  # (T, L + Drope)
-        latent_dim = q_nope.shape[-1]  # ckv width (post-w_kc absorption)
-        query = torch.cat([q_nope, q_pe], dim=-1).float()  # (T, H, L + Drope)
-
-        out = torch.empty_like(q_nope)
-        for span in dsa_ctx.spans:
-            if span.q_len != 1:
-                raise RuntimeError(
-                    f"request {span.request_id!r}: sparse attention beyond "
-                    "index_topk is decode-only in v1 (q_len == 1); prefill "
-                    "beyond topk is refused by the submodule guard"
-                )
-            pages = torch.tensor(
-                span.page_indices, dtype=torch.long, device=latent.device)
-            pos = span.ctx_start  # this decode token's absolute position
-            latent_cache[pages[pos // page_size], pos % page_size] = (
-                latent[span.q_start].to(latent_cache.dtype))
-
-            row = selection[span.q_start]
-            picked = row[row >= 0].long()  # request-local positions, causal
-            gathered = latent_cache[
-                pages[picked // page_size], picked % page_size
-            ].float()  # (n, L + Drope)
-
-            # fp32 outside the engine's bf16 autocast, which would run both einsums in bf16
-            with torch.autocast(query.device.type, enabled=False):
-                scores = torch.einsum(
-                    "hd,kd->hk", query[span.q_start], gathered) * self.softmax_scale
-                attn = scores.softmax(dim=-1)
-                out[span.q_start] = torch.einsum(
-                    "hk,kd->hd", attn, gathered[:, :latent_dim]).to(out.dtype)
-        return out
+        """Write the step's latents at the plan's slots, then attend each row over its own
+        selected slots (prefill rows too: each sees its causal top-k)."""
+        layer_idx = self.cache_layer_idx
+        dsa_paged.write_rows(self._kv, layer_idx, torch.cat([kv_c, k_pe], dim=-1).squeeze(1),
+                             dsa_ctx)
+        return dsa_paged.sparse_attend(
+            q_nope, q_pe, self._kv.layer_view(layer_idx), slots, dsa_ctx, self.softmax_scale)
 
     # The absorbed forward reads only w_kc / w_vc / fused_qkv_a_proj_weight;
     # these source projections would otherwise stay resident for the process

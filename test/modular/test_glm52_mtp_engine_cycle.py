@@ -598,3 +598,26 @@ def test_stop_counts_what_the_checked_steps_delivered():
                 break
             cur = nxt
         assert delivered == budget, (budget, delivered)
+
+
+@pytest.mark.parametrize("chunk", [8192, 3], ids=["one-pass", "row-chunks"])
+def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk):
+    """MTP on paged DSA, every context past index_topk: the verify and the seed pass select
+    per row, a rejected row's index keys are trimmed with its latents, and the emitted
+    stream is plain decode's. Row chunks: the prompt's trunk and MTP passes run in pieces."""
+    cfg = _cfg(2, True)
+    cfg.dsa_long_context, cfg.index_topk = True, 4
+    cfg.prefill_chunk_tokens = chunk
+    model = _model(cfg)
+    prompt = torch.tensor([5, 9, 2, 7, 1, 8, 3])
+    streams = []
+    for k in (0, 2):
+        cfg.mtp_num_draft_tokens = k
+        sub = Glm52LLMSubmodule(model, cfg)
+        driver = _Driver(sub, cfg, ["r0"])
+        streams.append(_drive(driver, prompt, _fwd_info("r0", 18, True)))
+        index = driver.resources["kv_index"]
+        assert index.stored_len("r0") == driver.resources[KV_RESOURCE].stored_len("r0")
+    cfg.mtp_num_draft_tokens = 2
+    assert torch.equal(streams[0], streams[1]), f"{streams[0].tolist()} vs {streams[1].tolist()}"
+    assert len(set(streams[0].tolist())) > 3

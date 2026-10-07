@@ -11,7 +11,7 @@ from mstar.model.glm52.components.language_model import (
     build_rmsnorm,
 )
 from mstar.model.glm52.config import Glm52ModelConfig
-from mstar.model.glm52.dsa import Glm52DsaForwardContext
+from mstar.model.glm52.dsa_paged import Glm52DsaPagedContext
 
 
 class Glm52DecoderLayer(nn.Module):
@@ -41,7 +41,7 @@ class Glm52DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        dsa_ctx: Glm52DsaForwardContext | None = None,
+        dsa_ctx: Glm52DsaPagedContext | None = None,
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         rows: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
