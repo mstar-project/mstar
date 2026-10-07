@@ -799,11 +799,9 @@ class MicroScheduler:
     def _set_in_flight(
         self, node_name: str, rid_to_wg: dict[int, int], in_flight: bool,
     ) -> None:
-        by_wg: dict[int, list[int]] = defaultdict(list)
-        for rid, wg_id in rid_to_wg.items():
-            by_wg[wg_id].append(rid)
-        for wg_id, rids in by_wg.items():
-            self.runtime.set_in_flight(node_name, wg_id, rids, in_flight)
+        self.runtime.set_in_flight(
+            node_name, list(rid_to_wg), list(rid_to_wg.values()), in_flight,
+        )
 
     def _mark_scheduled(
         self, node_name: str, graph_walk: str, num_requests: int,

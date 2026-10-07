@@ -445,6 +445,10 @@ class RouteInput(NamedTuple):
     # rid i's signal s. The runtime looks the metadata up in the store.
     tensors: list[int]
     num_tensors: list[int]
+    # Rows of several walks in one call: wg_ids.keys[i] ran
+    # walks[rid_walk_idx[i]]. None, every row ran graph_walk.
+    walks: list[str] | None = None
+    rid_walk_idx: list[int] | None = None
 
 
 class RouteOutput(NamedTuple):
@@ -580,9 +584,10 @@ class GraphRuntime(ABC):
 
     @abstractmethod
     def set_in_flight(
-        self, node: str, wg_id: int, rids: list[int],
+        self, node: str, rids: list[int], wg_ids: list[int],
         in_flight: bool,
     ):
+        """``rids[i]`` runs ``node`` in worker graph ``wg_ids[i]``."""
         pass
 
     @abstractmethod
@@ -823,12 +828,13 @@ class GraphRuntime(ABC):
     @abstractmethod
     def commit_speculation(
         self, spec_id: int, success: bool, dropped_rids: list[int] = (),
-        node: str | None = None, wg_id: int | None = None,
+        node: str | None = None, wg_ids: list[int] | None = None,
         scheduled_rids: list[int] = (),
     ):
         """Settle the streaming ingests a prep staged under ``spec_id``.
         On ``success``, ``scheduled_rids`` are also marked speculatively
-        scheduled on ``node``.
+        scheduled on ``node``, ``scheduled_rids[i]`` in worker graph
+        ``wg_ids[i]``.
 
         The scheduled rids are passed rather than read off the stage in order
         to also include the fresh rids rolled in from the ready queue. For
@@ -881,8 +887,9 @@ class GraphRuntime(ABC):
 
     @abstractmethod
     def pending_loop_stop_rids(
-        self, graph_walk: str, loop_name: str,
+        self, graph_walks: list[str], loop_name: str,
     ) -> set[int]:
+        """Rids with a pending stop of ``loop_name`` in any of ``graph_walks``."""
         pass
 
     @abstractmethod

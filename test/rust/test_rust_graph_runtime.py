@@ -197,7 +197,7 @@ def test_set_walk_and_stream_done_reach_the_request(runtime):
 def test_pending_loop_stops_live_one_iteration(runtime):
     rid = _admit(runtime)
     assert not runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
-    assert runtime.pending_loop_stop_rids(WALK, "ar_loop") == set()
+    assert runtime.pending_loop_stop_rids([WALK], "ar_loop") == set()
     runtime.clear_pending_loop_stops()
 
 
@@ -211,9 +211,9 @@ def test_node_metadata_is_accepted(runtime):
 
 def test_speculative_flag_rejects_an_unknown_node(runtime):
     rid = _admit(runtime)
-    runtime.set_in_flight("prefill", WG_ID, [rid], True)
+    runtime.set_in_flight("prefill", [rid], [WG_ID], True)
     with pytest.raises((RuntimeError, ValueError)):
-        runtime.set_in_flight("nope", WG_ID, [rid], True)
+        runtime.set_in_flight("nope", [rid], [WG_ID], True)
 
 
 # --- coverage of the ABC -----------------------------------------------------
@@ -820,7 +820,7 @@ def test_a_stop_records_a_pending_stop(runtime):
     )
     assert stopped_rids == [rid]
     assert runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
-    assert runtime.pending_loop_stop_rids(WALK, "ar_loop") == {rid}
+    assert runtime.pending_loop_stop_rids([WALK], "ar_loop") == {rid}
     runtime.clear_pending_loop_stops()
     assert not runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
 
@@ -833,7 +833,7 @@ def test_a_stop_for_a_loop_not_in_the_walk_is_dropped(runtime):
         loop_names=ParallelList([rid], [["not_a_loop"]]),
     )
     assert stopped_rids == []
-    assert runtime.pending_loop_stop_rids(WALK, "not_a_loop") == set()
+    assert runtime.pending_loop_stop_rids([WALK], "not_a_loop") == set()
 
 
 def test_a_peer_stop_applies_only_when_newer(runtime):
