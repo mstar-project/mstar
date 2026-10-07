@@ -28,6 +28,7 @@
    :recursive:
 
    base
+   chatterbox
    components
    cosmos3
    higgs_audio

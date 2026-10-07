@@ -13,6 +13,8 @@ mstar.api\_server.media\_io
 
    .. autosummary::
    
+      audio_formats
+      check_audio_format
       decode_audio
       modality_from_mime
       mux_mp4_with_pcm16
