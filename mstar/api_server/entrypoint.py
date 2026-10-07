@@ -184,6 +184,21 @@ class PendingRequest:
     consumed_chunks: int = 0
     error: Any | None = None
     error_status: int = 500
+    # Set by the streaming handler on its event loop; the message thread wakes
+    # it through these when a chunk or the completion lands, so the handler
+    # sleeps between chunks instead of polling every millisecond per request.
+    wake: Any | None = None
+    loop: Any | None = None
+
+    def notify(self) -> None:
+        """Wake the streaming handler, from any thread."""
+        loop, wake = self.loop, self.wake
+        if loop is None or wake is None:
+            return
+        try:
+            loop.call_soon_threadsafe(wake.set)
+        except RuntimeError:
+            pass  # the loop is closed: the client is gone
 
 
 def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
@@ -361,6 +376,7 @@ class APIServer:
                     req.error = message
                     req.error_status = 503
                 req.event.set()
+                req.notify()
             on_fatal = self.on_fatal
         if on_fatal is not None:
             on_fatal()
@@ -491,6 +507,7 @@ class APIServer:
                         )
                         req.error_status = 500
                 req.event.set()
+                req.notify()
                 # Snapshot the data worker's tx/rx now: the request is done (all
                 # final chunks received), so the worker thread is no longer mutating
                 # this rid's transport state, and we must read it before the hard
@@ -577,6 +594,7 @@ class APIServer:
                                 # result is coming, so the alternative is the
                                 # blanket request timeout.
                                 req.event.set()
+                                req.notify()
                                 # The conductor has already dropped this rid,
                                 # so no abort is needed — but the data worker
                                 # still holds its transport state. Parking the
@@ -656,6 +674,7 @@ class APIServer:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
                         req.chunks.append(result_chunk)
+                        req.notify()
 
                         if result_chunk.modality == "error":
                             # The data worker failed this request (preprocess,
@@ -668,6 +687,7 @@ class APIServer:
                                     (result_chunk.metadata or {}).get("status", 500)
                                 )
                             req.event.set()
+                            req.notify()
                             # Park the rid so _prune_recently_completed reclaims
                             # the data worker's per-request state once the
                             # client lets go of the request.
@@ -694,11 +714,22 @@ class APIServer:
         """
         start = time.time()
         finished = False
+        # Woken by the message thread (PendingRequest.notify) when a chunk or
+        # the completion lands; the timeout below is only a backstop.
+        wake = asyncio.Event()
+        with self.request_lock:
+            req = self.pending_requests.get(request_id)
+            if req is not None:
+                req.loop = asyncio.get_running_loop()
+                req.wake = wake
         try:
             while True:
                 if time.time() - start > self.timeout_seconds:
                     raise HTTPException(status_code=500, detail="Request timed out")
 
+                # Cleared before the read: a notification that lands after
+                # this point stays set and the wait below returns at once.
+                wake.clear()
                 new_chunks: list[ResultChunk] = []
                 done = False
                 with self.request_lock:
@@ -747,7 +778,12 @@ class APIServer:
                     finished = True
                     break
 
-                await asyncio.sleep(0.001)
+                if new_chunks:
+                    continue  # more may already be waiting
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    pass
         finally:
             if not finished:
                 self.abort_request(request_id)
