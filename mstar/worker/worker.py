@@ -7,7 +7,7 @@ import threading
 import time
 import time as _time
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -1917,6 +1917,23 @@ class Worker:
             self._reset_skip_plan_flags(spec_batch)
             return False
 
+    def _continuing_seq_lens(
+        self, batch_N: PendingBatch, node_name: str, graph_walk: str,
+        continuing: Collection[int], same_node: bool,
+    ) -> list[int]:
+        """The spans the continuing rows will run, for the merge's token
+        budget: the submodule's estimate, -1 where it has none."""
+        engine = self.engine_manager.get_engine(node_name)
+        prev, info = batch_N.node_batch, batch_N.node_batch.per_request_info
+        lens = []
+        for rid in continuing:
+            span = engine.speculative_input_seq_len(
+                node_name, graph_walk, info.get(rid),
+                prev.seq_len_of(rid) if same_node else -1,
+            )
+            lens.append(-1 if span is None else span)
+        return lens
+
     def _measure_ahead_spans(self, spec: Speculation, pending: PendingBatch | None) -> None:
         """Measure the speculative step's row spans, on the main thread, when
         that is what lets it lease and pre-plan a packed capture. A continuing
@@ -2688,6 +2705,11 @@ class Worker:
             target=spec_target,
             pre_existing_batch_size=len(continuing),
             capture_group_of=prep.ready_rids[0],
+            # estimated as a pre-plan estimates them, from this step's spans
+            pre_existing_seq_lens=self._continuing_seq_lens(
+                batch_N, spec_node_name, graph_walk, continuing,
+                speculating_same_node,
+            ),
         )
 
         if fresh_batch is not None:
@@ -3408,9 +3430,14 @@ class Worker:
                 batch.discard_rid(rid)
                 self._graph_runtime.push_back_node(node, [rid], [wg_id])
             else:
-                self.engine_manager.get_engine(node).release_chunk_inputs(rid, node)
-                if rid in outputs:
-                    outputs[rid] = self.scheduler.chunk_outputs.release(rid, node, outputs[rid])
+                engine = self.engine_manager.get_engine(node)
+                engine.release_chunk_inputs(rid, node)
+                merged = self.scheduler.chunk_outputs.release(
+                    rid, node, outputs.get(rid, {}),
+                    engine.chunked_prefill_output_policies(node, batch.walk_of(rid)),
+                )
+                if merged or rid in outputs:
+                    outputs[rid] = merged
         held = batch.incomplete_node_rids
         batch_N.node_batch.request_ids = [
             rid for rid in batch_N.node_batch.request_ids if rid not in held
