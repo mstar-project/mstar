@@ -605,12 +605,40 @@ class MicroScheduler:
         capture_group_of: int | None = None,
     ):
         node_partition = request_state.get_partition_for_node(batch.node_name)
-        not_ready_rids = {
-            rid for rid in batch.request_to_worker_graph if not self._check_ready(
+        # Check readiness in backlog order and stop once a step's worth is
+        # found: `_cap_batch_and_schedule` takes the first `max_bs` rids not
+        # excluded, which are exactly the ones checked and found ready, and
+        # the rids past that point keep their place for the next pass. Before
+        # this every backlogged request was checked (an engine sweep over the
+        # resources each) on every step, with 96 waiting at 128 in flight.
+        limit = len(batch) if max_bs is None else max(max_bs, 0)
+        group = functools.partial(
+            self._capture_group, request_state,
+            batch.node_name, batch.graph_walk,
+        )
+        # `is not None`: handle 0 is a real rid
+        wanted = None if capture_group_of is None else group(capture_group_of)
+        anchored = capture_group_of is not None
+        not_ready_rids: set[int] = set()
+        off_group: set[int] = set()
+        taken = 0
+        for rid in batch.request_to_worker_graph:
+            if taken >= limit:
+                break
+            if not self._check_ready(
                 batch.node_name, rid,
                 request_state.get_fwd_info(rid, node_partition),
-            )
-        }
+            ):
+                not_ready_rids.add(rid)
+                continue
+            rid_group = group(rid)
+            if not anchored:
+                # the first eligible rid sets the group, as before
+                wanted, anchored = rid_group, True
+            if rid_group != wanted:
+                off_group.add(rid)
+                continue
+            taken += 1
         # A failed rid is not "not ready yet": excluding it would put it
         # straight back in the backlog. This chunk is out of `self.backlog`
         # right now, so `_drop_backlogged_rid` cannot reach it.
@@ -622,9 +650,6 @@ class MicroScheduler:
                 batch.request_to_worker_graph.keys()
             )
         not_ready_rids -= self.failed_rids
-        off_group = self._off_group_rids(
-            request_state, batch, not_ready_rids, anchor=capture_group_of,
-        )
         return self._cap_batch_and_schedule(
             batch, max_bs, not_ready_rids | off_group,
         )
