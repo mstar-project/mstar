@@ -263,6 +263,8 @@ class MicroScheduler:
         self.get_tensor: Callable[[int], Any] | None = None
         # (rid, node) -> [tokens whose chunks have landed, total], for rows mid-prefill
         self.chunk_progress: dict[tuple[int, str], list[int]] = {}
+        # (rid, node) -> cached prefix a measured, not yet chunked row starts past
+        self.cached_prefix: dict[tuple[int, str], int] = {}
         # their non-final chunks' outputs, routed with the final chunk
         self.chunk_outputs = ChunkOutputAccumulator()
         self._warned_removed_rid = False
@@ -814,6 +816,7 @@ class MicroScheduler:
                 batch.row_lens[rid] = engine.input_sequence_len(
                     batch.node_name, batch.walk_of(rid),
                     request_state.get_fwd_info(rid, partition), inputs.get(rid, {}),
+                    rid=rid,
                 )
         return batch.row_lens
 
@@ -846,6 +849,8 @@ class MicroScheduler:
                 info = lens[rid]
                 if info is None:
                     continue
+                if info.cached_prefix:
+                    self.cached_prefix[(rid, node)] = info.cached_prefix
             tokens[rid] = info.seq_len
             if engine.supports_chunked_prefill(node, walk):
                 chunkable.add(rid)
@@ -949,9 +954,10 @@ class MicroScheduler:
             key = (rid, batch.node_name)
             progress = self.chunk_progress.get(key)
             if progress is None:
+                cached = self.cached_prefix.pop(key, 0)
                 if rid not in chunk_tokens:
                     continue
-                progress = self.chunk_progress[key] = [0, row_tokens[rid]]
+                progress = self.chunk_progress[key] = [cached, cached + row_tokens[rid]]
             start, total = progress
             end = start + chunk_tokens.get(rid, total - start)
             batch.chunk_ranges[rid] = (start, end)
@@ -1229,6 +1235,8 @@ class MicroScheduler:
         self.admit_errors.pop(rid, None)
         for key in [key for key in self.chunk_progress if key[0] == rid]:
             del self.chunk_progress[key]
+        for key in [key for key in self.cached_prefix if key[0] == rid]:
+            del self.cached_prefix[key]
         self.chunk_outputs.drop(rid)
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)
