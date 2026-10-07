@@ -676,6 +676,10 @@ class KVManager(AttentionResource):
         tail = list((overrides.prefix_tail or {}).get(label) or ())
         stream.chain = PrefixChain.seed(keys, tail, self.config.page_size)
 
+    @property
+    def keys_prefix_chains(self) -> bool:
+        return self._index is not None
+
     def extend_prefix_chain(
         self, rid: str, node_name: str, graph_walk: str, outputs,
     ) -> None:
