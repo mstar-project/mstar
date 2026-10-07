@@ -58,3 +58,16 @@ def test_a_mixed_step_with_a_vision_row_replays_the_deepstack_captures(thinker, 
     info = {i: SimpleNamespace(graph_walk=w, step_metadata={}) for i, w in enumerate(walks)}
 
     assert thinker.cg_key_info(THINKER_MIXED, info) == key
+
+
+@pytest.mark.parametrize("walks", [
+    ["thinker_decode", "prefill_vision"], ["thinker_decode", "prefill_text"],
+])
+def test_declare_step_stamps_the_key_cg_key_info_leased(thinker, walks):
+    vision = [torch.zeros(1, HIDDEN)] * 2
+    rows = [_row(1, w, vision if w == "prefill_vision" else None, 4) for w in walks]
+    info = {i: SimpleNamespace(graph_walk=w, step_metadata={}) for i, w in enumerate(walks)}
+
+    step = thinker.declare_step(THINKER_MIXED, list(range(len(rows))), rows)
+
+    assert step.cg_key_info == thinker.cg_key_info(THINKER_MIXED, info)

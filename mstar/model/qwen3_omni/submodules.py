@@ -575,6 +575,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 for inp, walk in zip(inputs, row_walks, strict=True)
             )
         return SubmoduleStep(
+            # must match `cg_key_info`, which picked the leased capture
+            cg_key_info=self.DEEPSTACK_KEY if (
+                graph_walk == THINKER_MIXED and pos_advance is not None) else None,
             segments=[
                 Segment(
                     request_id=rid,
