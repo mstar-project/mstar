@@ -2345,7 +2345,7 @@ class Worker:
             capture_group_of=prep.ready_rids[0],
             # this step's lengths predict a loop-back's; another node's say nothing
             pre_existing_seq_lens=[
-                batch_N.node_batch.seq_len_of(r) if speculating_same_node else -1
+                pending.node_batch.seq_len_of(r) if speculating_same_node else -1
                 for r in continuing
             ],
         )
