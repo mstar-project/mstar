@@ -1798,7 +1798,14 @@ class Engine:
         )
         if step is None:
             return False
-        if batch.inputs is not None:
+        if batch.inputs is not None or (
+            not submodule_mgmt.piecewise_runners
+            and submodule_mgmt.submodule.step_is_input_free(
+                batch.step_context.graph_walk,
+            )
+        ):
+            # exec drives this step as declared here (its admit ran as
+            # pre_admit), instead of declaring and admitting again
             batch.step = step
 
         batch.step_context.is_preplan = True
@@ -1841,6 +1848,10 @@ class Engine:
                 mark(f"engine.preplan_discarded.{batch.node_name}")
             batch.preplan_event = None
             batch.preplanned_rids = None
+            if batch.inputs is None:
+                # declared over template rows for a step that is now stale:
+                # exec declares again over the real ones
+                batch.step = None
             lease = batch.step_context.slot_lease
             cg_runner = self._submodules[batch.node_name].cuda_graph_runner
             if lease is not None and cg_runner is not None:
