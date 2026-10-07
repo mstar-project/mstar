@@ -449,7 +449,7 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
 
     assert _admit(rt, "r2") == rid, "the handle was recycled, as intended"
     assert not rt.has_pending_loop_stop(rid, WALK, "ar_loop")
-    assert rt.pending_loop_stop_rids(WALK, "ar_loop") == set()
+    assert rt.pending_loop_stop_rids([WALK], "ar_loop") == set()
 
 
 # --- stale handles -----------------------------------------------------------
@@ -474,8 +474,7 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
         lambda rt, r: rt.push_back_node("prefill", [r], [WG_ID]),
         id="push_back_node"),
     pytest.param(
-        lambda rt, r: rt.set_in_flight(
-            "prefill", WG_ID, [r], True),
+        lambda rt, r: rt.set_in_flight("prefill", [r], [WG_ID], True),
         id="set_in_flight"),
     pytest.param(
         lambda rt, r: rt.pop_rids("prefill", WALK, [r]), id="pop_rids"),
@@ -1127,6 +1126,29 @@ def test_a_scan_target_may_name_the_combined_walk(combined_two_walks):
     assert [s.graph_walk for s in rt.get_ready_nodes(set(), target=("LLM", "decode"))] == ["decode"]
 
 
+def test_one_route_takes_rows_of_both_walks(two_walks):
+    """A mixed step routes in one call, each row in its own walk: every row
+    completes and resets its own walk's graph, so it can run again there."""
+    rt, book, _ = two_walks
+    rids = _one_rid_per_walk(rt)
+    rt.ingest_inputs_batch(_ingest_block(rids, [_spec("text_inputs", "LLM") for _ in rids]))
+    rt.pop_walk_rids("LLM", RequestWalks(rids, ["prefill", "decode"], [0, 1]))
+    for uuid in (11, 12):
+        book.put_tensor(uuid, _info(uuid))
+        book.increment_ref(uuid, 1)
+
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk="prefill", node_name="LLM",
+        output_signals=["new_token"], wg_ids=ParallelList(rids, [0, 1]),
+        tensors=[11, 12], num_tensors=[1, 1],
+        walks=["prefill", "decode"], rid_walk_idx=[0, 1],
+    ))
+
+    assert sorted(out.register_uuids) == [11, 12]
+    rt.ingest_inputs_batch(_ingest_block(rids, [_spec("text_inputs", "LLM") for _ in rids]))
+    assert _ready(rt) == [("LLM", "decode", rids[1:]), ("LLM", "prefill", rids[:1])]
+
+
 def test_a_batch_transitions_together(two_walks):
     """Same handover with three requests, which is how it actually runs."""
     rt, book, store = two_walks
@@ -1388,10 +1410,10 @@ def test_marking_in_flight_does_not_unready_the_node(pair):
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     assert _ready(rt) == [("prefill", WALK, [rid])]
 
-    rt.set_in_flight("prefill", WG_ID, [rid], True)
+    rt.set_in_flight("prefill", [rid], [WG_ID], True)
     assert _ready(rt) == [("prefill", WALK, [rid])], "marking withdrew it"
 
-    rt.set_in_flight("prefill", WG_ID, [rid], False)
+    rt.set_in_flight("prefill", [rid], [WG_ID], False)
     assert _ready(rt) == [("prefill", WALK, [rid])]
 
 

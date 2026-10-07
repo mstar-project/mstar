@@ -18,7 +18,8 @@ def test_a_mixed_batch_flags_each_worker_graph():
     calls = []
     worker = Worker.__new__(Worker)
     worker._graph_runtime = SimpleNamespace(
-        set_in_flight=lambda node, wg, rids, value: calls.append((wg, sorted(rids), value)),
+        set_in_flight=lambda node, rids, wg_ids, value: calls.append(
+            (dict(zip(rids, wg_ids, strict=True)), value)),
     )
     batch = ScheduledBatch(
         node_name="LLM", graph_walk="mixed",
@@ -27,7 +28,7 @@ def test_a_mixed_batch_flags_each_worker_graph():
 
     worker._clear_in_flight_flag(batch)
 
-    assert sorted(calls) == [(7, [0, 2], False), (9, [1], False)]
+    assert calls == [({0: 7, 1: 9, 2: 7}, False)]  # one call, each row its own graph
 
 
 def test_a_mixed_speculative_batch_is_flagged_in_each_worker_graph():
@@ -37,9 +38,9 @@ def test_a_mixed_speculative_batch_is_flagged_in_each_worker_graph():
     flagged = []
     worker = Worker.__new__(Worker)
     worker._graph_runtime = SimpleNamespace(
-        commit_speculation=lambda spec_id, success, dropped, node=None, wg_id=None,
-        scheduled_rids=(): flagged.append((wg_id, sorted(scheduled_rids))) if node else None,
-        set_in_flight=lambda node, wg, rids, value: flagged.append((wg, sorted(rids))),
+        commit_speculation=lambda spec_id, success, dropped, node=None, wg_ids=None,
+        scheduled_rids=(): flagged.append(dict(zip(scheduled_rids, wg_ids, strict=True)))
+        if node else None,
     )
     batch = ScheduledBatch(
         node_name="LLM", graph_walk="mixed",
@@ -51,4 +52,4 @@ def test_a_mixed_speculative_batch_is_flagged_in_each_worker_graph():
 
     worker._settle_speculation(speculation, success=True)
 
-    assert sorted(flagged) == [(0, [1]), (5, [0, 2])]
+    assert flagged == [{0: 5, 1: 0, 2: 5}]  # one call, each row its own graph

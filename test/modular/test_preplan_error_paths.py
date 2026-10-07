@@ -46,7 +46,7 @@ def _fake_worker() -> Worker:
     w._graph_runtime = SimpleNamespace(
         push_back_node=lambda node_name, rids, wg_ids: w.pushed_back.extend(rids),
         set_in_flight=(
-            lambda node_name, wg_id, rids, value: w.despeculated.extend(rids)
+            lambda node_name, rids, wg_ids, value: w.despeculated.extend(rids)
         ),
         commit_speculation=(
             lambda spec_id, success, dropped, **kw: w.settled.append(

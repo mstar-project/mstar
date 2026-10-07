@@ -85,6 +85,8 @@ class CompletionState:
     graph_walk: str
     node_name: str
     routing: dict[int, NodeOutputRouting]
+    # rid -> the walk it completed in, where that is not graph_walk
+    rid_walk: dict[int, str]
     # rid -> the node's loop context before the completion advanced it
     nested_loop_indices: dict[int, NestedLoopIndices]
 
@@ -331,14 +333,13 @@ class PythonGraphRuntime(GraphRuntime):
         ]
 
     def set_in_flight(
-        self, node: str, wg_id: int, rids: list[int],
+        self, node: str, rids: list[int], wg_ids: list[int],
         in_flight: bool,
     ):
-        queues = self._queues[wg_id].per_request_queues
-        for rid in rids:
-            if rid not in queues:
-                continue
-            queues[rid].get_node(node)._in_flight = in_flight
+        for rid, wg_id in zip(rids, wg_ids, strict=True):
+            wgio = self._queues[wg_id].per_request_queues.get(rid)
+            if wgio is not None:
+                wgio.get_node(node)._in_flight = in_flight
 
     def is_in_flight(
         self, node: str, wg_id: int, rid: int,
@@ -897,13 +898,11 @@ class PythonGraphRuntime(GraphRuntime):
 
     def commit_speculation(
         self, spec_id: int, success: bool, dropped_rids: list[int] = (),
-        node: str | None = None, wg_id: int | None = None,
+        node: str | None = None, wg_ids: list[int] | None = None,
         scheduled_rids: list[int] = (),
     ):
-        if success and node is not None and wg_id is not None:
-            self.set_in_flight(
-                node, wg_id, list(scheduled_rids), True,
-            )
+        if success and node is not None and wg_ids is not None:
+            self.set_in_flight(node, list(scheduled_rids), wg_ids, True)
         staged = self._staged_specs.pop(spec_id, None)
         if staged is None:
             return
@@ -1299,11 +1298,11 @@ class PythonGraphRuntime(GraphRuntime):
             in self._pending_loop_stops
 
     def pending_loop_stop_rids(
-        self, graph_walk: str, loop_name: str,
+        self, graph_walks: list[str], loop_name: str,
     ) -> set[int]:
         return {
             stop.rid for stop in self._pending_loop_stops
-            if stop.loop_name == loop_name and stop.graph_walk == graph_walk
+            if stop.loop_name == loop_name and stop.graph_walk in graph_walks
         }
 
     def clear_pending_loop_stops(self):
@@ -1322,6 +1321,7 @@ class PythonGraphRuntime(GraphRuntime):
 
         routing_per_rid: dict[int, NodeOutputRouting] = {}
         nested_idxs: dict[int, NestedLoopIndices] = {}
+        rid_walk: dict[int, str] = {}
         register_uuids: list[int] = []
         register_rids: list[int] = []
         new_token_idxs: list[int] = []
@@ -1356,10 +1356,13 @@ class PythonGraphRuntime(GraphRuntime):
                 input.node_name
             )
             completion = self._mark_node_complete(rid, wg_id, input.node_name)
+            walk = input.graph_walk
+            if input.walks is not None:
+                walk = rid_walk[rid] = input.walks[input.rid_walk_idx[i]]
             routing = self._process_node_outputs(
                 rid, node_name=input.node_name,
                 outputs=[edge.clone() for edge in completion.output_edges],
-                graph_walk=input.graph_walk,
+                graph_walk=walk,
             )
             routing_per_rid[rid] = routing
 
@@ -1441,6 +1444,7 @@ class PythonGraphRuntime(GraphRuntime):
             node_name=input.node_name,
             routing=routing_per_rid,
             nested_loop_indices=nested_idxs,
+            rid_walk=rid_walk,
         )
         return RouteOutput(
             completion_id=completion_id,
@@ -1526,7 +1530,8 @@ class PythonGraphRuntime(GraphRuntime):
                 part = info.partition_info.get(partition)
                 node = self._queues[
                     self.get_worker_graph_id_for_node(
-                        completion.node_name, completion.graph_walk,
+                        completion.node_name,
+                        completion.rid_walk.get(rid, completion.graph_walk),
                     )
                 ].per_request_queues.get(rid)
                 speculative = node is not None and node.get_node(

@@ -428,9 +428,9 @@ def test_pending_loop_stops_are_recorded_and_live_one_iteration():
     )
     assert stopped_rids == [rid]
     assert runtime.has_pending_loop_stop(rid, walk, "ar_loop")
-    assert runtime.pending_loop_stop_rids(walk, "ar_loop") == {rid}
+    assert runtime.pending_loop_stop_rids([walk], "ar_loop") == {rid}
     # A different walk must not match.
-    assert runtime.pending_loop_stop_rids("other_walk", "ar_loop") == set()
+    assert runtime.pending_loop_stop_rids(["other_walk"], "ar_loop") == set()
 
     runtime.clear_pending_loop_stops()
     assert not runtime.has_pending_loop_stop(rid, walk, "ar_loop")
@@ -445,7 +445,7 @@ def test_stop_for_a_loop_not_in_the_walk_is_dropped():
         loop_names=ParallelList([rid], [["not_a_real_loop"]]),
     )
     assert stopped_rids == []
-    assert runtime.pending_loop_stop_rids(walk, "not_a_real_loop") == set()
+    assert runtime.pending_loop_stop_rids([walk], "not_a_real_loop") == set()
 
 
 def test_peer_loop_stop_compares_enclosing_loop_indices():
