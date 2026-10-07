@@ -751,6 +751,15 @@ class Engine:
             batch=batch, model_inputs=node_inputs
         )
 
+    def inline_client_signals(
+        self, node_name: str, graph_walk: str,
+    ) -> dict[str, str]:
+        """The node's client signals that can ride inline this walk."""
+        mgmt = self._submodules.get(node_name)
+        if mgmt is None:
+            return {}
+        return mgmt.submodule.inline_client_signals(graph_walk)
+
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
     ) -> None:
