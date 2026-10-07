@@ -114,6 +114,7 @@ def _engine_with(submodule):
     engine = Engine.__new__(Engine)
     engine._submodules = {"LLM": SimpleNamespace(submodule=submodule, resources={})}
     engine._chunk_inputs = {}
+    engine._keyed_walks = {}
     return engine
 
 
@@ -169,6 +170,97 @@ def test_the_whole_input_is_kept_until_the_last_chunk_lands():
 
     engine.release_chunk_inputs(0, "LLM")
     assert not engine._chunk_inputs
+
+
+# ── engine: a chunked row starts past its cached prefix ────────────────
+
+
+class _Runner:
+    """Answers a fixed cached prefix and records what was applied."""
+
+    def __init__(self, matched):
+        self.matched = matched
+        self.applied = []
+
+    def resolve_cached_prefix(self, rid, node_name, graph_walk):
+        return self.matched
+
+    def apply_cached_prefix(self, rid, node_name, graph_walk, inputs, matched_len):
+        self.applied.append((rid, inputs.input_seq_len, matched_len))
+
+
+class _KeyedPrompt(_Prompt):
+    def __init__(self, n, reuses=True, guided=False):
+        super().__init__(n)
+        self.reuses = reuses
+        self.guided = guided
+
+    def get_input_sequence_len(self, graph_walk, fwd_info, inputs):
+        from mstar.model.submodule_base import InputSeqLenInfo
+
+        return InputSeqLenInfo(self.n)
+
+    def supports_chunked_prefill(self, graph_walk):
+        return True
+
+    def reuses_cached_prefix(self, graph_walk, fwd_info):
+        return self.reuses
+
+    def prepare_inputs(self, **kwargs):
+        inputs = super().prepare_inputs(**kwargs)
+        inputs.resource_step_info = self.guided
+        return inputs
+
+
+def _keyed_engine(sub, matched):
+    engine = _engine_with(sub)
+    engine._keyed_walks = {"LLM": {"prefill"}}
+    engine._runner = _Runner(matched)
+    engine._prefix_model = "Test"
+    return engine
+
+
+def test_a_keyed_row_is_measured_without_its_cached_prefix():
+    engine = _keyed_engine(_KeyedPrompt(10), matched=4)
+
+    info = engine.input_sequence_len("LLM", "prefill", None, {}, rid=0)
+
+    assert (info.seq_len, info.cached_prefix) == (6, 4)
+
+
+def test_a_row_its_model_will_not_cut_is_measured_whole():
+    engine = _keyed_engine(_KeyedPrompt(10, reuses=False), matched=4)
+
+    info = engine.input_sequence_len("LLM", "prefill", None, {}, rid=0)
+
+    assert (info.seq_len, info.cached_prefix) == (10, 0)
+
+
+def test_the_first_chunk_applies_the_prefix_it_starts_past():
+    engine = _keyed_engine(_KeyedPrompt(10), matched=4)
+
+    first = engine._prepare_chunk(_batch(), 0, "prefill", (4, 6))
+    engine._prepare_chunk(_batch(), 0, "prefill", (6, 10))
+
+    assert engine._runner.applied == [(0, 10, 4)], "once, with the whole input"
+    assert first.input_ids.tolist() == [4, 5] and first.chunk_start == 4
+
+
+def test_a_row_with_no_cached_prefix_drops_any_lease():
+    engine = _keyed_engine(_KeyedPrompt(10), matched=0)
+
+    engine._prepare_chunk(_batch(), 0, "prefill", (0, 4))
+
+    assert engine._runner.applied == [(0, 10, 0)]
+
+
+def test_a_first_chunk_past_a_prefix_its_inputs_cannot_skip_fails():
+    import pytest
+
+    engine = _keyed_engine(_KeyedPrompt(10, guided=True), matched=4)
+
+    with pytest.raises(RuntimeError, match="reuses_cached_prefix"):
+        engine._prepare_chunk(_batch(), 0, "prefill", (4, 6))
 
 
 def test_a_step_over_its_token_budget_is_reported(caplog):
