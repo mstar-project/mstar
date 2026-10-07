@@ -38,6 +38,13 @@ if "triton" not in sys.modules:
     triton = types.ModuleType("triton")
     triton.language = types.ModuleType("triton.language")
     triton.language.constexpr = int
+    # dtype annotations such as tl.int64 on kernel arguments
+    def _tl_attr(name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return object()
+
+    triton.language.__getattr__ = _tl_attr
     triton.jit = lambda *a, **k: (lambda f: f)
     triton.cdiv = lambda a, b: -(-a // b)
     triton.Config = lambda *a, **k: a

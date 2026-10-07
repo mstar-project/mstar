@@ -26,7 +26,8 @@ class LinearAttnVariant(Enum):
 
 
 class LinearAttnBackend(Enum):
-    FLASHINFER = "flashinfer"
+    FLASHINFER = "flashinfer"  # GDN: FlashInfer's kernels
+    TRITON = "triton"  # KDA: the fused kernels in kda_triton.py
 
 
 @dataclass
@@ -81,4 +82,10 @@ class LinearAttnStep(ResourceStep):
     Carries no state semantics: the segments give the rows and spans, and the
     pool's own step says what becomes of the slots. The walk is derived from
     the spans.
+
+    ``speculative``: every row is a verify block of a speculating node, which
+    first replays the accepted part of the row's last block (the pool's
+    speculative blocks); the span is the block's length, the same for every row.
     """
+
+    speculative: bool = False
