@@ -1918,13 +1918,13 @@ class Worker:
             return False
 
     def _continuing_seq_lens(
-        self, batch_N: PendingBatch, node_name: str, graph_walk: str,
+        self, pending: PendingBatch, node_name: str, graph_walk: str,
         continuing: Collection[int], same_node: bool,
     ) -> list[int]:
         """The spans the continuing rows will run, for the merge's token
         budget: the submodule's estimate, -1 where it has none."""
         engine = self.engine_manager.get_engine(node_name)
-        prev, info = batch_N.node_batch, batch_N.node_batch.per_request_info
+        prev, info = pending.node_batch, pending.node_batch.per_request_info
         lens = []
         for rid in continuing:
             span = engine.speculative_input_seq_len(
@@ -2707,7 +2707,7 @@ class Worker:
             capture_group_of=prep.ready_rids[0],
             # estimated as a pre-plan estimates them, from this step's spans
             pre_existing_seq_lens=self._continuing_seq_lens(
-                batch_N, spec_node_name, graph_walk, continuing,
+                pending, spec_node_name, graph_walk, continuing,
                 speculating_same_node,
             ),
         )
