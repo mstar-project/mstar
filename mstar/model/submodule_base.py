@@ -677,6 +677,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         a fixed key set for graph compat, so the filtering happens here."""
         return outputs
 
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        """Output signals whose client-facing value is one scalar per row that
+        the stop check already copies to the host, as signal name -> the name
+        of the row-addressed stop buffer holding it. The worker then sends
+        those values inline, one frame per step, instead of one tensor per
+        request. Only for a walk whose emit edge is not persisted."""
+        del graph_walk
+        return {}
+
     def unpack_packed_outputs(
         self,
         static_output: dict,
