@@ -241,6 +241,9 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.engine.html">mstar.engine.engine</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -291,6 +294,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
@@ -303,6 +307,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.components.html">mstar.model.kokoro.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.submodules.html">mstar.model.kokoro.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.voices.html">mstar.model.kokoro.voices</a></li>
 </ul>
 </details></li>
@@ -333,6 +338,7 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.submodules.html">mstar.model.vjepa2.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -346,6 +352,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1227,7 +1234,7 @@ middle of a forward.</p>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>batch</strong> (<em>ExecutingBatch</em>)</p></li>
+<li><p><strong>batch</strong> (<a class="reference internal" href="mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch" title="mstar.engine.engine.ExecutingBatch"><em>ExecutingBatch</em></a>)</p></li>
 <li><p><strong>model_inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
@@ -1256,7 +1263,7 @@ codec submodules that need homogeneous frame counts).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>batch</strong> (<em>ExecutingBatch</em>)</p></li>
+<li><p><strong>batch</strong> (<a class="reference internal" href="mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch" title="mstar.engine.engine.ExecutingBatch"><em>ExecutingBatch</em></a>)</p></li>
 <li><p><strong>model_inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
@@ -1490,7 +1497,7 @@ and doesn’t need this surface.</p>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[CudaGraphConfig]</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig" title="mstar.engine.cuda_graph_config.CudaGraphConfig">CudaGraphConfig</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1539,7 +1546,7 @@ independent graphs (i.e., one per outer function to be graphed).</p>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, PiecewiseCudaGraphConfig]</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference internal" href="mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig" title="mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig">PiecewiseCudaGraphConfig</a>]</p>
 </dd>
 </dl>
 </dd></dl>

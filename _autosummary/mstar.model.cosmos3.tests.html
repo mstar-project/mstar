@@ -51,7 +51,7 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="mstar.model.cosmos3.tests.pipeline" href="mstar.model.cosmos3.tests.pipeline.html" />
-    <link rel="prev" title="mstar.model.cosmos3.sessions" href="mstar.model.cosmos3.sessions.html" />
+    <link rel="prev" title="mstar.model.cosmos3.submodules" href="mstar.model.cosmos3.submodules.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -237,6 +237,9 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.engine.html">mstar.engine.engine</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -287,6 +290,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4 current active"><a class="current reference internal" href="#">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
@@ -299,6 +303,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.components.html">mstar.model.kokoro.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.submodules.html">mstar.model.kokoro.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.voices.html">mstar.model.kokoro.voices</a></li>
 </ul>
 </details></li>
@@ -329,6 +334,7 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.submodules.html">mstar.model.vjepa2.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -342,6 +348,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -606,6 +613,15 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.cosmos3.tests.pipeline.html#module-mstar.model.cosmos3.tests.pipeline" title="mstar.model.cosmos3.tests.pipeline"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pipeline</span></code></a></p></td>
 <td><p>Fused generation pipeline for Cosmos3 (text/image-to-image/video).</p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.cosmos3.tests.test_engine_cache.html#module-mstar.model.cosmos3.tests.test_engine_cache" title="mstar.model.cosmos3.tests.test_engine_cache"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_engine_cache</span></code></a></p></td>
+<td><p>GPU parity for the cache-once engine path of the Cosmos3 generator.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.cosmos3.tests.test_sound.html#module-mstar.model.cosmos3.tests.test_sound" title="mstar.model.cosmos3.tests.test_sound"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_sound</span></code></a></p></td>
+<td><p>Tests for the Cosmos3 opt-in sound generation path.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.cosmos3.tests.test_video_capture.html#module-mstar.model.cosmos3.tests.test_video_capture" title="mstar.model.cosmos3.tests.test_video_capture"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_video_capture</span></code></a></p></td>
+<td><p>CPU checks for the video / windowed denoise CUDA-graph capture: one graph per latent shape built with every frame declared noisy, the request's clean/noisy layout carried as a per-token mask input.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -623,12 +639,12 @@
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.model.cosmos3.sessions.html"
+       href="mstar.model.cosmos3.submodules.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.model.cosmos3.sessions</p>
+        <p class="prev-next-title">mstar.model.cosmos3.submodules</p>
       </div>
     </a>
     <a class="right-next"
