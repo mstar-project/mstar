@@ -197,6 +197,9 @@ class EngineManager:
         conductor resolved for it (``Model.get_request_resource_configs``)."""
         self.engine.add_request(request_id, resource_configs)
 
+    def release_kv(self, request_id: str) -> None:
+        self.engine.release_kv(request_id)
+
     def remove_request(self, request_id: str) -> None:
         self.engine.remove_request(request_id)
 

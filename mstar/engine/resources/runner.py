@@ -14,8 +14,12 @@ from typing import Any
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
+    ADMIT_WAIT,
+    ADMIT_WAIT_BEHIND,
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
+    FULL_ADMIT_WAIT,
+    FULL_ADMIT_WAIT_BEHIND,
     FullAdmitOutcome,
     SubmoduleStep,
 )
@@ -93,12 +97,20 @@ class StepRunner:
             if type(self._resources[key]).admit_retrieve
             is not Resource.admit_retrieve
         ]
+        # Only a paged KV pool gives pages back before its request is removed;
+        # the rest of the resources have nothing to do on a release
+        self._release_order = [
+            key for key in self._order if hasattr(self._resources[key], "release_kv")
+        ]
         # Both sweeps run on behalf of one node and have no step to filter by,
         # so settle each node's share of them up front. `node_resources` must
         # name every node, including one that owns nothing — an absent node
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
+        # node -> the `admission_keys` of the pools in its retrieve sweep that have one;
+        # settled on first ask, as the sweep is fixed
+        self._deciders: dict[str | None, tuple] = {}
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
@@ -230,6 +242,11 @@ class StepRunner:
         for key in self._order:
             self._resources[key].remove_request(rid)
 
+    def release_kv(self, rid: str) -> None:
+        """give a finished request's KV pages back, ahead of `remove_request`"""
+        for key in self._release_order:
+            self._resources[key].release_kv(rid)
+
     def admit_retrieve(
         self, rid: str, node_name: str, graph_walk: str,
         published: Mapping[str, PublishedInfo] | None = None,
@@ -243,8 +260,17 @@ class StepRunner:
         answers for an unrecognised node with the default `["main"]`, so the
         node ends up gated on — and able to allocate against — another node's
         cache.
+
+        Not ready only because admission gates held the request back, and for
+        no other reason, answers `FULL_ADMIT_WAIT` (`FULL_ADMIT_WAIT_BEHIND` if
+        each had it behind the front of the queue): equal to the plain answer,
+        and what a caller may stop asking over while `admission_keys` stands.
+        Any other resource not being ready makes it the plain one.
         """
         ready = True
+        # the gates' answer, as long as no other reason has held the step back
+        waited = None
+        gates_only = True
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
         ):
@@ -258,9 +284,40 @@ class StepRunner:
                     key, outcome.reason.message
                 )
                 return FullAdmitOutcome(outcome, key)
-            ready = ready and outcome.ready
-        return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
+            if outcome.ready:
+                continue
+            ready = False
+            if outcome is ADMIT_WAIT:
+                waited = FULL_ADMIT_WAIT
+            elif outcome is ADMIT_WAIT_BEHIND:
+                waited = waited or FULL_ADMIT_WAIT_BEHIND
+            else:
+                gates_only = False
+        if ready:
+            return FULL_ADMIT_OK
+        return waited if gates_only else FULL_ADMIT_NOT_READY
 
+    def admission_keys(self, node_name: str | None = None):
+        """What a `FULL_ADMIT_WAIT*` from `admit_retrieve` on ``node_name`` depends on:
+        each pool that decides admission on the node gives its `admission_keys`, and these
+        are combined into one ``(behind, front)``: a tuple with each pool's part, or, with
+        the one pool there usually is, its own pair. None when no pool on the node decides,
+        so nothing is to be parked on.
+
+        A pool without ``admission_keys`` (a stub, say) is not one that decides.
+        """
+        gates = self._deciders.get(node_name)
+        if gates is None:
+            gates = self._deciders[node_name] = tuple(
+                gate for key in self._sweep(
+                    self._node_retrieve_order, self._retrieve_order, node_name
+                )
+                if (gate := getattr(self._resources[key], "admission_keys", None)) is not None
+            )
+        keys = [pair for gate in gates if (pair := gate()) is not None]
+        if len(keys) < 2:
+            return keys[0] if keys else None
+        return tuple(pair[0] for pair in keys), tuple(pair[1] for pair in keys)
 
 
     # ── Pre-plan bookkeeping ─────────────────────────────────────────────

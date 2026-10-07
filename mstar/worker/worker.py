@@ -29,7 +29,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_torch_config
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AllocationFailed, StepContext
+from mstar.engine.resources import AllocationFailed, GrantDeferred, StepContext
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -435,8 +435,11 @@ class Worker:
         # _in_flight_rids: rids referenced by an in-flight GPU step or its
         #   speculation; REMOVE_REQUEST for these is deferred.
         # _pending_removes: deferred REMOVE_REQUESTs.
+        # _pending_releases: deferred RELEASE_KVs, which wait for the same
+        #   in-flight step; applied wherever _pending_removes are.
         self._in_flight_rids: set[int] = set()
         self._pending_removes: set[int] = set()
+        self._pending_releases: set[int] = set()
         # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
         # behind an in-flight GPU step; _draining_rids have stopped reading and
         # persist until REMOVE_REQUEST (so no read can restart after READS_DONE);
@@ -725,6 +728,7 @@ class Worker:
         self.streaming_buffers.pop(request_id, None)
         self.scheduler.clear_rid(request_id, body.request_id)
         self._pending_removes.discard(request_id)
+        self._pending_releases.discard(request_id)
 
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
@@ -732,6 +736,60 @@ class Worker:
 
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
+
+    def _tp_followers(self, request_id: int) -> set[str]:
+        """The workers that follow this one, as leader, in ``request_id``'s TP groups."""
+        sharding = self._graph_runtime.get_sharding_config(request_id)
+        followers: set[str] = set()
+        if sharding is not None:
+            for group in sharding.groups:
+                if group.tp_size > 1 and group._tp_rank == 0:
+                    followers.update(group._workers[1:])
+        return followers
+
+    def _release_kv(self, body: RemoveRequest) -> None:
+        """Give back the KV pages of a request the conductor has finished, ahead
+        of its REMOVE_REQUEST (which waits for the client to read the outputs).
+
+        Only the pages and the reservation: the request's tensors, outputs,
+        transfer state and handle stay until the REMOVE_REQUEST that follows,
+        which finds nothing left to free. Safe here, and not at the decode
+        loop's stop, because only the conductor knows that no walk of the
+        request is left to read the pages.
+        """
+        if self.is_tp_follower and body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF):
+            return # wait for the release from TP rank 0, as for a removal
+
+        request_id = self._rid(body.request_id)
+        if request_id is None:
+            return # never admitted here, or already removed: no pages held
+        # A finished request has nothing left to run. The scheduler's failed set
+        # is what stops new work for a rid, a speculation chain from continuing
+        # it and its late KV publication (`_is_tearing_down`, `_publishable_request_ids`),
+        # and `clear_rid` takes it out with the REMOVE_REQUEST. Before the
+        # deferral below, so a step in flight is the last one.
+        self.scheduler.fail_rids({request_id})
+        # Same deferral as REMOVE_REQUEST: a step in flight reads these pages,
+        # and so does a TP-follow batch queued for this rank and not run yet.
+        if (
+            request_id in self._in_flight_rids
+            or self.scheduler.pending_tp_follow_count.get(body.request_id, 0) > 0
+        ):
+            self._pending_releases.add(request_id)
+            return
+
+        for worker in self._tp_followers(request_id):
+            self.communicator.send(
+                worker, msg=WorkerMessage(
+                    message_type=WorkerMessageType.RELEASE_KV,
+                    body=RemoveRequest(
+                        request_id=body.request_id,
+                        source=MessageSource.TP_RANK_0,
+                    )
+                )
+            )
+        self._pending_releases.discard(request_id)
+        self.engine_manager.release_kv(request_id)
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
@@ -945,6 +1003,7 @@ class Worker:
     def _process_message_list(self, messages: list[WorkerMessage]):
         msg_types_needing_active_request = [
             WorkerMessageType.REMOVE_REQUEST,
+            WorkerMessageType.RELEASE_KV,
             WorkerMessageType.INPUT_SIGNALS,
             WorkerMessageType.STOP_LOOPS
         ]
@@ -970,6 +1029,8 @@ class Worker:
                 self._drain_request(message.body)
             elif message.message_type == WorkerMessageType.REMOVE_REQUEST:
                 self._remove_request(message.body)
+            elif message.message_type == WorkerMessageType.RELEASE_KV:
+                self._release_kv(message.body)
             elif message.message_type == WorkerMessageType.INPUT_SIGNALS:
                 self._process_new_inputs(message.body)
             elif message.message_type == WorkerMessageType.TENSOR_RECEIVED:
@@ -1736,11 +1797,23 @@ class Worker:
         Every admit failure needs the push-back; only an ``AllocationFailed``
         also needs an eviction. ``RequestOffloading`` means the rid is already
         on its way to the host, so evicting anything else is wasted work — the
-        retry is gated on ``check_ready`` reloading it.
+        retry is gated on ``check_ready`` reloading it. A ``GrantDeferred``
+        names the one request whose page grant is unsafe until another has
+        progressed: only it is held, since holding the whole batch would hold
+        the request that has to progress along with it, and nothing is
+        offloaded, as no page is short.
         """
         reason = node_batch.admit_error
         if isinstance(reason, AllocationFailed):
             self._handle_allocation_failure(batch, node_batch)
+            return
+        if isinstance(reason, GrantDeferred):
+            self._push_back_batch(batch)
+            self.scheduler.hold_requests([reason.request_id])
+            logger.debug(
+                "Grant deferred node=%s walk=%s: holding %s, re-queued %d requests",
+                batch.node_name, batch.graph_walk, reason.request_id, len(batch),
+            )
             return
 
         self._push_back_batch(batch)
@@ -2953,7 +3026,12 @@ class Worker:
     ) -> None:
         """Apply ``REMOVE_REQUEST`` for any rid that is not currently held by
         an in-flight GPU step. Removes for in-flight rids stay deferred and
-        are reattempted next iter."""
+        are reattempted next iter. Deferred ``RELEASE_KV`` goes first: a rid
+        pending both gives its pages back, then is removed."""
+        for rid in [r for r in self._pending_releases if r not in in_flight_rids]:
+            self._release_kv(RemoveRequest(
+                request_id=self._rid_str(rid), source=MessageSource.SELF,
+            ))
         to_apply = [r for r in self._pending_removes if r not in in_flight_rids]
         for rid in to_apply:
             self._pending_removes.discard(rid)

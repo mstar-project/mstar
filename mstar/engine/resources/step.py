@@ -146,6 +146,18 @@ class RequestOffloading(AdmitFailedReason):
     request_id: str
 
 @dataclass
+class GrantDeferred(AdmitFailedReason):
+    """A page grant that would leave the admitted requests with no way to finish.
+
+    Not an `AllocationFailed`: pages are free, and nothing needs evicting or
+    offloading. The grant is unsafe until another request has progressed, so
+    the caller holds only ``request_id``, which the others are not to wait
+    behind, and re-drives the rest of the batch.
+    """
+    label: str
+    request_id: str
+
+@dataclass
 class AdmitRuntimeError(AdmitFailedReason):
     """A resource cannot serve this request at all.
 
@@ -163,6 +175,15 @@ class AdmitOutcome(NamedTuple):
 # Every resource's admit returns this on the common path, several times a
 # step; nothing reads identity, so hand back one instance rather than build it.
 ADMIT_OK = AdmitOutcome(ok=True, ready=True)
+
+# What a pool's admission gate answers a request it holds back until what it asked
+# for fits. Each equals any other `AdmitOutcome(ok=True, ready=False)`, so a caller
+# that reads `ok` and `ready` sees no difference; only identity says it was the
+# gate, and which wait. BEHIND: the request is neither the head of the queue nor in
+# the backfill window, so only the front of the queue moving can change the answer.
+# WAIT: it is the head, or in the window, and the pool moving can change it too.
+ADMIT_WAIT = AdmitOutcome(ok=True, ready=False)
+ADMIT_WAIT_BEHIND = AdmitOutcome(ok=True, ready=False)
 
 
 class FullAdmitOutcome(NamedTuple):
@@ -192,3 +213,8 @@ class FullAdmitOutcome(NamedTuple):
 FULL_ADMIT_OK = FullAdmitOutcome(ADMIT_OK)
 # admitted, but something it needs has not landed yet: retry, don't fail
 FULL_ADMIT_NOT_READY = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False))
+# not ready only because a pool's admission gate holds the request back (see ADMIT_WAIT),
+# and by no other resource: equal to FULL_ADMIT_NOT_READY, told apart by identity. WAIT_BEHIND
+# if every gate that held it back had it behind the front of the queue
+FULL_ADMIT_WAIT = FullAdmitOutcome(ADMIT_WAIT)
+FULL_ADMIT_WAIT_BEHIND = FullAdmitOutcome(ADMIT_WAIT_BEHIND)

@@ -162,6 +162,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     a, b = t.handle("req-a"), t.handle("req-b")
     w._in_flight_rids = set()
     w._pending_removes = set()
+    w._pending_releases = set()
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._last_active = {}
     w.streaming_buffers = {a: {}}

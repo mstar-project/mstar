@@ -1453,6 +1453,12 @@ class Engine:
             published=request_info.resource_publish_info,
         )
 
+    def admission_keys(self, node_name: str):
+        """What a ``FULL_ADMIT_WAIT*`` from `check_ready` on this node depends on, or None
+        when no pool on it decides: a request so answered need not be asked again while
+        this reads as it did. See `StepRunner.admission_keys`."""
+        return self._runner.admission_keys(node_name)
+
     def reserve_replay_slot(self, batch: ExecutingBatch) -> SlotLease | None:
         """Lease the slot this batch will replay on, before it is dispatched.
 
@@ -1687,6 +1693,11 @@ class Engine:
         overrides: Mapping[str, ResourceReqConfig] | None = None,
     ) -> None:
         self._runner.ingest_request(request_id, overrides)
+
+    def release_kv(self, request_id: str) -> None:
+        """Give back the paged KV pages of a request that is done, and nothing
+        else of it: `remove_request` still follows and clears the rest."""
+        self._runner.release_kv(request_id)
 
     def remove_request(self, request_id: str) -> None:
         self._runner.remove_request(request_id)
