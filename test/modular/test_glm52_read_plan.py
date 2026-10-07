@@ -1,0 +1,134 @@
+"""The TP fast read path's GLM-5.2 half: the read plan and the shape-driven
+expert loaders.
+"""
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from mstar.model.glm52.components.moe import (  # noqa: E402
+    _down_fp8_loader,
+    _gate_up_fp8_loader,
+)
+from mstar.model.glm52.config import Glm52ModelConfig  # noqa: E402
+from mstar.model.glm52.weight_loader import build_glm52_read_plan  # noqa: E402
+
+BLOCK = (16, 16)
+
+
+def test_read_plan_excludes_and_slices():
+    cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)  # moe_inter 64, 2 layers
+    cfg.dsa_long_context = True  # the indexer is read only on the DSA path
+    keys = [
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_a_proj.weight",
+        "model.layers.0.self_attn.indexer.wk.weight",       # layer 0 FULL
+        "model.layers.1.self_attn.indexer.wk.weight",       # layer 1 SHARED
+        "model.layers.1.mlp.experts.2.gate_proj.weight",
+        "model.layers.1.mlp.experts.2.gate_proj.weight_scale_inv",
+        "model.layers.1.mlp.experts.2.down_proj.weight",
+        "model.layers.1.mlp.experts.2.down_proj.weight_scale_inv",
+        "model.layers.1.mlp.shared_experts.gate_proj.weight",
+        "model.layers.2.enorm.weight",                      # MTP layer
+        "model.layers.2.mlp.experts.0.up_proj.weight",      # MTP expert
+    ]
+    plan_keys, specs = build_glm52_read_plan(keys, cfg, tp_rank=1, tp_size=2)
+
+    assert "model.layers.2.enorm.weight" not in plan_keys
+    assert "model.layers.2.mlp.experts.0.up_proj.weight" not in plan_keys
+    assert "model.layers.1.self_attn.indexer.wk.weight" not in plan_keys  # SHARED
+    assert "model.layers.0.self_attn.indexer.wk.weight" in plan_keys      # FULL
+    assert "model.layers.1.mlp.shared_experts.gate_proj.weight" in plan_keys
+    assert "model.layers.1.mlp.shared_experts.gate_proj.weight" not in specs
+    assert "model.embed_tokens.weight" in plan_keys
+
+    shard = cfg.moe_intermediate_size // 2  # 32
+    assert specs["model.layers.1.mlp.experts.2.gate_proj.weight"] == (0, 32, 64)
+    srows = shard // BLOCK[0]  # 2
+    assert specs["model.layers.1.mlp.experts.2.gate_proj.weight_scale_inv"] == (
+        0, srows, 2 * srows)
+    assert specs["model.layers.1.mlp.experts.2.down_proj.weight"] == (1, 32, 64)
+    scols = shard // BLOCK[1]
+    assert specs["model.layers.1.mlp.experts.2.down_proj.weight_scale_inv"] == (
+        1, scols, 2 * scols)
+
+
+def test_read_plan_flag_off_indexer_and_bf16_experts():
+    # load_indexer=False drops every indexer key, FULL layers included; a
+    # bf16 (non-fp8-resident) config reads experts whole — no slice specs
+    cfg = Glm52ModelConfig.reduced()
+    keys = [
+        "model.layers.0.self_attn.indexer.wk.weight",
+        "model.layers.1.mlp.experts.2.gate_proj.weight",
+    ]
+    plan_keys, specs = build_glm52_read_plan(keys, cfg, tp_rank=0, tp_size=2, load_indexer=False)
+    assert plan_keys == {"model.layers.1.mlp.experts.2.gate_proj.weight"}
+    assert specs == {}
+
+
+def test_read_plan_indexer_default_follows_dsa_long_context():
+    """Flag-off the model builds no indexer (Glm52MLAAttention), so the plan
+    must not read the keys — ~370 MB per rank of replicated weights on the
+    full model, transferred to every rank for nothing. Flag-on the FULL
+    layers' keys come back; an explicit ``load_indexer`` still wins."""
+    keys = [
+        "model.layers.0.self_attn.indexer.wk.weight",       # layer 0 FULL
+        "model.layers.1.self_attn.indexer.wk.weight",       # layer 1 SHARED
+        "model.layers.0.self_attn.q_a_proj.weight",
+    ]
+    cfg = Glm52ModelConfig.reduced()
+    assert cfg.dsa_long_context is False
+    plan_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=0, tp_size=1)
+    assert plan_keys == {"model.layers.0.self_attn.q_a_proj.weight"}
+
+    cfg.dsa_long_context = True
+    plan_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=0, tp_size=1)
+    assert plan_keys == {
+        "model.layers.0.self_attn.q_a_proj.weight",
+        "model.layers.0.self_attn.indexer.wk.weight",
+    }
+
+    cfg.dsa_long_context = False
+    plan_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=0, tp_size=1, load_indexer=True)
+    assert "model.layers.0.self_attn.indexer.wk.weight" in plan_keys
+
+
+def test_expert_loaders_accept_full_and_presliced():
+    full_inter, tp = 64, 2
+    shard = full_inter // tp
+    hidden = 32
+    param = torch.nn.Parameter(
+        torch.zeros(4, 2 * shard, hidden, dtype=torch.uint8), requires_grad=False)
+    full = torch.arange(full_inter * hidden, dtype=torch.uint8).view(full_inter, hidden)
+
+    _gate_up_fp8_loader(1, tp, full_inter, 1, param, full, "gate:3")
+    from_full = param.data[3, :shard].clone()
+    param.data.zero_()
+    _gate_up_fp8_loader(1, tp, full_inter, 1, param, full[shard:], "gate:3")
+    assert torch.equal(param.data[3, :shard], from_full)
+    assert torch.equal(from_full, full[shard:])
+
+    with pytest.raises(ValueError):
+        _gate_up_fp8_loader(1, tp, full_inter, 1, param, full[:10], "gate:3")
+
+    dparam = torch.nn.Parameter(
+        torch.zeros(4, hidden, shard, dtype=torch.uint8), requires_grad=False)
+    dfull = torch.arange(hidden * full_inter, dtype=torch.uint8).view(hidden, full_inter)
+    _down_fp8_loader(1, tp, full_inter, 1, dparam, dfull, "down:2")
+    d_from_full = dparam.data[2].clone()
+    dparam.data.zero_()
+    _down_fp8_loader(1, tp, full_inter, 1, dparam, dfull[:, shard:], "down:2")
+    assert torch.equal(dparam.data[2], d_from_full)
+    with pytest.raises(ValueError):
+        _down_fp8_loader(1, tp, full_inter, 1, dparam, dfull[:, :10], "down:2")
+
+
+def test_read_plan_refuses_shards_that_split_a_scale_block():
+    # per-rank intermediate must be a whole number of scale blocks, or the
+    # sliced fp8 bytes and sliced scales would misalign
+    cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)  # moe_inter 64
+    with pytest.raises(AssertionError, match="scale block"):
+        build_glm52_read_plan(["model.embed_tokens.weight"], cfg, tp_rank=0, tp_size=8)
