@@ -419,6 +419,49 @@ def test_audio_voices_404_for_non_speech_model(client_and_stub):
     assert client.get("/v1/audio/voices").status_code == 404
 
 
+@pytest.mark.parametrize("body", [
+    {"response_format": "xyz"},
+    {"response_format": "aac"},
+    {"response_format": "mp3", "stream": True},
+    {"response_format": "opus", "stream": True},
+])
+def test_speech_refuses_a_format_it_cannot_produce(client_and_stub, body):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2, 3]))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", **body})
+    assert r.status_code == 400 and "response_format" in r.json()["error"]["message"]
+    assert stub.last_submit is None  # refused before any work was submitted
+
+
+@pytest.mark.parametrize("ref,message", [
+    ("/etc/passwd", "paths on the server are refused"),
+    ("file:///etc/passwd", "paths on the server are refused"),
+    (123, "got int"),
+    ({"url": "x"}, "got dict"),
+])
+def test_chatterbox_adapter_refuses_a_bad_ref_audio(ref, message, tmp_path):
+    # refused as a client error (ValueError) before anything is opened
+    from mstar.api_server.openai import adapters
+    from mstar.api_server.openai.protocol import SpeechRequest
+
+    req = SpeechRequest.model_validate({"model": "chatterbox", "input": "hi", "ref_audio": ref})
+    with pytest.raises(ValueError, match=message):
+        adapters.ChatterboxAdapter().speech_to_request(req, tmp_path)
+
+
+@pytest.mark.parametrize("fmt,magic", [("mp3", None), ("flac", b"fLaC"), ("opus", b"OggS")])
+def test_speech_encodes_the_requested_container(client_and_stub, fmt, magic):
+    pytest.importorskip("soundfile")
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.next_chunks = [_Chunk("audio", _pcm(list(range(0, 24000, 7))))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": fmt})
+    assert r.status_code == 200 and r.content[:4] != b"RIFF"  # not WAV under another name
+    if magic:
+        assert r.content[:4] == magic
+
+
 def test_speech_stream_pcm_has_no_wav_header(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "orpheus"

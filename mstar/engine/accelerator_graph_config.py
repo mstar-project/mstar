@@ -47,6 +47,12 @@ class AcceleratorGraphConfig(ABC):
         self.capture_batch_sizes = capture_batch_sizes
         self.capture_forward_method = capture_forward_method
         self.caps_eager_batch_size = caps_eager_batch_size
+        # How many plan tokens one input token turns into (a step that commits
+        # KV under several labels combined into one plan, e.g. classifier-free
+        # guidance packing cond + uncond, has 2). Buckets are keyed by plan
+        # tokens; the engine asks for a bucket in input tokens and the runner
+        # scales by this. Subclasses that support it set it.
+        self.total_tokens_multiplier = 1
         self.input_seq_dims = input_seq_dims
 
     @abstractmethod
@@ -132,6 +138,11 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         capture_batch_sizes: list[int] | None = None,
         capture_forward_method: str = "forward_batched",
         caps_eager_batch_size: bool = True,
+        # ``capture_token_lengths`` count input tokens; a step whose plan
+        # carries every input token under several combined labels (batched
+        # guidance: cond + uncond in one plan) multiplies them by this, so
+        # the resources size their per-bucket buffers for the whole plan.
+        total_tokens_multiplier: int = 1,
         input_seq_dims: dict[str, int] | None = None,
     ):
         super().__init__(
@@ -144,17 +155,21 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
             caps_eager_batch_size=caps_eager_batch_size,
             input_seq_dims=input_seq_dims,
         )
+        if total_tokens_multiplier < 1:
+            raise ValueError("total_tokens_multiplier must be at least 1")
         self.make_node_input = make_node_input
         self.capture_token_lengths = capture_token_lengths
+        self.total_tokens_multiplier = total_tokens_multiplier
 
     def get_config_type(self) -> AcceleratorGraphConfigType:
         return AcceleratorGraphConfigType.FLASH_INFER_PACKED
 
     def get_total_tokens(self, bs: int) -> list[int]:
-        return self.capture_token_lengths
+        return [n * self.total_tokens_multiplier for n in self.capture_token_lengths]
 
     def get_node_inputs(self, bs: int, num_tokens: int):
-        seq_lens = distribute_tokens(num_tokens, bs)
+        # ``num_tokens`` is the bucket's plan tokens; the rows get input tokens
+        seq_lens = distribute_tokens(num_tokens // self.total_tokens_multiplier, bs)
         return [
             self.make_node_input(n) for n in seq_lens
         ]
