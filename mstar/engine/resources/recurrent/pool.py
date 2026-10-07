@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
+from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
 from mstar.engine.resources.recurrent.config import (
     RecurrentStateConfig,
@@ -69,18 +70,26 @@ class RecurrentStatePool(Resource):
         config = spec.config
         if info.joint_comm_group is not None:
             config.shard(info.joint_comm_group.world_size)
-        return cls(device=info.device, config=config)
+        return cls(
+            device=info.device, config=config, comm_group=info.joint_comm_group,
+        )
 
-    def __init__(self, device: torch.device, config: RecurrentStateConfig):
+    def __init__(
+        self, device: torch.device, config: RecurrentStateConfig,
+        comm_group: JointGroups | None = None,
+    ):
         self._device = device
         self.config = config
+        self._comm_group = comm_group
 
         # One [num_layers, max_slots, *shape] tensor per block. Layer-major so
         # `blocks[name][layer]` is contiguous: FlashInfer's pool paths assert
-        # the slot-major view is K-contiguous (stride(-1) == 1).
+        # the slot-major view is K-contiguous (stride(-1) == 1). A block that
+        # is not per layer is [max_slots, *shape].
         self._blocks: dict[str, torch.Tensor] = {
             name: torch.zeros(
-                (config.num_layers, config.max_slots, *block.shape),
+                (*((config.num_layers,) if block.per_layer else ()),
+                 config.max_slots, *block.shape),
                 dtype=block.dtype,
                 device=device,
             )
@@ -96,6 +105,11 @@ class RecurrentStatePool(Resource):
             assert sink == SINK_SLOT, f"expected slot {SINK_SLOT} first, got {sink}"
         # guards `_slots`/`_free` across threads; see `KVManager._lock`
         self._lock = threading.RLock()
+        # (rid, label, slot) the live reservation freshly took, oldest first,
+        # for `rollback_admit`; see `KVManager._admit_reserved_pages`
+        self._admit_reserved: list[tuple[str, str, SlotState]] = []
+        # the part of it the pre-plan pass took: all `clear_preplan` gives back
+        self._preplan_reserved: list[tuple[str, str, SlotState]] = []
 
         self._cg_max_bs = 0
         self._cg_addressing: dict[CGSlotKey, RecurrentAddressing] = {}
@@ -125,9 +139,22 @@ class RecurrentStatePool(Resource):
 
     # Storage access
 
-    def block(self, name: str, layer_idx: int) -> torch.Tensor:
-        """One layer's contiguous slot-major view of a block: ``[max_slots, *shape]``."""
-        return self._blocks[name][layer_idx]
+    def block(self, name: str, layer_idx: int | None = None) -> torch.Tensor:
+        """One layer's contiguous slot-major view of a block: ``[max_slots, *shape]``.
+        A block that is not per layer takes no ``layer_idx``."""
+        per_layer = self.config.blocks[name].per_layer
+        if per_layer == (layer_idx is None):
+            raise ValueError(
+                f"recurrent block {name!r} is "
+                f"{'per layer' if per_layer else 'per slot'}; got layer_idx={layer_idx}"
+            )
+        tensor = self._blocks[name]
+        return tensor[layer_idx] if per_layer else tensor
+
+    def _slot_views(self, index: int):
+        """Every block's rows of slot ``index``, all layers."""
+        for name, tensor in self._blocks.items():
+            yield tensor[:, index] if self.config.blocks[name].per_layer else tensor[index]
 
     @property
     def num_free_slots(self) -> int:
@@ -173,8 +200,8 @@ class RecurrentStatePool(Resource):
                     slot.has_state = False
 
     def _zero_slot(self, index: int) -> None:
-        for tensor in self._blocks.values():
-            tensor[:, index].zero_()
+        for rows in self._slot_views(index):
+            rows.zero_()
 
     def _alloc(self, rid: str, label: str) -> SlotState | None:
         with self._lock:
@@ -188,6 +215,7 @@ class RecurrentStatePool(Resource):
             # than check, and a scatter with two rows on one slot is
             # nondeterministic. The free list guarantees it.
             slot = labels[label] = SlotState(index=self._free.pop())
+            self._admit_reserved.append((rid, label, slot))
             return slot
 
     # Step lifecycle
@@ -201,6 +229,13 @@ class RecurrentStatePool(Resource):
         """
         if ctx.capture:
             return ADMIT_OK
+        with self._lock:
+            # A pre-planned step was reserved on its pre-plan pass, and a
+            # refusal after this no-op must still find that reservation.
+            if not (self._preplanned and not ctx.is_preplan):
+                self._admit_reserved.clear()
+            if ctx.is_preplan:
+                self._preplan_reserved = []
         for segment in step.segments or ():
             if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                 # reads its state without extending it, or a padding row
@@ -214,7 +249,34 @@ class RecurrentStatePool(Resource):
             for _, to_label in (*step.pre_forks, *step.post_forks):
                 if self._alloc(rid, to_label) is None:
                     return self._out_of_slots(rid, to_label)
+        if ctx.is_preplan:
+            with self._lock:
+                self._preplan_reserved = list(self._admit_reserved)
         return ADMIT_OK
+
+    def rollback_admit(self, step: RecurrentStep, ctx: StepContext) -> None:
+        """Give back the slots this admit freshly took.
+
+        Only those: a slot the request already held carries its state. Newest
+        first, so the free list is back in its old order and every rank of a
+        TP group hands out the same slots next.
+        """
+        del step, ctx
+        with self._lock:
+            reserved, self._admit_reserved = self._admit_reserved, []
+            self._preplan_reserved = []
+            self._release(reserved)
+
+    def _release(self, reserved: list[tuple[str, str, SlotState]]) -> None:
+        """Free the slots of ``reserved`` still held as taken, newest first and
+        zeroed: a step can raise after its forward wrote them. Caller holds the lock."""
+        for rid, label, slot in reversed(reserved):
+            labels = self._slots.get(rid)
+            if labels is None or labels.get(label) is not slot:
+                continue  # reset or removed under us; its slot went with it
+            del labels[label]
+            self._zero_slot(slot.index)
+            self._free.append(slot.index)
 
     def _out_of_slots(self, rid: str, label: str) -> AdmitOutcome:
         return AdmitOutcome(
@@ -273,7 +335,8 @@ class RecurrentStatePool(Resource):
             # `_pending_fork_state`.
             self._current = self._cached_plan_output
             self._maybe_apply_forks(step, ctx)
-            self.clear_preplan()
+            self._drop_stage()
+            self._preplan_reserved = []  # the live step's now: commit or roll back
             return self._current
 
         # Forks run ahead of the addressing, which records `has_state`; staging
@@ -295,7 +358,19 @@ class RecurrentStatePool(Resource):
         return self._current
 
     def clear_preplan(self):
-        """Drop the staged plan; staging touched no live state, so nothing to rewind."""
+        """Drop the staged plan and give back the slots its pre-plan pass took.
+
+        Staging builds addressing only (forks apply at promotion); a live step's
+        reservation is the runner's to commit or roll back.
+        """
+        self._drop_stage()
+        with self._lock:
+            staged, self._preplan_reserved = self._preplan_reserved, []
+            ids = {id(slot) for _, _, slot in staged}
+            self._admit_reserved = [r for r in self._admit_reserved if id(r[2]) not in ids]
+            self._release(staged)
+
+    def _drop_stage(self) -> None:
         self._preplanned = False
         self._cached_plan_output = None
 
@@ -303,6 +378,9 @@ class RecurrentStatePool(Resource):
         if ctx.capture:
             return
         with self._lock:
+            # committed, so there is nothing left to unwind
+            self._admit_reserved.clear()
+            self._preplan_reserved = []
             for segment in step.segments or ():
                 if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                     continue
@@ -335,8 +413,10 @@ class RecurrentStatePool(Resource):
                 f"fork target {rid}/{to_label} was never reserved; admit "
                 "should have allocated it"
             )
-            for tensor in self._blocks.values():
-                tensor[:, dst.index].copy_(tensor[:, src.index])
+            for to, from_ in zip(
+                self._slot_views(dst.index), self._slot_views(src.index), strict=True,
+            ):
+                to.copy_(from_)
             dst.has_state = src.has_state
             dst.generation += 1
 
@@ -447,6 +527,26 @@ class RecurrentStatePool(Resource):
         # per-key buffers are built on first plan; every runner calls in, so
         # keep the largest
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
+
+    def post_warmup_validate(self):
+        """Every rank of the group must hold the same free slots after warmup.
+
+        Each rank admits from its own pool, so identical free lists are what
+        make their verdicts agree; see ``KVManager.post_warmup_validate``.
+        """
+        if self._comm_group is None or self._comm_group.world_size == 1:
+            return
+        local = torch.tensor(
+            [self.num_free_slots], dtype=torch.int64, device=self._device,
+        )
+        for group in (self._comm_group.tp_group, self._comm_group.sp_group):
+            values = group.all_gather(local, dim=0).cpu().tolist()
+            if any(v != values[0] for v in values):
+                raise RuntimeError(
+                    f"recurrent state pool has asymmetric free slots across "
+                    f"ranks: {values}. Check the YAML for a per-rank max_slots, "
+                    "and any code that admits before warmup completes."
+                )
 
     def cleanup(self):
         self._blocks.clear()

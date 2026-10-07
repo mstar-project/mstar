@@ -25,11 +25,15 @@ class RecurrentBlockConfig:
 
     ``shape`` is opaque to the pool. ``shard_dims`` names the axes divided
     across ranks.
+
+    ``per_layer=False`` holds one tensor per slot for the whole layer stack,
+    for what a request carries once rather than per layer (a count, a seed).
     """
 
     shape: tuple[int, ...]
     dtype: torch.dtype
     shard_dims: tuple[int, ...] = ()
+    per_layer: bool = True
 
     def __post_init__(self):
         self.shape = tuple(self.shape)
@@ -93,9 +97,19 @@ class DeltaNetGeometry(RecurrentGeometry):
         self,
         state_dtype: torch.dtype = torch.float32,
         conv_dtype: torch.dtype = torch.bfloat16,
+        speculative_tokens: int = 0,
     ) -> dict[str, RecurrentBlockConfig]:
-        """Pool blocks for this geometry; head counts are pre-sharding."""
-        return {
+        """Pool blocks for this geometry; head counts are pre-sharding.
+
+        With ``speculative_tokens = k > 0`` the pool also keeps what a verify
+        step of ``k + 1`` tokens leaves for the next one, which learns how many
+        were accepted: the block's pre-conv inputs, raw forget gates and raw
+        betas, and the conv window before it, each on two sides (a step reads
+        one and writes the other); per slot, the accepted count (0 after a
+        prefill) and the side holding them. ``state`` then holds the state
+        before those accepted tokens.
+        """
+        blocks = {
             "state": RecurrentBlockConfig(
                 shape=(self.num_v_heads, self.head_v_dim, self.head_k_dim),
                 dtype=state_dtype,
@@ -107,6 +121,33 @@ class DeltaNetGeometry(RecurrentGeometry):
                 shard_dims=(0,),
             ),
         }
+        if speculative_tokens > 0:
+            k1 = speculative_tokens + 1
+            blocks["spec_prefix"] = RecurrentBlockConfig(
+                shape=(2, k1, self.conv_dim), dtype=conv_dtype, shard_dims=(2,),
+            )
+            blocks["spec_g"] = RecurrentBlockConfig(
+                shape=(2, k1, self.num_v_heads, self.head_k_dim), dtype=conv_dtype,
+                shard_dims=(2,),
+            )
+            blocks["spec_beta"] = RecurrentBlockConfig(
+                shape=(2, k1, self.num_v_heads), dtype=conv_dtype, shard_dims=(2,),
+            )
+            blocks["spec_conv"] = RecurrentBlockConfig(
+                shape=(2, self.conv_dim, self.conv_kernel_size - 1), dtype=conv_dtype,
+                shard_dims=(1,),
+            )
+            for name in ("spec_len", "spec_side"):
+                blocks[name] = RecurrentBlockConfig(
+                    shape=(1,), dtype=torch.int32, per_layer=False,
+                )
+        return blocks
+
+    @staticmethod
+    def speculative_tokens_of(blocks: dict[str, RecurrentBlockConfig]) -> int:
+        """The ``k`` of ``to_blocks(speculative_tokens=k)``, 0 without."""
+        prefix = blocks.get("spec_prefix")
+        return 0 if prefix is None else prefix.shape[1] - 1
 
     @classmethod
     def from_blocks(
@@ -241,7 +282,8 @@ class RecurrentStateConfig:
     # The total number of recurrent layers, not total transformer layers
     num_layers: int
     # Named blocks, e.g. what `DeltaNetGeometry.to_blocks` returns; the pool
-    # allocates one tensor per block and hands back per-layer views.
+    # allocates one tensor per block and hands back per-layer views (the whole
+    # tensor for a block that is not per layer).
     blocks: dict[str, RecurrentBlockConfig] = field(default_factory=dict)
 
     # Slots in the pool, including the sink if any. A request holds one per
@@ -278,7 +320,10 @@ class RecurrentStateConfig:
 
     @property
     def slot_bytes(self) -> int:
-        return self.num_layers * sum(b.nbytes for b in self.blocks.values())
+        return sum(
+            b.nbytes * (self.num_layers if b.per_layer else 1)
+            for b in self.blocks.values()
+        )
 
     @property
     def total_bytes(self) -> int:
