@@ -755,12 +755,15 @@ class Engine:
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
     ) -> None:
         """Key what this step generated, from the stop check's host copy."""
+        keys = self._runner.prefix_chain_keys(batch.node_name)
+        if not keys:
+            return
         walk = batch.step_context.graph_walk
         for rid in batch.request_ids:
             per_rid = outputs.get(rid)
             if isinstance(per_rid, dict):
                 self._runner.extend_prefix_chains(
-                    rid, batch.node_name, walk, per_rid,
+                    rid, batch.node_name, walk, per_rid, keys=keys,
                 )
 
     def _skip_cached_prefix(
