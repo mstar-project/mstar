@@ -427,6 +427,13 @@ class RouteInput(NamedTuple):
     # rid i's signal s. The runtime looks the metadata up in the store.
     tensors: list[int]
     num_tensors: list[int]
+    # One output signal whose per-rid value is a host scalar the worker
+    # already has (the sampled token): its EMIT_TO_CLIENT edge then rides
+    # inline in one frame per step instead of as a tensor per request. The
+    # values are in wg_ids.keys() order; empty means none. A runtime without
+    # `supports_inline_emit` ignores both.
+    inline_signal: str | None = None
+    inline_values: tuple[int, ...] | list[int] = ()
 
 
 class RouteOutput(NamedTuple):
@@ -491,6 +498,11 @@ class GraphRuntime(ABC):
     only what cannot live behind it -- forward-pass info (a wire object it
     forwards opaquely) and stream buffers (which hold tensors).
     """
+
+    # Whether `RouteInput.inline_signal` is honoured: an emit edge sent as one
+    # RESULT_TOKENS frame per step. A runtime that does not keeps the
+    # per-request tensor path, which stays correct.
+    supports_inline_emit: bool = False
 
     # --------- Bookkeeping ----------
     @abstractmethod
