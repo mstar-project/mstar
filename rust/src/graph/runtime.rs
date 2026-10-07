@@ -1076,6 +1076,8 @@ pub struct SendPlan {
     #[pyo3(get)] pub persist: Vec<(u32, String, Vec<u64>)>,
     /// (rid, signal, modality, tensors) -- sliced, as to_workers is.
     pub emit: Vec<(u32, String, String, Vec<TensorRef>)>,
+    /// (rid, signal, modality, value): emitted inline, one frame per step.
+    pub emit_inline: Vec<(u32, String, String, i64)>,
     /// (rid, finished worker graph ids, is_first_tp_rank)
     #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool)>,
     /// The pre-completion loop context, snapshotted at route time.
@@ -1100,6 +1102,12 @@ pub struct RouteArg {
     #[pyo3(item)] rids: Vec<u32>,
     #[pyo3(item)] tensors: Vec<u64>,
     #[pyo3(item)] num_tensors: Vec<usize>,
+    /// One output signal whose per-request value is a scalar the worker
+    /// already holds on the host (a sampled token). Its EMIT_TO_CLIENT edge
+    /// then rides inline in one frame per step instead of as a tensor per
+    /// request; `inline_values` are in `rids` order, or empty for none.
+    #[pyo3(item)] inline_signal: Option<String>,
+    #[pyo3(item)] inline_values: Vec<i64>,
 }
 
 /// `RouteOutput`.
@@ -1171,6 +1179,9 @@ pub struct Completion {
     /// have to ask for it per rid, convert it to strings on the way out, and
     /// hand it back to be re-interned.
     pub nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
+    /// Per rid: (signal, modality, value) of the emit edge that rides inline
+    /// instead of as a tensor. Empty unless the route carried inline values.
+    pub emit_inline: FxHashMap<u32, (Sym, Sym, i64)>,
 }
 
 /// `SpeculationPrepInput`.
@@ -2197,6 +2208,16 @@ impl GraphRuntime {
         let mut nested_snapshot: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)> =
             FxHashMap::default();
         let mut cursor = 0usize;
+        // The emit edge of this signal carries its value inline: no staging,
+        // no per-request frame, no reference for the api server to release.
+        // A persisted signal keeps the tensor: the conductor reads it.
+        let inline_sym: Option<Sym> = input
+            .inline_signal
+            .as_deref()
+            .and_then(|s| self.interner.get(s));
+        let inline_on = inline_sym.is_some()
+            && input.inline_values.len() == input.rids.len();
+        let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
 
         for (i, &rid) in input.rids.iter().enumerate() {
             // Slice this rid's uuids back out of the flat, rid-major layout.
@@ -2546,9 +2567,19 @@ impl GraphRuntime {
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
+                let inline_edge = inline_on
+                    && matches!(e.dest, Dest::EmitToClient)
+                    && Some(e.name) == inline_sym
+                    && !e.persist;
+                if inline_edge {
+                    emit_inline.insert(
+                        rid, (e.name, e.modality, input.inline_values[i]),
+                    );
+                }
                 let remote = (e.persist && has_remote)
                     || e.declined_local
                     || (!is_local
+                        && !inline_edge
                         && matches!(e.dest, Dest::External(_) | Dest::EmitToClient));
                 if remote {
                     for t in &e.tensors {
@@ -2603,7 +2634,11 @@ impl GraphRuntime {
                         // then nothing counted it and it goes on the wire.
                         Dest::Local(_) if e.declined_local => 1,
                         Dest::Local(_) | Dest::Empty => 0,
-                        Dest::EmitToClient => 1,
+                        // An inline emit holds no reference: nothing reads
+                        // the tensor on the api server's behalf.
+                        Dest::EmitToClient => i64::from(
+                            !(inline_on && Some(e.name) == inline_sym && !e.persist),
+                        ),
                         // One reference per destination WORKER, minus this
                         // one when the edge was already ingested into a local
                         // graph -- that copy is in local_counts. Python does
@@ -2713,6 +2748,7 @@ impl GraphRuntime {
                 first_tp_rank,
                 speculative,
                 nested: nested_snapshot,
+                emit_inline,
             },
         );
         Ok(out)
@@ -3007,6 +3043,49 @@ impl GraphRuntime {
                 self.dispatch("api_server", &bytes)?;
             }
 
+            // Inline emits: one RESULT_TOKENS frame per (signal, modality)
+            // per step, with the same per-request bookkeeping as a tensor
+            // emit so the completion report names the signal and its loop
+            // context. Usually one group.
+            if !plan.emit_inline.is_empty() {
+                let mut groups: Vec<((String, String), Vec<(u32, i64)>)> = Vec::new();
+                for (rid, signal, modality, value) in plan.emit_inline {
+                    let key = (signal, modality);
+                    match groups.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, items)) => items.push((rid, value)),
+                        None => groups.push((key, vec![(rid, value)])),
+                    }
+                }
+                for ((signal, modality), items) in groups {
+                    let sig = self.interner.intern(&signal);
+                    let mut request_ids: Vec<String> = Vec::with_capacity(items.len());
+                    let mut values: Vec<i64> = Vec::with_capacity(items.len());
+                    let mut loop_indices = Vec::with_capacity(items.len());
+                    for (rid, value) in items {
+                        let request_id = self.rid_name(rid)?;
+                        let idx = nested.get(&rid).cloned();
+                        if let Some(info) = self.requests[rid as usize].as_mut() {
+                            info.pending.output_signals.push(sig);
+                            if let Some(i) = idx.clone() {
+                                info.pending.set_loop_indices(sig, i);
+                            }
+                        }
+                        request_ids.push(request_id);
+                        values.push(value);
+                        loop_indices.push(idx);
+                    }
+                    let bytes = frames::ResultTokens {
+                        request_ids: &request_ids,
+                        values: &values,
+                        loop_indices: &loop_indices,
+                        signal: &signal,
+                        modality: &modality,
+                    }
+                    .encode(&self.interner);
+                    self.dispatch("api_server", &bytes)?;
+                }
+            }
+
             for (rid, signal, uuids) in plan.persist {
                 let sig = self.interner.intern(&signal);
                 if let Some(info) = self.requests[rid as usize].as_mut() {
@@ -3065,9 +3144,10 @@ impl GraphRuntime {
     /// itself are in `frames.rs` (INPUT_SIGNALS, WORKER_GRAPHS_DONE,
     /// STOP_LOOPS).
     fn take_send_plan(&mut self, completion_id: u64) -> PyResult<SendPlan> {
-        let c = self.completions.remove(&completion_id).ok_or_else(|| {
+        let mut c = self.completions.remove(&completion_id).ok_or_else(|| {
             PyValueError::new_err(format!("unknown completion {completion_id}"))
         })?;
+        let emit_inline = std::mem::take(&mut c.emit_inline);
         let g = self.graphs[c.wg as usize].clone();
         let mut plan = SendPlan {
             partition: c.partition.clone(),
@@ -3113,12 +3193,22 @@ impl GraphRuntime {
             for e in edges {
                 let name = self.interner.name(e.name).to_string();
                 match e.dest {
-                    Dest::EmitToClient => plan.emit.push((
-                        rid,
-                        name.clone(),
-                        self.interner.name(e.modality).to_string(),
-                        e.tensors.clone(),
-                    )),
+                    Dest::EmitToClient => match emit_inline.get(&rid) {
+                        Some(&(sig, modality, value)) if sig == e.name => {
+                            plan.emit_inline.push((
+                                rid,
+                                name.clone(),
+                                self.interner.name(modality).to_string(),
+                                value,
+                            ));
+                        }
+                        _ => plan.emit.push((
+                            rid,
+                            name.clone(),
+                            self.interner.name(e.modality).to_string(),
+                            e.tensors.clone(),
+                        )),
+                    },
                     Dest::External(dest) => {
                         // `Sym::MAX` is the fanout's marker for a destination
                         // with no sharding group, i.e. one no worker runs.
