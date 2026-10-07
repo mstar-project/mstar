@@ -94,7 +94,9 @@ async def _stream(api, model_name, request_id, sample_rate):
     def error(message: str, status: int) -> str:
         return sse({"error": {"message": message, "type": error_type(status), "code": status}})
 
-    yield chunk({"role": "assistant"})
+    # The role rides on the first delta: clients time the first token from the
+    # first chunk, so nothing may go out before the model has produced one.
+    role = {"role": "assistant"}
     failed = False
     try:
         # One yield per batch of text chunks: the tokens a request had waiting
@@ -105,16 +107,20 @@ async def _stream(api, model_name, request_id, sample_rate):
             text_events: list[str] = []
             for c in batch:
                 if c.modality == "text":
-                    text_events.append(chunk({"content": c.data.decode("utf-8", "replace")}))
+                    text_events.append(chunk({**role, "content": c.data.decode("utf-8", "replace")}))
+                    role = {}
                     continue
                 if text_events:
                     yield "".join(text_events)
                     text_events = []
                 if c.modality == "audio":
                     # Streaming audio deltas are base64 16-bit PCM at the model rate.
-                    yield chunk({"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}})
+                    audio = {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}
+                    yield chunk({**role, "audio": audio})
+                    role = {}
                 elif c.modality == "image":
-                    yield chunk({"content": media_io.png_to_data_url(c.data)})
+                    yield chunk({**role, "content": media_io.png_to_data_url(c.data)})
+                    role = {}
                 elif c.modality == "error":
                     # The request failed after the stream opened (an engine error
                     # mid generation, a preprocess error); the HTTP status is
@@ -134,5 +140,5 @@ async def _stream(api, model_name, request_id, sample_rate):
         failed = True
         yield error(str(exc.detail), exc.status_code)
     if not failed:
-        yield chunk({}, finish="stop")
+        yield chunk(role, finish="stop")
     yield SSE_DONE
