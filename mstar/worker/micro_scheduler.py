@@ -2,7 +2,7 @@ import functools
 import logging
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, NamedTuple
@@ -214,6 +214,14 @@ class PopReadyResult(NamedTuple):
     request_walks: dict[int, str] = {}
     walk_output_signals: dict[str, list[str]] = {}
 
+
+
+def _pre_existing_tokens(seq_lens: Collection[int], n: int) -> int:
+    """The tokens a speculation merge's own ``n`` rows will run, from their
+    previous step's lengths: their inputs do not exist yet."""
+    # A row with no length (-1: transitioning in from another node) guesses one token, a decode row.
+    # TODO: a model override (walk, fwd_info, prev_node, prev_tokens) once a use case needs it.
+    return sum(s if s >= 0 else 1 for s in seq_lens) + n - len(seq_lens)
 
 class MicroScheduler:
     """
@@ -513,6 +521,7 @@ class MicroScheduler:
         # are being speculated to be included in the batch size cap
         pre_existing_batch_size: int=0,
         capture_group_of: int | None = None,
+        pre_existing_seq_lens: Collection[int] = (),
     ) -> ScheduledBatch | None:
         """
         One step's worth: a pending TP follow batch if there is one, else
@@ -574,6 +583,7 @@ class MicroScheduler:
                 pre_existing_batch_size=pre_existing_batch_size,
                 capture_group_of=capture_group_of,
                 pre_existing_walk=pre_existing_walk,
+                pre_existing_seq_lens=pre_existing_seq_lens,
             )
 
         # A backlogged key goes first, oldest first, so a split set drains
@@ -663,6 +673,7 @@ class MicroScheduler:
         pre_existing_batch_size: int,
         capture_group_of: int | None,
         pre_existing_walk: str | None = None,
+        pre_existing_seq_lens: Collection[int] = (),
     ) -> ScheduledBatch | None:
         """One step for ``node_walk`` out of its backlog and its ready
         ``entries``, composed by the batch builder."""
@@ -674,7 +685,7 @@ class MicroScheduler:
             return None
         max_tokens = self.engine_manager.get_engine(node_walk[0]).get_max_batch_tokens(*node_walk)
         if max_tokens is not None:
-            max_tokens -= pre_existing_batch_size  # the caller's rows, one token each
+            max_tokens -= _pre_existing_tokens(pre_existing_seq_lens, pre_existing_batch_size)
         row_tokens: dict[int, int] = {}
         chunkable: set[int] = set()
         backlogged = self.backlog.pop(node_walk, None)

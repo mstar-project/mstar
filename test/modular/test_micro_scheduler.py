@@ -1333,3 +1333,19 @@ def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
 
     sched.advance_chunk("p0", NODE, 10)
     assert ("p0", NODE) not in sched.chunk_progress, "the last chunk ends the progress"
+
+
+@pytest.mark.parametrize("seq_lens,chunk", [
+    ([3], (0, 1)),   # the continuing row ran 3 tokens last step: 1 of the 4 is left
+    ([-1], (0, 3)),  # unknown: guessed at one token
+])
+def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+
+    merged = _next_batch(
+        sched, _Manager(["p0"], walks={"p0": "prefill"}), target=(NODE, WALK),
+        pre_existing_batch_size=1, pre_existing_seq_lens=seq_lens,
+    )
+
+    assert merged.chunk_ranges == {"p0": chunk}
