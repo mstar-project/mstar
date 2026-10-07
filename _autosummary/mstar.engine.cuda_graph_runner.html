@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 06, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 07, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -1070,7 +1070,9 @@ forward — see <code class="docutils literal notranslate"><span class="pre">Eng
 <dd><p>Tightest captured bucket that fits this batch, or None for eager.</p>
 <p>A walk may have several captures (e.g. one per image resolution, each a
 fixed shape with its own token count), so every matching bucket is
-considered rather than the first config declared.</p>
+considered rather than the first config declared. <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> counts
+the batch’s input tokens; a bucket is keyed by the tokens its plan
+carries, so the request is scaled by that config’s multiplier.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1872,7 +1874,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 06, 2026.
+  Last updated on Oct 07, 2026.
   <br/>
 </p>
   </div>

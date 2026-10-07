@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 06, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 07, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -948,6 +948,12 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">capture_batch_sizes</span> <span class="o">=</span> <span class="n">capture_batch_sizes</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">capture_forward_method</span> <span class="o">=</span> <span class="n">capture_forward_method</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">caps_eager_batch_size</span> <span class="o">=</span> <span class="n">caps_eager_batch_size</span>
+        <span class="c1"># How many plan tokens one input token turns into (a step that commits</span>
+        <span class="c1"># KV under several labels combined into one plan, e.g. classifier-free</span>
+        <span class="c1"># guidance packing cond + uncond, has 2). Buckets are keyed by plan</span>
+        <span class="c1"># tokens; the engine asks for a bucket in input tokens and the runner</span>
+        <span class="c1"># scales by this. Subclasses that support it set it.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="o">=</span> <span class="mi">1</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">input_seq_dims</span> <span class="o">=</span> <span class="n">input_seq_dims</span>
 
 <div class="viewcode-block" id="CudaGraphConfig.get_config_type">
@@ -1060,6 +1066,11 @@ window.runMermaid = runMermaid;</script>
         <span class="n">capture_batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">capture_forward_method</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"forward_batched"</span><span class="p">,</span>
         <span class="n">caps_eager_batch_size</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="c1"># ``capture_token_lengths`` count input tokens; a step whose plan</span>
+        <span class="c1"># carries every input token under several combined labels (batched</span>
+        <span class="c1"># guidance: cond + uncond in one plan) multiplies them by this, so</span>
+        <span class="c1"># the resources size their per-bucket buffers for the whole plan.</span>
+        <span class="n">total_tokens_multiplier</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
         <span class="n">input_seq_dims</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
@@ -1072,8 +1083,11 @@ window.runMermaid = runMermaid;</script>
             <span class="n">caps_eager_batch_size</span><span class="o">=</span><span class="n">caps_eager_batch_size</span><span class="p">,</span>
             <span class="n">input_seq_dims</span><span class="o">=</span><span class="n">input_seq_dims</span><span class="p">,</span>
         <span class="p">)</span>
+        <span class="k">if</span> <span class="n">total_tokens_multiplier</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"total_tokens_multiplier must be at least 1"</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">make_node_input</span> <span class="o">=</span> <span class="n">make_node_input</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">capture_token_lengths</span> <span class="o">=</span> <span class="n">capture_token_lengths</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="o">=</span> <span class="n">total_tokens_multiplier</span>
 
 <div class="viewcode-block" id="PackedCudaGraphConfig.get_config_type">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_config_type">[docs]</a>
@@ -1084,13 +1098,14 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="PackedCudaGraphConfig.get_total_tokens">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_total_tokens">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_total_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">capture_token_lengths</span></div>
+        <span class="k">return</span> <span class="p">[</span><span class="n">n</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">capture_token_lengths</span><span class="p">]</span></div>
 
 
 <div class="viewcode-block" id="PackedCudaGraphConfig.get_node_inputs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PackedCudaGraphConfig.get_node_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_node_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
-        <span class="n">seq_lens</span> <span class="o">=</span> <span class="n">distribute_tokens</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">bs</span><span class="p">)</span>
+        <span class="c1"># ``num_tokens`` is the bucket's plan tokens; the rows get input tokens</span>
+        <span class="n">seq_lens</span> <span class="o">=</span> <span class="n">distribute_tokens</span><span class="p">(</span><span class="n">num_tokens</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span><span class="p">,</span> <span class="n">bs</span><span class="p">)</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">make_node_input</span><span class="p">(</span><span class="n">n</span><span class="p">)</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">seq_lens</span>
         <span class="p">]</span></div>
@@ -1343,7 +1358,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 06, 2026.
+  Last updated on Oct 07, 2026.
   <br/>
 </p>
   </div>

@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 06, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 07, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1701,13 +1701,16 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        A walk may have several captures (e.g. one per image resolution, each a</span>
 <span class="sd">        fixed shape with its own token count), so every matching bucket is</span>
-<span class="sd">        considered rather than the first config declared.</span>
+<span class="sd">        considered rather than the first config declared. ``num_tokens`` counts</span>
+<span class="sd">        the batch's input tokens; a bucket is keyed by the tokens its plan</span>
+<span class="sd">        carries, so the request is scaled by that config's multiplier.</span>
 <span class="sd">        """</span>
         <span class="n">best</span><span class="p">:</span> <span class="n">BucketKey</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">bucket</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">if</span> <span class="n">key</span><span class="o">.</span><span class="n">graph_walk</span> <span class="o">!=</span> <span class="n">graph_walk</span> <span class="ow">or</span> <span class="n">key</span><span class="o">.</span><span class="n">cg_key_info</span> <span class="o">!=</span> <span class="n">cg_key_info</span><span class="p">:</span>
                 <span class="k">continue</span>
-            <span class="k">if</span> <span class="n">key</span><span class="o">.</span><span class="n">bs</span> <span class="o">&lt;</span> <span class="n">bs</span> <span class="ow">or</span> <span class="n">key</span><span class="o">.</span><span class="n">num_tokens</span> <span class="o">&lt;</span> <span class="n">num_tokens</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">bucket</span><span class="o">.</span><span class="n">slots</span><span class="p">:</span>
+            <span class="n">needed</span> <span class="o">=</span> <span class="n">num_tokens</span> <span class="o">*</span> <span class="n">bucket</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">total_tokens_multiplier</span>
+            <span class="k">if</span> <span class="n">key</span><span class="o">.</span><span class="n">bs</span> <span class="o">&lt;</span> <span class="n">bs</span> <span class="ow">or</span> <span class="n">key</span><span class="o">.</span><span class="n">num_tokens</span> <span class="o">&lt;</span> <span class="n">needed</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">bucket</span><span class="o">.</span><span class="n">slots</span><span class="p">:</span>
                 <span class="k">continue</span>
             <span class="k">if</span> <span class="n">best</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="p">(</span><span class="n">key</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">key</span><span class="o">.</span><span class="n">bs</span><span class="p">)</span> <span class="o">&lt;</span> <span class="p">(</span><span class="n">best</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">best</span><span class="o">.</span><span class="n">bs</span><span class="p">):</span>
                 <span class="n">best</span> <span class="o">=</span> <span class="n">key</span>
@@ -2599,7 +2602,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 06, 2026.
+  Last updated on Oct 07, 2026.
   <br/>
 </p>
   </div>
