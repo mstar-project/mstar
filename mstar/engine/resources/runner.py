@@ -470,6 +470,56 @@ class StepRunner:
             out[rid] = per_key
         return out
 
+    def publish_snapshot(
+        self,
+        request_ids: list[str],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """``publish``, deferred: per rid the snapshot each publisher took.
+
+        Finished by ``publish_from_snapshots`` for the rids that need it. A rid
+        with nothing to publish has no entry."""
+        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        if not order:
+            return {}
+        publishers = [(key, self._resources[key]) for key in order]
+        out: dict[str, dict[str, Any]] = {}
+        for rid in request_ids:
+            per_key: dict[str, Any] = {}
+            for key, resource in publishers:
+                snap = resource.publish_snapshot_for_step(
+                    rid, node_name=node_name, graph_walk=graph_walk,
+                )
+                if snap is not None:
+                    per_key[key] = snap
+            if per_key:
+                out[rid] = per_key
+        return out
+
+    def publish_from_snapshots(
+        self,
+        snapshots: dict[str, dict[str, Any]],
+        request_ids: list[str],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+    ) -> dict[str, dict[str, PublishedInfo]]:
+        """The published info of ``request_ids`` from their snapshots."""
+        out: dict[str, dict[str, PublishedInfo]] = {}
+        for rid in request_ids:
+            snaps = snapshots.get(rid)
+            if not snaps:
+                continue
+            per_key: dict[str, PublishedInfo] = {}
+            for key, snap in snaps.items():
+                info = self._resources[key].publish_from_snapshot(
+                    rid, snap, node_name=node_name, graph_walk=graph_walk,
+                )
+                if info is not None:
+                    per_key[key] = info
+            out[rid] = per_key
+        return out
+
     def publish_after_stop(
         self,
         request_ids: list[str],
