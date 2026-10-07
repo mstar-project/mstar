@@ -243,6 +243,12 @@ class EngineManager:
             kv_cache_type=autocast_dtype,
             model=model,
         )
+        budgets = model_config.get("max_batch_tokens") or {}
+        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
+        unknown = sorted(set(budgets) - known)
+        if unknown:
+            raise ValueError(f"max_batch_tokens names nodes {unknown} that no node group serves")
+        engine.set_token_budgets(budgets, set(model.get_graph_walk_graphs()))
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
         return cls(engine=engine, node_names=set(node_names))

@@ -234,6 +234,22 @@ frees only the device pages no other running request reads, though, so a request
 shares most of its prompt frees little. Offload helps a pool that runs short now and then.
 It doesn't replace the cap.
 
+**Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
+budget per step, and a longer prompt is split across steps. Each model sets its own
+budgets. A deployment can override them per node, either with one budget for every walk
+the model budgets or with a budget per walk:
+
+.. code-block:: yaml
+
+   max_batch_tokens:
+     LLM: 512                    # every budgeted walk of LLM
+     Thinker:
+       prefill_text: 1024
+       prefill_vision: null      # null turns chunking off for this walk
+
+Loading fails if a node is not in any node group, if a walk is one the model never runs, or
+if the model sets no budget for that walk.
+
 **Single GPU.** Everything on rank 0:
 
 .. code-block:: yaml

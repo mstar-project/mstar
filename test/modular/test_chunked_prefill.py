@@ -270,6 +270,7 @@ def test_a_step_over_its_token_budget_is_reported(caplog):
 
     engine = Engine.__new__(Engine)
     engine._token_budget_overruns = {}
+    engine._token_budget_overrides = {}
     submodule = SimpleNamespace(max_batch_tokens=lambda walk: 4)
     batch = SimpleNamespace(node_name="LLM", step_context=SimpleNamespace(graph_walk="mixed"))
     over = [SimpleNamespace(input_seq_len=3), SimpleNamespace(input_seq_len=2)]
@@ -303,3 +304,46 @@ def test_final_keeps_only_the_last_chunk_and_holds_nothing_before():
     out = acc.release(0, "LLM", {"token": [torch.tensor([9])], "states": [torch.tensor([2.0])]}, final)
     assert out["token"][0].tolist() == [9]
     assert out["states"][0].tolist() == [1.0, 2.0]
+
+
+# ── engine: the serving config's max_batch_tokens ──────────────────────
+
+
+def _budgeted_engine():
+    from types import SimpleNamespace
+
+    from mstar.engine.engine import Engine
+
+    sub = SimpleNamespace(max_batch_tokens=lambda walk: {"prefill": 512, "vision": 2048}.get(walk))
+    engine = Engine.__new__(Engine)
+    engine._submodules = {"LLM": SimpleNamespace(submodule=sub)}
+    engine._token_budget_overrides = {}
+    return engine
+
+
+def test_a_node_budget_overrides_every_budgeted_walk():
+    engine = _budgeted_engine()
+    engine.set_token_budgets({"LLM": 64, "other_worker_node": 8}, {"prefill", "vision", "decode"})
+
+    budgets = [engine.get_max_batch_tokens("LLM", w) for w in ("prefill", "vision", "decode")]
+    assert budgets == [64, 64, None]
+
+
+def test_a_walk_budget_wins_and_null_turns_chunking_off():
+    engine = _budgeted_engine()
+    engine.set_token_budgets({"LLM": {"prefill": None, "vision": 4096}}, {"prefill", "vision"})
+
+    assert engine.get_max_batch_tokens("LLM", "prefill") is None
+    assert engine.get_max_batch_tokens("LLM", "vision") == 4096
+
+
+def test_a_budget_the_model_does_not_set_is_refused():
+    import pytest
+
+    engine = _budgeted_engine()
+    with pytest.raises(ValueError, match="no budget there"):
+        engine.set_token_budgets({"LLM": {"decode": 8}}, {"prefill", "decode"})
+    with pytest.raises(ValueError, match="never runs"):
+        engine.set_token_budgets({"LLM": {"prefil": 8}}, {"prefill"})
+    with pytest.raises(ValueError, match="positive int"):
+        engine.set_token_budgets({"LLM": 0}, {"prefill"})
