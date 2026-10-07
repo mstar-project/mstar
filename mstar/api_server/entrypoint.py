@@ -30,7 +30,7 @@ from mstar.api_server.request_types import APIServerMessage, PreprocessInput, Re
 from mstar.api_server.sessions import SessionError, SessionRegistry, SessionRequest
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.multimodal import PromptPart
-from mstar.model.registry import HF_MODELS
+from mstar.model.registry import model_init_kwargs
 from mstar.model.sessions import apply_sessions_yaml_overrides
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
@@ -128,9 +128,8 @@ def _conductor_process_target(
         )
 
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
         cache_dir=cache_dir,
-        **yaml_model_kwargs,
+        **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
     conductor = Conductor(
         model=model,
@@ -1683,6 +1682,21 @@ async def shutdown_event():
 # CLI entry point
 # ------------------------------------------------------------------
 
+def _set_preprocess_threads(model, config: dict) -> None:
+    """Size torch's intra-op pool for this process's media preprocessing.
+
+    ``config.yaml``'s ``preprocess_torch_threads`` wins, else the model's
+    ``PREPROCESS_TORCH_THREADS``; None keeps torch's default. Affects only this
+    process: the conductor and workers are spawned fresh.
+    """
+    threads = config.get("preprocess_torch_threads", model.PREPROCESS_TORCH_THREADS)
+    if threads is None:
+        return
+    import torch
+
+    torch.set_num_threads(int(threads))
+
+
 def main(argv: list[str] | None = None):
     import argparse
 
@@ -1770,10 +1784,10 @@ def main(argv: list[str] | None = None):
     # (tokenization only — no GPU weights needed)
     from mstar.model.registry import get_model_class
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
         cache_dir=args.cache_dir,
-        **yaml_model_kwargs,
+        **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
+    _set_preprocess_threads(model, config)
 
     global api_server
     log_stats = args.log_stats or args.log_stats_file is not None

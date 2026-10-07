@@ -30,6 +30,30 @@ def test_container_wav_default():
     assert mime == "audio/wav" and out[:4] == b"RIFF" and out[44:] == pcm
 
 
+def test_check_audio_format_defaults_and_refusals():
+    assert media_io.check_audio_format(None) == "wav"
+    assert media_io.check_audio_format("PCM", stream=True) == "pcm"
+    for fmt, kwargs in [("xyz", {}), ("aac", {}), ("mp3", {"stream": True}), ("flac", {"stream": True})]:
+        with pytest.raises(ValueError, match=f"response_format '{fmt}' cannot be"):
+            media_io.check_audio_format(fmt, **kwargs)
+
+
+def test_compressed_containers_encode_for_real():
+    sf = pytest.importorskip("soundfile")
+    import io
+
+    pcm = (np.sin(np.arange(24000) / 10) * 8000).astype("<i2").tobytes()
+    for fmt, mime in [("mp3", "audio/mpeg"), ("flac", "audio/flac"), ("opus", "audio/ogg")]:
+        out, got = media_io.pcm16_to_container(pcm, 24000, fmt)
+        assert got == mime and out[:4] != b"RIFF"
+        audio, rate = sf.read(io.BytesIO(out))
+        assert rate == 24000 and abs(len(audio) - 24000) < 2400  # decodes back to ~1 s
+    # Opus has fixed rates; 44.1 kHz (e.g. Zonos2) is refused, not encoded as WAV
+    with pytest.raises(ValueError, match="'opus' cannot be produced"):
+        media_io.pcm16_to_container(pcm, 44100, "opus")
+    assert media_io.pcm16_to_container(pcm, 44100, "mp3")[1] == "audio/mpeg"
+
+
 def test_data_url_roundtrip(tmp_path):
     raw = b"\x89PNG hello world"
     url = "data:image/png;base64," + base64.b64encode(raw).decode()

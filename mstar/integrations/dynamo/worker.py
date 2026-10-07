@@ -56,7 +56,7 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     # mapping, --help) never loads the model stacks.
     from mstar.api_server.entrypoint import APIServer, _conductor_process_target
     from mstar.communication.communicator import CommProtocol
-    from mstar.model.registry import HF_MODELS, get_model_class
+    from mstar.model.registry import get_model_class, model_init_kwargs
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
@@ -64,9 +64,8 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     yaml_model_kwargs = config.get("model_kwargs", {}) or {}
 
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
         cache_dir=args.cache_dir,
-        **yaml_model_kwargs,
+        **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
 
     server = APIServer(

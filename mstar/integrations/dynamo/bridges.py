@@ -292,7 +292,11 @@ class RequestBridge:
         a raw audio-bytes response with the codec's content type)."""
         started = time.monotonic()
         body = _speech_body(request)
-        fmt = body["response_format"]
+        from mstar.api_server import media_io
+        model = self.server.model
+        sample_rate = model.get_output_sample_rate("audio") if model is not None else 24000
+        # refuse a codec we cannot produce before the request costs GPU time
+        fmt = media_io.check_audio_format(body["response_format"], sample_rate=sample_rate)
         req = SpeechRequest.model_validate(body)
         args = self.adapter.speech_to_request(req, self.server.upload_dir)
 
@@ -311,9 +315,6 @@ class RequestBridge:
             raise RuntimeError("request cancelled")
         if not pcm:
             raise RuntimeError("no audio produced")
-        from mstar.api_server import media_io
-        model = self.server.model
-        sample_rate = model.get_output_sample_rate("audio") if model is not None else 24000
         audio_bytes, _ = media_io.pcm16_to_container(bytes(pcm), sample_rate, fmt)
         return {
             "id": rid,
