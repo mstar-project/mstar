@@ -79,7 +79,11 @@ class LLMSubmodule(ARNodeSubmodule):
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # The ladder runs to 128 because the largest bucket is also the scheduler's
+    # cap on rows per decode step: with 32 as the top, 64 requests in flight
+    # ran as two alternating batches of 32 and each paid the whole per-step
+    # host cost. A step above 32 rows pads to the next bucket.
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]
 
     # Text plus image tokens of a whole prompt. Capped at 4096, not the
     # processor's 16384, because static buffers are sized by the largest
