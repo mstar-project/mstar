@@ -1,5 +1,6 @@
 """GLM-5.3-Flash (glm5_next) architecture + generation config."""
 
+import dataclasses
 import functools
 from dataclasses import dataclass, field
 
@@ -151,8 +152,15 @@ class Glm5NextModelConfig:
     # Engine half of DSA. Off: serving holds every context to index_topk,
     # where dense MLA computes exactly what DSA would (selecting
     # <= topk/kpool pools out of <= topk/kpool is the identity, tail
-    # included).
+    # included). On: contexts up to max_seq_len, every MLA layer through
+    # the k-pool indexer and sparse MLA (dsa.py).
     dsa_long_context: bool = False
+    # dsa_long_context: a prefill step runs its tokens through the model in windows of
+    # this many, so activations stay bounded however long the prompt.
+    prefill_window_tokens: int = 8192
+    # dsa_long_context under TP: each rank selects a block of a long prefill's rows and the
+    # blocks are all-gathered, instead of every rank selecting every row.
+    dsa_shard_prefill: bool = False
 
     # --- MLP / MoE ---
     first_k_dense_replace: int = 3  # layers 0..2 are dense
@@ -334,6 +342,42 @@ class Glm5NextModelConfig:
         if self.mtp_num_draft_tokens > 0 or _flashinfer_before("0.6.18"):
             return 64
         return 0
+
+    @property
+    def context_limit(self) -> int:
+        """Tokens a request may hold: index_topk, where dense MLA is exact, unless
+        dsa_long_context serves up to max_seq_len."""
+        return self.max_seq_len if self.dsa_long_context else self.index_topk
+
+    @property
+    def index_plane_offset(self) -> int:
+        """dsa_long_context: the first index plane of the MLA cache, after the latent planes
+        (the MTP layer's included)."""
+        return len(self.full_attn_layer_indices) + (1 if self.mtp_num_draft_tokens > 0 else 0)
+
+    @property
+    def num_kv_planes(self) -> int:
+        """Planes of the MLA cache: a latent plane per full-attention layer and the MTP
+        layer's, and with dsa_long_context an index plane per full-attention layer."""
+        index = len(self.full_attn_layer_indices) if self.dsa_long_context else 0
+        return self.index_plane_offset + index
+
+    def check_long_context(self, page_size: int | None = None) -> None:
+        """Refuse a dsa_long_context setup the index planes cannot hold."""
+        if not self.dsa_long_context:
+            return
+        if self.mtp_num_draft_tokens > 0:
+            raise ValueError(
+                "dsa_long_context with MTP is not supported: a verify step leaves rejected "
+                "drafts in the cache as holes, which the k-pool indexer would pool as tokens")
+        width = self.kv_lora_rank + self.mla_cache_kpe
+        if 3 * self.index_head_dim > width:
+            raise ValueError(
+                f"an index plane row holds 3 x index_head_dim={self.index_head_dim} values; "
+                f"the MLA cache row is {width} wide")
+        if page_size is not None and page_size % self.index_kpool:
+            raise ValueError(
+                f"page_size={page_size} must be a multiple of index_kpool={self.index_kpool}")
 
     @property
     def kv_rows(self) -> int:
@@ -551,6 +595,13 @@ class Glm5NextModelConfig:
             prefill_token_buckets=[64],
             prefill_capture_batch_sizes=[1],
         )
+
+    @classmethod
+    def reduced_long_context(cls, max_seq_len: int = 512) -> "Glm5NextModelConfig":
+        """``reduced`` with dsa_long_context: a latent wide enough for the index planes."""
+        cfg = cls.reduced()
+        return dataclasses.replace(cfg, kv_lora_rank=3 * cfg.index_head_dim,
+                                   dsa_long_context=True, max_seq_len=max_seq_len)
 
     @classmethod
     def reduced_fp8(
