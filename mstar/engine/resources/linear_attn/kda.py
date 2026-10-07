@@ -14,7 +14,8 @@ buffers that stay put under CUDA-graph capture.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -262,6 +263,32 @@ class KDAManager(LinearAttnManager):
                 "carry a segment in the step declaration."
             )
         return found
+
+    @contextmanager
+    def token_window(self, pieces: list[tuple[int, int]], label: str | None = None) -> Iterator[None]:
+        """Run this step's KDA over a window of its prefill tokens: ``pieces`` are (row, tokens)
+        in packed order, each the next run of that row's tokens. A row's state carries over in
+        its slot, so windows run in order compute what the whole step would."""
+        if label is None:
+            label = self._default_label
+        full = self.current_plan(label)
+        assert not (full.is_decode or full.is_verify), "kda: a token window splits a prefill"
+        rows = to_device_async([row for row, _ in pieces], torch.long, self._device)
+        spans = tuple(n for _, n in pieces)
+        plan = KDAPlan(
+            slot_ids=full.slot_ids.index_select(0, rows),
+            has_state=full.has_state.index_select(0, rows),
+            spans=spans, num_tokens=sum(spans), is_decode=False,
+        )
+        if self.kernels is not None:
+            host = self.kernels.layout(spans, plan.num_tokens, False)
+            if host is not None:
+                plan.layout = to_device_async(host, torch.int32, self._device)
+        self._current[label] = plan
+        try:
+            yield
+        finally:
+            self._current[label] = full
 
     # Submodule-level functionality
 

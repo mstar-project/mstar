@@ -644,8 +644,18 @@ def test_glm5next_model_constructs_from_config():
     assert req.temperature == 0.0 and req.top_k == 3
     assert req.top_p == constructed.config.top_p
 
-    with pytest.raises(NotImplementedError, match="dsa_long_context"):
+    # long context needs index planes as wide as 3 index heads, and no MTP holes
+    with pytest.raises(ValueError, match="index plane"):
         Glm5NextModel("x", config_variant="reduced", dsa_long_context=True)
+    with pytest.raises(ValueError, match="MTP"):
+        Glm5NextModel("x", config_variant="reduced_long_context", dsa_long_context=True,
+                      mtp_num_draft_tokens=1)
+    long = Glm5NextModel("x", config_variant="reduced_long_context", dsa_long_context=True,
+                         max_seq_len=4096)
+    assert long.config.context_limit == 4096
+    (kv_spec,) = [s for s in long.get_node_resources() if s.resource_key == "kv_cache"]
+    planes = len(long.config.full_attn_layer_indices)
+    assert kv_spec.config.num_layers == 2 * planes
 
 
 def test_glm5next_registered():

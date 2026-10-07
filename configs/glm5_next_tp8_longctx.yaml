@@ -1,0 +1,34 @@
+model: "glm5_next"
+# GLM-5.3-Flash on 8 GPUs of 80 GB with contexts to its native 1M tokens: every MLA layer runs
+# the k-pool DSA indexer and sparse MLA (dsa_long_context). Otherwise glm5_next_tp8.yaml.
+max_seq_len: 1048576
+# NVLS multicast for the small decode all-reduces; stays on NCCL, with a
+# warning, where NVLink multicast is unavailable.
+tp_allreduce: "symm_multimem"
+tp_allreduce_max_kb: 32768
+model_kwargs:
+  moe_quant_kernel: "auto"
+  mtp_num_draft_tokens: 0
+  dsa_long_context: true
+  # each rank selects a block of a long prompt's rows (the indexer grows as the prompt squared)
+  dsa_shard_prefill: true
+  # Tokens a request may hold, prompt and output together.
+  max_seq_len: 1048576
+  # Prompts up to the largest captured bucket (4096 tokens) prefill captured, several to a
+  # step; a longer prompt takes a step of its own and runs eager, 8192 tokens at a time.
+  prefill_graphs: true
+  prefill_max_step_tokens: "auto"
+resources:
+  kv_cache:
+    # 11 latent planes + 11 index planes, one 512-wide bf16 row per token each: 22.5 KB per
+    # token per rank. 8960 pages x 128 tokens = one 1M-token request plus ~100k tokens of
+    # others, ~26 GB/rank next to ~38 GB of weights.
+    max_num_pages: 8960
+    page_size: 128
+  kda_state:
+    max_slots: 65
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]
