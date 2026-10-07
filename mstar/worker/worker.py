@@ -325,6 +325,7 @@ class Worker:
             sharding_config=sharding_config,
             tensor_manager=self.tensor_manager,
             communicator=self.communicator,
+            combined_walk_of=model.combined_walk_of() if model is not None else None,
         )
 
         self.engine_manager = EngineManager.build(

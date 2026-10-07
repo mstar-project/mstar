@@ -230,8 +230,10 @@ class RustGraphRuntime(GraphRuntime):
         sharding_config: ShardingConfig,
         bookkeeping: TensorBookkeeping,
         communicator=None,
+        combined_walk_of: dict[tuple[str, str], str] | None = None,
     ):
         mine = {wg.worker_graph_id for wg in my_worker_graphs}
+        combined_walk_of = combined_walk_of or {}
         self._rust = _RustGraphRuntime(
             worker_graphs=[worker_graph_args(wg) for wg in my_worker_graphs],
             remote_worker_graphs=[
@@ -254,6 +256,11 @@ class RustGraphRuntime(GraphRuntime):
             # under the pyzmq communicator, which has no shareable object --
             # the worker's flag gate refuses that pairing anyway.
             communicator=getattr(communicator, "_inner", None),
+            combined_walks=(
+                [node for node, _ in combined_walk_of],
+                [walk for _, walk in combined_walk_of],
+                list(combined_walk_of.values()),
+            ),
         )
         self._node_to_partition = node_to_partition
         self._communicator = communicator

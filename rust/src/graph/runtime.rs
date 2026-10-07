@@ -172,6 +172,9 @@ pub struct GraphRuntime {
     /// prep used to reach the walk state.
     staged_specs: FxHashMap<u32, (WgIndex, Vec<(u32, NodeId, Vec<(u8, bool)>)>)>,
     spec_counter: u32,
+    /// (node, real walk) -> the combined walk the scheduler batches it under;
+    /// a ready-scan target or exclusion may name either.
+    combined_walk_of: FxHashMap<(Sym, Sym), Sym>,
 
     /// A share of the SAME bookkeeper Python handed TensorStore, taken at
     /// construction. Routing reads descriptors and adjusts refcounts through
@@ -430,9 +433,18 @@ pub struct GraphRuntime {
         false
     }
 
+    /// Whether a (node, walk) target names this node in this walk, directly
+    /// or by the combined walk the walk is batched under.
+    fn names_walk(&self, t: &(Option<Sym>, Option<Sym>), node: Sym, walk: Sym) -> bool {
+        t.0 == Some(node)
+            && (t.1 == Some(walk)
+                || t.1.is_some() && self.combined_walk_of.get(&(node, walk)).copied() == t.1)
+    }
+
     /// Walk every (node, walk, rid) whose graph inputs are satisfied, calling
     /// `f` for each. `f` returns false to stop -- that is what lets the peek
     /// bail on the first match instead of building the whole list.
+    /// `target` and `exclude_target` name a walk or a combined walk.
     fn scan_ready(
         &self,
         exclude_rids: &FxHashSet<u32>,
@@ -468,13 +480,13 @@ pub struct GraphRuntime {
                                 (word * 64) as NodeId + bits.trailing_zeros();
                             bits &= bits - 1; // clear the bit just taken
                             let name = g.node(node).name;
-                            if let Some((tn, tw)) = target {
-                                if tn != Some(name) || tw != Some(walk) {
+                            if let Some(t) = target {
+                                if !self.names_walk(&t, name, walk) {
                                     continue;
                                 }
                             }
-                            if let Some((xn, xw)) = exclude_target {
-                                if xn == Some(name) && xw == Some(walk) {
+                            if let Some(x) = exclude_target {
+                                if self.names_walk(&x, name, walk) {
                                     continue;
                                 }
                             }
@@ -1330,7 +1342,7 @@ impl GraphRuntime {
     #[new]
     #[pyo3(signature = (
         worker_graphs, remote_worker_graphs, sharding, bookkeeping, me,
-        communicator = None,
+        communicator = None, combined_walks = None,
     ))]
     fn new(
         worker_graphs: Vec<WorkerGraphArg>,
@@ -1341,8 +1353,23 @@ impl GraphRuntime {
         bookkeeping: PyRef<'_, TensorBookkeeping>,
         me: String,
         communicator: Option<PyRef<'_, PyZmqCommunicator>>,
+        // (nodes, walks, combined) as columns: `walks[i]` of `nodes[i]` is
+        // batched under `combined[i]`
+        combined_walks: Option<(Vec<String>, Vec<String>, Vec<String>)>,
     ) -> PyResult<Self> {
         let mut it = StrToId::default();
+        let (nodes, walks, combined) = combined_walks.unwrap_or_default();
+        if nodes.len() != walks.len() || nodes.len() != combined.len() {
+            return Err(PyValueError::new_err(
+                "combined_walks: nodes, walks and combined differ in length",
+            ));
+        }
+        let combined_walk_of: FxHashMap<(Sym, Sym), Sym> = nodes
+            .iter()
+            .zip(&walks)
+            .zip(&combined)
+            .map(|((n, w), c)| ((it.intern(n), it.intern(w)), it.intern(c)))
+            .collect();
         let mut graphs = Vec::with_capacity(worker_graphs.len());
         let mut wg_ids = Vec::with_capacity(worker_graphs.len());
         let mut node_owner: FxHashMap<(Sym, Sym), u32> = FxHashMap::default();
@@ -1448,6 +1475,7 @@ impl GraphRuntime {
             completion_counter: 0,
             staged_specs: FxHashMap::default(),
             spec_counter: 0,
+            combined_walk_of,
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
         })

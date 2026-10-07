@@ -988,6 +988,18 @@ def test_a_batch_completes_every_request_not_just_the_first(pair):
 
 @pytest.fixture(params=["python", "rust"])
 def two_walks(request):
+    return _two_walks(request.param)
+
+
+@pytest.fixture(params=["python", "rust"])
+def combined_two_walks(request):
+    return _two_walks(
+        request.param,
+        combined_walk_of={("LLM", "prefill"): "mixed", ("LLM", "decode"): "mixed"},
+    )
+
+
+def _two_walks(kind, **extra):
     """Two worker graphs, one per walk, both holding the same node.
 
     This is the t2t shape: prefill runs, the conductor advances the partition
@@ -1011,8 +1023,9 @@ def two_walks(request):
         all_wg_ids_to_nodes={0: {"LLM"}, 1: {"LLM"}},
         node_to_partition={"LLM": "default"},
         sharding_config=_sharding(),
+        **extra,
     )
-    if request.param == "python":
+    if kind == "python":
         book = PythonTensorBookkeeping()
         tm = _StubTensorManager(book)
         return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
@@ -1098,6 +1111,20 @@ def test_a_multi_walk_pop_is_all_or_none(two_walks):
         "LLM", RequestWalks(rids, ["prefill", "decode"], [0, 1]), check_ready=True,
     ) is None
     assert _ready(rt) == [("LLM", "prefill", rids[:1])]
+
+
+def test_a_scan_target_may_name_the_combined_walk(combined_two_walks):
+    """The scheduler keys a combined walk's rows by the combined walk; the
+    runtime matches it to each row's real walk, as target and as exclusion."""
+    rt, _, _ = combined_two_walks
+    rids = _one_rid_per_walk(rt)
+    rt.ingest_inputs_batch(_ingest_block(rids, [_spec("text_inputs", "LLM") for _ in rids]))
+
+    found = rt.get_ready_nodes(set(), target=("LLM", "mixed"))
+    assert sorted((s.graph_walk, s.rids) for s in found) == [("decode", rids[1:]), ("prefill", rids[:1])]
+    assert rt.get_ready_nodes(set(), exclude_target=("LLM", "mixed")) == []
+    assert not rt.has_ready_excluding(set(), ("LLM", "mixed"))
+    assert [s.graph_walk for s in rt.get_ready_nodes(set(), target=("LLM", "decode"))] == ["decode"]
 
 
 def test_a_batch_transitions_together(two_walks):

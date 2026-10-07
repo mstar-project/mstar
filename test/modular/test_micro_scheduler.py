@@ -79,8 +79,15 @@ class _Runtime:
     def __init__(self, manager: _Manager):
         self._manager = manager
 
+    # what the worker constructs the real runtime with
+    combined_walk_of: dict = {}
+
+    def _names(self, target, node_name, walk):
+        return target[0] == node_name and target[1] in (
+            walk, self.combined_walk_of.get((node_name, walk)),
+        )
+
     def _scan(self, exclude_rids, target, exclude_target):
-        target_node, target_walk = target if target is not None else (None, None)
         for queue in self._manager.queues.values():
             for rid, node_names in queue.get_ready_node_names().items():
                 if rid in exclude_rids \
@@ -88,12 +95,10 @@ class _Runtime:
                     continue
                 walk = self._manager.walk_of(rid)
                 for node_name in node_names:
-                    if target_node is not None and node_name != target_node:
-                        continue
-                    if target_walk is not None and walk != target_walk:
+                    if target is not None and not self._names(target, node_name, walk):
                         continue
                     if exclude_target is not None \
-                            and (node_name, walk) == exclude_target:
+                            and self._names(exclude_target, node_name, walk):
                         continue
                     yield node_name, walk, rid
 
@@ -256,11 +261,13 @@ def _next_batch(sched: MicroScheduler, manager: _Manager, **kwargs):
     manager per call, so the binding happens here instead.
     """
     sched.runtime = manager.runtime
+    manager.runtime.combined_walk_of = sched.combined_walk_of
     return sched.get_next_batch(manager, **kwargs)
 
 
 def _has_ready(sched: MicroScheduler, manager: _Manager, exclude_target=None):
     sched.runtime = manager.runtime
+    manager.runtime.combined_walk_of = sched.combined_walk_of
     return sched.has_ready_excluding(manager, exclude_target)
 
 
@@ -834,7 +841,7 @@ def test_the_scheduler_runs_the_configured_builder():
     assert list(batch.request_to_worker_graph) == ["r0", "r2"]
     (request,) = builder.requests
     assert (request.node_name, request.graph_walk) == (NODE, WALK)
-    assert request.max_batch_size == 8
+    assert request.walk_caps == {WALK: 8}
     assert request.capture_group_of == "r2"
 
 
@@ -857,7 +864,7 @@ def test_fifo_puts_the_backlog_ahead_of_fresh_rows():
         node_name=NODE, graph_walk=WALK,
         backlog=_batch(["b0", "b1"]),
         fresh=_batch(["f0", "f1"]),
-        max_batch_size=3,
+        walk_caps={WALK: 3},
     ))
 
     assert list(result.scheduled.request_to_worker_graph) == ["b0", "b1", "f0"]
@@ -1034,6 +1041,7 @@ def test_a_follower_pops_each_walk_of_a_combined_head():
     sched = _combined_scheduler(_Engine(max_bs=8))
     manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
     sched.runtime = manager.runtime
+    manager.runtime.combined_walk_of = sched.combined_walk_of
 
     popped = sched.pop_ready_rids(
         manager, NODE, MIXED, ["p0", "d0"], walks=["prefill", WALK], walk_idx=[0, 1],
@@ -1050,6 +1058,7 @@ def test_a_follower_pop_is_all_or_none_across_walks():
     manager = _Manager(["p0"], walks={"p0": "prefill", "d0": WALK})
     manager.per_request_info["d0"] = object()  # known, but its node is not ready
     sched.runtime = manager.runtime
+    manager.runtime.combined_walk_of = sched.combined_walk_of
 
     assert sched.pop_ready_rids(
         manager, NODE, MIXED, ["p0", "d0"], walks=["prefill", WALK], walk_idx=[0, 1],
