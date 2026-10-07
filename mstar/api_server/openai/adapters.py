@@ -573,6 +573,60 @@ class KokoroAdapter(OpenAIAdapter):
         )
 
 
+def _refuse_server_path(ref: str, upload_dir: Path) -> None:
+    """A plain path must name a file the server stored itself, under
+    ``upload_dir``; checked before anything is opened, so it cannot probe the disk."""
+    if not isinstance(ref, str):
+        raise ValueError(f"ref_audio must be a data URL or an http(s) URL, got {type(ref).__name__}")
+    if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
+        return
+    if not Path(ref).resolve().is_relative_to(Path(upload_dir).resolve()):
+        raise ValueError(
+            "ref_audio must be a data URL or an http(s) URL; paths on the server are refused"
+        )
+
+
+class ChatterboxAdapter(OpenAIAdapter):
+    """Chatterbox / Chatterbox-Turbo: zero-shot TTS with voice cloning.
+
+    ``voice`` is either ``"default"`` (the voice shipped with the checkpoint)
+    or the name of a preset clip in the deployment's ``voices_dir``. A
+    reference clip for cloning comes through ``ref_audio`` in ``extra_body``
+    (a data URL or, when the server allows it, an http(s) URL; paths on the
+    server are refused) and is loaded by the worker like an uploaded file.
+    The model's own knobs --
+    ``exaggeration``, ``cfg_weight``, ``min_p``, ``repetition_penalty``,
+    ``top_k``, ``n_cfm_timesteps``, ``watermark``, ``max_new_tokens`` and, for
+    the multilingual checkpoint, ``language_id`` -- pass through ``extra_body``
+    verbatim; ``temperature``/``top_p``/``seed`` are the standard fields.
+    ``speed`` is not a Chatterbox control and is dropped.
+    """
+
+    supports_speech = True
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        if getattr(req, "voice", None):
+            mk.setdefault("voice", req.voice)
+        _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        file_paths = None
+        input_modalities = ["text"]
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            _refuse_server_path(ref_audio, upload_dir)
+            # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
+            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir, allow_remote=False)
+            file_paths = {"audio": [path]}
+            input_modalities = ["text", "audio"]
+        return SubmitArgs(
+            text=req.input,
+            file_paths=file_paths,
+            input_modalities=input_modalities,
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
 class Cosmos3Adapter(OpenAIAdapter):
     """NVIDIA Cosmos3: text-to-image and text/image-to-video generation.
 
@@ -945,6 +999,9 @@ class HiggsAudioAdapter(OpenAIAdapter):
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "bagel": BagelAdapter(),
+    "chatterbox": ChatterboxAdapter(),
+    "chatterbox_multilingual": ChatterboxAdapter(),
+    "chatterbox_turbo": ChatterboxAdapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),

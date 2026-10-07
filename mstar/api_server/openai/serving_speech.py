@@ -81,11 +81,15 @@ def list_voices(api) -> VoiceList | None:
 
 
 async def create_speech(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
+    sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
+    # before any upload or GPU work: a format we cannot produce is the client's error
+    try:
+        fmt = media_io.check_audio_format(req.response_format, bool(req.stream), sample_rate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # blocking work (base64 decode, file write, an allowed remote fetch) off the loop
     args = await asyncio.to_thread(adapter.speech_to_request, req, api.upload_dir)
     request_id = rid("speech")
-    sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
-    fmt = (req.response_format or "wav").lower()
     chunks = _plan_chunks(req, adapter, args.text or "")
 
     def submit(index: int) -> str:

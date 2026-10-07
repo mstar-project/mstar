@@ -54,6 +54,12 @@ class CudaGraphConfig(ABC):
         # scales by this. Subclasses that support it set it.
         self.total_tokens_multiplier = 1
         self.input_seq_dims = input_seq_dims
+        # How many plan tokens one input token turns into (a step that commits
+        # KV under several labels combined into one plan, e.g. classifier-free
+        # guidance packing cond + uncond, has 2). Buckets are keyed by plan
+        # tokens; the engine asks for a bucket in input tokens and the runner
+        # scales by this. Subclasses that support it set it.
+        self.total_tokens_multiplier = 1
 
     @abstractmethod
     def get_config_type(self) -> CudaGraphConfigType:
@@ -144,6 +150,11 @@ class PackedCudaGraphConfig(CudaGraphConfig):
         # the resources size their per-bucket buffers for the whole plan.
         total_tokens_multiplier: int = 1,
         input_seq_dims: dict[str, int] | None = None,
+        # ``capture_token_lengths`` count input tokens; a step whose plan
+        # carries every input token under several combined labels (batched
+        # guidance: cond + uncond in one plan) multiplies them by this, so
+        # the resources size their per-bucket buffers for the whole plan.
+        total_tokens_multiplier: int = 1,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
