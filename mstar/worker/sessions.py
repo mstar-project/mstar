@@ -38,6 +38,9 @@ class WorkerSessionManager:
     _pending_remove_end_session: set[int] = field(default_factory=set)
     # TEARDOWN_SESSIONs waiting on their requests to finish leaving
     _pending_session_teardowns: set[str] = field(default_factory=set)
+    # session id -> the TP followers this worker leads for it, recorded as its
+    # requests are bound; a teardown is forwarded to them
+    _session_followers: dict[str, set[str]] = field(default_factory=dict)
     # rid handle -> nodes whose loop ran a speculative step past its stop for
     # it; handed to the engine at removal. Session requests only.
     _overshot: dict[int, set[str]] = field(default_factory=dict)
@@ -125,12 +128,27 @@ class WorkerSessionManager:
         held, self._pending_session_ingests = self._pending_session_ingests, []
         return held
 
-    def bind(self, request_id: int, session_id: str | None) -> None:
-        """Record which session a request belongs to; a no-op without one."""
+    def bind(
+        self, request_id: int, session_id: str | None,
+        tp_followers: set[str] | None = None,
+    ) -> None:
+        """Record which session a request belongs to; a no-op without one.
+
+        ``tp_followers`` are the ranks this worker leads for the request; the
+        session's teardown goes to them too.
+        """
         if session_id is None:
             return
         self._session_rids.setdefault(session_id, set()).add(request_id)
         self._rid_session[request_id] = session_id
+        if tp_followers:
+            self._session_followers.setdefault(session_id, set()).update(
+                tp_followers
+            )
+
+    def tp_followers(self, session_id: str) -> set[str]:
+        """The TP followers this worker leads for the session."""
+        return set(self._session_followers.get(session_id, ()))
 
     # ------------------------------------------------------------------
     # Removal
@@ -186,6 +204,7 @@ class WorkerSessionManager:
     def forget_session(self, session_id: str) -> None:
         """Drop every trace of the session; its state is being freed."""
         self._pending_session_teardowns.discard(session_id)
+        self._session_followers.pop(session_id, None)
         for rid in self._session_rids.pop(session_id, set()):
             self._rid_session.pop(rid, None)
             self._pending_remove_end_session.discard(rid)

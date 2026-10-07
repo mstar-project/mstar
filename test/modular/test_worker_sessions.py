@@ -45,6 +45,7 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
     w._reads_done_sent = set()
     w._pending_removes = set()
     w._removes_awaiting_step = {}
+    w._teardowns_awaiting_step = {}
     w._tp_broadcast_seq = 0
     w._last_active = {}
     w._unprocessed_messages = {}
@@ -424,3 +425,90 @@ def test_an_overshoot_outside_a_session_is_not_kept():
     Worker._remove_request(w, RemoveRequest(request_id="X"))
 
     assert w.overshot == [("X", frozenset())]
+
+
+# ── a session's teardown under TP lands where rank 0's did ──────────────────
+
+def _forwarded_teardowns(w):
+    return [
+        (e, m.body) for e, m in w.sent
+        if m.message_type == WorkerMessageType.TEARDOWN_SESSION
+    ]
+
+
+def test_a_follower_ignores_the_conductor_s_teardown():
+    w = _worker(known_rids=(), is_follower=True)
+
+    Worker._teardown_session(w, TeardownSession(session_id="s"))
+
+    assert w.removed_sessions == []
+    assert _acks(w) == []
+
+
+def test_the_leader_forwards_the_teardown_stamped_with_its_last_step():
+    w = _worker(known_rids=())
+    w._sessions.bind("X", "s", tp_followers={"w1"})
+    w._sessions.release("X")
+    w._tp_broadcast_seq = 8
+
+    Worker._teardown_session(w, TeardownSession(session_id="s"))
+
+    [(to, body)] = _forwarded_teardowns(w)
+    assert (to, body.session_id) == ("w1", "s")
+    assert body.source == MessageSource.TP_RANK_0
+    assert body.after_tp_seq == 7
+    assert w.removed_sessions == ["s"]
+    assert _acks(w) == ["s"]
+
+
+def test_a_held_teardown_is_forwarded_when_it_runs_not_when_it_arrived():
+    # the stamp has to be the step rank 0 frees the pages after
+    w = _worker(sessions={"s": {"X"}}, in_flight=("X",))
+    w._sessions.bind("X", "s", tp_followers={"w1"})
+
+    Worker._teardown_session(w, TeardownSession(session_id="s"))
+    assert _forwarded_teardowns(w) == []
+
+    w._tp_broadcast_seq = 5
+    w._in_flight_rids.clear()
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    Worker._apply_pending_sessions(w)
+
+    [(_, body)] = _forwarded_teardowns(w)
+    assert body.after_tp_seq == 4
+    assert _acks(w) == ["s"]
+
+
+def test_a_follower_frees_the_session_once_it_reaches_rank_0_s_step():
+    w = _worker(known_rids=(), is_follower=True)
+    forwarded = TeardownSession(
+        session_id="s", source=MessageSource.TP_RANK_0, after_tp_seq=3,
+    )
+
+    Worker._teardown_session(w, forwarded)
+    assert w.removed_sessions == []
+
+    w.scheduler.last_consumed_tp_seq = 3
+    Worker._apply_removes_whose_step_landed(w)
+
+    assert w.removed_sessions == ["s"]
+    assert _acks(w) == ["s"]
+    # a follower leads no one, so nothing goes further
+    assert _forwarded_teardowns(w) == []
+
+
+def test_a_follower_ends_the_session_of_a_request_it_never_admitted():
+    # rank 0 forwarded the REMOVE; the follower had held the request
+    w = _worker(known_rids=("X",), sessions={"s": {"X"}}, is_follower=True)
+    Worker._add_new_request(w, _new_request(session_id="s"))
+    Worker._remove_request(w, RemoveRequest(
+        request_id="X", source=MessageSource.TP_RANK_0,
+    ))
+
+    Worker._remove_request(w, RemoveRequest(
+        request_id="Y", source=MessageSource.TP_RANK_0,
+        end_session=True, session_id="s",
+    ))
+
+    assert w.removed_sessions == ["s"]
+    assert _acks(w) == ["s"]

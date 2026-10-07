@@ -185,9 +185,14 @@ class OffloadDelta:
 @dataclass
 class TeardownSession(MessageBody):
     """Free everything a session holds. Sent to every worker that ran it; each
-    ACKs with SESSION_TORN_DOWN once its state is gone."""
+    ACKs with SESSION_TORN_DOWN once its state is gone.
+
+    A TP follower ignores the conductor's copy and acts on rank 0's forward,
+    stamped like a forwarded RemoveRequest: freeing the session's pages has to
+    land at the same point in the step sequence on every rank."""
     session_id: str
     source: int = MessageSource.CONDUCTOR
+    after_tp_seq: int = -1
 
 
 @dataclass

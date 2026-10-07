@@ -848,6 +848,7 @@ class _RemoveRank:
     def __init__(self, consumed: int):
         self.scheduler = SimpleNamespace(last_consumed_tp_seq=consumed)
         self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
+        self._teardowns_awaiting_step: dict = {}
         self.applied: list[str] = []
 
     def _remove_request(self, body):
@@ -916,6 +917,7 @@ class _ForwardingLeader:
     _remove_request = Worker._remove_request
     _removal_step_reached = Worker._removal_step_reached
     _rid = Worker._rid
+    _tp_followers = Worker._tp_followers
 
     def __init__(self, broadcast_seq: int):
         self.is_tp_follower = False
@@ -928,6 +930,7 @@ class _ForwardingLeader:
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
         self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
+        self._teardowns_awaiting_step: dict = {}
         self._draining_rids: set[str] = set()
         self._pending_drains: set[str] = set()
         self._reads_done_sent: set[str] = set()

@@ -1789,8 +1789,13 @@ class KVManager(AttentionResource):
                 self.session_rid(session_id)
             )
             logger.info(
-                "KV %s: session %s keeps %d pages from %s",
-                self.name, session_id, self.session_state_size(session_id), rid,
+                "KV %s: session %s keeps %d pages (%s tokens) from %s",
+                self.name, session_id, self.session_state_size(session_id),
+                {
+                    label: stream.stored_len for label, stream in
+                    self._streams.get(self.session_rid(session_id), {}).items()
+                },
+                rid,
             )
 
     def remove_session(self, session_id: str) -> None:

@@ -116,6 +116,11 @@ class TextSessionLLMSubmodule(LLMSubmodule):
         node_inputs = super().prepare_inputs(graph_walk, fwd_info, inputs, **kwargs)
         if graph_walk == "prefill_text":
             join = self.turn_join(fwd_info)
+            if fwd_info.session is not None and fwd_info.session.resumed:
+                logger.info(
+                    "Session %s: resumed turn joins with %s",
+                    fwd_info.session.session_id, join,
+                )
             if join:
                 ids = node_inputs.input_ids
                 node_inputs.input_ids = torch.cat([

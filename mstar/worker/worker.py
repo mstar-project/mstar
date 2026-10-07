@@ -443,6 +443,8 @@ class Worker:
         # (end_session, say), or the follower tears the request down
         # without the session it was supposed to take with it.
         self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
+        # The same for session teardowns rank 0 forwarded.
+        self._teardowns_awaiting_step: dict[int, list[TeardownSession]] = {}
 
         # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
         # behind an in-flight GPU step; _draining_rids have stopped reading and
@@ -628,7 +630,9 @@ class Worker:
             self._last_active[(request_id, node_name)] = now
 
         self.request_state.add_request(request_id, body.request_info)
-        self._sessions.bind(request_id, session_id)
+        self._sessions.bind(
+            request_id, session_id, tp_followers=self._tp_followers(request_id),
+        )
         self.engine_manager.add_request(
             request_id, body.request_info.resource_configs, session=session,
         )
@@ -725,36 +729,28 @@ class Worker:
         # remove it too. Followers defer removal until they get this message
         # (see the guard at the top of this method) so they can't tear down
         # state we're still reading from an in-flight step/speculation.
-        sharding = self._graph_runtime.get_sharding_config(request_id)
-        if sharding is not None:
-            followers: set[str] = set()
-            for group in sharding.groups:
-                # _workers is rank-ordered; index 0 is this worker when we are
-                # rank 0. Only real TP groups (tp_size > 1) have followers.
-                if group.tp_size > 1 and group._tp_rank == 0:
-                    followers.update(group._workers[1:])
-            for worker in followers:
-                self.communicator.send(
-                    worker, msg=WorkerMessage(
-                        message_type=WorkerMessageType.REMOVE_REQUEST,
-                        body=RemoveRequest(
-                            request_id=body.request_id,
-                            source=MessageSource.TP_RANK_0,
-                            # this rank is about to release the pages, having
-                            # broadcast up to here; followers must do it in the
-                            # same gap between steps
-                            after_tp_seq=self._tp_broadcast_seq - 1,
-                            end_session=body.end_session,
-                            # a follower may have held the request rather
-                            # than admitted it, and then needs the name
-                            session_id=(
-                                body.session_id
-                                or self._sessions.session_of(request_id)
-                                if body.end_session else None
-                            ),
-                        )
+        for worker in self._tp_followers(request_id):
+            self.communicator.send(
+                worker, msg=WorkerMessage(
+                    message_type=WorkerMessageType.REMOVE_REQUEST,
+                    body=RemoveRequest(
+                        request_id=body.request_id,
+                        source=MessageSource.TP_RANK_0,
+                        # this rank is about to release the pages, having
+                        # broadcast up to here; followers must do it in the
+                        # same gap between steps
+                        after_tp_seq=self._tp_broadcast_seq - 1,
+                        end_session=body.end_session,
+                        # a follower may have held the request rather
+                        # than admitted it, and then needs the name
+                        session_id=(
+                            body.session_id
+                            or self._sessions.session_of(request_id)
+                            if body.end_session else None
+                        ),
                     )
                 )
+            )
 
         # Hard cleanup: force-drop every tensor for the rid (unlink SHM),
         # ignoring ref counts / persist. Safe because the conductor only sends
@@ -803,7 +799,11 @@ class Worker:
                 body.request_id,
             )
         if body.end_session and body.session_id is not None:
-            self._teardown_session(TeardownSession(session_id=body.session_id))
+            # SELF: the removal carrying it was already ordered against the
+            # step sequence
+            self._teardown_session(TeardownSession(
+                session_id=body.session_id, source=MessageSource.SELF,
+            ))
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
@@ -831,15 +831,8 @@ class Worker:
         handle = self._rid(request_id)
         # Fan the drain to TP followers so each rank drains and ACKs its own
         # READS_DONE (the conductor waits on every rank).
-        sharding = (
-            None if handle is None else self._graph_runtime.get_sharding_config(handle)
-        )
-        if sharding is not None:
-            followers: set[str] = set()
-            for group in sharding.groups:
-                if group.tp_size > 1 and group._tp_rank == 0:
-                    followers.update(group._workers[1:])
-            for worker in followers:
+        if handle is not None:
+            for worker in self._tp_followers(handle):
                 self.communicator.send(
                     worker, msg=WorkerMessage(
                         message_type=WorkerMessageType.DRAIN_REQUEST,
@@ -908,11 +901,36 @@ class Worker:
         Deferred while any of the session's requests is still on its way out:
         that request's removal would otherwise hand its state back to a session
         that no longer exists.
+
+        Under TP the pages go at the same point in the step sequence on every
+        rank, as a removal's do: a follower ignores the conductor's copy, and
+        rank 0 forwards its own, stamped with the last step it broadcast, at
+        the moment it frees them. A follower that freed them later would admit
+        a step rank 0 planned into those pages without them.
         """
         session_id = body.session_id
+        if self.is_tp_follower:
+            if body.source == MessageSource.CONDUCTOR:
+                return  # wait for rank 0's forward
+            if not self._removal_step_reached(body):
+                self._teardowns_awaiting_step.setdefault(
+                    body.after_tp_seq, []
+                ).append(body)
+                return
         if self._sessions.requests_still_leaving(session_id):
             self._sessions.hold_teardown(session_id)
             return
+        for worker in self._sessions.tp_followers(session_id):
+            self.communicator.send(
+                worker, msg=WorkerMessage(
+                    message_type=WorkerMessageType.TEARDOWN_SESSION,
+                    body=TeardownSession(
+                        session_id=session_id,
+                        source=MessageSource.TP_RANK_0,
+                        after_tp_seq=self._tp_broadcast_seq - 1,
+                    ),
+                ),
+            )
         self._sessions.forget_session(session_id)
         self.engine_manager.remove_session(session_id)
         self._ack_session_torn_down(session_id)
@@ -936,7 +954,10 @@ class Worker:
         for body in self._sessions.take_held_ingests():
             self._add_new_request(body)
         for session_id in self._sessions.ready_teardowns():
-            self._teardown_session(TeardownSession(session_id=session_id))
+            # SELF: it already passed the TP checks when it was first held
+            self._teardown_session(TeardownSession(
+                session_id=session_id, source=MessageSource.SELF,
+            ))
 
     def _ack_session_torn_down(self, session_id: str) -> None:
         self.communicator.send(
@@ -3156,7 +3177,22 @@ class Worker:
 
         return cpu_per_rid
 
-    def _removal_step_reached(self, body: RemoveRequest) -> bool:
+    def _tp_followers(self, request_id: int) -> set[str]:
+        """The ranks this worker leads for the request: rank 0 of each real
+        TP group (tp_size > 1) it is in. ``_workers`` is rank-ordered, so
+        index 0 is this worker when it is rank 0."""
+        sharding = self._graph_runtime.get_sharding_config(request_id)
+        followers: set[str] = set()
+        if sharding is None:
+            return followers
+        for group in sharding.groups:
+            if group.tp_size > 1 and group._tp_rank == 0:
+                followers.update(group._workers[1:])
+        return followers
+
+    def _removal_step_reached(
+        self, body: RemoveRequest | TeardownSession,
+    ) -> bool:
         """Whether this rank has consumed the step rank 0 released these pages
         after. Unstamped removals (``-1``) are not ordered against anything."""
         return (
@@ -3168,13 +3204,18 @@ class Worker:
         """Tear down the requests rank 0 released once this rank reaches the step
         it released them after. Cannot strand them: the step was broadcast before
         the removal, so this rank gets there."""
-        if not self._removes_awaiting_step:
+        if not (self._removes_awaiting_step or self._teardowns_awaiting_step):
             return
         reached = self.scheduler.last_consumed_tp_seq
         for seq in sorted(s for s in self._removes_awaiting_step if s <= reached):
             for parked in self._removes_awaiting_step.pop(seq):
                 # replace, not a fresh body: every field it carried survives
                 self._remove_request(replace(
+                    parked, source=MessageSource.SELF, after_tp_seq=-1,
+                ))
+        for seq in sorted(s for s in self._teardowns_awaiting_step if s <= reached):
+            for parked in self._teardowns_awaiting_step.pop(seq):
+                self._teardown_session(replace(
                     parked, source=MessageSource.SELF, after_tp_seq=-1,
                 ))
 
