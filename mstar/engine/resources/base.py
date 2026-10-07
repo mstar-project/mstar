@@ -128,6 +128,12 @@ class Resource(ABC):
         """Take this step's sampled tokens, so what was generated can be keyed."""
         return
 
+    @property
+    def keys_prefix_chains(self) -> bool:
+        """Whether ``extend_prefix_chain`` can do anything right now (a prefix
+        cache is open). The runner skips the per-request sweep otherwise."""
+        return False
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 
