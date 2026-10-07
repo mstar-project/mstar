@@ -16,6 +16,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
+    "glm52": ("mstar.model.glm52.glm52_model", "Glm52Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
@@ -74,6 +75,9 @@ HF_MODELS: dict[str, dict] = {
     # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.
     "flux2_klein": {"model_path_hf": "black-forest-labs/FLUX.2-klein-4B"},
     "flux2_klein_9b": {"model_path_hf": "black-forest-labs/FLUX.2-klein-9B"},
+    # GLM-5.2: 753B/40B MoE causal LM (MLA + DSA). The official release ships
+    # FP8 e4m3 block-scale under the -FP8 repo id; real serving is TP8.
+    "glm52": {"model_path_hf": "zai-org/GLM-5.2-FP8"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},

@@ -52,6 +52,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
        decoder, 54 bundled voices and voice blends, sentence-chunked streaming,
        batched across requests.
+   * - ``glm52``
+     - ``zai-org/GLM-5.2-FP8``
+     - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.

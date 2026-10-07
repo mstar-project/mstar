@@ -1,0 +1,13 @@
+model: "glm52"
+# GLM-5.2 on a single rank, for dummy mode and small-scale development. The
+# real checkpoint is ~750 GB fp8, so production serving is TP8: see
+# configs/glm52_tp8.yaml.
+#
+# max_seq_len here is presence-checked only. The serving ceiling stays
+# Glm52ModelConfig.max_seq_len, and without dsa_long_context the hard limit
+# is index_topk (2048) regardless.
+max_seq_len: 2048
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]
+    graph_walks: [prefill, decode]

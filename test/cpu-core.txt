@@ -68,3 +68,16 @@ test/modular/test_step_token_budget.py
 test/modular/test_symm_allreduce_routing.py
 test/modular/test_kv_offload.py
 test/modular/test_openai_router.py
+test/modular/test_glm52_dsa_engine.py
+test/modular/test_glm52_engine_cycle.py
+test/modular/test_glm52_indexer.py
+test/modular/test_glm52_mla_absorb.py
+test/modular/test_glm52_model.py
+test/modular/test_glm52_moe.py
+test/modular/test_glm52_output_budget.py
+test/modular/test_glm52_prefill.py
+test/modular/test_glm52_quant.py
+test/modular/test_glm52_read_plan.py
+test/modular/test_kv_stored_len.py
+test/modular/test_pinned_staging.py
+test/modular/test_openai_adapters.py
