@@ -490,6 +490,11 @@ class LLMSubmodule(ARNodeSubmodule):
         )
         return {"decode_loop"} if hit_eos or out_of_budget else set()
 
+    def step_is_input_free(self, graph_walk: str) -> bool:
+        # decode rows are one token each, like the template; the prefill walks
+        # feed `prefill_tokens` from the inputs
+        return graph_walk == "decode"
+
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # the decode loop's client edge carries the sampled token the stop
         # check already has on the host; prefill's new_token edge is persisted
