@@ -266,6 +266,8 @@ class RustGraphRuntime(GraphRuntime):
         self._all_wg_ids_to_nodes = all_wg_ids_to_nodes
         self._sharding: dict[int, ShardingConfig] = {}
 
+    supports_inline_emit = True
+
     # --------- Bookkeeping ----------
 
     def set_node_metadata(
@@ -551,6 +553,8 @@ class RustGraphRuntime(GraphRuntime):
             "rids": list(input.wg_ids.keys),
             "tensors": list(input.tensors),
             "num_tensors": list(input.num_tensors),
+            "inline_signal": input.inline_signal,
+            "inline_values": list(input.inline_values),
         })
         return RouteOutput(
             completion_id=out.completion_id,
