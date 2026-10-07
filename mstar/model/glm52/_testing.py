@@ -130,7 +130,7 @@ def build_cpu_resources(
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, SAMPLER_RESOURCE
 
-    num_layers = config.num_hidden_layers
+    num_layers = config.num_hidden_layers + (1 if config.mtp_num_draft_tokens > 0 else 0)
     device = torch.device("cpu")
     stub = manager_mod.KVTransferManager
     manager_mod.KVTransferManager = _StubTransferManager
@@ -147,7 +147,14 @@ def build_cpu_resources(
                 cfg=kv_cfg, name=KV_RESOURCE, joint_comm_group=None,
                 transfer_engine_info=None, device=device, dtype=torch.float32,
             )
-            attn = FlashInferMLAManager(
+            class _ReplannedMLA(FlashInferMLAManager):
+                # EagerPiecewiseRunner plans before every region call, so a leased
+                # fallback plan is never replayed stale
+                @property
+                def uses_kernel(self) -> bool:
+                    return True
+
+            attn = _ReplannedMLA(
                 kv_cache=KV_RESOURCE, device=device, dtype=torch.float32,
                 kv_config=kv_cfg, sm_scale=config.qk_head_dim ** -0.5,
             )

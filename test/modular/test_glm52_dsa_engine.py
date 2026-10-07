@@ -100,19 +100,30 @@ def test_kstore_desync_and_overrun_raise():
 def test_cleanup_request_evicts_kstore():
     """Retirement leaves NO per-request growth: the engine's request removal
     calls cleanup_request on every managed submodule, which must drop the
-    k-history and the token budget."""
+    k-history, the MTP counters and the token budget."""
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = Glm52ModelConfig.reduced()
     sub.request_states = {}
     sub._dsa_k_store = Glm52DsaKStore()
+    sub._mtp_emitted = {"r0": 7}
+    sub._mtp_checked = {"r0": 7}
+    sub._mtp_max_tokens = {"r0": 32}
+    sub._mtp_ignore_eos = {"r0": False}
     sub._token_budget = {"r0": 20}
+    sub._mtp_pending, sub._mtp_verdict, sub._mtp_trimmed = {"r0": (3, 0, 0)}, {"r0": ()}, {"r0": 3}
+    sub._mtp_slot, sub._mtp_free_slots = {"r0": 5}, []
 
     sub._dsa_k_store.append("r0", 0, torch.randn(5, 16), start_pos=0)
     sub.request_state("r0")  # base per-request state exists too
     sub.cleanup_request("r0")
     assert sub._dsa_k_store.tracked_requests() == set()
     assert sub.request_states == {}
+    assert sub._mtp_emitted == {}
+    assert sub._mtp_max_tokens == {}
+    assert sub._mtp_ignore_eos == {}
     assert sub._token_budget == {}
+    assert not (sub._mtp_pending or sub._mtp_verdict or sub._mtp_trimmed or sub._mtp_slot)
+    assert sub._mtp_free_slots == [5]  # the seed slot goes back
     sub.cleanup_request("r0")  # idempotent, like the base hook
 
 
@@ -234,6 +245,26 @@ def test_model_kwarg_dsa_long_context():
 
     with pytest.raises(ValueError, match="mla_absorb"):
         Glm52Model(model_path_hf="", config_variant="reduced", dsa_long_context=True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        Glm52Model(model_path_hf="", dsa_long_context=True, mtp_num_draft_tokens=2)
+
+
+def test_reduced_variant_grows_trunk_for_mtp():
+    # reduced() sizes 2 trunk layers, landing the MTP position on a SHARED
+    # indexer slot; a reduced-variant serve yaml with MTP on must still
+    # construct. Real variants keep the loud SHARED guard in the constructor.
+    from mstar.model.glm52.components.indexer import is_full_indexer_layer
+    from mstar.model.glm52.components.mtp import Glm52MTPModule
+
+    off = Glm52Model(model_path_hf="", config_variant="reduced_fp8")
+    assert off.config.num_hidden_layers == 2  # untouched without MTP
+
+    for variant in ("reduced", "reduced_fp8"):
+        m = Glm52Model(
+            model_path_hf="", config_variant=variant, mtp_num_draft_tokens=2)
+        pos = m.config.num_hidden_layers
+        assert is_full_indexer_layer(m.config, pos), variant
+        Glm52MTPModule(m.config)  # the SHARED-slot guard no longer fires
 
 
 def test_no_cuda_graphs_when_long_context():

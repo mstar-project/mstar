@@ -69,6 +69,12 @@ def _make_model(config: Glm52ModelConfig | None = None) -> Glm52Model:
     return model
 
 
+def _make_model_k(k: int) -> Glm52Model:
+    cfg = Glm52ModelConfig()
+    cfg.mtp_num_draft_tokens = k
+    return _make_model(cfg)
+
+
 def test_glm52_registered():
     # The registry is lazy (module path, class name) so importing it pulls
     # no model code; resolve the entry and check it is the class.
@@ -121,6 +127,15 @@ def test_glm52_resources_absorbed_is_mla_latent_layout():
     assert attn.config.sm_scale == cfg.qk_head_dim ** -0.5  # 256**-0.5, no mscale
     assert attn.depends_on() == {KV_RESOURCE}
     assert sampler.vocab_size == cfg.vocab_size
+
+
+def test_glm52_resources_mtp_adds_the_plane_layer():
+    # the layer-78 draft module keeps its KV in one extra plane on the
+    # trunk's page table
+    kv, _, _ = _specs(_make_model_k(2).config)
+    assert kv.config.num_layers == 79
+    kv0, _, _ = _specs(_make_model_k(0).config)
+    assert kv0.config.num_layers == 78
 
 
 def test_glm52_resources_flag_off_is_naive():
@@ -197,6 +212,28 @@ def test_glm52_decode_seeds_from_the_new_token_not_the_prompt():
     assert res.unpersist_tensors == ["tok"]
 
 
+def test_glm52_mtp_prefill_emits_only_its_token():
+    """The MTP prefill seeds the first decode step's drafts on the device; its only edge is
+    the emitted token, as at k=0."""
+    for k in (0, 2):
+        prefill = _make_model_k(k).get_graph_walk_graphs()["prefill"]
+        assert [e.name for e in prefill.outputs] == ["new_token"]
+
+
+def test_glm52_decode_never_reseeds_from_the_prompt_signal():
+    """Decode is seeded from the emitted token, never from the prompt signal, under MTP too."""
+    metadata = CurrentForwardConductorMetadata(
+        input_modalities=["text"], output_modalities=["text"],
+        graph_walk="prefill", is_prefill=True,
+    )
+    res = _make_model_k(2).get_partition_forward_pass_args(
+        partition_name="default", partition_metadata=metadata,
+        persist_signals={"text_inputs": ["PROMPT"], "new_token": ["tok"]},
+    )
+    assert res.inputs[0].tensor_info == ["tok"]
+    assert res.unpersist_tensors == ["tok"]
+
+
 def test_glm52_decode_loop_cap_stays_below_the_context_guard():
     """The decode loop cap must NOT be raised to max_seq_len."""
     model = _make_model()
@@ -253,10 +290,23 @@ def test_glm52_request_config_is_the_sampler_config():
     assert over.temperature == cfg.temperature
 
 
-def test_glm52_mtp_is_refused_until_it_lands():
-    with pytest.raises(ValueError, match="mtp_num_draft_tokens"):
-        Glm52Model(model_path_hf="", tokenizer_mode="byte", mtp_num_draft_tokens=2)
-    Glm52Model(model_path_hf="", tokenizer_mode="byte", mtp_num_draft_tokens=0)
+def test_glm52_mtp_declares_greedy_default_but_honors_explicit_asks():
+    """MTP decode is raw argmax unless the request asks for something else."""
+    k2 = _make_model_k(2)
+    assert k2.get_request_resource_configs({})[SAMPLER_RESOURCE].temperature == 0.0
+    assert k2.get_request_resource_configs(
+        {}, {"temperature": 0.7})[SAMPLER_RESOURCE].temperature == 0.7
+    # k=0 keeps the model default — speculation is what forces greedy.
+    k0 = _make_model_k(0)
+    assert k0.get_request_resource_configs({})[SAMPLER_RESOURCE].temperature == k0.config.temperature
+
+
+def test_glm52_mtp_refuses_a_shallower_trunk_than_the_checkpoint():
+    """Every checkpoint layer past the served trunk routes to the draft
+    module, so trunk layers would load as the MTP layer."""
+    with pytest.raises(ValueError, match="num_hidden_layers"):
+        Glm52Model(model_path_hf="", mtp_num_draft_tokens=2, num_hidden_layers=10)
+    assert Glm52Model(model_path_hf="", mtp_num_draft_tokens=2).config.num_hidden_layers == 78
 
 
 # ── config ──
@@ -466,6 +516,13 @@ def test_indexer_exists_only_on_the_dsa_path():
     assert on.model.layers[0].self_attn.indexer is not None  # FULL
     assert on.model.layers[1].self_attn.indexer is None      # SHARED
     assert all(n.startswith("model.layers.0.") for n in _indexer_params(on))
+
+    # the MTP layer's indexer follows the same flag (drafting is flag-off
+    # only, so it never carries one in practice)
+    cfg = Glm52ModelConfig.reduced()
+    cfg.num_hidden_layers = 4  # MTP position lands FULL
+    cfg.mtp_num_draft_tokens = 2
+    assert Glm52ForCausalLM(cfg).mtp.transformer_layer.self_attn.indexer is None
 
 
 def test_flag_off_layer_refuses_a_dsa_ctx():

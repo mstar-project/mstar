@@ -82,3 +82,15 @@ test/modular/test_glm52_loading_guards.py
 test/modular/test_kv_stored_len.py
 test/modular/test_pinned_staging.py
 test/modular/test_openai_adapters.py
+test/modular/test_glm52_dense_fp8_model.py
+test/modular/test_glm52_fused_add_rmsnorm.py
+test/modular/test_glm52_mla_prep.py
+test/modular/test_glm52_moe_decode.py
+test/modular/test_glm52_moe_fused_allreduce.py
+test/modular/test_glm52_mtp_configs.py
+test/modular/test_glm52_mtp_engine_cycle.py
+test/modular/test_glm52_mtp.py
+test/modular/test_glm52_step_tokens.py
+test/modular/test_kv_correct_len.py
+test/modular/test_kv_host_plan.py
+test/modular/test_piecewise_dummy_rows.py
