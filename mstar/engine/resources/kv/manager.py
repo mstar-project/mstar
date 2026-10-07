@@ -1772,6 +1772,76 @@ class KVManager(AttentionResource):
             request_id, node_name=node_name, graph_walk=graph_walk,
         )
 
+    def publish_snapshot_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        """Per label the length, page count and generation ``publish`` would
+        export now. The page list itself is copied only when the publication
+        is finished, which in a steady decode loop is never: this ran for every
+        request on every step and was a quarter of the gpu thread's host time.
+        """
+        with self._lock:
+            streams = self._streams.get(request_id)
+            overrides = self._overrides.get(request_id)
+            if streams is None or overrides is None:
+                return None
+            labels = overrides.get_publish_labels(
+                node_name, graph_walk, list(streams), final=False,
+            )
+            if not labels:
+                return None
+            snap = tuple(
+                (label, stream.stored_len, len(stream.page_indices),
+                 stream.reset_generation)
+                for label in labels
+                if (stream := streams.get(label)) is not None
+            )
+        return snap or None
+
+    def publish_from_snapshot(
+        self,
+        request_id: str,
+        snapshot,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        """``publish`` as of the snapshot: the lengths are the snapshot's, so a
+        step that committed in between (the next one is already running when
+        the worker finishes a publication) does not leak into it."""
+        del node_name, graph_walk
+        if not snapshot:
+            return None
+        with self._lock:
+            streams = self._streams.get(request_id)
+            if streams is None:
+                return None
+            seq_info = {}
+            for label, seq_len, num_pages, reset_generation in snapshot:
+                stream = streams.get(label)
+                if stream is None:
+                    continue
+                pages = list(stream.page_indices[:num_pages])
+                seq_info[label] = KVSequenceInfo(
+                    seq_len=seq_len,
+                    latest_kv_transfer_info=self._transfer.get_kv_transfer_info(
+                        request_id=request_id,
+                        label=label,
+                        page_indices=pages,
+                        seq_len=seq_len,
+                        reset_generation=reset_generation,
+                    ),
+                    page_indices=pages,
+                    reset_generation=reset_generation,
+                )
+        if not seq_info:
+            return None
+        return PublishedKVInfo.build_for_rank(
+            rank=self._rank, world_size=self._world_size, seq_info=seq_info,
+        )
+
     def publish_after_stop(
         self,
         request_id: str,
