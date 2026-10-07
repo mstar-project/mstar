@@ -40,6 +40,7 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     EdgeSpec,
     GraphRuntime,
+    RequestWalks,
     RouteInput,
     RouteOutput,
     SendInput,
@@ -1455,9 +1456,12 @@ class Worker:
         workers = self._graph_runtime.get_sharding_config(sample_rid).get_sharding_group(
             node_batch.node_name, ctx.walk_of(sample_rid)
         )._workers[1:]
-        request_walks = [
-            ctx.walk_of(r) for r in node_batch.request_ids
-        ] if ctx.request_walks else []
+        walks, walk_idx = [], []
+        if ctx.request_walks:
+            rows = RequestWalks.from_walks(
+                node_batch.request_ids, [ctx.walk_of(r) for r in node_batch.request_ids],
+            )
+            walks, walk_idx = rows.walks, rows.walk_idx
         for worker in workers:
             self.communicator.send(
                 worker, msg=WorkerMessage(
@@ -1470,7 +1474,8 @@ class Worker:
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
                         resident_delta=resident_delta.copy(),
-                        request_walks=request_walks,
+                        walks=walks,
+                        walk_idx=walk_idx,
                     )
                 )
             )
@@ -1989,7 +1994,8 @@ class Worker:
         ]
 
     def _async_schedulable(self, batch: ScheduledBatch) -> bool:
-        return all(
+        """Any walk of the batch may speculate; the runtime skips the others."""
+        return any(
             self._graph_runtime.is_async_schedulable(batch.node_name, walk)
             for walk in batch.rids_by_walk()
         )
@@ -2238,21 +2244,22 @@ class Worker:
         """
         batch_N = pending.batch
 
-        # One sample rid per real walk; only the matched walk's rids continue.
-        # The runtime applies the async/TP-async eligibility filter; the
-        # loop-completion filter is per rid and lives in prep_spec_rids.
+        # One sample rid per real walk; only the chosen target's walk's rids
+        # continue. The runtime applies the async/TP-async eligibility filter,
+        # per walk; the loop-completion filter is per rid and lives in
+        # prep_spec_rids.
         groups = batch_N.rids_by_walk()
-        found = self._graph_runtime.speculate_node(
+        ready_for_spec = self._graph_runtime.speculate_node(
             batch_N.node_name, list(groups), [rids[0] for rids in groups.values()],
         )
-        if found is None:
+        if not ready_for_spec:
             return # no nodes can be speculated
-        graph_walk, ready_for_spec = found
-        rid = groups[graph_walk][0]
 
         # TODO: use the microscheduler to break ties when ready_for_spec
-        # contains multiple ready nodes
+        # contains multiple ready nodes or walks
         spec_target_info = ready_for_spec[0]
+        graph_walk = spec_target_info.graph_walk
+        rid = groups[graph_walk][0]
         spec_node_name = spec_target_info.node_name
         speculating_same_node = spec_node_name == batch_N.node_name
 
@@ -2412,7 +2419,7 @@ class Worker:
             for r in dropped:
                 speculation.node_batch.per_request_input_tensors.pop(r, None)
                 speculation.node_batch.per_request_info.pop(r, None)
-                speculation.scheduled_batch.request_to_worker_graph.pop(r, None)
+                speculation.scheduled_batch.discard_rid(r)
                 speculation.node_batch.per_request_input_metadata.pop(r, None)
                 # Its final chunks go back below; it must not flush or report done.
                 speculation.node_batch.final_stream_rids.discard(r)
@@ -2457,13 +2464,13 @@ class Worker:
         batch_N = pending.batch
         # The leader names its rids by wire string; these are this rank's handles.
         head_rids = self.scheduler.tp_rids(head)
-        head_walks = dict(zip(head_rids, head.request_walks or [head.graph_walk] * len(head_rids), strict=True))
+        head_walk_idx = dict(zip(head_rids, head.walk_idx, strict=True)) if head.walks else None
         in_batch = batch_N.request_to_worker_graph
         continuing = [r for r in head_rids if r in in_batch]
         fresh = [r for r in head_rids if r not in in_batch]
         if not continuing:
             return None
-        spec_walk = head_walks[continuing[0]]
+        spec_walk = head.walks[head_walk_idx[continuing[0]]] if head.walks else head.graph_walk
         # The leader already chose the target; this just reports its loop
         # context. speculate_node's eligibility filter cannot run here -- it
         # requires the node be a parallel LEADER node.
@@ -2486,7 +2493,8 @@ class Worker:
         # successful all-or-nothing prep to unwind, with no API for it.
         popped = self.scheduler.pop_ready_rids(
             self.request_state, head.node_name, head.graph_walk, fresh,
-            request_walks=[head_walks[r] for r in fresh] if head.request_walks else None,
+            walks=head.walks or None,
+            walk_idx=[head_walk_idx[r] for r in fresh] if head.walks else None,
         )
 
         def _return_all_polled() -> None:
@@ -2574,7 +2582,9 @@ class Worker:
             new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, continuing,
             is_same_node=True, spec_id=prep.spec_id, tp_seq=head.spec_seq,
-            request_walks=head_walks,
+            request_walks={
+                r: head.walks[w] for r, w in head_walk_idx.items()
+            } if head.walks else None,
         )
 
     # How many "no speculative head from step s" seqs a follower remembers.
@@ -2742,7 +2752,7 @@ class Worker:
             for stopped_rid in stopped_rids:
                 outputs.pop(stopped_rid, None)
                 valid_rids.discard(stopped_rid)
-                batch_N.batch.request_to_worker_graph.pop(stopped_rid, None)
+                batch_N.batch.discard_rid(stopped_rid)
                 batch_N.node_batch.per_request_info.pop(stopped_rid, None)
         # keep the forward's order: other code walks this list positionally
         batch_N.node_batch.request_ids = [
@@ -2761,7 +2771,7 @@ class Worker:
         # the routing/output loops below only touch rids that produced outputs.
         for rid in list(batch_N.batch.request_to_worker_graph):
             if rid not in valid_rids:
-                batch_N.batch.request_to_worker_graph.pop(rid, None)
+                batch_N.batch.discard_rid(rid)
 
         _pp_stage("pending_loop_stops")
         if self.enable_nvtx:
@@ -3295,7 +3305,7 @@ class Worker:
         """
         for rid in failed_requests:
             outputs.pop(rid, None)
-            pending.batch.request_to_worker_graph.pop(rid, None)
+            pending.batch.discard_rid(rid)
             pending.node_batch.per_request_info.pop(rid, None)
             # Clear what we just reported, so a later stage that fails more
             # rids (check_stop, below the forward) can tell its own from these

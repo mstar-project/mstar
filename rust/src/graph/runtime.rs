@@ -533,6 +533,9 @@ pub struct GraphRuntime {
             return vec![];
         };
         let Some(source) = self.nid(wg, node_name) else { return vec![] };
+        if !self.graphs[wg as usize].node(source).async_enabled {
+            return vec![]; // this walk's node opts out of async scheduling
+        }
         let Some(spec_nodes) = self.spec_targets(wg, source, sample_rid) else {
             return vec![];
         };
@@ -1051,7 +1054,12 @@ pub struct PopRidsOut {
     #[pyo3(get)] pub wg_ids: Vec<u32>,
     /// The node's output edge names, sorted and deduped. Reported by the POP
     /// so the caller does not cross back once per forward pass just to ask.
+    /// The first walk's, under a multi-walk pop.
     #[pyo3(get)] pub output_signals: Vec<String>,
+    /// Multi-walk pop only: each popped rid's index into the walks, and each
+    /// walk's output edge names.
+    #[pyo3(get)] pub rid_walk_idx: Vec<u32>,
+    #[pyo3(get)] pub walk_output_signals: Vec<Vec<String>>,
     /// The ready inputs as columns; see `EdgeColumns`. Flattened on rather
     /// than nested, because a `#[pyo3(get)]` on a pyclass field clones it.
     #[pyo3(get)] pub signal_names: Vec<String>,
@@ -1993,12 +2001,37 @@ impl GraphRuntime {
         request_ids: Vec<u32>,
         check_ready: bool,
     ) -> Option<PopRidsOut> {
-        let wg = self.owner_of(node_name, graph_walk)?;
-        let node = self.nid(wg, node_name)?;
-        let wg_id = self.wg_ids[wg as usize];
+        let n = request_ids.len();
+        self.pop_walk_rids(
+            node_name, vec![graph_walk.to_string()], request_ids, vec![0; n], check_ready,
+        )
+    }
+
+    /// `pop_rids` for rids of several walks of one node, in one call: rid `i`
+    /// runs walk `graph_walks[rid_walk_idx[i]]`. All or none under
+    /// `check_ready`, across every walk.
+    #[pyo3(signature = (node_name, graph_walks, request_ids, rid_walk_idx, check_ready = false))]
+    fn pop_walk_rids(
+        &mut self,
+        node_name: &str,
+        graph_walks: Vec<String>,
+        request_ids: Vec<u32>,
+        rid_walk_idx: Vec<u32>,
+        check_ready: bool,
+    ) -> Option<PopRidsOut> {
+        if request_ids.len() != rid_walk_idx.len() {
+            return None;
+        }
+        // (worker graph, node) per walk; a walk this worker does not own pops nothing
+        let mut targets = Vec::with_capacity(graph_walks.len());
+        for walk in &graph_walks {
+            let wg = self.owner_of(node_name, walk)?;
+            targets.push((wg, self.nid(wg, node_name)?));
+        }
 
         if check_ready {
-            for &rid in &request_ids {
+            for (&rid, &w) in request_ids.iter().zip(&rid_walk_idx) {
+                let (wg, node) = *targets.get(w as usize)?;
                 let ready = self.state(wg, rid)
                     .is_some_and(|s| s.is_ready(node));
                 if !ready {
@@ -2008,24 +2041,30 @@ impl GraphRuntime {
         }
 
         let mut out = PopRidsOut::default();
-        // Structural: the same for every rid in the batch.
-        out.output_signals = {
-            let g = self.g(wg).clone();
-            let mut v: Vec<String> = g
-                .node(node)
-                .outputs
-                .iter()
-                .map(|e| self.interner.name(e.name).to_string())
-                .collect();
-            v.sort();
-            v.dedup();
-            v
-        };
+        // Structural: the same for every rid of a walk.
+        out.walk_output_signals = targets
+            .iter()
+            .map(|&(wg, node)| {
+                let g = self.g(wg).clone();
+                let mut v: Vec<String> = g
+                    .node(node)
+                    .outputs
+                    .iter()
+                    .map(|e| self.interner.name(e.name).to_string())
+                    .collect();
+                v.sort();
+                v.dedup();
+                v
+            })
+            .collect();
+        out.output_signals = out.walk_output_signals.first().cloned().unwrap_or_default();
         // Columns, filled as the edges are found. `next_node` is not carried:
         // it is `node_name`, the same for every edge, and nothing downstream
         // of a pop reads it.
         let mut cols = EdgeColumns::default();
-        for rid in request_ids {
+        for (rid, w) in request_ids.into_iter().zip(rid_walk_idx) {
+            let Some(&(wg, node)) = targets.get(w as usize) else { continue };
+            let wg_id = self.wg_ids[wg as usize];
             let Some(state) = self.state_mut(wg, rid) else {
                 continue;
             };
@@ -2033,6 +2072,7 @@ impl GraphRuntime {
             let inputs = state.input_tensors(node, false);
             out.rids.push(rid);
             out.wg_ids.push(wg_id);
+            out.rid_walk_idx.push(w);
             for (name, tensors, final_chunk) in inputs {
                 cols.push(
                     &self.interner, rid, name,
@@ -2048,24 +2088,23 @@ impl GraphRuntime {
 
     /// Which nodes could run next, after the current node's outputs land.
     ///
-    /// Takes one sample rid per walk in the batch; the first walk with a
-    /// target wins. Filters for async eligibility; the per-rid
-    /// loop-completion filter lives in prep_spec_rids.
+    /// Takes one sample rid per walk in the batch and returns every walk's
+    /// targets, each naming its walk; the caller picks. Filters for async
+    /// eligibility, per walk; the per-rid loop-completion filter lives in
+    /// prep_spec_rids.
     fn speculate_node(
         &mut self, node_name: &str, graph_walks: Vec<String>, sample_rids: Vec<u32>,
-    ) -> PyResult<Option<(String, Vec<(String, String, bool, Option<String>, Vec<String>)>)>> {
+    ) -> PyResult<Vec<(String, String, bool, Option<String>, Vec<String>)>> {
         if graph_walks.len() != sample_rids.len() {
             return Err(PyValueError::new_err(
                 "speculate_node: graph_walks and sample_rids differ in length",
             ));
         }
-        for (walk, rid) in graph_walks.into_iter().zip(sample_rids) {
-            let out = self.speculate_walk(node_name, &walk, rid);
-            if !out.is_empty() {
-                return Ok(Some((walk, out)));
-            }
-        }
-        Ok(None)
+        Ok(graph_walks
+            .into_iter()
+            .zip(sample_rids)
+            .flat_map(|(walk, rid)| self.speculate_walk(node_name, &walk, rid))
+            .collect())
     }
 
     /// The loop context of a target chosen elsewhere.

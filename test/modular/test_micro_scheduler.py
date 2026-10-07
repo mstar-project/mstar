@@ -31,6 +31,7 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     PopRidsOutput,
     ReadyNodeSpec,
+    RequestWalks,
 )
 from mstar.utils.containers import ParallelList
 from mstar.worker.batch_builder import (
@@ -117,25 +118,36 @@ class _Runtime:
         return "wg0"
 
     def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):
-        self._manager.pops.append((graph_walk, list(request_ids)))
-        assert all(self._manager.walk_of(r) == graph_walk for r in request_ids), (
-            "pop_rids resolves one worker graph per walk"
+        return self.pop_walk_rids(
+            node_name, RequestWalks(request_ids, [graph_walk], [0] * len(request_ids)),
+            check_ready,
         )
+
+    def pop_walk_rids(self, node_name, rows, check_ready=False):
+        self._manager.pops.append((tuple(rows.walks), list(rows.rids)))
+        assert all(
+            self._manager.walk_of(r) == rows.walks[w]
+            for r, w in zip(rows.rids, rows.walk_idx, strict=True)
+        ), "each rid pops under its own walk's worker graph"
         queue = self._manager.queues["wg0"]
         if check_ready:
             ready = queue.get_ready_node_names()
-            for rid in request_ids:
+            for rid in rows.rids:
                 if node_name not in ready.get(rid, ()):
                     return None
-        rids, wg_ids = [], []
-        for rid in request_ids:
+        rids, wg_ids, walk_idx = [], [], []
+        for rid, w in zip(rows.rids, rows.walk_idx, strict=True):
             if queue.pop_ready_nodes(rid, [node_name]):
                 rids.append(rid)
                 wg_ids.append("wg0")
+                walk_idx.append(w)
+        signals = tuple((f"out_{walk}",) for walk in rows.walks)
         return PopRidsOutput(
             wg_ids=ParallelList(rids, wg_ids),
             input_edges=_edge_block(rids),
-            output_signals=(f"out_{graph_walk}",),
+            output_signals=signals[0],
+            rid_walk_idx=walk_idx,
+            walk_output_signals=signals,
         )
 
     def get_nodes(self, node_name, rids, wg_ids):
@@ -1027,7 +1039,7 @@ def test_a_combined_walk_batches_its_walks_together():
 
     assert batch.graph_walk == MIXED
     assert batch.request_walks == {"p0": "prefill", "d0": WALK, "d1": WALK}
-    assert sorted(walk for walk, _ in manager.pops) == ["decode", "prefill"]
+    assert [sorted(walks) for walks, _ in manager.pops] == [["decode", "prefill"]]  # one call
 
 
 def test_a_combined_batch_of_one_walk_keeps_its_real_label():
@@ -1088,11 +1100,13 @@ def test_a_follower_pops_each_walk_of_a_combined_head():
     sched.runtime = manager.runtime
 
     popped = sched.pop_ready_rids(
-        manager, NODE, MIXED, ["p0", "d0"], request_walks=["prefill", WALK],
+        manager, NODE, MIXED, ["p0", "d0"], walks=["prefill", WALK], walk_idx=[0, 1],
     )
 
     assert set(popped.wg_ids) == {"p0", "d0"}
     assert popped.request_walks == {"p0": "prefill", "d0": WALK}
+    assert popped.walk_output_signals == {"prefill": ["out_prefill"], WALK: [f"out_{WALK}"]}
+    assert len(manager.pops) == 1
 
 
 def test_a_follower_pop_is_all_or_none_across_walks():
@@ -1102,7 +1116,7 @@ def test_a_follower_pop_is_all_or_none_across_walks():
     sched.runtime = manager.runtime
 
     assert sched.pop_ready_rids(
-        manager, NODE, MIXED, ["p0", "d0"], request_walks=["prefill", WALK],
+        manager, NODE, MIXED, ["p0", "d0"], walks=["prefill", WALK], walk_idx=[0, 1],
     ) is None
     assert "p0" in manager.queues["wg0"].get_ready_node_names()
 
