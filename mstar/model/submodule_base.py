@@ -250,6 +250,20 @@ def _split_pos_ids(
     return pos_ids[..., start:end]
 
 
+class ChunkedPrefillOutputMode(Enum):
+    # each tensor torch.cat across the chunks along `dim`: the unchunked output
+    CONCAT = "concat"
+    # every chunk's tensors in chunk order, for a consumer that takes the pieces
+    LIST = "list"
+
+
+@dataclass(frozen=True)
+class ChunkedPrefillOutputPolicy:
+    """How a chunked node's output edge is put back together at its final chunk."""
+    mode: ChunkedPrefillOutputMode = ChunkedPrefillOutputMode.CONCAT
+    dim: int = 0
+
+
 class InputSeqLenInfo(NamedTuple):
     """A row's token count before ``prepare_inputs``, for admission."""
     seq_len: int
@@ -545,6 +559,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         del graph_walk, per_request_info, per_request_input_metadata, kwargs
         return None
+
+    def get_chunked_prefill_output_policies(
+        self, graph_walk: str,
+    ) -> dict[str, ChunkedPrefillOutputPolicy]:
+        """Output edge -> how its chunks are joined; unlisted edges CONCAT on dim 0."""
+        del graph_walk
+        return {}
 
     def supports_chunked_prefill(self, graph_walk: str) -> bool:
         """Whether this walk's inputs may be split across forward passes

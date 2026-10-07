@@ -47,6 +47,7 @@ from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
     BatchedModelOutput,
+    ChunkedPrefillOutputPolicy,
     HostRows,
     InputMetadata,
     InputSeqLenInfo,
@@ -252,6 +253,8 @@ class ExecutingBatch:
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
+    # rid -> the tokens it runs this step, once prepared
+    input_seq_lens: dict[int, int] = field(default_factory=dict)
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[str] = field(default_factory=set)
@@ -322,6 +325,10 @@ class ExecutingBatch:
 
     def register_prepare_batch(self, inputs: list[NodeInputs]):
         self.inputs = inputs
+
+    def seq_len_of(self, rid: int) -> int:
+        """The tokens ``rid`` runs this step; -1 before it is prepared."""
+        return self.input_seq_lens.get(rid, -1)
 
     def release_waiters(self):
         """Let anything waiting on this step proceed.
@@ -411,6 +418,10 @@ class Engine:
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
+        # (node, walk) -> steps that ran over the walk's token budget
+        self._token_budget_overruns: dict[tuple[str, str], int] = {}
+        # (node, walk) -> the submodule's chunked output policies
+        self._chunk_output_policies: dict[tuple[str, str], dict[str, ChunkedPrefillOutputPolicy]] = {}
 
     def load_model(
         self,
@@ -720,6 +731,28 @@ class Engine:
             if self._enable_nvtx:
                 range_pop()
 
+    def _check_token_budget(
+        self, batch: ExecutingBatch, submodule, node_inputs: list[NodeInputs],
+    ) -> None:
+        """Warn when a step runs over its walk's token budget: the scheduler
+        sizes a speculation merge's continuing rows by guess, before their
+        inputs exist. Logged on the 1st, 2nd, 4th, ... overrun per walk."""
+        walk = batch.step_context.graph_walk
+        budget = submodule.max_batch_tokens(walk)
+        if budget is None:
+            return
+        total = sum(inp.input_seq_len for inp in node_inputs)
+        if total <= budget:
+            return
+        key = (batch.node_name, walk)
+        count = self._token_budget_overruns[key] = self._token_budget_overruns.get(key, 0) + 1
+        if count & (count - 1) == 0:
+            logger.warning(
+                "%s/%s: step of %d tokens over its budget of %d (%d overruns so far); "
+                "a speculation merge's continuing rows ran more tokens than their last step",
+                batch.node_name, walk, total, budget, count,
+            )
+
     def _prepare_inputs(self, batch: ExecutingBatch) -> None:
         submodule = self._submodules[batch.node_name].submodule
         node_inputs: list[NodeInputs] = []
@@ -733,6 +766,7 @@ class Engine:
                         batch.skipped_rids.add(rid)
                     else:
                         node_inputs.append(req_inputs)
+                        batch.input_seq_lens[rid] = req_inputs.input_seq_len
                     continue
                 req_inputs = submodule.prepare_inputs(
                     graph_walk=walk,
@@ -759,8 +793,10 @@ class Engine:
                 batch.skipped_rids.add(rid)
             else:
                 node_inputs.append(req_inputs)
+                batch.input_seq_lens[rid] = req_inputs.input_seq_len
 
         batch.register_prepare_batch(node_inputs)
+        self._check_token_budget(batch, submodule, node_inputs)
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
@@ -1632,6 +1668,19 @@ class Engine:
 
     def supports_chunked_prefill(self, node_name: str, graph_walk: str) -> bool:
         return self._submodules[node_name].submodule.supports_chunked_prefill(graph_walk)
+
+    def chunked_prefill_output_policies(
+        self, node_name: str, graph_walk: str,
+    ) -> dict[str, ChunkedPrefillOutputPolicy]:
+        """The submodule's, asked once per (node, walk)."""
+        key = (node_name, graph_walk)
+        policies = self._chunk_output_policies.get(key)
+        if policies is None:
+            submodule = self._submodules[node_name].submodule
+            policies = self._chunk_output_policies[key] = (
+                submodule.get_chunked_prefill_output_policies(graph_walk)
+            )
+        return policies
 
     def declares_input_sequence_len(self, node_name: str) -> bool:
         """Whether the node's submodule reports row lengths before prepare."""

@@ -2343,6 +2343,11 @@ class Worker:
             target=spec_target,
             pre_existing_batch_size=len(continuing),
             capture_group_of=prep.ready_rids[0],
+            # this step's lengths predict a loop-back's; another node's say nothing
+            pre_existing_seq_lens=[
+                batch_N.node_batch.seq_len_of(r) if speculating_same_node else -1
+                for r in continuing
+            ],
         )
 
         if fresh_batch is not None:
@@ -2989,9 +2994,14 @@ class Worker:
                 batch.discard_rid(rid)
                 self._graph_runtime.push_back_node(node, [rid], [wg_id])
             else:
-                self.engine_manager.get_engine(node).release_chunk_inputs(rid, node)
-                if rid in outputs:
-                    outputs[rid] = self.scheduler.chunk_outputs.release(rid, node, outputs[rid])
+                engine = self.engine_manager.get_engine(node)
+                engine.release_chunk_inputs(rid, node)
+                merged = self.scheduler.chunk_outputs.release(
+                    rid, node, outputs.get(rid, {}),
+                    engine.chunked_prefill_output_policies(node, batch.walk_of(rid)),
+                )
+                if merged or rid in outputs:
+                    outputs[rid] = merged
         held = batch.incomplete_node_rids
         batch_N.node_batch.request_ids = [
             rid for rid in batch_N.node_batch.request_ids if rid not in held
