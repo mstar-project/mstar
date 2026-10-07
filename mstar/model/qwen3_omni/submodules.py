@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
 from collections.abc import Mapping
@@ -565,12 +566,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
         }
 
         pos_advance = None
-        if graph_walk == "prefill_vision":
-            # The 3D-grid MRoPE span is larger than the token count; the
-            # commit advances the position counter by the declared span.
+        if "prefill_vision" in row_walks:
+            # A vision row's 3D-grid MRoPE span is larger than its token count,
+            # so it advances the counter by its own; other rows by their span.
             pos_advance = tuple(
                 int(inp.tensor_inputs.get("mrope_pos_advance", 0))
-                for inp in inputs
+                if walk == "prefill_vision" else inp.input_seq_len
+                for inp, walk in zip(inputs, row_walks, strict=True)
             )
         return SubmoduleStep(
             segments=[
@@ -624,36 +626,14 @@ class ThinkerSubmodule(ARNodeSubmodule):
         )
 
         extra_inputs = {}
-        if graph_walk == "prefill_vision":
-            assert len(inputs) == 1, \
-                "Batching not implemented for Thinker vision prefill"
-            inp = inputs[0]
+        if graph_walk == "prefill_vision" or any("deepstack" in inp.tensor_inputs for inp in inputs):
             # Q3(b): emit deepstack as separate keys ``deepstack_<i>`` so each
             # tensor gets its own static buffer in the captured config (the
             # runner's static-buffer interning is per-key and tensor-typed;
             # passing a list-of-tensors under one key would not get interned
             # and addresses captured into the graph would be stale at replay).
             # ``forward_batched``/``forward`` reassemble the list from kwargs.
-            num_deepstack = len(self.config.vision.deepstack_visual_indexes)
-            deepstack_list = inp.tensor_inputs.get("deepstack")
-            if deepstack_list is None or (
-                isinstance(deepstack_list, torch.Tensor) and deepstack_list.numel() == 0
-            ):
-                # Eager fallback / missing deepstack (shouldn't happen in
-                # normal vision prefill, but keep the path robust).
-                empty = torch.zeros(
-                    (inp.input_seq_len, self.config.thinker_hidden_size),
-                    dtype=input_embeds.dtype, device=device,
-                )
-                for i in range(num_deepstack):
-                    extra_inputs[f"deepstack_{i}"] = empty
-            else:
-                assert len(deepstack_list) == num_deepstack, (
-                    f"deepstack list length ({len(deepstack_list)}) does not match "
-                    f"vision.deepstack_visual_indexes ({num_deepstack})."
-                )
-                for i, t in enumerate(deepstack_list):
-                    extra_inputs[f"deepstack_{i}"] = t
+            extra_inputs = self._deepstack_inputs(inputs, input_embeds.dtype, device)
 
         return {
             "input_embeds": input_embeds,
@@ -666,6 +646,32 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     for (rid, inp) in zip(engine_inputs.request_ids, inputs, strict=True)
             },
             **extra_inputs
+        }
+
+    def _deepstack_inputs(
+        self, inputs: list[ARNodeInputs], dtype: torch.dtype, device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Each deepstack layer packed over the step's rows; a row with no
+        vision features (a text, audio or decode row beside a vision one)
+        contributes zeros, which the splice adds as nothing."""
+        num_deepstack = len(self.config.vision.deepstack_visual_indexes)
+        layers: list[list[torch.Tensor]] = [[] for _ in range(num_deepstack)]
+        for inp in inputs:
+            rows = inp.tensor_inputs.get("deepstack")
+            if rows is None or (isinstance(rows, torch.Tensor) and rows.numel() == 0):
+                zeros = torch.zeros(
+                    (inp.input_seq_len, self.config.thinker_hidden_size), dtype=dtype, device=device,
+                )
+                rows = [zeros] * num_deepstack
+            assert len(rows) == num_deepstack, (
+                f"deepstack list length ({len(rows)}) does not match "
+                f"vision.deepstack_visual_indexes ({num_deepstack})."
+            )
+            for layer, t in zip(layers, rows, strict=True):
+                layer.append(t)
+        return {
+            f"deepstack_{i}": layer[0] if len(layer) == 1 else torch.cat(layer)
+            for i, layer in enumerate(layers)
         }
 
     # ---- forward ----
@@ -778,11 +784,14 @@ class ThinkerSubmodule(ARNodeSubmodule):
     # because eager prefill_vision asserts a single request per step
     PREFILL_VISION_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
     PREFILL_VISION_CAPTURE_BATCH_SIZES = [1]
+    # mixed steps holding a vision row: coarse batch buckets, padded host-side
+    MIXED_VISION_CAPTURE_BATCH_SIZES = [4, 16, 32]
+    DEEPSTACK_KEY = "deepstack"
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[CudaGraphConfig]:
-        num_deepstack = len(self.config.vision.deepstack_visual_indexes)
+        vision_input = functools.partial(self._vision_capture_input, device)
         return [
             BatchedCudaGraphConfig(
                 capture_graph_walk="thinker_decode",
@@ -834,36 +843,63 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 replay_graph_walks=["prefill_vision"],
                 capture_token_lengths=self.PREFILL_VISION_TOKEN_BUCKETS,
                 capture_batch_sizes=self.PREFILL_VISION_CAPTURE_BATCH_SIZES,
-                make_node_input=lambda n: ARNodeInputs(
-                    input_seq_len=n,
-                    input_embeds=torch.zeros(
-                        (n, self.config.thinker_hidden_size),
-                        device=device, dtype=torch.bfloat16,
-                    ),
-                    custom_pos_ids=torch.zeros(
-                        (3, n),
-                        dtype=torch.float,
-                        device=device,
-                    ),
-                    tensor_inputs={
-                        "masks_for_talker": torch.zeros(
-                            (2, n), dtype=torch.float, device=device,
-                        ),
-                        # Use a list (matches eager prepare_inputs) — preprocess turns it
-                        # into per-layer ``deepstack_<i>`` keys.
-                        "deepstack": [
-                            torch.zeros(
-                                (n, self.config.thinker_hidden_size),
-                                dtype=torch.bfloat16, device=device,
-                            )
-                            for _ in range(num_deepstack)
-                        ],
-                        "mrope_pos_advance": n,
-                    },
-                )
-
-            )
+                make_node_input=vision_input,
+            ),
+            # a mixed step holding a vision row: the same packed forward, plus
+            # the deepstack features the plain mixed captures do not take
+            PackedCudaGraphConfig(
+                capture_graph_walk="prefill_vision",
+                replay_graph_walks=[THINKER_MIXED],
+                additional_key_info=self.DEEPSTACK_KEY,
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                capture_batch_sizes=self.MIXED_VISION_CAPTURE_BATCH_SIZES,
+                make_node_input=vision_input,
+            ),
         ]
+
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs,
+    ):
+        """A mixed step holding a vision row replays the deepstack captures."""
+        del per_request_input_metadata, kwargs
+        if graph_walk == THINKER_MIXED and any(
+            info.graph_walk == "prefill_vision" for info in per_request_info.values()
+        ):
+            return self.DEEPSTACK_KEY
+        return None
+
+    def _vision_capture_input(self, device: torch.device, n: int) -> ARNodeInputs:
+        num_deepstack = len(self.config.vision.deepstack_visual_indexes)
+        return ARNodeInputs(
+            input_seq_len=n,
+            input_embeds=torch.zeros(
+                (n, self.config.thinker_hidden_size),
+                device=device, dtype=torch.bfloat16,
+            ),
+            custom_pos_ids=torch.zeros(
+                (3, n),
+                dtype=torch.float,
+                device=device,
+            ),
+            tensor_inputs={
+                "masks_for_talker": torch.zeros(
+                    (2, n), dtype=torch.float, device=device,
+                ),
+                # Use a list (matches eager prepare_inputs) — preprocess turns it
+                # into per-layer ``deepstack_<i>`` keys.
+                "deepstack": [
+                    torch.zeros(
+                        (n, self.config.thinker_hidden_size),
+                        dtype=torch.bfloat16, device=device,
+                    )
+                    for _ in range(num_deepstack)
+                ],
+                "mrope_pos_advance": n,
+            },
+        )
 
     def forward_batched(
         self,
