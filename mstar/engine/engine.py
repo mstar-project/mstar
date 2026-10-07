@@ -422,6 +422,8 @@ class Engine:
         self._token_budget_overruns: dict[tuple[str, str], int] = {}
         # (node, walk) -> the submodule's chunked output policies
         self._chunk_output_policies: dict[tuple[str, str], dict[str, ChunkedPrefillOutputPolicy]] = {}
+        # the serving config's max_batch_tokens: node -> budget, (node, walk) -> budget; None is off
+        self._token_budget_overrides: dict[str | tuple[str, str], int | None] = {}
 
     def load_model(
         self,
@@ -738,7 +740,7 @@ class Engine:
         sizes a speculation merge's continuing rows by guess, before their
         inputs exist. Logged on the 1st, 2nd, 4th, ... overrun per walk."""
         walk = batch.step_context.graph_walk
-        budget = submodule.max_batch_tokens(walk)
+        budget = self._token_budget(batch.node_name, submodule, walk)
         if budget is None:
             return
         total = sum(inp.input_seq_len for inp in node_inputs)
@@ -1675,7 +1677,41 @@ class Engine:
         return min(capped) if capped else None
 
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
-        return self._submodules[node_name].submodule.max_batch_tokens(graph_walk)
+        return self._token_budget(node_name, self._submodules[node_name].submodule, graph_walk)
+
+    def _token_budget(self, node_name: str, submodule, graph_walk: str) -> int | None:
+        """The submodule's budget for the walk, unless the serving config overrides it."""
+        budget = submodule.max_batch_tokens(graph_walk)
+        if budget is None or not self._token_budget_overrides:
+            return budget
+        for key in ((node_name, graph_walk), node_name):
+            if key in self._token_budget_overrides:
+                return self._token_budget_overrides[key]
+        return budget
+
+    def set_token_budgets(self, overrides: Mapping[str, Any], walks: set[str]) -> None:
+        """Apply a serving config's ``max_batch_tokens`` to this engine's nodes.
+
+        Per node, one budget for every walk the model budgets, or a mapping of
+        walk -> budget; null turns chunking off. Only walks the submodule
+        budgets can be overridden: elsewhere the setting would do nothing.
+        """
+        for node, setting in overrides.items():
+            if node not in self._submodules:
+                continue
+            submodule = self._submodules[node].submodule
+            per_walk = setting if isinstance(setting, Mapping) else None
+            for walk, budget in (per_walk or {None: setting}).items():
+                if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget < 1):
+                    raise ValueError(f"max_batch_tokens for {node}: {budget!r} is not a positive int or null")
+                if walk is None:
+                    self._token_budget_overrides[node] = budget
+                    continue
+                if walk not in walks:
+                    raise ValueError(f"max_batch_tokens names walk {walk!r} of {node}, which the model never runs")
+                if submodule.max_batch_tokens(walk) is None:
+                    raise ValueError(f"max_batch_tokens for {node}/{walk}: the model sets no budget there to override")
+                self._token_budget_overrides[(node, walk)] = budget
 
     def supports_chunked_prefill(self, node_name: str, graph_walk: str) -> bool:
         return self._submodules[node_name].submodule.supports_chunked_prefill(graph_walk)
