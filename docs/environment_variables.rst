@@ -295,6 +295,14 @@ Worker scheduling
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
        thread.
+   * - ``MSTAR_LAZY_PUBLISH``
+     - ``1``
+     - Publish resource state (KV pages, positions) only for the requests
+       whose frame or completion carries it: ``finalize_batch`` keeps a
+       cheap per-request snapshot and the worker finishes it on demand.
+       ``0`` builds the full publication for every request on every step,
+       the old behaviour; it was a quarter of the GPU thread's host time at
+       batch 32 in a decode loop that never reads it.
    * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
