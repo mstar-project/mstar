@@ -535,8 +535,7 @@ def test_push_back_makes_a_popped_node_ready_again(runtime):
 
 
 def _spec_targets(runtime, node, walk, rid):
-    found = runtime.speculate_node(node, [walk], [rid])
-    return [] if found is None else found[1]
+    return runtime.speculate_node(node, [walk], [rid])
 
 
 # --- speculation -------------------------------------------------------------

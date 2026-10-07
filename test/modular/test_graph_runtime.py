@@ -760,8 +760,7 @@ def test_an_unread_loop_back_is_not_routed():
 
 
 def _spec_targets(runtime, node, walk, rid):
-    found = runtime.speculate_node(node, [walk], [rid])
-    return [] if found is None else found[1]
+    return runtime.speculate_node(node, [walk], [rid])
 
 
 # --- speculate_node -----------------------------------------------------------
@@ -788,6 +787,19 @@ def test_speculate_node_skips_a_target_that_opted_out_of_async():
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
     wgio = runtime._queues[0].per_request_queues[rid]
     wgio.nodes["ar_decode"].enable_async_scheduling = False
+
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
+
+
+def test_speculate_node_skips_a_walk_whose_source_opted_out_of_async():
+    """Checked per walk, so a mixed batch can still speculate its other walks."""
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+    wgio = runtime._queues[0].per_request_queues[rid]
+    wgio.nodes["prefill"].enable_async_scheduling = False
 
     assert _spec_targets(runtime, "prefill", "decode", rid) == []
 
@@ -819,16 +831,17 @@ def test_speculate_node_refuses_a_parallel_target_without_tp_async():
     assert _spec_targets(runtime, "prefill", "decode", rid) == []
 
 
-def test_speculate_node_takes_the_first_walk_with_a_target():
+def test_speculate_node_returns_every_walks_targets():
+    """A walk whose sample rid has no target adds nothing; each target names
+    its walk, and the caller picks."""
     mgr, runtime, rid = _build(
         _make_ar_walk_graph(), 0, "decode",
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
 
-    walk, out = runtime.speculate_node("prefill", ["decode", "decode"], [rid + 999, rid])
-    assert walk == "decode"
-    assert [o.node_name for o in out] == ["ar_decode"]
+    out = runtime.speculate_node("prefill", ["decode", "decode"], [rid + 999, rid])
+    assert [(o.node_name, o.graph_walk) for o in out] == [("ar_decode", "decode")]
 
 
 def test_speculate_node_returns_nothing_for_an_unknown_rid():

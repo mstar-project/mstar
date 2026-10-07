@@ -357,6 +357,24 @@ class PopRidsOutput(NamedTuple):
     # carries. Trailing with a default so a caller that does not need them can
     # leave it off.
     output_signals: tuple[str, ...] = ()
+    # Multi-walk pop only: each popped rid's index into the walks, and each
+    # walk's output edge names.
+    rid_walk_idx: list[int] = []
+    walk_output_signals: tuple[tuple[str, ...], ...] = ()
+
+
+class RequestWalks(NamedTuple):
+    """Rows of several walks of one node, columnar: rid ``rids[i]`` runs
+    ``walks[walk_idx[i]]``."""
+    rids: list[int]
+    walks: list[str]
+    walk_idx: list[int]
+
+    @classmethod
+    def from_walks(cls, rids: list[int], row_walks: list[str]) -> "RequestWalks":
+        index: dict[str, int] = {}
+        walk_idx = [index.setdefault(walk, len(index)) for walk in row_walks]
+        return cls(list(rids), list(index), walk_idx)
 
 
 class SpeculationPrepInput(NamedTuple):
@@ -701,6 +719,15 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
+    def pop_walk_rids(
+        self, node_name: str, rows: "RequestWalks", check_ready: bool = False,
+    ) -> PopRidsOutput | None:
+        """``pop_rids`` for rows of several walks of one node in one call,
+        all or none across every walk under ``check_ready``. Fills
+        ``rid_walk_idx`` and ``walk_output_signals``."""
+        pass
+
+    @abstractmethod
     def has_ready_excluding(
         self, exclude_rids: set[int],
         exclude_target: tuple[str, str] | None=None,
@@ -742,11 +769,12 @@ class GraphRuntime(ABC):
         self, node_name: str,
         graph_walks: list[str],
         sample_rids: list[int],
-    ) -> tuple[str, list[SpeculationOutput]] | None:
+    ) -> list[SpeculationOutput]:
         """
         The nodes ready for speculation, checking against whether the node is
-        async enabled (known internally) and TP async compatible. Takes one
-        sample rid per walk; returns the first walk with a target and its targets.
+        async enabled (known internally, per walk) and TP async compatible.
+        Takes one sample rid per walk; returns every walk's targets, each
+        naming its walk, for the caller to pick from.
         """
         pass
 

@@ -41,6 +41,7 @@ from mstar.graph.runtime.base import (
     PopRidsOutput,
     Profiling,
     ReadyNodeSpec,
+    RequestWalks,
     RouteInput,
     RouteOutput,
     SendInput,
@@ -435,6 +436,22 @@ class RustGraphRuntime(GraphRuntime):
             output_signals=tuple(out.output_signals),
         )
 
+    def pop_walk_rids(
+        self, node_name: str, rows: RequestWalks, check_ready: bool = False,
+    ) -> PopRidsOutput | None:
+        out = self._rust.pop_walk_rids(
+            node_name, list(rows.walks), list(rows.rids), list(rows.walk_idx), check_ready,
+        )
+        if out is None:
+            return None
+        return PopRidsOutput(
+            wg_ids=ParallelList(out.rids, out.wg_ids),
+            input_edges=_columns(out),
+            output_signals=tuple(out.output_signals),
+            rid_walk_idx=out.rid_walk_idx,
+            walk_output_signals=tuple(tuple(s) for s in out.walk_output_signals),
+        )
+
     def has_ready_excluding(
         self, exclude_rids: set[int],
         exclude_target: tuple[str, str] | None = None,
@@ -459,18 +476,16 @@ class RustGraphRuntime(GraphRuntime):
 
     def speculate_node(
         self, node_name: str, graph_walks: list[str], sample_rids: list[int],
-    ) -> tuple[str, list[SpeculationOutput]] | None:
-        found = self._rust.speculate_node(node_name, graph_walks, sample_rids)
-        if found is None:
-            return None
-        walk, targets = found
-        return walk, [
+    ) -> list[SpeculationOutput]:
+        return [
             SpeculationOutput(
                 node_name=n, graph_walk=w,
                 is_new_loop_iter=new_iter, loop_name=loop_name,
                 output_signals=tuple(signals),
             )
-            for n, w, new_iter, loop_name, signals in targets
+            for n, w, new_iter, loop_name, signals in self._rust.speculate_node(
+                node_name, graph_walks, sample_rids,
+            )
         ]
 
     def get_spec_target(
