@@ -307,6 +307,15 @@ class ExecutingBatch:
                 ),
             ) for rid, info in self.per_request_info.items()
         }
+        # rows whose streamed input came from a producer mid-walk (a chunked
+        # prefill's non-final chunk): the step does not finish their walk
+        self.incomplete_walk_rids = {
+            rid for rid, meta in self.per_request_input_metadata.items()
+            if any(not chunk.finished_graph_walk for chunk in meta.stream_chunks.values())
+        }
+
+    def completes_walk(self, rid: int) -> bool:
+        return rid not in self.incomplete_walk_rids
 
     @property
     def request_ids(self):

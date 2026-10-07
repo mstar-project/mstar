@@ -946,7 +946,7 @@ class Worker:
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
                 for info in edge.tensor_info:
-                    stream_buf.pre_read_register(info.uuid)
+                    stream_buf.pre_read_register(info.uuid, edge.finished_graph_walk)
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("process_new_inputs.process_inputs")
@@ -1056,6 +1056,7 @@ class Worker:
                     name=edge_name,
                     tensor_info=[],
                     _final_stream_chunk=chunk.is_final,
+                    finished_graph_walk=chunk.finished_graph_walk,
                 )
             else:
                 # Normal chunk — store tensor and create edge with tensor_info.
@@ -1074,6 +1075,7 @@ class Worker:
                     name=edge_name,
                     tensor_info=tensor_infos.get(edge_name, []),
                     _final_stream_chunk=chunk.is_final,
+                    finished_graph_walk=chunk.finished_graph_walk,
                 )
             return StreamingEdge(synthetic_edge, chunk.info)
         return None

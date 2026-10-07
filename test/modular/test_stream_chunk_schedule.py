@@ -133,7 +133,7 @@ def test_returned_streaming_edge_keeps_its_chunk_info():
 def test_chunk_info_matches_chunk():
     chunks = _drive(LeftContextChunkPolicy(chunk=4, left_context=1), total_items=10)
     for c in chunks:
-        assert c.info == (c.start_offset, c.context_items, c.num_items, c.is_final)
+        assert c.info == (c.start_offset, c.context_items, c.num_items, c.is_final, c.finished_graph_walk)
 
 
 def test_primed_stream_delivers_its_lead_as_first_window_context():

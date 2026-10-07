@@ -76,6 +76,9 @@ class GraphEdge:
     # set on a synthetic streaming-input edge carrying the final chunk, so the
     # consuming pass (not the earlier ingest) reports the partition done
     _final_stream_chunk: bool = field(default=False)
+    # False on a chunked prefill's non-final chunk, streamed early to a
+    # consumer that opted into ``ChunkPolicy.allow_partial_input``
+    finished_graph_walk: bool = field(default=True)
 
     # Set for sharded configurations
     _total_fanin: int = 1
@@ -92,6 +95,7 @@ class GraphEdge:
             output_modality=self.output_modality,
             _persist_for_loop=self._persist_for_loop,
             _final_stream_chunk=self._final_stream_chunk,
+            finished_graph_walk=self.finished_graph_walk,
         )
 
 
