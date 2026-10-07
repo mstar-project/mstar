@@ -2835,18 +2835,22 @@ class Worker:
 
         # Ordinary publication precedes stop detection on the GPU thread.
         # Export final-only state now, after the last iteration committed and
-        # before routing reports the completed loop to the conductor.
+        # before routing reports the completed loop to the conductor. The
+        # ordinary publication of a stopping request is finished first, so the
+        # completion carries both, as it did when every step published.
         if stopped_rids:
+            engine.materialize_publish(batch_N.node_batch, stopped_rids)
             engine.finalize_stopped_requests(batch_N.node_batch, stopped_rids)
 
         # CurrentForwardPassInfo also contains publication inherited from peer
         # ranks. Buffer only what this worker produced for the conductor.
-        for rid in batch_N.node_batch.request_ids:
-            self.request_state.buffer_publish_info(
-                rid,
-                batch_N.partition,
-                batch_N.node_batch.resource_publish_info.get(rid, {}),
-            )
+        buffered_publish: set[int] = set()
+        for rid, published in batch_N.node_batch.resource_publish_info.items():
+            if published:
+                self.request_state.buffer_publish_info(
+                    rid, batch_N.partition, published,
+                )
+                buffered_publish.add(rid)
 
         _pp_stage("stop_loops")
         if self.enable_nvtx:
@@ -2984,6 +2988,19 @@ class Worker:
             send_rids if needs_info is None
             else [rid for rid in send_rids if rid in needs_info]
         )
+        # A frame to a peer or the conductor carries this step's publication:
+        # finish the snapshot for those rids (the stopped ones already are).
+        if info_rids:
+            engine.materialize_publish(batch_N.node_batch, info_rids)
+            for rid in info_rids:
+                if rid in buffered_publish:
+                    continue
+                published = batch_N.node_batch.resource_publish_info.get(rid)
+                if published:
+                    self.request_state.buffer_publish_info(
+                        rid, batch_N.partition, published,
+                    )
+                    buffered_publish.add(rid)
         send_input = SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
