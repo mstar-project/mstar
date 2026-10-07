@@ -564,25 +564,38 @@ class ThinkerSubmodule(ARNodeSubmodule):
             )
 
     MAX_BATCH_TOKENS = 1024
+    # vision runs alone (bs=1 captures), so a larger chunk costs no decode rows a step
+    MAX_VISION_BATCH_TOKENS = 2048
 
     def supports_chunked_prefill(self, graph_walk: str) -> bool:
-        return graph_walk in ("prefill_text", "prefill_audio")
+        return graph_walk in ("prefill_text", "prefill_audio", "prefill_vision")
 
     def max_batch_tokens(self, graph_walk: str) -> int | None:
         if graph_walk in ("prefill_text", "prefill_audio", THINKER_MIXED):
             return self.MAX_BATCH_TOKENS
+        if graph_walk == "prefill_vision":
+            return self.MAX_VISION_BATCH_TOKENS
         return None
 
     def split_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
         inputs: ARNodeInputs, start: int, end: int,
     ) -> ARNodeInputs:
-        masks = inputs.tensor_inputs.get("masks_for_talker")
+        tensor_inputs = inputs.tensor_inputs
+        unknown = tensor_inputs.keys() - {"masks_for_talker", "deepstack", "mrope_pos_advance"}
+        if unknown:
+            raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
         cut = super().split_inputs(
             graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end,
         )
-        if masks is not None:
-            cut.tensor_inputs = {"masks_for_talker": masks[:, start:end]}  # (2, seq)
+        cut.tensor_inputs = {}
+        if (masks := tensor_inputs.get("masks_for_talker")) is not None:
+            cut.tensor_inputs["masks_for_talker"] = masks[:, start:end]  # (2, seq)
+        if (deepstack := tensor_inputs.get("deepstack")) is not None:
+            cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in deepstack]  # (seq, hidden)
+        if "mrope_pos_advance" in tensor_inputs:
+            # the whole span's; declare_step applies it on the final chunk
+            cut.tensor_inputs["mrope_pos_advance"] = tensor_inputs["mrope_pos_advance"]
         return cut
 
     def declare_step(
@@ -615,8 +628,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if "prefill_vision" in row_walks:
             # A vision row's 3D-grid MRoPE span is larger than its token count,
             # so it advances the counter by its own; other rows by their span.
+            # A chunk's positions were cut from the whole span's, so only a
+            # vision row's final chunk advances the counter.
             pos_advance = tuple(
-                int(inp.tensor_inputs.get("mrope_pos_advance", 0))
+                (int(inp.tensor_inputs.get("mrope_pos_advance", 0)) if inp.is_final_chunk else 0)
                 if walk == "prefill_vision" else inp.input_seq_len
                 for inp, walk in zip(inputs, row_walks, strict=True)
             )
