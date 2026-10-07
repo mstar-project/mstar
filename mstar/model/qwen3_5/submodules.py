@@ -486,6 +486,11 @@ class LLMSubmodule(ARNodeSubmodule):
         )
         return {"decode_loop"} if hit_eos or out_of_budget else set()
 
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        # the decode loop's client edge carries the sampled token the stop
+        # check already has on the host; prefill's new_token edge is persisted
+        return {"text_inputs": "new_token"} if graph_walk == "decode" else {}
+
     def check_stop_batched(
         self,
         request_ids: list[str],
