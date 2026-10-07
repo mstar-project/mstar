@@ -6,6 +6,7 @@
 import logging
 import os
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -900,6 +901,25 @@ class LLMSubmodule(ARNodeSubmodule):
             return InputSeqLenInfo(1)
         return None
 
+    MAX_BATCH_TOKENS = 1024
+
+    def supports_chunked_prefill(self, graph_walk: str) -> bool:
+        return graph_walk == "prefill_text"
+
+    def max_batch_tokens(self, graph_walk: str) -> int | None:
+        return self.MAX_BATCH_TOKENS if graph_walk in ("prefill_text", MIXED_TEXT) else None
+
+    def split_inputs(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: ARNodeInputs, start: int, end: int,
+    ) -> ARNodeInputs:
+        # resource_step_info is the row's requires_cfg flag, the same for every chunk
+        cut = super().split_inputs(
+            graph_walk, fwd_info, replace(inputs, resource_step_info=None), start, end,
+        )
+        cut.resource_step_info = inputs.resource_step_info
+        return cut
+
     def declare_step(
         self,
         graph_walk: str,
@@ -980,12 +1000,17 @@ class LLMSubmodule(ARNodeSubmodule):
 
         pre_forks: tuple = ()
         post_forks: tuple = ()
+        fork_rids = None
         row_walks = [inp.graph_walk or graph_walk for inp in inputs]
         if requires_cfg:
             if "prefill_text" in row_walks:
                 # cfg_text keeps the pre-text context, so it forks before
-                # anything plans or writes.
-                pre_forks = (("main", "cfg_text"),)
+                # anything plans or writes: a chunked prompt, on its first chunk
+                fork_rids = frozenset(
+                    rid for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
+                    if walk == "prefill_text" and inp.chunk_start == 0
+                )
+                pre_forks = (("main", "cfg_text"),) if fork_rids else ()
             elif graph_walk in ("prefill_vit", "prefill_vae"):
                 # cfg_text tracks the context including this image, so it
                 # forks at commit, after the step's writes have landed.
@@ -1027,6 +1052,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 commit=writes,
                 pre_forks=pre_forks,
                 post_forks=post_forks,
+                fork_rids=fork_rids,
             ),
             "attn": AttentionStep(
                 segments=segments,
@@ -1590,8 +1616,10 @@ class LLMSubmodule(ARNodeSubmodule):
     ):
         if "new_token" not in outputs:
             return
+        inputs = kwargs.get("inputs")
         if request_info.graph_walk != "decode" and (
             not request_info.step_metadata.get("sample_prefill_token", False)
+            or (inputs is not None and not inputs.is_final_chunk)  # only the last chunk's token is real
         ):
             outputs.pop("new_token")
             return
