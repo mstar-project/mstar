@@ -49,3 +49,20 @@ def test_shipped_config_prefill_steps_fit_the_largest_bucket(name):
     path = Path(__file__).resolve().parents[2] / "configs" / name
     kwargs = yaml.safe_load(path.read_text())["model_kwargs"]
     assert _budget(**kwargs) == max(kwargs["prefill_batched_token_buckets"])
+
+
+def test_longctx_config_window_fits_its_pages():
+    """The long-context yaml builds the DSA path, and both caches hold a full window."""
+    import yaml
+
+    path = Path(__file__).resolve().parents[2] / "configs" / "glm52_tp8_longctx.yaml"
+    cfg = yaml.safe_load(path.read_text())
+    model = Glm52Model("", tokenizer_mode="byte", config_variant="full", **cfg["model_kwargs"])
+    assert model.config.dsa_long_context
+    assert model.config.dsa_shard_prefill
+    # every step of the captured prefill buckets runs in one pass, never in row chunks
+    assert _submodule(model.config).max_step_tokens("prefill") <= model.config.prefill_chunk_tokens
+    assert model.config.max_seq_len == cfg["max_seq_len"]
+    for key in ("kv", "kv_index"):
+        res = cfg["resources"][key]
+        assert res["max_num_pages"] * res["page_size"] >= model.config.max_seq_len
