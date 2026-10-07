@@ -135,11 +135,23 @@ class StepRunner:
                 rid, node_name, graph_walk, inputs, matched_len,
             )
 
+    def prefix_chain_keys(self, node_name: str | None) -> list[str]:
+        """The node's resources with a prefix cache open right now. Empty in
+        the common case, which lets the caller skip a per-request sweep that
+        was six no-op calls per request per step."""
+        return [
+            key for key in self._sweep(self._node_order, self._order, node_name)
+            if self._resources[key].keys_prefix_chains
+        ]
+
     def extend_prefix_chains(
         self, rid: str, node_name: str, graph_walk: str, outputs,
+        keys: list[str] | None = None,
     ) -> None:
         """Offer this step's sampled tokens to the node's own resources."""
-        for key in self._sweep(self._node_order, self._order, node_name):
+        if keys is None:
+            keys = self._sweep(self._node_order, self._order, node_name)
+        for key in keys:
             self._resources[key].extend_prefix_chain(
                 rid, node_name, graph_walk, outputs,
             )
