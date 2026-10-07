@@ -1486,7 +1486,7 @@ class Engine:
         )
         outputs: dict[str, NameToTensorList] = {}
 
-        self._merge_per_rid(
+        row_clones = self._merge_per_rid(
             outputs, raw_outputs, request_ids, out_ids, submodule, req_info,
         )
         self._merge_unpacked(
@@ -1495,7 +1495,11 @@ class Engine:
         )
         return BatchedModelOutput(
             per_rid_outputs=outputs,
-            check_stop_buffers=raw_outputs.clone_check_stop_buffers(),
+            # the stop buffer that is a row output shares its clone: one copy
+            # of the sampled tokens per step, not two
+            check_stop_buffers=raw_outputs.clone_check_stop_buffers(
+                reuse=row_clones,
+            ),
             # row i is request_ids[i] as the forward ran them, not the
             # worker's later-rewritten request list
             row_request_ids=tuple(request_ids),
@@ -1509,14 +1513,37 @@ class Engine:
         out_ids: list[str],
         submodule: NodeSubmodule,
         req_info: Mapping[str, CurrentForwardPassInfo],
-    ) -> None:
+    ) -> dict[str, torch.Tensor]:
         """Fold the forward's per-rid entries into ``outputs``.
 
         ``row_outputs`` are cloned once for the batch and handed out as row
         views; per-rid entries are cloned individually after
         ``filter_batched_output``. A name in both resolves to the per-rid one.
+        Returns the row clones so the caller can share them.
         """
         row_clones = raw_outputs.clone_row_outputs(len(request_ids))
+        # The common decode case: only row outputs, and a submodule that does
+        # not filter per request. One ``split`` per output makes every row
+        # view in a single call, the same ``tensor[i:i+1]`` views the loop
+        # below would slice one at a time, and the per-rid dicts are built
+        # without the candidate/from_rows bookkeeping.
+        if (
+            not raw_outputs.per_rid_outputs
+            and type(submodule).filter_batched_output
+            is NodeSubmodule.filter_batched_output
+        ):
+            row_views = {
+                name: tensor.split(1)
+                for name, tensor in row_clones.items()
+                if isinstance(tensor, torch.Tensor) and tensor.dim()
+            }
+            if row_views:
+                for i, rid in enumerate(request_ids):
+                    merged = outputs.setdefault(rid, {})
+                    for name, views in row_views.items():
+                        if i < len(views):
+                            merged[name] = [views[i]]
+            return row_clones
         for i, (rid, out_id) in enumerate(
             zip(request_ids, out_ids, strict=False)
         ):
@@ -1549,6 +1576,7 @@ class Engine:
                     merged[key] = [value.clone()]
                 else:
                     merged[key] = value
+        return row_clones
 
     def _merge_unpacked(
         self,
