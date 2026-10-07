@@ -531,6 +531,24 @@ class APIServer:
                         logger.warning("Unexpected message type: %s", type(message))
                         continue
 
+                    if message.message_type == "result_tokens":
+                        # One frame for the step: every request's value.
+                        # A request that is gone needs nothing acked back.
+                        body = message.body
+                        with self.request_lock:
+                            for i, rid in enumerate(body.request_ids):
+                                if rid in self.pending_requests:
+                                    self.preprocess_worker.new_result_token(
+                                        rid, body.values[i],
+                                        body.loop_indices[i],
+                                        body.signal, body.modality,
+                                    )
+                                elif rid not in self.recently_completed:
+                                    logger.warning(
+                                        "Token for unknown request %s dropped", rid,
+                                    )
+                        continue
+
                     rid = message.body.request_id
 
                     with self.request_lock:
