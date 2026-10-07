@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
 from mstar.engine.resources import (
@@ -80,6 +81,34 @@ def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
             raise ValueError(
                 f"{type(model).__name__}: {node!r} splits its combined walk "
                 f"{combined!r} by capture key"
+            )
+
+
+def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGroup | None:
+    """The TP group ``node`` runs ``walk`` in, from the static config; None
+    when it has none or one of size 1."""
+    for group in sharding.groups:
+        if node in group.nodes and (group.graph_walks is None or walk in group.graph_walks):
+            return group if group.tp_size > 1 else None
+    return None
+
+
+def refuse_combined_walks_across_tp_groups(
+    model: Model, sharding: ShardingConfig, node_names: set[str],
+) -> None:
+    """A combined walk runs every walk's rows in one forward, so on this
+    worker its walks must share one TP group, or all have world size 1."""
+    groups: dict[tuple[str, str], dict[str, ShardingGroup | None]] = {}
+    for (node, walk), combined in model.combined_walk_of().items():
+        if node in node_names:
+            groups.setdefault((node, combined), {})[walk] = _tp_group_of(sharding, node, walk)
+    for (node, combined), by_walk in groups.items():
+        if len({id(group) for group in by_walk.values()}) > 1:
+            sizes = {walk: 1 if g is None else g.tp_size for walk, g in sorted(by_walk.items())}
+            raise ValueError(
+                f"{type(model).__name__}: combined walk {combined!r} of {node!r} "
+                f"spans TP groups (walk -> TP size: {sizes}); its walks must "
+                "share one group or all have world size 1"
             )
 
 

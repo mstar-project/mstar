@@ -74,7 +74,7 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
-from mstar.worker.engine_manager import EngineManager
+from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 
@@ -312,7 +312,8 @@ class Worker:
         node_names = set()
         for wg in my_worker_graphs:
             node_names.update(wg.section.get_nodes())
-
+        if model is not None:
+            refuse_combined_walks_across_tp_groups(model, sharding_config, node_names)
 
         # The graph runtime owns the per-request queues and the graph state.
         self._graph_runtime = _make_graph_runtime(

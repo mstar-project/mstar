@@ -610,11 +610,12 @@ class MicroScheduler:
     def label_for(
         self, node_name: str, request_walks: dict[int, str],
     ) -> tuple[str, dict[int, str]]:
-        """A batch's walk label and ``request_walks`` for rows with these real walks."""
+        """A batch's walk label and ``request_walks`` for rows with these real
+        walks. The batch takes ``request_walks`` itself, not a copy."""
         walks = set(request_walks.values())
         if len(walks) == 1:
             return walks.pop(), {}
-        return self._key(node_name, next(iter(walks)))[1], dict(request_walks)
+        return self._key(node_name, next(iter(walks)))[1], request_walks
 
     def _ready_specs(
         self, exclude: set[int],
