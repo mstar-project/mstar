@@ -27,6 +27,7 @@ from mstar.graph.runtime.base import (
     PopRidsOutput,
     Profiling,
     ReadyNodeSpec,
+    RequestWalks,
     RouteInput,
     RouteOutput,
     SendInput,
@@ -525,42 +526,59 @@ class PythonGraphRuntime(GraphRuntime):
         request_ids: list[int],
         check_ready: bool = False,
     ) -> PopRidsOutput | None:
-        wg_id = self.get_worker_graph_id_for_node(node_name, graph_walk)
-        queue = self._queues.get(wg_id)
-        if queue is None:
+        return self.pop_walk_rids(
+            node_name, RequestWalks(request_ids, [graph_walk], [0] * len(request_ids)),
+            check_ready,
+        )
+
+    def pop_walk_rids(
+        self, node_name: str, rows: RequestWalks, check_ready: bool = False,
+    ) -> PopRidsOutput | None:
+        wg_ids_of_walk = [
+            self.get_worker_graph_id_for_node(node_name, walk) for walk in rows.walks
+        ]
+        queues = [self._queues.get(wg_id) for wg_id in wg_ids_of_walk]
+        if any(queue is None for queue in queues):
             return None
         if check_ready:
             # All or nothing: verified for every rid before anything is popped,
             # so a partially ready set is retried intact later.
-            for rid in request_ids:
-                wgio = queue.per_request_queues.get(rid)
+            for rid, w in zip(rows.rids, rows.walk_idx, strict=True):
+                wgio = queues[w].per_request_queues.get(rid)
                 if wgio is None or node_name not in wgio.ready_node_names:
                     return None  # unknown rid (removed here) counts as not ready
 
         rids: list[int] = []
         wg_ids: list[int] = []
+        rid_walk_idx: list[int] = []
         # Columns filled as the edges are found; no EdgeSpec ever exists.
         # next_node is not carried: it is `node_name`, the same for every edge,
         # and nothing downstream of a pop reads it.
         edges = ColumnarEdgeSpecs.empty()
-        for rid in request_ids:
-            popped = queue.pop_ready_nodes(rid, [node_name])
+        for rid, w in zip(rows.rids, rows.walk_idx, strict=True):
+            popped = queues[w].pop_ready_nodes(rid, [node_name])
             if not popped:
                 continue
             assert len(popped) == 1
             node = popped[0]
             rids.append(rid)
-            wg_ids.append(wg_id)
+            wg_ids.append(wg_ids_of_walk[w])
+            rid_walk_idx.append(w)
             for signal, edge in node.ready_signals.ready_inputs.items():
                 edges.add(
                     rid, signal,
                     [info.uuid for info in edge.tensor_info],
                     edge._final_stream_chunk,
                 )
+        walk_signals = tuple(
+            tuple(self.get_output_signals(node_name, walk)) for walk in rows.walks
+        )
         return PopRidsOutput(
             wg_ids=ParallelList(rids, wg_ids),
             input_edges=edges,
-            output_signals=self.get_output_signals(node_name, graph_walk),
+            output_signals=walk_signals[0] if walk_signals else (),
+            rid_walk_idx=rid_walk_idx,
+            walk_output_signals=walk_signals,
         )
 
     def _scan_ready(
@@ -639,12 +657,12 @@ class PythonGraphRuntime(GraphRuntime):
         self, node_name: str,
         graph_walks: list[str],
         sample_rids: list[int],
-    ) -> tuple[str, list[SpeculationOutput]] | None:
-        for walk, rid in zip(graph_walks, sample_rids, strict=True):
-            out = self._speculate_walk(node_name, walk, rid)
-            if out:
-                return walk, out
-        return None
+    ) -> list[SpeculationOutput]:
+        return [
+            target
+            for walk, rid in zip(graph_walks, sample_rids, strict=True)
+            for target in self._speculate_walk(node_name, walk, rid)
+        ]
 
     def _speculate_walk(
         self, node_name: str, graph_walk: str, sample_rid: int,
@@ -654,6 +672,8 @@ class PythonGraphRuntime(GraphRuntime):
         if wgio is None:
             return []
         node = wgio.nodes[node_name]
+        if not node.enable_async_scheduling:
+            return []  # this walk's node opts out of async scheduling
         if not node.outputs:
             return []  # nothing to feed a spec target
 

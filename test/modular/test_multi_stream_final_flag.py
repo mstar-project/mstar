@@ -21,6 +21,7 @@ from mstar.streaming.stream_buffer import (  # noqa: E402
     StreamChunkInfo,
     StreamingEdge,
 )
+from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 PARTITION = "Decoder"
@@ -142,7 +143,7 @@ def test_a_dropped_speculative_rid_neither_flushes_nor_reports_done():
     assert (batch.final_stream_rids, batch.stream_partition_done_rids) == ({"r"}, {"r"})
     speculation = SimpleNamespace(
         node_batch=batch, continuing_rids={"r"}, consumed_edges=[("loop", None)],
-        scheduled_batch=SimpleNamespace(request_to_worker_graph={"r": 0}),
+        scheduled_batch=ScheduledBatch(node_name="n", graph_walk="w", request_to_worker_graph={"r": 0}),
         consumed_streaming_edges={"r": [edge]}, spec_id=0,
     )
     # The dropped rid's staged ingest is undone before its chunk goes back.
