@@ -2898,6 +2898,9 @@ class Worker:
 
         # The graph runtime's own share of postprocess: the routing call.
         _t_route = _time.perf_counter() if self._phase_period else 0.0
+        inline_signal, inline_values = self._inline_emit_values(
+            engine, batch_N, host_rows, rids, signals,
+        )
         route_output = self._graph_runtime.complete_and_route_batch(
             RouteInput(
                 partition=batch_N.partition,
@@ -2910,6 +2913,8 @@ class Worker:
                 ),
                 tensors=flat_uuids,
                 num_tensors=num_tensors,
+                inline_signal=inline_signal,
+                inline_values=inline_values,
             ),
         )
         if self._phase_period:
@@ -3047,6 +3052,37 @@ class Worker:
         _pp_stage("send_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
+
+    def _inline_emit_values(
+        self, engine, batch_N: PendingBatch, host_rows: "HostRows | None",
+        rids: list[int], signals,
+    ) -> tuple[str | None, list[int]]:
+        """The values of a client signal that can ride inline this step.
+
+        Taken off the stop check's host copy, one ``tolist`` for the batch.
+        Every rid must have a row, or the step keeps the tensor path for the
+        whole batch: the runtime applies the values positionally.
+        """
+        if host_rows is None or not self._graph_runtime.supports_inline_emit:
+            return None, []
+        candidates = engine.inline_client_signals(
+            batch_N.node_name, batch_N.graph_walk,
+        )
+        if not candidates:
+            return None, []
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        for signal, buffer_name in candidates.items():
+            if signal not in signals:
+                continue
+            buf = host_rows.buffers.get(buffer_name)
+            if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
+                continue
+            values = buf.reshape(buf.shape[0], -1)[:, 0].tolist()
+            try:
+                return signal, [values[row_of[rid]] for rid in rids]
+            except (KeyError, IndexError):
+                return None, []
+        return None, []
 
     def _get_pinned_d2h_buffer(
         self,
