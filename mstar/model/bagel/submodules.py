@@ -906,6 +906,11 @@ class LLMSubmodule(ARNodeSubmodule):
     def supports_chunked_prefill(self, graph_walk: str) -> bool:
         return graph_walk == "prefill_text"
 
+    def reuses_cached_prefix(self, graph_walk: str, fwd_info: CurrentForwardPassInfo) -> bool:
+        # a guided prompt writes two labels from one input, as `_skip_cached_prefix` refuses
+        del graph_walk
+        return not fwd_info.step_metadata.get("requires_cfg", False)
+
     def max_batch_tokens(self, graph_walk: str) -> int | None:
         return self.MAX_BATCH_TOKENS if graph_walk in ("prefill_text", MIXED_TEXT) else None
 

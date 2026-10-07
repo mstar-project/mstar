@@ -807,10 +807,11 @@ class Engine:
     ) -> NodeInputs | None:
         """One chunk of a row's input, cut from the whole input prepared once
         on its first chunk and kept until the last one lands
-        (``release_chunk_inputs``). A chunked row skips the prefix cache."""
+        (``release_chunk_inputs``). A chunked row's first chunk starts past its cached prefix, if any."""
         submodule = self._submodules[batch.node_name].submodule
         key = (rid, batch.node_name)
         full = self._chunk_inputs.get(key)
+        start, end = chunk
         if full is None:
             full = submodule.prepare_inputs(
                 graph_walk=walk,
@@ -822,8 +823,15 @@ class Engine:
             )
             if full is None:
                 return None
+            if walk in self._keyed_walks.get(batch.node_name, ()):
+                # a first chunk starts past what `input_sequence_len` matched
+                if start and not self._prefix_cuttable(full, batch.node_name, walk):
+                    raise RuntimeError(
+                        f"{batch.node_name}/{walk}: reuses_cached_prefix allowed a "
+                        "row whose prepared inputs cannot skip a cached prefix"
+                    )
+                self._runner.apply_cached_prefix(rid, batch.node_name, walk, full, start)
             self._chunk_inputs[key] = full
-        start, end = chunk
         part = submodule.split_inputs(
             walk, batch.per_request_info_wrapped[rid], full, start, end,
         )
@@ -857,11 +865,7 @@ class Engine:
         walk = batch.step_context.walk_of(rid)
         if walk not in self._keyed_walks.get(batch.node_name, ()):
             return inputs
-        assert isinstance(inputs, ARNodeInputs) and inputs.custom_pos_ids is None, (
-            f"{self._prefix_model} keys the {walk!r} walk of {batch.node_name} "
-            "for prefix reuse, but that walk places positions of its own"
-        )
-        if inputs.tensor_inputs or inputs.kwargs or inputs.resource_step_info:
+        if not self._prefix_cuttable(inputs, batch.node_name, walk):
             return inputs
         matched = self._runner.resolve_cached_prefix(rid, batch.node_name, walk)
         self._runner.apply_cached_prefix(
@@ -873,6 +877,13 @@ class Engine:
             walk, batch.per_request_info_wrapped[rid], inputs,
             matched, inputs.input_seq_len,
         )
+
+    def _prefix_cuttable(self, inputs: NodeInputs, node_name: str, walk: str) -> bool:
+        assert isinstance(inputs, ARNodeInputs) and inputs.custom_pos_ids is None, (
+            f"{self._prefix_model} keys the {walk!r} walk of {node_name} "
+            "for prefix reuse, but that walk places positions of its own"
+        )
+        return not (inputs.tensor_inputs or inputs.kwargs or inputs.resource_step_info)
 
     def exec(
         self, batch: ExecutingBatch
@@ -1690,10 +1701,23 @@ class Engine:
     def input_sequence_len(
         self, node_name: str, graph_walk: str,
         request_info: CurrentForwardPassInfo, inputs: NameToTensorList,
+        rid: int | None = None,
     ) -> InputSeqLenInfo | None:
-        return self._submodules[node_name].submodule.get_input_sequence_len(
-            graph_walk, request_info, inputs,
-        )
+        """A row's length; a chunkable keyed row's leaves out the prefix the
+        cache holds, which ``rid``'s lease keeps until its first chunk applies it."""
+        submodule = self._submodules[node_name].submodule
+        info = submodule.get_input_sequence_len(graph_walk, request_info, inputs)
+        if (
+            info is None or rid is None or info.resource_segment_lengths
+            or graph_walk not in self._keyed_walks.get(node_name, ())
+            or not submodule.supports_chunked_prefill(graph_walk)
+            or not submodule.reuses_cached_prefix(graph_walk, request_info)
+        ):
+            return info
+        matched = self._runner.resolve_cached_prefix(rid, node_name, graph_walk)
+        if not 0 < matched < info.seq_len:
+            return info
+        return InputSeqLenInfo(info.seq_len - matched, cached_prefix=matched)
 
     def check_ready(
         self, node_name: str, request_id: str,

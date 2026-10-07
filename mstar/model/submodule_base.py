@@ -273,6 +273,8 @@ class InputSeqLenInfo(NamedTuple):
     seq_len: int
     # resource key -> tokens that resource reserves, when not ``seq_len``
     resource_segment_lengths: dict[str, int] = {}
+    # leading tokens the prefix cache already holds, not counted in ``seq_len``
+    cached_prefix: int = 0
 
     def get_admit_segment_len(self, resource: str) -> int:
         return self.resource_segment_lengths.get(resource, self.seq_len)
@@ -581,6 +583,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """Token cap for one step of this walk; None for no cap."""
         del graph_walk
         return None
+
+    def reuses_cached_prefix(self, graph_walk: str, fwd_info: CurrentForwardPassInfo) -> bool:
+        """Whether a chunked row of this walk may start past its cached prefix,
+        decided before its inputs are prepared."""
+        del graph_walk, fwd_info
+        return True
 
     def get_input_sequence_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,

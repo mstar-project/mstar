@@ -1166,9 +1166,9 @@ class _SizedEngine(_Engine):
         del node_name
         return True
 
-    def input_sequence_len(self, node_name, graph_walk, request_info, inputs):
+    def input_sequence_len(self, node_name, graph_walk, request_info, inputs, rid=None):
         del node_name, graph_walk, request_info
-        return SimpleNamespace(seq_len=len(inputs))
+        return InputSeqLenInfo(len(inputs))
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True, seq_len_info=None):
         if seq_len_info is not None and rid in self.too_big:
@@ -1205,8 +1205,9 @@ def test_a_backlogged_row_without_room_stays_parked():
 class _ChunkingEngine(_SizedEngine):
     """A 4-token budget; ``p0``'s walk can be chunked and it is 10 tokens long."""
 
-    def __init__(self, **kw):
+    def __init__(self, cached=None, **kw):
         super().__init__(too_big=(), **kw)
+        self.cached = cached or {}
 
     def get_max_batch_tokens(self, node_name, graph_walk):
         del node_name, graph_walk
@@ -1216,9 +1217,12 @@ class _ChunkingEngine(_SizedEngine):
         del node_name
         return graph_walk == "prefill"
 
-    def input_sequence_len(self, node_name, graph_walk, request_info, inputs):
+    def input_sequence_len(self, node_name, graph_walk, request_info, inputs, rid=None):
         del node_name, request_info, inputs
-        return InputSeqLenInfo(10 if graph_walk == "prefill" else 1)
+        if graph_walk != "prefill":
+            return InputSeqLenInfo(1)
+        cached = self.cached.get(rid, 0)
+        return InputSeqLenInfo(10 - cached, cached_prefix=cached)
 
 
 def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
@@ -1238,6 +1242,18 @@ def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
 
     sched.advance_chunk("p0", NODE, 10)
     assert ("p0", NODE) not in sched.chunk_progress, "the last chunk ends the progress"
+
+
+def test_a_chunked_row_starts_past_its_cached_prefix():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, cached={"p0": 4}))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+
+    first = _next_batch(sched, manager)
+
+    assert first.chunk_ranges == {"p0": (4, 6)}
+    assert sched.chunk_progress[("p0", NODE)] == [4, 10]
+    assert not sched.cached_prefix
 
 
 @pytest.mark.parametrize("seq_lens,chunk", [
