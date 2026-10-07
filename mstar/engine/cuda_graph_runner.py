@@ -26,6 +26,59 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
+# torch.compile mode for a captured forward. A config names its mode
+# (``compile_mode``); "default" keeps cuBLAS GEMMs with Inductor fusion and
+# skips GEMM autotuning. The env var overrides every config.
+_COMPILE_MODE_ENV = "MSTAR_GRAPH_COMPILE_MODE"
+_DEFAULT_COMPILE_MODE = "max-autotune-no-cudagraphs"
+
+
+def _validate_compile_mode(mode: str, source: str) -> str:
+    """Raise now rather than inside every capture, where the per-capture
+    fallback would serve the model eager."""
+    if mode == "default":
+        return mode
+    try:
+        from torch._inductor import list_mode_options
+
+        list_mode_options(mode)
+    except Exception as exc:
+        raise ValueError(
+            f"{source}={mode!r} is not a mode this torch.compile accepts: {exc}"
+        ) from exc
+    return mode
+
+
+def _read_compile_mode_override(environ: Mapping[str, str] | None = None) -> str | None:
+    """The env override, validated at import. Takes the mapping so a test
+    can drive it without reloading this module."""
+    env = os.environ if environ is None else environ
+    mode = env.get(_COMPILE_MODE_ENV)
+    if mode is not None:
+        _validate_compile_mode(mode, _COMPILE_MODE_ENV)
+    return mode
+
+
+_COMPILE_MODE_OVERRIDE = _read_compile_mode_override()
+
+
+def resolve_compile_mode(config_mode: str | None) -> str:
+    """The env override, else the config's mode, else the default."""
+    if _COMPILE_MODE_OVERRIDE is not None:
+        return _COMPILE_MODE_OVERRIDE
+    if config_mode is not None:
+        return _validate_compile_mode(config_mode, "compile_mode")
+    return _DEFAULT_COMPILE_MODE
+
+
+def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": False}
+    mode = resolve_compile_mode(config_mode)
+    if mode != "default":
+        kwargs["mode"] = mode
+    return kwargs
+
+
 def autocast_scope(dtype: torch.dtype | None, device_type: str = "cuda"):
     """A forward's autocast scope; ``None`` (``disable_autocast``) runs the
     submodule in its own dtype and shuts out any ambient autocast."""
@@ -650,10 +703,7 @@ class CudaGraphRunner:
             return forward
         if spec.config_idx not in self._compiled_forwards:
             self._compiled_forwards[spec.config_idx] = torch.compile(
-                forward,
-                mode="max-autotune-no-cudagraphs",
-                fullgraph=False,
-                dynamic=False,
+                forward, **compile_kwargs(spec.config.compile_mode),
             )
         return self._compiled_forwards[spec.config_idx]
 
@@ -1275,9 +1325,7 @@ class PiecewiseCudaGraphRunner:
 
         fn = self._config.capture_fn
         if self._config.compile:
-            fn = torch.compile(
-                fn, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=False,
-            )
+            fn = torch.compile(fn, **compile_kwargs(self._config.compile_mode))
 
         def run_fn():
             return self._normalize_output(fn(call))

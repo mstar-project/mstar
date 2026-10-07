@@ -2124,11 +2124,23 @@ class KVManager(AttentionResource):
         )
 
     @torch.compiler.disable
+    def write_slots(self, label: str=None) -> tuple[torch.Tensor, torch.Tensor]:
+        """The (page, offset-in-page) slots ``write_kv`` scatters this step's tokens to, as
+        device tensors, for a kernel that writes the cache itself. Under a capture lease they
+        are the slot's static buffers, so a graph replays with the next step's slots."""
+        if label is None:
+            label = self._default_label
+        plan_state = self._current_plan_states[label]
+        n = plan_state.total_tokens
+        return plan_state.token_to_page[:n], plan_state.token_to_cache[:n]
+
+    @torch.compiler.disable
     def write_kv(
-        self, k: torch.Tensor, v: torch.Tensor,
+        self, k: torch.Tensor, v: torch.Tensor | None = None,
         layer_idx: int=None, label: str=None, return_tensor: bool = False,
     ) -> torch.Tensor | None:
-        """Write K, V into this step's planned slots.
+        """Write K, V into this step's planned slots (under MLA: the per-token
+        latent as ``k`` and ``v=None``).
 
         Returns nothing by default: reading the slots back is a gather no
         caller wants today, and skipping it keeps the write a pure mutation.
@@ -2141,7 +2153,7 @@ class KVManager(AttentionResource):
         n = plan_state.total_tokens
         return self.kv_cache.write_tokens(
             layer_idx=layer_idx,
-            k=k[:n], v=v[:n],
+            k=k[:n], v=None if v is None else v[:n],
             page_idx=plan_state.token_to_page[:n],
             cache_idx=plan_state.token_to_cache[:n],
             return_tensor=return_tensor,

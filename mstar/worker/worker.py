@@ -406,7 +406,11 @@ class Worker:
 
         self.scheduler = MicroScheduler(
             self.engine_manager,
-            parallel_leader_nodes=self.parallel_leader_nodes
+            parallel_leader_nodes=self.parallel_leader_nodes,
+            max_step_tokens=lambda node, walk: (
+                self.engine_manager.get_engine(node).get_max_step_tokens(node, walk)
+            ),
+            tensor_rows=self._tensor_rows,
         )
 
         # Request ids are strings on the wire and ints (handles) inside this
@@ -592,6 +596,11 @@ class Worker:
         """Handle for an inbound message's request id, or None if this worker
         does not know it (removed already -- a benign race, not an error)."""
         return self._graph_runtime.get_rid_handle(request_id)
+
+    def _tensor_rows(self, uuid: int) -> int:
+        """A stored tensor's leading dim, 0 when it has none or is gone."""
+        info = self.tensor_manager.tensor_store.get_info(uuid)
+        return info.dims[0] if info is not None and info.dims else 0
 
     def _rid_str(self, request_id: int) -> str:
         """The wire identity, for a message about to leave this process."""

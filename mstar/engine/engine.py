@@ -1566,6 +1566,10 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
+    def get_max_step_tokens(self, node_name: str, graph_walk: str) -> int | None:
+        """The submodule's token budget for one step of this walk, or None."""
+        return self._submodules[node_name].submodule.max_step_tokens(graph_walk)
+
     def check_ready(
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,

@@ -118,6 +118,20 @@ class ScheduledBatch:
         return len(self.request_to_worker_graph)
 
 
+def _input_tokens(
+    edges: ColumnarEdgeSpecs, tensor_rows: Callable[[int], int],
+) -> dict[int, int]:
+    """Each rid's input rows for this node's step: the most any one of its input
+    edges carries (a prompt's token ids)."""
+    tokens: dict[int, int] = {}
+    start = 0
+    for rid, n in zip(edges.rids, edges.tensors_per_edge, strict=True):
+        rows = sum(tensor_rows(uuid) for uuid in edges.uuids[start:start + n])
+        start += n
+        tokens[rid] = max(tokens.get(rid, 1), rows)
+    return tokens
+
+
 class SchedulingType(Enum):
     ROUND_ROBIN = "round_robin"
     # TODO: priority. It used to key off a per-engine-type table, which no
@@ -148,8 +162,14 @@ class MicroScheduler:
         sched_type=SchedulingType.ROUND_ROBIN,
         parallel_leader_nodes: set[str] | None = None,
         max_consec_tp_follower_batches: int = 1,
+        max_step_tokens: Callable[[str, str], int | None] | None = None,
+        tensor_rows: Callable[[int], int] | None = None,
     ):
         self.engine_manager = engine_manager
+        # (node, walk) -> its step token budget or None; None here: no budgets
+        self.max_step_tokens = max_step_tokens
+        # tensor uuid -> its leading dim, to count a popped step's input tokens
+        self.tensor_rows = tensor_rows
         self.batch_number = 0
         # The graph runtime, installed by the worker. Interning and the
         # (walk, node) -> worker graph index both live there.
@@ -501,29 +521,37 @@ class MicroScheduler:
 
         if self.sched_type != SchedulingType.ROUND_ROBIN:
             raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
-        best_node_name, graph_walk = self._select_node_rr(node_name_to_requests)
-
-        if best_node_name is None:
-            return None
+        while True:
+            best_node_name, graph_walk = self._select_node_rr(node_name_to_requests)
+            if best_node_name is None:
+                return None
+            cap = max_batch_size
+            if cap is None:
+                cap = self._max_batch_size(best_node_name, graph_walk)
+            remaining = self._remaining_capacity(cap, pre_existing_batch_size)
+            if remaining is None or remaining > 0:
+                break
+            # No room: the caller already holds a full batch, or the walk takes
+            # nothing now (no free state slot). Leave its nodes queued and pick
+            # another walk, which may be the one that frees the room; the least
+            # recently scheduled walk would otherwise be picked every time.
+            left = [e for e in node_name_to_requests[best_node_name]
+                    if e.graph_walk != graph_walk]
+            if left:
+                node_name_to_requests[best_node_name] = left
+            else:
+                del node_name_to_requests[best_node_name]
 
         # Pop ready nodes for all requests of this node name
         entries = [e for e in node_name_to_requests[best_node_name] \
                    if e.graph_walk == graph_walk]
-
-        if max_batch_size is None:
-            max_batch_size = self._max_batch_size(best_node_name, graph_walk)
-        remaining = self._remaining_capacity(max_batch_size, pre_existing_batch_size)
-        if remaining is not None and remaining <= 0:
-            # The caller already holds a full batch. Assembling would pop these
-            # nodes off their ready queues with nowhere to run them, so leave
-            # them queued for the next pass.
-            return None
 
         full_batch = self._assemble_batch(
             request_state, best_node_name, graph_walk, entries
         )
         if not full_batch:
             return None
+        full_batch = self._within_token_budget(full_batch, remaining)
 
         # Everything past the first step is already popped off the queues, so
         # it has to be remembered here or it would never run.
@@ -533,6 +561,35 @@ class MicroScheduler:
                 request_state, full_batch, anchor=capture_group_of,
             ),
         )
+
+    def _within_token_budget(
+        self, batch: ScheduledBatch, max_rows: int | None,
+    ) -> ScheduledBatch:
+        """The oldest requests whose input tokens fit the (node, walk)'s budget,
+        at least one, and no more than ``max_rows``.
+
+        The rest go back to ready, not to the backlog. Parked in the backlog they
+        would run back to back ahead of everything else; left ready, the
+        round-robin can put another walk (decode) between them. Only this call's
+        requests count against the budget, not ``pre_existing_batch_size`` rows.
+        """
+        if self.max_step_tokens is None or self.tensor_rows is None:
+            return batch
+        budget = self.max_step_tokens(batch.node_name, batch.graph_walk)
+        if budget is None:
+            return batch
+        tokens = _input_tokens(batch.input_edges, self.tensor_rows)
+        total = 0
+        for i, rid in enumerate(batch.request_to_worker_graph):
+            total += tokens.get(rid, 1)
+            if i > 0 and (total > budget or (max_rows is not None and i >= max_rows)):
+                taken, left = batch.split_off_first(i)
+                rids = list(left.request_to_worker_graph)
+                self.runtime.push_back_node(
+                    left.node_name, rids, [left.request_to_worker_graph[r] for r in rids],
+                )
+                return taken
+        return batch
 
     @staticmethod
     def _remaining_capacity(

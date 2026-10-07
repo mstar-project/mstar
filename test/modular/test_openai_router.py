@@ -314,7 +314,7 @@ def test_chat_stream_reports_a_failed_request_in_band(client_and_stub):
         json={"model": "bagel", "messages": [{"role": "user", "content": "go"}], "stream": True},
     ).text
     events = [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
-    assert events[1]["choices"][0]["delta"]["content"] == "Paris"
+    assert events[0]["choices"][0]["delta"] == {"role": "assistant", "content": "Paris"}
     assert events[-1]["error"] == {
         "message": "Error in worker: ValueError: q implies q_len_per_req=5", "type": "server_error", "code": 500,
     }
@@ -358,11 +358,30 @@ def test_chat_stream_reports_a_timeout_in_band(client_and_stub):
     stub.next_chunks = [_Chunk("text", b"Par")]
     stub.raise_after = HTTPException(status_code=500, detail="Request timed out")
     text, events = _stream_events(client)
-    assert events[1]["choices"][0]["delta"]["content"] == "Par"
+    assert events[0]["choices"][0]["delta"] == {"role": "assistant", "content": "Par"}
     assert events[-1]["error"] == {"message": "Request timed out", "type": "server_error", "code": 500}
     assert not any(e.get("choices", [{}])[0].get("finish_reason") for e in events)
     assert text.rstrip().endswith("data: [DONE]")
     assert stub.aborted == [stub.last_submit["request_id"]]
+
+
+def test_chat_stream_sends_role_with_first_token(client_and_stub):
+    """Clients time TTFT at the first chunk, so none may precede the first token."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b"strea"), _Chunk("text", b"ming")]
+    _, lines = _stream_events(client)
+    assert lines[0]["choices"][0]["delta"] == {"role": "assistant", "content": "strea"}
+    assert len(lines) == 3
+
+
+def test_chat_stream_without_output_still_names_the_role(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = []
+    _, lines = _stream_events(client)
+    assert lines == [lines[0]] and lines[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert lines[0]["choices"][0]["finish_reason"] == "stop"
 
 
 def test_unsupported_model_404(client_and_stub):

@@ -498,10 +498,18 @@ class Conductor:
         self.parallel_config = GlobalParallelConfig(
             worker_graphs=self.worker_graphs,
             worker_ids=self.worker_ids,
+            dist_timeout_s=self.model_config.get("dist_timeout_s"),
+            tp_allreduce=self.model_config.get("tp_allreduce"),
+            tp_allreduce_max_kb=self.model_config.get("tp_allreduce_max_kb"),
         )
 
     def _launch_workers(self):
         """Spawn one process per worker rank using spawn context."""
+        # JIT-build the fused-MoE CUDA op once here; the workers then find it
+        # cached instead of racing each other on the same build lock.
+        from mstar.utils.fused_moe.align import _cuda_op_available
+
+        _cuda_op_available()
         ctx = mp.get_context("spawn")
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(

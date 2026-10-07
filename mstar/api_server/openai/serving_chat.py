@@ -94,17 +94,19 @@ async def _stream(api, model_name, request_id, sample_rate):
     def error(message: str, status: int) -> str:
         return sse({"error": {"message": message, "type": error_type(status), "code": status}})
 
-    yield chunk({"role": "assistant"})
+    # The role rides on the first delta: clients time the first token from the
+    # first chunk, so nothing may go out before the model has produced one.
+    role = {"role": "assistant"}
     failed = False
     try:
         async for c in api.iter_result_chunks(request_id):
             if c.modality == "text":
-                yield chunk({"content": c.data.decode("utf-8", "replace")})
+                delta = {"content": c.data.decode("utf-8", "replace")}
             elif c.modality == "audio":
                 # Streaming audio deltas are base64 16-bit PCM at the model rate.
-                yield chunk({"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}})
+                delta = {"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}}
             elif c.modality == "image":
-                yield chunk({"content": media_io.png_to_data_url(c.data)})
+                delta = {"content": media_io.png_to_data_url(c.data)}
             elif c.modality == "error":
                 # The request failed after the stream opened (an engine error
                 # mid generation, a preprocess error); the HTTP status is
@@ -116,11 +118,16 @@ async def _stream(api, model_name, request_id, sample_rate):
                 # request that is already gone.
                 failed = True
                 yield error(c.data.decode("utf-8", "replace"), int(c.metadata.get("status", 500)))
+                continue
+            else:
+                continue
+            yield chunk({**role, **delta})
+            role = {}
     except HTTPException as exc:
         # The delivery timeout raises out of the iterator (which aborts the
         # request on its way out); report it the same way.
         failed = True
         yield error(str(exc.detail), exc.status_code)
     if not failed:
-        yield chunk({}, finish="stop")
+        yield chunk(role, finish="stop")
     yield SSE_DONE
