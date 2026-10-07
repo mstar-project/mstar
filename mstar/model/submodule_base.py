@@ -677,6 +677,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         a fixed key set for graph compat, so the filtering happens here."""
         return outputs
 
+    def step_is_input_free(self, graph_walk: str) -> bool:
+        """Whether ``declare_step`` for this walk reads nothing from the inputs
+        but their spans, and every real row has the span of the template row.
+        Then the step a pre-plan declared over the bucket's template rows is
+        the step the forward would declare, and the engine runs it instead of
+        declaring and admitting a second time."""
+        del graph_walk
+        return False
+
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         """Output signals whose client-facing value is one scalar per row that
         the stop check already copies to the host, as signal name -> the name
