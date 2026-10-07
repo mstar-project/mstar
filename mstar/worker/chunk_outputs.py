@@ -20,11 +20,15 @@ class ChunkOutputAccumulator:
         # (rid, node) -> edge -> each held chunk's tensors, in chunk order
         self._held: dict[tuple[int, str], dict[str, list[list[torch.Tensor]]]] = {}
 
-    def hold(self, rid: int, node_name: str, outputs: NameToTensorList) -> None:
-        """Keep a non-final chunk's outputs, in chunk order."""
+    def hold(
+        self, rid: int, node_name: str, outputs: NameToTensorList,
+        policies: Mapping[str, ChunkedPrefillOutputPolicy] = {},
+    ) -> None:
+        """Keep a non-final chunk's outputs, in chunk order; FINAL edges' are dropped."""
         held = self._held.setdefault((rid, node_name), {})
         for name, tensors in outputs.items():
-            held.setdefault(name, []).append(list(tensors))
+            if policies.get(name, _DEFAULT).mode is not ChunkedPrefillOutputMode.FINAL:
+                held.setdefault(name, []).append(list(tensors))
 
     def release(
         self, rid: int, node_name: str, outputs: NameToTensorList,
@@ -39,6 +43,10 @@ class ChunkOutputAccumulator:
         for name in {**held, **outputs}:
             chunks = held.get(name, []) + ([list(outputs[name])] if name in outputs else [])
             policy = policies.get(name, _DEFAULT)
+            if policy.mode is ChunkedPrefillOutputMode.FINAL:
+                if name in outputs:
+                    merged[name] = list(outputs[name])
+                continue
             if policy.mode is ChunkedPrefillOutputMode.LIST or len(chunks) == 1:
                 merged[name] = [t for chunk in chunks for t in chunk]
                 continue
