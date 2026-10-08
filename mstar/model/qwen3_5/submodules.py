@@ -464,8 +464,7 @@ class LLMSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs,
     ):
-        if request_info.graph_walk != "decode" and \
-                not request_info.step_metadata.get("last_prefill", False):
+        if not self._token_is_real(request_info):
             outputs.pop("new_token", None)
             return
         # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is
@@ -474,13 +473,21 @@ class LLMSubmodule(ARNodeSubmodule):
             return
         outputs["text_inputs"] = outputs["new_token"]
 
+    @staticmethod
+    def _token_is_real(request_info: CurrentForwardPassInfo) -> bool:
+        """Whether this step's token is the request's: decode, or the last prefill's."""
+        return request_info.graph_walk == "decode" or request_info.step_metadata.get(
+            "last_prefill", False,
+        )
+
     def check_stop(
         self,
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if "new_token" not in outputs:
+        # only a decode row's stop can end decode_loop; a prefill is not in it yet
+        if request_info.graph_walk != "decode" or "new_token" not in outputs:
             return set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
@@ -510,6 +517,8 @@ class LLMSubmodule(ARNodeSubmodule):
             if i is None or i >= len(values):
                 continue  # no row, no output: the per-request path skips it too
             info = request_infos[rid]
+            if info.graph_walk != "decode":
+                continue  # as check_stop: only a decode row's stop ends decode_loop
             hit_eos = (
                 not info.resource_configs[SAMPLER].ignore_eos
                 and values[i] in stop_ids
