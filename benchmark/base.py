@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Optional
@@ -185,6 +186,26 @@ class Kokoro(Model):
         return "kokoro"
 
 
+class Chatterbox(Model):
+    """Chatterbox (Resemble AI) zero-shot TTS; the Turbo checkpoint shares the
+    request shape and is served under the ``chatterbox_turbo`` registry key."""
+
+    def get_hf_url(self):
+        return "ResembleAI/chatterbox"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2S}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        # The reference package's defaults (temperature 0.8, exaggeration 0.5,
+        # cfg 0.5), so every system synthesises the same request and stops on
+        # the model's own EOS. The voice defaults to the checkpoint's built-in
+        # one; set CHATTERBOX_BENCH_VOICE to a preset file name (e.g.
+        # "Abigail.wav") that both M* (voices_dir) and Chatterbox-TTS-Server
+        # (predefined voices) resolve, for a same-voice comparison.
+        return {"voice": os.environ.get("CHATTERBOX_BENCH_VOICE", "default"), "temperature": 0.8}
+
+
 class Qwen3Omni(Model):
     def get_hf_url(self):
         return "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -275,6 +296,22 @@ class Qwen3TTS(Model):
 
     def get_supported_modalities(self):
         return {RequestType.T2S}
+
+
+class Qwen3_5_Dense(Model):
+    """Qwen3.5 dense (text + image in, text out) benchmark metadata."""
+
+    DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
+    def __init__(self, model_id: str | None = None):
+        if model_id is None:
+            model_id = self.DEFAULT_MODEL_ID
+        self.model_id = model_id
+
+    def get_hf_url(self):
+        return self.model_id
+
+    def get_supported_modalities(self):
+        return {RequestType.T2T, RequestType.I2T}
 
 
 class Qwen3TTS1p7B(Qwen3TTS):
@@ -399,6 +436,7 @@ class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
     KOKORO = "kokoro"
+    CHATTERBOX = "chatterbox"
     QWEN3OMNI = "qwen3omni"
     QWEN3TTS = "qwen3_tts"
     QWEN3TTS_1P7B = "qwen3_tts_1p7b"
@@ -410,6 +448,7 @@ class ModelType(Enum):
     QWEN3_ASR = "qwen3_asr"
     QWEN3_ASR_REALTIME = "qwen3_asr_realtime"
     HIGGS_AUDIO = "higgs_audio"
+    QWEN3_5 = "qwen3.5"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -418,6 +457,8 @@ class ModelType(Enum):
             return Orpheus(**kwargs)
         if self == ModelType.KOKORO:
             return Kokoro(**kwargs)
+        if self == ModelType.CHATTERBOX:
+            return Chatterbox(**kwargs)
         if self == ModelType.QWEN3OMNI:
             return Qwen3Omni(**kwargs)
         if self == ModelType.QWEN3TTS:
@@ -440,4 +481,6 @@ class ModelType(Enum):
             return Qwen3ASRRealtime(**kwargs)
         if self == ModelType.HIGGS_AUDIO:
             return HiggsAudio(**kwargs)
+        if self == ModelType.QWEN3_5:
+            return Qwen3_5_Dense(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")

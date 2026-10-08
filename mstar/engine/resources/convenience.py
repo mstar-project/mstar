@@ -3,6 +3,8 @@ import torch
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.ragged.base import RaggedAttnManager
 from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.linear_attn.base import LinearAttnManager
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
 
 class AttentionCallable:
@@ -61,6 +63,67 @@ class AttentionCallable:
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
 
 
+class LinearAttnCallable:
+    """A recurrent state pool plus the resource running kernels against it,
+    mirroring :class:`AttentionCallable`.
+
+    The layer calls ``conv`` then the instance; this hands the pool's per-layer
+    blocks over as plain tensors, so neither the layer nor the manager holds
+    the pool.
+    """
+
+    def __init__(self, pool: RecurrentStatePool, attn: LinearAttnManager | None = None):
+        self.pool = pool
+        self.attn = attn
+        self._layer_idx = 0
+
+    @torch.compiler.disable
+    def bind_step(self, label: str, attn: LinearAttnManager | None = None) -> None:
+        if attn is not None:
+            self.attn = attn
+        assert self.attn is not None, (
+            "no linear attention resource: pass `attn` here or at construction"
+        )
+        self.attn.set_default_label(label)
+
+    @property
+    def label(self) -> str:
+        return self.attn.default_label
+
+    @torch.compiler.disable
+    def set_layer_idx(self, layer_idx: int) -> None:
+        """The layer's index among the *recurrent* layers, not the stack's."""
+        self._layer_idx = layer_idx
+        self.attn.set_default_layer_idx(layer_idx)
+
+    @torch.compiler.disable
+    def conv(
+        self, x: torch.Tensor, weight: torch.Tensor,
+        bias: torch.Tensor | None = None, activation: str | None = "silu",
+    ) -> torch.Tensor:
+        return self.attn.run_conv(
+            x,
+            conv_layer=self.pool.block("conv", self._layer_idx),
+            weight=weight,
+            bias=bias,
+            activation=activation,
+        )
+
+    @torch.compiler.disable
+    def __call__(
+        self,
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        a: torch.Tensor, b: torch.Tensor,
+        a_log: torch.Tensor, dt_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.attn.run(
+            q, k, v, a, b,
+            state_layer=self.pool.block("state", self._layer_idx),
+            a_log=a_log,
+            dt_bias=dt_bias,
+        )
+
+
 class RaggedAttentionCallable:
     """`AttentionCallable` for a cacheless attention: ``(q, k, v) -> out`` over
     one declared span of a `RaggedAttnManager`.
@@ -88,3 +151,62 @@ class RaggedAttentionCallable:
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     ) -> torch.Tensor:
         return self.attn.run(q, k, v, label=self.label)
+
+
+class Mamba2Callable:
+    """``LinearAttnCallable`` for a Mamba-2 layer: the conv, then the SSD
+    recurrence, each handed this layer's block of the pool as a plain tensor.
+
+    Same cursor protocol (``bind_step`` once per stack, ``set_layer_idx`` per
+    recurrent layer). The layer index counts recurrent layers only; a hybrid
+    stack interleaves them with attention layers, and the pool is sized by its
+    own count.
+    """
+
+    def __init__(self, pool: RecurrentStatePool, attn: LinearAttnManager | None = None):
+        self.pool = pool
+        self.attn = attn
+        self._layer_idx = 0
+
+    @torch.compiler.disable
+    def bind_step(self, label: str, attn: LinearAttnManager | None = None) -> None:
+        if attn is not None:
+            self.attn = attn
+        assert self.attn is not None, (
+            "no Mamba-2 resource: pass `attn` here or at construction"
+        )
+        self.attn.set_default_label(label)
+
+    @property
+    def label(self) -> str:
+        return self.attn.default_label
+
+    @torch.compiler.disable
+    def set_layer_idx(self, layer_idx: int) -> None:
+        self._layer_idx = layer_idx
+        self.attn.set_default_layer_idx(layer_idx)
+
+    @torch.compiler.disable
+    def conv(
+        self, x: torch.Tensor, weight: torch.Tensor,
+        bias: torch.Tensor | None = None, activation: str | None = "silu",
+    ) -> torch.Tensor:
+        return self.attn.run_conv(
+            x,
+            conv_layer=self.pool.block("conv", self._layer_idx),
+            weight=weight,
+            bias=bias,
+            activation=activation,
+        )
+
+    @torch.compiler.disable
+    def __call__(
+        self,
+        x: torch.Tensor, dt: torch.Tensor, b: torch.Tensor, c: torch.Tensor,
+        a_log: torch.Tensor, d: torch.Tensor | None, dt_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return self.attn.run(
+            x, dt, b, c,
+            ssm_layer=self.pool.block("ssm", self._layer_idx),
+            a_log=a_log, d=d, dt_bias=dt_bias,
+        )

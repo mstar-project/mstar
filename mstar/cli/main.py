@@ -33,6 +33,9 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "cosmos3_super_i2v_4step": "cosmos3_super_i2v_4step_tp2.yaml",
     "cosmos3_super_t2i_4step": "cosmos3_super_t2i_4step_tp2.yaml",
     "kokoro": "kokoro.yaml",
+    "chatterbox": "chatterbox.yaml",
+    "chatterbox_multilingual": "chatterbox_multilingual.yaml",
+    "chatterbox_turbo": "chatterbox_turbo.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
@@ -52,6 +55,15 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "wan22": "wan22.yaml",
     "waypoint": "waypoint.yaml",
 }
+
+# qwen 3.5 series (dense)
+qwen_3_5_dense_sizes = ("0.8", "2", "4", "9", "27")
+DEFAULT_CONFIGS.update({
+    f"qwen3_5_{size}b": f"qwen3_5_{size}b.yaml" \
+        for size in qwen_3_5_dense_sizes
+})
+# 27B has no single-GPU form
+DEFAULT_CONFIGS["qwen3_5_27b"] = "qwen3_5_27b_tp4.yaml"
 
 
 def _repo_root() -> Path:
@@ -133,6 +145,12 @@ def _next_steps(model: str, host: str, port: int) -> str:
             "qwen3_tts_1p7b": "Vivian",
         }[model]
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
+    if model in ("chatterbox", "chatterbox_multilingual", "chatterbox_turbo"):
+        lines.append("    client.tts(\"Hello there\", voice=\"default\", cfg_weight=0.5).to_wav(\"out.wav\")")
+        if model == "chatterbox_multilingual":
+            lines.append("    client.tts(\"Bonjour\", voice=\"default\", language_id=\"fr\").to_wav(\"fr.wav\")")
+        lines.append("    # clone a voice: client.generate(text=\"Hello\", audio=\"ref.wav\",")
+        lines.append("    #     input_modalities=(\"text\",\"audio\"), output_modalities=(\"audio\",))")
     if model == "qwen3_tts_voicedesign":
         lines.append("    client.tts(\"Hello there\", instruct=\"A calm, warm female voice\").to_wav(\"out.wav\")")
     if model == "qwen3_tts_base":
