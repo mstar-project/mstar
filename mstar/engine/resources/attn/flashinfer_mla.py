@@ -344,8 +344,11 @@ class FlashInferMLAManager(AttentionManager):
                 spans = [int(seg.span) for seg in (step.segments or ()) if seg.label == label]
                 views = context_only_views(kv_out.views, spans, self._kv_config.page_size)
                 indptrs = build_paged_indptrs(views, self._kv_config.page_size)
-            # FlashMLA for a plain decode plan (one causal query per row, no context-only read)
-            fmla = self._flashmla and FlashMLAWrapper.plan_fits(indptrs.qo_indptr, step.causal, step.context_only) == 1
+            # FlashMLA for an eager plain decode plan (one causal query per row, no context-only
+            # read). Not under a lease: a replay keeps the captured kernel, and a bucket replays
+            # with padding rows of no query, which FlashMLA cannot plan
+            fmla = (self._flashmla and lease is None
+                    and FlashMLAWrapper.plan_fits(indptrs.qo_indptr, step.causal, step.context_only) == 1)
             if lease is not None:
                 wrapper = self._cg_wrapper(lease, label, indptrs.qo_indptr.shape[0] - 1, fmla)
             else:
