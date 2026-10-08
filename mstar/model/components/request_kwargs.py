@@ -39,6 +39,9 @@ def checked_request_kwargs(kwargs: dict | None) -> dict:
             raise ValueError(f"{key} must be an integer, got {value!r}") from None
         if key == "max_output_tokens" and out[key] < 1:
             raise ValueError(f"max_output_tokens must be at least 1, got {out[key]}")
+        # the conductor's seed is an int64
+        if key == "seed" and not -2**63 <= out[key] < 2**63:
+            raise ValueError(f"seed must fit in an int64, got {out[key]}")
     for key in _FLOATS:
         if out.get(key) is None:
             continue

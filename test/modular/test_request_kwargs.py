@@ -20,7 +20,7 @@ def test_known_fields_are_coerced():
     {"max_output_tokens": "abc"}, {"max_output_tokens": 0}, {"max_output_tokens": True},
     {"temperature": "hot"}, {"temperature": -1}, {"temperature": float("nan")},
     {"top_p": 0}, {"top_p": 1.5}, {"ignore_eos": "maybe"}, {"language": 5},
-    {"timestamps": "letters"},
+    {"timestamps": "letters"}, {"seed": 2**63}, {"seed": -2**64},
 ])
 def test_bad_values_name_the_field(bad):
     (key,) = bad
