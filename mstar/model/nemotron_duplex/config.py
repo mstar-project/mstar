@@ -244,6 +244,15 @@ class ConformerSTTConfig:
     def hop_length(self) -> int:
         return round(self.sample_rate * self.window_stride)
 
+    def num_frames(self, num_samples: int) -> int:
+        """Encoder frames for ``num_samples`` of audio: the mel frame count
+        (``get_seq_len``), then the subsampling's ``calc_length``."""
+        import math
+        n = num_samples // self.hop_length + 1
+        for _ in range(int(math.log2(self.subsampling_factor))):
+            n = n // 2 + 1
+        return n
+
     @property
     def subsampling_flat(self) -> int:
         # Freq after log2(factor) causal stride-2 conv stages (kernel 3, causal

@@ -343,10 +343,13 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 class NemotronDuplexModel(Model):
     """NVIDIA NemotronLabs VoiceChat-11B (duplex S2S)."""
 
-    def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs):
+    def __init__(self, model_path_hf: str, cache_dir: str | None = None,
+                 max_session_s: float | None = None, **kwargs):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.config = NemotronDuplexConfig()
+        if max_session_s:
+            self.max_session_s = max_session_s
         self._tokenizer = None  # lazy — not needed in dummy mode
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
@@ -390,14 +393,36 @@ class NemotronDuplexModel(Model):
     # Sessions resident at once (one recurrent slot each; ~137 MB per slot in
     # fp32 for Nemotron-H). A deployment tunes it under ``resources: mamba_state``.
     DEFAULT_MAMBA_SLOTS = 64          # sessions; the runner's padding rows take no slot (#258)
-    # Talker KV pages (128 positions each, ~16.5 MB a page over 28 layers):
-    # Talker KV pool, both CFG streams of every session. A page is 128
-    # positions: 28 layers x 128 x 16 heads x 128 (the padded head dim) x K,V x
-    # bf16 = 28 MiB, so 512 pages = 14 GiB = 65 536 positions = 64 sessions x 2
-    # streams x 512 positions (the 38-token warm-up + ~38 s of frames). Size by
-    # sessions x 2 x ceil((38 + frames) / 128); a stream that outgrows the pool
-    # stalls its session (no sliding-window eviction yet).
-    DEFAULT_TALKER_KV_PAGES = 512
+    # Longest session served (``model_kwargs: {max_session_s: ...}``). The
+    # talker KV pool is sized so DEFAULT_MAMBA_SLOTS sessions this long fit at
+    # once: a full pool stalls every session, not just the one that outgrew it.
+    # A page is 128 positions: 28 layers x 128 x 16 heads x 128 (the padded
+    # head dim) x K,V x bf16 = 28 MiB. 78 s = 976 frames, so 37 warm-up + 976
+    # + 1 final PAD frame fit 8 pages a stream; 64 sessions x 2 streams x 8 =
+    # 1024 pages (+ the sink) = 28 GiB.
+    max_session_s = 78.0
+    TALKER_WARMUP_POSITIONS = 37      # the speaker warm-up each talker stream prefills
+    # Headroom over max_session_frames for the loops and the conductor's token
+    # cap; a cap reached mid-stream hangs the session instead of ending it.
+    LOOP_ITERS_MARGIN = 16
+
+    @property
+    def max_session_frames(self) -> int:
+        stt = self.config.stt
+        return stt.num_frames(int(self.max_session_s * stt.sample_rate))
+
+    def talker_kv_pages(self, page_size: int) -> int:
+        """Pages for DEFAULT_MAMBA_SLOTS sessions of max_session_frames, both CFG streams."""
+        positions = self.TALKER_WARMUP_POSITIONS + self.max_session_frames + 1
+        # + 1 for the pool's sink page
+        return self.DEFAULT_MAMBA_SLOTS * 2 * -(-positions // page_size) + 1
+
+    def get_max_output_tokens(self, **model_kwargs) -> int:
+        # One text token per audio frame, so the audio fixes the length and
+        # process_prompt has already bounded it. A client cap would cut the
+        # text loop short of its stream's end and hang the session.
+        del model_kwargs
+        return self.max_session_frames + self.LOOP_ITERS_MARGIN
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         nano = self.config.nano
@@ -455,7 +480,7 @@ class NemotronDuplexModel(Model):
                     # the sliding window plus the speaker warm-up, rounded up
                     max_seq_len=eartts.sliding_window + 512,
                     num_qo_heads=eartts.num_attention_heads,
-                    max_num_pages=self.DEFAULT_TALKER_KV_PAGES,
+                    max_num_pages=self.talker_kv_pages(PagedKVConfig.page_size),
                 ),
             ),
             AttentionSpec(
@@ -644,6 +669,12 @@ class NemotronDuplexModel(Model):
                         raise ValueError(
                             f"audio is {w.numel()} samples; need at least {min_samples} "
                             f"({min_samples * 1000 // stt.sample_rate} ms at {stt.sample_rate} Hz)"
+                        )
+                    # past the cap the talker KV and the decode loops run out
+                    if stt.num_frames(w.numel()) > self.max_session_frames:
+                        raise ValueError(
+                            f"audio is {w.numel() / stt.sample_rate:.1f} s; this server "
+                            f"takes sessions up to {self.max_session_s:g} s"
                         )
                 out["audio_features"] = wav
         # Seed the decode loop's iteration-0 fed-back tokens. The frame-
