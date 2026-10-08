@@ -24,7 +24,6 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
 )
-
 from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
