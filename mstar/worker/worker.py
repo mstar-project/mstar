@@ -2449,9 +2449,10 @@ class Worker:
     ):
         """Splice batch N's outputs into the spec batch's inputs.
 
-        Runs on the plan thread as soon as N's outputs are published, so it
-        must not read a tensor VALUE: it only moves tensor lists and tests
-        which keys are present. N's kernels may still be running.
+        Runs on the main thread right after N's future resolves, which is
+        when the GPU thread has enqueued N, so it must not read a tensor
+        VALUE: it only moves tensor lists and tests which keys are present.
+        N's kernels may still be running.
         """
         threaded_continuing: set[int] = set()
         dropped: set[int] = set()
