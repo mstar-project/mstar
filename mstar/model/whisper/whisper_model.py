@@ -405,7 +405,7 @@ class WhisperModel(Model):
         # ``.tolist()``, which is a D2H sync inside ``prepare_inputs`` on the
         # GPU thread — at prefill it blocks on the encoder's queued window.
         # Detection leaves the language token unknown by construction; the
-        # align walk takes it off the transcript instead (``_prepare_alignment``).
+        # decoder keeps the sampled one from the prompt walk instead.
         language = kwargs.get("language")
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,

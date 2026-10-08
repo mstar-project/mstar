@@ -406,6 +406,26 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     assert detect.tensor_inputs["ts_rules"].tolist() == inactive_state()
 
 
+def test_decoder_align_walk_uses_the_detected_language():
+    cfg = _tiny_config()
+    sub = _decoder_submodule(cfg)
+    sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
+    # after detection the route leaves the language unset on the prompt walk
+    fwd = _fwd(7, "r", language=None, task=TRANSCRIBE, timestamps=False)
+    detected = torch.tensor([DE])
+    sub.prepare_inputs(
+        PREFILL_PROMPT_WALK, fwd,
+        {"text_inputs": [detected], "prompt_tail": [torch.tensor([TRANSCRIBE, NOTS])]},
+    )
+    detected.fill_(EN)  # the input's memory is reused once the walk is done
+    row = sub.prepare_inputs(ALIGN_WALK, fwd, {
+        "transcript": [torch.tensor([7]), torch.tensor([EOT])],
+        "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
+        "audio_frames": [torch.tensor([cfg.num_frames])],
+    })
+    assert row.input_ids.tolist() == [SOT, DE, TRANSCRIBE, NOTS, 7, EOT]
+
+
 def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)

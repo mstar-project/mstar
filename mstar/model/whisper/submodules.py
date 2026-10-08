@@ -359,9 +359,11 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 graph_walk != DETECT_LANGUAGE_WALK and bool(meta.get("timestamps"))
             )
             # the align walk rebuilds the forced prompt from these. The
-            # language is None exactly when it is being detected, and that walk
-            # reads it off the transcript instead (see ``_prepare_alignment``).
+            # language is None exactly when it is being detected; the sampled
+            # token then leads the prompt walk's input, kept on the device.
             language = meta.get("language")
+            if language is None and graph_walk == PREFILL_PROMPT_WALK:
+                language = token_ids[:1].clone()
             if language is not None:
                 state.add("language", language)
             task = meta.get("task")
@@ -386,8 +388,8 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         state = self.request_state(fwd_info.rid_handle)
         generated = [int(t) for part in inputs["transcript"] for t in part.reshape(-1).tolist()]
         language = state.get("language")
-        if generated and self.config.language_of(generated[0]) is not None:
-            language, generated = generated[0], generated[1:]  # detected, not forced
+        if isinstance(language, torch.Tensor):
+            language = int(language.item())
         task = state.get("task", self.config.task_token("transcribe"))
         text = [t for t in generated if t < self.config.eos_token_id]
         if language is None:
