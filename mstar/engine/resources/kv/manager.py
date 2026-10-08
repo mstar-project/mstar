@@ -1320,6 +1320,10 @@ class KVManager(AttentionResource):
         self._cached_plan_output = None
 
     def commit(self, step: KVStep, ctx: StepContext):
+        streams = self._streams
+        retention = step.retention
+        # the index only sees real rows of a non-capture step; checked once
+        index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
             # committed, so there is nothing left to unwind
@@ -1327,7 +1331,7 @@ class KVManager(AttentionResource):
             for segment in step.segments:
                 if ctx.is_padding_row(segment.request_id):
                     continue  # ran against SINK_PAGE, holds nothing
-                stream = self._streams[segment.request_id][segment.label]
+                stream = streams[segment.request_id][segment.label]
                 # cleared before the `step.commit` test: a step that keeps no
                 # tokens (image_gen, action_gen) still read these pages, and
                 # leaving the mark set would make the request unevictable
@@ -1347,10 +1351,14 @@ class KVManager(AttentionResource):
                     stream.stored_len += segment.span
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
-                    policy = step.retention.get((segment.request_id, segment.label))
+                    policy = (
+                        retention.get((segment.request_id, segment.label))
+                        if retention else None
+                    )
                     if policy is not None:
                         self._adopt_retention(stream, policy, segment)
-                    self._index_filled_pages(segment, stream, ctx)
+                    if index_on and stream.chain is not None:
+                        self._index_filled_pages(segment, stream, ctx)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
