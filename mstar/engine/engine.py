@@ -1607,6 +1607,13 @@ class Engine:
         A captured region can't do this itself: the per-request slice ends
         depend on the real seq_lens, which only reach it through the plan.
         """
+        if (
+            not raw_outputs.packed_outputs
+            and type(submodule).unpack_packed_outputs
+            is NodeSubmodule.unpack_packed_outputs
+        ):
+            # nothing packed and the base no-op: skip the per-rid lengths
+            return
         unpacked = submodule.unpack_packed_outputs(
             static_output=raw_outputs.packed_outputs,
             request_ids=request_ids,
