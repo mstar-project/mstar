@@ -3694,6 +3694,11 @@ class Worker:
         spec_peek_for_fairness = (
             os.environ.get("MSTAR_SPEC_PEEK_FOR_FAIRNESS", "1") == "1"
         )
+        # How long the loop keeps speculating once another step is ready, so
+        # that at high concurrency the requests arriving over that window
+        # prefill in one step rather than one step each. 0 yields at once.
+        spec_yield_hold_s = float(os.environ.get("MSTAR_SPEC_YIELD_HOLD_MS", "0")) / 1000.0
+        fairness_ready_since: list[float | None] = [None]
         consecutive_spec_steps = 0
         yield_away_from_target: tuple[str, str] | None = None
         # Build N+2 while N+1 runs, between the two halves of N's
@@ -3725,7 +3730,7 @@ class Worker:
                 # another (node, walk) actually ready to schedule on
                 # this worker. On single-walk workers (Orpheus LLM,
                 # Orpheus SNAC) this returns False and we always speculate.
-                must_yield_for_fairness = (
+                other_ready = (
                     spec_peek_for_fairness
                     and consecutive >= 1
                     and self.scheduler.has_ready_excluding(
@@ -3733,10 +3738,22 @@ class Worker:
                         (pending.node_name, pending.graph_walk),
                     )
                 )
+                if other_ready:
+                    now = _time.perf_counter()
+                    if fairness_ready_since[0] is None:
+                        fairness_ready_since[0] = now
+                    must_yield_for_fairness = (
+                        now - fairness_ready_since[0] >= spec_yield_hold_s
+                    )
+                else:
+                    fairness_ready_since[0] = None
+                    must_yield_for_fairness = False
                 must_yield_away = (
                     consecutive >= max_consecutive_spec
                     or must_yield_for_fairness
                 )
+                if must_yield_away:
+                    fairness_ready_since[0] = None
                 if not must_yield_away and not admit_refused:
                     if self.enable_nvtx:
                         range_push("worker.speculate", synchronize=False)
