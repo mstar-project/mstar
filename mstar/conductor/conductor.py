@@ -50,6 +50,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
+from mstar.utils.gc_freeze import freeze_after_setup
 
 logger = logging.getLogger(__name__)
 
@@ -1537,6 +1538,8 @@ class Conductor:
         from mstar.utils.profiler import range_pop, range_push
 
         self._wait_for_workers_ready()
+        # the set-up heap is complete: keep gen-2 collections off it
+        freeze_after_setup("Conductor")
 
         self.communicator.send(
             "api_server",
