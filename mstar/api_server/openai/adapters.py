@@ -1002,7 +1002,12 @@ class TextChatAdapter(OpenAIAdapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        text, _, _, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
+        text, _, modalities, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
+        # an image or audio part was decoded to disk and then dropped: the model
+        # answered as if it had seen it
+        other = sorted(set(modalities) - {"text"})
+        if other:
+            raise ValueError(f"this model takes text only; the messages carry {other}")
         if not text:
             raise ValueError("messages carry no text content")
         for name in ("max_tokens", "max_completion_tokens"):
@@ -1011,6 +1016,11 @@ class TextChatAdapter(OpenAIAdapter):
                 raise ValueError(f"{name} must be at least 1, got {value}")
         mk = _passthrough(req)
         _apply_sampling(req, mk)
+        # extra_body can override max_tokens with anything; a string reached the
+        # conductor's min() and took its whole message batch down
+        _check_numeric_kwargs(mk)
+        if mk.get("max_output_tokens") is not None and mk["max_output_tokens"] < 1:
+            raise ValueError(f"max_output_tokens must be at least 1, got {mk['max_output_tokens']}")
         return SubmitArgs(
             text=text,
             input_modalities=["text"],
