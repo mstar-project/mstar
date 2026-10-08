@@ -547,6 +547,17 @@ def test_from_hf_config_reads_the_checkpoint_geometry():
         Glm52ModelConfig.from_hf_config(hf)
 
 
+@pytest.mark.parametrize("rope", [
+    {"rope_parameters": {"rope_theta": 8e6, "rope_type": "yarn", "factor": 4.0}},
+    {"rope_scaling": {"type": "dynamic", "factor": 2.0}},
+])
+def test_a_scaled_rope_is_refused(rope):
+    # it ran as plain RoPE: wrong frequencies and softmax scale, no error
+    hf = {**_hf_config(Glm52ModelConfig()), **rope}
+    with pytest.raises(ValueError, match="plain RoPE"):
+        Glm52ModelConfig.from_hf_config(hf)
+
+
 def test_model_takes_its_geometry_from_config_json(tmp_path):
     import json
 
