@@ -1232,6 +1232,7 @@ class _SizedEngine(_Engine):
     def __init__(self, too_big, **kw):
         super().__init__(**kw)
         self.too_big = set(too_big)
+        self.measured = []
 
     def declares_input_sequence_len(self, node_name):
         del node_name
@@ -1239,6 +1240,7 @@ class _SizedEngine(_Engine):
 
     def input_sequence_len(self, node_name, graph_walk, request_info, inputs):
         del node_name, graph_walk, request_info
+        self.measured.append(len(inputs))
         return SimpleNamespace(seq_len=len(inputs))
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True, seq_len_info=None):
@@ -1267,4 +1269,18 @@ def test_a_backlogged_row_without_room_stays_parked():
     batch = _next_batch(sched, _Manager([]))
 
     assert list(batch.request_to_worker_graph) == ["b0"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b1"]
+
+
+def test_a_parked_row_is_measured_once_and_checked_once_per_pass():
+    engine = _SizedEngine(too_big={"b1"}, max_bs=8)
+    sched = _scheduler(engine)
+    sched.get_tensor = lambda uuid: uuid
+    sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
+
+    _next_batch(sched, _Manager([]))
+    _next_batch(sched, _Manager([]))
+
+    assert len(engine.measured) == 2, "b0 once, b1 once though it waited two passes"
+    assert engine.checked == ["b0"], "one check per row, with its length"
     assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b1"]
