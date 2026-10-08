@@ -391,7 +391,8 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         if isinstance(language, torch.Tensor):
             language = int(language.item())
         task = state.get("task", self.config.task_token("transcribe"))
-        text = [t for t in generated if t < self.config.eos_token_id]
+        # the 4 prompt tokens and end-of-text stay inside the position table
+        text = [t for t in generated if t < self.config.eos_token_id][: self.config.max_target_positions - 5]
         if language is None:
             language = self.config.language_token("en")
         seq = [self.config.decoder_start_token_id, language, task, self.config.no_timestamps_token_id]

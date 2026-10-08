@@ -426,6 +426,20 @@ def test_decoder_align_walk_uses_the_detected_language():
     assert row.input_ids.tolist() == [SOT, DE, TRANSCRIBE, NOTS, 7, EOT]
 
 
+def test_decoder_align_walk_fits_the_position_table():
+    cfg = _tiny_config()
+    sub = _decoder_submodule(cfg)
+    sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
+    sub.request_state(8).add("language", EN)
+    # more text than fits after the forced prompt
+    row = sub.prepare_inputs(ALIGN_WALK, _fwd(8), {
+        "transcript": [torch.tensor([7])] * cfg.max_target_positions + [torch.tensor([EOT])],
+        "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
+        "audio_frames": [torch.tensor([cfg.num_frames])],
+    })
+    assert row.input_seq_len == cfg.max_target_positions and row.input_ids.tolist()[-1] == EOT
+
+
 def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
