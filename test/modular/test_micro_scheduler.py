@@ -472,6 +472,48 @@ def test_a_full_caller_batch_does_not_clobber_the_backlog():
     )
 
 
+def test_a_full_caller_checks_nothing():
+    """Speculation asks every step; with its own rows at the cap, re-checking
+    the backlog or the ready queue only to put it all back is wasted work."""
+    engine = _Engine(max_bs=16)
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch([f"b{i}" for i in range(8)])
+
+    batch = _next_batch(sched,
+        _Manager(["f0", "f1"]), target=(NODE, WALK), pre_existing_batch_size=16,
+    )
+
+    assert batch is None
+    assert engine.checked == []
+    assert len(sched.backlog[(NODE, WALK)]) == 8
+
+
+def test_a_caller_filled_by_its_backlog_does_not_scan():
+    engine = _Engine(max_bs=16)
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch([f"b{i}" for i in range(8)])
+
+    batch = _next_batch(sched,
+        _Manager(["f0", "f1"]), target=(NODE, WALK), pre_existing_batch_size=8,
+    )
+
+    assert set(batch.request_to_worker_graph) == {f"b{i}" for i in range(8)}
+    assert not {"f0", "f1"} & set(engine.checked), "the ready queue was scanned"
+
+
+def test_a_held_backlog_row_does_not_count_toward_skipping_the_scan():
+    engine = _Engine(max_bs=16)
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch([f"b{i}" for i in range(8)])
+    sched.hold_requests(["b0"])
+
+    batch = _next_batch(sched,
+        _Manager(["f0", "f1"]), target=(NODE, WALK), pre_existing_batch_size=8,
+    )
+
+    assert {"b1", "f0"} <= set(batch.request_to_worker_graph)
+
+
 def test_fresh_work_does_not_evict_a_blocked_backlog_chunk():
     """Capacity remains, but a wholly-blocked chunk is already parked under
     this key. The scan's leftovers must fold in beside it — replacing drops
