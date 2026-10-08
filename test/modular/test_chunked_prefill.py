@@ -314,7 +314,7 @@ def _budgeted_engine():
 
     from mstar.engine.engine import Engine
 
-    sub = SimpleNamespace(max_batch_tokens=lambda walk: {"prefill": 512, "vision": 2048}.get(walk))
+    sub = SimpleNamespace(max_batch_tokens={"prefill": 512, "vision": 2048}.get)
     engine = Engine.__new__(Engine)
     engine._submodules = {"LLM": SimpleNamespace(submodule=sub)}
     engine._token_budget_overrides = {}
