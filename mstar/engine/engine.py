@@ -48,6 +48,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     BatchedModelOutput,
     ChunkedPrefillOutputPolicy,
+    ChunkingPolicy,
     HostRows,
     InputMetadata,
     InputSeqLenInfo,
@@ -420,8 +421,8 @@ class Engine:
         self._enable_profile = enable_profile
         # (node, walk) -> steps that ran over the walk's token budget
         self._token_budget_overruns: dict[tuple[str, str], int] = {}
-        # (node, walk) -> the submodule's chunked output policies
-        self._chunk_output_policies: dict[tuple[str, str], dict[str, ChunkedPrefillOutputPolicy]] = {}
+        # (node, walk) -> the submodule's chunking policy, asked once
+        self._chunking_policies: dict[tuple[str, str], ChunkingPolicy] = {}
         # the serving config's max_batch_tokens: node -> budget, (node, walk) -> budget; None is off
         self._token_budget_overrides: dict[str | tuple[str, str], int | None] = {}
 
@@ -734,13 +735,13 @@ class Engine:
                 range_pop()
 
     def _check_token_budget(
-        self, batch: ExecutingBatch, submodule, node_inputs: list[NodeInputs],
+        self, batch: ExecutingBatch, node_inputs: list[NodeInputs],
     ) -> None:
         """Warn when a step runs over its walk's token budget: the scheduler
         sizes a speculation merge's continuing rows by guess, before their
         inputs exist. Logged on the 1st, 2nd, 4th, ... overrun per walk."""
         walk = batch.step_context.graph_walk
-        budget = self._token_budget(batch.node_name, submodule, walk)
+        budget = self.get_max_batch_tokens(batch.node_name, walk)
         if budget is None:
             return
         total = sum(inp.input_seq_len for inp in node_inputs)
@@ -798,7 +799,7 @@ class Engine:
                 batch.input_seq_lens[rid] = req_inputs.input_seq_len
 
         batch.register_prepare_batch(node_inputs)
-        self._check_token_budget(batch, submodule, node_inputs)
+        self._check_token_budget(batch, node_inputs)
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
@@ -829,8 +830,8 @@ class Engine:
                 # a first chunk starts past what `input_sequence_len` matched
                 if start and not self._prefix_cuttable(full, batch.node_name, walk):
                     raise RuntimeError(
-                        f"{batch.node_name}/{walk}: reuses_cached_prefix allowed a "
-                        "row whose prepared inputs cannot skip a cached prefix"
+                        f"{batch.node_name}/{walk}: the chunking policy reuses a cached "
+                        "prefix for a row whose prepared inputs cannot skip it"
                     )
                 self._runner.apply_cached_prefix(rid, batch.node_name, walk, full, start)
             self._chunk_inputs[key] = full
@@ -1676,12 +1677,18 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
-    def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
-        return self._token_budget(node_name, self._submodules[node_name].submodule, graph_walk)
+    def chunking_policy(self, node_name: str, graph_walk: str) -> ChunkingPolicy:
+        """The submodule's, asked once per (node, walk)."""
+        key = (node_name, graph_walk)
+        policy = self._chunking_policies.get(key)
+        if policy is None:
+            submodule = self._submodules[node_name].submodule
+            policy = self._chunking_policies[key] = submodule.get_chunking_policy(graph_walk)
+        return policy
 
-    def _token_budget(self, node_name: str, submodule, graph_walk: str) -> int | None:
-        """The submodule's budget for the walk, unless the serving config overrides it."""
-        budget = submodule.max_batch_tokens(graph_walk)
+    def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
+        """The walk's budget, unless the serving config overrides it."""
+        budget = self.chunking_policy(node_name, graph_walk).max_batch_tokens
         if budget is None or not self._token_budget_overrides:
             return budget
         for key in ((node_name, graph_walk), node_name):
@@ -1699,7 +1706,6 @@ class Engine:
         for node, setting in overrides.items():
             if node not in self._submodules:
                 continue
-            submodule = self._submodules[node].submodule
             per_walk = setting if isinstance(setting, Mapping) else None
             for walk, budget in (per_walk or {None: setting}).items():
                 if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget < 1):
@@ -1709,25 +1715,17 @@ class Engine:
                     continue
                 if walk not in walks:
                     raise ValueError(f"max_batch_tokens names walk {walk!r} of {node}, which the model never runs")
-                if submodule.max_batch_tokens(walk) is None:
+                if self.chunking_policy(node, walk).max_batch_tokens is None:
                     raise ValueError(f"max_batch_tokens for {node}/{walk}: the model sets no budget there to override")
                 self._token_budget_overrides[(node, walk)] = budget
 
     def supports_chunked_prefill(self, node_name: str, graph_walk: str) -> bool:
-        return self._submodules[node_name].submodule.supports_chunked_prefill(graph_walk)
+        return self.chunking_policy(node_name, graph_walk).chunkable
 
     def chunked_prefill_output_policies(
         self, node_name: str, graph_walk: str,
-    ) -> dict[str, ChunkedPrefillOutputPolicy]:
-        """The submodule's, asked once per (node, walk)."""
-        key = (node_name, graph_walk)
-        policies = self._chunk_output_policies.get(key)
-        if policies is None:
-            submodule = self._submodules[node_name].submodule
-            policies = self._chunk_output_policies[key] = (
-                submodule.get_chunked_prefill_output_policies(graph_walk)
-            )
-        return policies
+    ) -> Mapping[str, ChunkedPrefillOutputPolicy]:
+        return self.chunking_policy(node_name, graph_walk).output_policies
 
     def declares_input_sequence_len(self, node_name: str) -> bool:
         """Whether the node's submodule reports row lengths before prepare."""
@@ -1743,11 +1741,13 @@ class Engine:
         cache holds, which ``rid``'s lease keeps until its first chunk applies it."""
         submodule = self._submodules[node_name].submodule
         info = submodule.get_input_sequence_len(graph_walk, request_info, inputs)
+        policy = self.chunking_policy(node_name, graph_walk)
         if (
             info is None or rid is None or info.resource_segment_lengths
             or graph_walk not in self._keyed_walks.get(node_name, ())
-            or not submodule.supports_chunked_prefill(graph_walk)
-            or not submodule.reuses_cached_prefix(graph_walk, request_info)
+            or not policy.chunkable
+            or (policy.reuses_cached_prefix is not None
+                and not policy.reuses_cached_prefix(request_info))
         ):
             return info
         matched = self._runner.resolve_cached_prefix(rid, node_name, graph_walk)

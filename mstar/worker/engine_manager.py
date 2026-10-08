@@ -81,7 +81,7 @@ def _refuse_unsupported_chunking(
     for walk, section in model.get_graph_walk_graphs().items():
         for node in section.get_nodes():
             submodule = submodules.get(node)
-            if submodule is None or not submodule.supports_chunked_prefill(walk):
+            if submodule is None or not submodule.get_chunking_policy(walk).chunkable:
                 continue
             if type(submodule).get_input_sequence_len is NodeSubmodule.get_input_sequence_len:
                 raise ValueError(

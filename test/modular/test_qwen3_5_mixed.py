@@ -73,9 +73,10 @@ def test_text_and_decode_rows_report_their_length(walk, inputs, length):
 def test_text_prefill_chunks_under_a_budget_that_fits_the_captures():
     llm = object.__new__(LLMSubmodule)
 
-    assert llm.supports_chunked_prefill("prefill_text")
-    assert not llm.supports_chunked_prefill("prefill_vision")
-    assert llm.max_batch_tokens(LLM_MIXED) == llm.MAX_BATCH_TOKENS
+    assert llm.get_chunking_policy("prefill_text").chunkable
+    assert not llm.get_chunking_policy("prefill_vision").chunkable
+    mixed = llm.get_chunking_policy(LLM_MIXED)
+    assert not mixed.chunkable and mixed.max_batch_tokens == llm.MAX_BATCH_TOKENS
     largest = max(LLMSubmodule.PREFILL_TOKEN_BUCKETS)
     assert llm.MAX_BATCH_TOKENS + max(LLMSubmodule.DECODE_CAPTURE_BATCH_SIZES) <= largest
 

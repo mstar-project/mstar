@@ -62,9 +62,11 @@ from mstar.model.qwen3_5.config import (
 )
 from mstar.model.qwen3_5.qwen3_5_model import TEXT_PART
 from mstar.model.submodule_base import (
+    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    ChunkingPolicy,
     HostRows,
     InputSeqLenInfo,
     ModelInputsFromEngine,
@@ -262,11 +264,12 @@ class LLMSubmodule(ARNodeSubmodule):
     # under the largest prefill capture (2048) with a mixed step's decode rows
     MAX_BATCH_TOKENS = 1024
 
-    def supports_chunked_prefill(self, graph_walk: str) -> bool:
-        return graph_walk == "prefill_text"
-
-    def max_batch_tokens(self, graph_walk: str) -> int | None:
-        return self.MAX_BATCH_TOKENS if graph_walk in ("prefill_text", LLM_MIXED) else None
+    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
+        if graph_walk == "prefill_text":
+            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS)
+        if graph_walk == LLM_MIXED:
+            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
+        return NO_CHUNKING
 
     def get_input_sequence_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
