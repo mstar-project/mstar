@@ -71,7 +71,9 @@ Communication
        (whole forwards and piecewise regions). Unset, each capture config's
        ``compile_mode`` applies, else ``max-autotune-no-cudagraphs``.
        ``default`` keeps Inductor's fusion but takes cuBLAS for every GEMM
-       and skips autotuning. An unknown mode fails at import.
+       and skips autotuning. An unknown or empty mode fails at import, and so
+       does one with Inductor's own CUDA graphs (``reduce-overhead``,
+       ``max-autotune``).
    * - ``MSTAR_DIST_TIMEOUT_S``
      - config's ``dist_timeout_s``
      - Timeout in seconds for the NCCL world group and its parallel

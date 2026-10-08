@@ -38,14 +38,24 @@ def _validate_compile_mode(mode: str, source: str) -> str:
     fallback would serve the model eager."""
     if mode == "default":
         return mode
+    if not mode:
+        # list_mode_options("") is the whole table, and torch.compile skips a falsy mode
+        raise ValueError(f"{source} is empty; name a mode or unset it")
     try:
         from torch._inductor import list_mode_options
 
-        list_mode_options(mode)
+        options = list_mode_options(mode)
     except Exception as exc:
         raise ValueError(
             f"{source}={mode!r} is not a mode this torch.compile accepts: {exc}"
         ) from exc
+    if options.get("triton.cudagraphs"):
+        # Inductor's own graphs inside the runner's capture fail it, and the
+        # bucket would serve eager
+        raise ValueError(
+            f"{source}={mode!r} turns on Inductor's CUDA graphs inside the runner's "
+            "capture; use a -no-cudagraphs mode"
+        )
     return mode
 
 

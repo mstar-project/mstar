@@ -38,7 +38,14 @@ def test_config_mode_defaults_to_the_historical_autotune(no_env_override):
 
 def test_config_names_its_own_mode(no_env_override):
     assert compile_kwargs("default") == {"fullgraph": False, "dynamic": False}
-    assert compile_kwargs("reduce-overhead")["mode"] == "reduce-overhead"
+    assert compile_kwargs("max-autotune-no-cudagraphs")["mode"] == "max-autotune-no-cudagraphs"
+
+
+@pytest.mark.parametrize("mode", ["reduce-overhead", "max-autotune"])
+def test_a_mode_with_inductor_cudagraphs_is_refused(no_env_override, mode):
+    # inside the runner's own capture they fail it, and the bucket serves eager
+    with pytest.raises(ValueError, match="no-cudagraphs"):
+        compile_kwargs(mode)
 
 
 def test_invalid_config_mode_is_refused(no_env_override):
@@ -79,7 +86,10 @@ def test_env_override_is_read_and_validated_at_import():
     read = runner_mod._read_compile_mode_override
     assert read({}) is None
     assert read({ENV: "default"}) == "default"
-    assert read({ENV: "reduce-overhead"}) == "reduce-overhead"
+    assert read({ENV: "max-autotune-no-cudagraphs"}) == "max-autotune-no-cudagraphs"
+    # an empty export (MODE=${MODE:-}) silently compiled in Inductor's default mode
+    with pytest.raises(ValueError, match="empty"):
+        read({ENV: ""})
     with pytest.raises(ValueError, match=f"{ENV}='no-such-mode'"):
         read({ENV: "no-such-mode"})
 
