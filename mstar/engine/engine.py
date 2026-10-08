@@ -55,7 +55,14 @@ from mstar.model.submodule_base import (
 )
 from mstar.profile.worker import ExecTimings
 from mstar.utils.ipc_format import OffloadDelta
-from mstar.utils.profiler import PHASE_PERIOD, mark, phase_record, range_pop, range_push
+from mstar.utils.profiler import (
+    PHASE_PERIOD,
+    mark,
+    nvtx_enabled,
+    phase_record,
+    range_pop,
+    range_push,
+)
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -400,6 +407,7 @@ class Engine:
         model: "Model | None" = None,
     ):
         self._device = device
+        self._enable_nvtx = nvtx_enabled(self._enable_nvtx, device)
         if kv_cache_type is None:
             kv_cache_type = self._autocast_dtype
 

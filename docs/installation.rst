@@ -80,6 +80,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - BAGEL runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``Pillow``, ``torchvision`` / ``torchaudio`` / ``torchcodec``,
        ``huggingface-hub``, ``regex``, and ``mooncake-transfer-engine`` (RDMA transport).
+   * - ``.[bagel_xpu]``
+     - BAGEL runtime for Intel XPU. Pins ``vllm-xpu-kernels==0.1.15.4`` for
+       batched token sampling with per-request RNG state on the device.
+       Install the matching XPU build of PyTorch.
    * - ``.[qwen3_omni]``
      - Qwen3-Omni runtime: the BAGEL set plus ``qwen-omni-utils``, ``datasets``, and
        ``ninja`` (speeds up the JIT build of the vendored MoE align kernel).

@@ -72,7 +72,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
+from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -236,7 +236,7 @@ class Worker:
     ):
         self.worker_id = worker_id
         self.device = device
-        self.enable_nvtx = enable_nvtx
+        self.enable_nvtx = nvtx_enabled(enable_nvtx, device)
 
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads
@@ -2715,7 +2715,8 @@ class Worker:
             rid for rid in batch_N.node_batch.request_ids if rid in valid_rids
         ]
         if not valid_rids:
-            range_pop(synchronize=False)
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
             return
 
         # pending stops are only needed for one iteration, so can be cleared now
