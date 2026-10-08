@@ -1,5 +1,6 @@
 """The row store: a decode step's outputs are row views of one batch clone,
 stored from one row's description and the stop check's host rows."""
+import pytest
 import torch
 
 from mstar.communication.tensors import SharedMemoryCommunicationManager
@@ -17,6 +18,14 @@ def _manager(tmp_path):
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_NullCommunicator(), shm_dir=str(tmp_path),
     )
+
+
+def _columnar(mgr):
+    """The row store only exists for the columnar (mstar_rust) tensor store;
+    without it the manager takes the general path, which is tested elsewhere."""
+    if not mgr.tensor_store.has_put_tensor_batch_columns:
+        pytest.skip("the row store needs the columnar tensor store (mstar_rust)")
+    return mgr
 
 
 def _batch(rids):
@@ -44,7 +53,7 @@ def _batch(rids):
 def test_row_store_matches_the_general_path(tmp_path):
     rids = [3, 5, 8, 13]
     outputs, host_rows, cpu_per_rid = _batch(rids)
-    fast_mgr, slow_mgr = _manager(tmp_path / "a"), _manager(tmp_path / "b")
+    fast_mgr, slow_mgr = _columnar(_manager(tmp_path / "a")), _manager(tmp_path / "b")
     fast = fast_mgr.store_row_outputs_batch(
         rids, outputs, SIGNALS, outputs.row_views, outputs.row_request_ids,
         node_name="text", graph_walk="decode", host_rows=host_rows,
@@ -99,7 +108,7 @@ def test_row_store_keeps_the_general_path_shape_for_missing_signals(tmp_path):
     rids = [1, 2, 3]
     outputs, host_rows, cpu_per_rid = _batch(rids)
     del outputs.per_rid_outputs[2]["text_inputs"]
-    mgr = _manager(tmp_path)
+    mgr = _columnar(_manager(tmp_path))
     fast = mgr.store_row_outputs_batch(
         rids, outputs, SIGNALS, outputs.row_views, outputs.row_request_ids,
         host_rows=host_rows,
@@ -113,7 +122,7 @@ def test_row_store_keeps_the_general_path_shape_for_missing_signals(tmp_path):
 def test_row_store_without_host_rows_stores_no_host_copy(tmp_path):
     rids = [1, 2]
     outputs, _, _ = _batch(rids)
-    mgr = _manager(tmp_path)
+    mgr = _columnar(_manager(tmp_path))
     fast = mgr.store_row_outputs_batch(
         rids, outputs, SIGNALS, outputs.row_views, outputs.row_request_ids,
     )
