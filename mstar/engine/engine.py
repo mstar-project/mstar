@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Callable, Mapping
@@ -27,7 +27,6 @@ from mstar.engine.resources import (
     PublishedInfo,
     Resource,
     ResourceReqConfig,
-    SamplerStep,
     SlotLease,
     StepContext,
     StepRunner,
@@ -373,22 +372,6 @@ class ExecutingBatch:
         self.step_context.slot_lease = slot_lease
         if self.slot is None:
             self.set_slot(slot_lease.slot)
-
-
-def _keep_only_final_chunk_samples(
-    step: SubmoduleStep, rids: list, inputs: list[NodeInputs],
-) -> None:
-    """A non-final chunk's sampled token is dropped, so its sampler state is not committed."""
-    non_final = {
-        rid for rid, inp in zip(rids, inputs, strict=False)
-        if not getattr(inp, "is_final_chunk", True)
-    }
-    if not non_final:
-        return
-    for key, sub in step.steps.items():
-        if isinstance(sub, SamplerStep):
-            kept = frozenset(rids) if sub.kept_rids is None else sub.kept_rids
-            step.steps[key] = replace(sub, kept_rids=kept - non_final)
 
 
 class Engine:
@@ -1165,7 +1148,6 @@ class Engine:
             # the submodule declared no step (a node owning no resources);
             # there is nothing to admit, and the forward still runs
             return ADMIT_OK, None
-        _keep_only_final_chunk_samples(step, rids, inputs)
         # admit reads the step's ctx, so bind it before the sweep rather than
         # in `_drive_step`
         step.set_ctx(ctx)

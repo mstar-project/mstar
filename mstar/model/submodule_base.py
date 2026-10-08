@@ -256,8 +256,8 @@ class ChunkedPrefillOutputMode(Enum):
     # every chunk's tensors in chunk order, for a consumer that takes the pieces
     LIST = "list"
     # the final chunk's tensors alone; earlier chunks' are dropped, never held.
-    # A non-final chunk's rows are never stop-checked (held first) nor kept by
-    # the sampler, so FINAL on a sampled-token edge needs no drop in postprocess.
+    # A non-final chunk's rows are never stop-checked (held first), so FINAL on a
+    # sampled-token edge needs no drop in postprocess (see keep_final_chunk_samples).
     FINAL = "final"
 
 
