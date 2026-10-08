@@ -131,7 +131,9 @@ class Resource(ABC):
     @property
     def keys_prefix_chains(self) -> bool:
         """Whether ``extend_prefix_chain`` can do anything right now (a prefix
-        cache is open). The runner skips the per-request sweep otherwise."""
+        cache is open). The runner skips the per-request sweep otherwise. A
+        resource that overrides ``extend_prefix_chain`` but not this is swept
+        every step."""
         return False
 
     def fingerprint(self) -> bytes | None:
