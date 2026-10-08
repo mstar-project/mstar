@@ -1626,6 +1626,23 @@ class Worker:
             for edge_name, sbuf in req_info.stream_buffers.items()
         }
 
+    def _stream_consumption_batch(
+        self, rids: list[int],
+    ) -> list[tuple[int, dict[str, int]]]:
+        """``_stream_consumption`` for the rids that have stream buffers at
+        all; the rest would report an empty dict."""
+        infos = self.request_state.per_request_info
+        out: list[tuple[int, dict[str, int]]] = []
+        for rid in rids:
+            req_info = infos.get(rid)
+            if req_info is None or not req_info.stream_buffers:
+                continue
+            out.append((rid, {
+                edge_name: sbuf._consumed
+                for edge_name, sbuf in req_info.stream_buffers.items()
+            }))
+        return out
+
     def _profiling_payloads(self, rids: list[int]) -> ParallelList:
         """rx/tx/timings for each rid's WORKER_GRAPHS_DONE."""
         return ParallelList(rids, [
@@ -3129,6 +3146,13 @@ class Worker:
                         rid, batch_N.partition, published,
                     )
                     buffered_publish.add(rid)
+        # Only the rids with something to report cross: a decode step has no
+        # new-token counts (the inline token is not counted) and no stream
+        # buffers, and an empty entry per rid cost a dict each to build and to
+        # extract on the runtime side. A rid left out gets nothing added,
+        # which is what an empty entry did.
+        ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
+        consumed = self._stream_consumption_batch(send_rids)
         send_input = SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
@@ -3139,12 +3163,10 @@ class Worker:
                 ],
             ),
             new_token_counts=ParallelList(
-                send_rids,
-                [new_token_counts.get(rid, {}) for rid in send_rids],
+                ntc_rids, [new_token_counts[rid] for rid in ntc_rids],
             ),
             stream_tokens_consumed=ParallelList(
-                send_rids,
-                [self._stream_consumption(rid) for rid in send_rids],
+                [rid for rid, _ in consumed], [c for _, c in consumed],
             ),
             profiling=self._profiling_payloads(send_rids) if self.enable_prof
             else None,
