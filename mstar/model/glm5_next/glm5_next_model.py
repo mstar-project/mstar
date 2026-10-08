@@ -86,6 +86,9 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 class Glm5NextModel(Model):
     """GLM-5.3-Flash: 320B hybrid KDA/MLA MoE causal LM, text in / text out."""
 
+    # the conductor builds the fused-MoE align op before spawning the workers
+    prebuild_fused_moe = True
+
     def __init__(
         self,
         model_path_hf: str,
