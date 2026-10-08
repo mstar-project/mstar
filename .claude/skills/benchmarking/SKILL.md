@@ -7,7 +7,7 @@ description: How to get a trustworthy performance number out of M* — starting 
 
 Most wrong performance conclusions in this repo come from measurement error, not from the code under test. The traps at the bottom of this page — compile costs landing on one request, kernel selection changing across server processes, sampling variance that only appears after a restart — have each produced a confident, wrong answer before. Read those before reporting a regression.
 
-Invariant 9 in [AGENTS.md](../../../AGENTS.md) is the rule this skill serves: a performance claim needs a number from one of these harnesses.
+Invariant 10 in [AGENTS.md](../../../AGENTS.md) is the rule this skill serves: a performance claim needs a number from one of these harnesses.
 
 ## Before you start
 
@@ -98,9 +98,12 @@ python -m benchmark.worker_phases.server \
 
 Reading the table:
 
-- **`event_sync` is the real GPU wait.** Near zero → you are **CPU-bound**. Anything else → **GPU-bound**, and the next step is profiling kernels, not shaving Python.
+- **`event_sync` is the only real GPU wait.** Near zero → you are **CPU-bound**. A sizeable value → there is a **GPU-bound** component, and the next step is profiling kernels, not shaving Python. For a firm answer, measure GPU busy time from an nsys capture (the README says how); it cannot be derived from the table.
 - **`await_gpu` is not that signal.** It is waiting for the CPU part of the GPU thread.
 - **`check_stop` is a side-stream D2H**, not pure Python/Rust CPU work.
+- **A host sync hides in whatever phase encloses it** and makes `event_sync` look smaller. An unexpectedly expensive `prepare_inputs` is the usual tell.
+
+The README's table of which phases are waits and which are work is worth reading before you draw any conclusion. Summing a wait into a work total is the most common way to misread this output.
 
 Prefer this over `mstar/profile/` for worker-level timing — the profile output is per-request and much harder to read. If you suspect the slowdown is *above* the worker, at the API server, then `--log-stats` (which is `mstar/profile/`) is the only thing that sees it.
 
@@ -123,7 +126,7 @@ Keep the two sides **adjacent in time**: run branch and main for one model back 
 
 ## Three traps that produce fake regressions
 
-**1. Kernel selection changes across server processes.** Compilation uses `mode="max-autotune-no-cudagraphs"` (`mstar/engine/cuda_graph_runner.py`). Inductor benchmarks candidate kernels at compile time and keeps the fastest by measured wall time — and those measurements are noisy, so two processes running *identical* code can select different kernels. That changes float accumulation order and perturbs logits in the low bits. Greedy stages are unaffected (argmax rarely flips), but any sampled stage can flip a token, and one flipped token changes the whole downstream generation. Observed on qwen3-omni: identical byte totals across repeats within one process, but mean audio duration 55.6s vs 59.0s across two processes of the same code. So don't attribute a cross-process difference to the branch; sample several processes per side. Setting `TORCHINDUCTOR_CACHE_DIR` to a shared persistent path should pin selection after the first compile (worth doing, unverified).
+**1. Kernel selection changes across server processes.** Compilation uses `mode="max-autotune-no-cudagraphs"` (`mstar/engine/cuda_graph_runner.py`). Inductor benchmarks candidate kernels at compile time and keeps the fastest by measured wall time — and those measurements are noisy, so two processes running *identical* code can select different kernels. That changes float accumulation order and perturbs logits in the low bits. Greedy stages are unaffected (argmax rarely flips), but any sampled stage can flip a token, and one flipped token changes the whole downstream generation. Observed on qwen3-omni: identical byte totals across repeats within one process, but mean audio duration 55.6s vs 59.0s across two processes of the same code. It moves throughput too, not only sampled output: the same Whisper code over four restarts gave 368–455 RTFx at c=32, while c=1 stayed within ~1%. So don't attribute a cross-process difference to the branch; sample several processes per side, and treat a high-concurrency delta under ~10% as noise until it survives several restarts. When the change can be switched at runtime, run both arms on one build rather than two. Setting `TORCHINDUCTOR_CACHE_DIR` to a shared persistent path should pin selection after the first compile (worth doing, unverified).
 
 **2. The first request of a new shape pays compilation, not inference.** That cost lands entirely on one request and reads like a tail regression. Concrete case: in the VBench I2V set, `req7` is the first landscape image (1024x672; req0-6 are portrait) and takes ~23s where its neighbours take ~7s. `req9` is also landscape and is *not* slow, because req7 already paid. Re-running confirms it — req7 drops from 23.8s to 6.7s. When a p95 or p99 moves on a generation benchmark, check whether one request is carrying a compile, and compare compile cost and steady-state cost separately: a branch can be slower to compile and faster to run.
 

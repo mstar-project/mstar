@@ -47,15 +47,56 @@ worker.postprocess.route                     0.050    0.060    0.110     1500
   indicative, and `mean_ms` is the number to compare.
 * `samples` is how many individual timings went in.
 
-Phases that are WAITS, not work -- a larger number is not automatically worse:
+A phase whose p50 << mean << p95 is bimodal: the mean is mixing two kinds of
+iteration (e.g. prefill and decode, or two nodes). Don't try to recover the
+two modes from mean/p50/p95 algebra; doing so once "found" a 76 ms cost that
+measured 0.15 ms when timed directly. Add a span keyed by whatever
+distinguishes them (node, walk) instead.
 
-* `await_gpu`, `postprocess.event_sync` -- waiting on the GPU. These GROW when
-  the CPU side gets faster, because the CPU arrives at the sync sooner.
-* `follow_await` -- a TP follower waiting for its leader's decision.
-* `submit_spec` -- includes a deliberate wait for the GPU thread to reach the
-  forward launch.
+### Which phases are work and which are waits
+
+The names say neither which thread a phase runs on nor whether it is work.
+
+| phase | thread | what it is |
+| --- | --- | --- |
+| `worker.postprocess.event_sync` | main | **The only real GPU wait.** Blocks on the step's completion event |
+| `await_gpu` | main | Waits for the GPU *thread's* host work (`prepare_inputs` plus kernel launch). Not GPU execution |
+| `worker.gpu_thread.exec` | GPU | CPU time spent enqueuing kernels, not GPU time |
+| `worker.gpu_thread.prepare_inputs` | GPU | Host work, but it absorbs any host sync inside a submodule's `prepare_inputs` |
+| `worker.gpu_thread.await_plan` | GPU | Wait on the plan thread |
+| `worker.plan_thread.await_commit` | plan | Wait on the previous step's commit event |
+| `worker.plan_thread.pre_plan` | plan | Work |
+| `submit_spec` | main | Includes a deliberate wait for the GPU thread to reach the forward launch |
+| `follow_await` | main | A TP follower waiting for its leader's decision |
+
+Consequences:
+
+* **Never add a wait to a work total.** `pre_plan + await_plan + await_commit`
+  is not "planning cost": the last two can be the same interval, waited on from
+  two threads. Summing them once turned a 2 ms cost into 5.5 ms and a 3% win
+  into a projected 2x.
+* Waits GROW when the CPU side gets faster, because the CPU arrives at them
+  sooner. A larger wait is not automatically worse.
 * `postprocess_batch` contains several of the `postprocess.*` phases, so it
   does not sum with them.
+* **GPU busy time is not in this table**, and `iter_total - event_sync` is not
+  GPU idle time. A non-zero `event_sync` means the CPU did wait on the GPU; a
+  small one means the GPU-bound component is marginal, not absent. For the
+  actual GPU utilization, take an nsys capture, merge the intervals from
+  `SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL`, and compare their union
+  to the capture's wall time.
+* **A host sync is charged to the span that encloses it, not to
+  `event_sync`.** A `.tolist()` in `prepare_inputs` reports as expensive
+  `prepare_inputs`, and `event_sync` gets *smaller* because the wait moved
+  upstream. Watching `event_sync` will not find syncs.
+
+### Adding spans
+
+* Phase names must match `[\w.]+`. The parser silently drops anything else,
+  so `foo[bar/baz]` vanishes without an error. Use dots.
+* Instrumentation is not free. Per-step f-string span names have cost 7% of
+  throughput, and a three-span probe cost 2%, so don't compare throughput across
+  differently instrumented builds.
 
 ## Why segments
 
@@ -80,7 +121,9 @@ Knobs:
 | `--min-records` | 3 | drop segments shorter than this |
 | `--phases` | all | only show phases containing one of these |
 
-Take the LONGEST segment at the expected batch size as steady state.
+Take the LONGEST segment at the expected batch size as steady state. Check
+`bs` against the client concurrency: the worker may build smaller batches
+than the client could fill, which can be a performance finding in itself.
 
 ## Caveats
 

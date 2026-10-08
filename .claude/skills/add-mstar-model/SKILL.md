@@ -9,7 +9,7 @@ A model is not done when it produces correct output once. It is done when it is 
 
 Supersedes the `add-mstar-model` skill drafted in PRs [#214](https://github.com/mstar-project/mstar/pull/214) and [#253](https://github.com/mstar-project/mstar/pull/253). Much of the design guidance below is distilled from the `mstar-model-port` and `model-recon` skills on [`garv/new-model-support-agent-2`](https://github.com/mstar-project/mstar/tree/garv/new-model-support-agent-2/.claude/skills), themselves distilled from the Waypoint port — those remain worth reading as standalone deep treatments of reconnaissance and port planning.
 
-Read [AGENTS.md](../../../AGENTS.md) alongside this. Invariants 1, 2, 3, 5 and 10 are the ones model ports trip over, and the PR reviewer cites them by number.
+Read [AGENTS.md](../../../AGENTS.md) alongside this. Invariants 1, 2, 3, 4 and 8 are the ones model ports trip over, and the PR reviewer cites them by number.
 
 ## Two drift patterns seen in real agent-written ports
 
@@ -49,7 +49,7 @@ If a vLLM or SGLang port exists, record what it did — registration, cache conf
 
 A **resource** is state the engine must admit, plan, commit and clean up per request, and that must survive graph capture: persistent cross-step state, and anything planned over it. Everything else is a submodule.
 
-Reuse KV, attention, cross-attention, ragged (cacheless) attention, position and sampler resources wherever their contracts fit. A genuinely new kind is a normal outcome and gets a package under `mstar/engine/resources/<kind>/` with declaration types, a manager, exports and focused tests, built on the existing spec, request-config, step and `Resource` interfaces. Several current model PRs add recurrent-state and linear-attention resources this way, modelled on the KV resource.
+Reuse KV, attention, cross-attention, ragged (cacheless) attention, position and sampler resources wherever their contracts fit. A genuinely new kind is a normal outcome and gets a package under `mstar/engine/resources/<kind>/` with declaration types, a manager, exports and focused tests, built on the existing spec, request-config, step and `Resource` interfaces. Several current model PRs add recurrent-state and linear-attention resources this way, modelled on the KV resource. Read the [engine-resources skill](../engine-resources/SKILL.md) before writing one.
 
 Do not modify `engine.py`, `resources/base.py`, `resources/runner.py` or `resources/step.py` to make your model fit, and do not fall back to model-owned pooling, allocation, capacity, dependency scheduling or cleanup. If the engine genuinely cannot express something, document the missing extension interface — effort is not a blocker, and neither is losing a preferred optimization.
 
@@ -102,6 +102,8 @@ Use the [benchmarking skill](../benchmarking/SKILL.md) for methodology — warmu
 ## Phase 8 — Performance tuning
 
 Establish CPU-bound or GPU-bound first; the benchmarking skill covers how (`event_sync` near zero means CPU-bound). That much is settled. Beyond it **there is no established best practice in this repo yet** — current tuning work is iterative and exploratory, so treat any confident-sounding recipe with suspicion, including one you generate yourself. What holds regardless: same harness, same box, two sides adjacent in time, and re-check the workloads you are not targeting before calling a change a win.
+
+Two things that are settled: a host sync in your `prepare_inputs` hides inside that phase rather than in `event_sync`, and a host-bound step gets faster by deleting work, not by moving it to another thread. Values already known on the host travel in `step_metadata`.
 
 If tuning pushes you into the worker or engine rather than your model, read the [async-worker skill](../async-worker/SKILL.md) first.
 
