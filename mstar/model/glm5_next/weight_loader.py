@@ -293,6 +293,8 @@ def load_glm5_next_hf_weights(
         weights = dequant_fp8_block_stream(weights, quant_config, keep_fp8=keep)
     elif fp8_experts:
         raise ValueError("fp8_experts=True requires a quant_config")
+    else:
+        weights = _refuse_fp8(weights)
 
     restore_fp32_params(module)
     return load_hf_weights(
@@ -624,3 +626,15 @@ def _main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_main())
+
+
+def _refuse_fp8(weights: Iterable[tuple[str, torch.Tensor]]):
+    """Without a quant config an fp8 checkpoint loaded clean and served garbage: its e4m3
+    tensors were copied unscaled and its block scales dropped as unmatched."""
+    for name, tensor in weights:
+        if name.endswith("_scale_inv") or tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            raise ValueError(
+                f"{name} is fp8 or a block scale, but no quantization_config was found "
+                "(config.json's, at its top level)"
+            )
+        yield name, tensor
