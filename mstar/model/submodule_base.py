@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -14,6 +13,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
+from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 
 class HostRows(NamedTuple):
@@ -257,12 +257,6 @@ def _split_pos_ids(
             "cannot be told apart; override `split_inputs`"
         )
     return pos_ids[..., start:end]
-
-
-def device_loopback_enabled() -> bool:
-    """``MSTAR_DEVICE_LOOPBACK`` (default 1): whether a node may keep its
-    loop-back token on the device instead of routing a tensor per request."""
-    return os.environ.get("MSTAR_DEVICE_LOOPBACK", "1") == "1"
 
 
 @dataclass
