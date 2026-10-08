@@ -362,6 +362,52 @@ def test_non_streaming_disconnect_stops_submitting_and_releases_the_pieces_ahead
     assert collected == ids[:1] and len(ids) == 3 and stub.released == ids[1:]
 
 
+def test_a_client_seed_advances_per_chunk_and_wraps_at_int64():
+    from mstar.api_server.openai.serving_speech import _chunk_kwargs
+
+    assert [_chunk_kwargs({"seed": 7}, i)["seed"] for i in range(3)] == [7, 8, 9]
+    top = 2**63 - 1
+    assert [_chunk_kwargs({"seed": top}, i)["seed"] for i in range(3)] == [top, 0, 1]
+    # the first piece keeps the client's value
+    assert _chunk_kwargs({"seed": -5}, 0)["seed"] == -5
+    assert "seed" not in _chunk_kwargs({"sentence_chunking": True}, 1)
+
+
+def test_the_adapter_maps_the_request_off_the_event_loop():
+    """A slow ``speech_to_request`` (a clip decode, or an allowed remote fetch)
+    must not hold the loop: a concurrent task keeps running while it works."""
+    import time
+
+    from mstar.api_server.openai.protocol import SpeechRequest
+    from mstar.api_server.openai.serving_speech import create_speech
+
+    class _SlowAdapter(adapters.OrpheusAdapter):
+        def speech_to_request(self, req, upload_dir):
+            time.sleep(0.3)
+            return super().speech_to_request(req, upload_dir)
+
+    stub = _RecordingAPI()
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    async def run():
+        task = asyncio.create_task(ticker())
+        try:
+            await create_speech(stub, "orpheus", _SlowAdapter(), SpeechRequest(model="orpheus", input="Hello."))
+        finally:
+            task.cancel()
+        return ticks
+
+    # on the loop the ticker gets at most a tick or two around the awaits
+    assert asyncio.run(run()) >= 10
+    assert len(stub.submits) == 1
+
+
 def test_release_request_aborts_only_requests_still_running():
     import threading
 

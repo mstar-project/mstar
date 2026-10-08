@@ -326,18 +326,16 @@ class RustGraphRuntime(GraphRuntime):
     def set_walk(self, rid: int, partition: str, walk: str):
         self._rust.set_walk(rid, partition, walk)
 
-    def set_speculatively_scheduled(
+    def set_in_flight(
         self, node: str, wg_id: int, rids: list[int],
-        speculatively_scheduled: bool,
+        in_flight: bool,
     ):
-        self._rust.set_speculatively_scheduled(
-            node, wg_id, rids, speculatively_scheduled
-        )
+        self._rust.set_in_flight(node, wg_id, rids, in_flight)
 
-    def is_speculatively_scheduled(
+    def is_in_flight(
         self, node: str, wg_id: int, rid: int,
     ) -> bool:
-        return self._rust.is_speculatively_scheduled(node, wg_id, rid)
+        return self._rust.is_in_flight(node, wg_id, rid)
 
     def mark_stream_partition_done(self, rid: int, partition: str):
         self._rust.mark_stream_partition_done(rid, partition)

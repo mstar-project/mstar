@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Collection, Iterable, Mapping
+from time import perf_counter
 from typing import Any
 
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
@@ -19,7 +20,7 @@ from mstar.engine.resources.step import (
     FullAdmitOutcome,
     SubmoduleStep,
 )
-from mstar.utils.profiler import range_pop, range_push
+from mstar.utils.profiler import PHASE_PERIOD, phase_record, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
@@ -318,13 +319,16 @@ class StepRunner:
             self._resources[key].clear_preplan()
 
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
-        """reserve capacity for step"""
+        """Reserve capacity for step. A refused admit gives back everything
+        the step reserved.
+        """
         self._drop_stale_preplan(step)
         ready = True
         admitted: list[str] = []
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.admit.{key}")
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             except Exception:
@@ -332,6 +336,8 @@ class StepRunner:
                 self._abort(step, admitted)
                 raise
             finally:
+                if PHASE_PERIOD:
+                    phase_record(f"res.admit.{key}", perf_counter() - t0)
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
@@ -339,6 +345,10 @@ class StepRunner:
                     "Admit for resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
+                for done in reversed([*admitted, key]):
+                    self._resources[done].rollback_admit(
+                        step.get(done), step.ctx,
+                    )
                 # a refused step never commits, so the in-flight marks taken above
                 # would block offload; a staged pre-plan keeps its marks for the retry
                 if self._staged is None:
@@ -363,9 +373,12 @@ class StepRunner:
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.plan.{key}")
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
+                if PHASE_PERIOD:
+                    phase_record(f"res.plan.{key}", perf_counter() - t0)
                 if self._nvtx:
                     range_pop()
         return results
@@ -374,8 +387,12 @@ class StepRunner:
         """admit over the pre-planning subset, a step ahead
 
         the later full `admit` covers the rest; these resources see their own
-        state as already reserved and no-op"""
+        state as already reserved and no-op
+
+        Unwound on refusal exactly as ``admit`` is.
+        """
         ready = True
+        admitted: list[str] = []
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_admit.{key}")
@@ -389,7 +406,12 @@ class StepRunner:
                     "Admit for pre-planning resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
+                for done in reversed([*admitted, key]):
+                    self._resources[done].rollback_admit(
+                        step.get(done), step.ctx,
+                    )
                 return FullAdmitOutcome(outcome, key)
+            admitted.append(key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
@@ -403,9 +425,12 @@ class StepRunner:
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_plan.{key}")
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
+                if PHASE_PERIOD:
+                    phase_record(f"res.pre_plan.{key}", perf_counter() - t0)
                 if self._nvtx:
                     range_pop()
         self._staged = self._step_key(step)
@@ -416,9 +441,12 @@ class StepRunner:
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.commit.{key}")
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 self._resources[key].commit(step.get(key), step.ctx)
             finally:
+                if PHASE_PERIOD:
+                    phase_record(f"res.commit.{key}", perf_counter() - t0)
                 if self._nvtx:
                     range_pop()
 

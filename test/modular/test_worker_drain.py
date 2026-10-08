@@ -8,6 +8,9 @@ the inputs a committed TP-follow batch still queued for it needs.
 
 from types import SimpleNamespace
 
+import pytest
+
+from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -29,6 +32,7 @@ def _worker(
 ):
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
+    w._phase_period = 0
     w.is_tp_follower = is_follower
     w.sent = []
     w.cleared = []
@@ -87,6 +91,49 @@ def _reads_done(w):
         m for e, m in w.sent
         if e == "conductor" and m.message_type == ConductorMessageType.READS_DONE
     ]
+
+
+@pytest.mark.parametrize("enable_nvtx", [False, True])
+def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
+    monkeypatch, enable_nvtx,
+):
+    """A speculative step may finish after its request's decode loop stopped."""
+    w = _worker()
+    w.enable_nvtx = enable_nvtx
+    collected = []
+    w.tensor_manager.cleanup_collectable = lambda *args: collected.append(args)
+    w._graph_runtime.cleanup_consumed_inputs = lambda *args: ({}, {})
+    w._graph_runtime.pending_loop_stop_rids = lambda *args: {7}
+    pending = SimpleNamespace(
+        batch=SimpleNamespace(node_name="LLM", request_to_worker_graph={7: 0}),
+        node_batch=SimpleNamespace(request_ids=[7], per_request_info={7: object()}),
+        speculative_new_iter=True, graph_walk="decode", loop_name="decode",
+    )
+    outputs = BatchedModelOutput(per_rid_outputs={7: {}})
+    ranges, markers = [], []
+
+    def push(name, **kwargs):
+        assert enable_nvtx, "NVTX must not run while profiling is disabled"
+        ranges.append(name)
+        markers.append("push")
+
+    def pop(**kwargs):
+        assert enable_nvtx, "NVTX must not run while profiling is disabled"
+        ranges.pop()
+        markers.append("pop")
+
+    monkeypatch.setattr("mstar.worker.worker.range_push", push)
+    monkeypatch.setattr("mstar.worker.worker.range_pop", pop)
+
+    Worker._postprocess_batch(w, pending, outputs)
+
+    assert collected == [({}, {})]
+    assert outputs.per_rid_outputs == {}
+    assert pending.node_batch.request_ids == []
+    assert pending.node_batch.per_request_info == {}
+    assert pending.batch.request_to_worker_graph == {}
+    assert ranges == []
+    assert markers == (["push", "pop", "push", "pop"] if enable_nvtx else [])
 
 
 def test_draining_and_pending_removal_rids_are_not_published():

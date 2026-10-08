@@ -30,7 +30,7 @@ from mstar.api_server.request_types import APIServerMessage, PreprocessInput, Re
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.base import MODALITIES
 from mstar.model.multimodal import PromptPart
-from mstar.model.registry import HF_MODELS
+from mstar.model.registry import model_init_kwargs
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
@@ -129,9 +129,8 @@ def _conductor_process_target(
         )
 
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
         cache_dir=cache_dir,
-        **yaml_model_kwargs,
+        **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
     conductor = Conductor(
         model=model,
@@ -255,7 +254,7 @@ class APIServer:
         # cost is invisible to worker-side markers. Streaming a 720p chunk means
         # base64-encoding 11 MiB into 14.7 MiB of ASCII and copying that again
         # through json.dumps, once per engine step.
-        self.enable_nvtx = enable_nvtx
+        self.enable_nvtx = profiler.nvtx_enabled(enable_nvtx)
 
         # Per-request profiling: when enabled, a RequestProfile is collected for
         # each request and pretty-printed when the request finishes. ``log_stats_file``
@@ -278,7 +277,7 @@ class APIServer:
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=self.log_stats,
-            enable_nvtx=enable_nvtx,
+            enable_nvtx=self.enable_nvtx,
         )
 
         # Concurrent request tracking
@@ -1482,6 +1481,21 @@ async def shutdown_event():
 # CLI entry point
 # ------------------------------------------------------------------
 
+def _set_preprocess_threads(model, config: dict) -> None:
+    """Size torch's intra-op pool for this process's media preprocessing.
+
+    ``config.yaml``'s ``preprocess_torch_threads`` wins, else the model's
+    ``PREPROCESS_TORCH_THREADS``; None keeps torch's default. Affects only this
+    process: the conductor and workers are spawned fresh.
+    """
+    threads = config.get("preprocess_torch_threads", model.PREPROCESS_TORCH_THREADS)
+    if threads is None:
+        return
+    import torch
+
+    torch.set_num_threads(int(threads))
+
+
 def main(argv: list[str] | None = None):
     import argparse
 
@@ -1509,7 +1523,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "--enable-nvtx",
         action="store_true",
-        help="Enable torch.cuda.nvtx markers during execution",
+        help="Enable NVTX markers during CUDA execution (disabled on XPU and CPU)",
     )
     parser.add_argument(
         "--tensor-comm-protocol",
@@ -1569,10 +1583,10 @@ def main(argv: list[str] | None = None):
     # (tokenization only — no GPU weights needed)
     from mstar.model.registry import get_model_class
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
         cache_dir=args.cache_dir,
-        **yaml_model_kwargs,
+        **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
+    _set_preprocess_threads(model, config)
 
     global api_server
     log_stats = args.log_stats or args.log_stats_file is not None

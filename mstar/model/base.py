@@ -296,6 +296,12 @@ MODALITIES: frozenset[str] = frozenset(
 
 
 class Model(ABC):
+    # Intra-op threads for the API server's preprocessing of this model's
+    # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
+    # default of one per core; ``preprocess_torch_threads`` in the model's
+    # config.yaml overrides either. See ``entrypoint._set_preprocess_threads``.
+    PREPROCESS_TORCH_THREADS: int | None = None
+
     # Input/output modalities the model handles at intake. The base is the full
     # universe, so a model that doesn't narrow it behaves as before
     SUPPORTED_INPUT_MODALITIES: frozenset[str] = MODALITIES

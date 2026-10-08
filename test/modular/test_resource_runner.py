@@ -42,7 +42,9 @@ class _Stub(Resource):
         published=None,
         final_published=None,
         retrieve_outcome: AdmitOutcome | None = None,
+        preplans: bool = False,
     ):
+        self._preplans = preplans
         self.name = name
         self._deps = set(deps)
         self._plan_value = plan_value if plan_value is not None else f"{name}-plan"
@@ -58,6 +60,10 @@ class _Stub(Resource):
     def build(cls, spec, device, comm_group, **engine_kwargs):
         raise NotImplementedError("stub is constructed directly")
 
+    @property
+    def supports_preplan(self):
+        return self._preplans
+
     def depends_on(self) -> set[str]:
         return set(self._deps)
 
@@ -70,6 +76,9 @@ class _Stub(Resource):
     def admit(self, step, ctx):
         self.calls.append("admit")
         return self._admit_outcome or AdmitOutcome(ok=True)
+
+    def rollback_admit(self, step, ctx):
+        self.calls.append("rollback")
 
     # declared on the class, not patched onto an instance: the runner settles
     # who can actually retrieve by comparing against `Resource.admit_retrieve`
@@ -249,6 +258,75 @@ def test_admit_that_raises_unwinds_the_resources_before_it():
 
     assert kv.calls == ["admit", "abort"]
     assert attn.calls == ["admit"] and sampler.calls == []
+
+
+def test_a_refused_admit_gives_back_what_the_step_reserved():
+    """Nothing else would. ``commit`` is what normally releases a reservation and
+    a refused step never commits, so every refusal used to leak whatever the
+    resources ahead of the refusing one had taken — on a path a loaded worker
+    hits constantly."""
+    reason = AllocationFailed(
+        message="Not enough free pages", pages_short=3, label="main", request_id="r1",
+    )
+    kv = _Stub("kv")
+    attn = _Stub("attn", deps=("kv",), admit_outcome=AdmitOutcome(ok=False, reason=reason))
+    runner = StepRunner({"attn": attn, "kv": kv})
+
+    assert runner.admit(_step(["kv", "attn"])).ok is False
+
+    assert "rollback" in kv.calls, "the resource ahead of the failure kept its pages"
+
+
+def test_the_refusing_resource_is_unwound_too():
+    """It reserves per request, so it can have taken pages for several before the
+    one it refused."""
+    reason = AllocationFailed(
+        message="Not enough free pages", pages_short=3, label="main", request_id="r1",
+    )
+    kv = _Stub("kv", admit_outcome=AdmitOutcome(ok=False, reason=reason))
+    runner = StepRunner({"kv": kv})
+
+    runner.admit(_step(["kv"]))
+
+    assert kv.calls == ["admit", "rollback"]
+
+
+def test_the_unwind_runs_in_reverse_dependency_order():
+    """A resource gives its pages back before whatever it depends on does. The
+    order also has to be deterministic — two ranks unwinding differently is the
+    asymmetry this whole mechanism exists to avoid — so it comes off a list, not
+    a set."""
+    reason = AllocationFailed(
+        message="Not enough free pages", pages_short=3, label="main", request_id="r1",
+    )
+    order: list[str] = []
+    kv = _Stub("kv")
+    attn = _Stub("attn", deps=("kv",))
+    sampler = _Stub("sampler", deps=("attn",),
+                    admit_outcome=AdmitOutcome(ok=False, reason=reason))
+    for res in (kv, attn, sampler):
+        res.rollback_admit = (
+            lambda step, ctx, name=res.name: order.append(name)
+        )
+    runner = StepRunner({"sampler": sampler, "kv": kv, "attn": attn})
+
+    runner.admit(_step(["kv", "attn", "sampler"]))
+
+    assert order == ["sampler", "attn", "kv"], order
+
+
+def test_a_pending_admit_keeps_its_reservation():
+    """``ready=False`` means admitted and waiting — on an in-flight KV read, say.
+    The step holds its pages legitimately until it can run, and releasing them
+    here would have it re-acquire on every poll."""
+    kv = _Stub("kv", admit_outcome=AdmitOutcome(ok=True, ready=False))
+    sampler = _Stub("sampler")
+    runner = StepRunner({"kv": kv, "sampler": sampler})
+
+    outcome = runner.admit(_step(["kv", "sampler"]))
+
+    assert (outcome.ok, outcome.ready) == (True, False)
+    assert "rollback" not in kv.calls + sampler.calls
 
 
 def test_admit_reports_not_ready_when_any_resource_is_pending():
@@ -510,3 +588,24 @@ def test_reassigning_the_same_rids_keeps_the_padded_list():
     batch.request_ids = ["a", "b"]
 
     assert ctx.padded_request_ids == padded
+
+
+def test_a_refused_pre_admit_gives_back_what_it_reserved():
+    """Same reason as ``admit``: the pre-planned step never runs, so nothing
+    commits and nothing else returns the reservation. ``clear_preplan`` covers
+    only the labels the pre-plan created, not pages appended to streams that were
+    already there — and this matters more once speculation is on, since that is
+    the path that pre-plans."""
+    reason = AllocationFailed(
+        message="Not enough free pages", pages_short=3, label="main", request_id="r1",
+    )
+    # only pre-planning resources are in the pre-admit sweep
+    kv = _Stub("kv", preplans=True)
+    attn = _Stub("attn", deps=("kv",), preplans=True,
+                 admit_outcome=AdmitOutcome(ok=False, reason=reason))
+    runner = StepRunner({"attn": attn, "kv": kv})
+
+    assert runner.pre_admit(_step(["kv", "attn"])).ok is False
+
+    assert kv.calls.count("rollback") == 1
+    assert attn.calls.count("rollback") == 1, "the refusing resource too"
