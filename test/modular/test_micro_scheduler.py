@@ -41,7 +41,7 @@ from mstar.worker.batch_builder import (
     BatchBuildResult,
     FIFOBatchBuilder,
 )
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import ChunkProgress, MicroScheduler, ScheduledBatch
 
 
 def _edge_block(rids) -> ColumnarEdgeSpecs:
@@ -1252,7 +1252,7 @@ def test_a_chunked_row_starts_past_its_cached_prefix():
     first = _next_batch(sched, manager)
 
     assert first.chunk_ranges == {"p0": (4, 6)}
-    assert sched.chunk_progress[("p0", NODE)] == [4, 10]
+    assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(4, 10)
     assert not sched.cached_prefix
 
 

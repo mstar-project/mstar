@@ -210,6 +210,13 @@ class PopReadyResult(NamedTuple):
 
 
 
+@dataclass(slots=True)
+class ChunkProgress:
+    """A row mid-prefill: tokens whose chunks have landed, and its total."""
+    done: int
+    total: int
+
+
 def _pre_existing_tokens(seq_lens: Collection[int], n: int) -> int:
     """The tokens a speculation merge's own ``n`` rows will run, from their
     previous step's lengths: their inputs do not exist yet."""
@@ -255,8 +262,8 @@ class MicroScheduler:
         # Resolves a tensor uuid, for row lengths read from popped inputs; the
         # worker installs the tensor manager's. None skips the room check.
         self.get_tensor: Callable[[int], Any] | None = None
-        # (rid, node) -> [tokens whose chunks have landed, total], for rows mid-prefill
-        self.chunk_progress: dict[tuple[int, str], list[int]] = {}
+        # (rid, node) -> progress, for rows mid-prefill
+        self.chunk_progress: dict[tuple[int, str], ChunkProgress] = {}
         # (rid, node) -> cached prefix a measured, not yet chunked row starts past
         self.cached_prefix: dict[tuple[int, str], int] = {}
         # their non-final chunks' outputs, routed with the final chunk
@@ -775,7 +782,7 @@ class MicroScheduler:
             walk = batch.walk_of(rid)
             progress = self.chunk_progress.get((rid, node))
             if progress is not None:
-                info = InputSeqLenInfo(progress[1] - progress[0])
+                info = InputSeqLenInfo(progress.total - progress.done)
             else:
                 info = engine.input_sequence_len(node, walk, fwd_info, inputs.get(rid, {}), rid=rid)
                 if info is None:
@@ -860,8 +867,8 @@ class MicroScheduler:
                 cached = self.cached_prefix.pop(key, 0)
                 if rid not in chunk_tokens:
                     continue
-                progress = self.chunk_progress[key] = [cached, cached + row_tokens[rid]]
-            start, total = progress
+                progress = self.chunk_progress[key] = ChunkProgress(cached, cached + row_tokens[rid])
+            start, total = progress.done, progress.total
             end = start + chunk_tokens.get(rid, total - start)
             batch.chunk_ranges[rid] = (start, end)
             if end < total:
@@ -872,10 +879,10 @@ class MicroScheduler:
         progress = self.chunk_progress.get((rid, node_name))
         if progress is None:
             return
-        if end >= progress[1]:
+        if end >= progress.total:
             del self.chunk_progress[(rid, node_name)]
         else:
-            progress[0] = end
+            progress.done = end
 
     def _backlog(self, node_walk: tuple[str, str], batch: ScheduledBatch) -> None:
         """Park ``batch``, folding it into whatever already waits under this key.
