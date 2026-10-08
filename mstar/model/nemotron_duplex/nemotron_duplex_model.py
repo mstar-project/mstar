@@ -636,6 +636,15 @@ class NemotronDuplexModel(Model):
         if tensors:
             wav = tensors.get("audio_inputs") or tensors.get("audio_features")
             if wav:
+                # one encoder frame; shorter audio breaks the STFT pad and the token stream
+                stt = self.config.stt
+                min_samples = stt.hop_length * stt.subsampling_factor
+                for w in wav:
+                    if w.numel() < min_samples:
+                        raise ValueError(
+                            f"audio is {w.numel()} samples; need at least {min_samples} "
+                            f"({min_samples * 1000 // stt.sample_rate} ms at {stt.sample_rate} Hz)"
+                        )
                 out["audio_features"] = wav
         # Seed the decode loop's iteration-0 fed-back tokens. The frame-
         # synchronous nano step lists prev_text / prev_func as inputs, so

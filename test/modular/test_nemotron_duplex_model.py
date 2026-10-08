@@ -9,6 +9,7 @@ so a dangling edge name or unresolved partition fails loudly here.
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mstar.engine.resources import (
@@ -242,6 +243,19 @@ def test_duplex_process_prompt_seeds_frame0_feedback():
     )
     assert int(out_p["prev_text"][0].item()) == model.config.text_pad_id
     assert out_p["text_inputs"][0].tolist() == [5, 6, 7] and "has_prompt" in out_p
+
+
+def test_duplex_process_prompt_rejects_audio_under_one_frame():
+    """Audio shorter than one encoder frame (80 ms) crashes the STFT pad or ends
+    the talker's stream empty; it is a ValueError, which the data worker turns into a 400."""
+    model = _make_model()
+    stt = model.config.stt
+    frame = stt.hop_length * stt.subsampling_factor
+    for n in (0, 1, 511, frame - 1):
+        with pytest.raises(ValueError, match="need at least"):
+            model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(n)]})
+    out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(frame)]})
+    assert out["audio_features"][0].numel() == frame
 
 
 def test_duplex_no_prompt_seeds_initial_decode_inputs():
