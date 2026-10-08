@@ -1025,6 +1025,10 @@ class CudaGraphableSampler(BaseSampler):
     seen_tokens_buf: torch.Tensor | None = None  # [bs, V] bool
     # ``None`` for submodules whose ``SamplerSpec`` leaves ``enable_min_p`` off.
     min_p_buf: torch.Tensor | None = None
+    # ``[bs]`` per-step row of the slot's ``last_token`` buffer: the captured
+    # sample writes the (TP-agreed) token here, and ``commit`` scatters it to
+    # the slot master so the next step can read the token on the device.
+    last_token_buf: torch.Tensor | None = None
     tp_group: "CommGroup | None" = None  # noqa: F821
 
     # Set during graph capture, and used by the cuda graph runner to determine
@@ -1047,6 +1051,8 @@ class CudaGraphableSampler(BaseSampler):
         )
         self.offset_buf += 1
         codes = self._broadcast_tokens(codes)
+        if self.last_token_buf is not None:
+            self.last_token_buf.copy_(codes)
         if apply_penalty and self.seen_tokens_buf is not None:
             self.applied_penalty_in_graph = True
             # Record the (broadcast, TP-agreed) token in the seen-token buffer so
@@ -1266,6 +1272,14 @@ class SamplerBuffers:
     # ``_scalar_buffers`` (never written from a SamplingConfig) and reset to 0
     # on register instead.
     offset: Buffer
+    # Per-request last sampled token, by slot: the captured sample writes the
+    # per-step row (double-buffered, one row per cg slot), ``scatter_last_token``
+    # persists it to the master after the replay, and a decode step reads its
+    # input ids straight off the master (``gather_last_tokens``) instead of a
+    # per-request tensor routed through the graph. An eager step writes the
+    # master by request (``write_last_tokens``). Never gathered into the
+    # per-step row: only the sample writes it.
+    last_token: Buffer
 
     # TP communicator for the submodule that owns these buffers. Passed
     # through ``slice_for_bs`` into every per-step ``CudaGraphableSampler``
@@ -1380,6 +1394,7 @@ class SamplerBuffers:
             seed=mk(torch.long, 0),
             rep_penalty=mk(torch.float32, 1.0),
             offset=Buffer.allocate(max_batch_size, cap, device, torch.long, 0, 1),
+            last_token=Buffer.allocate(max_batch_size, cap, device, torch.long, 0, cg_slots),
             tp_group=tp_group,
             seen_tokens=seen_tokens,
             min_p=mk(torch.float32, 0.0) if enable_min_p else None,
@@ -1405,6 +1420,7 @@ class SamplerBuffers:
             "rep_penalty_buf": self.rep_penalty.slot_view(cg_slot, bs),
             "seen_tokens_buf": self.seen_tokens.slot_view(cg_slot, bs) if self.seen_tokens is not None else None,
             "min_p_buf": self.min_p.slot_view(cg_slot, bs) if self.min_p is not None else None,
+            "last_token_buf": self.last_token.slot_view(cg_slot, bs),
             "tp_group": self.tp_group,
         }
 
@@ -1448,6 +1464,7 @@ class SamplerBuffers:
         for buf in self._scalar_buffers():
             buf.grow_master(new_capacity)
         self.offset.grow_master(new_capacity)
+        self.last_token.grow_master(new_capacity)
         if self.seen_tokens is not None:
             self.seen_tokens.grow_master(new_capacity)
         self._free_slots.extend(range(self._master_capacity, new_capacity))
@@ -1669,3 +1686,45 @@ class SamplerBuffers:
         self.offset.scatter(
             self._slot_idx_gpu[cg_slot], self._last_real_bs[cg_slot], cg_slot
         )
+
+    # ------------------------------------------------------------------
+    # Last sampled token: written by the sample, read by the next step
+    # ------------------------------------------------------------------
+    def scatter_last_token(self, cg_slot: int = 0) -> None:
+        """Persist the tokens the captured sample wrote into ``cg_slot``'s
+        per-step row to their slot masters. Same contract as ``scatter_offset``:
+        after the replay, real rows only."""
+        self.last_token.scatter(
+            self._slot_idx_gpu[cg_slot], self._last_real_bs[cg_slot], cg_slot
+        )
+
+    def gather_last_tokens(self, cg_slot: int, padded_bs: int) -> torch.Tensor:
+        """``[padded_bs]`` last tokens of the batch staged on ``cg_slot``, in
+        its row order (padding rows read slot 0, like every other gather).
+        A fresh tensor on the current stream; the runner stages it into the
+        slot's static ``input_ids``. Call after ``gather_dynamic`` uploaded the
+        slot's index row for this step."""
+        return self.last_token.master.index_select(
+            0, self._slot_idx_gpu[cg_slot, :padded_bs]
+        )
+
+    def _slots_of(self, request_ids: list[str]) -> torch.Tensor:
+        slots = [self._rid_to_slot[rid] for rid in request_ids]
+        return torch.tensor(slots, dtype=torch.long, device=self.last_token.master.device)
+
+    def write_last_tokens(self, request_ids: list[str], tokens: torch.Tensor) -> None:
+        """Eager-step write of ``tokens`` (``[len(request_ids)]``) to the
+        requests' master rows. Every request must be registered."""
+        if not request_ids:
+            return
+        self.last_token.master.index_copy_(
+            0, self._slots_of(request_ids), tokens.to(self.last_token.master.dtype)
+        )
+
+    def last_tokens_for(self, request_ids: list[str]) -> torch.Tensor:
+        """``[len(request_ids)]`` last tokens of registered requests, for an
+        eager step that has no staged slot row."""
+        return self.last_token.master.index_select(0, self._slots_of(request_ids))
+
+    def has_slot(self, rid: str) -> bool:
+        return rid in self._rid_to_slot
