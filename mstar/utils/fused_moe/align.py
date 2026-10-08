@@ -179,8 +179,10 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
 
-    # CPU inputs (host-side tests) take the torch fallback even on a GPU box.
-    if _cuda_op_available() and topk_ids.is_cuda:
+    # CPU inputs (host-side tests) take the torch fallback even on a GPU box, and so does
+    # an empty step: the CUDA op launches a grid of 0 blocks for it without checking, and
+    # the next unrelated launch reports the error.
+    if _cuda_op_available() and topk_ids.is_cuda and topk_ids.numel():
         torch.ops._mstar_moe_C.moe_align_block_size(
             topk_ids,
             num_experts,
