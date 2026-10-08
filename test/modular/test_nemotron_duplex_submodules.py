@@ -7,6 +7,7 @@ prompt priming, stop rule) and the codec's per-request left context.
 """
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -268,11 +269,20 @@ def test_codec_prepare_inputs_flattens_stacked_row_views():
     assert stacked.tensor_inputs["codes"].shape == (5, q) and single.tensor_inputs["codes"].shape == (1, q)
 
 
-def test_codec_skips_an_empty_final_chunk():
-    """A frame count divisible by the chunk size ends on an empty final chunk; skip it."""
-    codec = AudioCodecDecoderSubmodule(_FakeCodec(), NemotronDuplexConfig())
-    assert codec.prepare_inputs("codec_chunk", None, {"codec_tokens": []}, is_final_stream_chunk=True) is None
-    assert codec.prepare_inputs("codec_chunk", None, {}, is_final_stream_chunk=True) is None
+def test_codec_runs_an_empty_final_chunk_as_a_flush():
+    """A frame count divisible by the chunk size ends on an empty final chunk. The codec
+    must run it, since a skipped rid in a shared batch never finishes its stream."""
+    codec = _make_codec()
+    for chunk in ({"codec_tokens": []}, {}):
+        inp = codec.prepare_inputs("codec_chunk", None, chunk, is_final_stream_chunk=True)
+        assert inp is not None and inp.kwargs["flush"] and not inp.tensor_inputs
+    _run_codec(codec, "a", 5, 1)
+    eng = SimpleNamespace(request_ids=["a", "b"])
+    inputs = [codec.prepare_inputs("codec_chunk", None, {}, is_final_stream_chunk=True),
+              codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [_codes(5, 2)]})]
+    out = codec.forward_batched("codec_chunk", eng, **codec.preprocess("codec_chunk", eng, inputs))
+    assert out["a"]["audio_chunk"][0].numel() == 0     # the fake vocoder holds nothing back
+    assert out["b"]["audio_chunk"][0].shape[0] == 5 * _FakeCodec.SPF
 
 
 def test_codec_batches_requests_with_equal_windows():
@@ -323,11 +333,12 @@ def test_codec_cleanup_clears_per_request_context():
     assert "r" not in codec.request_states
 
 
-def test_codec_stream_is_the_full_history_decode_with_the_real_decoder():
+@pytest.mark.parametrize("frames", [23, 25])
+def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(frames):
     """With the real (tiny-channel, real kernel / rates / block count) decoder,
     the chunked stream -- 3 frames of left context, right edge carried into the
-    next chunk -- equals the one-shot decode of all frames, sample for sample,
-    up to the held-back tail of the last chunk."""
+    next chunk -- equals the one-shot decode of all frames, sample for sample.
+    The final chunk flushes the held tail; 25 frames end on an empty one."""
     from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec
     from mstar.model.nemotron_duplex.config import CodecConfig
 
@@ -340,20 +351,23 @@ def test_codec_stream_is_the_full_history_decode_with_the_real_decoder():
     cfg = NemotronDuplexConfig()
     codec = AudioCodecDecoderSubmodule(codec=real, config=cfg)
     assert cfg.eartts.codec_left_context_frames == 3 and codec._hold == ccfg.n_fft - ccfg.hop_length == 12
-    frames, chunk = 23, 5
+    chunk = 5
     codes = torch.randint(0, ccfg.codebook_size, (frames, ccfg.num_quantizers))
     with torch.no_grad():
         whole, _ = real.decode(codes.unsqueeze(0))
         whole = (whole[0, 0].clamp(-1, 1) * 32767).to(torch.int16)
         pieces = []
-        for start in range(0, frames, chunk):
-            inp = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [codes[start:start + chunk]]})
+        starts = list(range(0, frames + (frames % chunk == 0), chunk))
+        for start in starts:
+            piece = codes[start:start + chunk]
+            inp = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [piece] if len(piece) else []},
+                                       is_final_stream_chunk=start == starts[-1])
             eng = SimpleNamespace(request_ids=["r"], resources={}, per_request_states=None)
             out = codec.forward_batched("codec_chunk", eng, **codec.preprocess("codec_chunk", eng, [inp]))
             pieces.append(out["r"]["audio_chunk"][0])
     stream = torch.cat(pieces)
-    assert stream.shape[0] == whole.shape[0] - codec._hold
-    torch.testing.assert_close(stream, whole[: stream.shape[0]], atol=1, rtol=0)   # int16: one quantization step
+    assert stream.shape[0] == whole.shape[0]
+    torch.testing.assert_close(stream, whole, atol=1, rtol=0)   # int16: one quantization step
 
 
 def test_codec_requests_are_isolated():
