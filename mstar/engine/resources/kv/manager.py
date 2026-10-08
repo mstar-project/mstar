@@ -869,7 +869,10 @@ class KVManager(AttentionResource):
         # moved — re-admitting it allocates nothing and re-copies nothing.
         # A post-fork copies the source *after* this step's spans land, so its
         # reservation covers them.
-        growth = self._label_growth(step) if step.commit else {}
+        # only a post-fork reads the growth, so a decode step does not build it
+        growth = (
+            self._label_growth(step) if step.commit and step.post_forks else {}
+        )
         forks = [(pre, 0) for pre in step.pre_forks] + [
             (post, growth) for post in step.post_forks
         ]
@@ -927,6 +930,7 @@ class KVManager(AttentionResource):
                         self._admit_reserved_pages.setdefault(
                             (rid, to_label), []).extend(alloc_res.new_pages)
 
+            page_size = self.config.page_size
             for segment in step.segments:
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
@@ -934,10 +938,16 @@ class KVManager(AttentionResource):
                 if segment.span == 0 or ctx.is_padding_row(segment.request_id):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
+                seq_len = segment.span + stream.stored_len
+                # the common decode row: its pages already cover the token it
+                # appends, so there is nothing to acquire and nothing to record
+                if (
+                    not stream.offloaded
+                    and len(stream.page_indices) * page_size >= seq_len
+                ):
+                    continue
                 alloc_res = self._alloc(
-                    segment.request_id,
-                    segment.label,
-                    segment.span + stream.stored_len
+                    segment.request_id, segment.label, seq_len,
                 )
                 if not alloc_res.success:
                     return AdmitOutcome(ok=False, reason=alloc_res.error)
