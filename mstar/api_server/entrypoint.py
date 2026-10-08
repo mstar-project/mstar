@@ -201,6 +201,32 @@ class PendingRequest:
             pass  # the loop is closed: the client is gone
 
 
+def _set_events(wakes: list) -> None:
+    for wake in wakes:
+        wake.set()
+
+
+def notify_many(reqs) -> None:
+    """``PendingRequest.notify`` for a batch: one loop wake-up (a self-pipe
+    write) per event loop rather than one per chunk. A step's RESULT_TOKENS
+    frame lands one chunk per running request, so the message thread was
+    waking the loop once per token."""
+    by_loop: dict[int, tuple[Any, list]] = {}
+    for req in reqs:
+        loop, wake = req.loop, req.wake
+        if loop is None or wake is None:
+            continue
+        entry = by_loop.get(id(loop))
+        if entry is None:
+            entry = by_loop[id(loop)] = (loop, [])
+        entry[1].append(wake)
+    for loop, wakes in by_loop.values():
+        try:
+            loop.call_soon_threadsafe(_set_events, wakes)
+        except RuntimeError:
+            pass  # the loop is closed: the client is gone
+
+
 def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
     """Serialize one result chunk as an NDJSON line."""
     return json.dumps({
@@ -653,6 +679,9 @@ class APIServer:
                                 update.preprocess_finish_time
                             req.profile.inputs = update.inputs
 
+                # the handlers are woken once per pass, after every chunk of
+                # the pass has been appended, not once per chunk
+                to_wake: dict[int, PendingRequest] = {}
                 for result_chunk in self.preprocess_worker.get_result_chunks():
                     logger.debug(
                         "Got result chunk of %s modality for request %s",
@@ -674,7 +703,7 @@ class APIServer:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
                         req.chunks.append(result_chunk)
-                        req.notify()
+                        to_wake[id(req)] = req
 
                         if result_chunk.modality == "error":
                             # The data worker failed this request (preprocess,
@@ -687,11 +716,12 @@ class APIServer:
                                     (result_chunk.metadata or {}).get("status", 500)
                                 )
                             req.event.set()
-                            req.notify()
                             # Park the rid so _prune_recently_completed reclaims
                             # the data worker's per-request state once the
                             # client lets go of the request.
                             self.recently_completed[rid] = time.time()
+                if to_wake:
+                    notify_many(to_wake.values())
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
