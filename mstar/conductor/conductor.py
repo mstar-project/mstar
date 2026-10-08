@@ -33,6 +33,7 @@ from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.exitcode import describe_exitcode
+from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -50,7 +51,6 @@ from mstar.utils.ipc_format import (
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
-from mstar.utils.gc_freeze import freeze_after_setup
 
 logger = logging.getLogger(__name__)
 
