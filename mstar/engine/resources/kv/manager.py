@@ -706,6 +706,43 @@ class KVManager(AttentionResource):
                 return
             stream.chain.extend(sampled[0].flatten().tolist(), self.config.page_size)
 
+    def extend_prefix_chains_batch(
+        self, request_ids: list[str], node_name: str, graph_walk: str,
+        host_rows,
+    ) -> None:
+        """``extend_prefix_chain`` for a step, from the stop check's row
+        buffers (``HostRows``: row i of every buffer belongs to
+        ``host_rows.request_ids[i]``). One lock, one ``tolist`` per buffer
+        instead of one per request."""
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        buffers = host_rows.buffers
+        rows_of: dict[str, list] = {}
+        page_size = self.config.page_size
+        with self._lock:
+            for rid in request_ids:
+                label = self._keyed_label(rid, node_name, graph_walk)
+                if label is None:
+                    continue
+                tensor = (self._overrides[rid].prefix_decode or {}).get(label)
+                if not tensor:
+                    continue
+                rows = rows_of.get(tensor)
+                if rows is None:
+                    buf = buffers.get(tensor)
+                    if not torch.is_tensor(buf) or buf.dim() == 0:
+                        continue
+                    rows = rows_of[tensor] = buf.reshape(buf.shape[0], -1).tolist()
+                i = row_of.get(rid)
+                if i is None or i >= len(rows):
+                    continue
+                stream = self._streams.get(rid, {}).get(label)
+                if stream is None or stream.chain is None or stream.chain.unkeyed is None:
+                    continue
+                if stream.released:
+                    stream.chain = None
+                    continue
+                stream.chain.extend(rows[i], page_size)
+
     def _release_lease(self, stream: CacheStream) -> None:
         """Give back a lease `admit` never converted; a converted one is released
         with `page_indices`."""
