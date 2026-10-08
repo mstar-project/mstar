@@ -2928,7 +2928,10 @@ impl GraphRuntime {
         // Python thread may call into this runtime while a send is in
         // flight: it would get `Already mutably borrowed` rather than block.
         // Only the worker's main loop does today.
-        py.allow_threads(move || -> PyResult<Vec<u32>> {
+        let t_call = std::time::Instant::now();
+        let out = py.allow_threads(move || -> PyResult<Vec<u32>> {
+            let t_body = std::time::Instant::now();
+            let out = (move || -> PyResult<Vec<u32>> {
             let request_infos: Vec<(u32, Option<Vec<u8>>)> =
                 info_rids.into_iter().zip(request_infos).collect();
             let new_token_counts: Vec<(u32, Vec<(String, i64)>)> = ntc_rids
@@ -3110,7 +3113,12 @@ impl GraphRuntime {
                 sent_rids.push(rid);
             }
             Ok(sent_rids)
-        })
+            })();
+            send_timing::record_body(t_body);
+            out
+        });
+        send_timing::record_total(t_call);
+        out
     }
 
     fn get_loop_stop_times(
@@ -3432,5 +3440,49 @@ mod tests {
     fn releasing_an_unknown_handle_is_ignored() {
         let mut rids = InternedRids::new();
         assert!(!rids.release(42));
+    }
+}
+
+/// Env-gated timing of `send_outputs` (MSTAR_RUST_SEND_TIMING=1): how long
+/// the GIL-free body takes against the whole call, which also pays for
+/// taking the GIL back. Printed to stderr every 500 calls.
+mod send_timing {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static BODY_NS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    const EVERY: u64 = 500;
+
+    fn enabled() -> bool {
+        *ENABLED.get_or_init(|| {
+            std::env::var("MSTAR_RUST_SEND_TIMING").map(|v| v == "1").unwrap_or(false)
+        })
+    }
+
+    pub fn record_body(t: std::time::Instant) {
+        if enabled() {
+            BODY_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_total(t: std::time::Instant) {
+        if !enabled() {
+            return;
+        }
+        TOTAL_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % EVERY == 0 {
+            let body = BODY_NS.swap(0, Ordering::Relaxed) as f64;
+            let total = TOTAL_NS.swap(0, Ordering::Relaxed) as f64;
+            let per = EVERY as f64 * 1000.0;
+            eprintln!(
+                "mstar_rust send_outputs timing over {} calls: body {:.1} us, \
+                 total {:.1} us, gil reacquire {:.1} us",
+                EVERY, body / per, total / per, (total - body) / per,
+            );
+        }
     }
 }
