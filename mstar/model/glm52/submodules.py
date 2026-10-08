@@ -173,6 +173,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             "compile_mode": "default",
         }
 
+    @property
+    def disable_torch_compile(self) -> bool:
+        # the escape hatch covers the uncaptured steps too, which the engine compiles
+        return os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") != "1"
+
     def to(self, *args, **kwargs):
         """Honor device moves; refuse post-load dtype casts (per-param dtypes
         are fixed at load — fp32 block scales + router bias, uint8 fp8)."""
