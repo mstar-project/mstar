@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -256,6 +257,12 @@ def _split_pos_ids(
             "cannot be told apart; override `split_inputs`"
         )
     return pos_ids[..., start:end]
+
+
+def device_loopback_enabled() -> bool:
+    """``MSTAR_DEVICE_LOOPBACK`` (default 1): whether a node may keep its
+    loop-back token on the device instead of routing a tensor per request."""
+    return os.environ.get("MSTAR_DEVICE_LOOPBACK", "1") == "1"
 
 
 @dataclass
@@ -691,6 +698,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
         declaring and admitting a second time."""
         del graph_walk
         return False
+
+    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        """Loop-back input signals of this walk whose per-row value the node
+        keeps on the device itself (a sampler's slot master), so the worker
+        routes them with no tensor: the next step reads the value in
+        ``preprocess`` and every fallback batch arrives with the signal
+        empty. Only sound when ``prepare_inputs`` accepts the empty signal on
+        this walk. Empty by default; ``MSTAR_DEVICE_LOOPBACK=0`` keeps every
+        node on the tensor path."""
+        del graph_walk
+        return frozenset()
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         """Output signals whose client-facing value is one scalar per row that
