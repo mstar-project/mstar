@@ -273,12 +273,44 @@ pub struct GraphRuntime {
     /// is right for the no-transport case: the frame builders are exercised
     /// without a socket, and the worker's flag gate already refuses to pair
     /// the Rust runtime with a communicator it cannot share.
-    fn dispatch(&self, peer: &str, bytes: &[u8]) -> PyResult<()> {
-        if let Some(comm) = &self.communicator {
-            comm.send(peer, bytes)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    /// Send frames in order. Each is first tried without blocking, with the
+    /// GIL held: a send that goes through costs no GIL reacquisition, which
+    /// the released-GIL form paid at up to a millisecond per step on the
+    /// worker's main thread. From the first frame a peer cannot take (its
+    /// high-water mark), the rest go out blocking with the GIL released, as
+    /// every send did before, so a stalled peer still cannot freeze the
+    /// other Python threads.
+    fn send_frames(
+        &self, py: Python<'_>, frames: Vec<(String, Vec<u8>)>,
+    ) -> PyResult<()> {
+        let Some(comm) = &self.communicator else { return Ok(()) };
+        let mut rest: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut blocked = false;
+        for (peer, bytes) in frames {
+            if blocked {
+                rest.push((peer, bytes));
+                continue;
+            }
+            match comm.try_send(&peer, &bytes) {
+                Ok(true) => {}
+                Ok(false) => {
+                    blocked = true;
+                    rest.push((peer, bytes));
+                }
+                Err(e) => return Err(PyRuntimeError::new_err(e.to_string())),
+            }
         }
-        Ok(())
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let comm = comm.clone();
+        py.allow_threads(move || -> Result<(), crate::communicator::CommError> {
+            for (peer, bytes) in &rest {
+                comm.send(peer, bytes)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// One WORKER_GRAPHS_DONE frame. Drains the request's pending persist
@@ -2810,7 +2842,9 @@ impl GraphRuntime {
         loop_names: Vec<Vec<String>>,
     ) -> PyResult<Vec<u32>> {
         // One release for the whole batch; see send_outputs.
-        py.allow_threads(move || -> PyResult<Vec<u32>> {
+        // bookkeeping with the GIL held; the frames go out through send_frames
+        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+        let out = (|| -> PyResult<Vec<u32>> {
             if rids.len() != loop_names.len() {
                 return Err(PyValueError::new_err(
                     "stop_loops_batched: rids and loop_names must be the same length",
@@ -2859,12 +2893,15 @@ impl GraphRuntime {
                         loop_stop_times: stop_times.clone(),
                     }
                     .encode(&self.interner);
-                    self.dispatch(self.interner.name(worker), &bytes)?;
+                    frames.push((self.interner.name(worker).to_string(), bytes));
                 }
                 stopped_rids.push(rid);
             }
             Ok(stopped_rids)
-        })
+        })();
+        let out = out?;
+        self.send_frames(py, frames)?;
+        Ok(out)
     }
 
     /// A peer's STOP_LOOPS landing here.
@@ -2972,9 +3009,12 @@ impl GraphRuntime {
         // flight: it would get `Already mutably borrowed` rather than block.
         // Only the worker's main loop does today.
         let t_call = std::time::Instant::now();
-        let out = py.allow_threads(move || -> PyResult<Vec<u32>> {
-            let t_body = std::time::Instant::now();
-            let out = (move || -> PyResult<Vec<u32>> {
+        // Encoding and bookkeeping run with the GIL held (tens of
+        // microseconds); the frames go out through send_frames, which
+        // releases the GIL only for a peer at its high-water mark.
+        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+        let t_body = std::time::Instant::now();
+        let out = (|| -> PyResult<Vec<u32>> {
             let request_infos: Vec<(u32, Option<Vec<u8>>)> =
                 info_rids.into_iter().zip(request_infos).collect();
             let new_token_counts: Vec<(u32, Vec<(String, i64)>)> = ntc_rids
@@ -3059,9 +3099,8 @@ impl GraphRuntime {
                     ));
                 }
             }
-            for (worker, bytes) in &frames_out {
-                let name = self.interner.name(*worker).to_string();
-                self.dispatch(&name, bytes)?;
+            for (worker, bytes) in frames_out {
+                frames.push((self.interner.name(worker).to_string(), bytes));
             }
 
             for (rid, signal, modality, refs) in plan.emit {
@@ -3086,7 +3125,7 @@ impl GraphRuntime {
                     }
                     .encode(&self.interner, bk.strings())
                 };
-                self.dispatch("api_server", &bytes)?;
+                frames.push(("api_server".to_string(), bytes));
             }
 
             // Inline emits: one RESULT_TOKENS frame per (signal, modality)
@@ -3128,7 +3167,7 @@ impl GraphRuntime {
                         modality: &modality,
                     }
                     .encode(&self.interner);
-                    self.dispatch("api_server", &bytes)?;
+                    frames.push(("api_server".to_string(), bytes));
                 }
             }
 
@@ -3152,16 +3191,16 @@ impl GraphRuntime {
                     profiling.get(&rid).and_then(|b| b.as_deref()),
                     spec_flags.get(&rid).copied().unwrap_or(false),
                 )?;
-                self.dispatch("conductor", &bytes)?;
+                frames.push(("conductor".to_string(), bytes));
                 sent_rids.push(rid);
             }
             Ok(sent_rids)
-            })();
-            send_timing::record_body(t_body);
-            out
-        });
+        })();
+        send_timing::record_body(t_body);
+        let out = out?;
+        self.send_frames(py, frames)?;
         send_timing::record_total(t_call);
-        out
+        Ok(out)
     }
 
     fn get_loop_stop_times(
