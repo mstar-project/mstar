@@ -307,10 +307,7 @@ class Glm5NextModel(Model):
                 ],
             ),
             # Runaway guard; the per-request budget lives in check_stop.
-            # Keep this cap strictly below the preprocess context guard:
-            # raising it toward max_seq_len converts a per-request
-            # truncation into a batch-fatal context escape.
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.max_decode_steps(),
             outputs=[],
         )
 
@@ -415,6 +412,9 @@ class Glm5NextModel(Model):
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
                 return_tensors="pt",
+                # transformers 5.x defaults return_dict=True (a BatchEncoding);
+                # keep the bare-tensor return so [0] selects the row
+                return_dict=False,
             )[0]
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
@@ -431,8 +431,17 @@ class Glm5NextModel(Model):
             )
         return {"text_inputs": [input_ids.to(torch.long)]}
 
+    def max_decode_steps(self) -> int:
+        """Decode iterations a one-token prompt can run before its context
+        reaches index_topk or its cache rows reach kv_rows (an MTP step stores
+        k + 1); check_stop stops every request before either."""
+        cfg = self.config
+        return min(cfg.index_topk - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
+
     def get_max_output_tokens(self, **model_kwargs):
-        return model_kwargs.get("max_output_tokens", self.config.max_output_tokens)
+        # held to the window: a one-token prompt emits at most index_topk tokens
+        budget = model_kwargs.get("max_output_tokens", self.config.max_output_tokens)
+        return min(budget, self.config.index_topk)
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
