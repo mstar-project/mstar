@@ -222,6 +222,10 @@ class FlashInferMLAManager(AttentionManager):
         assert kv_config.layout == KVLayout.MLA, (
             f"FlashInferMLAManager needs a KVLayout.MLA cache; {kv_cache!r} is {kv_config.layout}"
         )
+        if not kv_config.qo_heads_given:
+            # it defaulted to the one latent KV head, and the kernel planned a single head
+            raise ValueError(f"MLA attention over {kv_cache!r} needs the cache's num_qo_heads, "
+                             "the model's query heads")
         self._kv_cache_name = kv_cache
         self._device = device
         self._dtype = dtype

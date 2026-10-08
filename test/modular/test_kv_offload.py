@@ -72,7 +72,8 @@ def _make_manager(
     max_num_pages: int = 16, cpu_offload_pages: int = 16,
     layout: KVLayout = KVLayout.NHD,
 ):
-    mla = dict(kv_lora_rank=3, qk_rope_head_dim=1) if layout == KVLayout.MLA else {}
+    mla = (dict(kv_lora_rank=3, qk_rope_head_dim=1, num_qo_heads=2)
+           if layout == KVLayout.MLA else {})
     cfg = PagedKVConfig(
         num_layers=2,
         num_kv_heads=1,

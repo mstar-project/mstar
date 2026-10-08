@@ -96,3 +96,27 @@ def test_flashmla_serves_eager_decode_plans_only(captured, monkeypatch):
         is_preplan=False, plan_results={"kv": {"main": SimpleNamespace(cpu_indptrs=indptrs)}})
     attn.plan(SimpleNamespace(causal=True, context_only=False, segments=None), ctx)
     assert chose == [not captured]
+
+
+def test_mla_attention_needs_the_query_heads():
+    # defaulted to the one latent KV head, the kernel planned a single head; a cache only
+    # stored (an index-key cache) needs none
+    kv = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=32, max_seq_len=64, page_size=16,
+                       max_num_pages=8, layout=KVLayout.MLA, kv_lora_rank=32, qk_rope_head_dim=0)
+    with pytest.raises(ValueError, match="num_qo_heads"):
+        fm.FlashInferMLAManager("kv", torch.device("cpu"), torch.float32, kv, sm_scale=0.1)
+
+
+def test_only_the_mla_backend_takes_sm_scale():
+    kv = PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=96, max_seq_len=64, page_size=16,
+                       max_num_pages=8)
+    info = SimpleNamespace(
+        dependency=lambda key: SimpleNamespace(config=kv),
+        device=torch.device("cpu"), kv_dtype=torch.float32, joint_comm_group=None,
+    )
+    spec = AttentionSpec(
+        resource_key="attn", nodes={"LLM"},
+        config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLASHINFER, sm_scale=0.1),
+    )
+    with pytest.raises(ValueError, match="ignores sm_scale"):
+        AttentionManager.build(spec, info)
