@@ -2909,13 +2909,24 @@ class Worker:
         # Pass the stop check's host copies so a host-memory transport needn't
         # copy the rows again. They are views of pinned buffers the next step
         # reuses; safe because the sends below are their last reader.
-        stored = self.tensor_manager.store_and_return_tensor_info_batch(
-            rids, outputs, signals,
-            node_name=batch_N.node_name,
-            graph_walk=batch_N.graph_walk,
-            skip_cuda_sync=True,
-            cpu_tensors=cpu_outputs,
-        )
+        # Row views of one batch clone (a decode step) are described from one
+        # row; anything else goes through the general per-tensor path.
+        stored = None
+        if outputs.row_views and outputs.row_request_ids is not None:
+            stored = self.tensor_manager.store_row_outputs_batch(
+                rids, outputs, signals, outputs.row_views, outputs.row_request_ids,
+                node_name=batch_N.node_name,
+                graph_walk=batch_N.graph_walk,
+                host_rows=host_rows,
+            )
+        if stored is None:
+            stored = self.tensor_manager.store_and_return_tensor_info_batch(
+                rids, outputs, signals,
+                node_name=batch_N.node_name,
+                graph_walk=batch_N.graph_walk,
+                skip_cuda_sync=True,
+                cpu_tensors=cpu_outputs,
+            )
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
         signal_idxs = stored.signal_idxs
