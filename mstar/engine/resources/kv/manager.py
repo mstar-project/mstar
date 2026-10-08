@@ -535,7 +535,7 @@ class KVManager(AttentionResource):
         if (
             self._index is None
             or ctx.capture
-            or segment.request_id not in ctx.request_ids
+            or not ctx.is_real_row(segment.request_id)
             or chain is None
         ):
             return
@@ -1775,6 +1775,42 @@ class KVManager(AttentionResource):
         return self.publish(
             request_id, node_name=node_name, graph_walk=graph_walk,
         )
+
+    def publish_snapshot_batch(
+        self,
+        request_ids: list[str],
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> list:
+        """``publish_snapshot_for_step`` for a batch: one lock acquisition and
+        a plain loop, which is what the gpu thread can afford per row."""
+        out = []
+        append = out.append
+        streams_of = self._streams.get
+        overrides_of = self._overrides.get
+        with self._lock:
+            for request_id in request_ids:
+                streams = streams_of(request_id)
+                overrides = overrides_of(request_id)
+                if streams is None or overrides is None:
+                    append(None)
+                    continue
+                labels = overrides.get_publish_labels(
+                    node_name, graph_walk, list(streams), final=False,
+                )
+                if not labels:
+                    append(None)
+                    continue
+                snap = []
+                for label in labels:
+                    stream = streams.get(label)
+                    if stream is not None:
+                        snap.append((
+                            label, stream.stored_len, len(stream.page_indices),
+                            stream.reset_generation,
+                        ))
+                append(tuple(snap) if snap else None)
+        return out
 
     def publish_snapshot_for_step(
         self,
