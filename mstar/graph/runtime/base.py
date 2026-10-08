@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -597,6 +598,18 @@ class GraphRuntime(ABC):
         partition: str,
     ) -> ParallelList[int, dict[str,int]]:
         pass
+
+    def update_dynamic_loop_iters(
+        self, per_request_info: Mapping[int, "CurrentForwardPassInfo"], partition: str,
+    ) -> None:
+        """Refresh ``dynamic_loop_iter_counts`` on each request's forward-pass
+        info from the runtime's loop counters. The default goes through
+        ``get_dynamic_loop_iters``; a runtime with a cheaper bulk form
+        overrides this."""
+        for rid, new_iters in self.get_dynamic_loop_iters(
+            list(per_request_info), partition=partition,
+        ):
+            per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
 
     @abstractmethod
     def is_async_schedulable(self, node_name: str, graph_walk: str) -> bool:
