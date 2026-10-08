@@ -259,6 +259,15 @@ class LLMSubmodule(ARNodeSubmodule):
             },
         )
 
+    # under the largest prefill capture (2048) with a mixed step's decode rows
+    MAX_BATCH_TOKENS = 1024
+
+    def supports_chunked_prefill(self, graph_walk: str) -> bool:
+        return graph_walk == "prefill_text"
+
+    def max_batch_tokens(self, graph_walk: str) -> int | None:
+        return self.MAX_BATCH_TOKENS if graph_walk in ("prefill_text", LLM_MIXED) else None
+
     def get_input_sequence_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList, **kwargs,
@@ -476,7 +485,11 @@ class LLMSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs,
     ):
-        if not self._token_is_real(request_info):
+        inputs = kwargs.get("inputs")
+        # only the last chunk's token is real
+        if not self._token_is_real(request_info) or (
+            inputs is not None and not inputs.is_final_chunk
+        ):
             outputs.pop("new_token", None)
             return
         # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is
