@@ -14,6 +14,7 @@ mstar.utils.profiler
    .. autosummary::
    
       mark
+      nvtx_enabled
       nvtx_range
       phase_buffer
       phase_record

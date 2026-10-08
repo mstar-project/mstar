@@ -717,30 +717,35 @@ CUDA toolkit</a> for details and the manual fallback.</p>
 <code class="docutils literal notranslate"><span class="pre">einops</span></code>, <code class="docutils literal notranslate"><span class="pre">Pillow</span></code>, <code class="docutils literal notranslate"><span class="pre">torchvision</span></code> / <code class="docutils literal notranslate"><span class="pre">torchaudio</span></code> / <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code>,
 <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">regex</span></code>, and <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code> (RDMA transport).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[qwen3_omni]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[bagel_xpu]</span></code></p></td>
+<td><p>BAGEL runtime for Intel XPU. Pins <code class="docutils literal notranslate"><span class="pre">vllm-xpu-kernels==0.1.15.4</span></code> for
+batched token sampling with per-request RNG state on the device.
+Install the matching XPU build of PyTorch.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[qwen3_omni]</span></code></p></td>
 <td><p>Qwen3-Omni runtime: the BAGEL set plus <code class="docutils literal notranslate"><span class="pre">qwen-omni-utils</span></code>, <code class="docutils literal notranslate"><span class="pre">datasets</span></code>, and
 <code class="docutils literal notranslate"><span class="pre">ninja</span></code> (speeds up the JIT build of the vendored MoE align kernel).
 <strong>Also needs</strong> <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>, which is installed separately —
 see <a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[orpheus]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[orpheus]</span></code></p></td>
 <td><p>Orpheus TTS runtime: <code class="docutils literal notranslate"><span class="pre">transformers</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
 <code class="docutils literal notranslate"><span class="pre">einops</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[omnivoice]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[omnivoice]</span></code></p></td>
 <td><p>OmniVoice TTS. The extra is empty on purpose: the runtime is the
 <code class="docutils literal notranslate"><span class="pre">omnivoice</span></code> package, installed separately from git —
 see <a class="reference internal" href="#omnivoice-omnivoice">omnivoice (OmniVoice)</a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[pi05]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[pi05]</span></code></p></td>
 <td><p>Pi0.5 runtime: <code class="docutils literal notranslate"><span class="pre">transformers</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
 <code class="docutils literal notranslate"><span class="pre">triton</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[vjepa2]</span></code> / <code class="docutils literal notranslate"><span class="pre">.[vjepa2_ac]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[vjepa2]</span></code> / <code class="docutils literal notranslate"><span class="pre">.[vjepa2_ac]</span></code></p></td>
 <td><p>V-JEPA 2 runtime: <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>, <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>,
 <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code> (<code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code> also adds <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[waypoint]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[waypoint]</span></code></p></td>
 <td><p>Index-hosted Waypoint dependencies: <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
 and <code class="docutils literal notranslate"><span class="pre">tensordict</span></code> for reference validation. The pinned TAEHV implementation
 must be installed separately as shown below; keeping its direct URL out of
@@ -748,14 +753,14 @@ package metadata allows <code class="docutils literal notranslate"><span class="
 <code class="docutils literal notranslate"><span class="pre">flash-attn-4</span></code>, which is installed separately —
 see <a class="reference internal" href="#flash-attn-4-waypoint-fa3-sm90-kernel">flash-attn-4 (Waypoint, FA3 sm90 kernel)</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[audio]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[audio]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">soundfile</span></code> — only needed to return <strong>non-WAV</strong> audio containers (mp3/flac/…)
 from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[dev]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[dev]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">ruff</span></code> + <code class="docutils literal notranslate"><span class="pre">pytest</span></code> for linting and the test suite.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[all]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[all]</span></code></p></td>
 <td><p>The union of the index-hosted dependencies from every model extra above.
 Convenient for a machine that serves multiple models; heavier and slower to
 install than a single family’s extra. It excludes the separately installed
