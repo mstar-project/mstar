@@ -405,6 +405,17 @@ class Glm5NextModel(Model):
         if prompt is None:
             return {}
 
+        if self.config.mtp_num_draft_tokens > 0:
+            # MTP verifies by argmax. Refused here it is the client's 400; the worker's
+            # refusal was a 500, after the request had reached every rank
+            temperature = float(kwargs.get("temperature", 0.0))
+            penalty = float(kwargs.get("repetition_penalty", self.config.repetition_penalty))
+            if temperature > 0.0 or penalty != 1.0:
+                raise ValueError(
+                    f"MTP drafting is greedy only (temperature={temperature}, "
+                    f"repetition_penalty={penalty}); serve with mtp_num_draft_tokens: 0"
+                )
+
         if self._tokenizer_mode == "byte":
             # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
             vocab = self.config.vocab_size
