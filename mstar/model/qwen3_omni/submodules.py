@@ -52,8 +52,10 @@ from mstar.model.qwen3_omni.config import (
     Qwen3OmniModelConfig,
 )
 from mstar.model.submodule_base import (
+    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
+    ChunkingPolicy,
     InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
@@ -567,15 +569,14 @@ class ThinkerSubmodule(ARNodeSubmodule):
     # vision runs alone (bs=1 captures), so a larger chunk costs no decode rows a step
     MAX_VISION_BATCH_TOKENS = 2048
 
-    def supports_chunked_prefill(self, graph_walk: str) -> bool:
-        return graph_walk in ("prefill_text", "prefill_audio", "prefill_vision")
-
-    def max_batch_tokens(self, graph_walk: str) -> int | None:
-        if graph_walk in ("prefill_text", "prefill_audio", THINKER_MIXED):
-            return self.MAX_BATCH_TOKENS
+    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
+        if graph_walk in ("prefill_text", "prefill_audio"):
+            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS)
         if graph_walk == "prefill_vision":
-            return self.MAX_VISION_BATCH_TOKENS
-        return None
+            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_VISION_BATCH_TOKENS)
+        if graph_walk == THINKER_MIXED:
+            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
+        return NO_CHUNKING
 
     def split_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,

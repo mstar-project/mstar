@@ -69,8 +69,10 @@ class _Submodule:
         """The span a step would declare from these inputs."""
         return inputs.input_seq_len
 
-    def max_batch_tokens(self, graph_walk):
-        return None  # NodeSubmodule's default: no token budget
+    def get_chunking_policy(self, graph_walk):
+        from mstar.model.submodule_base import NO_CHUNKING
+
+        return NO_CHUNKING  # NodeSubmodule's default
 
 
 def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]):
@@ -83,6 +85,7 @@ def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]
     }
     # every node keys WALK, as a declaration would name it
     engine._keyed_walks = {node: {WALK} for node in node_resources}
+    engine._chunking_policies = {}
     engine._prefix_model = "_Model"
     return engine
 

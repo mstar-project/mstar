@@ -14,9 +14,11 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import (
+    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    ChunkingPolicy,
     InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
@@ -50,11 +52,12 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
     MAX_BATCH_TOKENS = 512
 
-    def supports_chunked_prefill(self, graph_walk: str) -> bool:
-        return graph_walk == "prefill"
-
-    def max_batch_tokens(self, graph_walk: str) -> int | None:
-        return self.MAX_BATCH_TOKENS if graph_walk in ("prefill", "mixed") else None
+    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
+        if graph_walk == "prefill":
+            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS)
+        if graph_walk == "mixed":
+            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
+        return NO_CHUNKING
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,

@@ -38,9 +38,11 @@ from mstar.model.bagel.components.vit_encoder import VIT_ATTN
 from mstar.model.bagel.config import MIXED_TEXT, BagelModelConfig
 from mstar.model.higgs_audio.config import SAMPLER
 from mstar.model.submodule_base import (
+    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    ChunkingPolicy,
     InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
@@ -428,6 +430,11 @@ class ViTEncoderSubmodule(NodeSubmodule):
             out[rid] = {"img_emb": [features[offset:offset + n]]}
             offset += n
         return out
+
+
+def _unguided(fwd_info: CurrentForwardPassInfo) -> bool:
+    """A guided prompt writes two labels from one input, as `_skip_cached_prefix` refuses."""
+    return not fwd_info.step_metadata.get("requires_cfg", False)
 
 
 # Added to the request seed for the VAE posterior draw, so it is a different
@@ -903,16 +910,15 @@ class LLMSubmodule(ARNodeSubmodule):
 
     MAX_BATCH_TOKENS = 1024
 
-    def supports_chunked_prefill(self, graph_walk: str) -> bool:
-        return graph_walk == "prefill_text"
-
-    def reuses_cached_prefix(self, graph_walk: str, fwd_info: CurrentForwardPassInfo) -> bool:
-        # a guided prompt writes two labels from one input, as `_skip_cached_prefix` refuses
-        del graph_walk
-        return not fwd_info.step_metadata.get("requires_cfg", False)
-
-    def max_batch_tokens(self, graph_walk: str) -> int | None:
-        return self.MAX_BATCH_TOKENS if graph_walk in ("prefill_text", MIXED_TEXT) else None
+    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
+        if graph_walk == "prefill_text":
+            return ChunkingPolicy(
+                chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS,
+                reuses_cached_prefix=_unguided,
+            )
+        if graph_walk == MIXED_TEXT:
+            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
+        return NO_CHUNKING
 
     def split_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
