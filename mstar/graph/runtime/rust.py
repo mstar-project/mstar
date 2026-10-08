@@ -395,6 +395,18 @@ class RustGraphRuntime(GraphRuntime):
             signals, can_buffer, is_streaming,
         )
 
+    def update_dynamic_loop_iters(
+        self, per_request_info, partition: str,
+    ) -> None:
+        rids = list(per_request_info)
+        names, rid_idx, name_idx, iters = self._rust.get_dynamic_loop_iters_flat(
+            rids, partition,
+        )
+        for k in range(len(iters)):
+            per_request_info[rids[rid_idx[k]]].dynamic_loop_iter_counts[
+                names[name_idx[k]]
+            ] = iters[k]
+
     def get_dynamic_loop_iters(
         self, request_ids: list[int], partition: str,
     ) -> ParallelList[int, dict[str, int]]:
