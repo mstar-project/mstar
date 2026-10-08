@@ -150,6 +150,18 @@ def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
 
 
 @dataclass
+class _SpecFairness:
+    """The decode loop's fairness settings and clock for ``_build_speculation``:
+    whether to peek for other ready work, how long to hold the yield once it
+    is seen, the consecutive-step cap, and when other work first became
+    ready (None while nothing else waits)."""
+    peek: bool
+    hold_s: float
+    max_consecutive: int
+    ready_since: float | None = None
+
+
+@dataclass
 class PendingBatch:
     batch: ScheduledBatch
     node_batch: ExecutingBatch
@@ -3599,6 +3611,112 @@ class Worker:
         # Note: we do not cleanup the request right now; we wait for the conductor
         # to officially send a removal message
 
+    def _build_speculation(
+        self, pending: PendingBatch | None, consecutive: int,
+        fair: "_SpecFairness", decide: bool = True,
+    ) -> tuple[Speculation | None, tuple[str, str] | None]:
+        """Speculate the step after ``pending`` (N+1 from N), or a
+        yield-away batch when fairness says so. Returns the speculation
+        and the (node, walk) to exclude on the non-speculative path.
+
+        ``decide=False`` (the early build on a parallel node) makes a
+        build that finds no head non-committal: no marker to the
+        followers, no yield-away batch; the caller's next full call
+        takes the decision for this step instead."""
+        speculation = None
+        yield_away_from_target = None
+        batch = None
+        admit_refused = (
+            pending is not None
+            and pending.node_batch.admit_error is not None
+        )
+
+        if pending is not None and self._can_speculate(pending.batch):
+            # Fairness check (peek-based, replaces the old iter-
+            # counter cap): only break the spec chain when there's
+            # another (node, walk) actually ready to schedule on
+            # this worker. On single-walk workers (Orpheus LLM,
+            # Orpheus SNAC) this returns False and we always speculate.
+            other_ready = (
+                fair.peek
+                and consecutive >= 1
+                and self.scheduler.has_ready_excluding(
+                    self.request_state,
+                    (pending.node_name, pending.graph_walk),
+                )
+            )
+            if other_ready:
+                now = _time.perf_counter()
+                if fair.ready_since is None:
+                    fair.ready_since = now
+                must_yield_for_fairness = (
+                    now - fair.ready_since >= fair.hold_s
+                )
+            else:
+                fair.ready_since = None
+                must_yield_for_fairness = False
+            must_yield_away = (
+                consecutive >= fair.max_consecutive
+                or must_yield_for_fairness
+            )
+            if must_yield_away:
+                fair.ready_since = None
+            if not must_yield_away and not admit_refused:
+                if self.enable_nvtx:
+                    range_push("worker.speculate", synchronize=False)
+                _t0 = _time.perf_counter() if self._phase_period else 0.0
+                speculation = self._try_speculate_next(pending)
+                if self._phase_period:
+                    self._phase_record("speculate", _time.perf_counter() - _t0)
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
+                if speculation is not None:
+                    # Broadcast the head now, during forward N, so
+                    # followers build it during theirs (-1: not parallel).
+                    speculation.tp_seq = self.maybe_send_zmq_to_tp_followers(
+                        speculation.node_batch,
+                        speculative=True, spec_from_seq=pending.tp_seq,
+                    )
+            if speculation is None and not decide:
+                return None, None
+            if self._tp_lead_needs_marker(pending, speculation):
+                self._broadcast_tp_nospec(pending)
+            # ``yield_away_from_target`` stays None when the admit
+            # refused, so the non-speculative path below schedules
+            # without the fairness exclusion — it should be free to pick
+            # up the batch ``_handle_admit_failure`` just pushed back.
+            if speculation is None and not admit_refused:
+                yield_away_from_target = (
+                    pending.node_name,
+                    pending.graph_walk,
+                ) if must_yield_away else None
+                with self._span("worker.schedule_yield_away"):
+                    batch = self.scheduler.get_next_batch(
+                        self.request_state,
+                        exclude_target=yield_away_from_target,
+                    )
+                if batch is not None:
+                    node_batch = self._build_executing_batch(batch)
+                    batch_partition = self.request_state.get_partition_for_node(batch.node_name)
+                    logger.debug(f"Yield away: {batch.node_name} {node_batch.request_ids}")
+                    speculation = Speculation(
+                        scheduled_batch=batch,
+                        node_batch=node_batch,
+                        consumed_edges=set(),
+                        continuing_rids=set(), # n/a
+                        partition=batch_partition,
+                        is_new_iter=False,
+                        is_same_node=False,
+                        is_yield_away=True
+                    )
+
+                    # A leader stamps the seq it sends; a follower's
+                    # batch keeps the one it came off the FIFO with.
+                    ya_seq = self.maybe_send_zmq_to_tp_followers(node_batch)
+                    speculation.tp_seq = ya_seq if ya_seq >= 0 else batch.tp_seq
+
+        return speculation, yield_away_from_target
+
     def run(self) -> None:
         switch_interval = os.environ.get("MSTAR_PY_SWITCH_INTERVAL_SEC", "")
         if switch_interval:
@@ -3725,115 +3843,24 @@ class Worker:
         # that at high concurrency the requests arriving over that window
         # prefill in one step rather than one step each. 0 yields at once.
         spec_yield_hold_s = float(os.environ.get("MSTAR_SPEC_YIELD_HOLD_MS", "0")) / 1000.0
-        fairness_ready_since: list[float | None] = [None]
+        fair = _SpecFairness(
+            peek=spec_peek_for_fairness, hold_s=spec_yield_hold_s,
+            max_consecutive=max_consecutive_spec,
+        )
         consecutive_spec_steps = 0
         yield_away_from_target: tuple[str, str] | None = None
         # Build N+2 while N+1 runs, between the two halves of N's
         # post-processing: its pre-plan then overlaps the routing half rather
-        # than the next launch. TP1 nodes only; a parallel node keeps the head
-        # broadcast in the order the followers settle it.
+        # than the next launch. On a parallel (TP) node the early build only
+        # commits when it finds a head: the followers settle each step on
+        # exactly one decision, so an early build that finds nothing sends no
+        # marker and schedules no yield-away, and the top of the next
+        # iteration decides as it always did.
         early_spec = os.environ.get("MSTAR_EARLY_SPEC", "1") == "1"
         next_speculation: Speculation | None = None
         next_yield_away: tuple[str, str] | None = None
         from mstar.utils.profiler import range_pop, range_push
 
-        def _build_speculation(
-            pending: PendingBatch | None, consecutive: int,
-        ) -> tuple[Speculation | None, tuple[str, str] | None]:
-            """Speculate the step after ``pending`` (N+1 from N), or a
-            yield-away batch when fairness says so. Returns the speculation
-            and the (node, walk) to exclude on the non-speculative path."""
-            speculation = None
-            yield_away_from_target = None
-            batch = None
-            admit_refused = (
-                pending is not None
-                and pending.node_batch.admit_error is not None
-            )
-
-            if pending is not None and self._can_speculate(pending.batch):
-                # Fairness check (peek-based, replaces the old iter-
-                # counter cap): only break the spec chain when there's
-                # another (node, walk) actually ready to schedule on
-                # this worker. On single-walk workers (Orpheus LLM,
-                # Orpheus SNAC) this returns False and we always speculate.
-                other_ready = (
-                    spec_peek_for_fairness
-                    and consecutive >= 1
-                    and self.scheduler.has_ready_excluding(
-                        self.request_state,
-                        (pending.node_name, pending.graph_walk),
-                    )
-                )
-                if other_ready:
-                    now = _time.perf_counter()
-                    if fairness_ready_since[0] is None:
-                        fairness_ready_since[0] = now
-                    must_yield_for_fairness = (
-                        now - fairness_ready_since[0] >= spec_yield_hold_s
-                    )
-                else:
-                    fairness_ready_since[0] = None
-                    must_yield_for_fairness = False
-                must_yield_away = (
-                    consecutive >= max_consecutive_spec
-                    or must_yield_for_fairness
-                )
-                if must_yield_away:
-                    fairness_ready_since[0] = None
-                if not must_yield_away and not admit_refused:
-                    if self.enable_nvtx:
-                        range_push("worker.speculate", synchronize=False)
-                    _t0 = _time.perf_counter() if phase_period else 0.0
-                    speculation = self._try_speculate_next(pending)
-                    if phase_period:
-                        _phase_record("speculate", _time.perf_counter() - _t0)
-                    if self.enable_nvtx:
-                        range_pop(synchronize=False)
-                    if speculation is not None:
-                        # Broadcast the head now, during forward N, so
-                        # followers build it during theirs (-1: not parallel).
-                        speculation.tp_seq = self.maybe_send_zmq_to_tp_followers(
-                            speculation.node_batch,
-                            speculative=True, spec_from_seq=pending.tp_seq,
-                        )
-                if self._tp_lead_needs_marker(pending, speculation):
-                    self._broadcast_tp_nospec(pending)
-                # ``yield_away_from_target`` stays None when the admit
-                # refused, so the non-speculative path below schedules
-                # without the fairness exclusion — it should be free to pick
-                # up the batch ``_handle_admit_failure`` just pushed back.
-                if speculation is None and not admit_refused:
-                    yield_away_from_target = (
-                        pending.node_name,
-                        pending.graph_walk,
-                    ) if must_yield_away else None
-                    with self._span("worker.schedule_yield_away"):
-                        batch = self.scheduler.get_next_batch(
-                            self.request_state,
-                            exclude_target=yield_away_from_target,
-                        )
-                    if batch is not None:
-                        node_batch = self._build_executing_batch(batch)
-                        batch_partition = self.request_state.get_partition_for_node(batch.node_name)
-                        logger.debug(f"Yield away: {batch.node_name} {node_batch.request_ids}")
-                        speculation = Speculation(
-                            scheduled_batch=batch,
-                            node_batch=node_batch,
-                            consumed_edges=set(),
-                            continuing_rids=set(), # n/a
-                            partition=batch_partition,
-                            is_new_iter=False,
-                            is_same_node=False,
-                            is_yield_away=True
-                        )
-
-                        # A leader stamps the seq it sends; a follower's
-                        # batch keeps the one it came off the FIFO with.
-                        ya_seq = self.maybe_send_zmq_to_tp_followers(node_batch)
-                        speculation.tp_seq = ya_seq if ya_seq >= 0 else batch.tp_seq
-
-            return speculation, yield_away_from_target
 
         def _arm_speculation(
             spec: Speculation, pending_for: PendingBatch | None = None,
@@ -3961,8 +3988,8 @@ class Worker:
                     next_speculation = next_yield_away = None
                     self._armed_spec_rids = set()
                 else:
-                    speculation, yield_away_from_target = _build_speculation(
-                        pending, consecutive_spec_steps,
+                    speculation, yield_away_from_target = self._build_speculation(
+                        pending, consecutive_spec_steps, fair,
                     )
                     if speculation is not None:
                         _arm_speculation(speculation)
@@ -4148,7 +4175,6 @@ class Worker:
                             if (
                                 early_spec and pp_state is not None
                                 and spec_pending is not None
-                                and spec_pending.node_name not in self.parallel_nodes
                             ):
                                 # N's stops are decided and N+1 is launched:
                                 # build N+2 now and hand its pre-plan to the
@@ -4160,9 +4186,13 @@ class Worker:
                                     self._await_admit_settled(spec_pending)
                                     if spec_pending.node_batch.admit_error is None:
                                         next_speculation, next_yield_away = (
-                                            _build_speculation(
+                                            self._build_speculation(
                                                 spec_pending,
-                                                consecutive_spec_steps + 1,
+                                                consecutive_spec_steps + 1, fair,
+                                                # a TP leader commits early
+                                                # only with a head in hand
+                                                decide=spec_pending.node_name
+                                                not in self.parallel_nodes,
                                             )
                                         )
                                         if next_speculation is not None:
