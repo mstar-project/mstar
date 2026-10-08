@@ -495,14 +495,19 @@ class StepRunner:
         order = self._sweep(self._node_publish_order, self._publish_order, node_name)
         if not order:
             return {}
-        publishers = [(key, self._resources[key]) for key in order]
+        # one call per publisher for the whole batch, then one dict per
+        # request that has anything to publish
+        columns = [
+            (key, self._resources[key].publish_snapshot_batch(
+                request_ids, node_name=node_name, graph_walk=graph_walk,
+            ))
+            for key in order
+        ]
         out: dict[str, dict[str, Any]] = {}
-        for rid in request_ids:
+        for i, rid in enumerate(request_ids):
             per_key: dict[str, Any] = {}
-            for key, resource in publishers:
-                snap = resource.publish_snapshot_for_step(
-                    rid, node_name=node_name, graph_walk=graph_walk,
-                )
+            for key, snaps in columns:
+                snap = snaps[i]
                 if snap is not None:
                     per_key[key] = snap
             if per_key:
