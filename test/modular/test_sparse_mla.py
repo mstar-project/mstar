@@ -99,3 +99,12 @@ def test_pack_lays_the_slots_out_as_the_plan_describes():
 def test_a_row_attends_at_most_its_width():
     # packed, a length past the width read index entries no slot was written to
     assert sparse_mla._lens([1, 5, 9], 5) == [1, 5, 5]
+
+
+def test_the_kernel_serves_only_its_latent_shape(monkeypatch):
+    # a reduced model's latent went to the kernel, which read out of bounds
+    q = torch.empty(2, 4, 32, dtype=torch.bfloat16)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    assert not sparse_mla.uses_kernel(q, torch.empty(8, 1, 32 + 16, dtype=torch.bfloat16))
+    q = torch.empty(2, 4, 512, dtype=torch.bfloat16)
+    assert sparse_mla.uses_kernel(q, torch.empty(8, 1, 512 + 64, dtype=torch.bfloat16))
