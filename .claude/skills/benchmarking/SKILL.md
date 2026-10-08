@@ -44,6 +44,8 @@ If another server still holds the port, uvicorn logs startup-complete and only *
 
 `SIGINT` (Ctrl-C) on the `mstar` process shuts the whole deployment down gracefully. Give it up to a minute. You normally do not need to clean up processes individually.
 
+Signal it by PID. `pkill -f` / `pgrep -f` with a pattern that also appears in your own command line match your own shell: the kill takes the shell down, and a watcher loop polling `pgrep -f` never exits. Likewise a bare `wait` in a script that started the server with `&` waits on the server forever.
+
 **But killing it non-gracefully does not kill its workers.** The conductor and workers are `multiprocessing` spawns; orphaned, they hold both their GPU memory and their IPC handles, and the next server fails to start. After any hard kill, reap the tree:
 
 ```bash
@@ -113,6 +115,8 @@ Prefer this over `mstar/profile/` for worker-level timing — the profile output
 
 The editable install maps the `mstar` package to this checkout's absolute path via a `sys.meta_path` finder, so the `mstar` console script always resolves to *this* directory whatever your CWD is. The simplest A/B is therefore to `git checkout` in place — stash, checkout `main`, run, checkout back — with both sides sharing one venv, which is what you want for a fair comparison. If you do use a second clone, invoke it as `python -m mstar.cli.main` from that clone's root so `sys.path[0]` beats the editable finder.
 
+**For a change with no runtime switch, A/B from one checkout with a patch.** Save the diff (`git diff > change.patch`) and alternate arms with `git apply -R` / `git apply`, under `trap restore EXIT` so a crash can't leave the tree reverted. Interleave rounds (A B A B) rather than running all of A then all of B. This is cheaper than a checkout per arm, and both arms share every config and the venv.
+
 **Let the checkout settle before starting a server.** Branches don't share a package layout, so a server launched against a half-switched tree dies with `ImportError: cannot import name ... (unknown location)`. After every checkout:
 
 ```bash
@@ -123,6 +127,21 @@ python -c "import mstar, mstar.conductor.conductor, mstar.worker.worker"
 Never run two things that touch the repo at once — a `git checkout` racing a server start produces exactly this failure.
 
 Keep the two sides **adjacent in time**: run branch and main for one model back to back before moving to the next model, so drift in machine load doesn't get attributed to the code change.
+
+## Profiling a gap against another engine
+
+Comparing against vLLM or SGLang has its own ways to go wrong.
+
+**Match the configuration before comparing.** Each server falls back to its own defaults for anything the client leaves out, and the defaults differ.
+- **Sampling.** `benchmark.runner` sends no sampling parameters unless the model's `get_model_kwargs` adds them. In one Qwen3.5 comparison mstar sampled at its default temperature through top-k/top-p kernels while SGLang took a plain argmax, about 50 µs a step at 9B TP2 that had nothing to do with the engines.
+- **Recurrent-state dtype.** vLLM and SGLang honour a checkpoint's fp32 `mamba_ssm_dtype` (SGLang only when passed `--mamba-ssm-dtype float32`); fp32 state costs a few percent.
+- **Prefix caching.** Check both whether it is on and whether it hits: SGLang's radix cache was on for short prompts and hit 0%.
+
+**Use worker phases, not nsys, to decide CPU- vs GPU-bound.** nsys inflates host time. Under nsys a 9B TP2 decode step showed ~430 µs of GPU idle per step, which read as host-bound; `worker_phases` without nsys, on both ranks, showed the GPU busy for the whole step. nsys is the tool for *what* the GPU runs, not for whether it is waiting.
+
+**Break the gap down per kernel and per layer type before naming a cause.** Total kernel time per step misleads when the other engine overlaps work on side streams. Export the capture to sqlite and compute, per decode step, kernel time by stream and by kernel name; then print one step's kernel sequence with grid sizes, so layers line up across the two engines. In the Qwen3.5 case the first explanation (SGLang overlapping two small GDN projections on a second stream) bought it nothing over mstar's single fused GEMM. The gap was in the full-attention layers: separate q/k/v GEMMs, six small q/k-norm and rope kernels, a two-kernel KV write. Fusing q/k/v alone recovered the predicted ~2%.
+
+**The other engine's choices are ideas, not answers.** Its fused all-reduce + norm and fused QKV were real wins; its second stream was not. Measure each one here.
 
 ## Three traps that produce fake regressions
 
@@ -148,7 +167,9 @@ How many repeats, and how large a delta counts as real, depend on the model and 
 - **A phase can slow down without its code changing.** Before reaching for GIL contention, check whether what the phase iterates over grew (e.g., tensors freed per step, with bigger batches), and rule out syscall or filesystem cost with `strace -c` on the worker.
 - **Profile one process, not the server tree.** `py-spy record --subprocesses` at a high rate fell a minute behind and dropped ~40% of samples, leaving the worker with 183 samples on one side and 3394 on the other. Attach to the GPU worker's pid alone at a modest rate (~50–100 Hz). If the sample counts on the two sides of an A/B differ a lot, discard the profile.
 - **Single A/B jobs vary even with ABBA ordering and two restarts per side.** The same code pair measured −1.4% to −5.5% across separate jobs. Pool several jobs and report the range.
-- **Output-equivalence checks need a same-code control.** Greedy output isn't byte-reproducible across server processes (see trap 1): two runs of identical code matched on 3/8 and 6/8 prompts. Run A against A to get the noise floor, then compare B against A to that floor. For audio, compare waveforms, not bytes.
+- **On a shared machine with CPU contention, host-bound arms drift by tens of percent between runs hours apart, while GPU-bound arms barely move.** One build of Qwen3.5 0.8B `image_to_text` measured 394 tok/s in a sweep and 489–510 a few hours later on the same node; 4B and up moved a few percent. (A quiet box doesn't behave like this.) So interleave systems and variants within each round (mstar/vLLM/SGLang per round, or A B A B), log the load average per arm, and don't compare absolute numbers from separate jobs for small or host-bound models.
+- **When the expected effect is smaller than the noise, time the mechanism directly.** Two end-to-end A/Bs of one question gave +3–5% and −6–8%, both noise (the same unmodified build measured 489 and 510 tok/s in consecutive A/Bs). A 30-line CUDA-graph microbenchmark of the attention in question settled it in minutes, and stopped an engine change that would have bought nothing.
+- **Output-equivalence checks need a same-code control.** Greedy output isn't byte-reproducible across server processes (see trap 1): two runs of identical code matched on 3/8 and 6/8 prompts. Nor is it within one server once requests batch together: two greedy rounds against one server differed on 2–4 of 6 prompts, and a near-tie first token flipped between builds and back again on a later run. Run A against A to get the noise floor, then compare B against A to that floor. For audio, compare waveforms, not bytes.
 - **Verify what the client actually sent.** `benchmark.runner` can fall back to its default dataset when a flag (e.g. `--dataset text`) is omitted, and samples prompts randomly. A "long prompt" probe once ran on short prompts. Check input lengths in the results before trusting a targeted probe.
 - **`--ignore-eos` isn't safe for every model.** It's the right default for plain text output, but Qwen3-Omni's talker has undefined behavior past EOS and crashes on stale SHM reads, which looks like a regression.
 - **Two servers on one machine need distinct `--socket-path-prefix`.** `--port` alone doesn't isolate the ZMQ IPC sockets, and one server's handshake gets taken by the other.

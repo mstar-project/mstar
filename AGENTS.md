@@ -120,6 +120,8 @@ Some additional information:
 
 **Environment variables**: `MSTAR_*` knobs are read all over the codebase and are the main deployment interface. A new one must land with a row in [docs/environment_variables.rst](docs/environment_variables.rst) giving its default and its meaning, and should name the function that reads it. Environment variables that don't make sense to include in production (e.g., for A/B testing of a decision where there is a clear winner, or for debugging) should be removed. A tuning value a deployment may reasonably want to change (e.g., a per-step token budget) belongs in the serving config, not in an env var added for testing.
 
+The same goes for code paths added for performance: A/B them, and delete the ones that don't measurably help rather than leaving them in behind a switch. On the Qwen3.5 PR, a stream manager and a fused-norm flag both measured neutral and were removed, and segment-count graph buckets were built, measured as no gain, and reverted.
+
 ### 10. Performance claims come from the repo's own harnesses
 
 Don't assert a speedup without a number. Which tool depends on *where* you think the time goes:
@@ -179,6 +181,8 @@ Before attributing a test failure to your change, check whether it also fails on
 
 The Rust extension under `rust/` is a build artifact, so it goes stale after merging or rebasing onto a `main` that changed `rust/`. A stale build imports fine and then fails at request time (often as an unexpected-keyword `TypeError` from a runtime call), and tests that need it (e.g., `test_graph_runtime_factory.py`) fail in a checkout where it isn't built. Rebuild before believing either.
 
+Unix-socket paths are limited to about 107 characters, so a long `--basetemp` or `TMPDIR` makes the ZMQ-based Rust tests fail with `File name too long`, which reads like a real failure. Use a short `--basetemp`.
+
 ## Splitting work across PRs
 
 Recommended practice: the reviewer raises these as notes and never blocks on them.
@@ -214,3 +218,14 @@ Not rules, and the reviewer shouldn't cite them; these are cleanups that came ou
 **One hook that returns a policy object, rather than several parallel hooks.** Chunked prefill first added four methods to the submodule base class (whether a walk is chunkable, its token budget, how its outputs accumulate, whether it reuses a cached prefix). They became one `get_chunking_policy(graph_walk) -> ChunkingPolicy` ([#365](https://github.com/mstar-project/mstar/pull/365)), a frozen dataclass with a callable field for the one dynamic case, which the engine caches per (node, walk). A submodule author implements one thing per concern and sees every option in one place, and the engine doesn't rebuild the answer every step.
 
 **If a structural restriction can be enforced at startup, enforce it at startup.** Speculating into a chunkable (node, walk) isn't safe, since chunks are cut at schedule time from lengths a speculative batch doesn't know yet. Rather than the worker filtering speculation targets at runtime and hoping the runtime picks a safe one, the chunkable pairs are computed once when submodules load and passed to the graph runtime's constructor as `disable_spec_node_walks` ([#365](https://github.com/mstar-project/mstar/pull/365)), and the runtime never returns them from `speculate_node`. A component that can't produce the forbidden thing is safer than call sites that each have to remember to check.
+
+## Performance ideas from past work
+
+Not rules, and the reviewer shouldn't cite them. These paid off for Qwen3.5 against vLLM and SGLang, each measured with the harnesses in invariant 10; they are worth checking for a new model, but whether they help depends on where its time goes.
+
+- **Fuse small projections at decode width.** Decode GEMMs are latency-bound, so one wide GEMM beats several narrow ones. Fusing attention's q/k/v through `QKVParallelLinear` and stacked loader rules gave +1.9% at 9B TP2, and one fused GDN input projection matched SGLang running two of them overlapped on a second stream.
+- **Remove the eager kernels around a captured graph.** Per-step `.contiguous()` copies and zero-fills outside the graph cost +3.5% at 9B TP2 c=16; passing preallocated output buffers removed them.
+- **Check what Inductor generates for small reductions at decode batch sizes.** Its fused residual-add + RMSNorm was about 3x slower than FlashInfer's `fused_add_rmsnorm` at batch 4, run 65 times a step; switching gave +6% at 4B c=4.
+- **Under TP, fuse all-reduce, residual add and norm** (FlashInfer's one-shot kernel) rather than NCCL followed by a separate norm: +10-15% at 9B TP2.
+- **Cap torch's intra-op threads for CPU work in the API server** such as image preprocessing. The default pool stalled about one preprocess in eight by 35-130 ms on a shared host.
+- **Capture launch-bound encoders.** An eager ViT tower was ~4 ms of GPU work in a ~20 ms forward; a piecewise capture of its block loop (`PiecewisePackedConfig`) brought `image_to_text` level with vLLM.
