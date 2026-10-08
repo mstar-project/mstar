@@ -456,15 +456,15 @@ class Glm5NextModel(Model):
 
     def max_decode_steps(self) -> int:
         """Decode iterations a one-token prompt can run before its context
-        reaches index_topk or its cache rows reach kv_rows (an MTP step stores
-        k + 1); check_stop stops every request before either."""
+        reaches the context limit or its cache rows reach kv_rows (an MTP step
+        stores k + 1); check_stop stops every request before either."""
         cfg = self.config
-        return min(cfg.index_topk - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
+        return min(cfg.context_limit - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
 
     def get_max_output_tokens(self, **model_kwargs):
-        # held to the window: a one-token prompt emits at most index_topk tokens
+        # held to the window: a one-token prompt emits at most context_limit tokens
         budget = model_kwargs.get("max_output_tokens", self.config.max_output_tokens)
-        return min(budget, self.config.index_topk)
+        return min(budget, self.config.context_limit)
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

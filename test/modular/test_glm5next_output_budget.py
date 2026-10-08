@@ -58,3 +58,10 @@ def test_chat_template_returns_the_bare_ids():
     m._tokenizer = ChatTokenizer()
     ids = m.process_prompt("hi", ["text"], ["text"])["text_inputs"][0]
     assert ids.tolist() == [7, 8, 9]
+
+
+def test_long_context_budget_follows_the_window():
+    # held to index_topk, a long-context request was cut at 2048 tokens
+    m = _model(dsa_long_context=True, max_seq_len=1 << 20)
+    assert m.get_max_output_tokens(max_output_tokens=5000) == 5000
+    assert _decode(m).max_iters == m.config.context_limit - 1 == (1 << 20) - 1
