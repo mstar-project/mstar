@@ -234,10 +234,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         text_inputs = inputs["text_inputs"][0]
         # here, not in preprocess, so the refusal fails this request and not its batch
-        if graph_walk == "prefill" and text_inputs.shape[0] >= self._context_limit():
+        # (process_prompt refuses the same prompts first, as a 400)
+        if graph_walk == "prefill" and text_inputs.shape[0] > self.config.max_prompt_tokens:
             raise RuntimeError(
                 f"request {fwd_info.request_id}: a prompt of {text_inputs.shape[0]} tokens "
-                f"leaves no room under the context limit {self._context_limit()}"
+                f"exceeds the {self.config.max_prompt_tokens} served"
             )
         return ARNodeInputs(
             input_ids=text_inputs,

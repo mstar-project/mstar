@@ -165,6 +165,15 @@ class Glm52ModelConfig:
     def num_dense_layers(self) -> int:
         return min(self.first_k_dense_replace, self.num_hidden_layers)
 
+    @property
+    def max_prompt_tokens(self) -> int:
+        """The longest prompt served. Decode runs at least one step after the
+        prefill and the next may already be scheduled when it stops, so the
+        prompt leaves two rows under the context limit; a DSA prefill attends
+        densely, within index_topk."""
+        limit = self.max_seq_len if self.dsa_long_context else self.index_topk
+        return min(limit - 2, self.index_topk)
+
     @classmethod
     def from_hf_config(cls, hf_config: dict) -> "Glm52ModelConfig":
         """Geometry from the checkpoint's config.json; serving knobs keep

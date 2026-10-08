@@ -6,6 +6,9 @@ is only the runaway guard. It used to be sized to the *default* budget
 error while vLLM honored the same request in full.
 """
 
+import pytest
+import torch
+
 from mstar.graph.base import Loop
 from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.model.glm52.glm52_model import Glm52Model
@@ -76,3 +79,23 @@ def test_reduced_variant_cap_tracks_its_smaller_window():
     decode = m.get_graph_walk_graphs()["decode"]
     assert decode.max_iters == guard - 1
     assert m.get_max_output_tokens(max_output_tokens=1000) == guard
+
+
+def test_process_prompt_refuses_a_prompt_without_room():
+    """A prompt leaves two rows under the limit (decode runs a step, and the
+    next may already be scheduled when it stops); refusing it here is a 400,
+    in the worker a 500, and at limit - 1 it used to fail its decode batch."""
+    m = _model()
+    n = m.config.max_prompt_tokens
+    assert n == _guard(m.config) - 2
+    assert len(m.process_prompt("x" * n, ["text"], ["text"])["text_inputs"][0]) == n
+    with pytest.raises(ValueError, match=f"at most {n}"):
+        m.process_prompt("x" * (n + 1), ["text"], ["text"])
+
+
+def test_a_long_context_prompt_is_held_to_index_topk():
+    # the DSA prefill attends densely: a longer prompt failed its prefill batch
+    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=8192)
+    assert cfg.max_prompt_tokens == cfg.index_topk == 2048
+    assert Glm52ModelConfig().max_prompt_tokens == 2046
+

@@ -332,12 +332,11 @@ class Glm52Model(Model):
             # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
             vocab = self.config.vocab_size
             byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
-            return {"text_inputs": [torch.tensor(byte_ids, dtype=torch.long)]}
-
+            input_ids = torch.tensor(byte_ids, dtype=torch.long)
         # GLM-5.2 chat template (adds [gMASK]<sop> etc. and the assistant
         # turn). TODO: thinking mode / reasoning_effort dial once the
         # OpenAI adapter plumbs it through.
-        if getattr(self.tokenizer, "chat_template", None):
+        elif getattr(self.tokenizer, "chat_template", None):
             input_ids = self.tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
@@ -349,6 +348,12 @@ class Glm52Model(Model):
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
 
+        # here, in the data worker, a ValueError reaches the client as a 400
+        if input_ids.numel() > self.config.max_prompt_tokens:
+            raise ValueError(
+                f"prompt is {input_ids.numel()} tokens; GLM-5.2 is served with "
+                f"at most {self.config.max_prompt_tokens}"
+            )
         return {"text_inputs": [input_ids.to(torch.long)]}
 
     def get_request_resource_configs(
