@@ -459,6 +459,20 @@ def test_dynamic_loop_iters_for_an_unknown_partition_are_empty(runtime):
     assert runtime.get_dynamic_loop_iters([rid], "nope").values == [{}]
 
 
+def test_update_dynamic_loop_iters_matches_the_per_rid_form(runtime):
+    from types import SimpleNamespace
+    rid = _admit(runtime)
+    infos = {rid: SimpleNamespace(dynamic_loop_iter_counts={"stale": 7})}
+    runtime.update_dynamic_loop_iters(infos, "default")
+    expect = dict(runtime.get_dynamic_loop_iters([rid], "default").values[0])
+    expect["stale"] = 7
+    assert infos[rid].dynamic_loop_iter_counts == expect
+    infos = {rid: SimpleNamespace(dynamic_loop_iter_counts={})}
+    runtime.update_dynamic_loop_iters(infos, "nope")
+    assert infos[rid].dynamic_loop_iter_counts == {}
+    runtime.update_dynamic_loop_iters({}, "default")
+
+
 # --- scheduling --------------------------------------------------------------
 
 def test_a_ready_node_is_reported(runtime):
