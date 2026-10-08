@@ -16,13 +16,13 @@ max_seq_len: 12288
 
 # One recurrent slot per session (DEFAULT_MAMBA_SLOTS); past it the engine spins
 # on admit and wedges every session. Keep the two equal; the overflow queues.
-max_concurrent_requests: 64
+max_concurrent_requests: 32
 
 # Sessions longer than max_session_s get a 400. The talker KV pool is sized so
-# 64 sessions that long fit at once (78 s: 1025 pages, 28 GiB); a longer cap
+# 32 sessions that long fit at once (160 s: 1025 pages, 28 GiB); a longer cap
 # grows it in step. A full talker pool stalls every session.
 model_kwargs:
-  max_session_s: 78
+  max_session_s: 160
   # Longer system prompts get a 400; the prompt prefills in one step that
   # stalls every live session (~2.75 ms/token). TODO(prefill): drop once chunked.
   max_prompt_tokens: 512

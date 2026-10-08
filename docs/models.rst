@@ -306,11 +306,11 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   the attention plan on it (``resources: nano_kv`` / ``nano_attn``; no
   positional encoding, so no position resource), a recurrent-state pool holding
   the 27 Mamba-2 layers' conv window and SSM state, one slot per session
-  (``mamba_state``: 64 sessions by default, ~137 MB per slot in fp32, tunable
+  (``mamba_state``: 32 sessions by default, ~137 MB per slot in fp32, tunable
   with ``max_slots`` / ``state_dtype``; the shipped configs set
-  ``max_concurrent_requests: 64`` to match, so raise the two together), the Mamba-2 resource planned on it
+  ``max_concurrent_requests: 32`` to match, so raise the two together), the Mamba-2 resource planned on it
   (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
-  captured as a CUDA graph for batch sizes 1 to 64.
+  captured as a CUDA graph for batch sizes 1 to 32.
 - ``eartts_talker`` advances every live session in one backbone pass per frame
   through the engine's paged KV (``talker_kv`` / ``talker_attn`` /
   ``talker_pos``): each session owns two streams, the conditional and the
@@ -322,15 +322,16 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   from the positions the position resource planned. Sampling noise is drawn
   per row from the request's seeded generator before the step, so a session's
   speech does not depend on which other sessions share it. The per-frame step
-  is captured as a CUDA graph for 1 to 64 sessions; a session's first step
-  (its 38-token speaker warm-up) runs eager. The talker KV pool is 512 pages
-  of 128 positions (14 GiB): 64 sessions x 2 streams x 512 positions, about
-  38 s of speech per session, with no sliding-window eviction yet.
+  is captured as a CUDA graph for 1 to 32 sessions; a session's first step
+  (its 38-token speaker warm-up) runs eager. The talker KV pool is 1025 pages
+  of 128 positions (28 GiB): 32 sessions x 2 streams x 16 pages plus a sink
+  page, enough for ``max_session_s`` (160 s) per session, with no
+  sliding-window eviction yet; longer audio gets a 400.
 - Measured on one H100 80GB (``benchmark/nemotron_duplex/sessions.py`` on the
-  106-frame demo clip, three repeats): 23.7 ms per 80 ms tick with one session,
-  54-55 ms with 32 concurrent sessions, 84-86 ms with 64 (2026-09-27; an
-  earlier node gave 74-80 ms at 64, so 64 sits at or just over the budget
-  depending on the node); every session received all its frames. Served audio is checked for intelligibility by
+  106-frame demo clip, three repeats): 24-25 ms per 80 ms tick with one
+  session, 61-64 ms with 32 concurrent sessions, 76-85 ms with 40, 87-92 ms
+  with 48 and 95-97 ms with 64 (2026-10-08). 32 is the most that keep up with
+  real time, hence the shipped cap; every session received all its frames. Served audio is checked for intelligibility by
   transcribing it (``test/nemotron_duplex/asr_check.py``, Whisper
   large-v3-turbo): MaskGIT sampling is knife-edge, so attention-backend
   numerics change the waveform but not the words.

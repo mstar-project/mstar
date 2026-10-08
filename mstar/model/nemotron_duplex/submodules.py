@@ -93,7 +93,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     # Decode batch sizes captured as CUDA graphs: one row per live session per
     # 80 ms tick. The recurrent pool holds a slot per row (padding rows take
     # one transiently), so the model's pool sizing covers the largest bucket.
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
     DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
     PROMPT_DONE_KEY = "prompt_consumed"   # set once the request's first step (prompt + frame) has run
 
@@ -468,7 +468,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     GEN_KEY = "talker_gen"
     DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
     SPEAKER = "Aria"
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     def __init__(self, talker: nn.Module, config: NemotronDuplexConfig,
                  subword_to_char: dict | None = None, char_pad_idx: int | None = None):

@@ -395,15 +395,17 @@ class NemotronDuplexModel(Model):
 
     # Sessions resident at once (one recurrent slot each; ~137 MB per slot in
     # fp32 for Nemotron-H). A deployment tunes it under ``resources: mamba_state``.
-    DEFAULT_MAMBA_SLOTS = 64          # sessions; the runner's padding rows take no slot (#258)
+    # 32 is the most that keep up with real time on one H100: a tick takes
+    # ~62 ms at 32 sessions, and 40+ miss the 80 ms budget.
+    DEFAULT_MAMBA_SLOTS = 32          # sessions; the runner's padding rows take no slot (#258)
     # Longest session served (``model_kwargs: {max_session_s: ...}``). The
     # talker KV pool is sized so DEFAULT_MAMBA_SLOTS sessions this long fit at
     # once: a full pool stalls every session, not just the one that outgrew it.
     # A page is 128 positions: 28 layers x 128 x 16 heads x 128 (the padded
-    # head dim) x K,V x bf16 = 28 MiB. 78 s = 976 frames, so 37 warm-up + 976
-    # + 1 final PAD frame fit 8 pages a stream; 64 sessions x 2 streams x 8 =
+    # head dim) x K,V x bf16 = 28 MiB. 160 s = 2001 frames, so 37 warm-up + 2001
+    # + 1 final PAD frame fit 16 pages a stream; 32 sessions x 2 streams x 16 =
     # 1024 pages (+ the sink) = 28 GiB.
-    max_session_s = 78.0
+    max_session_s = 160.0
     # Longest system prompt (``model_kwargs: {max_prompt_tokens: ...}``). The
     # prompt prefills in one step batched with every live session's frame, so
     # it stalls them all for its prefill time
