@@ -15,8 +15,8 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model
-from mstar.utils.streams import reset_device_scheduling
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.utils.streams import reset_device_scheduling
 
 logger = logging.getLogger(__name__)
 
