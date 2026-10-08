@@ -176,6 +176,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         """The most rows a captured prefill takes, or None while prefill runs eager."""
         if not self.config.prefill_graphs or not _fused_kda(self.config):
             return None
+        # declared no prefill graph (reference MoE, the MLA fallback): an eager prefill
+        # held to 4 rows took 16 steps for a burst of 64 prompts
+        if getattr(self, "_prefill_captured", True) is False:
+            return None
         return max(self.config.prefill_capture_batch_sizes or PREFILL_CAPTURE_BATCH_SIZES)
 
     def max_step_tokens(self, graph_walk: str) -> int | None:
@@ -194,6 +198,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 "glm5_next: reference MoE dispatch active; decode runs eager "
                 "(set moe_quant_kernel=auto for the capturable fused kernel)"
             )
+            self._prefill_captured = False
             return []
         # The MLA fallback bakes page indices into its plan, so a captured
         # replay would attend the capture's pages (the resource refuses).
@@ -203,6 +208,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 "glm5_next: MLA is on the SDPA fallback, which cannot be "
                 "captured; decode runs eager"
             )
+            self._prefill_captured = False
             return []
         max_slots = self._kda_max_slots()
         batch_sizes = [
@@ -245,6 +251,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 caps_eager_batch_size=False,
                 compile=False,
             ))
+        self._prefill_captured = any(c.capture_graph_walk == "prefill" for c in configs)
         return configs
 
     # -- dtype discipline -------------------------------------------------
