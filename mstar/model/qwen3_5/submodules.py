@@ -7,6 +7,7 @@ counter, and the 3D ids are built here and passed in as cos/sin.
 """
 
 import logging
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -83,7 +84,13 @@ class LLMSubmodule(ARNodeSubmodule):
     # cap on rows per decode step: with 32 as the top, 64 requests in flight
     # ran as two alternating batches of 32 and each paid the whole per-step
     # host cost. A step above 32 rows pads to the next bucket.
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]
+    # MSTAR_QWEN35_DECODE_BUCKETS="1,2,4,8,16,32" narrows the ladder (less graph
+    # memory, or the pre-#258 ladder for an A/B).
+    DECODE_CAPTURE_BATCH_SIZES = [
+        int(x) for x in os.environ.get(
+            "MSTAR_QWEN35_DECODE_BUCKETS", "1,2,4,8,16,32,48,64,96,128",
+        ).split(",")
+    ]
 
     # Text plus image tokens of a whole prompt. Capped at 4096, not the
     # processor's 16384, because static buffers are sized by the largest
