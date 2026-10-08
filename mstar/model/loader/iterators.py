@@ -77,10 +77,14 @@ class _Read(NamedTuple):
     narrow: TensorSlice | None  # applied in memory, after the read
 
 
+# per call: macOS rejects an iovec of 2 GiB or more (EINVAL); Linux caps a call below that
+_PREAD_MAX = 1 << 30
+
+
 def _pread_into(fd: int, buf: memoryview, offset: int) -> None:
     done = 0
     while done < len(buf):
-        n = os.preadv(fd, [buf[done:]], offset + done)
+        n = os.preadv(fd, [buf[done:done + _PREAD_MAX]], offset + done)
         if n <= 0:
             raise EOFError(f"safetensors file truncated at byte {offset + done}")
         done += n
@@ -130,6 +134,9 @@ def _plan_read(meta: dict, base: int, spec: TensorSlice | None) -> _Read | None:
     if spec is None:
         return _Read(base + begin, end - begin, dtype, shape, None)
     dim, start, stop = spec
+    if not -len(shape) <= dim < len(shape):
+        # as safe_open's get_slice: a wrapped dim would read another axis's shard
+        raise IndexError(f"slice dim {dim} out of range for a {len(shape)}-d tensor {meta}")
     dim %= len(shape)
     start, stop, _ = slice(start, stop).indices(shape[dim])
     stop = max(start, stop)
@@ -179,7 +186,10 @@ def _iter_files(
                 rd = _plan_read(header[key], 8 + header_len, spec)
                 last_fd = fd if i == len(selected) - 1 else None
                 if rd is None:
-                    yield key, 0, partial(_read_with_safetensors, path, key, spec), last_fd
+                    # a dtype torch reads here but this path does not: its bytes still count
+                    # against the read-ahead
+                    begin, end = header[key]["data_offsets"]
+                    yield key, end - begin, partial(_read_with_safetensors, path, key, spec), last_fd
                 else:
                     yield key, rd.nbytes, partial(_read_tensor, fd, rd), last_fd
             if not selected:
