@@ -49,3 +49,4 @@ test/modular/test_collect_outputs_fast_path.py
 test/modular/test_inline_tokens.py
 test/modular/test_sampler_static_gather_skip.py
 test/modular/test_row_output_store.py
+test/modular/test_lazy_per_rid.py
