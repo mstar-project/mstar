@@ -46,7 +46,7 @@ def _routing(tokens, experts, top_k, device="cuda"):
 @gpu
 @pytest.mark.parametrize("tokens", [17, 64, 65, 300, 1036])
 @pytest.mark.parametrize("limit", [10.0, None])
-@pytest.mark.parametrize("hidden", [1024, 1536])
+@pytest.mark.parametrize("hidden", [1024, 1536, 6144])
 def test_matches_the_shared_runner(tokens, limit, hidden):
     from mstar.utils.fused_moe import fused_experts_fp8
 
@@ -61,7 +61,11 @@ def test_matches_the_shared_runner(tokens, limit, hidden):
     # the shared expert's output rides the top-k sum: the block's routed + shared, same bits
     shared = torch.randn(tokens, hidden, device="cuda").to(torch.bfloat16)
     out = prefill.experts(x, w13, w2, s13, s2, weights, ids, shared=shared, **kw)
-    assert torch.equal(out, ref + shared)
+    if hidden % 2048:
+        assert torch.equal(out, ref + shared)
+    else:
+        # GLM-5.2's 6144 takes the fused sum-and-add, one rounding instead of two
+        torch.testing.assert_close(out.float(), ref.float() + shared.float(), rtol=1e-2, atol=1e-2)
 
 
 @gpu
@@ -137,3 +141,15 @@ def test_compiles_on_a_dynamic_token_count():
         x = torch.randn(tokens, 512, device="cuda").to(torch.bfloat16)
         weights, ids = _routing(tokens, 16, 4)
         assert torch.equal(compiled(x, weights, ids), f(x, weights, ids))
+
+
+def test_a_strided_shared_output_is_refused():
+    """The kernels read ``shared`` as dense rows; a strided view added the wrong rows."""
+    x = torch.zeros(4, 256, dtype=torch.bfloat16)
+    w13 = torch.zeros(2, 256, 256, dtype=torch.uint8)
+    w2 = torch.zeros(2, 256, 128, dtype=torch.uint8)
+    s13, s2 = torch.ones(2, 2, 2), torch.ones(2, 2, 1)
+    shared = torch.zeros(4, 512, dtype=torch.bfloat16)[:, :256]
+    with pytest.raises(AssertionError):
+        prefill._experts(x, w13, w2, s13, s2, torch.ones(4, 1), torch.zeros(4, 1, dtype=torch.int64),
+                         (128, 128), None, shared)

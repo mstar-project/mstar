@@ -337,3 +337,17 @@ def test_the_router_refuses_more_tokens_than_its_tile_holds():
     with pytest.raises(ValueError, match="at most"):
         decode.route(torch.empty(T, 256), torch.empty(8, 256), torch.empty(8), top_k=2,
                      scale=1.0, normalize=True)
+
+
+def test_strided_block_scales_are_refused():
+    """The kernels index the scales as dense blocks past their leading stride: a TP slice
+    kept as a view applied other blocks' scales, silently."""
+    H, I, E = 256, 128, 2
+    x = torch.zeros(1, H, dtype=torch.bfloat16)
+    w13, w2 = torch.zeros(E, 2 * I, H, dtype=torch.uint8), torch.zeros(E, H, I, dtype=torch.uint8)
+    s13 = torch.ones(E, 2 * I // 128, H // 128)
+    s2 = torch.ones(E, H // 128, 2 * I // 128)[:, :, : I // 128]
+    sw13, sw2 = torch.zeros(2 * I, H, dtype=torch.bfloat16), torch.zeros(H, I, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="contiguous"):
+        decode._check_experts(x, w13, s13, w2, s2, sw13, sw2, (128, 128))
+    decode._check_experts(x, w13, s13, w2, s2.contiguous(), sw13, sw2, (128, 128))
