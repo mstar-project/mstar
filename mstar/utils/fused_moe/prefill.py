@@ -175,6 +175,36 @@ def experts(x, w13, w2, s13, s2, topk_weights, topk_ids, *, block_size, swiglu_l
     """``fused_experts_fp8``: the routed experts of ``x (T, H)``, weighted and summed per
     token, with ``tiles``; plus ``shared (T, H)`` when given. ``swiglu_limit`` clamps the
     SwiGLU's inputs, None: no clamp."""
+    return torch.ops.mstar.fused_moe_prefill_experts(
+        x, w13, w2, s13, s2, topk_weights, topk_ids, list(block_size), swiglu_limit, shared)
+
+
+# One opaque op to dynamo, as runner.fused_experts_fp8: traced inline, the launch path's
+# host logic breaks the graph (and fails outright on a symbolic token count in some torch
+# versions).
+@torch.library.custom_op("mstar::fused_moe_prefill_experts", mutates_args=())
+def _experts_op(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    s13: torch.Tensor,
+    s2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    block_size: list[int],
+    swiglu_limit: float | None,
+    shared: torch.Tensor | None,
+) -> torch.Tensor:
+    return _experts(x, w13, w2, s13, s2, topk_weights, topk_ids, tuple(block_size),
+                    swiglu_limit, shared)
+
+
+@_experts_op.register_fake
+def _(x, w13, w2, s13, s2, topk_weights, topk_ids, block_size, swiglu_limit, shared):
+    return torch.empty_like(x)
+
+
+def _experts(x, w13, w2, s13, s2, topk_weights, topk_ids, block_size, swiglu_limit, shared):
     T, H = x.shape
     top_k = topk_ids.shape[1]
     w13, w2 = w13.view(FP8_DTYPE), w2.view(FP8_DTYPE)

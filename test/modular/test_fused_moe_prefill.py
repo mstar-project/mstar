@@ -106,3 +106,34 @@ def test_tiles_keep_the_runner_rows():
     assert small["BLOCK_SIZE_M"] == 16 and large["BLOCK_SIZE_M"] == 64
     # both GEMMs read one alignment, so they share its tile rows
     assert down["BLOCK_SIZE_M"] == large["BLOCK_SIZE_M"] and large["BLOCK_SIZE_K"] == 128
+
+
+def test_one_opaque_op_to_dynamo():
+    """Like fused_experts_fp8: traced inline, the launch path's host logic broke the graph
+    and failed outright on a symbolic token count (torch 2.9.1)."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    assert hasattr(torch.ops.mstar, "fused_moe_prefill_experts")
+    with FakeTensorMode():
+        x = torch.empty(37, 256, dtype=torch.bfloat16)
+        w13 = torch.empty(4, 256, 256, dtype=torch.uint8)
+        w2 = torch.empty(4, 256, 128, dtype=torch.uint8)
+        s13, s2 = torch.empty(4, 2, 2), torch.empty(4, 2, 1)
+        out = prefill.experts(x, w13, w2, s13, s2, torch.empty(37, 2),
+                              torch.empty(37, 2, dtype=torch.int64), block_size=(128, 128),
+                              shared=torch.empty(37, 256, dtype=torch.bfloat16))
+    assert out.shape == (37, 256) and out.dtype == torch.bfloat16
+
+
+@gpu
+def test_compiles_on_a_dynamic_token_count():
+    w13, w2, s13, s2 = _layer(16, 512, 256, 128)
+
+    def f(x, weights, ids):
+        return prefill.experts(x, w13, w2, s13, s2, weights, ids, block_size=(128, 128))
+
+    compiled = torch.compile(f, dynamic=True, fullgraph=True)
+    for tokens in (65, 300):
+        x = torch.randn(tokens, 512, device="cuda").to(torch.bfloat16)
+        weights, ids = _routing(tokens, 16, 4)
+        assert torch.equal(compiled(x, weights, ids), f(x, weights, ids))
