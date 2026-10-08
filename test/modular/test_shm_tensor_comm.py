@@ -865,9 +865,27 @@ def test_shm_sends_the_stored_host_copy():
         infos = sender.store_and_return_tensor_info(
             "req1", {"tok": [tensor]}, cpu_tensors={"tok": [host]},
         )
-        assert sender.tensor_store.get_cpu_tensor(infos["tok"][0].uuid) is host
+        assert torch.equal(sender.tensor_store.get_cpu_tensor(infos["tok"][0].uuid), host)
         edges = [GraphEdge(next_node="LLM", name="tok", tensor_info=infos["tok"])]
         assert torch.equal(_send_and_read(sender, receiver, "req1", edges), host)
+
+
+def test_a_persisted_output_sends_its_own_step_values():
+    """The stop check's host copies are views of pinned buffers the next step
+    reuses. A loop's accumulated tokens are sent when the loop ends, after
+    later steps have written that buffer again."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sender = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        receiver = _make_manager(tmpdir, entity_id="worker_1", request_id="req1")
+        pinned = torch.tensor([[5, 6]])
+        stored = sender.store_and_return_tensor_info_batch(
+            ["req1"], {"req1": {"tok": [torch.tensor([[5, 6]])]}}, ["tok"],
+            cpu_tensors={"req1": {"tok": [pinned[:1]]}},
+        )
+        pinned.fill_(9)  # the next step's stop check
+        infos = [sender.tensor_store.get_info(u) for u in stored.flat_uuids]
+        edges = [GraphEdge(next_node="LLM", name="tok", tensor_info=infos)]
+        assert _send_and_read(sender, receiver, "req1", edges).tolist() == [[5, 6]]
 
 
 def test_host_copy_follows_a_renamed_output():
@@ -883,7 +901,7 @@ def test_host_copy_follows_a_renamed_output():
             [7], outputs, ["text_inputs"],
             cpu_tensors={7: {"new_token": [host]}},
         )
-        assert mgr.tensor_store.get_cpu_tensor(stored.flat_uuids[0]) is host
+        assert torch.equal(mgr.tensor_store.get_cpu_tensor(stored.flat_uuids[0]), host)
 
 
 def test_host_copies_not_kept_for_device_transports():

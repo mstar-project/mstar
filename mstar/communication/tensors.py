@@ -392,14 +392,18 @@ class TensorCommunicationManager(ABC):
     ) -> torch.Tensor | None:
         """The producer's host copy of ``tensor``, if it gave a usable one: a
         host tensor of the same shape and dtype, else None (the send then
-        copies from the device tensor)."""
+        copies from the device tensor).
+
+        Cloned: the worker's copies are views of pinned buffers the next step
+        reuses, and a persisted output can be sent steps later (a loop's
+        accumulated tokens go out when the loop ends)."""
         cpu = by_tensor.get(id(tensor))
         if not torch.is_tensor(cpu) or cpu.device.type != "cpu":
             return None
         cpu = self._ensure_leading_shard_dim(shard_dim, cpu)
         if cpu.shape != canonical.shape or cpu.dtype != canonical.dtype:
             return None
-        return cpu
+        return cpu.clone()
 
     def _ensure_leading_shard_dim(self, shard_dim: int | None, tensor: torch.Tensor):
         """Move ``shard_dim`` to dim 0, preserving the relative order of the
