@@ -44,7 +44,7 @@ def _raw(bs=4, with_per_rid=False):
 def _collect(sub, raw, rids):
     eng = Engine.__new__(Engine)
     outputs = {}
-    row_clones = eng._merge_per_rid(outputs, raw, rids, rids, sub, {})
+    row_clones, _ = eng._merge_per_rid(outputs, raw, rids, rids, sub, {})
     return outputs, row_clones
 
 
