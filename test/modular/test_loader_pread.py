@@ -169,3 +169,26 @@ def test_every_opened_file_is_closed(tmp_path, monkeypatch, ahead_tensors):
     closed.clear()
     assert len(list(iter_safetensors_shards(tmp_path))) > 0
     assert len(opened) == 2 and sorted(opened) == sorted(closed)
+
+
+def test_a_slice_dim_past_the_tensor_raises(tmp_path):
+    """As safe_open's get_slice: a column spec that also matched a 1-d bias wrapped onto
+    dim 0 and read a plausible-shaped wrong shard."""
+    path = tmp_path / "model.safetensors"
+    save_file({"bias": torch.randn(8)}, str(path))
+    with pytest.raises(IndexError, match="out of range"):
+        list(iter_safetensors_file(path, slice_spec={"bias": TensorSlice(1, 0, 4)}.get))
+
+
+def test_reads_are_split_below_2_gib(tmp_path, monkeypatch):
+    # macOS rejects one iovec of 2 GiB or more with EINVAL
+    sizes = []
+    real = iterators.os.preadv
+    monkeypatch.setattr(iterators, "_PREAD_MAX", 16)
+    monkeypatch.setattr(iterators.os, "preadv",
+                        lambda fd, bufs, off: sizes.append(len(bufs[0])) or real(fd, bufs, off))
+    path = tmp_path / "model.safetensors"
+    t = torch.arange(40, dtype=torch.int32)
+    save_file({"t": t}, str(path))
+    (_, got), = list(iter_safetensors_file(path))
+    assert torch.equal(got, t) and max(sizes) <= 16
