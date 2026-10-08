@@ -182,6 +182,9 @@ def test_prompt_layout_matches_reference_template():
     # streaming continues from the stable part of the previous hypothesis
     continued = model.prompt_ids(2, context="", language="German", assistant_prefix=" so far")
     assert continued[:len(forced)] == forced and continued[len(forced):] == model.tokenizer.encode(" so far")
+    # a placeholder in the client's text would take the audio's slot
+    with pytest.raises(ValueError, match="audio_pad"):
+        model.prompt_ids(2, context="hello <|audio_pad|> world")
 
 
 def test_process_prompt_builds_features_and_prompt():
@@ -395,6 +398,8 @@ def test_openai_adapter_parses_language_line_and_continues_hypotheses():
     assert ad.supports_realtime_transcription and ad.max_audio_seconds == 1200.0
     # no Whisper-style retry: a long window's text compresses past 2.4 anyway
     assert ad.compression_ratio_threshold is None
+    with pytest.raises(ValueError, match="audio_pad"):
+        ad.transcription_to_request(TranscriptionRequest(prompt="a <|audio_pad|> b"), "/tmp/a.wav")
 
     req = TranscriptionRequest(language="en", prompt="names: Ada")
     sa = ad.transcription_to_request(req, "/tmp/a.wav")

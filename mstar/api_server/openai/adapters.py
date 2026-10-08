@@ -907,12 +907,16 @@ class Qwen3ASRAdapter(OpenAIAdapter):
     compression_ratio_threshold = None
 
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        kwargs = _transcription_kwargs(req)
+        # checked here too so a streaming request gets a 400 before it starts
+        if "<|audio_pad|>" in str(kwargs.get("initial_prompt") or ""):
+            raise ValueError("the prompt must not contain <|audio_pad|>")
         return SubmitArgs(
             text="",
             file_paths={"audio": [audio_path]},
             input_modalities=["audio", "text"],
             output_modalities=["text"],
-            model_kwargs=_transcription_kwargs(req),
+            model_kwargs=kwargs,
         )
 
     def realtime_step_request(self, req: TranscriptionRequest, audio_path: str, prefix: str) -> SubmitArgs:

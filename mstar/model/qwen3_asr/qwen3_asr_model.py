@@ -342,6 +342,8 @@ class Qwen3ASRModel(Model):
         ids = self.tokenizer.encode(
             self.prompt_text(1, context, language, assistant_prefix), add_special_tokens=False,
         )
+        if ids.count(self.config.audio_token_id) != 1:
+            raise ValueError("the prompt must not contain <|audio_pad|>")
         slot = ids.index(self.config.audio_token_id)
         return ids[:slot] + [self.config.audio_token_id] * num_audio_tokens + ids[slot + 1:]
 
