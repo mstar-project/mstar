@@ -57,3 +57,14 @@ def test_the_kernel_follows_a_packed_capture_not_the_spans(force_prefill, spans,
     gdn._build_plan("main", segments, addressing, ctx)
 
     assert gdn.kinds == [kind]
+
+
+@pytest.mark.parametrize("walk,inputs,length", [
+    ("decode", {}, 1),
+    ("prefill_text", {"text_inputs": [torch.zeros(7, dtype=torch.long)]}, 7),
+    ("prefill_vision", {"text_inputs": [torch.zeros(7, dtype=torch.long)]}, None),
+])
+def test_text_and_decode_rows_report_their_length(walk, inputs, length):
+    info = LLMSubmodule.get_input_sequence_len(None, walk, None, inputs)
+
+    assert (info.seq_len if info is not None else None) == length
