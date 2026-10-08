@@ -307,10 +307,10 @@ class DuplexStream:
         codes, self._talker_state = talker.infer_codes_one_step(
             self._talker_state, cur, cur, self._prev_codes, cond=cond,
             text_eos_id=cfg.text_eos_id, temperature=self.temperature,
-            num_iter=cfg.eartts.inference_num_iter,
-            guidance_scale=cfg.eartts.inference_guidance_scale,
-            noise_scale=cfg.eartts.inference_noise_scale,
-            top_p=cfg.eartts.inference_top_p,
+            num_iter=talker.config.inference_num_iter,
+            guidance_scale=talker.config.inference_guidance_scale,
+            noise_scale=talker.config.inference_noise_scale,
+            top_p=talker.config.inference_top_p,
             generator=self._talker_gen,
         )
         self._prev_codes = codes
@@ -1097,8 +1097,9 @@ class NemotronDuplexModel(Model):
         tok = self._talker_tokenizer()
         cv = build_char_vocab(tok)
         s2c, _ = subword_to_char_ids(tok, cv)
+        # checkpoint config, so the talker samples with its inference_* knobs
         return EarTTSTalkerSubmodule(
-            talker=talker, config=self.config, subword_to_char=s2c, char_pad_idx=len(cv),
+            talker=talker, config=cfg, subword_to_char=s2c, char_pad_idx=len(cv),
         )
 
     def _create_codec_submodule(

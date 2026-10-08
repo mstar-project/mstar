@@ -420,7 +420,8 @@ class NemotronDuplexConfig:
             activation=jc["jointnet"]["activation"],
         )
 
-        tts = raw["model"]["speech_generation"]["model"]["tts_config"]
+        sg = raw["model"]["speech_generation"]["model"]
+        tts = sg["tts_config"]
         bb, mog = tts["backbone_config"], tts["mog_head_config"]
         cfg.eartts = EarTTSConfig(
             hidden_size=bb["hidden_size"],
@@ -441,9 +442,9 @@ class NemotronDuplexConfig:
             mog_eps=mog["eps"],
             mog_exponent=mog.get("exponent", 3.0),
             inference_num_iter=tts.get("inference_num_iter", 8),
-            inference_guidance_scale=tts.get("inference_guidance_scale", 0.5),
-            inference_noise_scale=tts.get("inference_noise_scale", 0.8),
-            inference_top_p=tts.get("inference_top_p_or_k", 0.8),
+            inference_guidance_scale=sg.get("inference_guidance_scale", 0.5),
+            inference_noise_scale=sg.get("inference_noise_scale", 0.8),
+            inference_top_p=sg.get("inference_top_p_or_k", 0.8),
         )
 
         enc = raw["model"]["stt"]["model"]["perception"]["encoder"]
