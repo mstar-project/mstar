@@ -2878,7 +2878,7 @@ class Worker:
                 "worker.postprocess.check_stop", _time.perf_counter() - _t_stop,
             )
         # the same host copy, before stops, so a request ending here still indexes its pages
-        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs)
+        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
 
         # Stream-terminated loop: a stream-consuming node inside a loop has no
         # internal stop signal (unlike a self-EOS loop), so when it consumes the
