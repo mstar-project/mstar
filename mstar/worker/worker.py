@@ -360,7 +360,6 @@ class Worker:
             if self.parallel_groups.get_instance_rank_for_node(node) == 0
         ])
 
-        # v1: disallow multiple lockstep-scheduled nodes in the same worker.
         # A node is lockstep-scheduled when its instance spans more than one rank,
         # i.e. tp_size * sp_size > 1. Pure sequence-parallel nodes (tp_size 1,
         # sp_size > 1) need this too: their attention all-to-all requires the
@@ -369,11 +368,21 @@ class Worker:
             node for node in node_names
             if self.parallel_groups.get_instance_world_size_for_node(node) > 1
         ])
-        if len(self.parallel_nodes) > 1:
+        # Several lockstep nodes may share a worker (e.g. an encoder and an LLM
+        # sharded over the same ranks) as long as one rank schedules them all:
+        # followers then run every node's collectives in the order that single
+        # leader broadcasts them. Two leaders could each block in a collective
+        # the other's followers never reach.
+        parallel_leaders = {
+            self.parallel_groups.get_leader_global_rank(node)
+            for node in self.parallel_nodes
+        }
+        if len(parallel_leaders) > 1:
             raise NotImplementedError(
-                f"Multiple parallel nodes {self.parallel_nodes} found in worker "
-                f"{worker_id}; current implementation requires at most one "
-                "lockstep-parallel node per worker."
+                f"Parallel nodes {sorted(self.parallel_nodes)} in worker "
+                f"{worker_id} have different instance leaders "
+                f"{sorted(parallel_leaders)}; current implementation requires "
+                "every lockstep-parallel node on a worker to share one leader."
             )
 
         self.is_tp_follower = len(self.parallel_nodes - self.parallel_leader_nodes) > 0

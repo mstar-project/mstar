@@ -279,6 +279,11 @@ class WorkerParallelGroups:
     node_to_instance_groups: dict[
         str, frozenset[tuple[int, ...]]
     ] = field(default_factory=dict)
+    # This worker's own lockstep instance per node: the TP x SP block's global
+    # ranks, row-major [sp][tp] (``WorkerGraph._instance_ranks``), so index 0
+    # is the instance leader. Set by GlobalParallelConfig; a node absent here
+    # is unsharded on this worker.
+    node_to_instance_ranks: dict[str, tuple[int, ...]] = field(default_factory=dict)
     _device: torch.device | None = field(default=None, init=False, repr=False)
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
@@ -387,6 +392,15 @@ class WorkerParallelGroups:
 
     def get_instance_world_size_for_node(self, node: str) -> int:
         return self.get_joint_group_for_node(node).world_size
+
+    def get_leader_global_rank(self, node: str) -> int:
+        """Global rank of the leader of ``node``'s instance on this worker —
+        the rank that schedules it and broadcasts ``ScheduleTPNode``. Not
+        derivable from the local comm groups alone: the leader shares neither
+        a TP row nor an SP column with an off-axis rank. This worker itself
+        for an unsharded node."""
+        instance = self.node_to_instance_ranks.get(node)
+        return instance[0] if instance else self.global_rank
 
     def all_in_same_group(self, nodes: list[str]) -> bool:
         """Whether every node shares one (tp, sp) group.
@@ -514,6 +528,20 @@ class GlobalParallelConfig:
                 node_to_instance_groups=frozen_instance_groups,
             ) for i, wid in enumerate(worker_ids)
         }
+
+        for wg in worker_graphs.values():
+            for instance in wg._instance_ranks:
+                for rank in instance:
+                    config = self.per_worker_config[worker_ids[rank]]
+                    for node in wg.section.get_nodes():
+                        prev = config.node_to_instance_ranks.setdefault(
+                            node, tuple(instance)
+                        )
+                        if prev != tuple(instance):
+                            raise RuntimeError(
+                                f"Node {node} is in instances {prev} and "
+                                f"{tuple(instance)} on worker {rank}"
+                            )
 
         # (global rank, (group ranks...)) -> comm group, for each mesh axis.
         self.comm_groups: dict[tuple[int, tuple], CommGroup] = {}

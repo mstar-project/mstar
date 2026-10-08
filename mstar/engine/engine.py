@@ -526,7 +526,11 @@ class Engine:
     def warmup(self) -> None:
         cg_runners: dict[str, CudaGraphRunner] = {}
         piecewise: dict[str, dict[str, PiecewiseCudaGraphRunner]] = {}
-        for node_name, submodule_mgmt in self._submodules.items():
+        # Captures barrier on each node's comm group, so ranks sharing several
+        # parallel nodes must capture them in one agreed order.
+        order = sorted(self._submodules)
+        for node_name in order:
+            submodule_mgmt = self._submodules[node_name]
             submodule = submodule_mgmt.submodule
             cg_runners[node_name] = CudaGraphRunner(
                 submodule_name=node_name,
@@ -546,12 +550,13 @@ class Engine:
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
         # buffers an earlier node's graphs already recorded the address of.
-        for node_name in self._submodules:
+        for node_name in order:
             cg_runners[node_name].prepare_for_capture()
             for runner in piecewise[node_name].values():
                 runner.prepare_for_capture()
 
-        for node_name, submodule_mgmt in self._submodules.items():
+        for node_name in order:
+            submodule_mgmt = self._submodules[node_name]
             runner = cg_runners[node_name]
             runner.warmup_and_capture()
             if runner.any_graphs:
