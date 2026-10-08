@@ -1498,7 +1498,7 @@ class Engine:
         )
         outputs: dict[str, NameToTensorList] = {}
 
-        row_clones = self._merge_per_rid(
+        row_clones, row_views = self._merge_per_rid(
             outputs, raw_outputs, request_ids, out_ids, submodule, req_info,
         )
         self._merge_unpacked(
@@ -1515,6 +1515,7 @@ class Engine:
             # row i is request_ids[i] as the forward ran them, not the
             # worker's later-rewritten request list
             row_request_ids=tuple(request_ids),
+            row_views=row_views,
         )
 
     def _merge_per_rid(
@@ -1525,13 +1526,15 @@ class Engine:
         out_ids: list[str],
         submodule: NodeSubmodule,
         req_info: Mapping[str, CurrentForwardPassInfo],
-    ) -> dict[str, torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[torch.Tensor, ...]] | None]:
         """Fold the forward's per-rid entries into ``outputs``.
 
         ``row_outputs`` are cloned once for the batch and handed out as row
         views; per-rid entries are cloned individually after
         ``filter_batched_output``. A name in both resolves to the per-rid one.
-        Returns the row clones so the caller can share them.
+        Returns the row clones so the caller can share them, and on the
+        rows-only path the views themselves (name -> views, row i for
+        ``request_ids[i]``), which the store describes without reading each.
         """
         row_clones = raw_outputs.clone_row_outputs(len(request_ids))
         # The common decode case: only row outputs, and a submodule that does
@@ -1555,7 +1558,7 @@ class Engine:
                     for name, views in row_views.items():
                         if i < len(views):
                             merged[name] = [views[i]]
-            return row_clones
+            return row_clones, (row_views or None)
         for i, (rid, out_id) in enumerate(
             zip(request_ids, out_ids, strict=False)
         ):
@@ -1588,7 +1591,7 @@ class Engine:
                     merged[key] = [value.clone()]
                 else:
                     merged[key] = value
-        return row_clones
+        return row_clones, None
 
     def _merge_unpacked(
         self,
