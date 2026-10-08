@@ -9,6 +9,9 @@ model: "glm52"
 # ~= 93 KB. With ~96 GB/rank of weights, 8 GPUs of 141 GB hold about 300k tokens, so the
 # window is 256k (the model's own is 1M); 8 GPUs of 80 GB cannot hold the weights.
 max_seq_len: 262144
+# The KV pools below hold about one full window: they admit by prompt, and when the live
+# contexts outgrow them, decode holds requests until they time out (no eviction).
+max_concurrent_requests: 64
 # A 750 GB load outruns PyTorch's default process-group timeout.
 dist_timeout_s: 7200
 # NVLS multicast all-reduce, one-shot up to 32 KiB; stays on NCCL, with a

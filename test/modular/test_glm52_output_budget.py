@@ -132,8 +132,13 @@ def test_the_compile_hatch_covers_uncaptured_steps(monkeypatch):
     from mstar.model.glm52.submodules import Glm52LLMSubmodule
 
     sub = object.__new__(Glm52LLMSubmodule)
+    sub.config = Glm52ModelConfig()
     monkeypatch.delenv("MSTAR_GLM52_GRAPH_COMPILE", raising=False)
     assert not sub.disable_torch_compile
+    # DSA's uncaptured steps run eager; compiled, the frame keys on each prompt's length
+    sub.config.dsa_long_context = True
+    assert sub.disable_torch_compile
+    sub.config.dsa_long_context = False
     monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
     assert sub.disable_torch_compile and not sub._compile_flags()["compile"]
 
