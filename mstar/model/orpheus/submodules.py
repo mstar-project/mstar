@@ -9,7 +9,16 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    keep_final_chunk_samples,
+)
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
@@ -127,10 +136,10 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             steps={
                 KV_CACHE: KVStep(),
                 ATTN: AttentionStep(causal=True),
-                SAMPLER: SamplerStep(
+                SAMPLER: keep_final_chunk_samples(SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens
-                ),
+                ), request_ids, inputs),
                 ROPE: PositionStep()
             }
         )
