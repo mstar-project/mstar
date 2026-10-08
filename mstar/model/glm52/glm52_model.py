@@ -52,6 +52,9 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 class Glm52Model(Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
 
+    # the conductor builds the fused-MoE align op before spawning the workers
+    prebuild_fused_moe = True
+
     def __init__(
         self,
         model_path_hf: str,
