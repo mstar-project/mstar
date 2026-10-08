@@ -528,11 +528,6 @@ class MicroScheduler:
         """One step for ``node_walk`` out of its backlog and its ready
         ``entries``, composed by the batch builder."""
         backlogged = self.backlog.pop(node_walk, None)
-        blocked = set()
-        if backlogged is not None:
-            blocked = self._unready_backlog_rids(backlogged, request_state)
-            if not backlogged:
-                backlogged = None  # every row failed
         if max_batch_size is None:
             max_batch_size = self._max_batch_size(*node_walk)
         remaining = self._remaining_capacity(max_batch_size, pre_existing_batch_size)
@@ -543,6 +538,15 @@ class MicroScheduler:
             if backlogged is not None:
                 self._backlog(node_walk, backlogged)
             return None
+        # After the capacity check, and with it: the readiness scan is bounded
+        # by the room this step actually has, and a full caller skips it.
+        blocked = set()
+        if backlogged is not None:
+            blocked = self._unready_backlog_rids(
+                backlogged, request_state, remaining, capture_group_of,
+            )
+            if not backlogged:
+                backlogged = None  # every row failed
 
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
             if entries else None
@@ -600,16 +604,30 @@ class MicroScheduler:
 
     def _unready_backlog_rids(
         self, batch: ScheduledBatch, request_state: RequestStateManager,
+        max_bs: int | None = None, capture_group_of: int | None = None,
     ) -> set[int]:
-        """The rows of a backlogged ``batch`` that cannot run yet; failed rows
-        are dropped from it instead."""
+        """The rows of a backlogged ``batch`` that cannot run this step; failed
+        rows are dropped from it instead."""
         node_partition = request_state.get_partition_for_node(batch.node_name)
+        # Held (OOM backoff) and pending-remove rows wait without asking the
+        # engine, as on the fresh path: asking reloads an offloaded row, which
+        # would OOM it again straight away. They do not count against the
+        # step's worth below either -- they were never candidates for it.
+        now = time.monotonic()
+        waiting = {
+            rid for rid in batch.request_to_worker_graph
+            if rid in self.pending_removes or self.held_until.get(rid, 0.0) > now
+        }
         # Check readiness in backlog order and stop once a step's worth is
-        # found: `_cap_batch_and_schedule` takes the first `max_bs` rids not
-        # excluded, which are exactly the ones checked and found ready, and
-        # the rids past that point keep their place for the next pass. Before
-        # this every backlogged request was checked (an engine sweep over the
-        # resources each) on every step, with 96 waiting at 128 in flight.
+        # found: the builder takes the first `max_bs` rids not excluded, which
+        # are exactly the ones checked and found ready, and the rids past that
+        # point keep their place for the next pass. Before this every
+        # backlogged request was checked (an engine sweep over the resources
+        # each) on every step, with 96 waiting at 128 in flight.
+        #
+        # The capture group is settled in the same loop, not left to the
+        # builder: an off-group row must not consume the step's worth, or the
+        # scan would stop with rows the builder then takes unchecked.
         limit = len(batch) if max_bs is None else max(max_bs, 0)
         group = functools.partial(
             self._capture_group, request_state,
@@ -618,12 +636,14 @@ class MicroScheduler:
         # `is not None`: handle 0 is a real rid
         wanted = None if capture_group_of is None else group(capture_group_of)
         anchored = capture_group_of is not None
-        not_ready_rids: set[int] = set()
+        not_ready_rids: set[int] = set(waiting)
         off_group: set[int] = set()
         taken = 0
         for rid in batch.request_to_worker_graph:
             if taken >= limit:
                 break
+            if rid in waiting:
+                continue
             if not self._check_ready(
                 batch.node_name, rid,
                 request_state.get_fwd_info(rid, node_partition),
@@ -638,6 +658,7 @@ class MicroScheduler:
                 off_group.add(rid)
                 continue
             taken += 1
+        not_ready_rids |= off_group
         # A failed rid is not "not ready yet": excluding it would put it
         # straight back in the backlog. This chunk is out of `self.backlog`
         # right now, so `_drop_backlogged_rid` cannot reach it.
