@@ -178,8 +178,6 @@ def test_duplex_initial_partition_routing():
     no_prompt = {"audio_features": ["a"], "text_inputs": ["s"]}
     fpa = model.get_initial_forward_pass_args("LLM", ["audio"], ["audio"], no_prompt)
     assert fpa.full_metadata.graph_walk == "decode" and fpa.step_metadata == {"prompt_pending": False}
-    # audio not requested -> streaming output partitions are immediately done
-    assert model.get_initial_forward_pass_args("Codec", ["audio"], ["text"], sig).request_done
 
 
 def test_duplex_llm_after_the_first_step_nothing_is_pending():
@@ -256,6 +254,39 @@ def test_duplex_process_prompt_rejects_audio_under_one_frame():
             model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(n)]})
     out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(frame)]})
     assert out["audio_features"][0].numel() == frame
+
+
+def test_duplex_process_prompt_rejects_bad_requests():
+    """Requests the duplex loop cannot serve are a ValueError (a 400), not a 500
+    or a silently wrong reply: no audio, non-finite audio, or no audio output."""
+    model = _make_model()
+    ok = {"audio_inputs": [torch.zeros(16000)]}
+    model._tokenizer = lambda prompt, return_tensors: SimpleNamespace(input_ids=torch.tensor([[5, 6, 7]]))
+    for tensors in (None, {}, {"audio_inputs": []}):
+        with pytest.raises(ValueError, match="needs an audio input"):
+            model.process_prompt("hi", ["text"], ["audio", "text"], tensors=tensors)
+    for bad in (float("nan"), float("inf"), -float("inf")):
+        wav = torch.zeros(16000)
+        wav[100] = bad
+        with pytest.raises(ValueError, match="NaN or inf"):
+            model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [wav]})
+    for omod in (["text"], ["image"], ["audio", "image"], []):
+        with pytest.raises(ValueError, match="output modalities"):
+            model.process_prompt(None, ["audio"], omod, tensors=ok)
+    for omod in (["audio"], ["text", "audio"]):
+        model.process_prompt(None, ["audio"], omod, tensors=ok)
+
+
+def test_duplex_process_prompt_scales_down_over_full_scale_audio():
+    """Float files can exceed full scale; past it the agent goes silent, so the
+    peak is brought back to 1.0. Audio within full scale is left untouched."""
+    model = _make_model()
+    wav = torch.sin(torch.arange(16000) / 10.0)
+    out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [wav * 1e6]})
+    assert torch.allclose(out["audio_features"][0], wav, atol=1e-6)
+    quiet = wav * 0.5
+    out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [quiet]})
+    assert torch.equal(out["audio_features"][0], quiet)
 
 
 def test_duplex_no_prompt_seeds_initial_decode_inputs():

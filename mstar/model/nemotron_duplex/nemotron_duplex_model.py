@@ -663,6 +663,11 @@ class NemotronDuplexModel(Model):
         # Duplex request: raw user audio (-> Encoder partition) plus an optional
         # system-prompt text that primes the nano cache (prefill_text).
         out: NameToTensorList = {}
+        # The agent always speaks: text-only would need the LLM to stop feeding the talker stream
+        if "audio" not in output_modalities or set(output_modalities) - {"text", "audio"}:
+            raise ValueError(
+                f"output modalities {sorted(output_modalities)} are not supported; use audio or text,audio"
+            )
         if prompt:
             ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0].to(torch.long)
             # TODO(prefill): stopgap for prompt decode stalls; can be removed once we get prefill
@@ -674,25 +679,32 @@ class NemotronDuplexModel(Model):
             out["text_inputs"] = [ids]
         # The data worker loads audio files under ``audio_inputs`` (f"{modality}_inputs");
         # expose them as ``audio_features`` — the conformer_encoder node's input.
-        if tensors:
-            wav = tensors.get("audio_inputs") or tensors.get("audio_features")
-            if wav:
-                # one encoder frame; shorter audio breaks the STFT pad and the token stream
-                stt = self.config.stt
-                min_samples = stt.hop_length * stt.subsampling_factor
-                for w in wav:
-                    if w.numel() < min_samples:
-                        raise ValueError(
-                            f"audio is {w.numel()} samples; need at least {min_samples} "
-                            f"({min_samples * 1000 // stt.sample_rate} ms at {stt.sample_rate} Hz)"
-                        )
-                    # past the cap the talker KV and the decode loops run out
-                    if stt.num_frames(w.numel()) > self.max_session_frames:
-                        raise ValueError(
-                            f"audio is {w.numel() / stt.sample_rate:.1f} s; this server "
-                            f"takes sessions up to {self.max_session_s:g} s"
-                        )
-                out["audio_features"] = wav
+        wav = (tensors or {}).get("audio_inputs") or (tensors or {}).get("audio_features")
+        # the duplex loop is driven by audio frames; with none there is nothing to step
+        if not wav:
+            raise ValueError("this model needs an audio input; got none")
+        # one encoder frame; shorter audio breaks the STFT pad and the token stream
+        stt = self.config.stt
+        min_samples = stt.hop_length * stt.subsampling_factor
+        for i, w in enumerate(wav):
+            if not torch.isfinite(w).all():
+                raise ValueError("audio contains NaN or inf samples")
+            # float files can exceed full scale, and loud input silences the agent
+            peak = w.abs().max() if w.numel() else 0.0
+            if peak > 1.0:
+                wav[i] = w = w / peak
+            if w.numel() < min_samples:
+                raise ValueError(
+                    f"audio is {w.numel()} samples; need at least {min_samples} "
+                    f"({min_samples * 1000 // stt.sample_rate} ms at {stt.sample_rate} Hz)"
+                )
+            # past the cap the talker KV and the decode loops run out
+            if stt.num_frames(w.numel()) > self.max_session_frames:
+                raise ValueError(
+                    f"audio is {w.numel() / stt.sample_rate:.1f} s; this server "
+                    f"takes sessions up to {self.max_session_s:g} s"
+                )
+        out["audio_features"] = wav
         # Seed the decode loop's iteration-0 fed-back tokens. The frame-
         # synchronous nano step lists prev_text / prev_func as inputs, so
         # without these the readiness gate never fires on the first frame (no
@@ -721,7 +733,10 @@ class NemotronDuplexModel(Model):
 
         from mstar.model.base import TensorAndMetadata
 
-        data, sr = sf.read(filepath, dtype="float32")
+        try:
+            data, sr = sf.read(filepath, dtype="float32")
+        except sf.SoundFileError as exc:   # garbage or truncated upload
+            raise ValueError(f"could not decode the audio file: {exc}") from exc
         audio = torch.from_numpy(data)
         if audio.dim() == 2:                       # stereo -> mono
             audio = audio.mean(dim=-1)
@@ -755,8 +770,6 @@ class NemotronDuplexModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        audio_out = "audio" in output_modalities
-
         if partition_name == "Encoder":
             edge = GraphEdge(next_node="conformer_encoder", name="audio_features")
             edge.tensor_info = input_signals.get("audio_features", [])
@@ -786,7 +799,7 @@ class NemotronDuplexModel(Model):
             walk = "talker_decode" if partition_name == "Talker" else "codec_chunk"
             return ForwardPassArgs(
                 full_metadata=self._meta(input_modalities, output_modalities, walk, False),
-                inputs=[], unpersist_tensors=[], request_done=not audio_out,
+                inputs=[], unpersist_tensors=[], request_done=False,
             )
         raise ValueError(f"Unknown partition: {partition_name!r}")
 
@@ -1031,7 +1044,8 @@ class NemotronDuplexModel(Model):
     def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
         if modality == "text":
             token_ids = output.tolist() if output.dim() else [int(output)]
-            return self.tokenizer.decode(token_ids).encode("utf-8")
+            # PAD fills every silent frame; it and BOS/EOS are not reply text
+            return self.tokenizer.decode(token_ids, skip_special_tokens=True).encode("utf-8")
         if modality == "audio":
             if output.numel() == 0:
                 return b""
