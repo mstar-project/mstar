@@ -221,6 +221,52 @@ class _PostprocessState:
     signal_idxs: object = None
 
 
+class _LazyPerRid:
+    """``Worker._rows_to_per_rid`` on demand: the per-rid host dicts are built
+    the first time a consumer reads them. The batched stop check, the row store
+    and the inline emit read the rows directly, so in the common decode step
+    nobody does, and the per-request dicts are never built."""
+
+    __slots__ = ("_host", "_request_ids", "_built")
+
+    def __init__(self, host: dict, request_ids: list[int]):
+        self._host = host
+        self._request_ids = request_ids
+        self._built: dict | None = None
+
+    def _dict(self) -> dict:
+        if self._built is None:
+            self._built = Worker._rows_to_per_rid(self._host, self._request_ids)
+        return self._built
+
+    def get(self, key, default=None):
+        return self._dict().get(key, default)
+
+    def __getitem__(self, key):
+        return self._dict()[key]
+
+    def __contains__(self, key) -> bool:
+        return key in self._dict()
+
+    def __iter__(self):
+        return iter(self._dict())
+
+    def __len__(self) -> int:
+        return len(self._request_ids)
+
+    def __bool__(self) -> bool:
+        return bool(self._request_ids)
+
+    def items(self):
+        return self._dict().items()
+
+    def keys(self):
+        return self._dict().keys()
+
+    def values(self):
+        return self._dict().values()
+
+
 class Worker:
     """
     Real worker that integrates RequestStateManager, EngineManager,
@@ -3280,7 +3326,7 @@ class Worker:
         if outputs.check_stop_buffers is not None and row_rids is not None:
             host = self._d2h_batched(outputs.check_stop_buffers, side)
             return (
-                Worker._rows_to_per_rid(host, row_rids),
+                _LazyPerRid(host, row_rids),
                 HostRows(tuple(row_rids), host),
             )
 
