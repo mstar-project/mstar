@@ -604,8 +604,17 @@ class MicroScheduler:
         """The rows of a backlogged ``batch`` that cannot run yet; failed rows
         are dropped from it instead."""
         node_partition = request_state.get_partition_for_node(batch.node_name)
-        not_ready_rids = {
-            rid for rid in batch.request_to_worker_graph if not self._check_ready(
+        # Held (OOM backoff) and pending-remove rows wait without asking the
+        # engine, as on the fresh path: asking reloads an offloaded row, which
+        # would OOM it again straight away.
+        now = time.monotonic()
+        waiting = {
+            rid for rid in batch.request_to_worker_graph
+            if rid in self.pending_removes or self.held_until.get(rid, 0.0) > now
+        }
+        not_ready_rids = waiting | {
+            rid for rid in batch.request_to_worker_graph
+            if rid not in waiting and not self._check_ready(
                 batch.node_name, rid,
                 request_state.get_fwd_info(rid, node_partition),
             )

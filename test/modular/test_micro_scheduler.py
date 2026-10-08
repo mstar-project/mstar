@@ -194,6 +194,8 @@ class _Engine:
         self.unservable = set(unservable)
         # rid -> capture group; a rid not named here has none
         self.groups = dict(groups or {})
+        # rids check_ready was asked about, in order
+        self.checked = []
 
     def get_max_batch_size(self, node_name, graph_walk):
         del node_name, graph_walk
@@ -205,6 +207,7 @@ class _Engine:
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
         del allow_reload, node_name, fwd_info
+        self.checked.append(rid)
         if rid in self.unservable:
             return FullAdmitOutcome(
                 AdmitOutcome(
@@ -404,6 +407,25 @@ def test_the_hold_backoff_expires_before_the_backlog_is_taken():
     _next_batch(sched, _Manager([]))
 
     assert "r0" not in sched.held_until
+
+
+@pytest.mark.parametrize("park", ["held", "pending_remove"])
+def test_a_held_or_removed_backlog_row_waits_without_a_readiness_check(park):
+    """Asking the engine reloads an offloaded row, which would OOM it again
+    straight after the hold that offloaded it."""
+    engine = _Engine(max_bs=8)
+    sched = _scheduler(engine)
+    if park == "held":
+        sched.hold_requests(["r0"])
+    else:
+        sched.pending_removes.add("r0")
+    sched.backlog[(NODE, WALK)] = _batch(["r0", "r1"])
+
+    batch = _next_batch(sched, _Manager([]))
+
+    assert list(batch.request_to_worker_graph) == ["r1"]
+    assert "r0" not in engine.checked
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r0"]
 
 
 def test_the_oldest_backlog_entry_goes_first():
