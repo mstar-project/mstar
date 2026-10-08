@@ -335,6 +335,15 @@ Worker scheduling
        milliseconds lets the arrivals of that window prefill together, which
        is worth decode throughput at high concurrency and costs up to that
        much time to first token.
+   * - ``MSTAR_GC_FREEZE``
+     - ``1``
+     - Once a process has finished its set-up (the API server and the
+       conductor when every worker is ready, the worker after warm-up and
+       graph capture), collect once and ``gc.freeze()`` the heap, so later
+       gen-2 collections do not walk the long-lived set-up objects. Measured
+       on the API server process: 200 ms per gen-2 pass every ~20 s under
+       load before, which stalled request admission and token delivery for
+       that long. ``0`` leaves the collector alone.
    * - ``MSTAR_DEVICE_LOOPBACK``
      - ``1``
      - Whether a decode node may keep its loop-back token on the device:
