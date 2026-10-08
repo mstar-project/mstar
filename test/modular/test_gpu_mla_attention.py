@@ -106,3 +106,26 @@ def test_mla_wrapper_matches_dense_reference(heads, lora, rope, page):
     ref2b = dense(ql2[1:], qp2[1:], torch.cat([latent[lens[0]:], lat2[1:]]))
     torch.testing.assert_close(out2[:1].float(), ref2a, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(out2[1:].float(), ref2b, rtol=2e-2, atol=2e-2)
+
+
+def test_captured_plan_takes_rows_that_share_a_prefix():
+    """Rows that matched one cached prefix all name its pages, so a step can name
+    more page ids than the pool holds: 4 rows x the same 6 pages, a pool of 8.
+    The captured kv_indices buffer was sized to the pool (8 + 4 rows)."""
+    from mstar.engine.resources.attn import flashinfer_mla as fm
+    from mstar.engine.resources.step import SlotLease
+
+    kv = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=576, max_seq_len=128, page_size=16,
+                       max_num_pages=8, num_qo_heads=16, layout=KVLayout.MLA,
+                       kv_lora_rank=512, qk_rope_head_dim=64)
+    attn = fm.FlashInferMLAManager("kv", DEV, torch.bfloat16, kv, sm_scale=0.1)
+    if not attn.uses_kernel:
+        pytest.skip("no FlashInfer MLA kernel")
+    wrapper = attn._cg_wrapper(SlotLease(slot=0, bucket=None), "main", num_rows=4)
+    pages = torch.arange(6, dtype=torch.int32)
+    wrapper.plan(
+        qo_indptr=torch.arange(5, dtype=torch.int32),
+        paged_kv_indptr=torch.arange(0, 25, 6, dtype=torch.int32),
+        paged_kv_indices=pages.repeat(4),
+        paged_kv_last_page_len=torch.full((4,), 16, dtype=torch.int32),
+    )

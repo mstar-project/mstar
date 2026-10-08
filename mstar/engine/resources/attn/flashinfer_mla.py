@@ -14,7 +14,7 @@ import logging
 
 import torch
 
-from mstar.engine.resources.attn.base import AttentionManager, WorkspacePool
+from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey, WorkspacePool
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.flashmla import FlashMLAWrapper, flashmla_available, flashmla_supports, flashmla_wanted
 from mstar.engine.resources.base import CGSlotKey
@@ -227,7 +227,7 @@ class FlashInferMLAManager(AttentionManager):
         self._dtype = dtype
         self._kv_config = kv_config
         self._current_plan_states: dict[str, FlashInferMLAWrapper | FlashMLAWrapper] = {}
-        self._eager_plan_states: dict[tuple[str, bool], FlashInferMLAWrapper | FlashMLAWrapper] = {}
+        self._eager_plan_states: dict[tuple[EagerSlotKey, bool], FlashInferMLAWrapper | FlashMLAWrapper] = {}
         self._cg_plan_states: dict[tuple[CGSlotKey, bool], FlashInferMLAWrapper | FlashMLAWrapper] = {}
         self._preplan_states: dict[str, FlashInferMLAWrapper | FlashMLAWrapper] = {}
         self._preplanned = False
@@ -285,26 +285,41 @@ class FlashInferMLAManager(AttentionManager):
             if flashmla:
                 wrapper = FlashMLAWrapper(batch_size=num_rows, use_cuda_graph=True, **self._flashmla_kwargs())
             else:
+                # per row, not per pool: rows that matched one cached prefix all
+                # name its pages, so a step can name more page ids than the pool holds
+                kwargs = {**self._wrapper_kwargs,
+                          "max_num_pages": num_rows * self._kv_config.max_num_pages}
                 wrapper = FlashInferMLAWrapper(
                     workspace_buffer=self._workspaces.get(label, lease.slot),
-                    batch_size=num_rows, use_cuda_graph=True, **self._wrapper_kwargs,
+                    batch_size=num_rows, use_cuda_graph=True, **kwargs,
                 )
             self._cg_plan_states[key] = wrapper
         return wrapper
 
-    def _eager_wrapper(self, label: str, flashmla: bool = False):
-        key = (label, flashmla)
+    def _eager_wrapper(self, label: str, slot: int, flashmla: bool = False):
+        """The persistent eager wrapper for one (label, slot): its plan stages into a
+        pinned buffer the wrapper holds, so one per slot keeps plan(N+1) off step N's
+        queued copy. Takes the workspace this slot's captured wrappers hold; the two
+        never run at once."""
+        key = (EagerSlotKey(label=label, slot=slot), flashmla)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
             if flashmla:
                 wrapper = FlashMLAWrapper(**self._flashmla_kwargs())
             else:
-                wrapper = FlashInferMLAWrapper(workspace_buffer=self._workspaces.get(label), **self._wrapper_kwargs)
+                wrapper = FlashInferMLAWrapper(
+                    workspace_buffer=self._workspaces.get(label, slot), **self._wrapper_kwargs)
             self._eager_plan_states[key] = wrapper
         return wrapper
 
     @property
     def supports_preplan(self):
+        return True
+
+    @property
+    def force_double_buffer(self):
+        # FlashInfer's MLA plan and FlashMLA's block table both stage into pinned
+        # buffers per wrapper and copy them to the device without blocking
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
@@ -334,7 +349,7 @@ class FlashInferMLAManager(AttentionManager):
             if lease is not None:
                 wrapper = self._cg_wrapper(lease, label, indptrs.qo_indptr.shape[0] - 1, fmla)
             else:
-                wrapper = self._eager_wrapper(label, fmla)
+                wrapper = self._eager_wrapper(label, ctx.slot, fmla)
             wrapper.plan(causal=step.causal, dtype=self._dtype, **indptrs.to_kwargs_dict())
             plan_states[label] = wrapper
         self._preplanned = ctx.is_preplan
