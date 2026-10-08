@@ -469,6 +469,16 @@ def _router_split(H, tuning):
     return splits, bk
 
 
+# The router's logits kernel holds every token in one tile: past this many its operands
+# outgrow shared memory on some tile tables. The models route larger batches elsewhere.
+MAX_ROUTER_TOKENS = 64
+
+
+def _check_router_tokens(T: int) -> None:
+    if T > MAX_ROUTER_TOKENS:
+        raise ValueError(f"the decode router takes at most {MAX_ROUTER_TOKENS} tokens, got {T}")
+
+
 def _launch_router(x, w, bias, part, topk_w, topk_ids, scale, normalize, pdl, tuning, be=32):
     T, H = x.shape
     E, K = w.shape[0], topk_ids.shape[1]
@@ -618,6 +628,7 @@ def route(x, w, bias, *, top_k, scale, normalize):
     """``(topk_weights fp32, topk_ids int64)``, both ``(T, top_k)``, of the sigmoid router
     on ``x (T, H) @ w (E, H).T``: a split-K logits kernel, then one program per token."""
     T, H = x.shape
+    _check_router_tokens(T)
     assert x.is_contiguous() and w.is_contiguous()
     tuning = _tuning(x.device)
     part = torch.empty(_router_split(H, tuning)[0], T, w.shape[0], dtype=torch.float32,
@@ -685,6 +696,7 @@ def forward(x, gate_w, bias, w13, s13, w2, s2, shared_w13, shared_w2, *, top_k, 
     _check_experts(x, w13, w2, shared_w13, shared_w2)
     assert gate_w.is_contiguous()
     T, H = x.shape
+    _check_router_tokens(T)
     tuning = _tuning(x.device)
     part = torch.empty(_router_split(H, tuning)[0], T, gate_w.shape[0], dtype=torch.float32,
                        device=x.device)
