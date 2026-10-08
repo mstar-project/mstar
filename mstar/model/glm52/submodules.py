@@ -78,7 +78,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._capture_block_warned = False
         # MTP: a decode step drafts k tokens, verifies them with the last emitted token and
         # seeds the next step, all in one captured graph; the eager fallback stays uncompiled
-        self.disable_torch_compile = config.mtp_num_draft_tokens > 0
+        self._mtp_uncompiled = config.mtp_num_draft_tokens > 0
         # DSA indexer k-cache (dsa.py): per-request index keys, appended by
         # FULL layers each forward when dsa_long_context is on; evicted in
         # cleanup_request.
@@ -260,7 +260,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     @property
     def disable_torch_compile(self) -> bool:
         # the escape hatch covers the uncaptured steps too, which the engine compiles
-        return os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") != "1"
+        return (getattr(self, "_mtp_uncompiled", False)
+                or os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") != "1")
 
     def to(self, *args, **kwargs):
         """Honor device moves; refuse post-load dtype casts (per-param dtypes
