@@ -73,6 +73,8 @@ class ScheduledBatch:
     request_walks: dict[int, str] = field(default_factory=dict)
     # real walk -> its output edge names, under a combined walk
     walk_output_signals: dict[str, list[str]] = field(default_factory=dict)
+    # rid -> its measured InputSeqLenInfo, or None for no length; a waiting row's inputs do not change
+    row_lens: dict[int, Any] = field(default_factory=dict)
     # `rids_by_walk`, computed once; `merge` and `discard_rid` reset it
     _by_walk: dict[str, list[int]] | None = field(default=None, repr=False, compare=False)
 
@@ -97,6 +99,7 @@ class ScheduledBatch:
         grouping never goes stale; ``input_edges`` is the caller's."""
         self.request_to_worker_graph.pop(rid, None)
         self.request_walks.pop(rid, None)
+        self.row_lens.pop(rid, None)
         self._by_walk = None
 
     def relabel_if_uniform(self) -> None:
@@ -125,6 +128,7 @@ class ScheduledBatch:
         self.input_edges.extend(other.input_edges)
         self.request_walks.update(other.request_walks)
         self.walk_output_signals.update(other.walk_output_signals)
+        self.row_lens.update(other.row_lens)
         self._by_walk = None
 
     def split_off_first(
@@ -160,6 +164,7 @@ class ScheduledBatch:
             input_edges=self.input_edges.select_rids(set(taken)),
             output_signals=self.output_signals,
             request_walks=self._walks_for(taken),
+            row_lens={rid: self.row_lens[rid] for rid in taken if rid in self.row_lens},
             # shared, not trimmed to the walks each half keeps: an extra entry
             # costs nothing, since outputs are only looked up for walks present
             walk_output_signals=self.walk_output_signals,
@@ -172,6 +177,7 @@ class ScheduledBatch:
             input_edges=self.input_edges.select_rids(set(left)),
             output_signals=self.output_signals,
             request_walks=self._walks_for(left),
+            row_lens={rid: self.row_lens[rid] for rid in left if rid in self.row_lens},
             walk_output_signals=self.walk_output_signals,
         )
 
@@ -764,15 +770,18 @@ class MicroScheduler:
         backlogged = self.backlog.pop(node_walk, None)
         blocked = set()
         if backlogged is not None:
+            waiting = self._waiting_rids(backlogged)
+            lens = self._row_lens(request_state, backlogged, [
+                rid for rid in backlogged.request_to_worker_graph if rid not in waiting
+            ])
             # bounded by what this step could take, so a long backlog is not
             # swept in full on every pass. Not `remaining`: that is the
             # caller's own walk's leftover and is None when it holds no rows.
             blocked = self._unready_backlog_rids(
-                backlogged, request_state,
+                backlogged, request_state, waiting, lens or {},
                 self._scan_limit(node_walk, pre_existing_batch_size),
                 capture_group_of, only_walk, skip_walk,
             )
-            blocked |= self._rows_without_room(request_state, backlogged, blocked)
             if not backlogged:
                 backlogged = None  # every row failed
         walk_caps = self._walk_caps(node_walk)
@@ -781,7 +790,9 @@ class MicroScheduler:
             if entries else None
         if fresh:
             # a row whose KV does not fit sits this step out, rather than refusing the step
-            no_room = self._rows_without_room(request_state, fresh)
+            no_room = self._rows_without_room(request_state, fresh, self._row_lens(
+                request_state, fresh, list(fresh.request_to_worker_graph),
+            ) or {})
             if no_room:
                 fresh, left = fresh.split_off_first(None, exclude_rids=no_room)
                 self.runtime.push_back_node(
@@ -884,53 +895,71 @@ class MicroScheduler:
             and self.held_until.get(r, 0.0) <= now
         }
 
-    def _rows_without_room(
+    def _row_lens(
         self, request_state: RequestStateManager, batch: ScheduledBatch,
-        skip: set[int] = frozenset(),
-    ) -> set[int]:
-        """Rows of ``batch`` whose node's resources cannot take their tokens
-        now, for submodules that report row lengths before prepare."""
+        rids: list[int],
+    ) -> dict[int, Any] | None:
+        """``rids``' lengths, for submodules that report them before prepare;
+        measured once per row and kept on ``batch``. None if not reported."""
         engine = self.engine_manager.get_engine(batch.node_name)
         if self.get_tensor is None or not engine.declares_input_sequence_len(batch.node_name):
-            return set()
+            return None
+        unmeasured = [rid for rid in rids if rid not in batch.row_lens]
+        if unmeasured:
+            partition = request_state.get_partition_for_node(batch.node_name)
+            inputs = batch.input_edges.to_input_tensors(
+                self.get_tensor, unmeasured, skip_missing=True,
+            ).by_rid
+            for rid in unmeasured:
+                batch.row_lens[rid] = engine.input_sequence_len(
+                    batch.node_name, batch.walk_of(rid),
+                    request_state.get_fwd_info(rid, partition), inputs.get(rid, {}),
+                )
+        return batch.row_lens
+
+    def _rows_without_room(
+        self, request_state: RequestStateManager, batch: ScheduledBatch,
+        lens: dict[int, Any],
+    ) -> set[int]:
+        """Rows of ``batch`` with a length in ``lens`` whose node's resources
+        cannot take it now."""
         partition = request_state.get_partition_for_node(batch.node_name)
-        rids = [rid for rid in batch.request_to_worker_graph if rid not in skip]
-        inputs = batch.input_edges.to_input_tensors(
-            self.get_tensor, rids, skip_missing=True,
-        ).by_rid
-        out = set()
-        for rid in rids:
-            fwd_info = request_state.get_fwd_info(rid, partition)
-            info = engine.input_sequence_len(
-                batch.node_name, batch.walk_of(rid), fwd_info, inputs.get(rid, {}),
-            )
+        return {
+            rid for rid, info in lens.items()
             if info is not None and not self._check_ready(
-                batch.node_name, rid, fwd_info, seq_len_info=info,
-            ):
-                out.add(rid)
-        return out
+                batch.node_name, rid, request_state.get_fwd_info(rid, partition),
+                seq_len_info=info,
+            )
+        }
+
+    def _waiting_rids(self, batch: ScheduledBatch) -> set[int]:
+        """``batch``'s held (OOM backoff) and pending-remove rows."""
+        now = time.monotonic()
+        return {
+            rid for rid in batch.request_to_worker_graph
+            if rid in self.pending_removes or self.held_until.get(rid, 0.0) > now
+        }
 
     def _unready_backlog_rids(
         self, batch: ScheduledBatch, request_state: RequestStateManager,
+        waiting: set[int], lens: dict[int, Any],
         max_bs: int | None = None, capture_group_of: int | None = None,
         only_walk: str | None = None, skip_walk: str | None = None,
     ) -> set[int]:
         """The rows of a backlogged ``batch`` that cannot run this step; failed
-        rows are dropped from it instead. Rows of a walk other than
-        ``only_walk``, or of ``skip_walk``, are parked."""
+        rows are dropped from it instead. One readiness check per row, with its
+        length from ``lens`` when the submodule reports one.
+
+        ``waiting`` -- OOM backoff and pending remove -- is the caller's: those
+        rows wait without asking the engine, as on the fresh path, since asking
+        reloads an offloaded row and would OOM it again straight away. They do
+        not count against the step's worth either, never having been candidates.
+        Rows of a walk other than ``only_walk``, or of ``skip_walk``, are
+        parked the same way.
+        """
         node_partition = request_state.get_partition_for_node(batch.node_name)
-        # Held (OOM backoff) and pending-remove rows wait without asking the
-        # engine, as on the fresh path: asking reloads an offloaded row, which
-        # would OOM it again straight away. They do not count against the
-        # step's worth below either -- they were never candidates for it.
-        now = time.monotonic()
-        waiting = {
-            rid for rid in batch.request_to_worker_graph
-            if rid in self.pending_removes or self.held_until.get(rid, 0.0) > now
-        }
-        # Parked by walk, likewise without a check and outside the step's worth.
         if batch.request_walks and (only_walk or skip_walk) is not None:
-            waiting |= {
+            waiting = waiting | {
                 rid for rid in batch.request_to_worker_graph
                 if (only_walk is not None and batch.walk_of(rid) != only_walk)
                 or batch.walk_of(rid) == skip_walk
@@ -964,6 +993,7 @@ class MicroScheduler:
             if not self._check_ready(
                 batch.node_name, rid,
                 request_state.get_fwd_info(rid, node_partition),
+                seq_len_info=lens.get(rid),
             ):
                 not_ready_rids.add(rid)
                 continue
