@@ -69,6 +69,14 @@ class ColumnarTensorInfo:
     def __post_init__(self):
         self._seen_dtypes: dict[torch.dtype, int] = {}
 
+    def dtype_index(self, dtype: torch.dtype) -> int:
+        """The batch-local index of ``dtype``, registering it on first use."""
+        idx = self._seen_dtypes.get(dtype)
+        if idx is None:
+            idx = self._seen_dtypes[dtype] = len(self.dtype_names)
+            self.dtype_names.append(_dtype_name(dtype))
+        return idx
+
     def add_tensors_canonical(
         self, uuids: list[int],
         canonicals: list[torch.Tensor],
@@ -638,10 +646,15 @@ class TensorStore:
         """Record which request owns each tensor. Pure Python dicts, so this
         stays a loop -- only the bookkeeping call crosses into Rust.
         ``cpu_tensors``, when given, is index-parallel to ``tensors``."""
-        for request_id, uuid, tensor in zip(request_ids, uuids, tensors, strict=True):
-            self._tensors[uuid] = tensor
-            self._rid_to_uuids.setdefault(request_id, set()).add(uuid)
-            self._uuid_to_rid[uuid] = request_id
+        if len(request_ids) != len(uuids) or len(uuids) != len(tensors):
+            raise ValueError("request_ids, uuids and tensors must be parallel")
+        # two of the three maps take the batch in one update each; only the
+        # per-request set stays a loop
+        self._tensors.update(zip(uuids, tensors, strict=True))
+        self._uuid_to_rid.update(zip(uuids, request_ids, strict=True))
+        owned = self._rid_to_uuids
+        for request_id, uuid in zip(request_ids, uuids, strict=True):
+            owned.setdefault(request_id, set()).add(uuid)
         if cpu_tensors is not None:
             for uuid, cpu_tensor in zip(uuids, cpu_tensors, strict=True):
                 if cpu_tensor is not None:
