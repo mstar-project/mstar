@@ -75,6 +75,8 @@ def _env(monkeypatch):
     monkeypatch.delenv(TP_ALLREDUCE_ENV, raising=False)
     monkeypatch.delenv(TP_SYMM_AR_MAX_KB_ENV, raising=False)
     monkeypatch.setattr(comm, "_SymmAllReduce", _FakeSymm)
+    # one process: every rank is this one
+    monkeypatch.setattr(comm, "_all_ranks_agree", lambda flag, cpu_group: flag)
     _FakeSymm.instances.clear()
 
 
@@ -156,6 +158,17 @@ def test_setup_failure_falls_back_to_nccl_with_warning(monkeypatch, fake_cuda, c
     assert any("using NCCL" in r.getMessage() for r in caplog.records)
 
 
+def test_a_peer_that_failed_takes_every_rank_to_nccl(monkeypatch, fake_cuda, caplog):
+    """One rank on NCCL while its peers wait in the symmetric kernel for its signal
+    deadlocked the first all-reduce."""
+    monkeypatch.setattr(comm, "_all_ranks_agree", lambda flag, cpu_group: False)
+    g = _group()
+    with caplog.at_level(logging.WARNING, logger=comm.__name__):
+        g._maybe_init_symm_allreduce("symm_multimem")
+    assert g._symm_ar is None
+    assert any("another rank" in r.getMessage() for r in caplog.records)
+
+
 def test_init_dist_sets_up_every_comm_group(monkeypatch, fake_cuda):
     """The hook point: ``init_dist`` builds the symm path for each group it
     wires a process group into."""
@@ -209,13 +222,15 @@ def test_config_mode_and_env_override(monkeypatch, fake_cuda, config, env, want)
 
 @pytest.mark.parametrize("config_kb, env, want_kb", [
     (None, None, 512), (32768, None, 32768), (32768, "64", 64), (None, "64", 64),
+    (0, None, None),
 ])
 def test_config_max_kb_and_env_override(monkeypatch, fake_cuda, config_kb, env, want_kb):
     if env is not None:
         monkeypatch.setenv(comm.TP_SYMM_AR_MAX_KB_ENV, env)
     g = _group()
     g._maybe_init_symm_allreduce("symm_multimem", config_kb)
-    assert g._symm_ar.max_bytes == want_kb * 1024
+    # 0 turns it off (it used to read as unset: 512)
+    assert getattr(g._symm_ar, "max_bytes", None) == (want_kb and want_kb * 1024)
 
 
 def test_unknown_config_mode_warns_and_is_nccl(fake_cuda, caplog):
