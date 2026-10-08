@@ -58,3 +58,23 @@ def test_shipped_configs_admit_one_request_per_kda_slot(name):
 
     cfg = yaml.safe_load((Path(__file__).resolve().parents[2] / "configs" / name).read_text())
     assert cfg["max_concurrent_requests"] == cfg["resources"]["kda_state"]["max_slots"] - 1
+
+
+def test_bucket_overrides_reach_the_config():
+    m = Glm5NextModel("x", tokenizer_mode="byte", prefill_token_buckets=[128, 256, 512],
+                      prefill_capture_batch_sizes=[1])
+    assert m.config.prefill_token_buckets == [128, 256, 512]
+    assert m.config.prefill_capture_batch_sizes == [1]
+
+
+def test_eager_prefill_is_not_held_to_the_captured_rows():
+    from mstar.model.glm5_next.config import Glm5NextModelConfig
+
+    sub = object.__new__(Glm5NextLLMSubmodule)
+    sub.config = Glm5NextModelConfig.reduced()
+    sub.config.prefill_graphs = True
+    sub.config.moe_quant_kernel = "auto"
+    if sub._captured_prefill_rows() is None:
+        pytest.skip("no fused KDA on this host")
+    sub._prefill_captured = False  # get_cuda_graph_configs declared none
+    assert sub._captured_prefill_rows() is None

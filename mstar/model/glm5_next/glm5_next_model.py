@@ -124,6 +124,11 @@ class Glm5NextModel(Model):
             self.config.mtp_num_draft_tokens = int(kwargs["mtp_num_draft_tokens"])
         if "prefill_graphs" in kwargs:
             self.config.prefill_graphs = bool(kwargs["prefill_graphs"])
+        # documented overrides of the submodule's buckets; swallowed by **kwargs,
+        # a YAML that set them still captured all 192 graphs
+        for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
+            if kwargs.get(key) is not None:
+                setattr(self.config, key, [int(n) for n in kwargs[key]])
         if kwargs.get("prefill_max_step_tokens") is not None:
             cap = kwargs["prefill_max_step_tokens"]
             self.config.prefill_max_step_tokens = cap if cap == "auto" else int(cap)
