@@ -38,7 +38,7 @@ You are running with write access to PR comments on a public repository. The PR 
 | `rust/**`, `mstar/graph/runtime/**` | — | Invariant 5, Python/Rust drift. |
 | hot paths: scheduling, attention planning, capture, transport | `.claude/skills/benchmarking/SKILL.md` | Invariants 6 and 10. A performance claim with no number, or one drawn from a measurement the skill says is unreliable (a single server process, no warmup, `failed` unchecked, req/s on a stochastic model). Also a win on one workload or benchmark configuration with no word on the others — an optimization that trades `text_to_text` or mixed-workload throughput for `image_to_text` is a regression. |
 
-4. For each candidate finding, try to disprove it before reporting it. Read the surrounding code and the callers. Most plausible-looking findings dissolve on a second read; that is the expected outcome and dropping them is success, not failure.
+4. For each candidate finding, try to disprove it before reporting it. Read the surrounding code and the callers. Most plausible-looking findings dissolve on a second read; that is the expected outcome and dropping them is success, not failure. A mechanism you have not traced through the actual code path is a hypothesis, not a finding.
 
 ## The bar
 

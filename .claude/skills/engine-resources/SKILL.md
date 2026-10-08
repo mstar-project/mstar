@@ -13,6 +13,10 @@ A resource's `plan` writes device buffers that a captured graph later reads, whi
 
 **`supports_preplan` pays off even with no kernel-side plan to hoist.** Host work counts. On Whisper, building a page table inline cost 0.052 ms on the critical path, while promoting a pre-planned one cost 0.009 ms.
 
+## Stateful resources move together
+
+KV pages and recurrent (GDN/Mamba) state slots are two forms of the same per-request state. A lifecycle feature added to one usually needs its analogue in the other. Forking for a request that branches, offload/reload, what a partially-run (chunked) step leaves behind: when you change one, check the others. Recurrent forking was initially missed when KV forking learned chunked-prefill semantics.
+
 ## Capture buckets
 
 - Batch buckets are geometric (`DEFAULT_CAPTURE_BATCH_SIZES` in `cuda_graph_runner.py`: 1, 2, 4, …, 64), so a replay usually runs wider than the live batch.

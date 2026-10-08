@@ -4,6 +4,8 @@ These apply to AI-assisted contributions to `mstar-project/mstar` and to the aut
 
 A human submitter must understand and defend every line of an AI-assisted PR, and must say in the PR description which tests were run, and what the results were.
 
+When explaining a correctness or performance result (in a PR description, a review, or to the person you're working with), point to the evidence for the mechanism: the code path, a profile, `TORCH_LOGS` output, a test that fails without the fix. A mechanism that sounds right but hasn't been checked should be labeled as a hypothesis. Plausible, unverified explanations have been wrong often enough in this codebase that they cost more than they save.
+
 ## Layer map
 
 | Layer | Path | Owns |
@@ -50,6 +52,8 @@ Some caveats:
 - Sometimes, building a cross-layer feature will be a long-running effort that should not block the implementation of a model. In that case, the right outcome is to note it, land the per-model version, and assign the system-level work.
 - There are cases where model-level state is lightweight enough that it can be held in the model itself; e.g., Qwen3-Omni allocates a fixed-size dense KV cache for the code predictor module.
 
+The converse matters just as much: **model-level concerns shouldn't leak into engine code.** If a behavior only makes sense for some models, the engine should provide it as a helper that the model opts into, rather than applying it to every model. For example, with chunked prefill, only the last chunk of a prompt samples a real token. Rather than the engine filtering sampler rows for every model, `keep_final_chunk_samples` ([#365](https://github.com/mstar-project/mstar/pull/365)) wraps a submodule's `SamplerStep`, and each submodule whose sampled token is meaningful only on the final chunk calls it in `declare_step`.
+
 ### 2. Resources are declared per graph node, and a node gets only what it declares
 
 `get_node_resources()` returns a `NodeResourceSpec` list; the engine builds one object per declaration and binds it into the submodule and its layers. Layers name their resources (`attn_key` / `kv_key` / `pos_key`). A node that declares nothing receives nothing (e.g., encoders and decoders with no persistent state or attention wrappers).
@@ -82,6 +86,9 @@ Things to be wary of that have caused issues in the past, by no means a comprehe
 - Per-tensor computation / data transfer that could naturally be batched
 - Passing many small objects through the Python <> Rust boundary. For instance, a `list[tuple]` or `list[dataclass]` is going to have a lot more overhead on the boundary than a parallel/columnar format. Specifically: `requests: list[int], values: list[int]` is preferable to `request_vals: list[tuple[int, int]]`.
 - Sending large objects over ZMQ
+- Work repeated every pass for requests that are waiting. When the ready set exceeds a batch cap, some rows wait in the backlog across many steps, so anything done per pass for them (re-measuring sequence lengths, rebuilding input tensors, readiness checks) is paid every step at high concurrency. Do the cheap checks (e.g., "is the caller's batch already full?") before touching queues or the backlog.
+
+Removing redundant computation and memoizing where possible is good low-hanging fruit. E.g., a backlogged row's inputs don't change while it waits, so its measured length can be computed once and carried on the batch, and a plain readiness check followed by a length-aware one is the same engine call twice. Prefer storing derived per-row facts on the object that already carries the row over a side dict that needs its own invalidation.
 
 If making worker-level changes, measure the change in CPU overhead rather than assuming, especially if trying to optimize. Throughput at high concurrency (32, 64) for a small model like Qwen 3.5 0.8B is a good litmus test (though it doesn't measure things like streaming and inter-worker communication because it's a simple model).
 
@@ -111,7 +118,7 @@ Some additional information:
 
 **Installation**: If the PR adds extra installation procedures (e.g., a package that has to be installed separately from the `pyproject.toml`), that should be documented in docs/installation.rst.
 
-**Environment variables**: `MSTAR_*` knobs are read all over the codebase and are the main deployment interface. A new one must land with a row in [docs/environment_variables.rst](docs/environment_variables.rst) giving its default and its meaning, and should name the function that reads it. Environment variables that don't make sense to include in production (e.g., for A/B testing of a decision where there is a clear winner, or for debugging) should be removed.
+**Environment variables**: `MSTAR_*` knobs are read all over the codebase and are the main deployment interface. A new one must land with a row in [docs/environment_variables.rst](docs/environment_variables.rst) giving its default and its meaning, and should name the function that reads it. Environment variables that don't make sense to include in production (e.g., for A/B testing of a decision where there is a clear winner, or for debugging) should be removed. A tuning value a deployment may reasonably want to change (e.g., a per-step token budget) belongs in the serving config, not in an env var added for testing.
 
 ### 10. Performance claims come from the repo's own harnesses
 
@@ -140,6 +147,8 @@ The failure mode that actually happens: a readiness scan, admission check, captu
 
 Review any new early return, `continue`, or exception path in worker and engine loops against this. A hang is much more expensive to debug than an error.
 
+Process-group creation is a collective too. `dist.new_group(ranks, backend="gloo")` while the default group is a device-bound NCCL group sends ranks *outside* `ranks` into an `ncclCommSplit` they never return from, which looks like a startup protocol hang. Create subgroups with `use_local_synchronization=True` so only members participate.
+
 ### 12. Async partitions coordinate through streaming edges
 
 Distinct from the async worker in invariant 7. An **async partition** keeps its own set of graph walks with independent state transitions; data crosses between partitions on **streaming edges**, buffered in `StreamBuffer`s on the consumer worker and handed to graph nodes according to a chunk policy. Two hazards we have seen so far:
@@ -166,6 +175,10 @@ The modular tests exist because these are the parts that are easy to get wrong: 
 
 Note that modular tests run models in **dummy mode**, where `get_submodule` returns `None`, and that several fakes stub worker internals **by name** — renaming a private on `Worker` can break them without any grep hit at the definition. Run the suite, don't just grep.
 
+Before attributing a test failure to your change, check whether it also fails on `main`; some modular tests have pre-existing failures. Compare the set of failing tests against main, not just the count.
+
+The Rust extension under `rust/` is a build artifact, so it goes stale after merging or rebasing onto a `main` that changed `rust/`. A stale build imports fine and then fails at request time (often as an unexpected-keyword `TypeError` from a runtime call), and tests that need it (e.g., `test_graph_runtime_factory.py`) fail in a checkout where it isn't built. Rebuild before believing either.
+
 ## Splitting work across PRs
 
 Recommended practice: the reviewer raises these as notes and never blocks on them.
@@ -178,13 +191,14 @@ Recommended practice: the reviewer raises these as notes and never blocks on the
 
 Readability rules the reviewer may cite as **S1**, **S2**, **S3**. These are the ones that come up frequently in AI-assisted PRs.
 
-**S1. Name your aggregates.** A `NamedTuple` or `@dataclass` instead of a long tuple. Prefer a `LoraAdapter` with fields `a`, `b` and `sigma` over `tuple[torch.Tensor, torch.Tensor, float]`, which is opaque at every call site and gets worse as it grows. This applies to return types and to anything that crosses a function boundary more than once.
+**S1. Name your aggregates.** A `NamedTuple` or `@dataclass` instead of a long tuple. Prefer a `LoraAdapter` with fields `a`, `b` and `sigma` over `tuple[torch.Tensor, torch.Tensor, float]`, which is opaque at every call site and gets worse as it grows. This applies to return types and to anything that crosses a function boundary more than once. Pick the type to signal intent: a `NamedTuple` (or frozen dataclass) for a value that shouldn't change, and a mutable `@dataclass(slots=True)` for state that is updated in place, e.g., a row's chunked-prefill progress.
 
 **S2. Write comments for an outside human reader.** Concise, aimed at someone who has not seen the conversation, plan or debugging session that produced the change.
 
 - No references to a plan's numbered or lettered steps.
 - Don't narrate a specific failure in depth when the general statement is the actual justification. "This is required to maintain symmetric resource state between TP ranks and avoid deadlock" is better than several sentences tracing one rank admitting a batch, the other refusing, and a thread spinning on a collective until the NCCL timeout.
 - Explain why, not what. Match the comment density of the file you're editing.
+- Check comments for staleness when the code under them changes, especially comments that state lifecycle or ordering semantics. A comment that was true of an earlier draft (e.g., "a chunked prompt forks on its first chunk", when pre-fork happens on the first chunk and post-fork on the last) is worse than none.
 
 **S3. Reach for a class when the shape calls for one.** Several related functions with differing implementations — attention backends being the obvious case — want a base class with subclasses, particularly where the alternative is module-level global state. Likewise, a cluster of related fields and methods accreting on `Worker` or `Engine` usually wants to be its own object; the graph runtime on the worker and submodule management / the CUDA graph runner on the engine are the examples worth imitating.
 
@@ -192,3 +206,11 @@ Readability rules the reviewer may cite as **S1**, **S2**, **S3**. These are the
 
 - Keep PRs focused. Mechanical cleanups can ride along with substantive work rather than landing as their own PR, but be careful about scope creep.
 - Don't add a dependency without saying why in the PR description.
+
+## Design patterns that have worked
+
+Not rules, and the reviewer shouldn't cite them; these are cleanups that came out of review and made the code easier to work with.
+
+**One hook that returns a policy object, rather than several parallel hooks.** Chunked prefill first added four methods to the submodule base class (whether a walk is chunkable, its token budget, how its outputs accumulate, whether it reuses a cached prefix). They became one `get_chunking_policy(graph_walk) -> ChunkingPolicy` ([#365](https://github.com/mstar-project/mstar/pull/365)), a frozen dataclass with a callable field for the one dynamic case, which the engine caches per (node, walk). A submodule author implements one thing per concern and sees every option in one place, and the engine doesn't rebuild the answer every step.
+
+**If a structural restriction can be enforced at startup, enforce it at startup.** Speculating into a chunkable (node, walk) isn't safe, since chunks are cut at schedule time from lengths a speculative batch doesn't know yet. Rather than the worker filtering speculation targets at runtime and hoping the runtime picks a safe one, the chunkable pairs are computed once when submodules load and passed to the graph runtime's constructor as `disable_spec_node_walks` ([#365](https://github.com/mstar-project/mstar/pull/365)), and the runtime never returns them from `speculate_node`. A component that can't produce the forbidden thing is safer than call sites that each have to remember to check.
