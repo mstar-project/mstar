@@ -16,6 +16,8 @@ from mstar.model.glm5_next.quantization import FP8_DTYPE, dequantize_fp8_block_w
 # HF Glm5NextTextTopkRouter: denominator = topk_weights.sum(...) + 1e-20.
 _TOPK_NORM_EPS = 1e-20
 
+MOE_QUANT_KERNELS = ("reference", "triton", "auto")
+
 # Up to this many tokens the router and experts take the moe_decode kernels; larger
 # batches share enough experts for the grouped-GEMM runner to win.
 _DECODE_MAX_TOKENS = 64
@@ -193,6 +195,12 @@ class Glm5NextSparseMoeBlock(nn.Module):
             config.quantization_config is not None and config.moe_fp8_resident
         )
         self.quant_kernel = getattr(config, "moe_quant_kernel", "reference")
+        if self.quant_kernel not in MOE_QUANT_KERNELS:
+            # an unknown value would otherwise resolve to the uncapturable
+            # reference loop and serve eager behind a healthy /health
+            raise ValueError(
+                f"moe_quant_kernel={self.quant_kernel!r} is not one of {MOE_QUANT_KERNELS}"
+            )
         # Resolved on the real device by process_weights_after_loading;
         # blocks used without the load hook (CPU tests) stay on reference.
         self._use_fused = False

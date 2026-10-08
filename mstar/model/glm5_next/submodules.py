@@ -312,7 +312,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         cfg = fwd_info.resource_configs.get(SAMPLER) if fwd_info.resource_configs else None
         if cfg is None:
             return
-        if (cfg.temperature or 0.0) > 0.0 or (cfg.repetition_penalty or 1.0) != 1.0:
+        # not `or`: an explicit repetition_penalty of 0 must not read as unset
+        temperature = 0.0 if cfg.temperature is None else cfg.temperature
+        penalty = 1.0 if cfg.repetition_penalty is None else cfg.repetition_penalty
+        if temperature > 0.0 or penalty != 1.0:
             raise RuntimeError(
                 f"request {fwd_info.request_id}: MTP drafting is greedy only "
                 f"(temperature={cfg.temperature}, "
