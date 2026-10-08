@@ -132,6 +132,7 @@ class Glm5NextModel(Model):
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
+        self._detokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
     @property
@@ -459,9 +460,14 @@ class Glm5NextModel(Model):
                 # Synthetic reduced models emit arbitrary byte ids; never
                 # touch the HF tokenizer.
                 return bytes((t & 0xFF) for t in token_ids)
-            return self.tokenizer.decode(
-                token_ids, skip_special_tokens=True,
-            ).encode("utf-8")
+            # The tokens' raw bytes (byte-level BPE): a character split across
+            # tokens reaches the client whole, where decoding each token alone
+            # gives U+FFFD. Special tokens drop, as with skip_special_tokens.
+            if self._detokenizer is None:
+                from mstar.model.utils import ByteLevelDetokenizer
+
+                self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
+            return self._detokenizer.to_bytes(token_ids)
         raise ValueError(f"Unsupported modality for GLM-5.3-Flash: {modality!r}")
 
     # -------------------------------------------------------------------
