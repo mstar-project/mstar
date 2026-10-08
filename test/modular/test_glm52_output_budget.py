@@ -100,6 +100,8 @@ def test_a_long_context_prompt_is_held_to_index_topk():
     cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=8192)
     assert cfg.max_prompt_tokens == cfg.index_topk == 2048
     assert Glm52ModelConfig().max_prompt_tokens == 2046
+    # an MTP step writes its whole verify block: two of them for k = 3
+    assert Glm52ModelConfig(mtp_num_draft_tokens=3).max_prompt_tokens == 2048 - 8
 
 
 def test_postprocess_emits_raw_token_bytes():
