@@ -271,11 +271,13 @@ def test_the_step_after_the_context_stop_still_fits():
 
 
 def test_a_prompt_without_room_fails_alone():
+    # decode runs a step after the prefill and the next may already be scheduled:
+    # a 15-token prompt in a 16-row window took its whole decode batch down
     cfg = _window_cfg(16)
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
-    fits, full = torch.arange(15) + 3, torch.arange(16) + 3
+    fits, full = torch.arange(14) + 3, torch.arange(15) + 3
     sub.prepare_inputs("prefill", _fwd_info("a", 8, True), {"text_inputs": [fits]})
-    with pytest.raises(RuntimeError, match="context limit"):
+    with pytest.raises(RuntimeError, match="exceeds the 14 served"):
         sub.prepare_inputs("prefill", _fwd_info("b", 8, True), {"text_inputs": [full]})
 
 
