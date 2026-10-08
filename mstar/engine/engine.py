@@ -750,8 +750,10 @@ class Engine:
         tensors = batch.per_request_input_tensors
         metadata = batch.per_request_input_metadata
         final_rids = batch.final_stream_rids
-        # only a keyed walk probes the prefix cache (see _skip_cached_prefix)
-        probe_prefix = walk in self._keyed_walks.get(batch.node_name, ())
+        # only a keyed walk probes the prefix cache (see _skip_cached_prefix);
+        # read leniently, as the probe itself was only reached per prepared row
+        keyed = getattr(self, "_keyed_walks", None)
+        probe_prefix = bool(keyed) and walk in keyed.get(batch.node_name, ())
         for rid in batch.request_ids:
             try:
                 req_inputs = prepare(
