@@ -62,7 +62,7 @@ class RealtimeConnection:
             "output_audio_format": "pcm16",
             "input_sample_rate": DEFAULT_INPUT_SR,
             "output_sample_rate": DEFAULT_OUTPUT_SR,
-            "temperature": 0.0,
+            "temperature": 0.7,
             **(send_defaults or {}),
         }
         self.stream = None

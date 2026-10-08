@@ -351,8 +351,7 @@ class NemotronDuplexConfig:
     codec: CodecConfig = field(default_factory=CodecConfig)
     rnnt: RnntConfig = field(default_factory=RnntConfig)
 
-    # generation defaults (text path). TODO(verify) against the model's
-    # recommended sampling for the voicechat contract.
+    # generation defaults (text path); keep in sync with create_stream, offline_inference and realtime_api.
     temperature: float = 0.7
     top_p: float = 0.9
     repetition_penalty: float = 1.0

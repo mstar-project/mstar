@@ -359,8 +359,9 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
 - Default deployment: ``configs/nemotron_duplex.yaml`` (all four nodes on one
   GPU); ``configs/nemotron_duplex_disagg.yaml`` puts the encoder+LLM, the talker
   and the codec on three ranks. Launch with ``--tensor-comm-protocol SHM`` on a
-  single node. Text is greedy at ``temperature: 0``; the talker's
-  mixture-of-Gaussians sampling is stochastic by design and seeded per request.
+  single node. Text samples at ``temperature: 0.7, top_p: 0.9`` by default;
+  send ``temperature: 0`` for greedy. The talker's mixture-of-Gaussians sampling
+  is stochastic by design and seeded per request.
 
 Cosmos3 environment requirements
 --------------------------------

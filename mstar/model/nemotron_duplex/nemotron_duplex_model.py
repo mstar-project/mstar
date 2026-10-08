@@ -89,8 +89,8 @@ def _sample_text_token(
     logits: torch.Tensor,          # (B, vocab)
     generated: torch.Tensor,       # (B, T) tokens so far
     step: int,
-    temperature: float = 0.0,
-    top_p: float = 1.0,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
     repetition_penalty: float = 1.0,
     presence_penalty: float = 0.0,
     special_ids: set | None = None,
@@ -851,7 +851,7 @@ class NemotronDuplexModel(Model):
 
     def create_stream(
         self, device: str = "cuda", voice: str = "Aria",
-        temperature: float = 0.0, top_p: float = 1.0, repetition_penalty: float = 1.0,
+        temperature: float = 0.7, top_p: float = 0.9, repetition_penalty: float = 1.0,
         prompt_tokens: torch.Tensor | None = None, system_prompt: str | None = None,
     ) -> DuplexStream:
         """Open an online duplex streaming session (see ``DuplexStream``).
@@ -876,8 +876,8 @@ class NemotronDuplexModel(Model):
         prompt_tokens: torch.Tensor | None = None,      # (B, P) text token ids, or None
         prompt_token_lens: torch.Tensor | None = None,  # (B,)
         device: str = "cuda",
-        temperature: float = 0.0,
-        top_p: float = 1.0,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
         repetition_penalty: float = 1.0,
         decode_audio: bool = True,
     ) -> dict:
