@@ -695,13 +695,15 @@ class EarTTSTalker(nn.Module):
         ``||e||^2 - 2<r, e>``), subtracting the chosen entry from the running
         residual ``r`` (which starts at ``z``)."""
         code = code.clone()
-        r = z
-        for i in range(depth_str, depth_str + k):
-            ei = self.rvq_embs[i]                                            # [codebook_size, code_dim]
-            dist = ei.pow(2).sum(-1) - 2.0 * torch.matmul(r, ei.transpose(-1, -2))  # [b, t, codebook_size]
-            idx = dist.argmin(-1)                                            # [b, t]
-            r = r - F.embedding(idx, ei)
-            code[..., i] = idx
+        # fp32, autocast off: in bf16 the distance argmin picks wrong entries, voicing PAD frames
+        r = z.float()
+        with torch.autocast(device_type=r.device.type, enabled=False):
+            for i in range(depth_str, depth_str + k):
+                ei = self.rvq_embs[i].float()                                # [codebook_size, code_dim]
+                dist = ei.pow(2).sum(-1) - 2.0 * torch.matmul(r, ei.transpose(-1, -2))  # [b, t, codebook_size]
+                idx = dist.argmin(-1)                                        # [b, t]
+                r = r - F.embedding(idx, ei)
+                code[..., i] = idx
         return code
 
     @torch.no_grad()
