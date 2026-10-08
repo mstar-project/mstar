@@ -16,6 +16,8 @@ CPU-only: nothing calls a kernel, so no device is needed.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -299,3 +301,19 @@ def test_qwen3_5_state_dtype_follows_checkpoint(ckpt, k, v, want):
     model = SimpleNamespace(config=SimpleNamespace(
         mamba_ssm_dtype=ckpt, linear_key_head_dim=k, linear_value_head_dim=v))
     assert Qwen3_5DenseModel._gdn_state_dtype(model) is want
+
+
+def test_a_step_forks_only_the_rows_it_names():
+    """As ``KVStep.fork_rids``: a chunked prompt forks on its first chunk only,
+    so a step holding it beside a prompt past its first chunk forks just it."""
+    pool = build_pool()
+    rids = ["a", "b"]
+    step = replace(forking_step(rids), fork_rids=frozenset({"a"}))
+    pool.admit(step, ctx(rids))
+    for rid in rids:
+        pool._slots[rid]["main"].has_state = True
+
+    pool.plan(step, ctx(rids))
+
+    assert pool._slots["a"]["draft"].has_state is True
+    assert "draft" not in pool._slots["b"], "b reserved or got a fork it was not named for"
