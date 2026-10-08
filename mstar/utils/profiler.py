@@ -15,6 +15,17 @@ PHASE_PERIOD = int(os.environ.get("MSTAR_PHASE_TIMING", "0") or "0")
 _PHASE_BUF: dict[str, list[float]] = defaultdict(list)
 
 
+def nvtx_enabled(
+    requested: bool, device: torch.device | None = None,
+) -> bool:
+    """Enable NVTX only for a CUDA deployment or an explicitly CUDA device."""
+    if not requested:
+        return False
+    if device is None:
+        device = torch.accelerator.current_accelerator(check_available=True)
+    return device is not None and device.type == "cuda"
+
+
 def phase_record(name: str, dt: float) -> None:
     if PHASE_PERIOD:
         _PHASE_BUF[name].append(dt)

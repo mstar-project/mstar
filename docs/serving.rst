@@ -139,7 +139,7 @@ mstar-serve
      - Network device for TCP tensor transport.
    * - ``--enable-nvtx``
      - off
-     - Emit NVTX markers for profiling.
+     - Emit NVTX markers for CUDA profiling. Disabled on XPU and CPU.
    * - ``--log-stats``
      - off
      - Print a per-request profile when each request finishes (see

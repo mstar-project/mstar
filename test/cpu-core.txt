@@ -4,6 +4,7 @@ test/modular/test_admit_failure_handling.py
 test/modular/test_micro_scheduler.py
 test/modular/test_worker_drain.py
 test/modular/test_worker_speculation_loop_counter.py
+test/modular/test_profiler_nvtx.py
 test/modular/test_ragged_attention_cpu.py
 test/modular/test_rid_handles.py
 test/modular/test_tensor_uuid.py
@@ -44,6 +45,8 @@ test/modular/test_gdn_prefill_padding_rows.py
 test/modular/test_gdn_tensor_parallel.py
 test/modular/test_recurrent_padding_rows.py
 test/modular/test_recurrent_preplan.py
+test/modular/test_mamba2_geometry.py
+test/modular/test_mamba2_resource.py
 test/modular/test_streams.py
 test/modular/test_batched_model_output.py
 test/modular/test_qwen3_5_check_stop_batched.py
