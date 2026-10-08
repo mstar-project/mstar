@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
@@ -266,6 +266,22 @@ class ChunkedPrefillOutputPolicy:
     """How a chunked node's output edge is put back together at its final chunk."""
     mode: ChunkedPrefillOutputMode = ChunkedPrefillOutputMode.CONCAT
     dim: int = 0
+
+
+@dataclass(frozen=True)
+class ChunkingPolicy:
+    """How a walk's prefill may be split across steps; the default is not at all."""
+    # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
+    chunkable: bool = False
+    # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
+    max_batch_tokens: int | None = None
+    # output edge -> how its chunks are joined; unlisted edges CONCAT on dim 0
+    output_policies: Mapping[str, ChunkedPrefillOutputPolicy] = field(default_factory=dict)
+    # whether a row may start past its cached prefix, asked before prepare; None is always
+    reuses_cached_prefix: Callable[[CurrentForwardPassInfo], bool] | None = None
+
+
+NO_CHUNKING = ChunkingPolicy()
 
 
 class InputSeqLenInfo(NamedTuple):
@@ -566,29 +582,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk, per_request_info, per_request_input_metadata, kwargs
         return None
 
-    def get_chunked_prefill_output_policies(
-        self, graph_walk: str,
-    ) -> dict[str, ChunkedPrefillOutputPolicy]:
-        """Output edge -> how its chunks are joined; unlisted edges CONCAT on dim 0."""
+    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
+        """How this walk's prefill may be split across steps; the engine asks once per walk."""
         del graph_walk
-        return {}
-
-    def supports_chunked_prefill(self, graph_walk: str) -> bool:
-        """Whether this walk's inputs may be split across forward passes
-        (``split_inputs``); such a walk must also report ``get_input_sequence_len``."""
-        del graph_walk
-        return False
-
-    def max_batch_tokens(self, graph_walk: str) -> int | None:
-        """Token cap for one step of this walk; None for no cap."""
-        del graph_walk
-        return None
-
-    def reuses_cached_prefix(self, graph_walk: str, fwd_info: CurrentForwardPassInfo) -> bool:
-        """Whether a chunked row of this walk may start past its cached prefix,
-        decided before its inputs are prepared."""
-        del graph_walk, fwd_info
-        return True
+        return NO_CHUNKING
 
     def get_input_sequence_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
