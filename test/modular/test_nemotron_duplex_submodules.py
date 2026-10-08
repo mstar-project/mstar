@@ -173,7 +173,7 @@ def test_nano_declare_step_per_walk():
     assert step.cg_key_info == nano.DECODE_KEY
     # the engine asks before the inputs exist: the routing's step_metadata answers
     pending = {"a": SimpleNamespace(step_metadata={"prompt_pending": True}), "b": SimpleNamespace(step_metadata={})}
-    assert nano.cg_key_info("decode", pending) is None
+    assert nano.cg_key_info("decode", pending, per_request_input_metadata={}) is None
     assert nano.cg_key_info("decode", {"b": pending["b"]}) == nano.DECODE_KEY
     # the mark stays on the routing for the whole loop: once the request's first
     # step (prompt + frame) has run, its later steps take the capture

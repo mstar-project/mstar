@@ -172,7 +172,9 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             steps=steps,
         )
 
-    def cg_key_info(self, graph_walk: str, per_request_info: Mapping[str, Any]) -> str | None:
+    def cg_key_info(
+        self, graph_walk: str, per_request_info: Mapping[str, Any], **kwargs: Any
+    ) -> str | None:
         """Decode capture unless a request still has its prompt pending (its first
         step is prompt + frame and runs eager). The routing sets that flag once
         for the whole loop, so the node also checks whether the request's first
@@ -527,7 +529,9 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     def _is_first_step(self, rid: str) -> bool:
         return self.request_state(rid).get(self.PREV_CODES_KEY) is None
 
-    def cg_key_info(self, graph_walk: str, per_request_info: Mapping[str, Any]) -> str | None:
+    def cg_key_info(
+        self, graph_walk: str, per_request_info: Mapping[str, Any], **kwargs: Any
+    ) -> str | None:
         """Which capture serves this batch: the steady-state decode capture
         (``DECODE_KEY``) when every session is past its first step, None (run
         eager) when any session prefills its warm-up this step. The engine
@@ -540,7 +544,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         # The LLM streams the sampled agent text token under "new_token". A
         # session's first step also prefills the speaker warm-up.
         tok = inputs["new_token"][0].reshape(1)
-        first = self._is_first_step(fwd_info.request_id)
+        first = self._is_first_step(fwd_info.rid_handle)
         span = self.warmup_len + 1 if first else 1
         return ARNodeInputs(input_ids=tok, input_seq_len=span, kwargs={"first": first})
 

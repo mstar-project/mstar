@@ -23,6 +23,11 @@ from test.modular.test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, 
 P = 37   # speaker warm-up positions
 
 
+def fwd(handle: str) -> SimpleNamespace:
+    """The engine keys request state by the worker-local handle, not the wire id."""
+    return SimpleNamespace(rid_handle=handle, request_id=f"wire-{handle}")
+
+
 def make_sub() -> EarTTSTalkerSubmodule:
     cfg = NemotronDuplexConfig()
     cfg.eartts = TINY
@@ -85,9 +90,9 @@ def test_pre_drawn_noise_reproduces_generator_sampling():
 def test_step_declares_both_streams_in_one_combined_plan():
     sub = make_sub()
     # first step of "a" (warm-up + frame), steady state for "b"
-    first = sub.prepare_inputs("talker_decode", SimpleNamespace(request_id="a"), {"new_token": [torch.tensor([5])]})
+    first = sub.prepare_inputs("talker_decode", fwd("a"), {"new_token": [torch.tensor([5])]})
     sub.request_state("b").add(sub.PREV_CODES_KEY, torch.zeros(TINY.num_quantizers, dtype=torch.long))
-    later = sub.prepare_inputs("talker_decode", SimpleNamespace(request_id="b"), {"new_token": [torch.tensor([7])]})
+    later = sub.prepare_inputs("talker_decode", fwd("b"), {"new_token": [torch.tensor([7])]})
     assert first.input_seq_len == P + 1 and first.kwargs["first"] is True
     assert later.input_seq_len == 1 and later.kwargs["first"] is False
     step = sub.declare_step("talker_decode", ["a", "b"], [first, later])
@@ -107,8 +112,8 @@ def test_preprocess_packs_rows_label_major_and_draws_noise_per_row():
     e = TINY
     sub.request_state("b").add(sub.PREV_CODES_KEY, torch.zeros(e.num_quantizers, dtype=torch.long))
     inputs = [
-        sub.prepare_inputs("talker_decode", SimpleNamespace(request_id="a"), {"new_token": [torch.tensor([5])]}),
-        sub.prepare_inputs("talker_decode", SimpleNamespace(request_id="b"), {"new_token": [torch.tensor([7])]}),
+        sub.prepare_inputs("talker_decode", fwd("a"), {"new_token": [torch.tensor([5])]}),
+        sub.prepare_inputs("talker_decode", fwd("b"), {"new_token": [torch.tensor([7])]}),
     ]
     eng = SimpleNamespace(request_ids=["a", "b"], resources={}, per_request_states=None)
     pre = sub.preprocess("talker_decode", eng, inputs)
@@ -118,7 +123,7 @@ def test_preprocess_packs_rows_label_major_and_draws_noise_per_row():
     assert pre["noise_u"].shape == (2, e.inference_num_iter, 1, e.mog_num_predictions)   # rows first
     assert pre["noise_eps"].shape == (2, e.inference_num_iter, 1, e.code_dim)
     # a steady-state batch is exactly two rows per session
-    inputs2 = [sub.prepare_inputs("talker_decode", SimpleNamespace(request_id="b"), {"new_token": [torch.tensor([7])]})]
+    inputs2 = [sub.prepare_inputs("talker_decode", fwd("b"), {"new_token": [torch.tensor([7])]})]
     pre2 = sub.preprocess("talker_decode", SimpleNamespace(request_ids=["b"], resources={}, per_request_states=None),
                           inputs2)
     assert pre2["x"].shape == (2, e.hidden_size) and pre2["spans"] == [1]
@@ -191,11 +196,12 @@ def test_warmup_steps_run_eager_and_steady_state_steps_hit_the_decode_capture():
     agree, and both must name the key the capture config was captured under."""
     sub = make_sub()
     sub.request_state("b").add(sub.PREV_CODES_KEY, torch.zeros(TINY.num_quantizers, dtype=torch.long))
-    infos = {"a": SimpleNamespace(request_id="a"), "b": SimpleNamespace(request_id="b")}
+    infos = {"a": fwd("a"), "b": fwd("b")}
     first = sub.prepare_inputs("talker_decode", infos["a"], {"new_token": [torch.tensor([5])]})
     later = sub.prepare_inputs("talker_decode", infos["b"], {"new_token": [torch.tensor([7])]})
 
-    assert sub.cg_key_info("talker_decode", infos) is None                      # "a" is on its warm-up step
+    # "a" is on its warm-up step; the engine also passes per_request_input_metadata
+    assert sub.cg_key_info("talker_decode", infos, per_request_input_metadata={}) is None
     assert sub.declare_step("talker_decode", ["a", "b"], [first, later]).cg_key_info is None
     assert sub.cg_key_info("talker_decode", {"b": infos["b"]}) == sub.DECODE_KEY
     assert sub.declare_step("talker_decode", ["b"], [later]).cg_key_info == sub.DECODE_KEY
