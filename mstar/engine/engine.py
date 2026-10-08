@@ -796,12 +796,19 @@ class Engine:
 
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        host_rows: HostRows | None = None,
     ) -> None:
         """Key what this step generated, from the stop check's host copy."""
         keys = self._runner.prefix_chain_keys(batch.node_name)
         if not keys:
             return
         walk = batch.step_context.graph_walk
+        if host_rows is not None:
+            self._runner.extend_prefix_chains_batch(
+                batch.request_ids, batch.node_name, walk, host_rows, outputs,
+                keys=keys,
+            )
+            return
         for rid in batch.request_ids:
             per_rid = outputs.get(rid)
             if isinstance(per_rid, dict):
