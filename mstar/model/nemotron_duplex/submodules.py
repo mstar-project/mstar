@@ -692,11 +692,15 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
         # samples at a window's right edge without their overlap-add partners
         self._hold = max(int(getattr(codec, "n_fft", 0)) - int(getattr(codec, "hop_length", 0)), 0)
 
-    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs | None:
         # ``codec_tokens`` is this chunk's NEW RVQ frames (T_new, num_q); the
         # Talker->Codec connection is a non-overlapping FixedChunkPolicy, so the
         # left context comes from per-request state, not the stream.
-        codes = inputs["codec_tokens"][0]
+        chunk = inputs.get("codec_tokens")
+        if not chunk:
+            # a frame count divisible by the chunk size ends on an empty final chunk
+            return None
+        codes = chunk[0]
         if codes.dim() == 3:
             # the stream stacks the talker's [1, num_q] frames to (T_new, 1, num_q);
             # a whole window handed over at once is (1, T_new, num_q)

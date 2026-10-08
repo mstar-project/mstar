@@ -268,6 +268,13 @@ def test_codec_prepare_inputs_flattens_stacked_row_views():
     assert stacked.tensor_inputs["codes"].shape == (5, q) and single.tensor_inputs["codes"].shape == (1, q)
 
 
+def test_codec_skips_an_empty_final_chunk():
+    """A frame count divisible by the chunk size ends on an empty final chunk; skip it."""
+    codec = AudioCodecDecoderSubmodule(_FakeCodec(), NemotronDuplexConfig())
+    assert codec.prepare_inputs("codec_chunk", None, {"codec_tokens": []}, is_final_stream_chunk=True) is None
+    assert codec.prepare_inputs("codec_chunk", None, {}, is_final_stream_chunk=True) is None
+
+
 def test_codec_batches_requests_with_equal_windows():
     """Requests at the same window length share one decode; a newcomer with a
     shorter window gets its own; every request emits only its new frames with
