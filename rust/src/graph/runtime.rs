@@ -11,7 +11,7 @@ use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
 use crate::communicator::RawZmqCommunicator;
 use crate::PyZmqCommunicator;
 use std::sync::Arc;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -1124,9 +1124,9 @@ pub struct LoopStopArg {
     #[pyo3(item)] wg_fwd_pass_idx: u32,
 }
 
-/// `RouteInput`.
+/// `RouteInput`, the keys every caller sends.
 #[derive(FromPyObject)]
-pub struct RouteArg {
+struct RouteArgRequired {
     #[pyo3(item)] partition: String,
     #[pyo3(item)] graph_walk: String,
     #[pyo3(item)] node_name: String,
@@ -1134,12 +1134,54 @@ pub struct RouteArg {
     #[pyo3(item)] rids: Vec<u32>,
     #[pyo3(item)] tensors: Vec<u64>,
     #[pyo3(item)] num_tensors: Vec<usize>,
+}
+
+/// `RouteInput`.
+pub struct RouteArg {
+    partition: String,
+    graph_walk: String,
+    node_name: String,
+    output_signals: Vec<String>,
+    rids: Vec<u32>,
+    tensors: Vec<u64>,
+    num_tensors: Vec<usize>,
     /// One output signal whose per-request value is a scalar the worker
     /// already holds on the host (a sampled token). Its EMIT_TO_CLIENT edge
     /// then rides inline in one frame per step instead of as a tensor per
     /// request; `inline_values` are in `rids` order, or empty for none.
-    #[pyo3(item)] inline_signal: Option<String>,
-    #[pyo3(item)] inline_values: Vec<i64>,
+    /// Both keys may be absent or None: a caller with no inline signal sends
+    /// the plain route input.
+    inline_signal: Option<String>,
+    inline_values: Vec<i64>,
+}
+
+/// An item of a mapping that may be missing or None.
+fn optional_item<'py, T: FromPyObject<'py>>(
+    ob: &Bound<'py, PyAny>, key: &str,
+) -> PyResult<Option<T>> {
+    match ob.get_item(key) {
+        Ok(v) if v.is_none() => Ok(None),
+        Ok(v) => v.extract().map(Some),
+        Err(e) if e.is_instance_of::<PyKeyError>(ob.py()) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+impl<'py> FromPyObject<'py> for RouteArg {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let r: RouteArgRequired = ob.extract()?;
+        Ok(RouteArg {
+            partition: r.partition,
+            graph_walk: r.graph_walk,
+            node_name: r.node_name,
+            output_signals: r.output_signals,
+            rids: r.rids,
+            tensors: r.tensors,
+            num_tensors: r.num_tensors,
+            inline_signal: optional_item(ob, "inline_signal")?,
+            inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
+        })
+    }
 }
 
 /// `RouteOutput`.
