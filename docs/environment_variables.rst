@@ -295,6 +295,13 @@ Worker scheduling
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
        thread.
+   * - ``MSTAR_QWEN35_DECODE_BUCKETS``
+     - ``1,2,4,8,16,32,48,64,96,128``
+     - The decode batch sizes Qwen3.5 captures as CUDA graphs. A decode step
+       runs at the smallest bucket that holds its rows, so the ladder bounds
+       both the rows per step and the graph memory; narrow it (for example
+       ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
+       former ladder.
    * - ``MSTAR_EARLY_SPEC``
      - ``1``
      - Build and pre-plan step N+2 while N+1 runs, between the stop and
