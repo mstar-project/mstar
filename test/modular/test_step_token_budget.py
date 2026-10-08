@@ -53,6 +53,15 @@ class _Runtime:
     def push_back_node(self, node_name, rids, wg_ids):
         self.ready |= set(rids)
 
+    def add_first(self, rid: str, tokens: int, walk: str = "prefill"):
+        """A new request whose handle scans before every live one, as the Rust
+        runtime's recycled handles can."""
+        self.tokens = {rid: tokens, **self.tokens}
+        self.walks[rid] = walk
+        self.ready.add(rid)
+        self.uuid[rid] = len(self.rows)
+        self.rows[len(self.rows)] = tokens
+
 
 class _State:
     """Stands in for RequestStateManager."""
@@ -131,6 +140,18 @@ def test_the_budget_takes_requests_in_arrival_order():
 
     assert _rids(sched.get_next_batch(state)) == ["p0"]
     assert _rids(sched.get_next_batch(state)) == ["p1", "p2"]
+
+
+def test_an_older_request_is_not_passed_over_for_a_recycled_handle():
+    """Ready order is handle order in the Rust runtime and handles are recycled, so a
+    newer request can scan first; the budget still takes the oldest, or a large one
+    is passed over under sustained arrivals."""
+    sched, runtime, state = _prefills(3000, 3000, budget={"prefill": 4096})
+    assert _rids(sched.get_next_batch(state)) == ["p0"]
+    runtime.add_first("p2", 3000)
+    state.per_request_info["p2"] = object()
+    assert _rids(sched.get_next_batch(state)) == ["p1"]
+    assert runtime.ready == {"p2"}
 
 
 def test_decode_batches_are_unaffected():

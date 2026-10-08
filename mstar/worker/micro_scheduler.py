@@ -203,6 +203,11 @@ class MicroScheduler:
         self.backlog: dict[tuple[str, str], ScheduledBatch] = {}
 
         self.node_and_walk_to_last_batch_num = {}
+        # rid -> when a step budget first saw it, so the budget takes the oldest:
+        # the runtime's ready order can't say (the Rust one scans by handle, and
+        # handles are recycled)
+        self._first_seen: dict[int, int] = {}
+        self._seen_count = 0
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
         # Rids with a deferred remove; stop initiating new work for them.
@@ -579,11 +584,17 @@ class MicroScheduler:
         if budget is None:
             return batch
         tokens = _input_tokens(batch.input_edges, self.tensor_rows)
+        rids = list(batch.request_to_worker_graph)
+        for rid in rids:
+            if rid not in self._first_seen:
+                self._first_seen[rid] = self._seen_count
+                self._seen_count += 1
+        rids.sort(key=self._first_seen.__getitem__)
         total = 0
-        for i, rid in enumerate(batch.request_to_worker_graph):
+        for i, rid in enumerate(rids):
             total += tokens.get(rid, 1)
             if i > 0 and (total > budget or (max_rows is not None and i >= max_rows)):
-                taken, left = batch.split_off_first(i)
+                taken, left = batch.split_off_first(i, exclude_rids=set(rids[i:]))
                 rids = list(left.request_to_worker_graph)
                 self.runtime.push_back_node(
                     left.node_name, rids, [left.request_to_worker_graph[r] for r in rids],
@@ -961,6 +972,7 @@ class MicroScheduler:
         self.failed_rids.discard(rid)
         self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
+        self._first_seen.pop(rid, None)
         self._drop_backlogged_rid(rid)
         self.clear_wire_rid(rid_str)
 
