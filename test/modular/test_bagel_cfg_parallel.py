@@ -184,6 +184,34 @@ def test_shm_kv_transfer_copies_only_requested_page_ranges(tmp_path):
     assert torch.count_nonzero(destination_cache.tensor[:, 1]) == 0
 
 
+def test_shm_kv_transfer_reads_an_mla_cache_by_token(tmp_path):
+    """MLA is [layers, pages, page_size, latent]: the reader took NHD's K/V axis
+    first and sliced latent columns, not tokens."""
+    from mstar.engine.resources.kv.cache import KVLayout
+
+    def mla_cache():
+        config = PagedKVConfig(max_num_pages=4, page_size=4, num_layers=2, num_kv_heads=1,
+                               head_dim=12, max_seq_len=16, num_qo_heads=2,
+                               layout=KVLayout.MLA, kv_lora_rank=8, qk_rope_head_dim=4)
+        return KVCache(config, torch.device("cpu"), torch.float32)
+
+    source_cache, destination_cache = mla_cache(), mla_cache()
+    source_cache.tensor.copy_(torch.arange(source_cache.tensor.numel(), dtype=torch.float32)
+                              .reshape(source_cache.tensor.shape))
+    producer = ShmKVTransferEngine(source_cache, "producer", str(tmp_path))
+    consumer = ShmKVTransferEngine(destination_cache, "consumer", str(tmp_path))
+    info = producer.get_kv_transfer_info(
+        request_id="request", label="main", page_indices=[1, 3], seq_len=6,
+    )
+    consumer.read_batched_async(
+        info, [r for layer in range(2)
+               for r in (KVReadInfo(layer, 0, 1, 0, 4), KVReadInfo(layer, 2, 3, 0, 2))])
+    src, dst = source_cache.tensor, destination_cache.tensor
+    torch.testing.assert_close(dst[:, 0], src[:, 1])
+    torch.testing.assert_close(dst[:, 2, :2], src[:, 3, :2])
+    assert torch.count_nonzero(dst[:, 2, 2:]) == 0
+
+
 def test_shm_kv_transfer_requires_deployment_directory():
     cache = _kv_cache(torch.zeros((1, 1, 2, 4, 1, 1)))
 
