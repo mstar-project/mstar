@@ -393,6 +393,8 @@ def test_openai_adapter_parses_language_line_and_continues_hypotheses():
         assert adapters.get_adapter(key).supports_transcriptions
     ad = adapters.get_adapter("qwen3_asr")
     assert ad.supports_realtime_transcription and ad.max_audio_seconds == 1200.0
+    # no Whisper-style retry: a long window's text compresses past 2.4 anyway
+    assert ad.compression_ratio_threshold is None
 
     req = TranscriptionRequest(language="en", prompt="names: Ada")
     sa = ad.transcription_to_request(req, "/tmp/a.wav")

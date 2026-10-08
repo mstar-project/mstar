@@ -902,6 +902,9 @@ class Qwen3ASRAdapter(OpenAIAdapter):
     supports_transcriptions = True
     supports_realtime_transcription = True
     max_audio_seconds = 1200.0
+    # 2.4 is Whisper's bound for a 30 s window. The ratio grows with length,
+    # so a 20 minute transcript of ordinary speech can pass it.
+    compression_ratio_threshold = None
 
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
         return SubmitArgs(
