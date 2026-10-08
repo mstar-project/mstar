@@ -34,6 +34,7 @@ from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
 from mstar.utils.exitcode import describe_exitcode
+from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 
@@ -1157,7 +1158,6 @@ api_server: APIServer | None = None
 # The router resolves the loaded model's adapter lazily per request, so models
 # without an adapter simply return a 404 there and keep working via /generate.
 from mstar.api_server.openai.router import router as openai_router  # noqa: E402
-from mstar.utils.gc_freeze import freeze_after_setup
 
 app.include_router(openai_router)
 
