@@ -57,3 +57,17 @@ def test_build_takes_the_mla_backend_on_a_paged_cache():
         config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA, sm_scale=0.1),
     )
     assert isinstance(AttentionManager.build(spec, info), fm.FlashInferMLAManager)
+
+
+def test_eager_wrappers_are_per_slot():
+    """A plan stages into a pinned buffer the wrapper holds and copies it to the
+    device without blocking: one wrapper per slot keeps plan(N+1) off step N's
+    queued copy, as FlashInferManager does since #243."""
+    kv = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=32, max_seq_len=64, page_size=16,
+                       max_num_pages=8, num_qo_heads=2, layout=KVLayout.MLA,
+                       kv_lora_rank=32, qk_rope_head_dim=0)
+    attn = fm.FlashInferMLAManager("kv", torch.device("cpu"), torch.float32, kv, sm_scale=0.1)
+    assert attn.force_double_buffer
+    w0 = attn._eager_wrapper("main", 0)
+    assert attn._eager_wrapper("main", 1) is not w0
+    assert attn._eager_wrapper("main", 0) is w0
