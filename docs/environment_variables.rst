@@ -309,8 +309,11 @@ Worker scheduling
        work the main thread does anyway instead of the next launch. ``0``
        builds each speculation at the top of the next iteration, after the
        whole post-processing, which left the plan thread idle during it.
-       Non-parallel (TP1) nodes only; a tensor-parallel node keeps the old
-       order so the followers see heads in the order they settle them.
+       On a tensor-parallel node the leader's early build commits only when
+       it finds a head (it broadcasts it at once); when it finds nothing it
+       sends no marker and schedules no yield-away, and the top of the next
+       iteration decides, so the followers still settle every step on
+       exactly one decision.
    * - ``MSTAR_LAZY_PUBLISH``
      - ``1``
      - Publish resource state (KV pages, positions) only for the requests
