@@ -323,6 +323,15 @@ Worker scheduling
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
        other ready work.
+   * - ``MSTAR_SPEC_YIELD_HOLD_MS``
+     - ``0``
+     - How long (ms) the speculative decode loop keeps going after another
+       step becomes ready, typically the prefill of requests that just
+       arrived. With ``0`` the loop yields at the next iteration and every
+       arrival tends to get a prefill step of its own; a hold of a few
+       milliseconds lets the arrivals of that window prefill together, which
+       is worth decode throughput at high concurrency and costs up to that
+       much time to first token.
    * - ``MSTAR_SPEC_PEEK_FOR_FAIRNESS``
      - ``1``
      - Yield the speculation chain only when another (node, walk) is
