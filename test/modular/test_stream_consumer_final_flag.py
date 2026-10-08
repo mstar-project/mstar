@@ -32,6 +32,7 @@ def _engine_with(submodule) -> Engine:
     engine._submodules = {"vocoder": SimpleNamespace(submodule=submodule, resources={})}
     engine._enable_nvtx = False
     engine._loopback_steps = {}
+    engine._chunking_policies = {}
     return engine
 
 

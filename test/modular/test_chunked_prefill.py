@@ -116,6 +116,7 @@ def _engine_with(submodule):
     engine._submodules = {"LLM": SimpleNamespace(submodule=submodule, resources={})}
     engine._chunk_inputs = {}
     engine._keyed_walks = {}
+    engine._chunking_policies = {}
     return engine
 
 
@@ -203,11 +204,10 @@ class _KeyedPrompt(_Prompt):
 
         return InputSeqLenInfo(self.n)
 
-    def supports_chunked_prefill(self, graph_walk):
-        return True
+    def get_chunking_policy(self, graph_walk):
+        from mstar.model.submodule_base import ChunkingPolicy
 
-    def reuses_cached_prefix(self, graph_walk, fwd_info):
-        return self.reuses
+        return ChunkingPolicy(chunkable=True, reuses_cached_prefix=lambda info: self.reuses)
 
     def prepare_inputs(self, **kwargs):
         inputs = super().prepare_inputs(**kwargs)
@@ -278,18 +278,22 @@ def test_a_step_over_its_token_budget_is_reported(caplog):
     from types import SimpleNamespace
 
     from mstar.engine.engine import Engine
+    from mstar.model.submodule_base import ChunkingPolicy
 
     engine = Engine.__new__(Engine)
     engine._token_budget_overruns = {}
     engine._token_budget_overrides = {}
-    submodule = SimpleNamespace(max_batch_tokens=lambda walk: 4)
+    engine._chunking_policies = {}
+    engine._submodules = {"LLM": SimpleNamespace(
+        submodule=SimpleNamespace(get_chunking_policy=lambda walk: ChunkingPolicy(max_batch_tokens=4)),
+    )}
     batch = SimpleNamespace(node_name="LLM", step_context=SimpleNamespace(graph_walk="mixed"))
     over = [SimpleNamespace(input_seq_len=3), SimpleNamespace(input_seq_len=2)]
 
     with caplog.at_level("WARNING"):
         for _ in range(3):
-            engine._check_token_budget(batch, submodule, over)
-        engine._check_token_budget(batch, submodule, over[:1])
+            engine._check_token_budget(batch, over)
+        engine._check_token_budget(batch, over[:1])
 
     assert engine._token_budget_overruns == {("LLM", "mixed"): 3}
     assert len(caplog.records) == 2  # the 1st and 2nd overrun; the 4th would be next
@@ -327,10 +331,14 @@ def _budgeted_engine():
 
     from mstar.engine.engine import Engine
 
-    sub = SimpleNamespace(max_batch_tokens={"prefill": 512, "vision": 2048}.get)
+    from mstar.model.submodule_base import ChunkingPolicy
+
+    budgets = {"prefill": 512, "vision": 2048}
+    sub = SimpleNamespace(get_chunking_policy=lambda walk: ChunkingPolicy(max_batch_tokens=budgets.get(walk)))
     engine = Engine.__new__(Engine)
     engine._submodules = {"LLM": SimpleNamespace(submodule=sub)}
     engine._token_budget_overrides = {}
+    engine._chunking_policies = {}
     return engine
 
 
