@@ -17,6 +17,8 @@ With ``glu`` the weight is ``[gate; up]`` stacked on its rows and the output is
 """
 from __future__ import annotations
 
+import logging
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -24,14 +26,18 @@ import triton.language as tl
 
 from mstar.model.glm52.quantization import FP8_DTYPE
 
+logger = logging.getLogger(__name__)
+
 # Tokens up to which w8a16 is the fastest (H100): the shared expert's small GEMMs keep it
 # longer. Above, W8A8: flashinfer's SM90 block-scale GEMM up to _FI_MAX_TOKENS, cuBLAS's
 # block-scaled GEMM beyond.
 _W8A16_MAX_TOKENS = 32
 _W8A16_MAX_TOKENS_BY_SHAPE = {(256, 6144, True): 128, (6144, 256, False): 128}
 _FI_MAX_TOKENS = 512
-# block-scaled fp8 in torch's scaled_mm (1x128 activations, 128x128 weights)
-_W8A8_OK = hasattr(F, "scaled_mm") and hasattr(F, "ScalingType")
+# block-scaled fp8 in torch's scaled_mm (1x128 activations, 128x128 weights), probed per device:
+# the API exists from torch 2.10 but raises off SM90 or on a cuBLASLt before 12.9 (cu128 builds)
+_W8A8_API = hasattr(F, "scaled_mm") and hasattr(F, "ScalingType")
+_W8A8_OK: dict[torch.device, bool] = {}
 _FI_OK: dict[torch.device, bool] = {}
 # Split-K arrival counters, one per output tile; every launch leaves them at zero.
 _COUNTERS: dict[torch.device, torch.Tensor] = {}
@@ -222,6 +228,22 @@ def reserve(device: torch.device | str) -> None:
     if device.type == "cuda" and device not in _COUNTERS:
         _COUNTERS[device] = torch.zeros(_MAX_TILES, dtype=torch.int32, device=device)
         _FI_OK[device] = _probe_fi(device)
+        _W8A8_OK[device] = _probe_w8a8(device)
+
+
+def _probe_w8a8(device: torch.device) -> bool:
+    """cuBLAS's block-scaled GEMM runs here; else the large tiles take the Triton w8a16."""
+    if not _W8A8_API:
+        return False
+    try:
+        x = torch.zeros(4, 128, dtype=torch.bfloat16, device=device)
+        _w8a8(x, torch.zeros(128, 128, dtype=torch.uint8, device=device),
+              torch.ones(1, 1, device=device), (128, 128), False)
+        return True
+    except Exception as exc:  # noqa: BLE001 - NotImplementedError off SM90 / old cuBLASLt
+        logger.warning("cuBLAS block-scaled fp8 GEMM unavailable (%r); dense fp8 above %d "
+                       "tokens takes the w8a16 kernel", exc, _FI_MAX_TOKENS)
+        return False
 
 
 def _probe_fi(device: torch.device) -> bool:
@@ -386,7 +408,7 @@ def _linear(x, w, s, block_size, glu):
         return _w8a16(x, w, s, block_size, glu)
     if M <= _FI_MAX_TOKENS and _FI_OK.get(x.device):
         return _fi(x, w, s, glu)
-    if _W8A8_OK:
+    if _W8A8_OK.get(x.device):
         return _w8a8(x, w, s, block_size, glu)
     return _w8a16(x, w, s, block_size, glu)
 
