@@ -74,6 +74,7 @@ from mstar.model.qwen3_omni.config import (
     TALKER_SAMPLER,
     THINKER_ATTN,
     THINKER_KV,
+    THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
 )
@@ -283,6 +284,11 @@ class Qwen3OmniModel(Model):
     # -----------------------------------------------------------------------
     # Model ABC: graph walk definitions
     # -----------------------------------------------------------------------
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        return {"Thinker": {THINKER_MIXED: {
+            "prefill_text", "prefill_audio", "prefill_vision", "thinker_decode",
+        }}}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
         """Define all graph walks for the 3-partition architecture.

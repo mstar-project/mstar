@@ -11,6 +11,9 @@ from pathlib import Path
 LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "full_attention"
 
+# text prefill and decode rows batched in one step (Model.get_combined_graph_walks)
+LLM_MIXED = "mixed"
+
 # resource keys this model declares
 KV_CACHE = "kv_cache"
 ATTN = "attn"

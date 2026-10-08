@@ -184,6 +184,10 @@ class ScheduleTPNode(MessageBody):
     spec_seq: int = -1
     spec_from_seq: int = -1
     resident_delta: OffloadDelta = field(default_factory=OffloadDelta.new)
+    # under a combined walk, request_ids[i] runs walks[walk_idx[i]]; empty
+    # means every rid runs graph_walk
+    walks: list[str] = field(default_factory=list)
+    walk_idx: list[int] = field(default_factory=list)
 
 
 @dataclass

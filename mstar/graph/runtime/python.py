@@ -27,6 +27,7 @@ from mstar.graph.runtime.base import (
     PopRidsOutput,
     Profiling,
     ReadyNodeSpec,
+    RequestWalks,
     RouteInput,
     RouteOutput,
     SendInput,
@@ -84,6 +85,8 @@ class CompletionState:
     graph_walk: str
     node_name: str
     routing: dict[int, NodeOutputRouting]
+    # rid -> the walk it completed in, where that is not graph_walk
+    rid_walk: dict[int, str]
     # rid -> the node's loop context before the completion advanced it
     nested_loop_indices: dict[int, NestedLoopIndices]
 
@@ -128,8 +131,12 @@ class PythonGraphRuntime(GraphRuntime):
         sharding_config: ShardingConfig,
         tensor_manager: TensorCommunicationManager,
         communicator: BaseCommunicator | None = None,
+        combined_walk_of: dict[tuple[str, str], str] | None = None,
     ):
         self._my_worker_id = my_worker_id
+        # (node, real walk) -> the combined walk the scheduler batches it under;
+        # a ready-scan target or exclusion may name either
+        self._combined_walk_of = dict(combined_walk_of or {})
         self._communicator = communicator
         # Refcount changes go through the manager rather than the bare store,
         # so a tensor that drops to zero is torn down (shm file, arena slot,
@@ -326,14 +333,13 @@ class PythonGraphRuntime(GraphRuntime):
         ]
 
     def set_in_flight(
-        self, node: str, wg_id: int, rids: list[int],
+        self, node: str, rids: list[int], wg_ids: list[int],
         in_flight: bool,
     ):
-        queues = self._queues[wg_id].per_request_queues
-        for rid in rids:
-            if rid not in queues:
-                continue
-            queues[rid].get_node(node)._in_flight = in_flight
+        for rid, wg_id in zip(rids, wg_ids, strict=True):
+            wgio = self._queues[wg_id].per_request_queues.get(rid)
+            if wgio is not None:
+                wgio.get_node(node)._in_flight = in_flight
 
     def is_in_flight(
         self, node: str, wg_id: int, rid: int,
@@ -525,42 +531,67 @@ class PythonGraphRuntime(GraphRuntime):
         request_ids: list[int],
         check_ready: bool = False,
     ) -> PopRidsOutput | None:
-        wg_id = self.get_worker_graph_id_for_node(node_name, graph_walk)
-        queue = self._queues.get(wg_id)
-        if queue is None:
+        return self.pop_walk_rids(
+            node_name, RequestWalks(request_ids, [graph_walk], [0] * len(request_ids)),
+            check_ready,
+        )
+
+    def pop_walk_rids(
+        self, node_name: str, rows: RequestWalks, check_ready: bool = False,
+    ) -> PopRidsOutput | None:
+        wg_ids_of_walk = [
+            self.get_worker_graph_id_for_node(node_name, walk) for walk in rows.walks
+        ]
+        queues = [self._queues.get(wg_id) for wg_id in wg_ids_of_walk]
+        if any(queue is None for queue in queues):
             return None
         if check_ready:
             # All or nothing: verified for every rid before anything is popped,
             # so a partially ready set is retried intact later.
-            for rid in request_ids:
-                wgio = queue.per_request_queues.get(rid)
+            for rid, w in zip(rows.rids, rows.walk_idx, strict=True):
+                wgio = queues[w].per_request_queues.get(rid)
                 if wgio is None or node_name not in wgio.ready_node_names:
                     return None  # unknown rid (removed here) counts as not ready
 
         rids: list[int] = []
         wg_ids: list[int] = []
+        rid_walk_idx: list[int] = []
         # Columns filled as the edges are found; no EdgeSpec ever exists.
         # next_node is not carried: it is `node_name`, the same for every edge,
         # and nothing downstream of a pop reads it.
         edges = ColumnarEdgeSpecs.empty()
-        for rid in request_ids:
-            popped = queue.pop_ready_nodes(rid, [node_name])
+        for rid, w in zip(rows.rids, rows.walk_idx, strict=True):
+            popped = queues[w].pop_ready_nodes(rid, [node_name])
             if not popped:
                 continue
             assert len(popped) == 1
             node = popped[0]
             rids.append(rid)
-            wg_ids.append(wg_id)
+            wg_ids.append(wg_ids_of_walk[w])
+            rid_walk_idx.append(w)
             for signal, edge in node.ready_signals.ready_inputs.items():
                 edges.add(
                     rid, signal,
                     [info.uuid for info in edge.tensor_info],
                     edge._final_stream_chunk,
                 )
+        walk_signals = tuple(
+            tuple(self.get_output_signals(node_name, walk)) for walk in rows.walks
+        )
         return PopRidsOutput(
             wg_ids=ParallelList(rids, wg_ids),
             input_edges=edges,
-            output_signals=self.get_output_signals(node_name, graph_walk),
+            output_signals=walk_signals[0] if walk_signals else (),
+            rid_walk_idx=rid_walk_idx,
+            walk_output_signals=walk_signals,
+        )
+
+    def _names_walk(self, target: tuple[str, str], node_name: str, walk: str) -> bool:
+        """``target`` names this node in this walk, directly or by its
+        combined walk."""
+        return target[0] == node_name and (
+            target[1] == walk
+            or self._combined_walk_of.get((node_name, walk)) == target[1]
         )
 
     def _scan_ready(
@@ -574,7 +605,7 @@ class PythonGraphRuntime(GraphRuntime):
         caller's to apply, because it can fail a request, which is a scheduling
         decision rather than a graph one.
         """
-        target_node, target_walk = target if target is not None else (None, None)
+        target_node = target[0] if target is not None else None
         for queue in self._queues.values():
             for rid, node_names in queue.get_ready_node_names().items():
                 if rid in exclude_rids or rid not in self._request_info:
@@ -586,10 +617,10 @@ class PythonGraphRuntime(GraphRuntime):
                     if partition is None:
                         continue
                     walk = self.get_walk(rid, partition)
-                    if target_walk is not None and walk != target_walk:
+                    if target is not None and not self._names_walk(target, node_name, walk):
                         continue
                     if exclude_target is not None \
-                            and (node_name, walk) == exclude_target:
+                            and self._names_walk(exclude_target, node_name, walk):
                         continue
                     yield node_name, walk, rid
 
@@ -637,14 +668,25 @@ class PythonGraphRuntime(GraphRuntime):
 
     def speculate_node(
         self, node_name: str,
-        graph_walk: str,
-        sample_rid: int,
+        graph_walks: list[str],
+        sample_rids: list[int],
+    ) -> list[SpeculationOutput]:
+        return [
+            target
+            for walk, rid in zip(graph_walks, sample_rids, strict=True)
+            for target in self._speculate_walk(node_name, walk, rid)
+        ]
+
+    def _speculate_walk(
+        self, node_name: str, graph_walk: str, sample_rid: int,
     ) -> list[SpeculationOutput]:
         wg_id = self.get_worker_graph_id_for_node(node_name, graph_walk)
         wgio = self._queues[wg_id].per_request_queues.get(sample_rid)
         if wgio is None:
             return []
         node = wgio.nodes[node_name]
+        if not node.enable_async_scheduling:
+            return []  # this walk's node opts out of async scheduling
         if not node.outputs:
             return []  # nothing to feed a spec target
 
@@ -856,13 +898,11 @@ class PythonGraphRuntime(GraphRuntime):
 
     def commit_speculation(
         self, spec_id: int, success: bool, dropped_rids: list[int] = (),
-        node: str | None = None, wg_id: int | None = None,
+        node: str | None = None, wg_ids: list[int] | None = None,
         scheduled_rids: list[int] = (),
     ):
-        if success and node is not None and wg_id is not None:
-            self.set_in_flight(
-                node, wg_id, list(scheduled_rids), True,
-            )
+        if success and node is not None and wg_ids is not None:
+            self.set_in_flight(node, list(scheduled_rids), wg_ids, True)
         staged = self._staged_specs.pop(spec_id, None)
         if staged is None:
             return
@@ -1258,11 +1298,11 @@ class PythonGraphRuntime(GraphRuntime):
             in self._pending_loop_stops
 
     def pending_loop_stop_rids(
-        self, graph_walk: str, loop_name: str,
+        self, graph_walks: list[str], loop_name: str,
     ) -> set[int]:
         return {
             stop.rid for stop in self._pending_loop_stops
-            if stop.loop_name == loop_name and stop.graph_walk == graph_walk
+            if stop.loop_name == loop_name and stop.graph_walk in graph_walks
         }
 
     def clear_pending_loop_stops(self):
@@ -1281,6 +1321,7 @@ class PythonGraphRuntime(GraphRuntime):
 
         routing_per_rid: dict[int, NodeOutputRouting] = {}
         nested_idxs: dict[int, NestedLoopIndices] = {}
+        rid_walk: dict[int, str] = {}
         register_uuids: list[int] = []
         register_rids: list[int] = []
         new_token_idxs: list[int] = []
@@ -1315,10 +1356,13 @@ class PythonGraphRuntime(GraphRuntime):
                 input.node_name
             )
             completion = self._mark_node_complete(rid, wg_id, input.node_name)
+            walk = input.graph_walk
+            if input.walks is not None:
+                walk = rid_walk[rid] = input.walks[input.rid_walk_idx[i]]
             routing = self._process_node_outputs(
                 rid, node_name=input.node_name,
                 outputs=[edge.clone() for edge in completion.output_edges],
-                graph_walk=input.graph_walk,
+                graph_walk=walk,
             )
             routing_per_rid[rid] = routing
 
@@ -1400,6 +1444,7 @@ class PythonGraphRuntime(GraphRuntime):
             node_name=input.node_name,
             routing=routing_per_rid,
             nested_loop_indices=nested_idxs,
+            rid_walk=rid_walk,
         )
         return RouteOutput(
             completion_id=completion_id,
@@ -1485,7 +1530,8 @@ class PythonGraphRuntime(GraphRuntime):
                 part = info.partition_info.get(partition)
                 node = self._queues[
                     self.get_worker_graph_id_for_node(
-                        completion.node_name, completion.graph_walk,
+                        completion.node_name,
+                        completion.rid_walk.get(rid, completion.graph_walk),
                     )
                 ].per_request_queues.get(rid)
                 speculative = node is not None and node.get_node(

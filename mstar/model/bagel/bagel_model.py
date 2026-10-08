@@ -72,7 +72,7 @@ from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
 from mstar.model.bagel.components.tokenization import BagelTokenizer, add_special_tokens
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN, BagelVisionModel
-from mstar.model.bagel.config import load_bagel_config
+from mstar.model.bagel.config import MIXED_TEXT, load_bagel_config
 from mstar.model.bagel.submodules import (
     CombineCFGSubmodule,
     LLMSubmodule,
@@ -911,6 +911,9 @@ class BagelModel(Model):
             and image_ranks.isdisjoint(llm_ranks("decode"))
         )
         return super().get_worker_graphs(config_path)
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        return {"LLM": {MIXED_TEXT: {"prefill_text", DECODE}}}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --

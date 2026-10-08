@@ -27,10 +27,16 @@ class BatchBuildRequest:
     fresh: "ScheduledBatch | None" = None
     # Rows of `backlog` that cannot run this step; they stay parked.
     blocked_rids: set[int] = field(default_factory=set)
-    # Rows left in the step once the caller's own are counted (> 0); None is uncapped.
-    max_batch_size: int | None = None
     # The rid whose capture group the step must share, else its first row's.
     capture_group_of: int | None = None
+    # Each walk's cap, before the caller's rows are counted; None (or absent)
+    # is uncapped. Under `graph_walk` for a key of one walk. Under a combined
+    # walk, each real walk's, plus the combined walk's own under `graph_walk`,
+    # which caps a step mixing walks.
+    walk_caps: dict[str, int | None] = field(default_factory=dict)
+    # The caller's own rows (a speculation merge's continuing ones) and their walk.
+    pre_existing_batch_size: int = 0
+    pre_existing_walk: str | None = None
     # `Engine.capture_group` for one rid of this (node, walk).
     capture_group: Callable[[int], Any] = lambda _: None
 
@@ -107,10 +113,15 @@ class BaseBatchBuilder(ABC):
 
 class FIFOBatchBuilder(BaseBatchBuilder):
     """Backlog first, then fresh rows, in arrival order, up to the cap; one
-    capture group per step. Everything past the cap stays in the backlog."""
+    capture group per step. Everything past the cap stays in the backlog.
+
+    Under a combined walk a step of one walk takes that walk's cap and a mixed
+    step the smallest of its walks' and the combined walk's. Rows join in
+    order; one whose walk would cap the step at or below the rows already in
+    it is left out, and is first in line next step.
+    """
 
     def build_batch(self, request: BatchBuildRequest) -> BatchBuildResult:
-        max_bs = request.max_batch_size
         batch = _merged(request.backlog, request.fresh)
         if batch is None:
             return BatchBuildResult(None)
@@ -119,8 +130,57 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             batch, request.capture_group,
             exclude_rids=request.blocked_rids, anchor=request.capture_group_of,
         )
+        walk = _single_walk(batch, request)
+        if walk is None:
+            max_bs, left_out = _compose_walks(batch, exclude, request)
+            exclude = exclude | left_out
+        else:
+            cap = request.walk_caps.get(walk)
+            max_bs = None if cap is None else cap - request.pre_existing_batch_size
+        if max_bs is not None and max_bs <= 0:
+            return BatchBuildResult(None, backlog=batch)  # the caller's rows fill it
         scheduled, remainder = batch.split_off_first(max_bs, exclude_rids=exclude)
         return BatchBuildResult(scheduled, backlog=remainder)
+
+
+def _single_walk(batch: "ScheduledBatch", request: BatchBuildRequest) -> str | None:
+    """The one walk of every row, the caller's included, else None."""
+    if not batch.request_walks:
+        return request.graph_walk
+    walks = set(batch.request_walks.values())  # rows and request_walks share keys
+    if request.pre_existing_walk is not None:
+        walks.add(request.pre_existing_walk)
+    return walks.pop() if len(walks) == 1 else None
+
+
+def _min_cap(*caps: int | None) -> int | None:
+    return min((cap for cap in caps if cap is not None), default=None)
+
+
+def _compose_walks(
+    batch: "ScheduledBatch", exclude: set[int], request: BatchBuildRequest,
+) -> tuple[int | None, set[int]]:
+    """Rows left for the step after the caller's, and the rows left out."""
+    caps = request.walk_caps
+    n = request.pre_existing_batch_size
+    walks = {request.pre_existing_walk} if request.pre_existing_walk else set()
+    cap = _min_cap(*(caps.get(walk) for walk in walks))
+    left_out = set()
+    for rid in batch.request_to_worker_graph:
+        if rid in exclude:
+            continue
+        walk = batch.walk_of(rid)
+        new_cap = cap
+        if walk not in walks:
+            mixed_cap = caps.get(request.graph_walk) if walks else None
+            new_cap = _min_cap(cap, caps.get(walk), mixed_cap)
+        if new_cap is not None and new_cap <= n:
+            left_out.add(rid)
+            continue
+        walks.add(walk)
+        cap = new_cap
+        n += 1
+    return (None if cap is None else cap - request.pre_existing_batch_size), left_out
 
 
 class BatchBuilderType(Enum):

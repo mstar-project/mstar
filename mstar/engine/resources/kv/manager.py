@@ -540,7 +540,7 @@ class KVManager(AttentionResource):
         ):
             return
         walks = self._keyed_walks.get(segment.label)
-        if walks is not None and ctx.graph_walk not in walks:
+        if walks is not None and ctx.walk_of(segment.request_id) not in walks:
             # another walk wrote this span (an edit's image, say), which the keys do not describe
             stream.chain = None
             return

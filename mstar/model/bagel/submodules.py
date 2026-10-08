@@ -34,11 +34,12 @@ from mstar.model.bagel.components.modeling_utils import (
     vllm_vit_resize,
 )
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN
-from mstar.model.bagel.config import BagelModelConfig
+from mstar.model.bagel.config import MIXED_TEXT, BagelModelConfig
 from mstar.model.higgs_audio.config import SAMPLER
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -86,7 +87,7 @@ def active_labels(graph_walk: str, cfg: bool, node_name: str) -> list[str]:
     off every walk is just "main". ``image_gen_cfg`` is the parallel variant,
     where each LLM node owns exactly one branch.
     """
-    if graph_walk in {"prefill_text", "decode"}:
+    if graph_walk in {"prefill_text", "decode", MIXED_TEXT}:
         if cfg:
             return ["main", "cfg_img"]
     elif graph_walk == "image_gen":
@@ -666,13 +667,9 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _sample_per_request(
         self, request_ids: list[str], logits: torch.Tensor,
-    ) -> dict[str, NameToTensorList]:
-        """The batched forward's output shape: rid -> that rid's outputs."""
-        tokens = self._sample_tokens(request_ids, logits)
-        return {
-            rid: {"new_token": [token]}
-            for rid, token in zip(request_ids, tokens.split(1), strict=True)
-        }
+    ) -> BatchedModelOutput:
+        """The batched forward's output: row i of ``new_token`` is request i."""
+        return BatchedModelOutput(row_outputs={"new_token": self._sample_tokens(request_ids, logits)})
 
     def __init__(
         self,
@@ -742,7 +739,8 @@ class LLMSubmodule(ARNodeSubmodule):
         return tensor_inputs
 
     PREFILL_TEXT_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
-    PREFILL_TEXT_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    # past 4 for mixed_text, whose decode rows ride in these captures
+    PREFILL_TEXT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -784,7 +782,8 @@ class LLMSubmodule(ARNodeSubmodule):
             ),
             PackedCudaGraphConfig(
                 capture_graph_walk="prefill_text",
-                replay_graph_walks=["prefill_text"],
+                # decode rows of a mixed step are one-token segments
+                replay_graph_walks=["prefill_text", MIXED_TEXT],
                 capture_token_lengths=list(self.PREFILL_TEXT_TOKEN_BUCKETS),
                 make_node_input=lambda n: ARNodeInputs(
                     input_ids=torch.zeros(n, dtype=torch.long, device=device),
@@ -970,8 +969,9 @@ class LLMSubmodule(ARNodeSubmodule):
 
         pre_forks: tuple = ()
         post_forks: tuple = ()
+        row_walks = [inp.graph_walk or graph_walk for inp in inputs]
         if requires_cfg:
-            if graph_walk == "prefill_text":
+            if "prefill_text" in row_walks:
                 # cfg_text keeps the pre-text context, so it forks before
                 # anything plans or writes.
                 pre_forks = (("main", "cfg_text"),)
@@ -983,21 +983,23 @@ class LLMSubmodule(ARNodeSubmodule):
         # `cg_key_info` picks among the walk's capture buckets; it must match
         # the `additional_key_info` on the configs in get_cuda_graph_configs.
         steps: dict = {}
-        # the prefill rows whose token `postprocess` keeps
+        # the rows whose token `postprocess` keeps
         info = per_request_info or {}
         kept_rids = frozenset(
-            rid for rid in request_ids
-            if rid in info and info[rid].step_metadata.get("sample_prefill_token", False)
+            rid for rid, walk in zip(request_ids, row_walks, strict=True)
+            if walk == "decode" or (
+                rid in info and info[rid].step_metadata.get("sample_prefill_token", False)
+            )
         )
-        if graph_walk == "prefill_text":
+        if graph_walk in ("prefill_text", MIXED_TEXT):
             # The prompt's tokens enter the repetition-penalty mask here; the
             # sampler resource adds them at plan time. Only prefill carries
             # them — a sampled token is tracked by the sampler itself.
             steps["sampler"] = SamplerStep(
                 prefill_tracked_tokens={
                     rid: inp.input_ids
-                    for rid, inp in zip(request_ids, inputs, strict=True)
-                    if inp.input_ids is not None
+                    for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
+                    if inp.input_ids is not None and walk == "prefill_text"
                 },
                 kept_rids=kept_rids,
             )
@@ -1017,7 +1019,7 @@ class LLMSubmodule(ARNodeSubmodule):
             ),
             "attn": AttentionStep(
                 segments=segments,
-                causal=graph_walk in ("prefill_text", "decode"),
+                causal=graph_walk in ("prefill_text", "decode", MIXED_TEXT),
             ),
             "rope": PositionStep(
                 segments=segments,
@@ -1489,7 +1491,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
             )
-        elif graph_walk == "prefill_text":
+        elif graph_walk in ("prefill_text", MIXED_TEXT):
             out = self._forward_prefill_text(
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
@@ -1567,7 +1569,7 @@ class LLMSubmodule(ARNodeSubmodule):
     def can_batch(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ):
-        return batch.graph_walk in ["decode", "prefill_text", "prefill_vit"]
+        return batch.graph_walk in ["decode", "prefill_text", "prefill_vit", MIXED_TEXT]
 
     def postprocess(
         self, request_id: str,

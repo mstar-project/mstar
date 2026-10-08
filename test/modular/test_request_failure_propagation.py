@@ -52,8 +52,8 @@ class _Runtime:
     def get_rid_string(self, h):
         return h
 
-    def set_in_flight(self, node, wg_id, rids, value):
-        del wg_id
+    def set_in_flight(self, node, rids, wg_ids, value):
+        del wg_ids
         if not value:
             self.cleared.append((node, list(rids)))
 

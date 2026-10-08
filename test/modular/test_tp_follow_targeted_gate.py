@@ -26,6 +26,7 @@ from mstar.graph.base import GraphNode  # noqa: E402
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     PopRidsOutput,
+    RequestWalks,
 )
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
@@ -94,7 +95,13 @@ class _FakeRuntime:
     def get_worker_graph_id_for_node(self, node_name, graph_walk):
         return "wg0"
     def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):
-        del graph_walk
+        return self.pop_walk_rids(
+            node_name, RequestWalks(request_ids, [graph_walk], [0] * len(request_ids)),
+            check_ready,
+        )
+
+    def pop_walk_rids(self, node_name, rows, check_ready=False):
+        request_ids = rows.rids
         queue = self._queue
         if check_ready:
             for rid in request_ids:

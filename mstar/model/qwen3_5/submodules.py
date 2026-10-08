@@ -53,6 +53,7 @@ from mstar.model.qwen3_5.config import (
     GDN_STATE,
     KV_CACHE,
     LINEAR_ATTN,
+    LLM_MIXED,
     ROPE,
     SAMPLER,
     VISION_ATTN,
@@ -75,7 +76,8 @@ logger = logging.getLogger(__name__)
 
 class LLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    # past 16 for the mixed walk, whose decode rows ride in these captures
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
@@ -145,6 +147,7 @@ class LLMSubmodule(ARNodeSubmodule):
             ),
             PackedCudaGraphConfig(
                 capture_graph_walk="prefill_text",
+                replay_graph_walks=["prefill_text", LLM_MIXED],
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=dummy,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
@@ -329,10 +332,12 @@ class LLMSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> SubmoduleStep:
         prefill_tokens = {}
-        if graph_walk == "prefill_text":
+        if graph_walk in ("prefill_text", LLM_MIXED):
+            # a mixed step's decode rows track their token through the sampler as usual
             prefill_tokens = {
                 rid: inp.input_ids
                 for rid, inp in zip(request_ids, inputs, strict=True)
+                if (inp.graph_walk or graph_walk) == "prefill_text"
             }
         elif graph_walk == "prefill_vision":
             # the prompt's text ids still feed the repetition penalty
@@ -459,8 +464,7 @@ class LLMSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs,
     ):
-        if request_info.graph_walk != "decode" and \
-                not request_info.step_metadata.get("last_prefill", False):
+        if not self._token_is_real(request_info):
             outputs.pop("new_token", None)
             return
         # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is
@@ -469,13 +473,21 @@ class LLMSubmodule(ARNodeSubmodule):
             return
         outputs["text_inputs"] = outputs["new_token"]
 
+    @staticmethod
+    def _token_is_real(request_info: CurrentForwardPassInfo) -> bool:
+        """Whether this step's token is the request's: decode, or the last prefill's."""
+        return request_info.graph_walk == "decode" or request_info.step_metadata.get(
+            "last_prefill", False,
+        )
+
     def check_stop(
         self,
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if "new_token" not in outputs:
+        # only a decode row's stop can end decode_loop; a prefill is not in it yet
+        if request_info.graph_walk != "decode" or "new_token" not in outputs:
             return set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
@@ -505,6 +517,8 @@ class LLMSubmodule(ARNodeSubmodule):
             if i is None or i >= len(values):
                 continue  # no row, no output: the per-request path skips it too
             info = request_infos[rid]
+            if info.graph_walk != "decode":
+                continue  # as check_stop: only a decode row's stop ends decode_loop
             hit_eos = (
                 not info.resource_configs[SAMPLER].ignore_eos
                 and values[i] in stop_ids

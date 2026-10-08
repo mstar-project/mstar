@@ -41,6 +41,7 @@ from mstar.graph.runtime.base import (
     PopRidsOutput,
     Profiling,
     ReadyNodeSpec,
+    RequestWalks,
     RouteInput,
     RouteOutput,
     SendInput,
@@ -229,8 +230,10 @@ class RustGraphRuntime(GraphRuntime):
         sharding_config: ShardingConfig,
         bookkeeping: TensorBookkeeping,
         communicator=None,
+        combined_walk_of: dict[tuple[str, str], str] | None = None,
     ):
         mine = {wg.worker_graph_id for wg in my_worker_graphs}
+        combined_walk_of = combined_walk_of or {}
         self._rust = _RustGraphRuntime(
             worker_graphs=[worker_graph_args(wg) for wg in my_worker_graphs],
             remote_worker_graphs=[
@@ -253,6 +256,11 @@ class RustGraphRuntime(GraphRuntime):
             # under the pyzmq communicator, which has no shareable object --
             # the worker's flag gate refuses that pairing anyway.
             communicator=getattr(communicator, "_inner", None),
+            combined_walks=(
+                [node for node, _ in combined_walk_of],
+                [walk for _, walk in combined_walk_of],
+                list(combined_walk_of.values()),
+            ),
         )
         self._node_to_partition = node_to_partition
         self._communicator = communicator
@@ -327,10 +335,10 @@ class RustGraphRuntime(GraphRuntime):
         self._rust.set_walk(rid, partition, walk)
 
     def set_in_flight(
-        self, node: str, wg_id: int, rids: list[int],
+        self, node: str, rids: list[int], wg_ids: list[int],
         in_flight: bool,
     ):
-        self._rust.set_in_flight(node, wg_id, rids, in_flight)
+        self._rust.set_in_flight(node, rids, wg_ids, in_flight)
 
     def is_in_flight(
         self, node: str, wg_id: int, rid: int,
@@ -372,9 +380,9 @@ class RustGraphRuntime(GraphRuntime):
         return self._rust.has_pending_loop_stop(rid, graph_walk, loop_name)
 
     def pending_loop_stop_rids(
-        self, graph_walk: str, loop_name: str,
+        self, graph_walks: list[str], loop_name: str,
     ) -> set[int]:
-        return set(self._rust.pending_loop_stop_rids(graph_walk, loop_name))
+        return set(self._rust.pending_loop_stop_rids(graph_walks, loop_name))
 
     def clear_pending_loop_stops(self):
         self._rust.clear_pending_loop_stops()
@@ -435,6 +443,22 @@ class RustGraphRuntime(GraphRuntime):
             output_signals=tuple(out.output_signals),
         )
 
+    def pop_walk_rids(
+        self, node_name: str, rows: RequestWalks, check_ready: bool = False,
+    ) -> PopRidsOutput | None:
+        out = self._rust.pop_walk_rids(
+            node_name, list(rows.walks), list(rows.rids), list(rows.walk_idx), check_ready,
+        )
+        if out is None:
+            return None
+        return PopRidsOutput(
+            wg_ids=ParallelList(out.rids, out.wg_ids),
+            input_edges=_columns(out),
+            output_signals=tuple(out.output_signals),
+            rid_walk_idx=out.rid_walk_idx,
+            walk_output_signals=tuple(tuple(s) for s in out.walk_output_signals),
+        )
+
     def has_ready_excluding(
         self, exclude_rids: set[int],
         exclude_target: tuple[str, str] | None = None,
@@ -458,7 +482,7 @@ class RustGraphRuntime(GraphRuntime):
     # --------- Speculation ----------
 
     def speculate_node(
-        self, node_name: str, graph_walk: str, sample_rid: int,
+        self, node_name: str, graph_walks: list[str], sample_rids: list[int],
     ) -> list[SpeculationOutput]:
         return [
             SpeculationOutput(
@@ -466,8 +490,9 @@ class RustGraphRuntime(GraphRuntime):
                 is_new_loop_iter=new_iter, loop_name=loop_name,
                 output_signals=tuple(signals),
             )
-            for n, w, new_iter, loop_name, signals
-            in self._rust.speculate_node(node_name, graph_walk, sample_rid)
+            for n, w, new_iter, loop_name, signals in self._rust.speculate_node(
+                node_name, graph_walks, sample_rids,
+            )
         ]
 
     def get_spec_target(
@@ -517,12 +542,12 @@ class RustGraphRuntime(GraphRuntime):
 
     def commit_speculation(
         self, spec_id: int, success: bool, dropped_rids: list[int] = (),
-        node: str | None = None, wg_id: int | None = None,
+        node: str | None = None, wg_ids: list[int] | None = None,
         scheduled_rids: list[int] = (),
     ):
         self._rust.commit_speculation(
             spec_id, success, list(dropped_rids),
-            node, wg_id, list(scheduled_rids),
+            node, wg_ids, list(scheduled_rids),
         )
 
     def prep_spec_rids(
@@ -551,6 +576,8 @@ class RustGraphRuntime(GraphRuntime):
             "rids": list(input.wg_ids.keys),
             "tensors": list(input.tensors),
             "num_tensors": list(input.num_tensors),
+            "walks": input.walks,
+            "rid_walk_idx": input.rid_walk_idx,
         })
         return RouteOutput(
             completion_id=out.completion_id,

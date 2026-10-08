@@ -13,7 +13,14 @@ from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerS
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
-from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import (
+    ARNodeInputs,
+    ARNodeSubmodule,
+    BatchedModelOutput,
+    ModelInputsFromEngine,
+    NodeInputs,
+    NodeSubmodule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +31,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     Dispatches on graph_walk:
       - prefill: embed text tokens, fill KV cache
       - decode: embed previous token, generate next audio token
+      - mixed: prefill and decode rows in one batch
     """
 
     def __init__(
@@ -38,7 +46,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.config = config
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -53,6 +61,8 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             ),
             PackedCudaGraphConfig(
                 capture_graph_walk="prefill",
+                # a mixed batch is packed rows too, decode rows one token long
+                replay_graph_walks=["prefill", "mixed"],
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=lambda n: ARNodeInputs(
                     input_ids=torch.zeros(
@@ -83,11 +93,10 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ):
-        prefill_tokens = {}
-        if graph_walk == "prefill":
-            prefill_tokens = {
-                rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
-            }
+        prefill_tokens = {
+            rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
+            if (inp.graph_walk or graph_walk) == "prefill"
+        }
         return SubmoduleStep(
             segments=[
                 Segment(
@@ -128,7 +137,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         emb = self.embed_tokens(text_inputs)
         hidden = self.language_model(emb, label="main")
 
-        if graph_walk == "prefill":
+        if graph_walk != "decode":
             hidden = attn.select_last_hidden(hidden)
 
         logits = self.lm_head(hidden)
@@ -165,16 +174,14 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         text_inputs: torch.Tensor,
         **kwargs
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         new_tokens = self._forward(
             graph_walk=graph_walk,
             engine_inputs=engine_inputs,
             text_inputs=text_inputs
         )
-        return {
-            rid: {"new_token": [new_tokens[i : i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        # row i is request i; a per-rid dict here would guard the compiled frame on the ids
+        return BatchedModelOutput(row_outputs={"new_token": new_tokens})
 
     def postprocess(
         self, request_id: str,
