@@ -600,11 +600,13 @@ def test_stop_counts_what_the_checked_steps_delivered():
         assert delivered == budget, (budget, delivered)
 
 
+@pytest.mark.parametrize("wrong_every", [None, 0, 3], ids=["mtp", "oracle", "oracle_partial"])
 @pytest.mark.parametrize("chunk", [8192, 3], ids=["one-pass", "row-chunks"])
-def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk):
+def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk, wrong_every):
     """MTP on paged DSA, every context past index_topk: the verify and the seed pass select
     per row, a rejected row's index keys are trimmed with its latents, and the emitted
-    stream is plain decode's. Row chunks: the prompt's trunk and MTP passes run in pieces."""
+    stream is plain decode's. Row chunks: the prompt's trunk and MTP passes run in pieces.
+    Random weights reject nearly every draft; the oracle reaches the accepted rows."""
     cfg = _cfg(2, True)
     cfg.dsa_long_context, cfg.index_topk = True, 4
     cfg.prefill_chunk_tokens = chunk
@@ -614,6 +616,8 @@ def test_mtp_stream_matches_baseline_past_topk_on_paged_dsa(chunk):
     for k in (0, 2):
         cfg.mtp_num_draft_tokens = k
         sub = Glm52LLMSubmodule(model, cfg)
+        if k and wrong_every is not None:
+            _oracle(sub, {"r0": streams[0].tolist()}, wrong_every)
         driver = _Driver(sub, cfg, ["r0"])
         streams.append(_drive(driver, prompt, _fwd_info("r0", 18, True)))
         index = driver.resources["kv_index"]

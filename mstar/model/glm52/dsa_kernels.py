@@ -8,8 +8,9 @@ a gathered history). The output is ``[rows, max_len]`` fp32, what
 The key store is ``[pages, page_size, head_dim]`` bf16, one layer view of an MLA-layout KV
 resource with a ``head_dim`` latent, addressed through a request's page-table row. Each dot is
 bf16 x bf16 with fp32 accumulation, so every product is exact; the relu and the w-weighted
-head sum run in fp32. Against the fp32 reference the scores differ by summation order only
-(~3e-7 relative) and the top-2048 sets match.
+head sum run in fp32. Against the stored keys the scores differ by summation order only. The
+store rounds the indexer's fp32 keys to bf16: against those the scores move ~2e-3 relative,
+and a row's top-2048 changes a few picks.
 
 Two launch shapes: decode (``decode_scores``: programs per row that stride over its key blocks,
 each row its own request) and prefill (``prefill_scores``: BR rows of one request per program,

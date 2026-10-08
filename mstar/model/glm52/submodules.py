@@ -160,6 +160,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return res[ATTN_RESOURCE]
 
     def bind_node_resources(self, resources: dict[str, Any]) -> None:
+        if self.config.dsa_long_context:
+            self._check_long_context(resources)
         super().bind_node_resources(resources)
         if self.mtp_k > 0:
             # a request holds at least one page, so the pool bounds the requests in flight
@@ -169,6 +171,29 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 slots, self.config.hidden_size, dtype=weight.dtype, device=weight.device)
             self._mtp_seed_draft = torch.zeros(slots, dtype=torch.long, device=weight.device)
             self._mtp_free_slots = list(range(slots - 1, 0, -1))
+
+    def _check_long_context(self, resources: dict[str, Any]) -> None:
+        cfg = self.config
+        if cfg.prefill_chunk_tokens < 1:
+            raise ValueError(f"prefill_chunk_tokens={cfg.prefill_chunk_tokens} must be >= 1")
+        for key in (KV_RESOURCE, INDEX_KV_RESOURCE):
+            if key not in resources:
+                continue
+            kv = resources[key].config
+            # the manager holds one page back as its sink
+            if (kv.max_num_pages - 1) * kv.page_size < cfg.max_seq_len:
+                logger.warning("%s: %d usable pages of %d hold less than max_seq_len=%d: a "
+                               "request that long waits for pages until it times out", key,
+                               kv.max_num_pages - 1, kv.page_size, cfg.max_seq_len)
+            # each rank attends the others' selected cache slots, so the ranks' page tables
+            # must agree, and an eviction frees pages in a different order on each rank
+            if cfg.dsa_shard_prefill and getattr(resources[key], "supports_eviction", False):
+                raise ValueError("dsa_shard_prefill needs cpu_offload_pages: 0")
+        if INDEX_KV_RESOURCE in resources:
+            page = resources[INDEX_KV_RESOURCE].config.page_size
+            if page & (page - 1):
+                # the score kernels read the keys in power-of-two blocks
+                raise ValueError(f"kv_index page_size={page} must be a power of two")
 
     def declare_step(
         self,
@@ -287,8 +312,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     @property
     def disable_torch_compile(self) -> bool:
-        # the escape hatch covers the uncaptured steps too, which the engine compiles
-        return (getattr(self, "_mtp_uncompiled", False)
+        # the escape hatch covers the uncaptured steps too, which the engine compiles; under
+        # dsa_long_context those run eager, and the frame would key on each prompt's length
+        return (getattr(self, "_mtp_uncompiled", False) or self.config.dsa_long_context
                 or os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") != "1")
 
     def to(self, *args, **kwargs):
@@ -322,8 +348,20 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
         )
         flags = self._compile_flags()
-        groups = [(prefill_buckets, prefill_batch_sizes)]
         batched = self.config.prefill_batched_token_buckets
+        if self.config.dsa_long_context:
+            # [requests, pages]: a size guess picks the page axis when it equals the tokens
+            flags["input_seq_dims"] = {"dsa_kv_table": 0, "dsa_index_table": 0}
+            # a captured prefill plans dense attention, which a step past
+            # prefill_chunk_tokens leaves unplanned (declare_step)
+            chunk = self.config.prefill_chunk_tokens
+            past = sorted({n for n in (*prefill_buckets, *(batched or ())) if n > chunk})
+            if past:
+                logger.warning("Glm52LLMSubmodule: prefill buckets %s pass prefill_chunk_tokens="
+                               "%d and run eager, in row chunks", past, chunk)
+                prefill_buckets = [n for n in prefill_buckets if n <= chunk]
+                batched = [n for n in batched or () if n <= chunk]
+        groups = [(prefill_buckets, prefill_batch_sizes)]
         if batched:
             # one request's buckets and a batch's apart, so each can be fine or coarse
             groups = [(prefill_buckets, [bs for bs in prefill_batch_sizes if bs == 1]),
@@ -351,7 +389,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     capture_batch_sizes=list(sizes),
                     **flags,
                 )
-                for buckets, sizes in groups if sizes
+                for buckets, sizes in groups if buckets and sizes
             ),
         ]
         if self.config.dsa_long_context and self.mtp_k:
