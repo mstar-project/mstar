@@ -33,6 +33,12 @@ from mstar.graph.runtime.base import (
     ReadyNodeSpec,
 )
 from mstar.utils.containers import ParallelList
+from mstar.worker.batch_builder import (
+    BaseBatchBuilder,
+    BatchBuildRequest,
+    BatchBuildResult,
+    FIFOBatchBuilder,
+)
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 
 
@@ -138,6 +144,14 @@ class _Runtime:
         for rid in rids:
             queue._ready.setdefault(rid, set()).add(node_name)
 
+    def set_in_flight(self, node_name, wg_id, rids, in_flight):
+        del wg_id
+        for rid in rids:
+            if in_flight:
+                self._manager.in_flight.add((rid, node_name))
+            else:
+                self._manager.in_flight.discard((rid, node_name))
+
 
 class _Manager:
     """Stands in for RequestStateManager: one worker graph, one node."""
@@ -147,6 +161,14 @@ class _Manager:
         self.per_request_info = dict.fromkeys(rids, object())
         self._walk = walk
         self.runtime = _Runtime(self)
+        # (rid, node) pairs marked in flight
+        self.in_flight: set = set()
+
+    def ingest(self, rid, node=NODE):
+        """An input landing for a node whose inputs are already satisfied:
+        the graph re-readies it unless it is in flight."""
+        if (rid, node) not in self.in_flight:
+            self.queues["wg0"]._ready.setdefault(rid, set()).add(node)
 
     def get_partition_for_node(self, node_name):
         del node_name
@@ -759,3 +781,150 @@ def test_a_submodule_that_does_not_opt_in_is_never_split():
 
 def test_a_walk_without_a_capture_is_never_split():
     assert _capture_group(captured=()) is None
+
+
+# ── pluggable batch builder ─────────────────────────────────────────────
+
+
+class _ReturnOddBuilder(BaseBatchBuilder):
+    """Runs the even-numbered rids and hands the odd ones back to the queue."""
+
+    def __init__(self):
+        self.requests: list[BatchBuildRequest] = []
+
+    def build_batch(self, request):
+        self.requests.append(request)
+        batch = request.fresh
+        odd = {rid for rid in batch.request_to_worker_graph if int(rid[1:]) % 2}
+        scheduled, returned = batch.split_off_first(None, exclude_rids=odd)
+        return BatchBuildResult(scheduled, returned=returned.request_to_worker_graph)
+
+
+def test_the_scheduler_runs_the_configured_builder():
+    sched = _scheduler(_Engine(max_bs=8))
+    builder = sched.batch_builder = _ReturnOddBuilder()
+    manager = _Manager(["r0", "r1", "r2", "r3"])
+
+    batch = _next_batch(sched, manager, capture_group_of="r2")
+
+    assert list(batch.request_to_worker_graph) == ["r0", "r2"]
+    (request,) = builder.requests
+    assert (request.node_name, request.graph_walk) == (NODE, WALK)
+    assert request.max_batch_size == 8
+    assert request.capture_group_of == "r2"
+
+
+def test_returned_rows_go_back_to_their_ready_queue_not_the_backlog():
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.batch_builder = _ReturnOddBuilder()
+    manager = _Manager(["r0", "r1", "r2", "r3"])
+
+    _next_batch(sched, manager)
+
+    assert not sched.backlog
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"r1", "r3"}
+
+
+def test_fifo_puts_the_backlog_ahead_of_fresh_rows():
+    """Not reachable through `get_next_batch` yet, which serves a backlog on
+    its own; a builder handed both must still keep arrival order."""
+    builder = FIFOBatchBuilder()
+    result = builder.build_batch(BatchBuildRequest(
+        node_name=NODE, graph_walk=WALK,
+        backlog=_batch(["b0", "b1"]),
+        fresh=_batch(["f0", "f1"]),
+        max_batch_size=3,
+    ))
+
+    assert list(result.scheduled.request_to_worker_graph) == ["b0", "b1", "f0"]
+    assert list(result.backlog.request_to_worker_graph) == ["f1"]
+    assert result.returned is None
+
+
+# ── one builder call per step ───────────────────────────────────────────
+
+
+def test_fresh_rows_join_a_short_backlog_in_one_step():
+    """A one-row remainder must not run alone while its walk has fresh rows
+    queued: that step would run at a fraction of the batch."""
+    sched = _scheduler(_Engine(max_bs=3))
+    sched.backlog[(NODE, WALK)] = _batch(["b0"])
+
+    batch = _next_batch(sched, _Manager(["f0", "f1", "f2"]))
+
+    assert list(batch.request_to_worker_graph) == ["b0", "f0", "f1"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["f2"]
+
+
+def test_a_backlogged_walk_goes_before_a_less_recent_fresh_one():
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.node_and_walk_to_last_batch_num[("B", WALK)] = 5
+    sched.backlog[("B", WALK)] = _batch(["b0"], node="B")
+
+    batch = _next_batch(sched, _Manager(["f0"]))
+
+    assert (batch.node_name, list(batch.request_to_worker_graph)) == ("B", ["b0"])
+
+
+def test_a_blocked_backlog_falls_through_to_the_ready_scan():
+    sched = _scheduler(_Engine(max_bs=8, not_ready={"b0"}))
+    sched.backlog[("B", WALK)] = _batch(["b0"], node="B")
+
+    batch = _next_batch(sched, _Manager(["f0"]))
+
+    assert (batch.node_name, list(batch.request_to_worker_graph)) == (NODE, ["f0"])
+    assert list(sched.backlog[("B", WALK)].request_to_worker_graph) == ["b0"]
+
+
+def test_a_full_caller_pops_neither_the_backlog_nor_the_queue():
+    sched = _scheduler(_Engine(max_bs=2))
+    sched.backlog[(NODE, WALK)] = _batch(["b0"])
+    manager = _Manager(["f0"])
+
+    assert _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=2,
+    ) is None
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b0"]
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"f0"}
+
+
+def test_a_tp_follow_batch_goes_before_the_backlog():
+    """The leader already sits in the collective for it."""
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.backlog[("B", WALK)] = _batch(["b0"], node="B")
+    sched.register_tp_follow(
+        ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=["t0"]),
+    )
+
+    batch = _next_batch(sched, _Manager(["t0"]))
+
+    assert (batch.node_name, list(batch.request_to_worker_graph)) == (NODE, ["t0"])
+    assert ("B", WALK) in sched.backlog
+
+
+def test_an_input_landing_on_a_backlogged_row_does_not_ready_it_again():
+    """A backlogged row's node is off its ready queue but not yet running. A
+    streamed input arriving for it then re-readied it, the next scan popped it
+    again, and the rid ran twice."""
+    sched = _scheduler(_Engine(max_bs=1))
+    manager = _Manager(["r0", "r1"])
+
+    assert list(_next_batch(sched, manager).request_to_worker_graph) == ["r0"]
+    assert ("r1", NODE) in manager.in_flight
+    manager.ingest("r1")
+
+    assert list(_next_batch(sched, manager).request_to_worker_graph) == ["r1"]
+    assert _next_batch(sched, manager) is None
+
+
+def test_returned_rows_are_no_longer_in_flight():
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.batch_builder = _ReturnOddBuilder()
+    manager = _Manager(["r0", "r1"])
+    manager.in_flight.add(("r1", NODE))
+
+    _next_batch(sched, manager)
+
+    assert ("r1", NODE) not in manager.in_flight

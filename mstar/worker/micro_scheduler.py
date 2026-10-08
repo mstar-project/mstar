@@ -11,6 +11,12 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AdmitRuntimeError
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
+from mstar.worker.batch_builder import (
+    BatchBuilderType,
+    BatchBuildRequest,
+    BatchBuildResult,
+    make_batch_builder,
+)
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
 
@@ -69,6 +75,9 @@ class ScheduledBatch:
         assert (self.node_name, self.graph_walk) == (
             other.node_name, other.graph_walk
         ), "only batches for the same (node, walk) share a backlog entry"
+        assert self.request_to_worker_graph.keys().isdisjoint(
+            other.request_to_worker_graph
+        ), "a rid is in both halves of a merge; its node was popped twice"
         self.request_to_worker_graph.update(other.request_to_worker_graph)
         self.input_edges.extend(other.input_edges)
 
@@ -148,8 +157,10 @@ class MicroScheduler:
         sched_type=SchedulingType.ROUND_ROBIN,
         parallel_leader_nodes: set[str] | None = None,
         max_consec_tp_follower_batches: int = 1,
+        batch_builder_type: BatchBuilderType = BatchBuilderType.FIFO,
     ):
         self.engine_manager = engine_manager
+        self.batch_builder = make_batch_builder(batch_builder_type)
         self.batch_number = 0
         # The graph runtime, installed by the worker. Interning and the
         # (walk, node) -> worker graph index both live there.
@@ -214,22 +225,14 @@ class MicroScheduler:
         return self._last_popped_tp_seq
 
     def _select_node_rr(
-        self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
-    ):
-        best_node_name = None
-        best_graph_walk = None
-        least_recent_step = float('inf')
-
-        for node_name, reqs in node_name_to_requests.items():
-            for req in reqs:
-                step = self.node_and_walk_to_last_batch_num.get((
-                    node_name, req.graph_walk
-                ), 0)
-                if step < least_recent_step:
-                    least_recent_step = step
-                    best_node_name = node_name
-                    best_graph_walk = req.graph_walk
-        return best_node_name, best_graph_walk
+        self, ready: dict[tuple[str, str], list[ReadyNodeEntry]],
+    ) -> tuple[str, str] | None:
+        """The least recently scheduled (node, walk) with a ready row; ties go
+        to the first scanned."""
+        return min(
+            ready, default=None,
+            key=lambda key: self.node_and_walk_to_last_batch_num.get(key, 0),
+        )
 
     def hold_requests(self, request_ids: list[int]) -> None:
         """Put requests on hold for a brief backoff period after OOM."""
@@ -416,12 +419,12 @@ class MicroScheduler:
         capture_group_of: int | None = None,
     ) -> ScheduledBatch | None:
         """
-        Scans all worker graph queues for ready nodes, groups by node name,
-        and returns one step's worth.
+        One step's worth: a pending TP follow batch if there is one, else
+        the batch builder's pick from one (node, walk)'s backlog and ready rows.
 
-        A backlogged step — the remainder of a ready set too big for one
-        forward — takes precedence over a fresh scan, so a split set drains
-        before anything else starts.
+        A (node, walk) with a backlog — the remainder of a ready set too big
+        for one forward — goes first, so a split set drains before anything
+        else starts; its fresh ready rows join the same step.
 
         A batch holds one capture group (``Engine.capture_group``); rids of
         another group wait in the backlog for a batch of their own.
@@ -441,19 +444,6 @@ class MicroScheduler:
             rid: t for rid, t in self.held_until.items() if t > now
         }
 
-        sched_from_backlog = self._schedule_from_backlogged(
-            request_state, target=target,
-            max_batch_size=max_batch_size,
-            pre_existing_batch_size=pre_existing_batch_size,
-            capture_group_of=capture_group_of,
-        )
-        if sched_from_backlog is not None:
-            return sched_from_backlog
-
-        # Collect all ready (node_name, request_id, graph_walk) tuples
-        # grouped by node name
-        node_name_to_requests: dict[str, list[ReadyNodeEntry]] = {}
-
         # Note: a TP follow batch has to be scheduled irrespective of failure.
         # Rank 0 already committed to this batch and will sit on the collective
         # inside the forward until every follower joins it, so a follower that
@@ -471,6 +461,37 @@ class MicroScheduler:
             self.num_consec_tp_follower_batches += 1
             return tp_follow_batch
 
+        if self.sched_type != SchedulingType.ROUND_ROBIN:
+            raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
+        ready = self._scan_ready(request_state, target, exclude_target)
+
+        # A backlogged key goes first, oldest first, so a split set drains
+        # before anything else starts; its fresh rows ride along. A key whose
+        # step comes out empty (every backlogged row blocked) is passed over
+        # rather than leaving the worker idle behind it. `exclude_target` is
+        # only a fairness hint, and finishing a split set beats fairness.
+        keys = [k for k in self.backlog if target is None or k == target]
+        rr_key = self._select_node_rr(ready)
+        if rr_key is not None and rr_key not in keys:
+            keys.append(rr_key)
+        for key in keys:
+            scheduled = self._schedule_key(
+                request_state, key, ready.get(key, []),
+                max_batch_size=max_batch_size,
+                pre_existing_batch_size=pre_existing_batch_size,
+                capture_group_of=capture_group_of,
+            )
+            if scheduled is not None:
+                return scheduled
+        return None
+
+    def _scan_ready(
+        self, request_state: RequestStateManager,
+        target: tuple[str, str] | None,
+        exclude_target: tuple[str, str] | None,
+    ) -> dict[tuple[str, str], list[ReadyNodeEntry]]:
+        """Engine-ready rows on the queues, by (node, walk), in scan order."""
+        ready: dict[tuple[str, str], list[ReadyNodeEntry]] = {}
         # Do not schedule a request that was removed between scheduling
         # cycles, has its remove deferred for in-flight safety, is in OOM
         # backoff, or recently failed.
@@ -492,47 +513,47 @@ class MicroScheduler:
                 # (e.g., for AR, whether the kv cache is read in)
                 if not self._check_ready(spec.node_name, rid, fwd_info):
                     continue
-                node_name_to_requests.setdefault(spec.node_name, []).append(
+                ready.setdefault((spec.node_name, spec.graph_walk), []).append(
                     ReadyNodeEntry(rid, wg_id, spec.graph_walk)
                 )
+        return ready
 
-        if not node_name_to_requests:
-            return None
-
-        if self.sched_type != SchedulingType.ROUND_ROBIN:
-            raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
-        best_node_name, graph_walk = self._select_node_rr(node_name_to_requests)
-
-        if best_node_name is None:
-            return None
-
-        # Pop ready nodes for all requests of this node name
-        entries = [e for e in node_name_to_requests[best_node_name] \
-                   if e.graph_walk == graph_walk]
-
+    def _schedule_key(
+        self, request_state: RequestStateManager,
+        node_walk: tuple[str, str], entries: list[ReadyNodeEntry],
+        max_batch_size: int | None,
+        pre_existing_batch_size: int,
+        capture_group_of: int | None,
+    ) -> ScheduledBatch | None:
+        """One step for ``node_walk`` out of its backlog and its ready
+        ``entries``, composed by the batch builder."""
+        backlogged = self.backlog.pop(node_walk, None)
+        blocked = set()
+        if backlogged is not None:
+            blocked = self._unready_backlog_rids(backlogged, request_state)
+            if not backlogged:
+                backlogged = None  # every row failed
         if max_batch_size is None:
-            max_batch_size = self._max_batch_size(best_node_name, graph_walk)
+            max_batch_size = self._max_batch_size(*node_walk)
         remaining = self._remaining_capacity(max_batch_size, pre_existing_batch_size)
         if remaining is not None and remaining <= 0:
             # The caller already holds a full batch. Assembling would pop these
             # nodes off their ready queues with nowhere to run them, so leave
             # them queued for the next pass.
+            if backlogged is not None:
+                self._backlog(node_walk, backlogged)
             return None
 
-        full_batch = self._assemble_batch(
-            request_state, best_node_name, graph_walk, entries
-        )
-        if not full_batch:
+        fresh = self._assemble_batch(request_state, *node_walk, entries) \
+            if entries else None
+        if backlogged is None and not fresh:
             return None
-
-        # Everything past the first step is already popped off the queues, so
-        # it has to be remembered here or it would never run.
-        return self._cap_batch_and_schedule(
-            batch=full_batch, max_bs=remaining,
-            exclude_rids=self._off_group_rids(
-                request_state, full_batch, anchor=capture_group_of,
-            ),
-        )
+        return self._build_and_schedule(request_state, BatchBuildRequest(
+            node_name=node_walk[0], graph_walk=node_walk[1],
+            backlog=backlogged, fresh=fresh or None, blocked_rids=blocked,
+            max_batch_size=remaining,
+            capture_group_of=capture_group_of,
+        ))
 
     @staticmethod
     def _remaining_capacity(
@@ -553,35 +574,13 @@ class MicroScheduler:
             node_name, graph_walk, rid, fwd_info,
         )
 
-    def _off_group_rids(
-        self, request_state: RequestStateManager, batch: ScheduledBatch,
-        exclude_rids: set[int] = frozenset(), anchor: int | None = None,
-    ) -> set[int]:
-        """The rids of ``batch`` outside ``anchor``'s capture group, or outside
-        the first eligible rid's when no anchor is given."""
-        rids = [
-            rid for rid in batch.request_to_worker_graph
-            if rid not in exclude_rids
-        ]
-        if not rids:
-            return set()
-        group = functools.partial(
-            self._capture_group, request_state,
-            batch.node_name, batch.graph_walk,
-        )
-        # `is not None`: handle 0 is a real rid
-        wanted = group(rids[0] if anchor is None else anchor)
-        return {rid for rid in rids if group(rid) != wanted}
-
     def backlog_splits_from(
         self, request_state: RequestStateManager,
         target: tuple[str, str], rid: int,
     ) -> bool:
-        """Whether ``target``'s backlog holds a live rid outside ``rid``'s
-        capture group.
-
-        A speculation chain only merges its own group, so such a rid waits
-        until the chain stops; the chain has to yield for it to run.
+        """Whether ``target``'s backlog holds a live rid a speculation chain
+        anchored at ``rid`` would never merge (``chain_must_yield``), so the
+        chain has to yield for it to run.
         """
         waiting = self.backlog.get(target)
         if waiting is None:
@@ -594,16 +593,16 @@ class MicroScheduler:
         }
         if not live:
             return False
-        exclude = set(waiting.request_to_worker_graph) - live
-        return bool(self._off_group_rids(
-            request_state, waiting, exclude_rids=exclude, anchor=rid,
-        ))
+        return self.batch_builder.chain_must_yield(
+            waiting, live, rid,
+            functools.partial(self._capture_group, request_state, *target),
+        )
 
-    def _filter_cap_and_schedule(
-        self, batch: ScheduledBatch, max_bs: int,
-        request_state: RequestStateManager,
-        capture_group_of: int | None = None,
-    ):
+    def _unready_backlog_rids(
+        self, batch: ScheduledBatch, request_state: RequestStateManager,
+    ) -> set[int]:
+        """The rows of a backlogged ``batch`` that cannot run yet; failed rows
+        are dropped from it instead."""
         node_partition = request_state.get_partition_for_node(batch.node_name)
         not_ready_rids = {
             rid for rid in batch.request_to_worker_graph if not self._check_ready(
@@ -621,39 +620,37 @@ class MicroScheduler:
             batch.input_edges = batch.input_edges.select_rids(
                 batch.request_to_worker_graph.keys()
             )
-        not_ready_rids -= self.failed_rids
-        off_group = self._off_group_rids(
-            request_state, batch, not_ready_rids, anchor=capture_group_of,
-        )
-        return self._cap_batch_and_schedule(
-            batch, max_bs, not_ready_rids | off_group,
-        )
+        return not_ready_rids - self.failed_rids
 
-
-    def _cap_batch_and_schedule(
-        self, batch: ScheduledBatch, max_bs: int | None,
-        exclude_rids: set[int] | None=None
+    def _build_and_schedule(
+        self, request_state: RequestStateManager, request: BatchBuildRequest,
     ) -> ScheduledBatch | None:
-        """One step's worth off ``batch``; whatever is left goes to the backlog.
+        """Have the batch builder compose one step for ``request``'s (node,
+        walk), and carry out its verdict.
 
         The single place a batch becomes scheduled, so the round-robin
         bookkeeping lives here — the backlog path has to count as scheduling
         its (node, walk) too, or a walk being served out of the backlog would
         look perpetually least-recent once it drains.
         """
-        node_walk = (batch.node_name, batch.graph_walk)
-        if max_bs is not None and max_bs <= 0:
-            self._backlog(node_walk, batch)
-            return None
-        capped_batch, remainder = batch.split_off_first(
-            max_bs, exclude_rids=exclude_rids
+        node_walk = (request.node_name, request.graph_walk)
+        request.capture_group = functools.partial(
+            self._capture_group, request_state, *node_walk,
         )
-        # only ever store a real remainder: `_drop_backlogged_rid` walks these
-        if remainder is not None:
-            self._backlog(node_walk, remainder)
-        if capped_batch is not None:
-            self._mark_scheduled(*node_walk, len(capped_batch))
-        return capped_batch
+        result: BatchBuildResult = self.batch_builder.build_batch(request)
+        # Whatever was popped past this step has to be remembered here, or it
+        # would never run.
+        if result.backlog is not None:
+            self._backlog(node_walk, result.backlog)
+        if result.returned:
+            self._set_in_flight(request.node_name, result.returned, False)
+            self.runtime.push_back_node(
+                request.node_name, list(result.returned),
+                list(result.returned.values()),
+            )
+        if result.scheduled is not None:
+            self._mark_scheduled(*node_walk, len(result.scheduled))
+        return result.scheduled
 
     def _backlog(self, node_walk: tuple[str, str], batch: ScheduledBatch) -> None:
         """Park ``batch``, folding it into whatever already waits under this key.
@@ -667,6 +664,19 @@ class MicroScheduler:
             self.backlog[node_walk] = batch
         else:
             existing.merge(batch)
+        # Claimed like a running batch: an input arriving while it waits must
+        # not put its node back on the ready queue, where it would be popped
+        # a second time.
+        self._set_in_flight(batch.node_name, batch.request_to_worker_graph, True)
+
+    def _set_in_flight(
+        self, node_name: str, rid_to_wg: dict[int, int], in_flight: bool,
+    ) -> None:
+        by_wg: dict[int, list[int]] = defaultdict(list)
+        for rid, wg_id in rid_to_wg.items():
+            by_wg[wg_id].append(rid)
+        for wg_id, rids in by_wg.items():
+            self.runtime.set_in_flight(node_name, wg_id, rids, in_flight)
 
     def _mark_scheduled(
         self, node_name: str, graph_walk: str, num_requests: int,
@@ -678,46 +688,6 @@ class MicroScheduler:
         )
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[(node_name, graph_walk)] = self.batch_number
-
-    def _schedule_from_backlogged(
-        self, request_state: RequestStateManager,
-        target: tuple[str, str] | None = None,
-        max_batch_size: int | None=None,
-        pre_existing_batch_size: int = 0,
-        capture_group_of: int | None = None,
-    ) -> ScheduledBatch | None:
-        """The oldest backlogged step with a ready request in it.
-
-        A caller targeting a specific (node, walk) — the TP-follow and
-        speculation paths — must get that one or nothing, so a backlog entry
-        for something else stays put. ``exclude_target`` is only a fairness
-        hint, and finishing a split set beats fairness.
-
-        A chunk whose requests are all blocked (its pages went to an eviction
-        while it waited) is put back and the next one tried, rather than
-        returning None and leaving the worker idle behind it.
-        """
-        if not self.backlog or target is not None and target not in self.backlog:
-            return None
-
-        # snapshot: `_cap_batch_and_schedule` re-inserts what it doesn't take,
-        # which moves that entry to the back
-        node_walks = list(self.backlog.keys())
-        for node_walk in node_walks:
-            if target is not None and node_walk != target:
-                continue
-            backlogged = self.backlog.pop(node_walk)
-            curr_max_bs = self._max_batch_size(backlogged.node_name, backlogged.graph_walk) \
-                if max_batch_size is None else max_batch_size
-            scheduled = self._filter_cap_and_schedule(
-                batch=backlogged,
-                max_bs=self._remaining_capacity(curr_max_bs, pre_existing_batch_size),
-                request_state=request_state,
-                capture_group_of=capture_group_of,
-            )
-            if scheduled is not None:
-                return scheduled
-        return None
 
     def _drop_backlogged_rid(self, rid: int) -> None:
         """Take a request out of anything still queued for it.
@@ -786,21 +756,11 @@ class MicroScheduler:
         return False
 
     def room_for_continuing(self, target: tuple[str, str]) -> int | None:
-        """How many of a speculative batch's own rids fit once this target's
-        backlog is served first.
-
-        The chain only ever continues its own rids, so at the cap a backlogged
-        chunk under the same (node, walk) would never be reached. Giving the
-        backlog first claim costs the displaced rids one step — their nodes go
-        ready again when the in-flight batch lands.
-
-        None for an uncapped node: everything fits, so nothing is displaced.
-        """
-        cap = self._max_batch_size(*target)
-        if cap is None:
-            return None
-        waiting = self.backlog.get(target)
-        return max(0, cap - (0 if waiting is None else len(waiting)))
+        """How many of a speculative batch's own rids fit in ``target``'s step
+        beside its backlog; see ``BaseBatchBuilder.room_for_continuing``."""
+        return self.batch_builder.room_for_continuing(
+            self._max_batch_size(*target), self.backlog.get(target),
+        )
 
     def has_ready_excluding(
         self,
