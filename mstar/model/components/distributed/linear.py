@@ -248,14 +248,25 @@ class QKVParallelLinear(ColumnParallelLinear):
         """Copy this rank's q / k / v slice into ``param`` at the right
         offset within the merged qkv parameter.
 
-        ``loaded_shard_id`` must be one of ``"q"``, ``"k"``, or ``"v"``.
+        ``loaded_shard_id`` must be one of ``"q"``, ``"k"``, or ``"v"``, or
+        None for a checkpoint that stores the projection already fused as
+        ``[q; k; v]`` along dim 0 (e.g. Qwen ViTs' ``attn.qkv``).
         For GQA where ``tp_size > total_num_kv_heads`` the K / V heads
         are replicated across ranks (each rank in the same KV-replica
         group loads the same KV head).
         """
+        if loaded_shard_id is None:
+            q, k, v = loaded_weight.split([
+                self.total_num_heads * self.head_size,
+                self.total_num_kv_heads * self.head_size,
+                self.total_num_kv_heads * self.v_head_size,
+            ], dim=0)
+            for shard_id, shard in (("q", q), ("k", k), ("v", v)):
+                self.weight_loader(param, shard, shard_id)
+            return
         assert loaded_shard_id in ("q", "k", "v"), (
             f"QKVParallelLinear.weight_loader requires loaded_shard_id "
-            f"in {{'q','k','v'}}, got {loaded_shard_id!r}"
+            f"in {{'q','k','v'}} or None, got {loaded_shard_id!r}"
         )
         if loaded_shard_id == "q":
             per_partition = self.num_heads * self.head_size

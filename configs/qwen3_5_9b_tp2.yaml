@@ -1,10 +1,11 @@
 model: "qwen3_5_9b"
 max_seq_len: 32768
 node_groups:
-  # Text and images; video is refused (see `process_prompt`). Colocated: the
-  # encoder runs once per request, then idles.
+  # Text and images; video is refused (see `process_prompt`).
+  # Sharded over the LLM's ranks, as vLLM does: one leader schedules both.
   - node_names: [vision_encoder]
-    ranks: [0]
+    ranks: [0, 1]
+    tp_size: 2
   - node_names: [LLM]
     ranks: [0, 1]
     tp_size: 2

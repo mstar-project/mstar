@@ -652,7 +652,7 @@ class Qwen3_5DenseModel(Model):
 
     def get_default_sharding_config(self) -> ShardingConfig:
         return ShardingConfig(
-            groups=[], tp_enabled_nodes={"LLM"}, shard_dim={},
+            groups=[], tp_enabled_nodes={"LLM", "vision_encoder"}, shard_dim={},
         )
 
     def get_submodule(
@@ -696,7 +696,8 @@ class Qwen3_5DenseModel(Model):
                     "`node_groups`."
                 )
             tower = self._build(
-                lambda: Qwen3_5VisionModel(self.vision_config), dtype, device,
+                lambda: Qwen3_5VisionModel(self.vision_config, tp_group),
+                dtype, device,
             )
             load_qwen3_5_vision_weights(tower, weights_dir, device=device)
             tower.requires_grad_(False).eval()

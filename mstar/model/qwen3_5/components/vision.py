@@ -7,6 +7,10 @@ temporal rotary axis, and deepstack.
 
 Images arrive packed: ``pixel_values`` is ``[total_patches, patch_numel]`` and
 ``grid_thw`` gives each image's ``(t, h, w)`` patch grid.
+
+Under TP the tower shards as vLLM's does (``mm_encoder_tp_mode="weights"``):
+attention by head, the MLP and the merger column-then-row, each ending in one
+all-reduce. Patch embed, the position table and the norms replicate.
 """
 from __future__ import annotations
 
@@ -14,6 +18,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.distributed.communication import CommGroup
+from mstar.model.components.distributed import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
 
 # ----------------------------------------------------------------------------
@@ -175,13 +185,17 @@ class VisionPatchEmbed(nn.Module):
 class VisionPatchMerger(nn.Module):
     """Folds each ``m x m`` block of patches into one LLM-width token."""
 
-    def __init__(self, config: Qwen3_5VisionConfig):
+    def __init__(self, config: Qwen3_5VisionConfig, comm_group: CommGroup):
         super().__init__()
         self.merged_size = config.hidden_size * config.merge_unit
         self.norm = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.linear_fc1 = nn.Linear(self.merged_size, self.merged_size)
+        self.linear_fc1 = ColumnParallelLinear(
+            comm_group, self.merged_size, self.merged_size, bias=True,
+        )
         self.act_fn = nn.GELU()
-        self.linear_fc2 = nn.Linear(self.merged_size, config.out_hidden_size)
+        self.linear_fc2 = RowParallelLinear(
+            comm_group, self.merged_size, config.out_hidden_size, bias=True,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.norm(x).view(-1, self.merged_size)
@@ -191,13 +205,13 @@ class VisionPatchMerger(nn.Module):
 class VisionMLP(nn.Module):
     """Plain, not gated: one up projection, an activation, one down."""
 
-    def __init__(self, config: Qwen3_5VisionConfig):
+    def __init__(self, config: Qwen3_5VisionConfig, comm_group: CommGroup):
         super().__init__()
-        self.linear_fc1 = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=True,
+        self.linear_fc1 = ColumnParallelLinear(
+            comm_group, config.hidden_size, config.intermediate_size, bias=True,
         )
-        self.linear_fc2 = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=True,
+        self.linear_fc2 = RowParallelLinear(
+            comm_group, config.intermediate_size, config.hidden_size, bias=True,
         )
         if config.hidden_act not in ("gelu_pytorch_tanh", "gelu_new"):
             raise NotImplementedError(
@@ -218,12 +232,20 @@ class VisionAttention(nn.Module):
     (``CantSplit``) to codegen packed runs of three or more images.
     """
 
-    def __init__(self, config: Qwen3_5VisionConfig):
+    def __init__(self, config: Qwen3_5VisionConfig, comm_group: CommGroup):
         super().__init__()
-        self.num_heads = config.num_heads
         self.head_dim = config.head_dim
-        self.qkv = nn.Linear(config.hidden_size, config.hidden_size * 3, bias=True)
-        self.proj = nn.Linear(config.hidden_size, config.hidden_size)
+        # the checkpoint's `qkv` is already fused; its loader splits it by head
+        self.qkv = QKVParallelLinear(
+            comm_group=comm_group, hidden_size=config.hidden_size,
+            head_size=config.head_dim, total_num_heads=config.num_heads,
+            bias=True,
+        )
+        # this rank's heads; the ragged resource narrows to the same count
+        self.num_heads = self.qkv.num_heads
+        self.proj = RowParallelLinear(
+            comm_group, config.hidden_size, config.hidden_size, bias=True,
+        )
         self.ragged_attn = None
 
     def bind_resources(self, resources: dict) -> None:
@@ -263,12 +285,12 @@ class VisionAttention(nn.Module):
 
 
 class VisionBlock(nn.Module):
-    def __init__(self, config: Qwen3_5VisionConfig):
+    def __init__(self, config: Qwen3_5VisionConfig, comm_group: CommGroup):
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.attn = VisionAttention(config)
-        self.mlp = VisionMLP(config)
+        self.attn = VisionAttention(config, comm_group)
+        self.mlp = VisionMLP(config, comm_group)
 
     def forward(
         self,
@@ -283,8 +305,12 @@ class VisionBlock(nn.Module):
 
 
 class Qwen3_5VisionModel(nn.Module):
-    def __init__(self, config: Qwen3_5VisionConfig):
+    def __init__(
+        self, config: Qwen3_5VisionConfig, comm_group: CommGroup | None = None,
+    ):
         super().__init__()
+        if comm_group is None:
+            comm_group = CommGroup.trivial()
         if config.deepstack_visual_indexes:
             raise NotImplementedError(
                 "deepstack is not wired up: this tower returns merged "
@@ -298,9 +324,9 @@ class Qwen3_5VisionModel(nn.Module):
         )
         self.rotary_pos_emb = VisionRotaryEmbedding(config)
         self.blocks = nn.ModuleList(
-            VisionBlock(config) for _ in range(config.depth)
+            VisionBlock(config, comm_group) for _ in range(config.depth)
         )
-        self.merger = VisionPatchMerger(config)
+        self.merger = VisionPatchMerger(config, comm_group)
 
     def forward(
         self,
