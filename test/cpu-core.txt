@@ -53,3 +53,4 @@ test/modular/test_lazy_per_rid.py
 test/modular/test_step_context_rows.py
 test/modular/test_publish_snapshot_batch.py
 test/modular/test_sampler_for_cache.py
+test/modular/test_send_prep_entries.py
