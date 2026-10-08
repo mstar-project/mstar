@@ -55,3 +55,4 @@ test/modular/test_publish_snapshot_batch.py
 test/modular/test_sampler_for_cache.py
 test/modular/test_send_prep_entries.py
 test/modular/test_kv_prefix_batch.py
+test/modular/test_data_worker_wakeup.py
