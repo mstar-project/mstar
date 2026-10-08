@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
     from huggingface_hub import snapshot_download
 
+    if Path(repo_id).is_dir():
+        return repo_id
     try:
         local_dir = snapshot_download(
             repo_id=repo_id,
@@ -44,8 +46,9 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
             local_files_only=False,
         )
     except Exception as e:
-        logger.warning("Error downloading from huggingface: %s", str(e))
-        return repo_id
+        # offline with a cold cache, a gated repo, a full disk: returned as a local
+        # path, the model built without its quant config and failed later, elsewhere
+        raise RuntimeError(f"could not fetch {repo_id!r} from the Hugging Face Hub: {e}") from e
     return str(Path(local_dir))
 
 
