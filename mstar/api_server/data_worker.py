@@ -248,9 +248,12 @@ class PreprocessWorker:
     def new_result_token(
         self, request_id: str, value: int,
         loop_indices: NestedLoopIndices | None, signal: str, modality: str,
+        wake: bool = True,
     ):
         """A value that rode inline: same accounting as a result tensor, no
-        transport read and nothing to ack."""
+        transport read and nothing to ack. ``wake=False`` queues without
+        ending the thread's idle wait: a frame's caller hands over every
+        request's value first and calls ``wake`` once."""
         if request_id not in self.output_loop_idxs:
             logger.debug("Late token for cleaned-up request %s dropped", request_id)
             return
@@ -262,6 +265,11 @@ class PreprocessWorker:
         self.result_tensor_input_queue.put(
             InlineToken(request_id, value, loop_indices, modality)
         )
+        if wake:
+            self._signal()
+
+    def wake(self):
+        """End the thread's idle wait after a batch of ``wake=False`` puts."""
         self._signal()
 
     def discard_result_tensors(self, input: ResultTensors):
