@@ -6,6 +6,7 @@
 import logging
 import os
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -22,7 +23,16 @@ from mstar.engine.cuda_graph_config import (
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    keep_final_chunk_samples,
+)
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -37,9 +47,11 @@ from mstar.model.bagel.components.vit_encoder import VIT_ATTN
 from mstar.model.bagel.config import MIXED_TEXT, BagelModelConfig
 from mstar.model.higgs_audio.config import SAMPLER
 from mstar.model.submodule_base import (
+    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    ChunkingPolicy,
     InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
@@ -427,6 +439,11 @@ class ViTEncoderSubmodule(NodeSubmodule):
             out[rid] = {"img_emb": [features[offset:offset + n]]}
             offset += n
         return out
+
+
+def _unguided(fwd_info: CurrentForwardPassInfo) -> bool:
+    """A guided prompt writes two labels from one input, as `_skip_cached_prefix` refuses."""
+    return not fwd_info.step_metadata.get("requires_cfg", False)
 
 
 # Added to the request seed for the VAE posterior draw, so it is a different
@@ -900,6 +917,29 @@ class LLMSubmodule(ARNodeSubmodule):
             return InputSeqLenInfo(1)
         return None
 
+    MAX_BATCH_TOKENS = 1024
+
+    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
+        if graph_walk == "prefill_text":
+            return ChunkingPolicy(
+                chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS,
+                reuses_cached_prefix=_unguided,
+            )
+        if graph_walk == MIXED_TEXT:
+            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
+        return NO_CHUNKING
+
+    def split_inputs(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: ARNodeInputs, start: int, end: int,
+    ) -> ARNodeInputs:
+        # resource_step_info is the row's requires_cfg flag, the same for every chunk
+        cut = super().split_inputs(
+            graph_walk, fwd_info, replace(inputs, resource_step_info=None), start, end,
+        )
+        cut.resource_step_info = inputs.resource_step_info
+        return cut
+
     def declare_step(
         self,
         graph_walk: str,
@@ -980,12 +1020,17 @@ class LLMSubmodule(ARNodeSubmodule):
 
         pre_forks: tuple = ()
         post_forks: tuple = ()
+        fork_rids = None
         row_walks = [inp.graph_walk or graph_walk for inp in inputs]
         if requires_cfg:
             if "prefill_text" in row_walks:
                 # cfg_text keeps the pre-text context, so it forks before
-                # anything plans or writes.
-                pre_forks = (("main", "cfg_text"),)
+                # anything plans or writes: a chunked prompt, on its first chunk
+                fork_rids = frozenset(
+                    rid for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
+                    if walk == "prefill_text" and inp.chunk_start == 0
+                )
+                pre_forks = (("main", "cfg_text"),) if fork_rids else ()
             elif graph_walk in ("prefill_vit", "prefill_vae"):
                 # cfg_text tracks the context including this image, so it
                 # forks at commit, after the step's writes have landed.
@@ -1006,14 +1051,14 @@ class LLMSubmodule(ARNodeSubmodule):
             # The prompt's tokens enter the repetition-penalty mask here; the
             # sampler resource adds them at plan time. Only prefill carries
             # them — a sampled token is tracked by the sampler itself.
-            steps["sampler"] = SamplerStep(
+            steps["sampler"] = keep_final_chunk_samples(SamplerStep(
                 prefill_tracked_tokens={
                     rid: inp.input_ids
                     for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
                     if inp.input_ids is not None and walk == "prefill_text"
                 },
                 kept_rids=kept_rids,
-            )
+            ), request_ids, inputs)
         elif graph_walk == "prefill_vit":
             # prefill_vit is the last walk before decode for an image prompt,
             # so it samples the first token too (prefill_vae never does).
@@ -1027,6 +1072,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 commit=writes,
                 pre_forks=pre_forks,
                 post_forks=post_forks,
+                fork_rids=fork_rids,
             ),
             "attn": AttentionStep(
                 segments=segments,
@@ -1130,10 +1176,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 label="main", **kwargs
             )
         if sample_token:
-            qo_indptr_buf = self.node_resources["attn"].qo_indptr_buf("main")
-            assert qo_indptr_buf is not None
-            last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
-            last_hidden = hidden.index_select(0, last_token_indices)
+            last_hidden = self.node_resources["attn"].select_last_hidden(hidden, "main")
             logits = self.lm_head(last_hidden)
             # `_LOGITS` is the private handoff to whichever dispatcher called:
             # the shape of a sampled token is `forward` vs `forward_batched`'s
@@ -1162,10 +1205,7 @@ class LLMSubmodule(ARNodeSubmodule):
         )
 
         if sample_token:
-            qo_indptr_buf = self.node_resources["attn"].qo_indptr_buf("main")
-            assert qo_indptr_buf is not None
-            last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
-            last_hidden = hidden.index_select(0, last_token_indices)
+            last_hidden = self.node_resources["attn"].select_last_hidden(hidden, "main")
             logits = self.lm_head(last_hidden)
             return {_LOGITS: [logits]}
         return {}
@@ -1590,8 +1630,10 @@ class LLMSubmodule(ARNodeSubmodule):
     ):
         if "new_token" not in outputs:
             return
+        inputs = kwargs.get("inputs")
         if request_info.graph_walk != "decode" and (
             not request_info.step_metadata.get("sample_prefill_token", False)
+            or (inputs is not None and not inputs.is_final_chunk)  # only the last chunk's token is real
         ):
             outputs.pop("new_token")
             return

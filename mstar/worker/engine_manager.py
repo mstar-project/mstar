@@ -15,6 +15,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model
+from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.streams import reset_device_scheduling
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,26 @@ def _refuse_unskippable_resources(
             "which the model keyed for prefix reuse; either drop the stream "
             "or give the resource the prefix hooks"
         )
+
+
+def _refuse_unsupported_chunking(
+    submodules: dict, model: Model, parallel_groups: WorkerParallelGroups,
+) -> None:
+    """A chunked walk must report row lengths, and chunking under TP/SP is not supported yet."""
+    for walk, section in model.get_graph_walk_graphs().items():
+        for node in section.get_nodes():
+            submodule = submodules.get(node)
+            if submodule is None or not submodule.get_chunking_policy(walk).chunkable:
+                continue
+            if type(submodule).get_input_sequence_len is NodeSubmodule.get_input_sequence_len:
+                raise ValueError(
+                    f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
+                    "report get_input_sequence_len"
+                )
+            if parallel_groups.get_instance_world_size_for_node(node) > 1:
+                raise NotImplementedError(
+                    f"{type(model).__name__}: chunked prefill of {node!r} under TP/SP"
+                )
 
 
 def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
@@ -133,6 +154,25 @@ def _refuse_unknown_walks(model: Model) -> None:
 
 
 @dataclass
+class LoadedSubmodules:
+    """A worker's submodules before its engine exists."""
+    submodules: dict[str, NodeSubmodule]
+    specs: list
+    autocast_dtype: torch.dtype
+
+    def chunkable_node_walks(self, model: Model) -> list[tuple[str, str]]:
+        """(node, walk) pairs whose prefill may be split, which speculation
+        must never target (``disable_spec_node_walks``)."""
+        return sorted(
+            (node, walk)
+            for walk, section in model.get_graph_walk_graphs().items()
+            for node in section.get_nodes()
+            if node in self.submodules
+            and self.submodules[node].get_chunking_policy(walk).chunkable
+        )
+
+
+@dataclass
 class EngineManager:
     """Owns the worker's engine.
 
@@ -142,20 +182,16 @@ class EngineManager:
     engine: Engine
     node_names: set[str] = field(default_factory=set)
 
-    @classmethod
-    def build(
-        cls,
+    @staticmethod
+    def load_submodules(
         node_names: set[str],
         device: torch.device,
         model_config: dict,
         parallel_groups: WorkerParallelGroups,
-        transfer_engine_info: TransferEngineInfo,
         model: Model,
-        graph_runtime: GraphRuntime,
-        enable_nvtx: bool = False,
-        enable_prof: bool=False,
-    ) -> "EngineManager":
-        """Build the engine and load this worker's nodes into it.
+    ) -> LoadedSubmodules:
+        """This worker's nodes' submodules and resource specs, checked; the
+        engine is built from them by ``build``.
 
         The model supplies each node's submodule via ``get_submodule`` and its
         resources via ``get_node_resources``; the KV cache's shape rides on
@@ -205,6 +241,28 @@ class EngineManager:
             node_dtype = submodule.get_autocast_dtype() or autocast_dtype
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
+        _refuse_unsupported_chunking(submodules, model, parallel_groups)
+        return LoadedSubmodules(submodules, specs, autocast_dtype)
+
+    @classmethod
+    def build(
+        cls,
+        node_names: set[str],
+        device: torch.device,
+        model_config: dict,
+        parallel_groups: WorkerParallelGroups,
+        transfer_engine_info: TransferEngineInfo,
+        model: Model,
+        graph_runtime: GraphRuntime,
+        enable_nvtx: bool = False,
+        enable_prof: bool=False,
+        loaded: LoadedSubmodules | None = None,
+    ) -> "EngineManager":
+        """Build the engine and load this worker's nodes into it, from
+        ``loaded`` when the caller needed the submodules first."""
+        if loaded is None:
+            loaded = cls.load_submodules(node_names, device, model_config, parallel_groups, model)
+        submodules, specs, autocast_dtype = loaded.submodules, loaded.specs, loaded.autocast_dtype
 
         engine = Engine(
             graph_runtime=graph_runtime,
@@ -221,6 +279,12 @@ class EngineManager:
             kv_cache_type=autocast_dtype,
             model=model,
         )
+        budgets = model_config.get("max_batch_tokens") or {}
+        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
+        unknown = sorted(set(budgets) - known)
+        if unknown:
+            raise ValueError(f"max_batch_tokens names nodes {unknown} that no node group serves")
+        engine.set_token_budgets(budgets, set(model.get_graph_walk_graphs()))
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
         return cls(engine=engine, node_names=set(node_names))

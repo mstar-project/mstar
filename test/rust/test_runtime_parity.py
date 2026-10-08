@@ -119,7 +119,7 @@ def _sharding():
     return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
 
 
-def _python():
+def _python(**kwargs):
     book = PythonTensorBookkeeping()
     tm = _StubTensorManager(book)
     wg = WorkerGraph(
@@ -134,11 +134,12 @@ def _python():
         sharding_config=_sharding(),
         tensor_manager=tm,
         communicator=None,
+        **kwargs,
     )
     return rt, book, tm.tensor_store
 
 
-def _rust():
+def _rust(**kwargs):
     book = RustTensorBookkeeping()
     wg = WorkerGraph(
         section=_graph(), graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
@@ -151,6 +152,7 @@ def _rust():
         node_to_partition=dict.fromkeys(NODES, "default"),
         sharding_config=_sharding(),
         bookkeeping=book,
+        **kwargs,
     )
     return rt, book, None
 
@@ -309,6 +311,21 @@ def test_speculation_agrees(pair):
     ]
     # Speculating must leave nothing behind.
     assert _ready(rt) == []
+
+
+@pytest.mark.parametrize("make", [_python, _rust])
+def test_a_disabled_node_walk_is_never_a_speculation_target(make):
+    """A chunkable (node, walk) is measured and cut when scheduled, so the
+    runtime never offers it, whether entered or looped back into."""
+    rt, _book, _store = make(disable_spec_node_walks=[("ar_decode", WALK)])
+    rid = _admit(rt)
+    assert _spec_targets(rt, "prefill", WALK, rid) == []
+    assert _spec_targets(rt, "ar_decode", WALK, rid) == []
+    assert _ready(rt) == []
+
+    rt, _book, _store = make(disable_spec_node_walks=[("ar_decode", "another_walk")])
+    rid = _admit(rt)
+    assert [o.node_name for o in _spec_targets(rt, "prefill", WALK, rid)] == ["ar_decode"]
 
 
 def test_loop_iters_agree(pair):

@@ -329,3 +329,24 @@ def test_kv_lens_match_flashinfer_seq_lens(page_size):
     expected = get_seq_lens(ind.paged_kv_indptr, ind.paged_kv_last_page_len, page_size)
     assert ind.kv_lens.dtype == expected.dtype
     assert torch.equal(ind.kv_lens, expected)
+
+
+def test_a_step_forks_only_the_rows_it_names():
+    """A chunked prompt forks on its first chunk only: a step holding it beside
+    a prompt already past its first chunk forks just the first."""
+    kv = _manager()
+    for rid in ("r0", "r1"):
+        kv.ingest_request(rid)
+        _grow(kv, rid, PAGE_SIZE)
+    step = KVStep(
+        segments=(Segment("r0", "main", 4), Segment("r1", "main", 4)),
+        pre_forks=(("main", "alt"),), fork_rids=frozenset({"r0"}),
+    )
+    ctx = _ctx("r0", "r1")
+
+    assert kv.admit(step, ctx).ok
+    kv.plan(step, ctx)
+    kv.commit(step, ctx)
+
+    assert "alt" in kv._streams["r0"] and "alt" not in kv._streams["r1"]
+    kv.assert_pages_conserved()

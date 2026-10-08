@@ -68,3 +68,31 @@ def test_text_and_decode_rows_report_their_length(walk, inputs, length):
     info = LLMSubmodule.get_input_sequence_len(None, walk, None, inputs)
 
     assert (info.seq_len if info is not None else None) == length
+
+
+def test_text_prefill_chunks_under_a_budget_that_fits_the_captures():
+    llm = object.__new__(LLMSubmodule)
+
+    assert llm.get_chunking_policy("prefill_text").chunkable
+    assert not llm.get_chunking_policy("prefill_vision").chunkable
+    mixed = llm.get_chunking_policy(LLM_MIXED)
+    assert not mixed.chunkable and mixed.max_batch_tokens == llm.MAX_BATCH_TOKENS
+    largest = max(LLMSubmodule.PREFILL_TOKEN_BUCKETS)
+    assert llm.MAX_BATCH_TOKENS + max(LLMSubmodule.DECODE_CAPTURE_BATCH_SIZES) <= largest
+
+
+def test_a_chunked_prompt_keeps_only_its_final_chunks_token():
+    from mstar.model.submodule_base import ARNodeSubmodule
+
+    llm = object.__new__(LLMSubmodule)
+    full = ARNodeInputs(input_seq_len=10, input_ids=torch.arange(10))
+    info = SimpleNamespace(graph_walk="prefill_text", step_metadata={"last_prefill": True})
+    kept = []
+    for start, end in ((0, 4), (4, 10)):
+        chunk = ARNodeSubmodule.split_inputs(llm, "prefill_text", info, full, start, end)
+        chunk.chunk_start, chunk.chunk_total = start, full.input_seq_len  # as the engine stamps them
+        outputs = {"new_token": [torch.tensor([1])]}
+        llm.postprocess(0, info, outputs, inputs=chunk)
+        kept.append("text_inputs" in outputs)
+
+    assert kept == [False, True]

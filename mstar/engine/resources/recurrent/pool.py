@@ -235,7 +235,8 @@ class RecurrentStatePool(Resource):
     def _fork_rids(step: RecurrentStep) -> set[str]:
         if not (step.pre_forks or step.post_forks):
             return set()
-        return {seg.request_id for seg in step.segments or ()}
+        rids = {seg.request_id for seg in step.segments or ()}
+        return rids if step.fork_rids is None else rids & step.fork_rids
 
     @property
     def supports_preplan(self):

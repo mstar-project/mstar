@@ -30,7 +30,7 @@ from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.engine.resources.sampler.config import SamplerStep
+from mstar.engine.resources.sampler.config import SamplerStep, keep_final_chunk_samples
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
@@ -62,9 +62,11 @@ from mstar.model.qwen3_5.config import (
 )
 from mstar.model.qwen3_5.qwen3_5_model import TEXT_PART
 from mstar.model.submodule_base import (
+    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    ChunkingPolicy,
     HostRows,
     InputSeqLenInfo,
     ModelInputsFromEngine,
@@ -259,6 +261,16 @@ class LLMSubmodule(ARNodeSubmodule):
             },
         )
 
+    # under the largest prefill capture (2048) with a mixed step's decode rows
+    MAX_BATCH_TOKENS = 1024
+
+    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
+        if graph_walk == "prefill_text":
+            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS)
+        if graph_walk == LLM_MIXED:
+            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
+        return NO_CHUNKING
+
     def get_input_sequence_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList, **kwargs,
@@ -380,10 +392,10 @@ class LLMSubmodule(ARNodeSubmodule):
                 ATTN: AttentionStep(causal=True),
                 GDN_STATE: RecurrentStep(),
                 LINEAR_ATTN: LinearAttnStep(),
-                SAMPLER: SamplerStep(
+                SAMPLER: keep_final_chunk_samples(SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
-                ),
+                ), request_ids, inputs),
                 ROPE: PositionStep(advance=advance),
             },
         )
@@ -476,7 +488,11 @@ class LLMSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs,
     ):
-        if not self._token_is_real(request_info):
+        inputs = kwargs.get("inputs")
+        # only the last chunk's token is real
+        if not self._token_is_real(request_info) or (
+            inputs is not None and not inputs.is_final_chunk
+        ):
             outputs.pop("new_token", None)
             return
         # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is

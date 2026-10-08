@@ -2,7 +2,7 @@ import functools
 import logging
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, NamedTuple
@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AdmitRuntimeError
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RequestWalks
+from mstar.model.submodule_base import InputSeqLenInfo
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
     BatchBuilderType,
@@ -17,6 +18,7 @@ from mstar.worker.batch_builder import (
     BatchBuildResult,
     make_batch_builder,
 )
+from mstar.worker.chunk_outputs import ChunkOutputAccumulator
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
 
@@ -75,6 +77,10 @@ class ScheduledBatch:
     walk_output_signals: dict[str, list[str]] = field(default_factory=dict)
     # `rids_by_walk`, computed once; `merge` and `discard_rid` reset it
     _by_walk: dict[str, list[int]] | None = field(default=None, repr=False, compare=False)
+    # Set once scheduled: rid -> [start, end) of a chunked row's input this
+    # step, and the rows whose node needs at least one more chunk.
+    chunk_ranges: dict[int, tuple[int, int]] = field(default_factory=dict)
+    incomplete_node_rids: set[int] = field(default_factory=set)
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
@@ -203,6 +209,21 @@ class PopReadyResult(NamedTuple):
     walk_output_signals: dict[str, list[str]] = {}
 
 
+
+@dataclass(slots=True)
+class ChunkProgress:
+    """A row mid-prefill: tokens whose chunks have landed, and its total."""
+    done: int
+    total: int
+
+
+def _pre_existing_tokens(seq_lens: Collection[int], n: int) -> int:
+    """The tokens a speculation merge's own ``n`` rows will run, from their
+    previous step's lengths: their inputs do not exist yet."""
+    # A row with no length (-1: transitioning in from another node) guesses one token, a decode row.
+    # TODO: a model override (walk, fwd_info, prev_node, prev_tokens) once a use case needs it.
+    return sum(s if s >= 0 else 1 for s in seq_lens) + n - len(seq_lens)
+
 class MicroScheduler:
     """
     Simple MVP scheduler: scans all worker graph queues for ready nodes,
@@ -241,6 +262,12 @@ class MicroScheduler:
         # Resolves a tensor uuid, for row lengths read from popped inputs; the
         # worker installs the tensor manager's. None skips the room check.
         self.get_tensor: Callable[[int], Any] | None = None
+        # (rid, node) -> progress, for rows mid-prefill
+        self.chunk_progress: dict[tuple[int, str], ChunkProgress] = {}
+        # (rid, node) -> cached prefix a measured, not yet chunked row starts past
+        self.cached_prefix: dict[tuple[int, str], int] = {}
+        # their non-final chunks' outputs, routed with the final chunk
+        self.chunk_outputs = ChunkOutputAccumulator()
         self._warned_removed_rid = False
         self.sched_type = sched_type
 
@@ -497,6 +524,7 @@ class MicroScheduler:
         # are being speculated to be included in the batch size cap
         pre_existing_batch_size: int=0,
         capture_group_of: int | None = None,
+        pre_existing_seq_lens: Collection[int] = (),
     ) -> ScheduledBatch | None:
         """
         One step's worth: a pending TP follow batch if there is one, else
@@ -562,6 +590,7 @@ class MicroScheduler:
                 pre_existing_batch_size=pre_existing_batch_size,
                 capture_group_of=capture_group_of,
                 pre_existing_walk=pre_existing_walk,
+                pre_existing_seq_lens=pre_existing_seq_lens,
             )
             if scheduled is not None:
                 return scheduled
@@ -630,14 +659,25 @@ class MicroScheduler:
         pre_existing_batch_size: int,
         capture_group_of: int | None,
         pre_existing_walk: str | None = None,
+        pre_existing_seq_lens: Collection[int] = (),
     ) -> ScheduledBatch | None:
         """One step for ``node_walk`` out of its backlog and its ready
         ``entries``, composed by the batch builder."""
+        max_tokens = self.engine_manager.get_engine(node_walk[0]).get_max_batch_tokens(*node_walk)
+        if max_tokens is not None:
+            max_tokens -= _pre_existing_tokens(pre_existing_seq_lens, pre_existing_batch_size)
+        row_tokens: dict[int, int] = {}
+        chunkable: set[int] = set()
         backlogged = self.backlog.pop(node_walk, None)
         blocked = set()
         if backlogged is not None:
             blocked = self._unready_backlog_rids(backlogged, request_state)
-            blocked |= self._rows_without_room(request_state, backlogged, blocked)
+            no_room, tokens, chunks = self._measure_rows(
+                request_state, backlogged, blocked, max_tokens,
+            )
+            blocked |= no_room
+            row_tokens.update(tokens)
+            chunkable |= chunks
             if not backlogged:
                 backlogged = None  # every row failed
         walk_caps = self._walk_caps(node_walk)
@@ -655,7 +695,11 @@ class MicroScheduler:
             if entries else None
         if fresh:
             # a row whose KV does not fit sits this step out, rather than refusing the step
-            no_room = self._rows_without_room(request_state, fresh)
+            no_room, tokens, chunks = self._measure_rows(
+                request_state, fresh, max_tokens=max_tokens,
+            )
+            row_tokens.update(tokens)
+            chunkable |= chunks
             if no_room:
                 fresh, left = fresh.split_off_first(None, exclude_rids=no_room)
                 self.runtime.push_back_node(
@@ -671,6 +715,9 @@ class MicroScheduler:
             walk_caps=walk_caps,
             pre_existing_batch_size=pre_existing_batch_size,
             pre_existing_walk=pre_existing_walk,
+            max_batch_tokens=max_tokens if row_tokens else None,
+            row_tokens=row_tokens,
+            chunkable=chunkable,
         ))
 
     def _capture_group(
@@ -709,31 +756,47 @@ class MicroScheduler:
             functools.partial(self._capture_group, request_state, *target),
         )
 
-    def _rows_without_room(
+    def _measure_rows(
         self, request_state: RequestStateManager, batch: ScheduledBatch,
-        skip: set[int] = frozenset(),
-    ) -> set[int]:
-        """Rows of ``batch`` whose node's resources cannot take their tokens
-        now, for submodules that report row lengths before prepare."""
-        engine = self.engine_manager.get_engine(batch.node_name)
-        if self.get_tensor is None or not engine.declares_input_sequence_len(batch.node_name):
-            return set()
-        partition = request_state.get_partition_for_node(batch.node_name)
+        skip: set[int] = frozenset(), max_tokens: int | None = None,
+    ) -> tuple[set[int], dict[int, int], set[int]]:
+        """For a node that reports row lengths: the rows of ``batch`` whose
+        resources cannot take their next step now, each row's remaining
+        tokens, and the rows that may be chunked. A chunkable row needs room
+        for one step's budget, not its whole input."""
+        node = batch.node_name
+        engine = self.engine_manager.get_engine(node)
+        if self.get_tensor is None or not engine.declares_input_sequence_len(node):
+            return set(), {}, set()
+        partition = request_state.get_partition_for_node(node)
         rids = [rid for rid in batch.request_to_worker_graph if rid not in skip]
+        unmeasured = [rid for rid in rids if (rid, node) not in self.chunk_progress]
         inputs = batch.input_edges.to_input_tensors(
-            self.get_tensor, rids, skip_missing=True,
-        ).by_rid
-        out = set()
+            self.get_tensor, unmeasured, skip_missing=True,
+        ).by_rid if unmeasured else {}
+        no_room: set[int] = set()
+        tokens: dict[int, int] = {}
+        chunkable: set[int] = set()
         for rid in rids:
             fwd_info = request_state.get_fwd_info(rid, partition)
-            info = engine.input_sequence_len(
-                batch.node_name, batch.walk_of(rid), fwd_info, inputs.get(rid, {}),
-            )
-            if info is not None and not self._check_ready(
-                batch.node_name, rid, fwd_info, seq_len_info=info,
-            ):
-                out.add(rid)
-        return out
+            walk = batch.walk_of(rid)
+            progress = self.chunk_progress.get((rid, node))
+            if progress is not None:
+                info = InputSeqLenInfo(progress.total - progress.done)
+            else:
+                info = engine.input_sequence_len(node, walk, fwd_info, inputs.get(rid, {}), rid=rid)
+                if info is None:
+                    continue
+                if info.cached_prefix:
+                    self.cached_prefix[(rid, node)] = info.cached_prefix
+            tokens[rid] = info.seq_len
+            if engine.supports_chunked_prefill(node, walk):
+                chunkable.add(rid)
+                if max_tokens is not None and info.seq_len > max_tokens:
+                    info = InputSeqLenInfo(max(max_tokens, 1))
+            if not self._check_ready(node, rid, fwd_info, seq_len_info=info):
+                no_room.add(rid)
+        return no_room, tokens, chunkable
 
     def _unready_backlog_rids(
         self, batch: ScheduledBatch, request_state: RequestStateManager,
@@ -787,8 +850,39 @@ class MicroScheduler:
             )
         if result.scheduled is not None:
             self._mark_scheduled(*node_walk, len(result.scheduled))
+            self._assign_chunks(result.scheduled, result.chunk_tokens or {}, request.row_tokens)
             result.scheduled.relabel_if_uniform()
         return result.scheduled
+
+    def _assign_chunks(
+        self, batch: ScheduledBatch, chunk_tokens: dict[int, int],
+        row_tokens: dict[int, int],
+    ) -> None:
+        """Stamp the [start, end) each chunked row runs this step; a row first
+        cut here starts its progress."""
+        for rid in batch.request_to_worker_graph:
+            key = (rid, batch.node_name)
+            progress = self.chunk_progress.get(key)
+            if progress is None:
+                cached = self.cached_prefix.pop(key, 0)
+                if rid not in chunk_tokens:
+                    continue
+                progress = self.chunk_progress[key] = ChunkProgress(cached, cached + row_tokens[rid])
+            start, total = progress.done, progress.total
+            end = start + chunk_tokens.get(rid, total - start)
+            batch.chunk_ranges[rid] = (start, end)
+            if end < total:
+                batch.incomplete_node_rids.add(rid)
+
+    def advance_chunk(self, rid: int, node_name: str, end: int) -> None:
+        """A chunk ending at ``end`` landed; the last one ends the row's progress."""
+        progress = self.chunk_progress.get((rid, node_name))
+        if progress is None:
+            return
+        if end >= progress.total:
+            del self.chunk_progress[(rid, node_name)]
+        else:
+            progress.done = end
 
     def _backlog(self, node_walk: tuple[str, str], batch: ScheduledBatch) -> None:
         """Park ``batch``, folding it into whatever already waits under this key.
@@ -1049,6 +1143,11 @@ class MicroScheduler:
         the wire string and everything else by the handle."""
         self.failed_rids.discard(rid)
         self.admit_errors.pop(rid, None)
+        for key in [key for key in self.chunk_progress if key[0] == rid]:
+            del self.chunk_progress[key]
+        for key in [key for key in self.cached_prefix if key[0] == rid]:
+            del self.cached_prefix[key]
+        self.chunk_outputs.drop(rid)
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)
         self.clear_wire_rid(rid_str)

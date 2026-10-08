@@ -924,9 +924,7 @@ class KVManager(AttentionResource):
                 self._preplan_new_labels = []
                 self._preplan_marked = []
             for (from_label, to_label), extra in forks:
-                for rid in ctx.padded_request_ids:
-                    if ctx.is_padding_row(rid):
-                        continue
+                for rid in self._forking_rids(step, ctx):
                     # checked before the reservation, which is what creates it
                     if (
                         ctx.is_preplan
@@ -1205,9 +1203,7 @@ class KVManager(AttentionResource):
 
     def _maybe_apply_forks(self, step: KVStep, ctx: StepContext):
         for (from_label, to_label) in step.pre_forks:
-            for rid in ctx.padded_request_ids:
-                if ctx.is_padding_row(rid):
-                    continue
+            for rid in self._forking_rids(step, ctx):
                 self._apply_fork(rid, from_label, to_label)
 
     def _pending_fork_state(
@@ -1222,9 +1218,7 @@ class KVManager(AttentionResource):
         pending: dict[tuple[str, str], tuple[int, int]] = {}
         with self._lock:
             for (from_label, to_label) in step.pre_forks:
-                for rid in ctx.padded_request_ids:
-                    if ctx.is_padding_row(rid):
-                        continue
+                for rid in self._forking_rids(step, ctx):
                     labels = self._streams.get(rid, {})
                     src = labels.get(from_label)
                     dst = labels.get(to_label)
@@ -1299,7 +1293,16 @@ class KVManager(AttentionResource):
         """What identifies the step a pre-plan was staged for: its segments
         and the replay slot it was leased on."""
         lease = ctx.slot_lease
-        return tuple(step.segments), (lease.slot if lease is not None else None)
+        return tuple(step.segments), (lease.slot if lease is not None else None), step.fork_rids
+
+    @staticmethod
+    def _forking_rids(step: KVStep, ctx: StepContext):
+        """The step's real rows its forks apply to: all of them unless it names some."""
+        return [
+            rid for rid in ctx.padded_request_ids
+            if not ctx.is_padding_row(rid)
+            and (step.fork_rids is None or rid in step.fork_rids)
+        ]
 
     def clear_preplan(self):
         # the staged step is not going to run, so undo what it did to live
@@ -1373,9 +1376,7 @@ class KVManager(AttentionResource):
             # post-forks copy what this step just wrote, so they land after the
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
-                for rid in ctx.padded_request_ids:
-                    if ctx.is_padding_row(rid):
-                        continue
+                for rid in self._forking_rids(step, ctx):
                     self._apply_fork(rid, from_label, to_label)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
