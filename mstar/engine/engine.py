@@ -716,22 +716,33 @@ class Engine:
                 range_pop()
 
     def _prepare_inputs(self, batch: ExecutingBatch) -> None:
-        submodule = self._submodules[batch.node_name].submodule
+        mgmt = self._submodules[batch.node_name]
+        submodule = mgmt.submodule
         node_inputs: list[NodeInputs] = []
+        # hoisted out of the per-request loop: the same for every row
+        walk = batch.step_context.graph_walk
+        prepare = submodule.prepare_inputs
+        resources = mgmt.resources
+        wrapped = batch.per_request_info_wrapped
+        tensors = batch.per_request_input_tensors
+        metadata = batch.per_request_input_metadata
+        final_rids = batch.final_stream_rids
+        # only a keyed walk probes the prefix cache (see _skip_cached_prefix)
+        probe_prefix = walk in self._keyed_walks.get(batch.node_name, ())
         for rid in batch.request_ids:
             try:
-                req_inputs = submodule.prepare_inputs(
-                    graph_walk=batch.step_context.graph_walk,
-                    fwd_info=batch.per_request_info_wrapped[rid],
-                    inputs=batch.per_request_input_tensors.get(rid, {}),
-                    resources=self._submodules[batch.node_name].resources,
+                req_inputs = prepare(
+                    graph_walk=walk,
+                    fwd_info=wrapped[rid],
+                    inputs=tensors.get(rid, {}),
+                    resources=resources,
                     # the step that ends the last of the node's streams: it must
                     # flush whatever it held back (a vocoder's crossfade tail, the
                     # look-ahead frames a token encoder withholds)
-                    is_final_stream_chunk=rid in batch.final_stream_rids,
-                    input_metadata=batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA),
+                    is_final_stream_chunk=rid in final_rids,
+                    input_metadata=metadata.get(rid, EMPTY_INPUT_METADATA),
                 )
-                if req_inputs is not None:
+                if req_inputs is not None and probe_prefix:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
             except Exception as error:
                 logger.exception(
