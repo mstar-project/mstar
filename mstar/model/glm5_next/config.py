@@ -375,9 +375,21 @@ class Glm5NextModelConfig:
             raise ValueError(
                 f"an index plane row holds 3 x index_head_dim={self.index_head_dim} values; "
                 f"the MLA cache row is {width} wide")
+        if self.max_seq_len <= self.index_topk:
+            # dense MLA already serves index_topk: the window is model_kwargs.max_seq_len
+            raise ValueError(
+                f"dsa_long_context serves contexts past index_topk={self.index_topk}; "
+                f"model_kwargs.max_seq_len is {self.max_seq_len}")
+        if self.prefill_window_tokens < 1:
+            raise ValueError(f"prefill_window_tokens={self.prefill_window_tokens} must be >= 1")
         if page_size is not None and page_size % self.index_kpool:
             raise ValueError(
                 f"page_size={page_size} must be a multiple of index_kpool={self.index_kpool}")
+        if page_size is not None and (page_size // self.index_kpool) & (
+                page_size // self.index_kpool - 1):
+            # flashinfer's page-table transform takes power-of-two pools per page
+            raise ValueError(f"page_size={page_size} over index_kpool={self.index_kpool} "
+                             "must be a power of two")
 
     @property
     def kv_rows(self) -> int:
