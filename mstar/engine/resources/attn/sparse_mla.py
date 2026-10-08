@@ -20,7 +20,12 @@ SHARD_MIN_ROWS = 64
 
 
 def uses_kernel(q_nope: torch.Tensor, latent: torch.Tensor) -> bool:
-    return q_nope.is_cuda and latent.dtype == torch.bfloat16
+    from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports
+
+    # the kernel reads out of bounds outside its latent shape (a reduced test model's)
+    rank = q_nope.shape[-1]
+    return (q_nope.is_cuda and latent.dtype == torch.bfloat16
+            and flashinfer_mla_supports(rank, latent.shape[-1] - rank))
 
 
 def _plan(wrapper, indices: torch.Tensor, lens: list[int], heads: int,
