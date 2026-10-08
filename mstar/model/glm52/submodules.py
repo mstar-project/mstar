@@ -583,9 +583,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     self._sparse_workspaces[slot] = torch.empty(
                         sparse_mla.WORKSPACE_BYTES, dtype=torch.uint8, device=device)
                 indices = self._sparse_indices.get(slot)
-                if indices is None or indices.numel() < rows * topk:
+                # +1: the plan's spare index entry
+                if indices is None or indices.numel() < rows * topk + 1:
                     indices = self._sparse_indices[slot] = torch.zeros(
-                        rows * topk, dtype=torch.int32, device=device)
+                        rows * topk + 1, dtype=torch.int32, device=device)
                 sparse_plan = self._sparse_plans[key] = sparse_mla.SparseGraphPlan(
                     rows, topk, self._sparse_workspaces[slot], indices)
             sparse_plan.plan([min(n, topk) for n in lens], attn.num_heads,
