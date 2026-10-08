@@ -63,8 +63,9 @@ def _chunk_kwargs(model_kwargs: dict, index: int) -> dict:
     kwargs = dict(model_kwargs)
     kwargs.pop("sentence_chunking", None)
     seed = kwargs.get("seed")
-    if isinstance(seed, int) and not isinstance(seed, bool):
-        kwargs["seed"] = seed + index
+    if isinstance(seed, int) and not isinstance(seed, bool) and index:
+        # the conductor's seed is an int64: a seed near the top wraps instead of overflowing
+        kwargs["seed"] = (seed + index) % 2**63
     return kwargs
 
 
@@ -88,7 +89,11 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # blocking work (base64 decode, file write, an allowed remote fetch) off the loop
-    args = await asyncio.to_thread(adapter.speech_to_request, req, api.upload_dir)
+    try:
+        args = await asyncio.to_thread(adapter.speech_to_request, req, api.upload_dir)
+    except ValueError as exc:
+        # the adapter refused the request's fields (a bad data URL, a server path)
+        raise HTTPException(status_code=400, detail=str(exc)) from None
     request_id = rid("speech")
     chunks = _plan_chunks(req, adapter, args.text or "")
 

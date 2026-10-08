@@ -362,6 +362,17 @@ def test_non_streaming_disconnect_stops_submitting_and_releases_the_pieces_ahead
     assert collected == ids[:1] and len(ids) == 3 and stub.released == ids[1:]
 
 
+def test_a_client_seed_advances_per_chunk_and_wraps_at_int64():
+    from mstar.api_server.openai.serving_speech import _chunk_kwargs
+
+    assert [_chunk_kwargs({"seed": 7}, i)["seed"] for i in range(3)] == [7, 8, 9]
+    top = 2**63 - 1
+    assert [_chunk_kwargs({"seed": top}, i)["seed"] for i in range(3)] == [top, 0, 1]
+    # the first piece keeps the client's value
+    assert _chunk_kwargs({"seed": -5}, 0)["seed"] == -5
+    assert "seed" not in _chunk_kwargs({"sentence_chunking": True}, 1)
+
+
 def test_the_adapter_maps_the_request_off_the_event_loop():
     """A slow ``speech_to_request`` (a clip decode, or an allowed remote fetch)
     must not hold the loop: a concurrent task keeps running while it works."""
