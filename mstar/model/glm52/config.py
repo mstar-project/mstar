@@ -219,10 +219,10 @@ class Glm52ModelConfig:
     def max_prompt_tokens(self) -> int:
         """The longest prompt served. Decode runs at least one step after the
         prefill and the next may already be scheduled when it stops, so the
-        prompt leaves two rows under the context limit; a DSA prefill attends
-        densely, within index_topk."""
+        prompt leaves two steps' rows under the context limit (an MTP step
+        writes k + 1); a DSA prefill attends densely, within index_topk."""
         limit = self.max_seq_len if self.dsa_long_context else self.index_topk
-        return min(limit - 2, self.index_topk)
+        return min(limit - 2 * (self.mtp_num_draft_tokens + 1), self.index_topk)
 
     @classmethod
     def from_hf_config(cls, hf_config: dict) -> "Glm52ModelConfig":
