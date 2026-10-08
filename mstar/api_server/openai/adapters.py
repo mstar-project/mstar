@@ -896,7 +896,7 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
 class Qwen3ASRAdapter(OpenAIAdapter):
     """Qwen3-ASR: an LLM decoder that writes ``language {Name}<asr_text>{text}``
     (or the text alone when the language is forced). Hears up to 20 minutes
-    per request, so uploads are not windowed; continues a hypothesis through
+    per request, longer uploads are windowed at that; continues a hypothesis through
     ``assistant_prefix``, which is what the realtime session needs."""
 
     supports_transcriptions = True

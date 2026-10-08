@@ -81,10 +81,11 @@ buckets) and decode (captured per batch size) run on paged KV. The model
 writes ``language {Name}<asr_text>{text}``; the adapter reports the
 language as an ISO code and the text alone.
 
-A request hears up to 20 minutes, so uploads are never windowed. The
-``context`` (the OpenAI ``prompt``) is the system-turn hint the reference
-SDK also takes; ``language`` forces the language; ``assistant_prefix``
-prefills the assistant turn, which is what streaming builds on.
+A request hears up to 20 minutes; longer uploads are cut into 20 minute
+windows. The ``context`` (the OpenAI ``prompt``) is the system-turn hint
+the reference SDK also takes; ``language`` forces the language;
+``assistant_prefix`` prefills the assistant turn, which is what streaming
+builds on.
 
 **Realtime.** ``/v1/realtime?intent=transcription`` (see :doc:`clients`)
 re-transcribes the audio heard so far every ``chunk_seconds`` as one engine
