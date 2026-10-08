@@ -355,3 +355,27 @@ def test_a_budget_the_model_does_not_set_is_refused():
         engine.set_token_budgets({"LLM": {"prefil": 8}}, {"prefill"})
     with pytest.raises(ValueError, match="positive int"):
         engine.set_token_budgets({"LLM": 0}, {"prefill"})
+
+
+# ── sampler: a non-final chunk's token is not kept ────────────────────
+
+
+def test_a_non_final_chunks_row_leaves_the_kept_rows():
+    from mstar.engine.resources.sampler.config import SamplerStep, keep_final_chunk_samples
+    from mstar.model.submodule_base import ARNodeInputs
+
+    def row(start, total, n):
+        inp = ARNodeInputs(input_seq_len=n)
+        inp.chunk_start, inp.chunk_total = start, total
+        return inp
+
+    whole, mid, last = ARNodeInputs(input_seq_len=1), row(0, 10, 4), row(4, 10, 6)
+
+    step = keep_final_chunk_samples(SamplerStep(), ["d", "m", "l"], [whole, mid, last])
+    assert step.kept_rids == {"d", "l"}
+
+    narrowed = keep_final_chunk_samples(SamplerStep(kept_rids=frozenset({"m"})), ["d", "m"], [whole, mid])
+    assert narrowed.kept_rids == frozenset()
+
+    untouched = SamplerStep()
+    assert keep_final_chunk_samples(untouched, ["d"], [whole]) is untouched

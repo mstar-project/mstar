@@ -23,7 +23,16 @@ from mstar.engine.cuda_graph_config import (
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    keep_final_chunk_samples,
+)
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -1042,14 +1051,14 @@ class LLMSubmodule(ARNodeSubmodule):
             # The prompt's tokens enter the repetition-penalty mask here; the
             # sampler resource adds them at plan time. Only prefill carries
             # them — a sampled token is tracked by the sampler itself.
-            steps["sampler"] = SamplerStep(
+            steps["sampler"] = keep_final_chunk_samples(SamplerStep(
                 prefill_tracked_tokens={
                     rid: inp.input_ids
                     for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
                     if inp.input_ids is not None and walk == "prefill_text"
                 },
                 kept_rids=kept_rids,
-            )
+            ), request_ids, inputs)
         elif graph_walk == "prefill_vit":
             # prefill_vit is the last walk before decode for an image prompt,
             # so it samples the first token too (prefill_vae never does).

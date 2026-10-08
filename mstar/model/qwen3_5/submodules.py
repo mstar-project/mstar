@@ -30,7 +30,7 @@ from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.engine.resources.sampler.config import SamplerStep
+from mstar.engine.resources.sampler.config import SamplerStep, keep_final_chunk_samples
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
@@ -392,10 +392,10 @@ class LLMSubmodule(ARNodeSubmodule):
                 ATTN: AttentionStep(causal=True),
                 GDN_STATE: RecurrentStep(),
                 LINEAR_ATTN: LinearAttnStep(),
-                SAMPLER: SamplerStep(
+                SAMPLER: keep_final_chunk_samples(SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
-                ),
+                ), request_ids, inputs),
                 ROPE: PositionStep(advance=advance),
             },
         )
