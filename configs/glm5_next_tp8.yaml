@@ -4,6 +4,9 @@ model: "glm5_next"
 # activations, graphs and NCCL. Resolve the checkpoint through the HF cache
 # (HF_HOME) or pass model_kwargs.checkpoint_path.
 max_seq_len: 2048
+# One request per KDA slot below: past them a prefill waits in the worker
+# for a slot, and its wait broke the decode speculation chain every step.
+max_concurrent_requests: 64
 # NVLS multicast for the small decode all-reduces; stays on NCCL, with a
 # warning, where NVLink multicast is unavailable.
 tp_allreduce: "symm_multimem"
