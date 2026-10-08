@@ -317,7 +317,6 @@ def _budgeted_engine():
     from types import SimpleNamespace
 
     from mstar.engine.engine import Engine
-
     from mstar.model.submodule_base import ChunkingPolicy
 
     budgets = {"prefill": 512, "vision": 2048}
