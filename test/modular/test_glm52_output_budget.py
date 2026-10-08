@@ -99,3 +99,19 @@ def test_a_long_context_prompt_is_held_to_index_topk():
     assert cfg.max_prompt_tokens == cfg.index_topk == 2048
     assert Glm52ModelConfig().max_prompt_tokens == 2046
 
+
+def test_postprocess_emits_raw_token_bytes():
+    class ByteLevelTokenizer:
+        # GPT-2 byte-level token strings: "Ã" + "©" are the bytes of "é"
+        all_special_ids = [0]
+        tokens = {0: "<|endoftext|>", 1: "Ã", 2: "©", 3: "Ġhi"}
+
+        def convert_ids_to_tokens(self, ids):
+            return [self.tokens[i] for i in ids]
+
+    m = Glm52Model(model_path_hf="")
+    m._tokenizer = ByteLevelTokenizer()
+    out = [m.postprocess(torch.tensor([i]), "text") for i in (1, 2)]
+    # per-token decode gave U+FFFD for each half
+    assert b"".join(out).decode("utf-8") == "é"
+    assert m.postprocess(torch.tensor([3, 0]), "text") == b" hi"
