@@ -30,7 +30,16 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    keep_final_chunk_samples,
+)
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
@@ -658,11 +667,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
             steps={
                 THINKER_KV: KVStep(),
                 THINKER_ATTN: AttentionStep(causal=True),
-                THINKER_SAMPLER: SamplerStep(
+                THINKER_SAMPLER: keep_final_chunk_samples(SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
                     kept_rids=kept_rids,
-                ),
+                ), request_ids, inputs),
                 THINKER_POS: PositionStep(
                     advance=pos_advance
                 )
