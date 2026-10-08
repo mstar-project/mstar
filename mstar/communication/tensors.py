@@ -547,6 +547,179 @@ class TensorCommunicationManager(ABC):
         )
         return tensor_info
 
+    def store_row_outputs_batch(
+        self,
+        request_ids: list[Rid],
+        outputs,
+        signals: list[str],
+        row_views: dict[str, tuple[torch.Tensor, ...]],
+        row_request_ids: tuple[Rid, ...],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+        host_rows=None,
+    ) -> StoredOutputs | None:
+        """``store_and_return_tensor_info_batch`` for a step whose per-request
+        outputs are views of row-addressed batch tensors (a decode step: row i
+        of ``new_token`` is request i).
+
+        The rows of one batch tensor differ only in address, so their
+        descriptors are built from one row's shape, stride and dtype instead
+        of being read off every view, and the host copies come from the stop
+        check's row buffers (``host_rows``) by index rather than being matched
+        tensor by tensor. Every (request, signal) entry must be exactly one
+        tensor that *is* a row view, or the result is None and the caller
+        takes the general path; nothing is recorded before that is settled.
+        What is stored is what the general path would store: one uuid per
+        (request, signal), request-major, the same row views.
+        """
+        if not row_views or not self.tensor_store.has_put_tensor_batch_columns:
+            return None
+        row_of = {rid: i for i, rid in enumerate(row_request_ids)}
+        sharding = self.sharding_configs
+        first_cfg = sharding.get(request_ids[0]) if request_ids else None
+        tp_size, tp_rank = self._source_tp(first_cfg, node_name, graph_walk)
+        columns = ColumnarTensorInfo(
+            source_session_id=self.my_session_id,
+            source_entity=self.my_entity_id,
+            source_node_name=node_name,
+            source_graph_walk=graph_walk,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+        )
+        want_cpu = host_rows is not None and self.needs_cpu_tensor
+        # signal -> the row tensor it views, learned from the first request
+        # that has it and checked on every other
+        alias: dict[str, str] = {}
+        # row tensor -> (base address, row step, nbytes, ndims, dims, stride,
+        # dtype index, host rows or None)
+        template: dict[str, tuple] = {}
+        flat_uuids: list[int] = []
+        flat_rids: list[int] = []
+        signal_idxs: list[int] = []
+        num_tensors: list[int] = []
+        canonicals: list[torch.Tensor] = []
+        cpus: list[torch.Tensor | None] | None = [] if want_cpu else None
+        sharded_uuids: list[int] = []
+        mint = self._uuid_minter.mint
+        add_uuid = columns.uuids.append
+        add_addr = columns.addresses.append
+        add_nbytes = columns.nbytes.append
+        add_ndims = columns.ndims.append
+        add_dims = columns.dims_flat.extend
+        add_stride = columns.stride_flat.extend
+        add_dtype = columns.dtype_idx.append
+        try:
+            for rid in request_ids:
+                i = row_of.get(rid)
+                if i is None:
+                    return None
+                rid_out = outputs.get(rid)
+                cfg = sharding.get(rid)
+                if cfg is not first_cfg and self._source_tp(
+                    cfg, node_name, graph_walk,
+                ) != (tp_size, tp_rank):
+                    raise ValueError(
+                        f"request {rid} has sharding "
+                        f"{self._source_tp(cfg, node_name, graph_walk)} for "
+                        f"node {node_name!r} walk {graph_walk!r}, but the batch "
+                        f"was built for {(tp_size, tp_rank)}; one batch is one "
+                        "node on one worker and cannot mix sharding groups"
+                    )
+                for s, signal in enumerate(signals):
+                    lst = rid_out.get(signal) if rid_out else None
+                    if not lst:
+                        num_tensors.append(0)
+                        continue
+                    if type(lst) is not list or len(lst) != 1:
+                        return None
+                    tensor = lst[0]
+                    name = alias.get(signal)
+                    if name is None:
+                        for cand, views in row_views.items():
+                            if views[i] is tensor:
+                                name = cand
+                                break
+                        if name is None:
+                            return None
+                        alias[signal] = name
+                        if name not in template:
+                            template[name] = self._row_template(
+                                views, columns, host_rows if want_cpu else None, name,
+                            )
+                    elif row_views[name][i] is not tensor:
+                        return None
+                    # a sharded output is permuted on store; not a plain row
+                    if cfg is not None and cfg.shard_dim.get(signal):
+                        return None
+                    base, step, nbytes, ndims, dims, stride, dtype_idx, host = template[name]
+                    uuid = mint()
+                    flat_uuids.append(uuid)
+                    flat_rids.append(rid)
+                    signal_idxs.append(s)
+                    num_tensors.append(1)
+                    canonicals.append(tensor)
+                    add_uuid(uuid)
+                    add_addr(base + i * step)
+                    add_nbytes(nbytes)
+                    add_ndims(ndims)
+                    add_dims(dims)
+                    add_stride(stride)
+                    add_dtype(dtype_idx)
+                    if want_cpu:
+                        cpus.append(host[i] if host is not None else None)
+                    if cfg is not None:
+                        sharded_uuids.append(uuid)
+        except IndexError:
+            # a row index past the views or the host rows: not this batch's rows
+            return None
+        # nothing above touched shared state; from here the general path's
+        # guarantees apply
+        shard_dims = self.uuid_to_shard_dim
+        for uuid in sharded_uuids:
+            shard_dims[uuid] = None
+        edge_names = self.uuid_to_edge_name
+        if self.enable_prof:
+            for uuid, s in zip(flat_uuids, signal_idxs, strict=True):
+                edge_names[uuid] = signals[s]
+        try:
+            self.tensor_store.put_tensor_batch_columns(
+                flat_rids, canonicals, columns, cpu_tensors=cpus,
+            )
+        except Exception:
+            for uuid in flat_uuids:
+                shard_dims.pop(uuid, None)
+                edge_names.pop(uuid, None)
+            raise
+        return StoredOutputs(flat_uuids, flat_rids, signal_idxs, num_tensors)
+
+    @staticmethod
+    def _row_template(
+        views: tuple[torch.Tensor, ...], columns: ColumnarTensorInfo,
+        host_rows, name: str,
+    ) -> tuple:
+        """What every row of one batch tensor shares, for the row store: the
+        first row's address and the step to the next, byte size, shape,
+        stride and dtype index, plus the matching host rows (one view per row)
+        when ``host_rows`` carries a buffer of this name with the rows' shape
+        and dtype."""
+        first = views[0]
+        base = first.data_ptr()
+        step = views[1].data_ptr() - base if len(views) > 1 else 0
+        dims = tuple(first.shape)
+        host = None
+        if host_rows is not None:
+            buf = host_rows.buffers.get(name)
+            if (
+                torch.is_tensor(buf) and buf.device.type == "cpu"
+                and buf.dim() == len(dims) and buf.dtype == first.dtype
+                and tuple(buf.shape[1:]) == dims[1:] and buf.shape[0] >= len(views)
+            ):
+                host = buf.split(1)
+        return (
+            base, step, first.nbytes, len(dims), dims, tuple(first.stride()),
+            columns.dtype_index(first.dtype), host,
+        )
+
     def store_and_return_tensor_info_batch(
         self,
         request_ids: list[Rid],
