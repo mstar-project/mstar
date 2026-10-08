@@ -332,6 +332,15 @@ Worker scheduling
        milliseconds lets the arrivals of that window prefill together, which
        is worth decode throughput at high concurrency and costs up to that
        much time to first token.
+   * - ``MSTAR_DEVICE_LOOPBACK``
+     - ``1``
+     - Whether a decode node may keep its loop-back token on the device:
+       the sampler writes each request's last token to a slot-addressed
+       master and the next step reads its input ids from it, so the worker
+       routes the signal with no tensor (no per-request store, hold or
+       cleanup per step). Only nodes that opt in (Qwen3.5 decode) and only
+       when the sampler has graph buffers; ``0`` keeps every node on the
+       per-request tensor path.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset
      - ``1`` makes the Rust runtime print, every 500 calls, how long the
