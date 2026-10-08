@@ -117,3 +117,7 @@ test/modular/test_glm5next_registry_contract.py
 test/modular/test_glm5next_sinkhorn_fused.py
 test/modular/test_glm5next_step_tokens.py
 test/modular/test_glm5next_submodule.py
+test/modular/test_glm5next_output_budget.py
+test/modular/test_glm5next_postprocess.py
+test/modular/test_glm5next_mtp_admission.py
+test/modular/test_glm5next_loading_guards.py
