@@ -109,6 +109,13 @@ def resolve_dist_timeout(dist_timeout_s: float | None = None) -> dict[str, timed
     return {"timeout": timedelta(seconds=float(dist_timeout_s))}
 
 
+def _all_ranks_agree(flag: bool, cpu_group) -> bool:
+    """AND ``flag`` across the ranks of ``cpu_group``."""
+    t = torch.tensor([int(flag)])
+    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=cpu_group)
+    return bool(t.item())
+
+
 class CommGroup:
     """A communication group over one axis of the worker device mesh.
 
@@ -155,7 +162,10 @@ class CommGroup:
             return
         if self.world_size == 1 or self.device_group is None or not torch.cuda.is_available():
             return
-        max_kb = int(os.environ.get(TP_SYMM_AR_MAX_KB_ENV) or config_max_kb or 512)
+        env_kb = os.environ.get(TP_SYMM_AR_MAX_KB_ENV)
+        max_kb = int(env_kb if env_kb else 512 if config_max_kb is None else config_max_kb)
+        if max_kb <= 0:
+            return
         try:
             self._symm_ar = _SymmAllReduce(
                 self.device_group, torch.device("cuda", torch.cuda.current_device()),
@@ -166,6 +176,12 @@ class CommGroup:
                 "all-reduce %s requested but symmetric memory could not be set up (%r); using NCCL",
                 mode, exc,
             )
+            self._symm_ar = None
+        # every rank or none: one rank on NCCL while its peers wait in the symmetric
+        # kernel for its signal deadlocks the first all-reduce
+        if not _all_ranks_agree(self._symm_ar is not None, self.cpu_group):
+            if self._symm_ar is not None:
+                logger.warning("all-reduce %s: another rank could not set it up; using NCCL", mode)
             self._symm_ar = None
             return
         if self.rank == 0:
