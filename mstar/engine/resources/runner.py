@@ -349,10 +349,12 @@ class StepRunner:
                     self._resources[done].rollback_admit(
                         step.get(done), step.ctx,
                     )
-                # a refused step never commits, so the in-flight marks taken above
-                # would block offload; a staged pre-plan keeps its marks for the retry
-                if self._staged is None:
-                    self._abort(step, admitted)
+                # a staged pre-plan's pages just went back, so its stage goes
+                # too; a refused step never commits, so drop its in-flight marks,
+                # which would block offload
+                if self._staged is not None:
+                    self.clear_preplan()
+                self._abort(step, admitted)
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready
