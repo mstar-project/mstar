@@ -23,11 +23,32 @@ def uses_kernel(q_nope: torch.Tensor, latent: torch.Tensor) -> bool:
     return q_nope.is_cuda and latent.dtype == torch.bfloat16
 
 
-def _plan(wrapper, indices: torch.Tensor, lens: list[int], width: int, heads: int,
+def _plan(wrapper, indices: torch.Tensor, lens: list[int], heads: int,
           kv_lora_rank: int, kpe: int, sm_scale: float) -> None:
+    # packed: row r's slots at indices[sum(lens[:r]):], what FlashInfer >= 0.7 checks the
+    # page counts against (one-token pages); _pack lays the slots out to match. lens are
+    # already held to the row width (_lens)
     qo = torch.arange(len(lens) + 1, dtype=torch.int32)
-    wrapper.plan(qo, qo * width, indices, torch.tensor(lens, dtype=torch.int32), heads,
+    kv = torch.zeros(len(lens) + 1, dtype=torch.int32)
+    kv[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
+    wrapper.plan(qo, kv, indices, torch.tensor(lens, dtype=torch.int32), heads,
                  kv_lora_rank, kpe, 1, False, sm_scale, torch.bfloat16, torch.bfloat16)
+
+
+def _lens(lens: list[int], width: int) -> list[int]:
+    """A row attends at most its ``width`` slots, as ``reference`` does: packed, a longer
+    length would read entries no slot was written to."""
+    return [min(n, width) for n in lens]
+
+
+def _pack(dst: torch.Tensor, slots: torch.Tensor, indptr: torch.Tensor,
+          lens: torch.Tensor) -> None:
+    """``slots [rows, width]`` into ``dst`` as the plan's CSR: row r's first ``lens[r]`` at
+    ``dst[indptr[r]:]``, the rest to ``dst``'s spare last entry. Fixed shapes, so it captures."""
+    rows, width = slots.shape
+    j = torch.arange(width, dtype=torch.int32, device=slots.device)
+    pos = torch.where(j < lens[:rows, None], indptr[:rows, None] + j, dst.numel() - 1)
+    dst.scatter_(0, pos.reshape(-1).long(), slots.reshape(-1).to(dst.dtype))
 
 
 def _split(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor):
@@ -39,8 +60,8 @@ def _split(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor):
 
 class SparseGraphPlan:
     """A CUDA-graph wrapper for ``rows`` query rows of up to ``width`` slots: owned length
-    buffers and a view of the capture slot's index buffer, planned outside the graph every
-    step and read by the replay."""
+    buffers and a view of the capture slot's index buffer (``rows * width + 1`` entries, the
+    last a spare for ``_pack``), planned outside the graph every step and read by the replay."""
 
     def __init__(self, rows: int, width: int, workspace: torch.Tensor,
                  indices: torch.Tensor | None = None):
@@ -48,8 +69,10 @@ class SparseGraphPlan:
 
         device = workspace.device
         self.rows, self.width = rows, width
-        self.indices = (torch.zeros(rows * width, dtype=torch.int32, device=device)
-                        if indices is None else indices[:rows * width])
+        size = rows * width + 1
+        assert indices is None or indices.numel() >= size, (indices.numel(), size)
+        self.indices = (torch.zeros(size, dtype=torch.int32, device=device)
+                        if indices is None else indices[:size])
         self._qo = torch.zeros(rows + 1, dtype=torch.int32, device=device)
         self._kv = torch.zeros(rows + 1, dtype=torch.int32, device=device)
         self._lens = torch.zeros(rows, dtype=torch.int32, device=device)
@@ -64,12 +87,14 @@ class SparseGraphPlan:
         if self._planned is not None:
             # the last plan's copy out of the wrapper's pinned buffer may still be queued
             self._planned.synchronize()
-        _plan(self.wrapper, self.indices, lens, self.width, heads, kv_lora_rank, kpe, sm_scale)
+        _plan(self.wrapper, self.indices, _lens(lens, self.width), heads, kv_lora_rank, kpe,
+              sm_scale)
         self._planned = torch.cuda.Event()
         self._planned.record()
 
     def attend(self, q_nope, q_pe, latent, slots) -> torch.Tensor:
-        self.indices.copy_(slots.reshape(-1))
+        # the plan's offsets and lengths are in the wrapper's device buffers by now
+        _pack(self.indices, slots, self._kv, self._lens)
         return self.wrapper.run(*_split(q_nope, q_pe, latent))
 
 
@@ -86,19 +111,23 @@ class EagerSparsePlan:
         # rewritten before that copy has run
         torch.cuda.current_stream(device).synchronize()
         workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        lens = _lens(lens, width)
         self.chunks = []
         for r0 in range(0, len(lens), MAX_ROWS):
             r1 = min(r0 + MAX_ROWS, len(lens))
             wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="auto")
-            indices = torch.empty((r1 - r0) * width, dtype=torch.int32, device=device)
-            _plan(wrapper, indices, lens[r0:r1], width, heads, kv_lora_rank, kpe, sm_scale)
-            self.chunks.append((r0, r1, wrapper, indices))
+            indices = torch.empty((r1 - r0) * width + 1, dtype=torch.int32, device=device)
+            chunk = torch.tensor(lens[r0:r1], dtype=torch.int32)
+            indptr = torch.cat([chunk.new_zeros(1), chunk.cumsum(0, dtype=torch.int32)])
+            _plan(wrapper, indices, lens[r0:r1], heads, kv_lora_rank, kpe, sm_scale)
+            self.chunks.append((r0, r1, wrapper, indices,
+                                indptr.to(device, non_blocking=True), chunk.to(device, non_blocking=True)))
 
     def attend(self, q_nope, q_pe, latent, slots) -> torch.Tensor:
         q_nope, q_pe, ckv, kpe = _split(q_nope, q_pe, latent)
         out = q_nope.new_empty(q_nope.shape)
-        for r0, r1, wrapper, indices in self.chunks:
-            indices.copy_(slots[r0:r1].reshape(-1))
+        for r0, r1, wrapper, indices, indptr, lens in self.chunks:
+            _pack(indices, slots[r0:r1], indptr, lens)
             out[r0:r1] = wrapper.run(q_nope[r0:r1], q_pe[r0:r1], ckv, kpe)
         return out
 

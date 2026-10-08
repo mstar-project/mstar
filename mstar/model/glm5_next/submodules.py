@@ -459,11 +459,12 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             sparse_plan = self._sparse_plans.get(key)
             if sparse_plan is None:
                 buffers = self._sparse_buffers.get(key[:2])
-                if buffers is None or buffers[1].numel() < rows * width:
-                    # captures run largest first, so the first is the slot's size
+                if buffers is None or buffers[1].numel() < rows * width + 1:
+                    # captures run largest first, so the first is the slot's size; +1: the
+                    # plan's spare index entry
                     buffers = self._sparse_buffers[key[:2]] = (
                         torch.empty(sparse_mla.WORKSPACE_BYTES, dtype=torch.uint8, device=device),
-                        torch.zeros(rows * width, dtype=torch.int32, device=device))
+                        torch.zeros(rows * width + 1, dtype=torch.int32, device=device))
                 sparse_plan = self._sparse_plans[key] = sparse_mla.SparseGraphPlan(
                     rows, width, buffers[0], buffers[1])
             attn = next(m for m in self.language_model.modules()
