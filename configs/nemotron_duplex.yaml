@@ -18,6 +18,9 @@ max_concurrent_requests: 64
 # grows it in step. A full talker pool stalls every session.
 model_kwargs:
   max_session_s: 78
+  # Longer system prompts get a 400; the prompt prefills in one step that
+  # stalls every live session (~2.75 ms/token). TODO(prefill): drop once chunked.
+  max_prompt_tokens: 512
 
 node_groups:
   - node_names:

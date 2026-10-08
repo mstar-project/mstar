@@ -344,12 +344,15 @@ class NemotronDuplexModel(Model):
     """NVIDIA NemotronLabs VoiceChat-11B (duplex S2S)."""
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None,
-                 max_session_s: float | None = None, **kwargs):
+                 max_session_s: float | None = None, max_prompt_tokens: int | None = None,
+                 **kwargs):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.config = NemotronDuplexConfig()
         if max_session_s:
             self.max_session_s = max_session_s
+        if max_prompt_tokens:
+            self.max_prompt_tokens = max_prompt_tokens
         self._tokenizer = None  # lazy — not needed in dummy mode
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
@@ -401,6 +404,11 @@ class NemotronDuplexModel(Model):
     # + 1 final PAD frame fit 8 pages a stream; 64 sessions x 2 streams x 8 =
     # 1024 pages (+ the sink) = 28 GiB.
     max_session_s = 78.0
+    # Longest system prompt (``model_kwargs: {max_prompt_tokens: ...}``). The
+    # prompt prefills in one step batched with every live session's frame, so
+    # it stalls them all for its prefill time
+    # TODO(prefill): drop this cap once chunked prefill keeps the prompt out of the frame batch.
+    max_prompt_tokens = 512
     TALKER_WARMUP_POSITIONS = 37      # the speaker warm-up each talker stream prefills
     # Headroom over max_session_frames for the loops and the conductor's token
     # cap; a cap reached mid-stream hangs the session instead of ending it.
@@ -655,6 +663,12 @@ class NemotronDuplexModel(Model):
         out: NameToTensorList = {}
         if prompt:
             ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0].to(torch.long)
+            # TODO(prefill): stopgap for prompt decode stalls; can be removed once we get prefill
+            if ids.numel() > self.max_prompt_tokens:
+                raise ValueError(
+                    f"system prompt is {ids.numel()} tokens; this server "
+                    f"takes prompts up to {self.max_prompt_tokens} tokens"
+                )
             out["text_inputs"] = [ids]
         # The data worker loads audio files under ``audio_inputs`` (f"{modality}_inputs");
         # expose them as ``audio_features`` — the conformer_encoder node's input.
