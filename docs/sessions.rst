@@ -362,11 +362,12 @@ Limits in this version
   with no offload (recurrent state), parked state holds its pages or slots until
   the session ends: size ``max_concurrent_sessions`` times each resource's
   ``max_state`` against the pool, leaving room for the requests
-  ``max_concurrent_requests`` allows, or a full pool will start refusing
-  admission. For a recurrent pool that means ``max_slots`` covers the parked
-  sessions' slots as well as one per label for every running request. (A
-  session's state does follow its request through an offload while that
-  request is running.)
+  ``max_concurrent_requests`` allows. A request that does not fit is not
+  refused: it waits in admission, retrying until pages free up or the client
+  gives up, as on a pool full of running requests. For a recurrent pool, size
+  ``max_slots`` to cover the parked sessions' slots as well as one per label
+  for every running request. (A session's state does follow its request through
+  an offload while that request is running.)
 - Sessions are reachable through the ``POST /generate`` form, the
   ``/generate/ws`` control-loop socket, ``/v1/chat/completions`` and the SDK. The
   other OpenAI-compatible routes have no use for them (one-shot speech, image
