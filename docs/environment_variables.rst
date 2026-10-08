@@ -332,6 +332,12 @@ Worker scheduling
        milliseconds lets the arrivals of that window prefill together, which
        is worth decode throughput at high concurrency and costs up to that
        much time to first token.
+   * - ``MSTAR_RUST_SEND_TIMING``
+     - unset
+     - ``1`` makes the Rust runtime print, every 500 calls, how long the
+       worker's per-step send spends in its own work against the whole call
+       (which includes taking the GIL back when the send had to release it).
+       A diagnostic for the host-overhead work; off by default.
    * - ``MSTAR_SPEC_PEEK_FOR_FAIRNESS``
      - ``1``
      - Yield the speculation chain only when another (node, walk) is
