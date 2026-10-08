@@ -12,7 +12,7 @@ import torch
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
-from mstar.engine.resources.linear_attn.mamba2 import Mamba2Manager
+from mstar.engine.resources.linear_attn.mamba2 import Mamba2Manager, Mamba2Plan
 from mstar.engine.resources.linear_attn.mamba2_kernels import (
     PAD_SLOT_ID,
     mamba2_scan,
@@ -25,7 +25,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateSpec,
     RecurrentStep,
 )
-from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool
+from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentStatePool
 from mstar.engine.resources.step import Segment, StepContext
 
 POOL, MAMBA = "mamba_state", "mamba"
@@ -33,19 +33,25 @@ GEOM = Mamba2Geometry(num_heads=4, head_dim=8, state_size=16, n_groups=2, conv_k
 NUM_LAYERS = 2
 
 
-def pool_spec(max_slots=8) -> RecurrentStateSpec:
+def pool_spec(max_slots=8, disable_sink_slot=False) -> RecurrentStateSpec:
     return RecurrentStateSpec(
         POOL, {"llm"},
-        RecurrentStateConfig(num_layers=NUM_LAYERS, blocks=GEOM.to_blocks(), max_slots=max_slots),
+        RecurrentStateConfig(
+            num_layers=NUM_LAYERS, blocks=GEOM.to_blocks(), max_slots=max_slots,
+            disable_sink_slot=disable_sink_slot,
+        ),
     )
 
 
-def build(device="cpu"):
+def build(device="cpu", disable_sink_slot=False):
     info = EngineResourceInfo(device=torch.device(device))
-    pool = RecurrentStatePool.build(pool_spec(), info)
+    pool = RecurrentStatePool.build(pool_spec(disable_sink_slot=disable_sink_slot), info)
     manager = LinearAttnManager.build(
         LinearAttnSpec(MAMBA, {"llm"}, LinearAttnConfig(recurrent_state=POOL, variant=LinearAttnVariant.MAMBA2)),
-        EngineResourceInfo(device=torch.device(device), dependencies={POOL: pool_spec()}),
+        EngineResourceInfo(
+            device=torch.device(device),
+            dependencies={POOL: pool_spec(disable_sink_slot=disable_sink_slot)},
+        ),
     )
     return pool, manager
 
@@ -186,6 +192,46 @@ def test_padding_rows_leave_live_slots_alone():
     torch.testing.assert_close(state[1], ref_state[1])   # untouched slot
     torch.testing.assert_close(state[3], ref_state[3])
     assert out[2].abs().sum() == 0                          # NO_SLOT row: skipped
+
+
+def test_prefill_no_slot_row_keeps_later_rows_aligned():
+    """A NO_SLOT row in a prefill batch is skipped, reads as zeros, and still
+    consumes its tokens, so the rows after it read their own."""
+    _, manager = build()
+    prm = params()
+    spans = (3, 2, 4)
+    x, dt, b, c = inputs(1, seq=sum(spans), gen=torch.Generator().manual_seed(8))
+    layer = torch.zeros(4, GEOM.num_heads, GEOM.head_dim, GEOM.state_size)
+    manager._current = {"main": Mamba2Plan(
+        slots=torch.tensor([1, NO_SLOT, 2], dtype=torch.int32),
+        has_state=torch.zeros(3, dtype=torch.bool),
+        spans=spans, num_rows=3,
+    )}
+    out = manager.run(x, dt, b, c, layer, prm["a_log"], prm["d"], prm["dt_bias"], label="main")
+
+    a = -torch.exp(prm["a_log"])
+    y_last, s_last = mamba2_scan(x[5:], dt[5:], a, b[5:], c[5:], None, d=prm["d"], dt_bias=prm["dt_bias"])
+    torch.testing.assert_close(out[5:], y_last)
+    torch.testing.assert_close(layer[2], s_last)
+    assert out[3:5].abs().sum() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="conv kernels need a GPU")
+@pytest.mark.parametrize("walk,span", [("decode", 1), ("prefill_text", 3)])
+def test_conv_updates_slot_zero_with_the_sink_off(walk, span):
+    """With the sink off, slot 0 is a live request's; the conv kernels must not
+    take it for the null slot and skip it."""
+    pool, manager = build("cuda", disable_sink_slot=True)
+    _, c = plan(pool, manager, ["a"], [span], walk=walk)
+    assert c.plan_results[POOL]["main"].slot_indices[0].item() == 0
+    conv_dim, width = GEOM.conv_dim, GEOM.conv_kernel_size
+    x = torch.randn(span, conv_dim, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(conv_dim, width, device="cuda", dtype=torch.bfloat16)
+    conv_layer = pool.block("conv", 0)
+    newest = x[-1].clone()  # the decode kernel writes its output over x
+    manager.run_conv(x, conv_layer, weight, activation=None, label="main")
+    # the window's last tap is the newest token
+    torch.testing.assert_close(conv_layer[0, :, -1], newest)
 
 
 def test_dt_clamp_applies_after_softplus():
