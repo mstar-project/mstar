@@ -307,7 +307,8 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   positional encoding, so no position resource), a recurrent-state pool holding
   the 27 Mamba-2 layers' conv window and SSM state, one slot per session
   (``mamba_state``: 64 sessions by default, ~137 MB per slot in fp32, tunable
-  with ``max_slots`` / ``state_dtype``), the Mamba-2 resource planned on it
+  with ``max_slots`` / ``state_dtype``; the shipped configs set
+  ``max_concurrent_requests: 64`` to match, so raise the two together), the Mamba-2 resource planned on it
   (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
   captured as a CUDA graph for batch sizes 1 to 64.
 - ``eartts_talker`` advances every live session in one backbone pass per frame

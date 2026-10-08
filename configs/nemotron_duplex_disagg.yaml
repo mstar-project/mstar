@@ -14,6 +14,10 @@
 model: "nemotron_duplex"
 max_seq_len: 12288
 
+# One recurrent slot per session (DEFAULT_MAMBA_SLOTS); past it the engine spins
+# on admit and wedges every session. Keep the two equal; the overflow queues.
+max_concurrent_requests: 64
+
 node_groups:
   - node_names:
       - conformer_encoder
