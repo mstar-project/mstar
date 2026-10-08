@@ -92,11 +92,15 @@ class PagedKVConfig(KVConfig):
     # MLA only: the latent is ``[ckv (kv_lora_rank) | kpe (qk_rope_head_dim)]``
     kv_lora_rank: int | None = None
     qk_rope_head_dim: int | None = None
+    # MLA: whether num_qo_heads was given. Unset it defaults to the one latent KV head, which
+    # the attention backend would plan; a cache only stored (index keys) needs no query heads
+    qo_heads_given: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if self.layout == KVLayout.MLA:
             if self.kv_lora_rank is None or self.qk_rope_head_dim is None:
                 raise ValueError("KVLayout.MLA needs kv_lora_rank and qk_rope_head_dim")
+            self.qo_heads_given = self.num_qo_heads is not None
             # the cache stores one latent per token: a single KV "head" of the
             # latent width, whatever the model's head counts are
             self.num_kv_heads = 1

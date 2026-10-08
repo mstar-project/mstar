@@ -31,7 +31,8 @@ class AttentionConfig:
     backend: AttnBackend = AttnBackend.FLASHINFER
     flashinfer_backend: str = "auto"
     # softmax scale; None means the kernel default (head_dim ** -0.5). MLA must
-    # pass the *original* qk head dim's scale, not the latent width's
+    # pass the *original* qk head dim's scale, not the latent width's. Only the MLA
+    # backend reads it; the others refuse it at build
     sm_scale: float | None = None
 
 
@@ -124,5 +125,6 @@ class AttentionStep(ResourceStep):
     causal: bool = True
     # queries attend to the stream's stored context only, not to the tokens this step appends
     # (a draft block over the context the target has produced so far); the step's own
-    # `segments` then carry the query counts, the cache's segments the appended counts
+    # `segments` then carry the query counts, the cache's segments the appended counts.
+    # Only the MLA backend reads it.
     context_only: bool = False
