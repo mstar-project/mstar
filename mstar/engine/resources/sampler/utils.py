@@ -1596,16 +1596,18 @@ class SamplerBuffers:
         update, never step to step.
 
         Skipped when ``cg_slot`` last gathered this same batch and no master row
-        changed since. Never skipped with a slot awaiting init, which also
-        catches a request id re-registered onto a new slot."""
+        changed since. Never skipped while a row of this batch awaits init,
+        which also catches a request id re-registered onto a new slot. Slots
+        awaiting init that belong to requests outside the batch (registered,
+        still queued) do not block the skip: their rows are not read here, and
+        their init runs on the gather that first includes them."""
         rids = tuple(request_ids)
-        if (
-            not self._pending_init
-            and self._static_key.get(cg_slot)
-            == (rids, padded_bs, self._config_version)
-        ):
-            self._last_real_bs[cg_slot] = len(request_ids)
-            return
+        if self._static_key.get(cg_slot) == (rids, padded_bs, self._config_version):
+            pending = self._pending_init
+            get = self._rid_to_slot.get
+            if not pending or not any(get(rid) in pending for rid in request_ids):
+                self._last_real_bs[cg_slot] = len(request_ids)
+                return
         self._stage_slot_idx(request_ids, padded_bs, cg_slot)
         # H2D copies only (pre-plan, see HostBuffer); gather_dynamic uploads
         # the device-side index row
