@@ -12,6 +12,7 @@ was supposed to continue, and nothing raises when it does.
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -102,7 +103,10 @@ class _Node:
         engine = Engine.__new__(Engine)
         engine._resources = {KV: self.kv, ROPE: self.rope}
         engine._runner = self.runner
-        engine._open_session_state({KV: object(), ROPE: object()}, config)
+        engine._open_session_state(
+            {KV: SimpleNamespace(nodes={NODE}), ROPE: SimpleNamespace(nodes={NODE})},
+            config,
+        )
         self.free_at_start = self.kv._arena.num_free
         self._started: set[str] = set()
 

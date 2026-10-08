@@ -38,6 +38,13 @@ resource — the position counters over a KV cache, for instance. Their state
 addresses the state being kept, so leaving it behind would have the next
 request write positions from 0 over pages the session still holds.
 
+A hybrid model names every cache its node keeps state in. Qwen3.5's layers
+carry both a KV cache and a recurrent state pool (each GDN layer's state matrix
+and conv window), so its sessions config names both: the pool parks its slots
+under the session as the KV manager parks its pages. Naming one alone is
+refused at load, since a resumed request would continue the one and start the
+other from zero. The pool's ``max_state`` is in slots, one per label.
+
 Prefix reuse and sessions
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -246,13 +253,25 @@ its state is being freed; the conductor and the workers carry that out.
 Trying it
 ---------
 
-``test_text_session`` is a deployment that exists to exercise this: BAGEL's LLM
-with everything else taken away, text in and text out, holding its KV for the
-session. One GPU.
+``test_text_session`` is a deployment that exists to exercise this, in two
+variants picked by the config's ``model:``, both text in and text out on one GPU:
+
+- ``test_text_session`` (``configs/test_text_session.yaml``): BAGEL's LLM with
+  everything else taken away, holding its KV for the session.
+- ``test_text_session_qwen3_5`` (``configs/test_text_session_qwen3_5.yaml``):
+  Qwen3.5's LLM without its vision tower, holding both its KV cache and its GDN
+  recurrent state. 4B by default; ``model_kwargs: {model_path_hf:
+  Qwen/Qwen3.5-9B}`` picks 9B. Thinking is always off: Qwen's template drops a
+  past turn's ``<think>`` block, reasoning and tags together, so a reasoning
+  trace kept in the session would sit in context where a resent transcript has
+  none. With it off, the one difference left is the pre-closed
+  ``<think>\n\n</think>\n\n`` each turn was generated after, which the KV keeps
+  and the template would not.
 
 .. code-block:: bash
 
    CUDA_VISIBLE_DEVICES=0 bash test/text_session/launch_server.sh
+   # or: CONFIG=configs/test_text_session_qwen3_5.yaml bash test/text_session/launch_server.sh
    python test/text_session/session_request.py
 
 The client script sends a turn, resumes with a second turn whose prompt says
@@ -294,20 +313,25 @@ the EOS, is the model's to record: its ``check_stop`` sees the turn's real last
 token exactly once, since an overshooting step's outputs are dropped before the
 stop check.
 
-``TextSessionModel``'s LLM reads both on a resumed turn's first prefill and
-puts back what the KV is missing:
+Both ``test_text_session`` variants' LLMs read both on a resumed turn's first
+prefill and put back what the KV is missing (``test_text_session/turn_join.py``):
 
-======================  ===================  ===========================
-last reply ended on     its token in the KV  its token not in the KV
-======================  ===================  ===========================
-EOS                     ``\n``               ``<|im_end|>\n``
-a cut                   nothing              the token
-======================  ===================  ===========================
+==========================  ===================  ================================
+last reply ended on         its token in the KV  its token not in the KV
+==========================  ===================  ================================
+``<|im_end|>``              ``\n``               ``<|im_end|>\n``
+another stop token          ``<|im_end|>\n``     the token, ``<|im_end|>\n``
+a cut                       nothing              the token
+==========================  ===================  ================================
+
+(Qwen3.5 can also stop on ``<|endoftext|>``, which the template never closes a
+turn with; BAGEL stops on ``<|im_end|>`` alone.)
 
 A cut reply is left open rather than closed like a finished one: the KV holds
 the whole reply the client saw and nothing after it, so a next turn asking to
-continue reads as the reply being interrupted rather than finished. The flags are cleared once that prefill has run, not when it is prepared,
-since a step refused at admission is prepared again.
+continue reads as the reply being interrupted rather than finished. The flags
+are cleared once that prefill has run, not when it is prepared, since a step
+refused at admission is prepared again.
 
 The role label is not cosmetic. Over 20 greedy two-turn chats on that model,
 asked ``What is my name?`` after being told it:
@@ -335,12 +359,14 @@ Limits in this version
   request needs its pages, longest-idle session first and before any cached
   prefix is evicted, but only for a KV cache with ``cpu_offload_pages``; the
   next turn brings it back at admission. Without a host pool, and for a resource
-  with no offload (recurrent state), parked state holds its pages until the
-  session ends: size ``max_concurrent_sessions`` times each resource's
+  with no offload (recurrent state), parked state holds its pages or slots until
+  the session ends: size ``max_concurrent_sessions`` times each resource's
   ``max_state`` against the pool, leaving room for the requests
   ``max_concurrent_requests`` allows, or a full pool will start refusing
-  admission. (A session's state does follow its request through an offload
-  while that request is running.)
+  admission. For a recurrent pool that means ``max_slots`` covers the parked
+  sessions' slots as well as one per label for every running request. (A
+  session's state does follow its request through an offload while that
+  request is running.)
 - Sessions are reachable through the ``POST /generate`` form, the
   ``/generate/ws`` control-loop socket, ``/v1/chat/completions`` and the SDK. The
   other OpenAI-compatible routes have no use for them (one-shot speech, image
@@ -349,5 +375,6 @@ Limits in this version
   the five fields on its ``/generate`` and chat routes, the session chunk in its
   writers, and new bridge messages for ``GET /sessions``, ``GET /sessions/{id}`` and
   ``DELETE /sessions/{id}``, which live only in the Python server.
-- Only ``test_text_session`` declares session support. Any other deployment
-  refuses sessions until its model opts in.
+- Only the two ``test_text_session`` variants declare session support. Any
+  other deployment, the stock Qwen3.5 and BAGEL included, refuses sessions
+  until its model opts in.

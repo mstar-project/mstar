@@ -243,6 +243,8 @@ def _llm():
     sub = TextSessionLLMSubmodule.__new__(TextSessionLLMSubmodule)
     NodeSubmodule.__init__(sub)
     sub.eos_token_id = EOS
+    sub.turn_close_id = EOS
+    sub.turn_stop_ids = frozenset({EOS})
     sub.newline_ids = list(NEWLINE)
     return sub
 

@@ -1002,6 +1002,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     # BAGEL's LLM, text only: the same chat request, and the deployment
     # sessions are exercised against (see docs/sessions.rst).
     "test_text_session": BagelAdapter(),
+    "test_text_session_qwen3_5": Qwen3_5Adapter(),
     "chatterbox": ChatterboxAdapter(),
     "chatterbox_multilingual": ChatterboxAdapter(),
     "chatterbox_turbo": ChatterboxAdapter(),

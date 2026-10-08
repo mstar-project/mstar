@@ -43,8 +43,13 @@ def _engine(resources):
     return engine
 
 
-def _specs(*keys):
-    return {key: object() for key in keys}
+def _specs(*keys, node=None):
+    """One node per resource unless ``node`` puts them all on one."""
+    from types import SimpleNamespace
+
+    return {
+        key: SimpleNamespace(nodes={node or key}) for key in keys
+    }
 
 
 def _config(*keys, **kwargs):
@@ -313,3 +318,51 @@ def test_a_sessionless_or_ending_request_flags_nothing():
     engine.remove_request("r1", end_session=True, overshot_nodes={"LLM"})
 
     assert engine._submodules["LLM"].submodule.session_states == {}
+
+
+# ── a node holds all its state for the session, or the load is refused ─────
+
+def test_a_stateful_resource_left_out_on_the_node_refuses_the_load():
+    # a hybrid model holding its KV but not its recurrent state would resume
+    # the one and silently start the other from zero
+    engine = _engine({"kv": _Res(), "gdn_state": _Res()})
+
+    with pytest.raises(ValueError, match="gdn_state"):
+        engine._open_session_state(_specs("kv", "gdn_state", node="LLM"), _config("kv"))
+
+
+def test_naming_both_holds_both():
+    engine = _engine({"kv": _Res(), "gdn_state": _Res()})
+
+    engine._open_session_state(
+        _specs("kv", "gdn_state", node="LLM"), _config("kv", "gdn_state"),
+    )
+
+    assert sorted(engine._runner.session_resource_keys()) == ["gdn_state", "kv"]
+
+
+def test_a_stateful_resource_on_another_node_is_none_of_its_business():
+    engine = _engine({"kv": _Res(), "vit_cache": _Res()})
+
+    engine._open_session_state(_specs("kv", "vit_cache"), _config("kv"))
+
+    assert engine._runner.session_resource_keys() == ["kv"]
+
+
+def test_a_resource_with_no_state_to_hold_is_left_alone_on_the_node():
+    class _Stateless(Resource):
+        @classmethod
+        def build(cls, spec, info):
+            raise NotImplementedError
+
+    engine = _engine({"kv": _Res(), "attn": _Stateless()})
+
+    engine._open_session_state(_specs("kv", "attn", node="LLM"), _config("kv"))
+
+    assert engine._runner.session_resource_keys() == ["kv"]
+
+
+def test_the_recurrent_pool_implements_the_session_hooks():
+    from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+
+    assert RecurrentStatePool.retain_session_state is not Resource.retain_session_state

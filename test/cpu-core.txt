@@ -17,7 +17,10 @@ test/modular/test_engine_session_state.py
 test/modular/test_api_server_sessions.py
 test/modular/test_session_continuation.py
 test/modular/test_kv_session_state.py
+test/modular/test_recurrent_session_state.py
 test/modular/test_text_session_model.py
+test/modular/test_text_session_qwen3_5.py
+test/modular/test_model_session_kwarg.py
 test/modular/test_rid_handles.py
 test/modular/test_tensor_uuid.py
 test/modular/test_shm_tensor_comm.py

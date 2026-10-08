@@ -676,10 +676,38 @@ class Engine:
             ):
                 derived[key] = SessionResourceConfig()
                 resource.session_config = derived[key]
+        self._refuse_partial_session_state(specs_by_key)
         logger.info(
             "Session state held by %s%s", self._runner.session_resource_keys(),
             f" (derived from a dependency: {sorted(derived)})" if derived else "",
         )
+
+    def _refuse_partial_session_state(self, specs_by_key) -> None:
+        """Every resource on a node that holds session state must hold it.
+
+        One that could (it implements the hooks) but is left out keeps its
+        per-request teardown, so a resumed request would continue the held
+        state and start the other from zero: a hybrid model's KV carried
+        across turns with its recurrent state silently reset.
+        """
+        held_nodes: dict[str, set[str]] = {}
+        for key, resource in self._resources.items():
+            if resource.session_config is not None:
+                for node in specs_by_key[key].nodes:
+                    held_nodes.setdefault(node, set()).add(key)
+        for key, resource in self._resources.items():
+            if resource.session_config is not None:
+                continue
+            if type(resource).retain_session_state is Resource.retain_session_state:
+                continue
+            for node in sorted(specs_by_key[key].nodes & held_nodes.keys()):
+                raise ValueError(
+                    f"the sessions config holds {sorted(held_nodes[node])} on "
+                    f"node {node!r} but not {key!r}, which keeps state there "
+                    "too: a resumed request would continue the one and start "
+                    f"{key!r} from zero. Name {key!r} in the sessions config "
+                    "as well."
+                )
 
     def _open_prefix_caches(self, specs_by_key, model) -> None:
         """Root each resource's cache in the weights, the preprocessing, and the

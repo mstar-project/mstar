@@ -136,6 +136,11 @@ class Qwen3_5DenseModel(Model):
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
 
+    # The LLM node's submodule class; None is `submodules.LLMSubmodule`. A
+    # subclass serving the same LLM differently (``test_text_session_qwen3_5``)
+    # swaps it here. Imported lazily, as the submodules are.
+    LLM_SUBMODULE_CLS: type | None = None
+
     def __init__(
         self,
         model_path_hf: str,
@@ -532,6 +537,7 @@ class Qwen3_5DenseModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,  # `session`, which this model does not use
     ) -> ForwardPassArgs:
         schedule = self._prefill_schedule(input_modalities, input_signals)
         if not schedule:
@@ -714,7 +720,9 @@ class Qwen3_5DenseModel(Model):
             # collective over the TP group; every rank builds the LLM here
             tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
-        return LLMSubmodule(model, self.config, self.vision_config)
+        return (self.LLM_SUBMODULE_CLS or LLMSubmodule)(
+            model, self.config, self.vision_config,
+        )
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
