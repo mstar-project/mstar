@@ -39,6 +39,7 @@ from mstar.model.higgs_audio.config import SAMPLER
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -666,13 +667,9 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _sample_per_request(
         self, request_ids: list[str], logits: torch.Tensor,
-    ) -> dict[str, NameToTensorList]:
-        """The batched forward's output shape: rid -> that rid's outputs."""
-        tokens = self._sample_tokens(request_ids, logits)
-        return {
-            rid: {"new_token": [token]}
-            for rid, token in zip(request_ids, tokens.split(1), strict=True)
-        }
+    ) -> BatchedModelOutput:
+        """The batched forward's output: row i of ``new_token`` is request i."""
+        return BatchedModelOutput(row_outputs={"new_token": self._sample_tokens(request_ids, logits)})
 
     def __init__(
         self,

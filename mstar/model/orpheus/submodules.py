@@ -13,7 +13,14 @@ from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerS
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
-from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import (
+    ARNodeInputs,
+    ARNodeSubmodule,
+    BatchedModelOutput,
+    ModelInputsFromEngine,
+    NodeInputs,
+    NodeSubmodule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,16 +174,14 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         text_inputs: torch.Tensor,
         **kwargs
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         new_tokens = self._forward(
             graph_walk=graph_walk,
             engine_inputs=engine_inputs,
             text_inputs=text_inputs
         )
-        return {
-            rid: {"new_token": [new_tokens[i : i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        # row i is request i; a per-rid dict here would guard the compiled frame on the ids
+        return BatchedModelOutput(row_outputs={"new_token": new_tokens})
 
     def postprocess(
         self, request_id: str,
