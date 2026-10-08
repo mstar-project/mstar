@@ -3032,11 +3032,9 @@ class Worker:
                 "worker.postprocess.route", _time.perf_counter() - _t_route,
             )
 
-        per_request_info = batch_N.node_batch.per_request_info
-        for rid, new_iters in self._graph_runtime.get_dynamic_loop_iters(
-            list(per_request_info), partition=batch_N.partition,
-        ):
-            per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
+        self._graph_runtime.update_dynamic_loop_iters(
+            batch_N.node_batch.per_request_info, batch_N.partition,
+        )
 
         # Normally empty: cleanup_consumed_inputs ran above and took them. Not
         # empty if a completion ever precedes it, and then nobody else will.
