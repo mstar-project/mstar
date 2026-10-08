@@ -118,7 +118,11 @@ class Glm52Model(Model):
             cap = kwargs["prefill_max_step_tokens"]
             self.config.prefill_max_step_tokens = cap if cap == "auto" else int(cap)
         if "mtp_num_draft_tokens" in kwargs:
-            self.config.mtp_num_draft_tokens = int(kwargs["mtp_num_draft_tokens"])
+            k = int(kwargs["mtp_num_draft_tokens"])
+            if k < 0:
+                # a negative k read as off in some places and on in others
+                raise ValueError(f"mtp_num_draft_tokens must be 0 (off) or more, got {k}")
+            self.config.mtp_num_draft_tokens = k
         if self.config.mtp_num_draft_tokens > 0:
             self._check_mtp(kwargs)
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).

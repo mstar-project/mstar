@@ -101,7 +101,8 @@ def test_mtp_acceptance_log_per_position(caplog):
     # The line must name which trunk-pairing mode produced it: a profile whose
     # mode you have to infer from the launch environment is one you cannot
     # trust afterwards, and a mislabelled one inverts the comparison silently.
-    assert "pre-final-norm" in pos_line and "POST" not in pos_line
+    assert "pre-final-norm (MSTAR_GLM52_MTP_PAIR_POSTNORM=0)" in pos_line
+    assert "post-final-norm" not in pos_line
 
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
@@ -109,7 +110,8 @@ def test_mtp_acceptance_log_per_position(caplog):
     (post_line,) = [
         r.getMessage() for r in caplog.records if "by position" in r.getMessage()
     ]
-    assert "POST-final-norm" in post_line
+    # post-norm pairing is the default (the env var's 1); the label said the opposite
+    assert "post-final-norm (default" in post_line
     # below the threshold nothing is logged
     caplog.clear()
     quiet = _ns(True)

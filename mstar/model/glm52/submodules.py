@@ -842,8 +842,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             "MTP acceptance by position: n_acc histogram %s, conditional accept "
             "per position %s [trunk pairing: %s]",
             self._mtp_stat_acc_hist, " ".join(cond),
-            "POST-final-norm (vLLM convention)" if self._mtp_pair_postnorm
-            else "pre-final-norm (default)",
+            "post-final-norm (default, vLLM's)" if self._mtp_pair_postnorm
+            else "pre-final-norm (MSTAR_GLM52_MTP_PAIR_POSTNORM=0)",
         )
 
     def postprocess(
