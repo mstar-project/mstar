@@ -925,6 +925,47 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 self._wake_q.put(None)
                 self._wake_q = None
 
+    def cleanup_collectable(
+        self, collectable: list[int], registered: list[bool],
+    ):
+        """``_cleanup_by_uuid`` for a batch, inlined: a decode step frees one
+        tensor per request here, and the three-level call chain per uuid was
+        most of the cost. Same steps in the same order as the per-uuid form."""
+        if not collectable:
+            return
+        del registered  # no transfer engine to unregister from
+        store = self.tensor_store
+        store.mark_forgotten(collectable)
+        shard_dims = self.uuid_to_shard_dim
+        edge_names = self.uuid_to_edge_name
+        arena_ts = self._arena_ts
+        arena_locs = self._arena_locs
+        shm_files = self._shm_files
+        present = store.check_uuid_presence
+        remove = store.remove_tensor
+        for uuid in collectable:
+            try:
+                shard_dims.pop(uuid, None)
+                edge_names.pop(uuid, None)
+                if present(uuid):
+                    remove(uuid)
+                else:
+                    logger.warning(
+                        "Trying to cleanup tensor %s, but uuid not found", uuid,
+                    )
+                arena_ts.pop(uuid, None)
+                if (loc := arena_locs.pop(uuid, None)) is not None:
+                    self._arena.free(*loc)
+                if (path := shm_files.pop(uuid, None)) is not None:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+            except Exception as e:
+                logger.error(
+                    "Error cleaning up tensor uuid %d: %s, skipping.", uuid, e,
+                )
+
     def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
         # Grandparent cleanup (refcounts): skip the file manager's unlink.
         super(SharedMemoryCommunicationManager, self)._cleanup_by_uuid(
