@@ -30,6 +30,7 @@ vision-language-action policies, and world models — through a **Python SDK**, 
    :caption: User Guide
 
    serving
+   sessions
    clients
 
 .. toctree::

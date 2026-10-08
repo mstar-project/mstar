@@ -548,6 +548,7 @@ class Pi05Model(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,

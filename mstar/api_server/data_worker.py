@@ -30,6 +30,7 @@ from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.model.base import Model, ProcessPromptOutput
+from mstar.model.sessions import RequestSession
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils import profiler
 from mstar.utils.ipc_format import (
@@ -338,6 +339,17 @@ class RequestOutputState:
     frame_index: int = 0
 
 
+def _request_session(input: PreprocessInput) -> RequestSession | None:
+    """The session a request belongs to, as the API server validated it."""
+    if input.session_id is None:
+        return None
+    return RequestSession(
+        session_id=input.session_id,
+        resumed=input.resumed,
+        end_session=input.end_session,
+    )
+
+
 class PreprocessWorkerThread:
     def __init__(
         self,
@@ -485,6 +497,7 @@ class PreprocessWorkerThread:
                 tensors=tensors,
                 input_metadata=input_metadata,
                 prompt_parts=input.prompt_parts,
+                session=_request_session(input),
                 **model_kwargs,
             )
             if isinstance(prompt_tensors, ProcessPromptOutput):
@@ -532,7 +545,10 @@ class PreprocessWorkerThread:
                 initial_input_modalities=input.input_modalities,
                 initial_output_modalities=input.output_modalities,
                 input_metadata=input_metadata,
-                model_kwargs=model_kwargs
+                model_kwargs=model_kwargs,
+                session_id=input.session_id,
+                resumed=input.resumed,
+                end_session=input.end_session,
             ),
         )
         self.communicator.send("conductor", msg)

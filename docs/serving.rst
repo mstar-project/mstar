@@ -224,6 +224,10 @@ no longer read. It raises an error with a message describing the migration.
 cached pages. A single request opts out by sending ``prefix_cache=False``, which
 travels with its other ``model_kwargs``.
 
+Persistent sessions are on for any model that declares support for them. A ``sessions:``
+block tunes the caps and how much state each session may hold, and
+``sessions: {enabled: false}`` turns them off. See :doc:`sessions`.
+
 A cached prompt no longer reserves its pages, so the pool no longer limits how many
 requests are admitted. It has to hold the decode of every request allowed to run at once,
 and a decode step that finds no free page holds its requests until they time out.

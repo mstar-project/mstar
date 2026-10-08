@@ -27,13 +27,20 @@ from starlette.concurrency import run_in_threadpool
 from mstar.api_server import media_io
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
+from mstar.api_server.sessions import SessionError, SessionRegistry, SessionRequest
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
+from mstar.model.sessions import apply_sessions_yaml_overrides
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
 from mstar.utils.exitcode import describe_exitcode
+from mstar.utils.ipc_format import (
+    ConductorMessage,
+    ConductorMessageType,
+    TeardownSession,
+)
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 
@@ -298,6 +305,22 @@ class APIServer:
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
         )
+        # Teardowns are sent from both the result-drain thread and the HTTP
+        # thread, and a ZMQ socket is single-threaded by contract.
+        self._send_lock = threading.Lock()
+
+        # Session tracking. The registry decides what a request may name and
+        # when a session is collected; the conductor carries it out.
+        sessions_config = None
+        if model is not None:
+            sessions_config = apply_sessions_yaml_overrides(
+                model.get_sessions_config(), model_config or {},
+            )
+        self.sessions = SessionRegistry(
+            sessions_config, teardown=self._request_session_teardown,
+        )
+        self._next_session_sweep = 0.0
+        self._session_sweep_interval_s = float(os.environ.get("MSTAR_SESSION_SWEEP_INTERVAL_S", "1.0"))
 
         # Background thread that drains results from the conductor. Started by
         # finalize_setup() once the workers report ready — before that there's
@@ -305,6 +328,18 @@ class APIServer:
         self._msg_thread = threading.Thread(
             target=self._process_messages, daemon=True
         )
+
+    def _request_session_teardown(self, session_id: str) -> None:
+        """Ask the conductor to free a session's state. The registry holds the
+        tombstone until ``session_torn_down`` comes back."""
+        with self._send_lock:
+            self.communicator.send(
+                "conductor",
+                ConductorMessage(
+                    message_type=ConductorMessageType.TEARDOWN_SESSION,
+                    body=TeardownSession(session_id=session_id),
+                ),
+            )
 
     def finalize_setup(self) -> None:
         """Block until the conductor signals that every worker has finished
@@ -362,6 +397,7 @@ class APIServer:
                     req.error_status = 503
                 req.event.set()
             on_fatal = self.on_fatal
+        self.sessions.fail_all(message)
         if on_fatal is not None:
             on_fatal()
 
@@ -394,6 +430,7 @@ class APIServer:
         prompt_parts: list[PromptPart] | None = None,
         streaming: bool = True,
         request_id: str | None = None,
+        session: SessionRequest | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -431,6 +468,19 @@ class APIServer:
                     timing=RequestTiming(recv_time=time.perf_counter()),
                 ),
             )
+            if session is not None and session.session_id is not None:
+                # First chunk out, so a streaming client learns the id the
+                # server minted before any output arrives.
+                self.pending_requests[request_id].chunks.append(ResultChunk(
+                    request_id=request_id,
+                    modality="session",
+                    data=session.session_id.encode("utf-8"),
+                    metadata={
+                        "session_id": session.session_id,
+                        "created": session.created,
+                        "end_session": session.end_session,
+                    },
+                ))
 
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=request_id,
@@ -440,7 +490,14 @@ class APIServer:
             output_modalities=output_modalities,
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
+            session_id=session.session_id if session else None,
+            resumed=bool(session and session.resumed),
+            end_session=bool(session and session.end_session),
         ))
+        if session is not None and session.end_session and session.session_id:
+            # Hold the tombstone from here: the session is spoken for, so
+            # nothing else may name it while this request winds down.
+            self.sessions.note_ending(session.session_id)
 
         logger.info(
             "Request %s submitted  in=%s  out=%s",
@@ -526,9 +583,24 @@ class APIServer:
                     if len(self.recently_completed) > 0:
                         self._prune_recently_completed()
 
+                # Session bookkeeping is applied outside request_lock: the
+                # registry takes its own lock and may send to the conductor.
+                done_sessions: list[str] = []
+                failed_sessions: list[tuple[str, str]] = []
+
+                if now >= self._next_session_sweep:
+                    self._next_session_sweep = (
+                        now + self._session_sweep_interval_s
+                    )
+                    self.sessions.sweep()
+
                 for message in self.communicator.get_all_new_messages():
                     if not isinstance(message, APIServerMessage):
                         logger.warning("Unexpected message type: %s", type(message))
+                        continue
+
+                    if message.message_type == "session_torn_down":
+                        self.sessions.torn_down(message.body.session_id)
                         continue
 
                     rid = message.body.request_id
@@ -565,9 +637,13 @@ class APIServer:
                                 # rid here makes _prune_recently_completed
                                 # release it once the client lets go.
                                 self.recently_completed[rid] = time.time()
+                                failed_sessions.append(
+                                    (rid, message.body.error_message)
+                                )
                             elif message.message_type == "request_complete":
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
+                                done_sessions.append(rid)
 
                                 if not message.body.final_outputs:
                                     logger.warning(
@@ -654,6 +730,11 @@ class APIServer:
                             # the data worker's per-request state once the
                             # client lets go of the request.
                             self.recently_completed[rid] = time.time()
+                            failed_sessions.append((rid, str(req.error)))
+                for rid in done_sessions:
+                    self.sessions.finish_request(rid)
+                for rid, error in failed_sessions:
+                    self.sessions.finish_request(rid, failed=True, error=error)
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
@@ -883,6 +964,11 @@ class APIServer:
             return
         logger.info("Client cancelled request %s; releasing resources", request_id)
         self.preprocess_worker.abort_request(request_id)
+        # An abandoned request leaves its session's state half-written, and v1
+        # has no rollback, so the session goes with it.
+        self.sessions.finish_request(
+            request_id, failed=True, error="its request was cancelled",
+        )
 
     def release_request(self, request_id: str) -> None:
         """Drop a request whose results will never be read: abort it if it is
@@ -1154,20 +1240,54 @@ def _ws_input_layout(
     return [p.modality for p in parts], parts
 
 
+def _ws_session(server, message: dict, request_id: str) -> SessionRequest:
+    """Resolve a WebSocket message's session the way ``/generate`` does.
+
+    The control loop is the surface that most wants sessions: a step continues
+    from the state the previous one left. The fields are the form's, so a client
+    moves between the two without changing what it sends.
+    """
+    flags = {
+        name: message.get(name, False)
+        for name in ("start_session", "resume_session", "end_session")
+    }
+    for name, value in flags.items():
+        # not `bool()`: a JSON client sending "false" would start a session
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be a boolean")
+    session_id = message.get("session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        raise ValueError("session_id must be a string")
+    timeout = message.get("session_timeout_s")
+    if timeout is not None and not isinstance(timeout, (int, float)):
+        raise ValueError("session_timeout_s must be a number")
+    if not any(flags.values()) and session_id is None:
+        return SessionRequest()
+    return server.sessions.resolve(
+        session_id=session_id,
+        session_timeout_s=None if timeout is None else float(timeout),
+        request_id=request_id,
+        **flags,
+    )
+
+
 @app.websocket("/generate/ws")
 async def generate_ws(websocket: WebSocket):
     """``/generate`` over one persistent WebSocket, for control loops.
 
     Each incoming message is one request with the ``/generate`` fields —
     ``text``, ``files`` (``[{"name", "data"}]``), ``input_modalities``,
-    ``output_modalities``, ``model_kwargs``, ``request_id`` — either a JSON
-    text frame (``data`` base64) or a msgpack binary frame (``data`` raw
-    bytes). Every result chunk comes back as a frame of the same encoding,
+    ``output_modalities``, ``model_kwargs``, ``request_id``, and the session
+    fields (``start_session``, ``resume_session``, ``end_session``,
+    ``session_id``, ``session_timeout_s``) — either a JSON text frame (``data``
+    base64) or a msgpack binary frame (``data`` raw bytes). Every result chunk
+    comes back as a frame of the same encoding,
     ``{"request_id", "modality", "data", "metadata"}``, followed by
     ``{"request_id", "finish": true}``. A rejected message answers
     ``{"request_id", "error": ...}``, and so does a request that fails after
     it was accepted (with the HTTP ``status`` it would have had); no finish
-    follows an error. Messages may be pipelined: a client can
+    follows an error. A refused session names the status it would have had on
+    the form route, so a control loop can tell a 409 from a 404. Messages may be pipelined: a client can
     send the next observation before the previous action chunk has returned,
     and the ``request_id`` tells the replies apart. Closing the socket aborts
     whatever is still in flight.
@@ -1192,6 +1312,7 @@ async def generate_ws(websocket: WebSocket):
     async def serve_one(message: dict, binary: bool) -> None:
         request_id = message.get("request_id")
         file_paths: dict[str, list[str]] | None = None
+        session = SessionRequest()
         try:
             if request_id is not None and not isinstance(request_id, str):
                 raise ValueError("request_id must be a string")
@@ -1212,6 +1333,11 @@ async def generate_ws(websocket: WebSocket):
                 model_kwargs = json.loads(model_kwargs)
             if model_kwargs is not None and not isinstance(model_kwargs, dict):
                 raise ValueError("model_kwargs must be a JSON object")
+            if request_id is None:
+                request_id = str(uuid.uuid4())
+            # the session frame reaches the client as the first chunk of
+            # ``iter_result_chunks``; see ``submit_request``
+            session = _ws_session(api_server, message, request_id)
             request_id = api_server.submit_request(
                 text=text,
                 file_paths=file_paths or None,
@@ -1221,6 +1347,7 @@ async def generate_ws(websocket: WebSocket):
                 prompt_parts=parts or None,
                 streaming=True,
                 request_id=request_id,
+                session=session,
             )
             # Cancelling this task (socket closed mid-stream) tears the
             # iterator down, and its ``finally`` aborts the engine request.
@@ -1246,9 +1373,24 @@ async def generate_ws(websocket: WebSocket):
         except (WebSocketDisconnect, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
-            logger.exception("generate/ws request failed")
+            if isinstance(exc, SessionError):
+                # A client error (unknown session, one already in use): the
+                # reply carries it, so a stack trace would just be noise.
+                logger.warning("generate/ws refused a session: %s", exc.detail)
+            else:
+                logger.exception("generate/ws request failed")
+            if session.session_id is not None:
+                # Release the session this message claimed: it never reached the
+                # engine, so nothing else would let go of it.
+                api_server.sessions.finish_request(
+                    request_id, failed=True, error=str(exc),
+                )
+            status = exc.status_code if isinstance(exc, SessionError) else None
+            reply = {"request_id": request_id, "error": str(exc)}
+            if status is not None:
+                reply["status"] = status
             try:
-                await send({"request_id": request_id, "error": str(exc)}, binary)
+                await send(reply, binary)
             except Exception:  # noqa: BLE001
                 pass
         finally:
@@ -1292,6 +1434,11 @@ async def generate(
     streaming: bool = Form(True),
     model_kwargs: Optional[str] = Form(None),
     request_id: Optional[str] = Form(None),
+    start_session: bool = Form(False),
+    resume_session: bool = Form(False),
+    end_session: bool = Form(False),
+    session_id: Optional[str] = Form(None),
+    session_timeout_s: Optional[float] = Form(None),
 ):
     """Submit a multimodal generation request.
 
@@ -1309,6 +1456,15 @@ async def generate(
             server generates a fresh uuid4. Pinning this is useful for
             deterministic-noise debugging because the conductor seeds its
             per-request RNG via ``hash(request_id)``.
+        start_session: Open a persistent session and run this request in it.
+            Without a ``session_id`` the server mints one and reports it as the
+            first result chunk (modality ``"session"``).
+        resume_session: Continue an existing session, named by ``session_id``.
+            It must exist and have no request in flight.
+        end_session: Tear the session down once this request finishes.
+        session_id: The session to start with this id, or the one to resume.
+        session_timeout_s: The session's TTL. Defaults to the deployment's, and
+            may not exceed its maximum.
     """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
@@ -1387,6 +1543,23 @@ async def generate(
             detail="model_kwargs must be a JSON object",
         )
 
+    if request_id is None:
+        request_id = str(uuid.uuid4())
+    # Only a request that asks for a session consults the registry at all.
+    session = SessionRequest()
+    if start_session or resume_session or end_session or session_id:
+        try:
+            session = api_server.sessions.resolve(
+                start_session=start_session,
+                resume_session=resume_session,
+                end_session=end_session,
+                session_id=session_id,
+                session_timeout_s=session_timeout_s,
+                request_id=request_id,
+            )
+        except SessionError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
     try:
         request_id = api_server.submit_request(
             text=text,
@@ -1397,6 +1570,7 @@ async def generate(
             prompt_parts=parts or None,
             streaming=streaming,
             request_id=request_id,
+            session=session,
         )
 
         if streaming:
@@ -1413,23 +1587,81 @@ async def generate(
         chunks = await api_server.collect_results(request_id, request)
         outputs: dict[str, list[dict]] = {}
         for chunk in chunks:
+            if chunk.modality == "session":
+                # reported once, as the body's ``session_id`` below
+                continue
             outputs.setdefault(chunk.modality, []).append({
                 "data": base64.b64encode(chunk.data).decode("ascii"),
                 "metadata": chunk.metadata,
             })
-        return JSONResponse({
+        payload: dict[str, Any] = {
             "request_id": request_id,
             "outputs": outputs,
-        })
+        }
+        if session.session_id is not None:
+            payload["session_id"] = session.session_id
+        return JSONResponse(payload)
 
     except HTTPException:
+        if session.session_id is not None:
+            api_server.sessions.finish_request(
+                request_id, failed=True, error="the request was refused",
+            )
         raise
     except Exception as e:
+        if session.session_id is not None:
+            api_server.sessions.finish_request(
+                request_id, failed=True, error=str(e),
+            )
         raise HTTPException(status_code=500, detail=str(e)) from e
     finally:
         # Deferred cleanup of uploaded files
         if file_paths:
             _schedule_upload_cleanup(file_paths)
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Tear a session down without riding on a request.
+
+    Returns as soon as the teardown is under way; the id stays refused until
+    the conductor confirms the state is gone.
+    """
+    if api_server is None:
+        raise HTTPException(status_code=503, detail="Server not ready")
+    try:
+        api_server.sessions.delete(session_id)
+    except SessionError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+    return {"session_id": session_id, "status": "closing"}
+
+
+@app.get("/sessions")
+async def session_counts():
+    """How many sessions the server holds, live or winding down.
+
+    Counts, not ids: there is no auth, and an id is all it takes to resume or
+    delete a session, so listing them would hand every client's out.
+    """
+    if api_server is None:
+        raise HTTPException(status_code=503, detail="Server not ready")
+    return {
+        "sessions_enabled": api_server.sessions.enabled,
+        **api_server.sessions.counts(),
+    }
+
+
+@app.get("/sessions/{session_id}")
+async def describe_session(session_id: str):
+    """One session's state, for a client that already holds its id."""
+    if api_server is None:
+        raise HTTPException(status_code=503, detail="Server not ready")
+    entry = api_server.sessions.describe(session_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"unknown session {session_id!r}",
+        )
+    return entry
 
 
 @app.get("/health")

@@ -172,6 +172,58 @@ class RecurrentStatePool(Resource):
                 for slot in labels.values():
                     slot.has_state = False
 
+    # Session state, held under a reserved rid as ``KVManager`` holds its pages,
+    # so a resumed request continues from the state the session's last request
+    # left in its slots. A parked slot is out of circulation until the session
+    # resumes or ends: there is no host offload for recurrent state yet.
+
+    @staticmethod
+    def session_rid(session_id: str) -> str:
+        """The reserved rid a session parks its slots under; see
+        ``KVManager.session_rid``."""
+        return f"__mstar_session__{session_id}"
+
+    def adopt_session_state(self, rid: str, session_id: str) -> None:
+        if self._move_slots(self.session_rid(session_id), rid):
+            logger.info(
+                "recurrent state: %s adopted %d slot(s) from session %s",
+                rid, len(self._slots.get(rid, {})), session_id,
+            )
+
+    def retain_session_state(self, rid: str, session_id: str) -> None:
+        if self._move_slots(rid, self.session_rid(session_id)):
+            logger.info(
+                "recurrent state: session %s keeps %d slot(s) from %s",
+                session_id, self.session_state_size(session_id), rid,
+            )
+
+    def remove_session(self, session_id: str) -> None:
+        self.remove_request(self.session_rid(session_id))
+
+    def session_state_size(self, session_id: str) -> int:
+        """Slots the session holds."""
+        with self._lock:
+            return len(self._slots.get(self.session_rid(session_id), {}))
+
+    def _move_slots(self, src: str, dst: str) -> bool:
+        """Hand every slot of ``src`` to ``dst``. False when ``src`` held none.
+
+        A slot ``dst`` already has for one of the labels is released first:
+        a fresh ingest's slot holds nothing (``_alloc`` hands one out at admit,
+        not ingest), and two slots under one label would leak one.
+        """
+        with self._lock:
+            moved = self._slots.pop(src, None)
+            if not moved:
+                return False
+            own = self._slots.setdefault(dst, {})
+            for label in moved.keys() & own.keys():
+                index = own.pop(label).index
+                self._zero_slot(index)
+                self._free.append(index)
+            own.update(moved)
+            return True
+
     def _zero_slot(self, index: int) -> None:
         for tensor in self._blocks.values():
             tensor[:, index].zero_()

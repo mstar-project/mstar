@@ -17,6 +17,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
 )
+from mstar.api_server.request_types import SessionTornDown as SessionReleased
 from mstar.communication.wire import _set_polymorphic, register
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.base import PublishedInfo
@@ -38,8 +39,10 @@ from mstar.utils.ipc_format import (
     ReadsDone,
     RemoveRequest,
     ScheduleTPNode,
+    SessionTornDown,
     SetupDone,
     StopLoops,
+    TeardownSession,
     TensorReceived,
     TPNoSpeculation,
     UnpersistTensors,
@@ -65,6 +68,7 @@ _TYPES: dict[str, type] = {
     "stop_loops": StopLoops,
     "schedule_tp_node": ScheduleTPNode,
     "tp_no_speculation": TPNoSpeculation,
+    "teardown_session": TeardownSession,
     # conductor-bound bodies
     "wgs_done": WorkerGraphsDone,
     "setup_done": SetupDone,
@@ -72,6 +76,7 @@ _TYPES: dict[str, type] = {
     "new_request_conductor": NewRequestConductor,
     "reads_done": ReadsDone,
     "fail_requests": FailRequests,
+    "session_torn_down": SessionTornDown,
     # api-server bodies
     "result_tensors": ResultTensors,
     "request_complete": RequestComplete,
@@ -80,6 +85,7 @@ _TYPES: dict[str, type] = {
     "preprocess_input": PreprocessInput,
     "data_worker_profile": DataWorkerProfile,
     "prompt_part": PromptPart,
+    "session_released": SessionReleased,
     # polymorphic leaves
     "fwd_pass_info": CurrentForwardPassInfo,
     "published_kv": PublishedKVInfo,

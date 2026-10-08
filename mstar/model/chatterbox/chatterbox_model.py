@@ -678,6 +678,7 @@ class ChatterboxModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,  # `session`, which this model does not use
     ) -> ForwardPassArgs:
         knobs = self.resolve_generation_kwargs(model_kwargs)
         has_voice = bool(input_signals.get(REF_AUDIO))

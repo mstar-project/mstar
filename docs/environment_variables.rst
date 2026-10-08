@@ -199,6 +199,21 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        request reaches the pod (Run:AI serves a workload at
        ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
        every route. Empty by default, so a direct deployment is unaffected.
+   * - ``MSTAR_SESSION_SWEEP_INTERVAL_S``
+     - ``1.0``
+     - How often the API server looks for persistent sessions whose TTL has
+       passed, and for tombstones to chase. The sweep runs on the thread that
+       drains results, so it also bounds how long after its deadline a session
+       keeps holding its state and its id. Raise it to sweep less often on a
+       deployment with many sessions, lower it to make a short TTL expire
+       promptly in a test. See :doc:`sessions`.
+   * - ``MSTAR_SESSION_TOMBSTONE_GRACE_S``
+     - ``180``
+     - How long a persistent session's id stays refused while its state is
+       being freed before the sweep gives up on the conductor's ACK and
+       releases the id. Above the conductor's own barrier TTL
+       (``MSTAR_DRAIN_TTL_S``, 120s), which force-finalizes first. See
+       :doc:`sessions`.
 
 Serving (Rust frontend)
 -----------------------

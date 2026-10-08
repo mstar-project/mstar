@@ -315,6 +315,7 @@ class OrpheusModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         if partition_name == "LLM":
             full_metadata = CurrentForwardConductorMetadata(

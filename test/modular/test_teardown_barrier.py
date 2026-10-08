@@ -58,6 +58,10 @@ def _conductor(requests, drain_ttl_s=120.0):
     )
     c.requests = dict(requests)
     c.draining = {}
+    c.sessions = {}
+    c.session_teardowns = {}
+    c.request_sessions = {}
+    c._session_teardown_deadlines = deque()
     c._drain_ttl_s = drain_ttl_s
     c._early_reads_done = {}
     c._early_abort_requests = set()
@@ -157,7 +161,23 @@ def test_fail_defers_client_notification_until_barrier_completes():
     ]
     assert len(failures) == 1
     assert failures[0].body.error_message == "boom"
+    assert failures[0].body.status == 500
     assert _remove_targets(c, "r1") == {"w0", PREPROCESS}
+
+
+def test_a_failure_s_status_reaches_the_client():
+    c = _conductor({"r1": _request_data()})
+    c._fail_requests(FailRequests(
+        errors={"r1": "session cleared"}, statuses={"r1": 410},
+    ))
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id="w0"))
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
+
+    [failure] = [
+        m for e, m in c.sent
+        if e == "api_server" and m.message_type == "request_failed"
+    ]
+    assert failure.body.status == 410
 
 
 # ── happy path ──────────────────────────────────────────────────────────────

@@ -826,6 +826,7 @@ class VJepa2Model(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         walk = self._initial_walk(model_kwargs)
         full_metadata = CurrentForwardConductorMetadata(

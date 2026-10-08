@@ -413,6 +413,11 @@ class KVManager(AttentionResource):
         # step's admit returns first -- see ``remove_request`` / ``reset_request``.
         self._admit_reserved_pages: dict[tuple[int, str], list[int]] = {}
 
+        # session id -> device pages its parked state holds, longest idle
+        # first. Offloaded (``_offload_idle_sessions``) when a live request
+        # needs the pages; adopting or removing the session takes it out.
+        self._idle_session_pages: dict[str, int] = {}
+
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
         return cls(
@@ -1652,6 +1657,7 @@ class KVManager(AttentionResource):
             return False
         with self._lock:
             evictable = 0 if self._index is None else self._index.num_sole_owned()
+            evictable += sum(self._idle_session_pages.values())
             return self._reload_pages_needed(rid) <= self._arena.num_free + evictable
 
     def reload(self, rid: str) -> bool:
@@ -1665,6 +1671,8 @@ class KVManager(AttentionResource):
         with self._lock:
             labels = self._cpu_pool.labels(rid)
             needed = self._reload_pages_needed(rid)
+            if needed > self._arena.num_free:
+                self._offload_idle_sessions(needed)
             if needed > self._arena.num_free and self._index is not None:
                 # as `_alloc` does: once the pool is all cached pages, nothing
                 # else would ever free one for this request to come back to
@@ -1815,6 +1823,153 @@ class KVManager(AttentionResource):
                 self._seed_keys(rid, label, stream)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
+
+    # ------------------------------------------------------------------
+    # Session state, held under a reserved rid so everything already keyed by
+    # request id (streams, offloaded host pages) carries over unchanged
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def session_rid(session_id: str) -> str:
+        """The reserved rid a session parks its state under.
+
+        A string, not a handle: handles are minted per request by the worker's
+        graph runtime and recycled once the request is gone, and the negative
+        range belongs to dummy rids, so there is no value here that is
+        guaranteed not to collide with a live request's.
+
+        TODO: a handle minter shared with the cuda graph runner's dummy id
+        production — one that can mint a (negative) handle for anything not
+        tied to a real request.
+        """
+        return f"__mstar_session__{session_id}"
+
+    def adopt_session_state(self, rid: str, session_id: str) -> None:
+        with self._lock:
+            if not self._move_streams(self.session_rid(session_id), rid):
+                # the session's first request, or a handover that went missing
+                logger.info(
+                    "KV %s: session %s held no state for %s",
+                    self.name, session_id, rid,
+                )
+                return
+            self._idle_session_pages.pop(session_id, None)
+            # Offloaded parked state is not reloaded here: `check_ready` sees
+            # the request offloaded and reloads it at admission once it fits,
+            # through `Engine.reload_request`, which journals the move for TP
+            # followers. A reload from here would bypass that journal.
+            logger.info(
+                "KV %s: %s adopted %d pages from session %s",
+                self.name, rid, self._pages_held(rid), session_id,
+            )
+            # its keys describe the new turn only, not the pages it inherited
+            overrides = self._overrides.get(rid)
+            if overrides is not None and overrides.prefix_cache:
+                overrides.prefix_cache = False
+                logger.debug(
+                    "KV %s: prefix cache off for %s; it resumes session %s",
+                    self.name, rid, session_id,
+                )
+
+    def retain_session_state(self, rid: str, session_id: str) -> None:
+        with self._lock:
+            if not self._move_streams(rid, self.session_rid(session_id)):
+                return
+            # re-inserted, so the dict stays ordered by how long each has idled
+            self._idle_session_pages.pop(session_id, None)
+            self._idle_session_pages[session_id] = self._pages_held(
+                self.session_rid(session_id)
+            )
+            logger.info(
+                "KV %s: session %s keeps %d pages (%s tokens) from %s",
+                self.name, session_id, self.session_state_size(session_id),
+                {
+                    label: stream.stored_len for label, stream in
+                    self._streams.get(self.session_rid(session_id), {}).items()
+                },
+                rid,
+            )
+
+    def remove_session(self, session_id: str) -> None:
+        with self._lock:
+            self._idle_session_pages.pop(session_id, None)
+        self.remove_request(self.session_rid(session_id))
+
+    def session_state_size(self, session_id: str) -> int:
+        """Pages the session holds, on device and offloaded to host."""
+        rid = self.session_rid(session_id)
+        with self._lock:
+            held = self._pages_held(rid)
+            if self._cpu_pool is not None:
+                held += self._reload_pages_needed(rid)
+            return held
+
+    def _offload_idle_sessions(self, num_free: int) -> None:
+        """Offload idle sessions, longest idle first, until ``num_free``
+        pages are free or none is left to move.
+
+        Caller holds the lock. Does nothing without a host pool. A session
+        whose pages the host pool can't take keeps them; the next one is tried.
+        """
+        if self._cpu_pool is None:
+            return
+        for session_id, held in list(self._idle_session_pages.items()):
+            if self._arena.num_free >= num_free:
+                return
+            if held == 0:
+                continue
+            rid = self.session_rid(session_id)
+            freed = self.offload(rid)
+            self._idle_session_pages[session_id] = self._pages_held(rid)
+            if freed:
+                logger.info(
+                    "KV %s: offloaded idle session %s (%d pages)",
+                    self.name, session_id, freed,
+                )
+
+    def _pages_held(self, rid: str) -> int:
+        with self._lock:
+            streams = self._streams.get(rid, {})
+            return sum(len(stream.page_indices) for stream in streams.values())
+
+    def _move_streams(self, src: str, dst: str) -> bool:
+        """Hand every stream (and its host pages) from one rid to another.
+
+        False when the source held nothing, so a caller can tell a resumed
+        request from the session's first one.
+        """
+        streams = self._streams.get(src)
+        if not streams:
+            return False
+        # drain in-flight reads outside the lock; see reset_request
+        for stream in streams.values():
+            if stream.read_future is not None:
+                wait([stream.read_future])
+        with self._lock:
+            streams = self._streams.pop(src, None)
+            if not streams:
+                return False
+            existing = self._streams.get(dst) or {}
+            for label, stream in existing.items():
+                if label in streams:
+                    # the destination's own stream for this label is empty (a
+                    # fresh ingest) but may hold a probe's lease
+                    self._release_lease(stream)
+                    self._arena.release(stream.page_indices)
+            for stream in streams.values():
+                self._release_lease(stream)
+                stream.converted = False
+                stream.step_in_flight = False
+                # a session's pages are not keyed for cross-request reuse
+                stream.forget_chain()
+            self._streams[dst] = {**existing, **streams}
+            self._overrides.setdefault(dst, KVReqConfig())
+            if self._cpu_pool is not None and src in self._cpu_pool.offloaded:
+                self._cpu_pool.offloaded[dst] = self._cpu_pool.offloaded.pop(src)
+            self._overrides.pop(src, None)
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
+        return True
 
     def remove_request(self, rid: str):
         streams = self._streams.get(rid)
@@ -2061,6 +2216,11 @@ class KVManager(AttentionResource):
             new_pages: list[int] = []
             if num_new_pages > 0:
                 new_pages = self._arena.acquire(num_new_pages)
+                if new_pages is None and self._idle_session_pages:
+                    # parked state comes back on adoption; a cached page that
+                    # is evicted is gone, so idle sessions go first
+                    self._offload_idle_sessions(num_new_pages)
+                    new_pages = self._arena.acquire(num_new_pages)
                 if new_pages is None and self._index is not None:
                     # cached pages are the only ones that can be given back
                     # without failing a request that is already running

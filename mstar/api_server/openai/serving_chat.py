@@ -21,24 +21,50 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 
-    api.submit_request(
-        text=args.text,
-        file_paths=args.file_paths,
-        input_modalities=args.input_modalities,
-        output_modalities=args.output_modalities,
-        model_kwargs=args.model_kwargs,
-        prompt_parts=args.prompt_parts,
-        streaming=bool(req.stream),
+    # A turn in a persistent session continues the state the last one built, so
+    # the client sends this turn alone. The registry no-ops when no session
+    # field is set, and raises SessionError (which carries its own status) for
+    # anything it refuses; the router reports that.
+    session = api.sessions.resolve(
+        start_session=bool(req.start_session),
+        resume_session=bool(req.resume_session),
+        end_session=bool(req.end_session),
+        session_id=req.session_id,
+        session_timeout_s=req.session_timeout_s,
         request_id=request_id,
     )
 
+    try:
+        api.submit_request(
+            text=args.text,
+            file_paths=args.file_paths,
+            input_modalities=args.input_modalities,
+            output_modalities=args.output_modalities,
+            model_kwargs=args.model_kwargs,
+            prompt_parts=args.prompt_parts,
+            streaming=bool(req.stream),
+            request_id=request_id,
+            session=session,
+        )
+    except Exception as e:
+        if session.session_id is not None:
+            # never reached the engine, so nothing else would release it
+            api.sessions.finish_request(request_id, failed=True, error=str(e))
+        raise
+
     if req.stream:
-        return _stream(api, model_name, request_id, sample_rate)
+        return _stream(
+            api, model_name, request_id, sample_rate, session.session_id,
+        )
     chunks = await api.collect_results(request_id, raw_request)
-    return _build_response(model_name, request_id, chunks, sample_rate)
+    return _build_response(
+        model_name, request_id, chunks, sample_rate, session.session_id,
+    )
 
 
-def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
+def _build_response(
+    model_name, request_id, chunks, sample_rate, session_id=None,
+) -> dict:
     text_parts: list[str] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
@@ -76,25 +102,30 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
         "model": model_name,
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        # the session this turn ran in, so a client that let the server mint the
+        # id learns it; absent for a request in no session
+        **({"session_id": session_id} if session_id else {}),
     }
 
 
-async def _stream(api, model_name, request_id, sample_rate):
+async def _stream(api, model_name, request_id, sample_rate, session_id=None):
     created = now()
 
-    def chunk(delta, finish=None) -> str:
+    def chunk(delta, finish=None, session=None) -> str:
         return sse({
             "id": request_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model_name,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            **({"session_id": session} if session else {}),
         })
 
     def error(message: str, status: int) -> str:
         return sse({"error": {"message": message, "type": error_type(status), "code": status}})
 
-    yield chunk({"role": "assistant"})
+    # the opening chunk names the session, before any output arrives
+    yield chunk({"role": "assistant"}, session=session_id)
     failed = False
     try:
         async for c in api.iter_result_chunks(request_id):
@@ -105,6 +136,8 @@ async def _stream(api, model_name, request_id, sample_rate):
                 yield chunk({"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}})
             elif c.modality == "image":
                 yield chunk({"content": media_io.png_to_data_url(c.data)})
+            elif c.modality == "session":
+                continue  # already reported on the opening chunk
             elif c.modality == "error":
                 # The request failed after the stream opened (an engine error
                 # mid generation, a preprocess error); the HTTP status is

@@ -311,6 +311,16 @@ class ARNodeInputs(NodeInputs):
         return dict(out)
 
 
+# Set by the engine in a node's session state when the session's last request
+# ended a loop on an overshot step: a speculative iteration already ran past
+# the stop, so the stopping iteration's output was fed back in and its effect
+# is in the node's resource state (for an LLM, the stopping token is in the
+# KV). Absent when the loop stopped exactly, which leaves that output out.
+# What the output was is the model's to record; a model that renders the join
+# between turns reads both on its next first step and clears them.
+OVERSHOT_LAST_ITER = "overshot_last_iter"
+
+
 @dataclass
 class PerRequestState:
     """Engine-owned per-request state a submodule persists across forwards.
@@ -396,6 +406,42 @@ class LazyRequestStates(Mapping):
         return len(self._rids)
 
 
+class LazySessionStates(Mapping):
+    """The batch's per-session states, by request id, resolved on first read.
+
+    A request with no session, or whose session the submodule has nothing for
+    yet, reads as ``None`` rather than raising: only a submodule that keeps
+    session state looks here at all.
+    """
+
+    __slots__ = ("_submodule", "_rids", "_sessions", "_members")
+
+    def __init__(
+        self, submodule: "NodeSubmodule", rids: "Sequence[str]",
+        sessions: "Mapping[str, str]",
+    ):
+        self._submodule = submodule
+        self._rids = rids
+        self._sessions = sessions
+        self._members: set[str] | None = None
+
+    def __getitem__(self, rid: str) -> "PerRequestState | None":
+        if self._members is None:
+            self._members = set(self._rids)
+        if rid not in self._members:
+            raise KeyError(rid)
+        session_id = self._sessions.get(rid)
+        if session_id is None:
+            return None
+        return self._submodule.session_state(session_id)
+
+    def __iter__(self):
+        return iter(self._rids)
+
+    def __len__(self) -> int:
+        return len(self._rids)
+
+
 @dataclass
 class ModelInputsFromEngine:
     request_ids: list[str]
@@ -412,6 +458,10 @@ class ModelInputsFromEngine:
     # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
     # Usually a ``LazyRequestStates`` view rather than a materialised dict.
     per_request_states: "Mapping[str, PerRequestState] | None" = None
+
+    # The batch's per-session states, by request id; None for a request in no
+    # session. Dropped at session teardown, not request teardown.
+    per_session_states: "Mapping[str, PerRequestState | None] | None" = None
 
     # This step's declaration, as ``declare_step`` returned it. A forward
     # that has to agree with its own declaration reads it here rather than
@@ -474,6 +524,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         # of the same objects. The engine removes a request's entry via
         # ``cleanup_request`` when the request is removed.
         self.request_states: dict[str, PerRequestState] = {}
+        # Per-session state store, the same shape as request_states but kept
+        # until the session ends rather than until the request does.
+        self.session_states: dict[str, PerRequestState] = {}
         # Engine-built resources for this submodule's node (KV cache pool,
         # embedder, scratch caches), bound once at load. Empty until then
         # and on engines that build none.
@@ -538,6 +591,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         state = self.request_states.get(request_id)
         if state is None:
             state = self.request_states[request_id] = PerRequestState()
+        return state
+
+    def session_state(self, session_id: str) -> PerRequestState:
+        """The session's state, created on first access."""
+        state = self.session_states.get(session_id)
+        if state is None:
+            state = self.session_states[session_id] = PerRequestState()
         return state
 
     def get_device(self):
@@ -842,6 +902,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
         this on request removal; overrides with extra internal state should
         call super()."""
         self.request_states.pop(request_id, None)
+
+    def cleanup_session(self, session_id: str):
+        """Remove per-session state when a session ends. The engines call this
+        on session teardown; overrides with extra internal state should call
+        super()."""
+        self.session_states.pop(session_id, None)
 
 
 class ARNodeSubmodule(NodeSubmodule):

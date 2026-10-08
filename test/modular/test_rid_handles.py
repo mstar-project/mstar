@@ -17,6 +17,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker.micro_scheduler import REMOVED_RID, MicroScheduler
 from mstar.worker.rid_table import RidTable
+from mstar.worker.sessions import WorkerSessionManager
 from mstar.worker.worker import Worker
 
 # ── the table ──────────────────────────────────────────────────────────────
@@ -143,6 +144,7 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
         per_request_info={h: SimpleNamespace() for h in handles},
         remove_request=lambda h: w.request_state.per_request_info.pop(h),  # noqa: PLW0108
     )
+    w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
     return w, t
 
 
@@ -165,7 +167,10 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._last_active = {}
     w.streaming_buffers = {a: {}}
-    w.engine_manager = SimpleNamespace(remove_request=lambda h: None, evictable_nodes=lambda: [])
+    w.engine_manager = SimpleNamespace(
+        remove_request=lambda h, end_session=False, **kw: None,
+        evictable_nodes=lambda: [],
+    )
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
     w.profile_info = SimpleNamespace(pop_request=lambda h: None)
     w.scheduler.held_until[a] = float("inf")
@@ -238,7 +243,9 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
         lambda request_id, request_info: got.__setitem__("state", request_id)
     )
     w.engine_manager = SimpleNamespace(
-        add_request=lambda rid, cfgs: got.__setitem__("engine", rid),
+        add_request=lambda rid, cfgs, session=None: got.__setitem__(
+            "engine", rid,
+        ),
         evictable_nodes=lambda: [],
     )
     w.tensor_manager = SimpleNamespace(
@@ -252,7 +259,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     w._unprocessed_messages = {}
     info = SimpleNamespace(
         rid_handle=-1, resource_configs={}, graph_walk="decode",
-        partition_name="p",
+        partition_name="p", session=None,
     )
     body = SimpleNamespace(
         request_id="wire-1", request_info=info,
@@ -283,7 +290,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     req = SimpleNamespace(stream_buffers={}, stream_buffers_by_consumer={})
     w.request_state.add_request = lambda request_id, request_info: None
     w.request_state.per_request_info = collections.defaultdict(lambda: req)
-    w.engine_manager = SimpleNamespace(add_request=lambda rid, cfgs: None, evictable_nodes=lambda: [])
+    w.engine_manager = SimpleNamespace(add_request=lambda rid, cfgs, session=None: None, evictable_nodes=lambda: [])
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
@@ -298,7 +305,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     def new(partition, lead):
         info = SimpleNamespace(
             rid_handle=-1, resource_configs={}, graph_walk="w", partition_name=partition,
-            stream_lead_items=lead,
+            stream_lead_items=lead, session=None,
         )
         body = SimpleNamespace(
             request_id="wire-1", request_info=info, partition_worker_graph_ids={},
