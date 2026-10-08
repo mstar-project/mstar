@@ -19,13 +19,14 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
+from mstar.engine.resources.attn import sparse_mla
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next import dsa
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import KV_CACHE, SAMPLER, Glm5NextModelConfig
+from mstar.model.glm5_next.config import ATTN, KV_CACHE, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
@@ -372,12 +373,13 @@ def test_two_long_requests_batch_like_one(window):
     assert seq["a"] == alone_a and seq["b"] == alone_b
 
 
-def test_one_token_prompts_prefill_eager_in_long_mode():
-    """A prefill step of one-token prompts plans KDA as decode: it runs as one window, and its
-    tokens are dense mode's (the identity regime)."""
+@pytest.mark.parametrize("window", [8192, 1])
+def test_one_token_prompts_prefill_eager_in_long_mode(window):
+    """A prefill step of one-token prompts plans KDA as decode: it runs as one window, whatever
+    prefill_window_tokens, and its tokens are dense mode's (the identity regime)."""
     want = {}
     for long_context in (False, True):
-        engine, _, _ = _engine(long_context)
+        engine, _, _ = _engine(long_context, window)
         for rid in ("a", "b"):
             engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
         toks = _step(engine, "prefill", {"a": torch.tensor([7]), "b": torch.tensor([42])})
@@ -396,3 +398,58 @@ def test_bind_refuses_a_page_size_pools_straddle():
     kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=cfg.index_kpool * 4 + 2))
     with pytest.raises(ValueError, match="multiple of index_kpool"):
         sub.bind_node_resources({KV_CACHE: kv})
+
+
+@pytest.mark.parametrize("change, match", [({"max_seq_len": 64}, "past index_topk"),
+                                           ({"prefill_window_tokens": 0}, "must be >= 1")])
+def test_long_context_refuses_what_it_cannot_serve(change, match):
+    cfg = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), **change)
+    with pytest.raises(ValueError, match=match):
+        cfg.check_long_context()
+
+
+def test_long_context_refuses_pools_per_page_off_a_power_of_two():
+    cfg = Glm5NextModelConfig.reduced_long_context()
+    with pytest.raises(ValueError, match="power of two"):
+        cfg.check_long_context(page_size=cfg.index_kpool * 3)
+
+
+def test_bind_refuses_sharded_prefill_beside_eviction():
+    cfg = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), dsa_shard_prefill=True)
+    sub = object.__new__(Glm5NextLLMSubmodule)
+    sub.config = cfg
+    kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=cfg.index_kpool * 4),
+                               supports_eviction=True)
+    with pytest.raises(ValueError, match="cpu_offload_pages"):
+        sub.bind_node_resources({KV_CACHE: kv})
+
+
+def test_bind_refuses_a_captured_bucket_past_the_sparse_plan():
+    cfg = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), prefill_graphs=True,
+                              prefill_token_buckets=[128, 2 * sparse_mla.MAX_ROWS])
+    sub = object.__new__(Glm5NextLLMSubmodule)
+    sub.config = cfg
+    with pytest.raises(ValueError, match="prefill buckets"):
+        sub.bind_node_resources({})
+
+
+def test_score_kernels_take_only_their_shapes():
+    view = torch.empty(0, dtype=torch.bfloat16)
+
+    def cuda(*shape):
+        return types.SimpleNamespace(is_cuda=True, shape=shape)
+
+    assert dsa._kernel_fits(cuda(8, 32, 128), view)
+    assert not dsa._kernel_fits(cuda(8, 4, 16), view)  # the reduced config's 4 index heads
+    assert not dsa._kernel_fits(cuda(8, 32, 128), view.float())
+
+
+def test_a_non_bf16_cache_captures_nothing_in_long_mode():
+    # the DSA kernels take a bf16 cache; the torch paths sync with the host
+    sub = object.__new__(Glm5NextLLMSubmodule)
+    sub.config = Glm5NextModelConfig.reduced_long_context()
+    sub._moe_capture_blocked = lambda tp_world_size: False
+    sub.node_resources = {ATTN: types.SimpleNamespace(uses_kernel=True),
+                          KV_CACHE: types.SimpleNamespace(layer_view=lambda *a: torch.empty(0))}
+    assert sub.get_cuda_graph_configs(torch.device("cuda")) == []
+    assert sub._prefill_captured is False

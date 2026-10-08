@@ -2,6 +2,9 @@ model: "glm5_next"
 # GLM-5.3-Flash on 8 GPUs of 80 GB with contexts to its native 1M tokens: every MLA layer runs
 # the k-pool DSA indexer and sparse MLA (dsa_long_context). Otherwise glm5_next_tp8.yaml.
 max_seq_len: 1048576
+# One request per KDA slot below, as glm5_next_tp8.yaml. The KV pool admits by prompt: when
+# the live contexts outgrow it, decode holds requests until they time out (no eviction).
+max_concurrent_requests: 64
 # NVLS multicast for the small decode all-reduces; stays on NCCL, with a
 # warning, where NVLink multicast is unavailable.
 tp_allreduce: "symm_multimem"

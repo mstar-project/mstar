@@ -133,6 +133,17 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     def bind_node_resources(self, resources: dict) -> None:
         if KV_CACHE in resources:
             self.config.check_long_context(resources[KV_CACHE].kv_cache.page_size)
+            # each rank attends the others' selected cache slots, so the ranks' page tables
+            # must agree, and an eviction frees pages in a different order on each rank
+            if self.config.dsa_shard_prefill and getattr(resources[KV_CACHE],
+                                                         "supports_eviction", False):
+                raise ValueError("dsa_shard_prefill needs cpu_offload_pages: 0")
+        buckets = self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS
+        if self.config.dsa_long_context and self.config.prefill_graphs and (
+                max(buckets) > sparse_mla.MAX_ROWS):
+            # a captured prefill plans its whole bucket at once; the eager plan takes chunks
+            raise ValueError(f"dsa_long_context captures prefill buckets up to "
+                             f"{sparse_mla.MAX_ROWS} tokens; the largest is {max(buckets)}")
         super().bind_node_resources(resources)
         # The fused kernels where they run; the torch reference elsewhere.
         kda = resources.get(KDA)
@@ -223,6 +234,14 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 "glm5_next: MLA is on the SDPA fallback, which cannot be "
                 "captured; decode runs eager"
             )
+            self._prefill_captured = False
+            return []
+        kv = self.node_resources.get(KV_CACHE)
+        if (self.config.dsa_long_context and device.type == "cuda" and kv is not None
+                and kv.layer_view().dtype != torch.bfloat16):
+            # the DSA kernels take a bf16 cache; the torch paths sync with the host
+            logger.warning("glm5_next: dsa_long_context on a %s cache cannot be captured; "
+                           "decode runs eager", kv.layer_view().dtype)
             self._prefill_captured = False
             return []
         max_slots = self._kda_max_slots()
@@ -607,7 +626,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         size = self.config.prefill_window_tokens
         total = input_ids.shape[0]
         last = [r0 + n - 1 for r0, n, _ in ctx.spans]
-        if total <= size:  # one window: the step's own plans (one-token prompts plan as decode)
+        # one window: the step's own plans (one-token prompts plan as decode, unsplittable)
+        if total <= size or len(ctx.spans) == total:
             rows = to_device_async(last, torch.long, input_ids.device)
             hidden = self.language_model.model(input_ids, rows=rows)
             return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(hidden))

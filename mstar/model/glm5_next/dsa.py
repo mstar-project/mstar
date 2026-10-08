@@ -159,8 +159,13 @@ def _select_rows(q, w, view, ctx, req, r0, r1):
     return out
 
 
+def _kernel_fits(q, view) -> bool:
+    # tl.dot takes 16+ rows and columns: a reduced config's 4 index heads take the torch math
+    return q.is_cuda and view.dtype == torch.bfloat16 and q.shape[1] >= 16 and q.shape[2] >= 16
+
+
 def _decode_scores(q, w, view, ctx):
-    if q.is_cuda and view.dtype == torch.bfloat16:
+    if _kernel_fits(q, view):
         from mstar.model.glm5_next.dsa_kernels import decode_scores
 
         return decode_scores(q.to(torch.bfloat16).contiguous(), w.float().contiguous(), view,
@@ -170,7 +175,7 @@ def _decode_scores(q, w, view, ctx):
 
 
 def _prefill_scores(q, w, view, ctx, req, c0, c1, pools):
-    if q.is_cuda and view.dtype == torch.bfloat16:
+    if _kernel_fits(q, view):
         from mstar.model.glm5_next.dsa_kernels import prefill_scores
 
         return prefill_scores(q.to(torch.bfloat16).contiguous(), w.float().contiguous(), view,
