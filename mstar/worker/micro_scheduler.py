@@ -463,7 +463,14 @@ class MicroScheduler:
 
         if self.sched_type != SchedulingType.ROUND_ROBIN:
             raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
-        ready = self._scan_ready(request_state, target, exclude_target)
+        scan = True
+        if target is not None:
+            room = self._room_left(target, max_batch_size, pre_existing_batch_size)
+            if room == 0:
+                return None  # the caller is full: nothing to scan for
+            # the caller and its backlog fill the step, so no fresh row could join
+            scan = room is None or len(self._live_backlog(target)) < room
+        ready = self._scan_ready(request_state, target, exclude_target) if scan else {}
 
         # A backlogged key goes first, oldest first, so a split set drains
         # before anything else starts; its fresh rows ride along. A key whose
@@ -527,22 +534,18 @@ class MicroScheduler:
     ) -> ScheduledBatch | None:
         """One step for ``node_walk`` out of its backlog and its ready
         ``entries``, composed by the batch builder."""
+        remaining = self._room_left(node_walk, max_batch_size, pre_existing_batch_size)
+        if remaining == 0:
+            # The caller already holds a full batch. Assembling would pop these
+            # nodes off their ready queues with nowhere to run them, so leave
+            # them and the backlog as they are for the next pass.
+            return None
         backlogged = self.backlog.pop(node_walk, None)
         blocked = set()
         if backlogged is not None:
             blocked = self._unready_backlog_rids(backlogged, request_state)
             if not backlogged:
                 backlogged = None  # every row failed
-        if max_batch_size is None:
-            max_batch_size = self._max_batch_size(*node_walk)
-        remaining = self._remaining_capacity(max_batch_size, pre_existing_batch_size)
-        if remaining is not None and remaining <= 0:
-            # The caller already holds a full batch. Assembling would pop these
-            # nodes off their ready queues with nowhere to run them, so leave
-            # them queued for the next pass.
-            if backlogged is not None:
-                self._backlog(node_walk, backlogged)
-            return None
 
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
             if entries else None
@@ -555,13 +558,17 @@ class MicroScheduler:
             capture_group_of=capture_group_of,
         ))
 
-    @staticmethod
-    def _remaining_capacity(
-        max_batch_size: int | None, pre_existing: int,
+    def _room_left(
+        self, node_walk: tuple[str, str], max_batch_size: int | None,
+        pre_existing_batch_size: int,
     ) -> int | None:
-        """What is left of the cap once the caller's own rows are counted.
-        None stays None: an uncapped node takes the whole ready set."""
-        return None if max_batch_size is None else max_batch_size - pre_existing
+        """What is left of ``node_walk``'s cap once the caller's own rows are
+        counted. None stays None: an uncapped node takes the whole ready set."""
+        if max_batch_size is None:
+            max_batch_size = self._max_batch_size(*node_walk)
+        if max_batch_size is None:
+            return None
+        return max(max_batch_size - pre_existing_batch_size, 0)
 
     def _capture_group(
         self, request_state: RequestStateManager,
@@ -582,21 +589,25 @@ class MicroScheduler:
         anchored at ``rid`` would never merge (``chain_must_yield``), so the
         chain has to yield for it to run.
         """
-        waiting = self.backlog.get(target)
-        if waiting is None:
+        live = self._live_backlog(target)
+        if not live:
             return False
+        return self.batch_builder.chain_must_yield(
+            self.backlog[target], live, rid,
+            functools.partial(self._capture_group, request_state, *target),
+        )
+
+    def _live_backlog(self, node_walk: tuple[str, str]) -> set[int]:
+        """``node_walk``'s backlogged rids that are not failed, removed or held."""
+        waiting = self.backlog.get(node_walk)
+        if waiting is None:
+            return set()
         now = time.monotonic()
-        live = {
+        return {
             r for r in waiting.request_to_worker_graph
             if r not in self.failed_rids and r not in self.pending_removes
             and self.held_until.get(r, 0.0) <= now
         }
-        if not live:
-            return False
-        return self.batch_builder.chain_must_yield(
-            waiting, live, rid,
-            functools.partial(self._capture_group, request_state, *target),
-        )
 
     def _unready_backlog_rids(
         self, batch: ScheduledBatch, request_state: RequestStateManager,
