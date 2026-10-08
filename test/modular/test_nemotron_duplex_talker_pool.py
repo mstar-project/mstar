@@ -87,6 +87,16 @@ def test_pre_drawn_noise_reproduces_generator_sampling():
     torch.testing.assert_close(with_noise, with_gens)
 
 
+def test_empty_chunk_runs_a_pad_frame():
+    """A very short clip ends the token stream on an empty chunk. The talker runs
+    a PAD frame rather than raising or skipping: either drops the rid from its
+    stream-ended loop, and the worker's stop then fails the whole batch."""
+    sub = make_sub()
+    for inputs in ({"new_token": []}, {}):
+        out = sub.prepare_inputs("talker_decode", fwd("a"), inputs, is_final_stream_chunk=True)
+        assert out.input_ids.tolist() == [sub.config.text_pad_id] and out.kwargs["first"] is True
+
+
 def test_step_declares_both_streams_in_one_combined_plan():
     sub = make_sub()
     # first step of "a" (warm-up + frame), steady state for "b"

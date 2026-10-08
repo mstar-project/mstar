@@ -543,7 +543,14 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> ARNodeInputs:
         # The LLM streams the sampled agent text token under "new_token". A
         # session's first step also prefills the speaker warm-up.
-        tok = inputs["new_token"][0].reshape(1)
+        chunk = inputs.get("new_token")
+        if chunk:
+            tok = chunk[0].reshape(1)
+        else:
+            # a very short clip ends the token stream on an empty chunk; run a PAD
+            # frame, since a skipped rid in a stream-ended loop breaks the stop
+            dev = self.talker.embed_code.weight.device
+            tok = torch.tensor([self.config.text_pad_id], dtype=torch.long, device=dev)
         first = self._is_first_step(fwd_info.rid_handle)
         span = self.warmup_len + 1 if first else 1
         return ARNodeInputs(input_ids=tok, input_seq_len=span, kwargs={"first": first})
