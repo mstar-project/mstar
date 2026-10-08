@@ -126,8 +126,9 @@ def test_w8a8_within_the_rounding_bound(dense_fp8, rank_weights, name, path, tok
     to bf16 before the SwiGLU."""
     q, s = rank_weights[name]
     n, k, glu = SHAPES[name]
-    if path == "fi" and not dense_fp8._FI_OK.get(torch.device("cuda", torch.cuda.current_device())):
-        pytest.skip("flashinfer's SM90 block-scale GEMM is not available")
+    device = torch.device("cuda", torch.cuda.current_device())
+    if not (dense_fp8._FI_OK if path == "fi" else dense_fp8._W8A8_OK).get(device):
+        pytest.skip(f"the {path} block-scaled fp8 GEMM is not available")
     gen = torch.Generator(device="cuda").manual_seed(tokens)
     x = _x(tokens, k, gen)
     got = dense_fp8._fi(x, q, s, glu) if path == "fi" else dense_fp8._w8a8(x, q, s, BLOCK, glu)
@@ -185,3 +186,22 @@ def test_op_compiles_whole(dense_fp8, rank_weights):
 
     torch._dynamo.reset()
     assert torch.equal(torch.compile(f, fullgraph=True)(x), f(x))
+
+
+def test_an_unusable_cublas_block_gemm_falls_back(monkeypatch):
+    """torch 2.10-2.12 have the API, but blockwise scaled_mm raises off SM90 or on a
+    cuBLASLt before 12.9 (the cu128 builds): every prefill step past 512 tokens failed."""
+    from mstar.model.glm52 import dense_fp8
+
+    def raises(*args, **kwargs):
+        raise NotImplementedError("blockwise scaling needs cuBLASLt >= 12.9")
+
+    monkeypatch.setattr(dense_fp8, "_W8A8_API", True)
+    monkeypatch.setattr(dense_fp8, "_w8a8", raises)
+    assert dense_fp8._probe_w8a8(torch.device("cpu")) is False
+    taken = []
+    monkeypatch.setattr(dense_fp8, "_w8a16", lambda *args: taken.append(1) or None)
+    monkeypatch.setattr(dense_fp8, "_W8A8_OK", {torch.device("cpu"): False})
+    dense_fp8._linear(torch.zeros(600, 256, dtype=torch.bfloat16),
+                      torch.zeros(256, 256, dtype=torch.uint8), torch.ones(2, 2), (128, 128), False)
+    assert taken == [1]
