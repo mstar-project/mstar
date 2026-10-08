@@ -139,10 +139,21 @@ class StepRunner:
         """The node's resources with a prefix cache open right now. Empty in
         the common case, which lets the caller skip a per-request sweep that
         was six no-op calls per request per step."""
-        return [
-            key for key in self._sweep(self._node_order, self._order, node_name)
-            if self._resources[key].keys_prefix_chains
-        ]
+        keys: list[str] = []
+        for key in self._sweep(self._node_order, self._order, node_name):
+            resource = self._resources[key]
+            if resource.keys_prefix_chains:
+                keys.append(key)
+                continue
+            # a resource that overrides the hook without saying when it keys
+            # is swept as before the skip existed
+            cls = type(resource)
+            if (
+                cls.extend_prefix_chain is not Resource.extend_prefix_chain
+                and cls.keys_prefix_chains is Resource.keys_prefix_chains
+            ):
+                keys.append(key)
+        return keys
 
     def extend_prefix_chains(
         self, rid: str, node_name: str, graph_walk: str, outputs,
@@ -155,6 +166,23 @@ class StepRunner:
             self._resources[key].extend_prefix_chain(
                 rid, node_name, graph_walk, outputs,
             )
+
+    def extend_prefix_chains_batch(
+        self, request_ids: list[str], node_name: str, graph_walk: str,
+        host_rows, outputs, keys: list[str],
+    ) -> None:
+        """``extend_prefix_chains`` for a step: a resource with a batch form
+        takes the host rows; the others are offered each request's host copy."""
+        for key in keys:
+            resource = self._resources[key]
+            batched = getattr(resource, "extend_prefix_chains_batch", None)
+            if batched is not None:
+                batched(request_ids, node_name, graph_walk, host_rows)
+                continue
+            for rid in request_ids:
+                per_rid = outputs.get(rid)
+                if isinstance(per_rid, dict):
+                    resource.extend_prefix_chain(rid, node_name, graph_walk, per_rid)
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
