@@ -328,6 +328,8 @@ class SamplerResource(Resource):
 
     ### Submodule-level functionality
 
+    # Out of the caller's compiled frame: dynamo would guard on the ids it passes on.
+    @torch.compiler.disable
     def sample(
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ):
