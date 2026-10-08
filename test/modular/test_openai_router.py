@@ -375,6 +375,29 @@ def test_chat_stream_sends_role_with_first_token(client_and_stub):
     assert len(lines) == 3
 
 
+def test_chat_joins_a_character_split_across_tokens(client_and_stub):
+    """Byte-level BPE models emit each token's raw bytes; "é√" arrives in 4 chunks."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b) for b in (b"\xc3", b"\xa9\xe2", b"\x88", b"\x9a!")]
+    body = client.post(
+        "/v1/chat/completions",
+        json={"model": "bagel", "messages": [{"role": "user", "content": "hi"}]},
+    ).json()
+    assert body["choices"][0]["message"]["content"] == "é√!"
+    _, lines = _stream_events(client)
+    assert lines[0]["choices"][0]["delta"] == {"role": "assistant", "content": "é"}
+    assert "".join(l["choices"][0]["delta"].get("content", "") for l in lines) == "é√!"
+
+
+def test_chat_stream_flushes_a_truncated_character(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b"a"), _Chunk("text", b"\xe2\x88")]
+    _, lines = _stream_events(client)
+    assert lines[-1]["choices"][0] == {"index": 0, "delta": {"content": "�"}, "finish_reason": "stop"}
+
+
 def test_chat_stream_without_output_still_names_the_role(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
