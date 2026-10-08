@@ -2835,7 +2835,7 @@ class Worker:
             for stopped_rid in stopped_rids:
                 # this step took the stopping token as its input, so it is in
                 # the KV now; a session continuing from it needs to know
-                self._sessions.note_overshoot(stopped_rid, batch_N.node_name)
+                self._sessions.note_overshoot(stopped_rid, batch_N.batch.node_name)
                 outputs.pop(stopped_rid, None)
                 valid_rids.discard(stopped_rid)
                 batch_N.batch.request_to_worker_graph.pop(stopped_rid, None)
