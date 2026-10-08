@@ -144,7 +144,10 @@ class _Serve:
         self.submodule = submodule
         self.rid = rid
         specs = model.get_node_resources()
-        apply_yaml_overrides(specs, KV_YAML)
+        # the flag-off arm declares no index-key cache
+        declared = {spec.resource_key for spec in specs}
+        apply_yaml_overrides(specs, {"resources": {
+            key: block for key, block in KV_YAML["resources"].items() if key in declared}})
         by_key = resolve_spec_dependencies(specs)
         groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
         transfer = TransferEngineInfo(
