@@ -240,6 +240,16 @@ def _split_pos_ids(
     return pos_ids[..., start:end]
 
 
+class InputSeqLenInfo(NamedTuple):
+    """A row's token count before ``prepare_inputs``, for admission."""
+    seq_len: int
+    # resource key -> tokens that resource reserves, when not ``seq_len``
+    resource_segment_lengths: dict[str, int] = {}
+
+    def get_admit_segment_len(self, resource: str) -> int:
+        return self.resource_segment_lengths.get(resource, self.seq_len)
+
+
 @dataclass
 class ARNodeInputs(NodeInputs):
     """
@@ -524,6 +534,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
         None (the default) means the walk has a single capture.
         """
         del graph_walk, per_request_info, per_request_input_metadata, kwargs
+        return None
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        """This row's token count, read from input shapes alone; None when the
+        walk does not declare one. Lets the scheduler leave out a row whose
+        KV does not fit instead of refusing the whole step."""
+        del graph_walk, fwd_info, inputs, kwargs
         return None
 
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:

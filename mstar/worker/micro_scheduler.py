@@ -238,6 +238,9 @@ class MicroScheduler:
         # here already holds handles. Defaults to the identity so a scheduler
         # driven directly with its own keys (tests) needs no table.
         self.rid_of: Callable[[str], int | None] = lambda r: r
+        # Resolves a tensor uuid, for row lengths read from popped inputs; the
+        # worker installs the tensor manager's. None skips the room check.
+        self.get_tensor: Callable[[int], Any] | None = None
         self._warned_removed_rid = False
         self.sched_type = sched_type
 
@@ -634,6 +637,7 @@ class MicroScheduler:
         blocked = set()
         if backlogged is not None:
             blocked = self._unready_backlog_rids(backlogged, request_state)
+            blocked |= self._rows_without_room(request_state, backlogged, blocked)
             if not backlogged:
                 backlogged = None  # every row failed
         walk_caps = self._walk_caps(node_walk)
@@ -649,6 +653,15 @@ class MicroScheduler:
 
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
             if entries else None
+        if fresh:
+            # a row whose KV does not fit sits this step out, rather than refusing the step
+            no_room = self._rows_without_room(request_state, fresh)
+            if no_room:
+                fresh, left = fresh.split_off_first(None, exclude_rids=no_room)
+                self.runtime.push_back_node(
+                    left.node_name, list(left.request_to_worker_graph),
+                    list(left.request_to_worker_graph.values()),
+                )
         if backlogged is None and not fresh:
             return None
         return self._build_and_schedule(request_state, BatchBuildRequest(
@@ -695,6 +708,32 @@ class MicroScheduler:
             waiting, live, rid,
             functools.partial(self._capture_group, request_state, *target),
         )
+
+    def _rows_without_room(
+        self, request_state: RequestStateManager, batch: ScheduledBatch,
+        skip: set[int] = frozenset(),
+    ) -> set[int]:
+        """Rows of ``batch`` whose node's resources cannot take their tokens
+        now, for submodules that report row lengths before prepare."""
+        engine = self.engine_manager.get_engine(batch.node_name)
+        if self.get_tensor is None or not engine.declares_input_sequence_len(batch.node_name):
+            return set()
+        partition = request_state.get_partition_for_node(batch.node_name)
+        rids = [rid for rid in batch.request_to_worker_graph if rid not in skip]
+        inputs = batch.input_edges.to_input_tensors(
+            self.get_tensor, rids, skip_missing=True,
+        ).by_rid
+        out = set()
+        for rid in rids:
+            fwd_info = request_state.get_fwd_info(rid, partition)
+            info = engine.input_sequence_len(
+                batch.node_name, batch.walk_of(rid), fwd_info, inputs.get(rid, {}),
+            )
+            if info is not None and not self._check_ready(
+                batch.node_name, rid, fwd_info, seq_len_info=info,
+            ):
+                out.add(rid)
+        return out
 
     def _unready_backlog_rids(
         self, batch: ScheduledBatch, request_state: RequestStateManager,
@@ -967,14 +1006,17 @@ class MicroScheduler:
 
     def _check_ready(
         self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
-        allow_reload: bool=True
+        allow_reload: bool=True, seq_len_info: Any | None = None,
     ) -> bool:
         """Engine-level readiness, with a terminal failure taken out of the
         scan. Retryable not-ready (an in-flight KV read, a reload that doesn't
         fit) just comes back False; an ``AdmitRuntimeError`` never will, so the
         rid is parked for the worker to fail instead of rescanned forever."""
         engine = self.engine_manager.get_engine(node_name)
-        outcome = engine.check_ready(node_name, rid, fwd_info, allow_reload=allow_reload)
+        extra = {} if seq_len_info is None else {"seq_len_info": seq_len_info}
+        outcome = engine.check_ready(
+            node_name, rid, fwd_info, allow_reload=allow_reload, **extra,
+        )
         if isinstance(outcome.reason, AdmitRuntimeError):
             logger.error(
                 "Request %s cannot be served on node %s by resource %s: %s",

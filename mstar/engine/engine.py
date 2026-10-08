@@ -48,6 +48,7 @@ from mstar.model.submodule_base import (
     BatchedModelOutput,
     HostRows,
     InputMetadata,
+    InputSeqLenInfo,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
@@ -1562,10 +1563,24 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
+    def declares_input_sequence_len(self, node_name: str) -> bool:
+        """Whether the node's submodule reports row lengths before prepare."""
+        impl = type(self._submodules[node_name].submodule).get_input_sequence_len
+        return impl is not NodeSubmodule.get_input_sequence_len
+
+    def input_sequence_len(
+        self, node_name: str, graph_walk: str,
+        request_info: CurrentForwardPassInfo, inputs: NameToTensorList,
+    ) -> InputSeqLenInfo | None:
+        return self._submodules[node_name].submodule.get_input_sequence_len(
+            graph_walk, request_info, inputs,
+        )
+
     def check_ready(
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,
         allow_reload: bool = True,
+        seq_len_info: InputSeqLenInfo | None = None,
     ) -> FullAdmitOutcome:
         """Whether this node can run the request now.
 
@@ -1588,6 +1603,7 @@ class Engine:
             rid=request_id, node_name=node_name,
             graph_walk=request_info.graph_walk,
             published=request_info.resource_publish_info,
+            seq_len_info=seq_len_info,
         )
 
     def reserve_replay_slot(self, batch: ExecutingBatch) -> SlotLease | None:

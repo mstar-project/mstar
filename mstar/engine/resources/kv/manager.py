@@ -844,6 +844,26 @@ class KVManager(AttentionResource):
             ok=True, ready=ready
         )
 
+    def has_room(
+        self, rid: str, node_name: str, graph_walk: str, segment_len: int,
+    ) -> bool:
+        overrides = self._overrides.get(rid)
+        if overrides is None:
+            return True
+        page = self.config.page_size
+        with self._lock:
+            streams = self._streams.get(rid, {})
+            needed = 0
+            for label in overrides.get_labels(node_name, graph_walk):
+                stream = streams.get(label)
+                stored, held = (0, 0) if stream is None else (stream.stored_len, len(stream.page_indices))
+                needed += max(0, (stored + segment_len + page - 1) // page - held)
+            if needed <= self._arena.num_free:
+                return True
+            # cached pages nothing else holds can be evicted for it, as `_alloc` does
+            spare = 0 if self._index is None else self._index.num_sole_owned()
+            return needed <= self._arena.num_free + spare
+
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned and not ctx.is_preplan:
             if self._preplan_key == self._plan_key(step, ctx):
