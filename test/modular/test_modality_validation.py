@@ -188,6 +188,12 @@ ACCEPTED = [
     ("higgs_audio", ["audio"], ["text"]),
     ("higgs_audio", ["audio", "text"], ["text"]),
     ("pi05", ["image", "text"], ["action"]),
+    ("chatterbox", ["text"], ["audio"]),
+    # speech route with ref_audio: the clip to clone
+    ("chatterbox", ["text", "audio"], ["audio"]),
+    ("chatterbox_turbo", ["text", "audio"], ["audio"]),
+    ("qwen3_5_0.8b", ["text"], ["text"]),
+    ("qwen3_5_0.8b", ["image", "text"], ["text"]),
 ]
 
 # Combinations a model has no encoder/decoder for; "audio is required" isn't
@@ -217,6 +223,11 @@ REJECTED = [
     # raw frames only, never an encoded video; and no prompt conditioning
     ("waypoint", ["image"], ["video"]),
     ("waypoint", ["image", "text"], ["video_frame"]),
+    ("chatterbox", ["text"], ["text"]),
+    ("chatterbox", ["image", "text"], ["audio"]),
+    # no timestamp tokens for video yet
+    ("qwen3_5_0.8b", ["video", "text"], ["text"]),
+    ("qwen3_5_0.8b", ["text"], ["audio"]),
 ]
 
 
@@ -340,3 +351,27 @@ def test_qwen3_tts_takes_a_clip_only_on_base(tmp_path, monkeypatch, tts_model_ty
     )
     model = cls(model_path_hf=str(tmp_path))
     assert (model.unsupported_modalities(["text", "audio"], ["audio"]) == []) is takes_audio
+
+
+@pytest.mark.parametrize("vision, takes_image", [(False, False), (True, True)])
+def test_qwen3_5_takes_an_image_only_with_a_vision_tower(tmp_path, monkeypatch, vision, takes_image):
+    cls = _model_cls("qwen3_5_0.8b")
+    text = dict(
+        num_hidden_layers=1, hidden_size=8, intermediate_size=8, layer_types=["full_attention"],
+        num_attention_heads=1, num_key_value_heads=1, head_dim=8, linear_num_key_heads=1,
+        linear_num_value_heads=1, linear_key_head_dim=8, linear_value_head_dim=8,
+        linear_conv_kernel_dim=4, vocab_size=16, rms_norm_eps=1e-6, max_position_embeddings=64,
+    )
+    raw = {"text_config": text}
+    if vision:
+        raw["vision_config"] = dict(
+            depth=1, hidden_size=8, intermediate_size=8, num_heads=1, in_channels=3, patch_size=2,
+            temporal_patch_size=1, spatial_merge_size=1, num_position_embeddings=4, out_hidden_size=8,
+        )
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    monkeypatch.setattr(
+        "mstar.model.qwen3_5.qwen3_5_model.AutoTokenizer.from_pretrained",
+        lambda *a, **k: SimpleNamespace(eos_token_id=None),
+    )
+    model = cls(model_path_hf=str(tmp_path))
+    assert (model.unsupported_modalities(["image", "text"], ["text"]) == []) is takes_image
