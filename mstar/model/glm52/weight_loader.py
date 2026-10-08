@@ -220,6 +220,10 @@ def _make_glm52_name_remapper(num_hidden_layers: int, load_mtp: bool):
     def remap(name: str) -> str | None:
         m = _LAYER_RE.match(name)
         if m and int(m.group(1)) >= num_hidden_layers:
+            if int(m.group(1)) > num_hidden_layers:
+                # one draft module: a second next-token layer silently overwrote the first
+                raise ValueError(f"{name}: MTP serves one next-token layer, "
+                                 f"{num_hidden_layers}; the checkpoint has more")
             return glm52_name_remapper("mtp." + remap_mtp_key(name[m.end():]))
         return glm52_name_remapper(name)
 

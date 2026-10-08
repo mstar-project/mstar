@@ -146,3 +146,19 @@ def test_the_single_rank_config_is_dummy_mode():
     path = Path(__file__).resolve().parents[2] / "configs" / "test" / "glm52_single_rank.yaml"
     # with the registry's repo id it downloaded 750 GB and built the model on one GPU
     assert yaml.safe_load(path.read_text())["model_kwargs"]["model_path_hf"] == ""
+
+
+def test_a_negative_draft_count_is_refused():
+    # read as off by some checks and on by others, its first decode step failed the batch
+    with pytest.raises(ValueError, match="mtp_num_draft_tokens"):
+        _model(mtp_num_draft_tokens=-1)
+
+
+def test_mtp_serves_one_next_token_layer():
+    from mstar.model.glm52.weight_loader import _make_glm52_name_remapper
+
+    remap = _make_glm52_name_remapper(78, load_mtp=True)
+    assert remap("model.layers.78.eh_proj.weight").startswith("mtp.")
+    # a second nextn layer silently overwrote the draft module's weights
+    with pytest.raises(ValueError, match="one next-token layer"):
+        remap("model.layers.79.eh_proj.weight")
