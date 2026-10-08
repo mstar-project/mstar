@@ -19,6 +19,7 @@ Build: ``maturin develop --release`` in ``rust/`` (see ``docs/installation.rst``
 from __future__ import annotations
 
 import time as _time
+from collections.abc import Iterable
 from copy import deepcopy
 from typing import get_args
 
@@ -231,6 +232,7 @@ class RustGraphRuntime(GraphRuntime):
         bookkeeping: TensorBookkeeping,
         communicator=None,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
+        disable_spec_node_walks: Iterable[tuple[str, str]] = (),
     ):
         mine = {wg.worker_graph_id for wg in my_worker_graphs}
         combined_walk_of = combined_walk_of or {}
@@ -261,6 +263,7 @@ class RustGraphRuntime(GraphRuntime):
                 [walk for _, walk in combined_walk_of],
                 list(combined_walk_of.values()),
             ),
+            disable_spec_node_walks=list(disable_spec_node_walks),
         )
         self._node_to_partition = node_to_partition
         self._communicator = communicator
