@@ -53,6 +53,7 @@ from mstar.model.qwen3_5.config import (
     GDN_STATE,
     KV_CACHE,
     LINEAR_ATTN,
+    LLM_MIXED,
     ROPE,
     SAMPLER,
     VISION_ATTN,
@@ -262,6 +263,9 @@ class Qwen3_5DenseModel(Model):
     # -----------------------------------------------------------------------
     # Model ABC: walk graph declaration
     # -----------------------------------------------------------------------
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        return {"LLM": {LLM_MIXED: {"prefill_text", "decode"}}}
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill_text = GraphNode(
             name="LLM",

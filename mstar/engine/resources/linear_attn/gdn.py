@@ -221,9 +221,9 @@ class GDNManager(LinearAttnManager):
         # a narrow, not a gather: padding rows keep pointing at the sink
         slots = addressing.slot_indices[:num_rows]
 
-        # One walk owns the whole step; splitting a mixed batch would be a
-        # change here, not to callers.
-        is_decode = bool(spans) and all(s == 1 for s in spans)
+        # One kernel for the step: the chunked one unless every row is one
+        # token, or always under a packed capture, which replays mixed steps.
+        is_decode = not ctx.force_prefill and bool(spans) and all(s == 1 for s in spans)
         wrapper = self._get_wrapper(label, is_decode, ctx.slot_lease)
         if is_decode:
             wrapper.plan(spans, slots)
