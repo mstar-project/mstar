@@ -47,3 +47,14 @@ def test_an_unknown_moe_kernel_is_refused(kernel):
     with pytest.raises(ValueError, match="moe_quant_kernel"):
         Glm5NextSparseMoeBlock(cfg)
 
+
+@pytest.mark.parametrize("name", ["glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml"])
+def test_shipped_configs_admit_one_request_per_kda_slot(name):
+    # past the slots a prefill waits in the worker, and its wait broke the decode
+    # speculation chain every other step
+    from pathlib import Path
+
+    import yaml
+
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[2] / "configs" / name).read_text())
+    assert cfg["max_concurrent_requests"] == cfg["resources"]["kda_state"]["max_slots"] - 1
