@@ -366,6 +366,9 @@ class APIServer:
                     and message.message_type == "setup_done"
                 ):
                     logger.info("All workers ready")
+                    # the set-up heap is complete: keep gen-2 collections off
+                    # it (measured 200 ms per pass on this process under load)
+                    freeze_after_setup("API server")
                     self._msg_thread.start()
                     return
                 logger.warning(
@@ -578,18 +581,24 @@ class APIServer:
                         # One frame for the step: every request's value.
                         # A request that is gone needs nothing acked back.
                         body = message.body
+                        queued = False
                         with self.request_lock:
                             for i, rid in enumerate(body.request_ids):
                                 if rid in self.pending_requests:
+                                    # one wake-up for the frame, after every
+                                    # request's value is queued
                                     self.preprocess_worker.new_result_token(
                                         rid, body.values[i],
                                         body.loop_indices[i],
-                                        body.signal, body.modality,
+                                        body.signal, body.modality, wake=False,
                                     )
+                                    queued = True
                                 elif rid not in self.recently_completed:
                                     logger.warning(
                                         "Token for unknown request %s dropped", rid,
                                     )
+                        if queued:
+                            self.preprocess_worker.wake()
                         continue
 
                     rid = message.body.request_id
@@ -1148,6 +1157,7 @@ api_server: APIServer | None = None
 # The router resolves the loaded model's adapter lazily per request, so models
 # without an adapter simply return a 404 there and keep working via /generate.
 from mstar.api_server.openai.router import router as openai_router  # noqa: E402
+from mstar.utils.gc_freeze import freeze_after_setup
 
 app.include_router(openai_router)
 
