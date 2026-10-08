@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 07, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 08, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -620,6 +620,13 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.LinearAttnCallable.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">LinearAttnCallable.set_layer_idx()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.Mamba2Callable"><code class="docutils literal notranslate"><span class="pre">Mamba2Callable</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.Mamba2Callable.bind_step"><code class="docutils literal notranslate"><span class="pre">Mamba2Callable.bind_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.Mamba2Callable.conv"><code class="docutils literal notranslate"><span class="pre">Mamba2Callable.conv()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.Mamba2Callable.label"><code class="docutils literal notranslate"><span class="pre">Mamba2Callable.label</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.Mamba2Callable.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">Mamba2Callable.set_layer_idx()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.RaggedAttentionCallable"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionCallable</span></code></a></li>
 </ul>
             </nav>
@@ -643,7 +650,10 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.convenience.LinearAttnCallable" title="mstar.engine.resources.convenience.LinearAttnCallable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LinearAttnCallable</span></code></a>(pool[, attn])</p></td>
 <td><p>A recurrent state pool plus the resource running kernels against it, mirroring <a class="reference internal" href="#mstar.engine.resources.convenience.AttentionCallable" title="mstar.engine.resources.convenience.AttentionCallable"><code class="xref py py-class docutils literal notranslate"><span class="pre">AttentionCallable</span></code></a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.convenience.RaggedAttentionCallable" title="mstar.engine.resources.convenience.RaggedAttentionCallable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedAttentionCallable</span></code></a>(attn, label)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.convenience.Mamba2Callable" title="mstar.engine.resources.convenience.Mamba2Callable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Mamba2Callable</span></code></a>(pool[, attn])</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LinearAttnCallable</span></code> for a Mamba-2 layer: the conv, then the SSD recurrence, each handed this layer's block of the pool as a plain tensor.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.convenience.RaggedAttentionCallable" title="mstar.engine.resources.convenience.RaggedAttentionCallable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedAttentionCallable</span></code></a>(attn, label)</p></td>
 <td><p><cite>AttentionCallable</cite> for a cacheless attention: <code class="docutils literal notranslate"><span class="pre">(q,</span> <span class="pre">k,</span> <span class="pre">v)</span> <span class="pre">-&gt;</span> <span class="pre">out</span></code> over one declared span of a <cite>RaggedAttnManager</cite>.</p></td>
 </tr>
 </tbody>
@@ -786,6 +796,78 @@ the pool.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.convenience.Mamba2Callable">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.convenience.</span></span><span class="sig-name descname"><span class="pre">Mamba2Callable</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">attn</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/convenience.html#Mamba2Callable"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.convenience.Mamba2Callable" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p><code class="docutils literal notranslate"><span class="pre">LinearAttnCallable</span></code> for a Mamba-2 layer: the conv, then the SSD
+recurrence, each handed this layer’s block of the pool as a plain tensor.</p>
+<p>Same cursor protocol (<code class="docutils literal notranslate"><span class="pre">bind_step</span></code> once per stack, <code class="docutils literal notranslate"><span class="pre">set_layer_idx</span></code> per
+recurrent layer). The layer index counts recurrent layers only; a hybrid
+stack interleaves them with attention layers, and the pool is sized by its
+own count.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pool</strong> (<a class="reference internal" href="mstar.engine.resources.recurrent.pool.html#mstar.engine.resources.recurrent.pool.RecurrentStatePool" title="mstar.engine.resources.recurrent.pool.RecurrentStatePool"><em>RecurrentStatePool</em></a>)</p></li>
+<li><p><strong>attn</strong> (<em>LinearAttnManager</em><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.convenience.Mamba2Callable.bind_step">
+<span class="sig-name descname"><span class="pre">bind_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">attn</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/convenience.html#Mamba2Callable.bind_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.convenience.Mamba2Callable.bind_step" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>attn</strong> (<em>LinearAttnManager</em><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.convenience.Mamba2Callable.conv">
+<span class="sig-name descname"><span class="pre">conv</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">activation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'silu'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/convenience.html#Mamba2Callable.conv"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.convenience.Mamba2Callable.conv" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>weight</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>bias</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>activation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.convenience.Mamba2Callable.label">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">label</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.convenience.Mamba2Callable.label" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.convenience.Mamba2Callable.set_layer_idx">
+<span class="sig-name descname"><span class="pre">set_layer_idx</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">layer_idx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/convenience.html#Mamba2Callable.set_layer_idx"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.convenience.Mamba2Callable.set_layer_idx" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>layer_idx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.convenience.RaggedAttentionCallable">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.convenience.</span></span><span class="sig-name descname"><span class="pre">RaggedAttentionCallable</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">attn</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/convenience.html#RaggedAttentionCallable"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.convenience.RaggedAttentionCallable" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
@@ -874,6 +956,13 @@ until Dynamo gives up.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.LinearAttnCallable.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">LinearAttnCallable.set_layer_idx()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.Mamba2Callable"><code class="docutils literal notranslate"><span class="pre">Mamba2Callable</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.Mamba2Callable.bind_step"><code class="docutils literal notranslate"><span class="pre">Mamba2Callable.bind_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.Mamba2Callable.conv"><code class="docutils literal notranslate"><span class="pre">Mamba2Callable.conv()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.Mamba2Callable.label"><code class="docutils literal notranslate"><span class="pre">Mamba2Callable.label</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.Mamba2Callable.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">Mamba2Callable.set_layer_idx()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.RaggedAttentionCallable"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionCallable</span></code></a></li>
 </ul>
   </nav></div>
@@ -908,7 +997,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 07, 2026.
+  Last updated on Oct 08, 2026.
   <br/>
 </p>
   </div>

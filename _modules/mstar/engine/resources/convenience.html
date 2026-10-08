@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 07, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 08, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -1075,6 +1075,77 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">label</span><span class="p">)</span></div>
 
+
+
+<div class="viewcode-block" id="Mamba2Callable">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.convenience.html#mstar.engine.resources.convenience.Mamba2Callable">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">Mamba2Callable</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``LinearAttnCallable`` for a Mamba-2 layer: the conv, then the SSD</span>
+<span class="sd">    recurrence, each handed this layer's block of the pool as a plain tensor.</span>
+
+<span class="sd">    Same cursor protocol (``bind_step`` once per stack, ``set_layer_idx`` per</span>
+<span class="sd">    recurrent layer). The layer index counts recurrent layers only; a hybrid</span>
+<span class="sd">    stack interleaves them with attention layers, and the pool is sized by its</span>
+<span class="sd">    own count.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="n">RecurrentStatePool</span><span class="p">,</span> <span class="n">attn</span><span class="p">:</span> <span class="n">LinearAttnManager</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">pool</span> <span class="o">=</span> <span class="n">pool</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">attn</span> <span class="o">=</span> <span class="n">attn</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_layer_idx</span> <span class="o">=</span> <span class="mi">0</span>
+
+<div class="viewcode-block" id="Mamba2Callable.bind_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.convenience.html#mstar.engine.resources.convenience.Mamba2Callable.bind_step">[docs]</a>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">bind_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">attn</span><span class="p">:</span> <span class="n">LinearAttnManager</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">attn</span> <span class="o">=</span> <span class="n">attn</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="p">(</span>
+            <span class="s2">"no Mamba-2 resource: pass `attn` here or at construction"</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="o">.</span><span class="n">set_default_label</span><span class="p">(</span><span class="n">label</span><span class="p">)</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">label</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="o">.</span><span class="n">default_label</span>
+
+<div class="viewcode-block" id="Mamba2Callable.set_layer_idx">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.convenience.html#mstar.engine.resources.convenience.Mamba2Callable.set_layer_idx">[docs]</a>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_layer_idx</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_layer_idx</span> <span class="o">=</span> <span class="n">layer_idx</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="o">.</span><span class="n">set_default_layer_idx</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="Mamba2Callable.conv">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.convenience.html#mstar.engine.resources.convenience.Mamba2Callable.conv">[docs]</a>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">conv</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">bias</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">activation</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="s2">"silu"</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="o">.</span><span class="n">run_conv</span><span class="p">(</span>
+            <span class="n">x</span><span class="p">,</span>
+            <span class="n">conv_layer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">pool</span><span class="o">.</span><span class="n">block</span><span class="p">(</span><span class="s2">"conv"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_layer_idx</span><span class="p">),</span>
+            <span class="n">weight</span><span class="o">=</span><span class="n">weight</span><span class="p">,</span>
+            <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+            <span class="n">activation</span><span class="o">=</span><span class="n">activation</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">dt</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">c</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">a_log</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">dt_bias</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+            <span class="n">x</span><span class="p">,</span> <span class="n">dt</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">c</span><span class="p">,</span>
+            <span class="n">ssm_layer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">pool</span><span class="o">.</span><span class="n">block</span><span class="p">(</span><span class="s2">"ssm"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_layer_idx</span><span class="p">),</span>
+            <span class="n">a_log</span><span class="o">=</span><span class="n">a_log</span><span class="p">,</span> <span class="n">d</span><span class="o">=</span><span class="n">d</span><span class="p">,</span> <span class="n">dt_bias</span><span class="o">=</span><span class="n">dt_bias</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
 </pre></div>
 
                 </article>
@@ -1122,7 +1193,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 07, 2026.
+  Last updated on Oct 08, 2026.
   <br/>
 </p>
   </div>

@@ -18,6 +18,7 @@ mstar.engine.resources.recurrent.config
    .. autosummary::
    
       DeltaNetGeometry
+      Mamba2Geometry
       RecurrentBlockConfig
       RecurrentGeometry
       RecurrentStateConfig

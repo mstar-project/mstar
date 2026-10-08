@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 07, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 08, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -1075,6 +1075,100 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="Mamba2Geometry">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.Mamba2Geometry">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Mamba2Geometry</span><span class="p">(</span><span class="n">RecurrentGeometry</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Head geometry of a Mamba-2 (SSD) layer: Nemotron-H, NVIDIA's Nemotron</span>
+<span class="sd">    Nano/VoiceChat backbones, Mamba-Codestral.</span>
+
+<span class="sd">    Two blocks, like the delta-net family: an ``[H, P, N]`` SSM state per head</span>
+<span class="sd">    (fp32 by default: it is an exponentially decayed running sum over the whole</span>
+<span class="sd">    session, and the reference keeps it in fp32) and the conv window over the</span>
+<span class="sd">    ``[x | B | C]`` projection, every tap but the current token's.</span>
+
+<span class="sd">    ``n_groups`` is the number of ``B``/``C`` groups shared by ``H`` heads. It</span>
+<span class="sd">    is a shape fact (``conv_dim = H * P + 2 * n_groups * N``), so it is</span>
+<span class="sd">    recoverable from the blocks and ``from_blocks`` inverts ``to_blocks``.</span>
+<span class="sd">    """</span>
+
+    <span class="n">num_heads</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">state_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">n_groups</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">conv_kernel_size</span><span class="p">:</span> <span class="nb">int</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">d_inner</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">conv_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The depthwise conv runs over ``[x | B | C]`` concatenated."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_inner</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_groups</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">state_size</span>
+
+<div class="viewcode-block" id="Mamba2Geometry.to_blocks">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.Mamba2Geometry.to_blocks">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_blocks</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">state_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
+        <span class="n">conv_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">RecurrentBlockConfig</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Pool blocks for this geometry; head counts pre-sharding (heads and</span>
+<span class="sd">        the conv channels both shard on their leading axis)."""</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">"ssm"</span><span class="p">:</span> <span class="n">RecurrentBlockConfig</span><span class="p">(</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">state_size</span><span class="p">),</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">state_dtype</span><span class="p">,</span>
+                <span class="n">shard_dims</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,),</span>
+            <span class="p">),</span>
+            <span class="s2">"conv"</span><span class="p">:</span> <span class="n">RecurrentBlockConfig</span><span class="p">(</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">conv_dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">conv_kernel_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">),</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">conv_dtype</span><span class="p">,</span>
+                <span class="n">shard_dims</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,),</span>
+            <span class="p">),</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="Mamba2Geometry.from_blocks">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.Mamba2Geometry.from_blocks">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_blocks</span><span class="p">(</span>
+        <span class="bp">cls</span><span class="p">,</span> <span class="n">blocks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">RecurrentBlockConfig</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"Mamba2Geometry"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Recover the geometry from block shapes (sharded ones too, since</span>
+<span class="sd">        every axis involved shards). Raises on shapes that are not a Mamba-2's,</span>
+<span class="sd">        which is the check that a pool and the resource planning against it</span>
+<span class="sd">        were built for the same model."""</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"ssm"</span><span class="p">,</span> <span class="s2">"conv"</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">blocks</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"not a Mamba-2 state pool: no </span><span class="si">{</span><span class="n">name</span><span class="si">!r}</span><span class="s2"> block, got </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">blocks</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span>
+        <span class="n">ssm</span><span class="p">,</span> <span class="n">conv</span> <span class="o">=</span> <span class="n">blocks</span><span class="p">[</span><span class="s2">"ssm"</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">blocks</span><span class="p">[</span><span class="s2">"conv"</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">ssm</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">3</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Mamba-2 'ssm' block must be [H, P, N], got </span><span class="si">{</span><span class="n">ssm</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">conv</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Mamba-2 'conv' block must be [conv_dim, width], got </span><span class="si">{</span><span class="n">conv</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="n">num_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span> <span class="n">state_size</span> <span class="o">=</span> <span class="n">ssm</span>
+        <span class="n">conv_dim</span><span class="p">,</span> <span class="n">width</span> <span class="o">=</span> <span class="n">conv</span>
+        <span class="n">bc_span</span> <span class="o">=</span> <span class="n">conv_dim</span> <span class="o">-</span> <span class="n">num_heads</span> <span class="o">*</span> <span class="n">head_dim</span>
+        <span class="k">if</span> <span class="n">bc_span</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">bc_span</span> <span class="o">%</span> <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">state_size</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"conv block </span><span class="si">{</span><span class="n">conv</span><span class="si">}</span><span class="s2"> does not match ssm block </span><span class="si">{</span><span class="n">ssm</span><span class="si">}</span><span class="s2">: [x|B|C] over "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">num_heads</span><span class="si">}</span><span class="s2">x</span><span class="si">{</span><span class="n">head_dim</span><span class="si">}</span><span class="s2"> leaves </span><span class="si">{</span><span class="n">bc_span</span><span class="si">}</span><span class="s2"> for 2 x n_groups x </span><span class="si">{</span><span class="n">state_size</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">num_heads</span><span class="o">=</span><span class="n">num_heads</span><span class="p">,</span>
+            <span class="n">head_dim</span><span class="o">=</span><span class="n">head_dim</span><span class="p">,</span>
+            <span class="n">state_size</span><span class="o">=</span><span class="n">state_size</span><span class="p">,</span>
+            <span class="n">n_groups</span><span class="o">=</span><span class="n">bc_span</span> <span class="o">//</span> <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">state_size</span><span class="p">),</span>
+            <span class="n">conv_kernel_size</span><span class="o">=</span><span class="n">width</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="RecurrentStateConfig">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.RecurrentStateConfig">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -1238,7 +1332,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 07, 2026.
+  Last updated on Oct 08, 2026.
   <br/>
 </p>
   </div>

@@ -19,6 +19,7 @@ mstar.engine.resources.convenience
    
       AttentionCallable
       LinearAttnCallable
+      Mamba2Callable
       RaggedAttentionCallable
    
    
