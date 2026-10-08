@@ -69,6 +69,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    device_loopback_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -276,8 +277,23 @@ class LLMSubmodule(ARNodeSubmodule):
         if graph_walk == "prefill_vision":
             return self._vision_inputs(fwd_info, inputs)
 
+        if graph_walk == "decode" and self._device_loopback():
+            # one token per row, read off the sampler's slot master in
+            # `preprocess`; the routed signal is empty (or ignored) here
+            return ARNodeInputs(input_seq_len=1)
         input_ids = inputs["text_inputs"][0]
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
+
+    def _device_loopback(self) -> bool:
+        return (
+            device_loopback_enabled()
+            and self.node_resources[SAMPLER].has_slot_masters
+        )
+
+    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        if graph_walk == "decode" and self._device_loopback():
+            return frozenset({"text_inputs"})
+        return frozenset()
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """``[3, total_tokens]`` for the step, in packed request order.
@@ -317,7 +333,12 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
-        if inputs[0].input_ids is not None:
+        if inputs[0].input_ids is None and inputs[0].input_embeds is None:
+            # device loop-back: every row of a decode step is its request's
+            # last sampled token, read by slot (padding rows read slot 0)
+            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+            out["input_ids"] = sampler.loopback_tokens(engine_inputs.request_ids)
+        elif inputs[0].input_ids is not None:
             out["input_ids"] = torch.cat([inp.input_ids for inp in inputs], dim=0)
         else:
             out["input_embeds"] = torch.cat(
