@@ -209,6 +209,29 @@ class ForwardPassInfoWrapper:
     info: CurrentForwardPassInfo
     metadata: InputMetadata
 
+    # The attributes every per-row step reads (prepare_inputs, the stop
+    # check) resolve without the ``__getattr__`` fallback, which costs a
+    # failed lookup plus a Python call per read.
+    @property
+    def dynamic_loop_iter_counts(self):
+        return self.metadata.dynamic_loop_iter_counts
+
+    @property
+    def resource_configs(self):
+        return self.info.resource_configs
+
+    @property
+    def max_tokens(self):
+        return self.info.max_tokens
+
+    @property
+    def graph_walk(self):
+        return self.info.graph_walk
+
+    @property
+    def step_metadata(self):
+        return self.info.step_metadata
+
     def __getattr__(self, name):
         if name == "dynamic_loop_iter_counts":
             return self.metadata.dynamic_loop_iter_counts
