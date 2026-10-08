@@ -209,6 +209,16 @@ def _experts(x, w13, w2, s13, s2, topk_weights, topk_ids, block_size, swiglu_lim
     top_k = topk_ids.shape[1]
     w13, w2 = w13.view(FP8_DTYPE), w2.view(FP8_DTYPE)
     num_experts, inter = w2.shape[0], w2.shape[2]
+    # what fused_experts_fp8 asserts: these kernels index x, shared and the scales as dense
+    # rows and write bf16
+    bo, bi = block_size
+    assert x.dtype == torch.bfloat16 and x.is_contiguous()
+    assert H % bi == 0 and inter % bi == 0, f"hidden {H} / inter {inter} vs block {bi}"
+    assert s13.is_contiguous() and s2.is_contiguous()
+    assert s13.shape == (num_experts, 2 * inter // bo, H // bi)
+    assert s2.shape == (num_experts, H // bo, inter // bi)
+    assert shared is None or (shared.shape == x.shape and shared.dtype == x.dtype
+                              and shared.is_contiguous())
     ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
     gate_up, down = tiles(T, num_experts, block_size[1])

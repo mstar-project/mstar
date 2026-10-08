@@ -579,11 +579,16 @@ def _launch_grouped(x, ids, tw, w13, s13, w2, s2, sw13, sw2, buf, block_size, li
         buf["part"], buf["out"], T, K=K, H=H, BN=sum_bn, PDL=pdl, num_warps=4, launch_pdl=pdl)
 
 
-def _check_experts(x, w13, w2, shared_w13, shared_w2):
+def _check_experts(x, w13, s13, w2, s2, shared_w13, shared_w2, block_size):
     H, I = x.shape[1], w13.shape[1] // 2
+    E, (bo, bi) = w13.shape[0], block_size
     assert x.is_contiguous() and w13.is_contiguous() and w2.is_contiguous()
     assert shared_w13.is_contiguous() and shared_w2.is_contiguous()
     assert shared_w13.dtype == shared_w2.dtype == x.dtype and shared_w2.shape == (H, I)
+    # the kernels index the scales as dense blocks, past their leading stride
+    assert s13.is_contiguous() and s2.is_contiguous(), "block scales must be contiguous"
+    assert s13.shape == (E, 2 * I // bo, H // bi) and s2.shape == (E, H // bo, I // bi), (
+        f"block scales {tuple(s13.shape)}, {tuple(s2.shape)} do not tile the weights")
 
 
 def _expert_buffers(x, K, E, I, pair_max_tokens, out=None):
@@ -672,7 +677,7 @@ def experts(x, w13, s13, w2, s2, shared_w13, shared_w2, topk_w, topk_ids, *,
     ``shared_w2 (H, I)`` are in ``x.dtype``; ``topk_w`` fp32, ``topk_ids`` int, distinct
     experts per token. ``swiglu_limit`` clamps gate from above and up to +-limit before the
     SwiGLU; None: no clamp. Above ``pair_max_tokens`` tokens ``x`` must be bf16."""
-    _check_experts(x, w13, w2, shared_w13, shared_w2)
+    _check_experts(x, w13, s13, w2, s2, shared_w13, shared_w2, block_size)
     tuning = _tuning(x.device)
     buf = _expert_buffers(x, topk_ids.shape[1], w13.shape[0], w13.shape[1] // 2,
                           tuning.pair_max_tokens)
@@ -693,7 +698,7 @@ def forward(x, gate_w, bias, w13, s13, w2, s2, shared_w13, shared_w2, *, top_k, 
     overlaps the router's top-k. So every buffer the chain writes is allocated before the
     first launch and stays referenced until the last: no launch may reuse memory that a
     still-running kernel reads."""
-    _check_experts(x, w13, w2, shared_w13, shared_w2)
+    _check_experts(x, w13, s13, w2, s2, shared_w13, shared_w2, block_size)
     assert gate_w.is_contiguous()
     T, H = x.shape
     _check_router_tokens(T)
