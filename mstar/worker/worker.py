@@ -22,6 +22,7 @@ from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import (
     LocalTransferEngine,
     NameToTensorList,
+    StoredOutputs,
     create_tensor_communication_manager,
 )
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -298,6 +299,8 @@ class Worker:
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = nvtx_enabled(enable_nvtx, device)
+        # (node, walk) -> the loop-back signals the node keeps on the device
+        self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
 
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads
@@ -2974,8 +2977,22 @@ class Worker:
         # reuses; safe because the sends below are their last reader.
         # Row views of one batch clone (a decode step) are described from one
         # row; anything else goes through the general per-tensor path.
+        # The client copy first: whether it rides inline decides whether the
+        # tensors are needed at all.
+        inline_signal, inline_values = self._inline_emit_values(
+            engine, batch_N, host_rows, rids, signals,
+        )
         stored = None
-        if outputs.row_views and outputs.row_request_ids is not None:
+        if inline_signal is not None and self._all_on_device(
+            engine, batch_N.node_name, batch_N.graph_walk, signals,
+        ):
+            # Device loop-back: the node keeps every routed signal's value on
+            # the device (the sampler's slot master) and the client copy rides
+            # inline, so nothing is stored, held or freed. The route still
+            # runs per request for the loop counters and the fallbacks; it
+            # carries zero tensors per (request, signal).
+            stored = StoredOutputs([], [], [], [0] * (len(rids) * len(signals)))
+        elif outputs.row_views and outputs.row_request_ids is not None:
             stored = self.tensor_manager.store_row_outputs_batch(
                 rids, outputs, signals, outputs.row_views, outputs.row_request_ids,
                 node_name=batch_N.node_name,
@@ -2999,7 +3016,8 @@ class Worker:
         # one per tensor -- with a Rust bookkeeper each is a boundary crossing,
         # and a 128-request batch has hundreds of them. The count is uniform,
         # so it crosses as a scalar rather than a list built per batch.
-        self.tensor_manager.increment_ref_batch_uniform(flat_uuids, 1)
+        if flat_uuids:
+            self.tensor_manager.increment_ref_batch_uniform(flat_uuids, 1)
         if self._phase_period:
             self._phase_record(
                 "worker.postprocess.store_tensors",
@@ -3008,9 +3026,6 @@ class Worker:
 
         # The graph runtime's own share of postprocess: the routing call.
         _t_route = _time.perf_counter() if self._phase_period else 0.0
-        inline_signal, inline_values = self._inline_emit_values(
-            engine, batch_N, host_rows, rids, signals,
-        )
         route_output = self._graph_runtime.complete_and_route_batch(
             RouteInput(
                 partition=batch_N.partition,
@@ -3195,6 +3210,20 @@ class Worker:
         _pp_stage("send_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
+
+    def _all_on_device(self, engine, node_name: str, graph_walk: str, signals) -> bool:
+        """Whether every output signal of this step is one the node keeps on
+        the device (cached per node and walk: it depends on the node's
+        resources, not on the step)."""
+        if not signals:
+            return False
+        key = (node_name, graph_walk)
+        on_device = self._device_loopback.get(key)
+        if on_device is None:
+            on_device = self._device_loopback[key] = frozenset(
+                engine.device_loopback_signals(node_name, graph_walk)
+            )
+        return all(s in on_device for s in signals)
 
     def _inline_emit_values(
         self, engine, batch_N: PendingBatch, host_rows: "HostRows | None",
