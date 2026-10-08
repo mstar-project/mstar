@@ -220,6 +220,22 @@ class Resource(ABC):
         del request_id, node_name, graph_walk
         return None
 
+    def publish_snapshot_batch(
+        self,
+        request_ids: list[str],
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> list:
+        """``publish_snapshot_for_step`` for every request of a step, one
+        entry per request in order (None for nothing to publish). A resource
+        with per-request locking or lookups overrides this to do them once."""
+        return [
+            self.publish_snapshot_for_step(
+                rid, node_name=node_name, graph_walk=graph_walk,
+            )
+            for rid in request_ids
+        ]
+
     def publish_snapshot_for_step(
         self,
         request_id: str,
