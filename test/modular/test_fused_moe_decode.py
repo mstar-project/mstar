@@ -328,3 +328,12 @@ def test_grouped_path_at_tp1_expert_width(tokens, monkeypatch, fp32_matmul):
     got = decode.experts(x, *_experts(p), topk_w, topk_ids, block_size=BLOCK)
     assert tokens > tuning.pair_max_tokens
     _assert_near_oracle(got, _oracle(p, x, topk_w, topk_ids, None), grouped=True)
+
+
+def test_the_router_refuses_more_tokens_than_its_tile_holds():
+    """All T tokens share one router tile; at 129+ on the H200 table the first launch
+    raised OutOfResources. The models send at most 64 tokens here."""
+    T = decode.MAX_ROUTER_TOKENS + 1
+    with pytest.raises(ValueError, match="at most"):
+        decode.route(torch.empty(T, 256), torch.empty(8, 256), torch.empty(8), top_k=2,
+                     scale=1.0, normalize=True)
