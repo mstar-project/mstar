@@ -438,6 +438,45 @@ def test_build_accelerator_graph_buffers_is_scoped_to_the_capturing_node():
     assert other.calls == [], "another node's resource was sized by this capture"
 
 
+@pytest.mark.parametrize("variant", ["gdn", "mamba2"])
+def test_graph_buffer_sizing_reaches_recurrent_and_linear_attention(variant):
+    """Real resources must override the runner's hook after API renames."""
+    import torch
+
+    from mstar.engine.resources.base import EngineResourceInfo
+    from mstar.engine.resources.linear_attn.base import LinearAttnManager
+    from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
+    from mstar.engine.resources.recurrent.config import (
+        DeltaNetGeometry,
+        Mamba2Geometry,
+        RecurrentStateConfig,
+        RecurrentStateSpec,
+    )
+    from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+
+    geometry = (
+        DeltaNetGeometry(2, 2, 16, 16, 4)
+        if variant == "gdn" else Mamba2Geometry(2, 16, 16, 1, 4)
+    )
+    device = torch.device("cpu")
+    spec = RecurrentStateSpec(
+        "state", {"llm"},
+        RecurrentStateConfig(num_layers=1, blocks=geometry.to_blocks(), max_slots=4),
+    )
+    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=device))
+    manager = LinearAttnManager.build(
+        LinearAttnSpec("linear", {"llm"}, LinearAttnConfig("state", LinearAttnVariant(variant))),
+        EngineResourceInfo(device=device, dependencies={"state": spec}),
+    )
+    runner = StepRunner({"state": pool, "linear": manager})
+
+    for size in (8, 2, 16):
+        runner.build_accelerator_graph_buffers([], max_bs=size, max_seq_len=64)
+        expected = max(size, 8)
+        assert pool._cg_max_bs == expected
+        assert manager._cg_max_bs == expected
+
+
 # --- the step envelope -----------------------------------------------------
 
 

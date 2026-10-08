@@ -71,7 +71,7 @@ class GDNManager(LinearAttnManager):
         )
         self._check_state_dtype(state_dtype, geometry, has_sink)
 
-        # See `build_cuda_graph_buffers`.
+        # See `build_accelerator_graph_buffers`.
         self._cg_max_bs = 0
         self._cg_wrappers: dict[CGSlotKey, GDNWrapper] = {}
 
@@ -306,7 +306,7 @@ class GDNManager(LinearAttnManager):
 
     # Engine lifecycle
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len
