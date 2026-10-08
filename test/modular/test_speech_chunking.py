@@ -368,8 +368,8 @@ def test_a_client_seed_advances_per_chunk_and_wraps_at_int64():
     assert [_chunk_kwargs({"seed": 7}, i)["seed"] for i in range(3)] == [7, 8, 9]
     top = 2**63 - 1
     assert [_chunk_kwargs({"seed": top}, i)["seed"] for i in range(3)] == [top, 0, 1]
-    # the first piece keeps the client's value: a model that bounds seeds refuses it up front
-    assert _chunk_kwargs({"seed": 2**63}, 0)["seed"] == 2**63
+    # the first piece keeps the client's value
+    assert _chunk_kwargs({"seed": -5}, 0)["seed"] == -5
     assert "seed" not in _chunk_kwargs({"sentence_chunking": True}, 1)
 
 

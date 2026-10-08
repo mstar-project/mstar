@@ -65,8 +65,7 @@ def _chunk_kwargs(model_kwargs: dict, index: int) -> dict:
     seed = kwargs.get("seed")
     if isinstance(seed, int) and not isinstance(seed, bool) and index:
         # the conductor's seed is an int64: a seed near the top wraps instead of overflowing
-        seed += index
-        kwargs["seed"] = seed - 2**63 if seed >= 2**63 else seed
+        kwargs["seed"] = (seed + index) % 2**63
     return kwargs
 
 

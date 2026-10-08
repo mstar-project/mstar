@@ -175,6 +175,15 @@ def test_speech_maps_adapter_errors(client_and_stub, monkeypatch, exc, status):
     assert stub.last_submit is None
 
 
+@pytest.mark.parametrize("seed,status", [(2**63 - 1, 200), (-(2**63), 200), (2**63, 422), (-(2**63) - 1, 422)])
+def test_speech_seed_is_an_int64(client_and_stub, seed, status):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.next_chunks = [_Chunk("audio", _pcm([100, -100]), {"sample_rate": 24000})]
+    r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": "hi", "voice": "tara", "seed": seed})
+    assert r.status_code == status
+
+
 def test_images(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
