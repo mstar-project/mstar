@@ -537,7 +537,8 @@ def test_graph_walks_and_resources():
     assert set(kv) == {KV_CACHE, CROSS_KV_CACHE}
     assert all(s.nodes == {DECODER_NODE} for s in specs)
     per_req_ctx = -(-model.config.max_source_positions // 128)
-    assert kv[CROSS_KV_CACHE].config.max_num_pages == per_req_ctx * model.MAX_CONCURRENT_REQUESTS
+    # one more for the sink page, so the last of MAX_CONCURRENT_REQUESTS fits
+    assert kv[CROSS_KV_CACHE].config.max_num_pages == per_req_ctx * model.MAX_CONCURRENT_REQUESTS + 1
     assert kv[KV_CACHE].config.max_num_pages == 4 * model.MAX_CONCURRENT_REQUESTS + 2 * model.MAX_CONCURRENT_REQUESTS
     assert model.get_max_output_tokens() == 444
     assert model.get_max_output_tokens(max_output_tokens=32) == 32

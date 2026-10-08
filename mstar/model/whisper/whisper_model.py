@@ -197,7 +197,7 @@ class WhisperModel(Model):
             + 2 * concurrency,
         )
         # The fixed 30 s window is max_source_positions (1500) tokens = 12
-        # pages per request.
+        # pages per request, plus the sink page the cache keeps for itself.
         context_kv_config = PagedKVConfig(
             num_layers=self.config.decoder_layers,
             num_kv_heads=self.config.decoder_attention_heads,
@@ -205,7 +205,7 @@ class WhisperModel(Model):
             max_seq_len=self.config.max_source_positions,
             num_qo_heads=self.config.decoder_attention_heads,
             page_size=page_size,
-            max_num_pages=self._pages(self.config.max_source_positions, page_size, concurrency),
+            max_num_pages=self._pages(self.config.max_source_positions, page_size, concurrency) + 1,
         )
         nodes = {DECODER_NODE}
         return [
