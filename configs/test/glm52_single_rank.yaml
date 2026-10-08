@@ -7,6 +7,11 @@ model: "glm52"
 # Glm52ModelConfig.max_seq_len, and without dsa_long_context the hard limit
 # is index_topk (2048) regardless.
 max_seq_len: 2048
+model_kwargs:
+  # no checkpoint: dummy mode (no submodule is built); the registry's repo id
+  # would download all 750 GB and allocate the model on one GPU. Name a
+  # checkpoint, or config_variant: reduced with tokenizer_mode: byte, to serve.
+  model_path_hf: ""
 node_groups:
   - node_names: [LLM]
     ranks: [0]

@@ -38,7 +38,9 @@ def fused_fp8_available(device: torch.device, block_size: tuple[int, int]) -> bo
         return False
     try:
         from mstar.utils.fused_moe import fused_experts_fp8  # noqa: F401
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - 'auto' serves the reference loop, loudly
+        logger.warning("fused fp8 MoE kernel unavailable (%r): the reference dispatch "
+                       "serves eager, without CUDA graphs", exc)
         return False
     return True
 

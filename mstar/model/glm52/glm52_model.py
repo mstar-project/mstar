@@ -374,6 +374,10 @@ class Glm52Model(Model):
             k: model_kwargs.get(k, getattr(self.config, k))
             for k in keys
         }
+        # the sampler's own knobs with no config default; dropped, a request got neither
+        for k, cast in (("top_k", int), ("min_p", float)):
+            if model_kwargs.get(k) is not None:
+                params[k] = cast(model_kwargs[k])
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
 
     def context_limit(self) -> int:

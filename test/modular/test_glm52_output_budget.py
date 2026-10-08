@@ -115,3 +115,30 @@ def test_postprocess_emits_raw_token_bytes():
     # per-token decode gave U+FFFD for each half
     assert b"".join(out).decode("utf-8") == "é"
     assert m.postprocess(torch.tensor([3, 0]), "text") == b" hi"
+
+
+def test_sampling_knobs_without_a_config_default_reach_the_sampler():
+    from mstar.model.glm52.config import SAMPLER_RESOURCE
+
+    cfg = _model().get_request_resource_configs({}, {"top_k": "20", "min_p": 0.05})
+    assert cfg[SAMPLER_RESOURCE].top_k == 20 and cfg[SAMPLER_RESOURCE].min_p == 0.05
+
+
+def test_the_compile_hatch_covers_uncaptured_steps(monkeypatch):
+    from mstar.model.glm52.submodules import Glm52LLMSubmodule
+
+    sub = object.__new__(Glm52LLMSubmodule)
+    monkeypatch.delenv("MSTAR_GLM52_GRAPH_COMPILE", raising=False)
+    assert not sub.disable_torch_compile
+    monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
+    assert sub.disable_torch_compile and not sub._compile_flags()["compile"]
+
+
+def test_the_single_rank_config_is_dummy_mode():
+    from pathlib import Path
+
+    import yaml
+
+    path = Path(__file__).resolve().parents[2] / "configs" / "test" / "glm52_single_rank.yaml"
+    # with the registry's repo id it downloaded 750 GB and built the model on one GPU
+    assert yaml.safe_load(path.read_text())["model_kwargs"]["model_path_hf"] == ""
