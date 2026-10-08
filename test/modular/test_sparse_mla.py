@@ -72,3 +72,30 @@ def test_select_rows_keeps_short_spans_on_every_rank():
     sparse_mla.select_rows(select, 0, 8 * sparse_mla.SHARD_MIN_ROWS - 1, 2, torch.device("cpu"),
                            group)
     assert calls == [(0, 8 * sparse_mla.SHARD_MIN_ROWS - 1)]
+
+
+def test_the_plan_describes_packed_rows():
+    """FlashInfer >= 0.7 checks each row's index count against its length (one-token
+    pages): a fixed row stride failed every plan with a short row."""
+    seen = {}
+
+    class Wrapper:
+        def plan(self, qo, kv, indices, lens, *args):
+            seen.update(kv=kv.tolist(), lens=lens.tolist())
+
+    sparse_mla._plan(Wrapper(), torch.zeros(10, dtype=torch.int32), [2, 3, 1], 4, 512, 64, 0.1)
+    assert seen == {"kv": [0, 2, 5, 6], "lens": [2, 3, 1]}
+
+
+def test_pack_lays_the_slots_out_as_the_plan_describes():
+    slots = torch.tensor([[10, 11, 12], [20, 21, 22], [30, 31, 32]], dtype=torch.int32)
+    dst = torch.full((3 * 3 + 1,), -7, dtype=torch.int32)
+    sparse_mla._pack(dst, slots, torch.tensor([0, 2, 5, 6], dtype=torch.int32),
+                     torch.tensor([2, 3, 1], dtype=torch.int32))
+    # what a row leaves unused lands on the spare last entry
+    assert dst[:9].tolist() == [10, 11, 20, 21, 22, 30, -7, -7, -7]
+
+
+def test_a_row_attends_at_most_its_width():
+    # packed, a length past the width read index entries no slot was written to
+    assert sparse_mla._lens([1, 5, 9], 5) == [1, 5, 5]
