@@ -192,6 +192,12 @@ class Glm52ModelConfig:
             missing.append("rope_theta")
         if missing:
             raise ValueError(f"config.json lacks {missing}")
+        # plain RoPE only: a scaled one (YaRN, dynamic) ran as plain, its frequencies
+        # and softmax scale wrong
+        for rope in (hf_config.get("rope_parameters"), hf_config.get("rope_scaling")):
+            kind = (rope or {}).get("rope_type", (rope or {}).get("type", "default"))
+            if kind not in (None, "default"):
+                raise ValueError(f"rope type {kind!r}: this model serves plain RoPE only")
 
         eos = hf_config["eos_token_id"]
         config = cls(
