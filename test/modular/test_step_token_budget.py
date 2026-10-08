@@ -56,6 +56,15 @@ class _Runtime:
     def set_in_flight(self, node_name, wg_id, rids, in_flight):
         pass
 
+    def add_first(self, rid: str, tokens: int, walk: str = "prefill"):
+        """A new request whose handle scans before every live one, as the Rust
+        runtime's recycled handles can."""
+        self.tokens = {rid: tokens, **self.tokens}
+        self.walks[rid] = walk
+        self.ready.add(rid)
+        self.uuid[rid] = len(self.rows)
+        self.rows[len(self.rows)] = tokens
+
 
 class _State:
     """Stands in for RequestStateManager."""
@@ -136,6 +145,18 @@ def test_the_budget_takes_requests_in_arrival_order():
     assert _rids(sched.get_next_batch(state)) == ["p1", "p2"]
 
 
+def test_an_older_request_is_not_passed_over_for_a_recycled_handle():
+    """Ready order is handle order in the Rust runtime and handles are recycled, so a
+    newer request can scan first; the budget still takes the oldest, or a large one
+    is passed over under sustained arrivals."""
+    sched, runtime, state = _prefills(3000, 3000, budget={"prefill": 4096})
+    assert _rids(sched.get_next_batch(state)) == ["p0"]
+    runtime.add_first("p2", 3000)
+    state.per_request_info["p2"] = object()
+    assert _rids(sched.get_next_batch(state)) == ["p1"]
+    assert runtime.ready == {"p2"}
+
+
 def test_decode_batches_are_unaffected():
     """Only the walk that declares a budget is cut; decode keeps its count cap
     and backlog."""
@@ -178,6 +199,21 @@ def test_a_budgeted_walk_leaves_rows_past_its_cap_ready():
         ("decode", ["d0"]),
         ("prefill", ["p4", "p5"]),
     ]
+    assert sched.backlog == {}
+
+
+def test_a_backlogged_row_counts_against_the_budget():
+    """A row parked for another capture group (a prefix-cache miss behind a
+    hit) comes back topped up with fresh rows, and the budget counts it too."""
+    sched, runtime, state = _prefills(2000, 2000, budget={"prefill": 4096})
+    engine = sched.engine_manager.get_engine(NODE)
+    engine.capture_group = lambda node_name, graph_walk, rid, fwd_info: "eager" if rid == "p0" else None
+    assert _rids(sched.get_next_batch(state)) == ["p0"]
+    assert {key: _rids(b) for key, b in sched.backlog.items()} == {(NODE, "prefill"): ["p1"]}
+    runtime.add_first("p2", 4000)
+
+    assert _rids(sched.get_next_batch(state)) == ["p1"], "2000 + 4000 is past 4096"
+    assert runtime.ready == {"p2"}, "the fresh row past the cut is ready again"
     assert sched.backlog == {}
 
 

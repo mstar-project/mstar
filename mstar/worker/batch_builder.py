@@ -29,8 +29,8 @@ class BatchBuildRequest:
     blocked_rids: set[int] = field(default_factory=set)
     # Rows left in the step once the caller's own are counted (> 0); None is uncapped.
     max_batch_size: int | None = None
-    # Most input tokens the step's fresh rows may take, None for no budget; and
-    # each fresh row's, in the order the budget takes them.
+    # Most input tokens the step may take, None for no budget; and each row's,
+    # backlog and fresh, oldest first: the order the budget takes them.
     max_batch_tokens: int | None = None
     row_tokens: dict[int, int] = field(default_factory=dict)
     # The rid whose capture group the step must share, else its first row's.
@@ -76,25 +76,24 @@ def _merged(
     return backlog
 
 
-def _within_token_budget(
-    fresh: "ScheduledBatch", row_tokens: dict[int, int], budget: int,
-    max_rows: int | None,
-) -> "tuple[ScheduledBatch, dict[int, int] | None]":
-    """The first rows of ``row_tokens`` whose tokens fit ``budget``, at least
-    one and no more than ``max_rows``, and the rest of ``fresh`` to return.
-
-    The rest go back to ready, not to the backlog. Parked in the backlog they
-    would run back to back ahead of everything else; left ready, the
-    round-robin can put another walk (decode) between them.
-    """
-    rids = list(row_tokens)
-    total = 0
-    for i, rid in enumerate(rids):
-        total += row_tokens[rid]
-        if i > 0 and (total > budget or (max_rows is not None and i >= max_rows)):
-            taken, left = fresh.split_off_first(i, exclude_rids=set(rids[i:]))
-            return taken, left.request_to_worker_graph
-    return fresh, None
+def _past_token_budget(
+    row_tokens: dict[int, int], budget: int, max_rows: int | None,
+    exclude: set[int],
+) -> set[int]:
+    """The rows of ``row_tokens`` past the cut once the oldest take ``budget``:
+    at least one row runs, and no more than ``max_rows``. ``exclude`` rows
+    cannot run this step and take none of it."""
+    total = taken = 0
+    past: set[int] = set()
+    for rid, tokens in row_tokens.items():
+        if rid in exclude:
+            continue
+        if taken and (past or total + tokens > budget or (max_rows is not None and taken >= max_rows)):
+            past.add(rid)
+            continue
+        total += tokens
+        taken += 1
+    return past
 
 
 class BaseBatchBuilder(ABC):
@@ -153,20 +152,21 @@ class FIFOBatchBuilder(BaseBatchBuilder):
     for any other reason -- OOM backoff, pending remove, a foreign capture
     group -- always parks: it cannot run this step whoever holds it.
 
-    Fresh rows past a token budget's cut always go back to ready.
+    Under a token budget the oldest rows take it, backlogged or fresh. A
+    fresh row past its cut always goes back to ready: parked, the rows past a
+    budget would run back to back ahead of everything else, where left ready
+    the round-robin can put another walk (decode) between them. A backlogged
+    row past it stays parked.
     """
 
     def build_batch(self, request: BatchBuildRequest) -> BatchBuildResult:
         max_bs = request.max_batch_size
-        fresh, over_budget = request.fresh, None
-        if request.max_batch_tokens is not None and fresh:
-            fresh, over_budget = _within_token_budget(
-                fresh, request.row_tokens, request.max_batch_tokens, max_bs,
-            )
         # both read before `_merged`, which folds `fresh` into `backlog` in place
         had_backlog = request.backlog is not None
-        fresh_rids = set(fresh.request_to_worker_graph) if fresh else set()
-        batch = _merged(request.backlog, fresh)
+        fresh_rids = (
+            set(request.fresh.request_to_worker_graph) if request.fresh else set()
+        )
+        batch = _merged(request.backlog, request.fresh)
         if batch is None:
             return BatchBuildResult(None)
 
@@ -174,17 +174,22 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             batch, request.capture_group,
             exclude_rids=request.blocked_rids, anchor=request.capture_group_of,
         )
-        scheduled, remainder = batch.split_off_first(max_bs, exclude_rids=exclude)
+        past_budget = set() if request.max_batch_tokens is None else _past_token_budget(
+            request.row_tokens, request.max_batch_tokens, max_bs, exclude,
+        )
+        scheduled, remainder = batch.split_off_first(max_bs, exclude_rids=exclude | past_budget)
+        if remainder is None:
+            return BatchBuildResult(scheduled)
         give_back = {
             rid for rid in remainder.request_to_worker_graph
-            if rid in fresh_rids and rid not in exclude
-        } if had_backlog and remainder is not None else set()
+            if rid in fresh_rids and rid not in exclude and (had_backlog or rid in past_budget)
+        }
         if not give_back:
-            return BatchBuildResult(scheduled, backlog=remainder, returned=over_budget)
+            return BatchBuildResult(scheduled, backlog=remainder)
         parked, returned = remainder.split_off_first(None, exclude_rids=give_back)
         return BatchBuildResult(
             scheduled, backlog=parked,
-            returned={**(over_budget or {}), **(returned.request_to_worker_graph if returned else {})},
+            returned=dict(returned.request_to_worker_graph) if returned else None,
         )
 
 
