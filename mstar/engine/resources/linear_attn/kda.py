@@ -203,11 +203,14 @@ class KDAManager(LinearAttnManager):
         rows = len(spans)
         lease = ctx.slot_lease
         num_tokens = lease.bucket.num_tokens if lease is not None else sum(spans)
-        # Against the bucket's token count, not just the spans: a captured
-        # prefill whose rows happen to be one token each still replays the
-        # prefill kernels, and reads the layout they were captured with.
-        is_decode = (not speculative and rows > 0 and num_tokens == rows
-                     and all(s == 1 for s in spans))
+        if lease is not None:
+            # A replay runs the kernels its bucket was captured with, so the walk decides,
+            # not this step's spans: a prefill bucket of as many tokens as rows captures
+            # one-token spans (decode kernels, before) and replays uneven ones.
+            is_decode = not speculative and ctx.graph_walk == "decode"
+        else:
+            is_decode = (not speculative and rows > 0 and num_tokens == rows
+                         and all(s == 1 for s in spans))
         plan = KDAPlan(
             slot_ids=addressing.slot_indices[:rows],
             has_state=addressing.has_state[:rows],

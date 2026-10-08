@@ -186,6 +186,21 @@ def test_a_captured_prefill_keeps_one_layout_buffer():
     assert third.layout.data_ptr() != first.layout.data_ptr()
 
 
+def test_a_prefill_bucket_of_one_token_rows_is_still_a_prefill():
+    """A prefill bucket with as many tokens as rows captured one-token spans, planned as a
+    decode: the graph then replayed the decode kernels over a step's uneven spans, each
+    token on another request's slot."""
+    pool, kda = build()
+    kda.set_kernels(_Recorder())
+    capture = plan(pool, kda, ["a", "b"], [1, 1], leased(["a", "b"], ["a", "b"], bs=2, tokens=2))
+    replay = plan(pool, kda, ["c", "pad"], [2, 0], leased(["c"], ["c", "pad"], bs=2, tokens=2))
+    assert not capture.is_decode and not replay.is_decode
+    # a decode bucket stays a decode
+    decode = plan(pool, kda, ["d", "e"], [1, 1],
+                  leased(["d", "e"], ["d", "e"], bs=2, tokens=2, walk="decode", slot=1))
+    assert decode.is_decode
+
+
 def test_preplan_promotes_the_staged_plan():
     pool, kda = build()
     kda.set_kernels(_Recorder())
