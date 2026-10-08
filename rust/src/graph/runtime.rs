@@ -1866,6 +1866,49 @@ impl GraphRuntime {
             .collect()
     }
 
+    /// `get_dynamic_loop_iters` as four flat columns: the distinct loop names
+    /// once, then per entry the request's index in `request_ids`, the name's
+    /// index and the iteration. One string per loop name instead of one per
+    /// request per step.
+    fn get_dynamic_loop_iters_flat(
+        &self, request_ids: Vec<u32>, partition: &str,
+    ) -> (Vec<String>, Vec<u32>, Vec<u32>, Vec<u32>) {
+        let mut names: Vec<String> = Vec::new();
+        let mut name_idx_of: FxHashMap<Sym, u32> = FxHashMap::default();
+        let mut rid_idx: Vec<u32> = Vec::new();
+        let mut name_idx: Vec<u32> = Vec::new();
+        let mut iters: Vec<u32> = Vec::new();
+        let Some(p) = self.interner.get(partition) else {
+            return (names, rid_idx, name_idx, iters);
+        };
+        for (i, &rid) in request_ids.iter().enumerate() {
+            let Some(info) = self.info(rid) else { continue };
+            let Some(part) = info.partitions.get(&p) else { continue };
+            for &wg in &part.walk_worker_graphs {
+                let Some(state) = self.state(wg, rid) else {
+                    continue;
+                };
+                let g = &self.graphs[wg as usize];
+                for (lid, iter) in state.loop_indices().into_iter().enumerate() {
+                    let sym = g.lp(lid as LoopId).name;
+                    let ni = match name_idx_of.get(&sym) {
+                        Some(&n) => n,
+                        None => {
+                            let n = names.len() as u32;
+                            names.push(self.interner.name(sym).to_string());
+                            name_idx_of.insert(sym, n);
+                            n
+                        }
+                    };
+                    rid_idx.push(i as u32);
+                    name_idx.push(ni);
+                    iters.push(iter);
+                }
+            }
+        }
+        (names, rid_idx, name_idx, iters)
+    }
+
     /// No-op by construction. Python clears `tensor_info` off the node's
     /// output edges because the edges are per-request objects that carry it;
     /// here outputs are passed into `complete_and_route_batch`, so there is
