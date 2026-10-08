@@ -78,6 +78,7 @@ test/modular/test_glm52_output_budget.py
 test/modular/test_glm52_prefill.py
 test/modular/test_glm52_quant.py
 test/modular/test_glm52_read_plan.py
+test/modular/test_glm52_loading_guards.py
 test/modular/test_kv_stored_len.py
 test/modular/test_pinned_staging.py
 test/modular/test_openai_adapters.py
