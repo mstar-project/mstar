@@ -9,6 +9,7 @@ counter, and the 3D ids are built here and passed in as cos/sin.
 import logging
 import os
 from collections.abc import Mapping
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -71,6 +72,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     device_loopback_enabled,
 )
+from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +339,10 @@ class LLMSubmodule(ARNodeSubmodule):
             # device loop-back: every row of a decode step is its request's
             # last sampled token, read by slot (padding rows read slot 0)
             sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             out["input_ids"] = sampler.loopback_tokens(engine_inputs.request_ids)
+            if PHASE_PERIOD:
+                phase_record("engine.preprocess.loopback", perf_counter() - t0)
         elif inputs[0].input_ids is not None:
             out["input_ids"] = torch.cat([inp.input_ids for inp in inputs], dim=0)
         else:
