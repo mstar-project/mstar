@@ -1327,6 +1327,8 @@ class SamplerBuffers:
     _static_key: dict[int, tuple[tuple[str, ...], int, int]] = field(
         default_factory=dict, repr=False
     )
+    # (padded_bs, cg slot) -> the sampler over that slot's views; see sampler_for
+    _samplers: dict = field(default_factory=dict, repr=False)
 
     @property
     def tracks_seen_tokens(self) -> bool:
@@ -1647,8 +1649,18 @@ class SamplerBuffers:
 
     def sampler_for(self, padded_bs: int, cg_slot: int) -> "CudaGraphableSampler":
         """A sampler bound to ``cg_slot``'s per-step buffer views (zero-copy).
-        Valid regardless of when the buffers are (re)gathered into."""
-        return CudaGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
+        Valid regardless of when the buffers are (re)gathered into.
+
+        Cached per (bucket, slot): the per-step buffers are allocated once and
+        never rebound, so the views are the same every step, and the sampler
+        itself keeps no per-step state the next step could read."""
+        key = (padded_bs, cg_slot)
+        sampler = self._samplers.get(key)
+        if sampler is None:
+            sampler = CudaGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
+            self._samplers[key] = sampler
+        sampler.applied_penalty_in_graph = False
+        return sampler
 
     def scatter_offset(self, cg_slot: int = 0) -> None:
         """Persist the (in-graph advanced) per-step offsets back to their slot
