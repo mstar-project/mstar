@@ -169,8 +169,13 @@ def _gathered_scores(q, w, keys, lens, width):
     return scores.masked_fill(~visible, float("-inf"))
 
 
+def _kernel_fits(q) -> bool:
+    # tl.dot takes 16+ rows and columns: a reduced config's 4 index heads take the torch math
+    return q.is_cuda and q.shape[1] >= 16 and q.shape[2] >= 16
+
+
 def _decode_scores(q, w, index_layer, index_table, row_req, lens, width):
-    if q.is_cuda:
+    if _kernel_fits(q):
         from mstar.model.glm52.dsa_kernels import decode_scores
 
         return decode_scores(q.to(torch.bfloat16).contiguous(), w.float().contiguous(),
@@ -180,7 +185,7 @@ def _decode_scores(q, w, index_layer, index_table, row_req, lens, width):
 
 
 def _prefill_scores(q, w, index_layer, table_row, lens, width):
-    if q.is_cuda:
+    if _kernel_fits(q):
         from mstar.model.glm52.dsa_kernels import prefill_scores
 
         return prefill_scores(q.to(torch.bfloat16).contiguous(), w.float().contiguous(),
