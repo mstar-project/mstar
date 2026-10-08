@@ -796,6 +796,16 @@ class Engine:
             return {}
         return mgmt.submodule.inline_client_signals(graph_walk)
 
+    def device_loopback_signals(
+        self, node_name: str, graph_walk: str,
+    ) -> frozenset[str]:
+        """The node's loop-back signals it keeps on the device this walk, so
+        the worker routes them without a tensor (see the submodule hook)."""
+        mgmt = self._submodules.get(node_name)
+        if mgmt is None:
+            return frozenset()
+        return mgmt.submodule.device_loopback_signals(graph_walk)
+
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
         host_rows: HostRows | None = None,
