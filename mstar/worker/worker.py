@@ -73,7 +73,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.knobs import launch_signal_after_commit
+from mstar.utils.knobs import launch_signal_after_commit, tp_early_spec
 from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
@@ -3963,6 +3963,8 @@ class Worker:
         # marker and schedules no yield-away, and the top of the next
         # iteration decides as it always did.
         early_spec = os.environ.get("MSTAR_EARLY_SPEC", "1") == "1"
+        # a parallel node builds early only with the knob (see tp_early_spec)
+        early_spec_tp = tp_early_spec()
         next_speculation: Speculation | None = None
         next_yield_away: tuple[str, str] | None = None
         from mstar.utils.profiler import range_pop, range_push
@@ -4281,6 +4283,11 @@ class Worker:
                             if (
                                 early_spec and pp_state is not None
                                 and spec_pending is not None
+                                and (
+                                    early_spec_tp
+                                    or spec_pending.node_name
+                                    not in self.parallel_nodes
+                                )
                             ):
                                 # N's stops are decided and N+1 is launched:
                                 # build N+2 now and hand its pre-plan to the
