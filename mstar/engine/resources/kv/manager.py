@@ -33,6 +33,7 @@ from mstar.engine.resources.kv.plan import (
     KVPlanOutput,
     KVPlanOutputs,
     PagedIndptrs,
+    PinnedIndexRing,
     SequenceView,
     build_paged_indptrs,
     group_by_plan_label,
@@ -50,7 +51,7 @@ from mstar.engine.resources.step import (
     StepContext,
 )
 from mstar.utils.h2d import PinnedStager
-from mstar.utils.knobs import kv_chain_lazy_steps, kv_plan_cache
+from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
 
 logger = logging.getLogger(__name__)
 
@@ -441,6 +442,10 @@ class KVManager(AttentionResource):
         self._plan_epoch = 0
         self._decode_plan_cache: _DecodePlanCache | None = None
         self._plan_cache_mode = kv_plan_cache()
+        # FlashInfer's index arrays from page-locked memory (see PinnedIndexRing)
+        self._indptr_ring = (
+            PinnedIndexRing() if kv_pinned_indptrs() and torch.cuda.is_available() else None
+        )
         self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
         self._current_plan_states: dict[str, KVPlanState] = {}
         self.reset_default_cursors()
@@ -1414,7 +1419,9 @@ class KVManager(AttentionResource):
 
     def _plan_output(self, views: list[SequenceView]) -> KVPlanOutput:
         return KVPlanOutput(
-            cpu_indptrs=build_paged_indptrs(views, self.kv_cache.page_size),
+            cpu_indptrs=build_paged_indptrs(
+                views, self.kv_cache.page_size, ring=self._indptr_ring,
+            ),
             views=views,
         )
 
@@ -1566,12 +1573,13 @@ class KVManager(AttentionResource):
                 )
             ]
             views.extend(rows.pad_views)
+            make = self._indptr_ring.take if self._indptr_ring is not None else torch.from_numpy
             out[label] = KVPlanOutput(
                 cpu_indptrs=PagedIndptrs(
-                    qo_indptr=torch.from_numpy(rows.qo_indptr),
-                    paged_kv_indptr=torch.from_numpy(rows.kv_indptr),
-                    paged_kv_indices=torch.from_numpy(rows.indices),
-                    paged_kv_last_page_len=torch.from_numpy(last_all.astype(np.int32)),
+                    qo_indptr=make(rows.qo_indptr),
+                    paged_kv_indptr=make(rows.kv_indptr),
+                    paged_kv_indices=make(rows.indices),
+                    paged_kv_last_page_len=make(last_all.astype(np.int32)),
                     kv_lens=torch.from_numpy(kv_lens.astype(np.int32)).as_subclass(HostLens),
                 ),
                 views=views,
