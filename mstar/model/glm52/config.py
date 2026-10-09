@@ -69,6 +69,10 @@ class Glm52ModelConfig:
     index_skip_topk_offset: int = 3
     index_share_for_mtp_iteration: bool = True
     indexer_rope_interleave: bool = True
+    # Speculative decoding: 0 = off, k > 0 = draft k tokens per step with the
+    # layer-78 MTP module. Gates both the Glm52MTPModule construction and the
+    # layer-78 weight load.
+    mtp_num_draft_tokens: int = 0
     # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
     # submodule guard holds every context to index_topk, where dense MLA IS
     # the exact DSA computation. On: the guard checks max_seq_len instead,
@@ -106,7 +110,7 @@ class Glm52ModelConfig:
     # ``max_seq_len`` model kwarg and the guard checks against it instead.
     max_seq_len: int = 2048
 
-    # --- MTP layer (in the checkpoint; not built or loaded) ---
+    # --- MTP layer (built and loaded only when mtp_num_draft_tokens > 0) ---
     num_nextn_predict_layers: int = 1
 
     # --- tokens / generation defaults ---
@@ -135,9 +139,51 @@ class Glm52ModelConfig:
     # per-hit-expert dequant loop, the numerics anchor (uncapturable). W8A8
     # activation quantization is the standard fp8 serving numerics, as in vLLM.
     moe_quant_kernel: str = "auto"
+    # With the fused path resolved, small batches run the router and the
+    # routed + shared experts in fused_moe's decode kernels instead: fp8
+    # weights times bf16 activations (w8a16) and fp32 routing weights, so
+    # numerics differ from the W8A8 runner.
+    moe_decode_kernel: bool = False
+    # On the fused path the router's sigmoid, bias, top-k and normalization run as
+    # fused_moe's one-program-per-token router kernel on the fp32 logits: one launch
+    # where torch takes several; ids can differ at exact ties, weights by an ulp.
+    # Off by default.
+    moe_router_kernel: bool = False
+    # Batches above 64 tokens on the fused path run fused_moe's prefill kernels:
+    # the runner's with wider tiles and a one-pass down GEMM, bit-identical output.
+    moe_prefill_kernel: bool = False
+    # Under TP, sum the shared expert's partial into the routed one and
+    # all-reduce once per MoE layer (components/moe.py). Off by default: bf16
+    # rounding order moves.
+    moe_fused_allreduce: bool = False
+    # Keep the non-expert linears the checkpoint stores in fp8 (q_a/kv_a, q_b, o_proj, the
+    # shared expert, the dense-layer MLPs) fp8 with their block scales instead of
+    # dequantizing them to bf16: half the bytes per step. kv_b_proj still dequantizes (the
+    # absorbed MLA folds it into w_kc / w_vc), and so does the shared expert under
+    # moe_decode_kernel, whose chain runs it faster in bf16. Numerics differ from the bf16
+    # copies (w8a16 for decode batches, W8A8 above), so off until the quality gate.
+    dense_fp8: bool = False
+    # The absorbed MLA's latent norms, RoPEs and KV-cache write as two kernels (mla_prep.py)
+    # instead of seven; the same bits as the compiled unfused path. Off by default.
+    mla_fused_prep: bool = False
+    # Under TP, o_proj and the FFN return partials, and each all-reduce runs fused into
+    # the next residual add + RMSNorm (CommGroup.allreduce_add_rmsnorm); the MoE block
+    # then sums its two partials as moe_fused_allreduce does. Off by default: the norm
+    # rounds differently.
+    fused_add_rmsnorm: bool = False
 
+    # Prefill runs the last layer's FFN half (norm, MoE, all-reduce) on the rows it samples
+    # only. Those few rows take the small-batch MoE path, so the first token's numerics
+    # move. Off by default.
+    prefill_last_layer_rows: bool = False
     prefill_token_buckets: list[int] | None = None
+    # Token buckets for the prefill batch sizes above 1; None captures them at
+    # prefill_token_buckets too.
+    prefill_batched_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
+    # Most prompt tokens one prefill step takes ("auto": the largest captured bucket), so a
+    # burst runs as captured chunks with decode steps between them. None: no cap.
+    prefill_max_step_tokens: int | str | None = None
 
     # Derived MLA cache geometry: the paged cache stores one 576-dim latent
     # vector per token per layer (512 compressed KV + 64 decoupled-RoPE key).
@@ -145,6 +191,10 @@ class Glm52ModelConfig:
 
     def __post_init__(self):
         self.cache_latent_dim = self.kv_lora_rank + self.qk_rope_head_dim
+
+    @property
+    def fp8_shared_expert(self) -> bool:
+        return self.dense_fp8 and not self.moe_decode_kernel
 
     @property
     def qk_head_dim(self) -> int:
@@ -169,10 +219,10 @@ class Glm52ModelConfig:
     def max_prompt_tokens(self) -> int:
         """The longest prompt served. Decode runs at least one step after the
         prefill and the next may already be scheduled when it stops, so the
-        prompt leaves two rows under the context limit; a DSA prefill attends
-        densely, within index_topk."""
+        prompt leaves two steps' rows under the context limit (an MTP step
+        writes k + 1); a DSA prefill attends densely, within index_topk."""
         limit = self.max_seq_len if self.dsa_long_context else self.index_topk
-        return min(limit - 2, self.index_topk)
+        return min(limit - 2 * (self.mtp_num_draft_tokens + 1), self.index_topk)
 
     @classmethod
     def from_hf_config(cls, hf_config: dict) -> "Glm52ModelConfig":

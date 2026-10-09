@@ -33,6 +33,9 @@ from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
+# fused_add_rmsnorm fuses all-reduces up to this size; larger ones reduce, add and norm apart
+AR_FUSION_MAX_BYTES = 1 << 20
+
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
     from huggingface_hub import snapshot_download
@@ -91,20 +94,68 @@ class Glm52Model(Model):
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
         if "moe_quant_kernel" in kwargs:
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
-        for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
+        if "moe_fused_allreduce" in kwargs:
+            self.config.moe_fused_allreduce = bool(kwargs["moe_fused_allreduce"])
+        if "moe_decode_kernel" in kwargs:
+            self.config.moe_decode_kernel = bool(kwargs["moe_decode_kernel"])
+        if "moe_prefill_kernel" in kwargs:
+            self.config.moe_prefill_kernel = bool(kwargs["moe_prefill_kernel"])
+        if "moe_router_kernel" in kwargs:
+            self.config.moe_router_kernel = bool(kwargs["moe_router_kernel"])
+        if "prefill_last_layer_rows" in kwargs:
+            self.config.prefill_last_layer_rows = bool(kwargs["prefill_last_layer_rows"])
+        if "dense_fp8" in kwargs:
+            self.config.dense_fp8 = bool(kwargs["dense_fp8"])
+        if "mla_fused_prep" in kwargs:
+            self.config.mla_fused_prep = bool(kwargs["mla_fused_prep"])
+        if "fused_add_rmsnorm" in kwargs:
+            self.config.fused_add_rmsnorm = bool(kwargs["fused_add_rmsnorm"])
+        for key in ("prefill_token_buckets", "prefill_batched_token_buckets",
+                    "prefill_capture_batch_sizes"):
             if key in kwargs:
                 setattr(self.config, key, [int(n) for n in kwargs[key]])
-        if int(kwargs.get("mtp_num_draft_tokens", 0)) > 0:
-            raise ValueError(
-                "mtp_num_draft_tokens > 0: GLM-5.2 MTP speculative decoding is "
-                "not supported yet and follows as a separate change; serve with "
-                "mtp_num_draft_tokens=0"
-            )
+        if kwargs.get("prefill_max_step_tokens") is not None:
+            cap = kwargs["prefill_max_step_tokens"]
+            self.config.prefill_max_step_tokens = cap if cap == "auto" else int(cap)
+        if "mtp_num_draft_tokens" in kwargs:
+            k = int(kwargs["mtp_num_draft_tokens"])
+            if k < 0:
+                # a negative k read as off in some places and on in others
+                raise ValueError(f"mtp_num_draft_tokens must be 0 (off) or more, got {k}")
+            self.config.mtp_num_draft_tokens = k
+        if self.config.mtp_num_draft_tokens > 0:
+            self._check_mtp(kwargs)
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
         self._detokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+
+    def _check_mtp(self, kwargs: dict) -> None:
+        if self.config.dsa_long_context:
+            # the draft loop stays in the short-context regime; k-store sync
+            # and rewind for the sparse path are not written
+            raise ValueError(
+                "mtp_num_draft_tokens and dsa_long_context are mutually "
+                "exclusive: MTP drafting is short-context only"
+            )
+        if self._config_variant in ("reduced", "reduced_fp8"):
+            from mstar.model.glm52.components.indexer import is_full_indexer_layer
+
+            # reduced() sizes 2 trunk layers, landing the MTP position
+            # (layer_idx = num_hidden_layers) on a SHARED indexer slot. Grow
+            # the trunk so it lands FULL, as the real 78 = 2 + 19·freq
+            # geometry does; real variants keep the MTP constructor's guard.
+            if not is_full_indexer_layer(self.config, self.config.num_hidden_layers):
+                self.config.num_hidden_layers = (
+                    self.config.index_skip_topk_offset - 1 + self.config.index_topk_freq
+                )
+        elif "num_hidden_layers" in kwargs:
+            # every checkpoint layer past the trunk routes to the draft module
+            raise ValueError(
+                "mtp_num_draft_tokens needs the checkpoint's own trunk depth; "
+                "with num_hidden_layers set, trunk layers would load as the MTP layer"
+            )
 
     def _checkpoint_config(self) -> Glm52ModelConfig:
         """A local checkpoint's config.json geometry, else the official one."""
@@ -158,8 +209,13 @@ class Glm52Model(Model):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         # Absorbed MLA caches one latent row per token per layer
         # (kv_lora_rank + rope dims = 576) shared by all 64 query heads. No
-        # Yarn -> the softmax scale is plain qk_head_dim**-0.5.
-        num_kv_layers = self.config.num_hidden_layers
+        # Yarn -> the softmax scale is plain qk_head_dim**-0.5. With MTP on,
+        # the layer-78 draft module keeps its KV in one extra layer plane at
+        # index num_hidden_layers, on the trunk's page table (draft-tail rows
+        # are overwritten as the verified stream advances into them).
+        num_kv_layers = self.config.num_hidden_layers + (
+            1 if self.config.mtp_num_draft_tokens > 0 else 0
+        )
         nodes = {"LLM"}
         if self.config.mla_absorb:
             kv = PagedKVConfig(
@@ -378,6 +434,12 @@ class Glm52Model(Model):
         for k, cast in (("top_k", int), ("min_p", float)):
             if model_kwargs.get(k) is not None:
                 params[k] = cast(model_kwargs[k])
+        if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
+            # MTP is greedy-only, so greedy is the declared default on MTP
+            # configs: a bare request serves instead of inheriting the config
+            # temperature and being refused by prepare_inputs. An explicit
+            # temperature > 0 still refuses.
+            params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
 
     def context_limit(self) -> int:
@@ -388,7 +450,9 @@ class Glm52Model(Model):
 
     def max_decode_steps(self) -> int:
         """Decode iterations a one-token prompt can run before the context
-        guard; every longer prompt stops sooner, via check_stop or the guard."""
+        guard; every longer prompt stops sooner, via check_stop or the guard.
+        Under MTP each iteration emits at least one token, so it bounds those
+        loops too."""
         return self.context_limit() - 1
 
     def get_max_output_tokens(self, **model_kwargs):
@@ -482,6 +546,13 @@ class Glm52Model(Model):
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
+        if self.config.fused_add_rmsnorm and tp_group is not None and tp_group.world_size > 1:
+            # collective over the TP group; every rank builds the LLM here
+            dtype = language_model.model.norm.weight.dtype
+            tp_group.init_allreduce_fusion(
+                self.config.hidden_size, dtype,
+                max_tokens=AR_FUSION_MAX_BYTES // (self.config.hidden_size * dtype.itemsize),
+            )
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
         submodule = Glm52LLMSubmodule(language_model=language_model, config=self.config)
@@ -504,6 +575,7 @@ class Glm52Model(Model):
         tp_size = tp_group.world_size if tp_group is not None else 1
         keys, specs = build_glm52_read_plan(
             checkpoint_keys, self.config, tp_rank, tp_size,
+            load_mtp=language_model.mtp is not None,
         )
         logger.info(
             "Glm52Model fast read plan: %d/%d keys, %d sliced (tp %d/%d)",
@@ -541,8 +613,9 @@ class Glm52Model(Model):
         )
         if quant is not None:
             logger.info(
-                "Glm52Model: fp8 %s checkpoint (block %s) — dense dequant on "
-                "load, routed experts fp8-resident=%s.",
-                quant.fmt, quant.weight_block_size, self.config.moe_fp8_resident,
+                "Glm52Model: fp8 %s checkpoint (block %s) — non-expert linears "
+                "fp8=%s, routed experts fp8-resident=%s.",
+                quant.fmt, quant.weight_block_size, self.config.dense_fp8,
+                self.config.moe_fp8_resident,
             )
             self.config.quantization_config = quant

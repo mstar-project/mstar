@@ -223,10 +223,16 @@ model, so they are named for it.
        uncompiled, an escape hatch for an Inductor failure that would
        otherwise fail every capture and serve eager.
    * - ``MSTAR_GLM52_MOE_FUSED_ALLREDUCE``
-     - ``0``
+     - config's ``moe_fused_allreduce``, else ``0``
      - GLM-5.2: add the shared-expert output to the routed partial before the
        TP all-reduce and reduce once per MoE layer instead of twice. Changes
-       the bf16 rounding order, so it is opt-in.
+       the bf16 rounding order; ``glm52_tp8.yaml`` and ``glm52_tp8_mtp.yaml``
+       turn it on.
+   * - ``MSTAR_GLM52_MTP_PAIR_POSTNORM``
+     - ``1``
+     - GLM-5.2 MTP: pair drafts against the trunk's post-norm hidden state,
+       the reference convention. ``0`` pairs the pre-norm state. Changes which
+       tokens are drafted, never which are emitted.
 
 Serving (Python frontend)
 -------------------------

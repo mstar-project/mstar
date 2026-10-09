@@ -17,6 +17,7 @@ from mstar.model.components.moe import (
     _gate_up_weight_loader,
     dispatch_experts_fused,
 )
+from mstar.model.glm52.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block
 from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.model.glm52.quantization import FP8_DTYPE, dequantize_fp8_block_weight
 
@@ -43,6 +44,8 @@ def fused_fp8_available(device: torch.device, block_size: tuple[int, int]) -> bo
                        "serves eager, without CUDA graphs", exc)
         return False
     return True
+# Up to this many tokens moe_decode_kernel routes the block through the decode kernels.
+_DECODE_MAX_TOKENS = 64
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -121,6 +124,8 @@ class Glm52MoEGate(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(n_routed_experts, dtype=torch.float32)
         )
+        # mstar::moe_router_topk once the fused path resolves with moe_router_kernel
+        self._topk_op = None
         # fp32 copy of ``weight``, built once by ``finalize_weights``: the
         # forward needs fp32 and the router never changes, so casting it once
         # per layer per step is pure waste. A plain attribute, not a buffer,
@@ -146,6 +151,9 @@ class Glm52MoEGate(nn.Module):
                 if w is None or w.device != self.weight.device:
                     w = self.weight.float()
                 logits = F.linear(flat.float(), w)
+        if self._topk_op is not None and logits.is_cuda:
+            return self._topk_op(logits, self.e_score_correction_bias, self.top_k,
+                                 self.routed_scaling_factor, self.norm_topk_prob)
         scores = logits.sigmoid()  # (T, E)
 
         biased = scores + self.e_score_correction_bias.unsqueeze(0)
@@ -164,12 +172,16 @@ class Glm52SparseMoeBlock(nn.Module):
     """Routed experts + ungated shared expert (DeepSeek-V3 block shape)."""
 
     def __init__(
-        self, config: Glm52ModelConfig, comm_group: CommGroup | None = None
+        self, config: Glm52ModelConfig, comm_group: CommGroup | None = None,
+        reduce_results: bool = True,
     ) -> None:
+        """``reduce_results=False`` returns this rank's partial (routed + shared) for the
+        caller to reduce."""
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()
         self.comm_group = comm_group
+        self.reduce_results = reduce_results
         self.tp_size = comm_group.world_size
         self.tp_rank = comm_group.rank
         self.hidden_size = config.hidden_size
@@ -191,6 +203,9 @@ class Glm52SparseMoeBlock(nn.Module):
         # Resolved on the real device by process_weights_after_loading;
         # blocks used without the load hook (CPU tests) stay on reference.
         self._use_fused = False
+        self._decode_kernel = bool(getattr(config, "moe_decode_kernel", False))
+        self._router_kernel = bool(getattr(config, "moe_router_kernel", False))
+        self._prefill_kernel = bool(getattr(config, "moe_prefill_kernel", False))
 
         self.gate = Glm52MoEGate(
             hidden_size=config.hidden_size,
@@ -250,18 +265,29 @@ class Glm52SparseMoeBlock(nn.Module):
         # per-rank partial is summed with the routed partial and reduced once.
         # Off by default — sum-then-reduce rounds differently from
         # reduce-then-sum in bf16, so the emitted tokens can shift at ties.
-        self._fused_allreduce = (
-            self.tp_size > 1
-            and os.environ.get("MSTAR_GLM52_MOE_FUSED_ALLREDUCE", "0") == "1"
+        # model_kwargs.moe_fused_allreduce turns it on; a set
+        # MSTAR_GLM52_MOE_FUSED_ALLREDUCE overrides it either way.
+        env = os.environ.get("MSTAR_GLM52_MOE_FUSED_ALLREDUCE", "")
+        self._fused_allreduce = self.tp_size > 1 and (
+            env == "1" if env else config.moe_fused_allreduce
         )
-        self.shared_expert = ParallelGatedMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
-            comm_group=comm_group,
-            activation=config.hidden_act,
-            bias=False,
-            reduce_results=not self._fused_allreduce,
-        )
+        # the two partials are summed before any reduce: one here, or none
+        self._sum_partials = self.tp_size > 1 and (self._fused_allreduce or not reduce_results)
+        shared_inter = config.moe_intermediate_size * config.n_shared_experts
+        dense_block = dense_fp8_block(config)
+        if dense_block is not None and config.fp8_shared_expert:
+            self.shared_expert = Fp8ParallelGatedMLP(
+                config.hidden_size, shared_inter, dense_block, comm_group=comm_group,
+                reduce_results=not self._sum_partials)
+        else:
+            self.shared_expert = ParallelGatedMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=shared_inter,
+                comm_group=comm_group,
+                activation=config.hidden_act,
+                bias=False,
+                reduce_results=not self._sum_partials,
+            )
 
     def _attach_expert_weight_loaders(self) -> None:
         """Reattach per-shard loaders after ``_apply`` rebuilds parameters."""
@@ -299,10 +325,21 @@ class Glm52SparseMoeBlock(nn.Module):
         input_shape = hidden_states.shape
         flat = hidden_states.view(-1, self.hidden_size).contiguous()
 
+        if self._use_decode(flat):
+            # routed + shared partials in one tensor, so one reduction
+            out = self._forward_decode(flat)
+            if self.tp_size > 1 and self.reduce_results:
+                self.comm_group.all_reduce(out)
+            return out.view(input_shape)
+
         # topk_weights stay fp32 into the combine, as in HF's experts.
         topk_weights, topk_ids = self.gate(flat)
         if self.fp8_experts:
-            if self._use_fused:
+            if self._use_fused and self._prefill_kernel and flat.shape[0] > _DECODE_MAX_TOKENS:
+                routed = self._dispatch_prefill(flat, topk_weights, topk_ids)
+                if self.tp_size > 1 and not self._sum_partials:
+                    self.comm_group.all_reduce(routed)
+            elif self._use_fused:
                 from mstar.utils.fused_moe import fused_experts_fp8
 
                 routed = fused_experts_fp8(
@@ -314,12 +351,12 @@ class Glm52SparseMoeBlock(nn.Module):
                     topk_weights, topk_ids,
                     block_size=self.block_size,
                 )
-                if self.tp_size > 1 and not self._fused_allreduce:
+                if self.tp_size > 1 and not self._sum_partials:
                     self.comm_group.all_reduce(routed)
             else:
                 routed = self._dispatch_fp8_reference(
                     flat, topk_weights, topk_ids,
-                    reduce=not self._fused_allreduce)
+                    reduce=not self._sum_partials)
         elif self.tp_size == 1:
             routed = _dispatch(
                 flat,
@@ -338,14 +375,77 @@ class Glm52SparseMoeBlock(nn.Module):
                 topk_ids,
                 topk_weights,
             )
-            if not self._fused_allreduce:
+            if not self._sum_partials:
                 self.comm_group.all_reduce(routed)
         shared = self.shared_expert(flat)
         out = routed + shared
-        if self._fused_allreduce:
+        if self._sum_partials and self.reduce_results:
             # Both terms are per-rank partials here; one reduce for the sum.
             self.comm_group.all_reduce(out)
         return out.view(input_shape)
+
+    def _use_decode(self, flat: torch.Tensor) -> bool:
+        """Small batches take the decode kernels when moe_decode_kernel is set on the
+        fused path; they need bf16 activations and the shared expert in the routed experts'
+        shape and dtype."""
+        if not (self._decode_kernel and self._use_fused
+                and flat.shape[0] <= _DECODE_MAX_TOKENS):
+            return False
+        shared = self.shared_expert.down_proj.weight
+        return (
+            flat.is_cuda
+            and shared.dtype == flat.dtype == torch.bfloat16
+            and shared.shape[1] == self.experts.down_proj_fp8.shape[2]
+        )
+
+    def _dispatch_decode(
+        self,
+        flat: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Routed + shared experts in the fused_moe decode kernels, launched unchained."""
+        from mstar.utils.fused_moe import decode as moe_decode
+
+        exp, shared = self.experts, self.shared_expert
+        return moe_decode.experts(
+            flat, exp.gate_up_proj_fp8, exp.gate_up_proj_scale_inv,
+            exp.down_proj_fp8, exp.down_proj_scale_inv,
+            shared.gate_up_proj.weight, shared.down_proj.weight, topk_weights, topk_ids,
+            block_size=self.block_size)
+
+    # Triton launches with PDL: dynamo stays out, the kernels run inside the captured graph.
+    @torch.compiler.disable
+    def _forward_decode(self, flat: torch.Tensor) -> torch.Tensor:
+        """Router, routed and shared experts as one fused_moe decode launch chain; returns
+        this rank's partial (routed + shared), unreduced."""
+        from mstar.utils.fused_moe import decode as moe_decode
+
+        gate, exp, shared = self.gate, self.experts, self.shared_expert
+        return moe_decode.forward(
+            flat, gate.weight, gate.e_score_correction_bias,
+            exp.gate_up_proj_fp8, exp.gate_up_proj_scale_inv,
+            exp.down_proj_fp8, exp.down_proj_scale_inv,
+            shared.gate_up_proj.weight, shared.down_proj.weight,
+            top_k=gate.top_k, scale=gate.routed_scaling_factor, normalize=gate.norm_topk_prob,
+            block_size=self.block_size)
+
+    # Triton launches stay outside dynamo, as the runner's fp8 quant does.
+    @torch.compiler.disable
+    def _dispatch_prefill(
+        self,
+        flat: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """fused_experts_fp8's output from the fused_moe prefill kernels (same bits)."""
+        from mstar.utils.fused_moe import prefill as moe_prefill
+
+        exp = self.experts
+        return moe_prefill.experts(
+            flat, exp.gate_up_proj_fp8, exp.down_proj_fp8, exp.gate_up_proj_scale_inv,
+            exp.down_proj_scale_inv, topk_weights, topk_ids, block_size=self.block_size,
+            swiglu_limit=None)
 
     def _dispatch_fp8_reference(
         self,
@@ -404,13 +504,19 @@ class Glm52SparseMoeBlock(nn.Module):
                 "'auto' to fall back to the reference dispatch."
             )
         self._use_fused = kernel == "triton" or (kernel == "auto" and fused_ok)
+        if self._use_fused and self._router_kernel:
+            from mstar.utils.fused_moe import decode as moe_decode  # registers the op
+
+            self.gate._topk_op = moe_decode.router_topk
         global _BACKEND_LOGGED
         if not _BACKEND_LOGGED:
             logger.info(
                 "Glm52SparseMoeBlock routed-expert backend: %s "
-                "(moe_quant_kernel=%s, block_size=%s, tp_size=%d).",
+                "(moe_quant_kernel=%s, moe_decode_kernel=%s, block_size=%s, "
+                "tp_size=%d).",
                 "fused_experts_fp8 W8A8" if self._use_fused
                 else "fp8-resident reference dispatch",
-                kernel, self.block_size, self.tp_size,
+                kernel, self._decode_kernel and self._use_fused, self.block_size,
+                self.tp_size,
             )
             _BACKEND_LOGGED = True

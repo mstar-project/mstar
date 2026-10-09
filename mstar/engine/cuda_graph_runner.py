@@ -1314,6 +1314,9 @@ class PiecewiseCudaGraphRunner:
                     self._label, shape.bs, shape.total_tokens, dropped,
                 )
             self.dropped_shapes.append((shape.bs, shape.total_tokens))
+        if self._config.get_config_type() == PiecewiseConfigType.PACKED:
+            # a packed replay pads with zero-length rows; a batched one replays real spans
+            self._dummy_rows.release_all()
         if self.dropped_shapes:
             logger.error(
                 "PiecewiseCudaGraphRunner[%s]: captured %d of %d shapes; these "
@@ -1358,8 +1361,7 @@ class PiecewiseCudaGraphRunner:
                 self._autocast_dtype,
             )
         finally:
-            # pages stay with the dummy streams: replay's padding rows address
-            # the same ids, so their plan finds the storage already resident
+            # at rest for the next shape; `warmup_and_capture` frees a packed region's pages
             self._dummy_rows.reset(dummy_rids)
 
         self._graphs[PiecewiseGraphKey(
@@ -1549,7 +1551,9 @@ class PiecewiseCudaGraphRunner:
             if buffer is None or not isinstance(value, torch.Tensor):
                 continue
             n = value.shape[0]
-            buffer[:n].copy_(value)
+            # a pinned host input must not drain the stream; the copy is
+            # stream-ordered ahead of the replay either way
+            buffer[:n].copy_(value, non_blocking=True)
             if n < buffer.shape[0]:
                 # the padded tail is real compute for a BATCHED capture, so it
                 # reads whatever is here; zero rather than last step's values
