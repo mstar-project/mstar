@@ -338,6 +338,15 @@ def _exec_batch(rids, slot=0):
     )
 
 
+def test_cpu_step_sync_does_not_access_gpu_streams(monkeypatch):
+    from mstar.engine import engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "_ENGINE_STEP_SYNC", True)
+    engine = _FakeExecEngine()
+    out = engine._exec_per_request(_exec_batch(["a"]))
+    assert out.per_rid_outputs == {"a": {"token": 1}}
+
+
 def test_per_request_admits_every_rid_before_running_any():
     engine = _FakeExecEngine()
 

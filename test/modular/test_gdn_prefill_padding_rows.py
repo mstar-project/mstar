@@ -3,7 +3,7 @@
 The GDN prefill kernel is warp-specialised: a row covering no tokens leaves its
 consumers waiting on a barrier its producer never reaches, so the launch never
 retires and every rank of a TP instance wedges behind it — no error, no log.
-A replay's padding rows arrive with span 0 (`PackedCudaGraphConfig` pads with
+A replay's padding rows arrive with span 0 (`PackedAcceleratorGraphConfig` pads with
 `distribute_tokens(0, n)`), which is exactly that shape.
 
 CPU-only: nothing here launches a kernel.
@@ -22,7 +22,7 @@ def build_wrapper(bs: int, num_tokens: int) -> GDNPrefillWrapper:
         pad_slot_id=0,
         num_tokens=num_tokens,
         bs=bs,
-        cuda_graph=True,
+        accelerator_graph=True,
     )
 
 
@@ -70,7 +70,7 @@ def test_a_batch_that_needs_no_padding_is_untouched():
 def test_eager_step_borrows_only_what_it_needs():
     """An eager step has no bucket tail to spend, so `run` pads by exactly the
     number of rows the fixup lengthened — never past the tokens it was given."""
-    w = GDNPrefillWrapper(device=torch.device("cpu"), pad_slot_id=0, cuda_graph=False)
+    w = GDNPrefillWrapper(device=torch.device("cpu"), pad_slot_id=0, accelerator_graph=False)
     state = plan_spans(w, [128, 0, 64])
     assert w._plan_borrowed == 1
     cu = state.cu_seqlens.tolist()

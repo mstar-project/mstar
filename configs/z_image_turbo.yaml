@@ -17,7 +17,7 @@ model_kwargs:
   # runs 1.25 s / 0.80 images/s at B=1 / concurrency 8 against 0.86 s / 1.17 for the plain compile (SGLang 0.86 s), and
   # [activations] buys nothing (median 34.9 dB). Default: the fast plain compile; set [norms] for reference-faithful output.
   compile_exact_ops: false
-  cuda_graph: true
+  accelerator_graph: true
   capture_sizes: [[1024, 1024]]
   # Captions pad to multiples of 32 up to max_seq_len, so cap_len has 16 possible
   # values -- and it is an INPUT, not a shape: the DiT substitutes a learned
@@ -28,7 +28,7 @@ model_kwargs:
   # The capture budget is len(capture_caption_lengths) x len(capture_batch_sizes),
   # so all 16 lengths would be 128 graphs. Spend the budget on caption lengths
   # instead of batch sizes: a captured bucket already serves SHORTER batches by
-  # padding them with dummy rows (CudaGraphRunner.DummyRowPool), so 1/2/4/8 covers
+  # padding them with dummy rows (AcceleratorGraphRunner.DummyRowPool), so 1/2/4/8 covers
   # every batch up to 8, where extra cap_lens cover nothing but themselves.
   # 4 x 4 = 16 graphs, the same count as the [32, 64] x [1..8] this replaced, with
   # twice the caption coverage. Widen if the measured startup and VRAM allow.

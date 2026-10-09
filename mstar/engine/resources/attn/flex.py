@@ -295,7 +295,7 @@ class FlexAttentionManager(AttentionManager):
         if mask is None:
             raise RuntimeError(
                 f"FlexAttention mask for slot={slot}, geometry={geometry}, "
-                f"batch={batch} was not allocated before CUDA graph capture"
+                f"batch={batch} was not allocated before accelerator graph capture"
             )
         return mask
 
@@ -344,7 +344,7 @@ class FlexAttentionManager(AttentionManager):
         self._visibility_tables[geometry] = table
         return table
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del max_bs, max_seq_len

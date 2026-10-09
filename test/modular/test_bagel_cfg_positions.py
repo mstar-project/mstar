@@ -205,7 +205,7 @@ def _decode_capture_inputs(cfg_on: bool):
             LLMSubmodule.PREFILL_TEXT_CAPTURE_BATCH_SIZES
         ),
     )
-    configs = LLMSubmodule.get_cuda_graph_configs(stub, torch.device("cuda"))
+    configs = LLMSubmodule.get_accelerator_graph_configs(stub, torch.device("cuda"))
     config = next(
         c for c in configs
         if getattr(c, "capture_graph_walk", None) == "decode"

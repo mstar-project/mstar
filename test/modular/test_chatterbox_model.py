@@ -13,7 +13,7 @@ import torch
 import yaml
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, PackedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
@@ -796,8 +796,8 @@ def test_t3_batches_only_one_guidance_mode_and_captures_both():
     # the engine passes the batch's input metadata too
     assert sub.cg_key_info("decode", {"a": _fwd_info("a", 0.5)}, per_request_input_metadata={}) is True
 
-    configs = sub.get_cuda_graph_configs(torch.device("cpu"))
-    batched = [c for c in configs if isinstance(c, BatchedCudaGraphConfig)]
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    batched = [c for c in configs if isinstance(c, BatchedAcceleratorGraphConfig)]
     keys = {c.additional_key_info: c for c in batched}
     assert set(keys) == {True, False}
     assert keys[True].total_tokens_multiplier == 2 and keys[False].total_tokens_multiplier == 1
@@ -806,7 +806,10 @@ def test_t3_batches_only_one_guidance_mode_and_captures_both():
     assert all(c.capture_graph_walk == "decode" for c in batched)
 
     turbo = _t3_submodule("turbo")
-    turbo_cfgs = [c for c in turbo.get_cuda_graph_configs(torch.device("cpu")) if isinstance(c, BatchedCudaGraphConfig)]
+    turbo_cfgs = [
+        c for c in turbo.get_accelerator_graph_configs(torch.device("cpu"))
+        if isinstance(c, BatchedAcceleratorGraphConfig)
+    ]
     assert [c.additional_key_info for c in turbo_cfgs] == [False]
     assert turbo.cg_key_info("decode", {"a": _fwd_info("a", 0.5)}) is False
 
@@ -816,7 +819,10 @@ def test_t3_prefill_is_captured_as_packed_graphs_for_both_guidance_modes():
     both prefill walks; the stand-in inputs carry the guidance branch's second
     embedding row set like ``prepare_inputs`` does. The knob turns it off."""
     sub = _t3_submodule()
-    packed = [c for c in sub.get_cuda_graph_configs(torch.device("cpu")) if isinstance(c, PackedCudaGraphConfig)]
+    packed = [
+        c for c in sub.get_accelerator_graph_configs(torch.device("cpu"))
+        if isinstance(c, PackedAcceleratorGraphConfig)
+    ]
     assert {c.additional_key_info for c in packed} == {True, False}
     for cfg in packed:
         assert cfg.capture_graph_walk == "prefill"
@@ -838,11 +844,14 @@ def test_t3_prefill_is_captured_as_packed_graphs_for_both_guidance_modes():
         per_request_input_tensors={}, per_request_info={},
     )
     inputs = [sub.prepare_inputs("prefill", _fwd_info("a"), {TEXT_INPUTS: [torch.tensor([255, 0])]})]
-    assert sub.can_use_cuda_graphs(prefill, inputs)
+    assert sub.can_use_accelerator_graphs(prefill, inputs)
 
     sub.config.t3_prefill_graphs = False
-    assert not any(isinstance(c, PackedCudaGraphConfig) for c in sub.get_cuda_graph_configs(torch.device("cpu")))
-    assert not sub.can_use_cuda_graphs(prefill, inputs)
+    assert not any(
+        isinstance(c, PackedAcceleratorGraphConfig)
+        for c in sub.get_accelerator_graph_configs(torch.device("cpu"))
+    )
+    assert not sub.can_use_accelerator_graphs(prefill, inputs)
 
 
 def test_sampler_min_p_goes_through_the_resource():

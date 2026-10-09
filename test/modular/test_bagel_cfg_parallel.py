@@ -26,6 +26,7 @@ from mstar.engine.resources.kv.transfer import (
     make_deployment_kv_shm_dir,
 )
 from mstar.model.bagel.bagel_model import BagelModel
+from mstar.model.bagel.components.modeling_utils import TimestepEmbedder
 from mstar.model.bagel.submodules import CombineCFGSubmodule
 
 
@@ -135,6 +136,40 @@ def test_bagel_configs_detect_only_graph_walk_split_llm_as_disaggregated():
     image_gen = model.get_graph_walk_graphs()["image_gen"]
     assert not image_gen.sections[0].section.enable_async_scheduling
 
+
+def test_timestep_embedding_preserves_fp32_frequencies_after_bf16_cast():
+    module = TimestepEmbedder(64, frequency_embedding_size=256).to(
+        dtype=torch.bfloat16
+    )
+    expected = torch.exp(
+        -torch.log(torch.tensor(10000.0))
+        * torch.arange(128, dtype=torch.float32)
+        / 128
+    )
+
+    assert module.timestep_freqs.dtype == torch.float32
+    torch.testing.assert_close(module.timestep_freqs, expected, rtol=0, atol=0)
+
+
+def test_timestep_embedding_survives_meta_to_empty_round_trip():
+    module = TimestepEmbedder(64, frequency_embedding_size=256).to("meta")
+    module.to_empty(device="cpu")
+    expected = torch.exp(
+        -torch.log(torch.tensor(10000.0))
+        * torch.arange(128, dtype=torch.float32)
+        / 128
+    )
+    torch.testing.assert_close(module.timestep_freqs, expected, rtol=0, atol=0)
+
+
+def test_timestep_embedding_buffer_matches_reference_formula():
+    module = TimestepEmbedder(64, frequency_embedding_size=256)
+    timesteps = torch.tensor([0.0, 0.25, 0.5, 1.0])
+    buffered = module(timesteps)
+    reference = module.mlp(
+        module.timestep_embedding(timesteps, module.frequency_embedding_size)
+    )
+    torch.testing.assert_close(buffered, reference, rtol=0, atol=0)
 
 def test_combine_cfg_is_parameterless():
     module = CombineCFGSubmodule(SimpleNamespace())

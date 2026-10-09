@@ -91,27 +91,27 @@ def test_serving_defaults_to_reference_compatible_optimized_execution():
     for config in (waypoint_1_5_1b_720p(), waypoint_1_5_1b_360p()):
         assert config.reference_compat is True
         assert config.compile_dit is True
-        assert config.cuda_graph is True
+        assert config.accelerator_graph is True
         assert config.capture_dit_prime is True
 
 
 @pytest.mark.parametrize("compile_dit", [False, True])
-@pytest.mark.parametrize("cuda_graph", [False, True])
+@pytest.mark.parametrize("accelerator_graph", [False, True])
 @pytest.mark.parametrize("capture_dit_prime", [False, True])
 @pytest.mark.parametrize("reference_compat", [False, True])
 def test_execution_and_numerical_modes_are_independent(
-    compile_dit, cuda_graph, capture_dit_prime, reference_compat,
+    compile_dit, accelerator_graph, capture_dit_prime, reference_compat,
 ):
     config = replace(
         waypoint_1_5_1b_720p(),
         compile_dit=compile_dit,
-        cuda_graph=cuda_graph,
+        accelerator_graph=accelerator_graph,
         capture_dit_prime=capture_dit_prime,
         reference_compat=reference_compat,
     )
     config.validate_supported_deployment()
     assert config.compile_dit is compile_dit
-    assert config.cuda_graph is cuda_graph
+    assert config.accelerator_graph is accelerator_graph
     assert config.capture_dit_prime is capture_dit_prime
     assert config.reference_compat is reference_compat
 
@@ -120,14 +120,26 @@ def test_model_constructor_threads_all_execution_modes_independently():
     model = WaypointModel(
         skip_weight_loading=True,
         compile_dit=False,
-        cuda_graph=False,
+        accelerator_graph=False,
         capture_dit_prime=False,
         reference_compat=False,
     )
     assert model.config.compile_dit is False
-    assert model.config.cuda_graph is False
+    assert model.config.accelerator_graph is False
     assert model.config.capture_dit_prime is False
     assert model.config.reference_compat is False
+
+
+@pytest.mark.parametrize("filename", ["waypoint.yaml", "waypoint_360p.yaml"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_shipped_configs_use_accelerator_graph_switch(filename, enabled):
+    config_path = Path(__file__).resolve().parents[2] / "configs" / filename
+    deployment = yaml.safe_load(config_path.read_text())
+    assert deployment["model_kwargs"]["accelerator_graph"] is True
+    deployment["model_kwargs"]["accelerator_graph"] = enabled
+    model = WaypointModel(**deployment["model_kwargs"], skip_weight_loading=True)
+    assert model.config.accelerator_graph is enabled
+    model.validate_config_yaml(deployment, str(config_path))
 
 
 @pytest.mark.parametrize(
@@ -443,7 +455,7 @@ def test_shipped_config_builds_through_registry_and_engine_manager_without_netwo
         assert manager.engine._autocast_dtype is torch.bfloat16
         assert model.config.reference_compat is True
         assert model.config.compile_dit is True
-        assert model.config.cuda_graph is True
+        assert model.config.accelerator_graph is True
         assert model.checkpoint_dir == "Overworld/Waypoint-1.5-1B"
         assert model._checkpoints_resolved is False
     finally:

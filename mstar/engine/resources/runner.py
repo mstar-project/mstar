@@ -493,7 +493,7 @@ class StepRunner:
             out[rid] = per_key
         return out
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
         node_name: str | None = None,
     ) -> None:
@@ -503,6 +503,6 @@ class StepRunner:
         batch size say nothing about a resource this node's graphs never touch.
         """
         for key in self._sweep(self._node_order, self._order, node_name):
-            self._resources[key].build_cuda_graph_buffers(
+            self._resources[key].build_accelerator_graph_buffers(
                 slots, max_bs, max_seq_len
             )

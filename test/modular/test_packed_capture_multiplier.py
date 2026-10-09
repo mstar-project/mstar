@@ -11,14 +11,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_config import PackedCudaGraphConfig
-from mstar.engine.cuda_graph_runner import CudaGraphRunner
+from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.resources import BucketKey
 from mstar.model.submodule_base import ARNodeInputs
 
 
-def _packed(multiplier: int) -> PackedCudaGraphConfig:
-    return PackedCudaGraphConfig(
+def _packed(multiplier: int) -> PackedAcceleratorGraphConfig:
+    return PackedAcceleratorGraphConfig(
         capture_graph_walk="prefill",
         capture_token_lengths=[256, 1024],
         make_node_input=lambda n: ARNodeInputs(input_ids=torch.zeros(n, dtype=torch.long), input_seq_len=n),
@@ -38,8 +38,8 @@ def test_buckets_are_keyed_by_plan_tokens_and_rows_get_input_tokens():
         _packed(0)
 
 
-def _runner_with(buckets: dict[BucketKey, PackedCudaGraphConfig]) -> CudaGraphRunner:
-    runner = object.__new__(CudaGraphRunner)
+def _runner_with(buckets: dict[BucketKey, PackedAcceleratorGraphConfig]) -> AcceleratorGraphRunner:
+    runner = object.__new__(AcceleratorGraphRunner)
     runner._buckets = {
         key: SimpleNamespace(config=cfg, slots=[object()], config_idx=0) for key, cfg in buckets.items()
     }

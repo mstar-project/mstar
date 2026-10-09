@@ -14,9 +14,9 @@ from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, Resou
 if TYPE_CHECKING:
     # the config reaches back here through the submodule base, so keep the
     # import out of module exec
-    from mstar.engine.cuda_graph_config import (
-        CudaGraphConfig,
-        PiecewiseCudaGraphConfig,
+    from mstar.engine.accelerator_graph_config import (
+        AcceleratorGraphConfig,
+        PiecewiseAcceleratorGraphConfig,
     )
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
@@ -26,7 +26,7 @@ class CGSlotSpec:
     bucket: BucketKey
     slot: int
     # a whole forward's capture, or one piecewise region's
-    config: CudaGraphConfig | PiecewiseCudaGraphConfig
+    config: AcceleratorGraphConfig | PiecewiseAcceleratorGraphConfig
     config_idx: int | None = None
 
     @property
@@ -215,7 +215,7 @@ class Resource(ABC):
         return None
 
     def reset_request(self, rid: str, free: bool=False):
-        """For clearing dummy RIDs during cuda graph capture"""
+        """For clearing dummy RIDs during accelerator graph capture"""
         return
 
     # Pre-planning
@@ -293,7 +293,7 @@ class Resource(ABC):
 
     # Engine lifecycle
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec],
         max_bs: int, max_seq_len: int
     ) -> None:
@@ -311,7 +311,7 @@ class Resource(ABC):
     def post_warmup_validate(self):
         """
         For, e.g., the KV cache to check that num_free_pages is identical
-        across TP ranks after cuda graph capture.
+        across TP ranks after accelerator graph capture.
 
         Raises an error (fails loudly) if invalid.
         """

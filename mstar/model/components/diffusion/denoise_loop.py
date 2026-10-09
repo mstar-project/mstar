@@ -12,7 +12,7 @@ leaves the model-specific parts to a handful of hooks:
   equal-key request batching (can_batch)          request_inputs(fwd_info, inputs, key) -> {name: [..]}
   stacked preprocess / per-row outputs            num_tokens(key)               -> int
   stop after the request's own step count         denoise(engine_inputs, key, latents, timestep,
-  per-key CUDA-graph buckets (Euler inside)               sigma, sigma_next, **cond) -> [B, L, C]
+  per-key accelerator graph buckets (Euler inside)       sigma, sigma_next, **cond) -> [B, L, C]
   ragged-attention step declaration               capture_request_inputs(key, device) -> {name: [..]}
                                                   attention_segments(key) -> ((label, span), ...)
 
@@ -32,7 +32,7 @@ Conventions the base fixes:
   staged buffers. Declaring one is enough: the base stages every source the
   table names on the device and slices it per step.
 * Rows are batched only at an identical ``bucket_key``, which is also the
-  CUDA-graph bucket key. It need not be shape alone: anything that has to match
+  accelerator graph bucket key. It need not be shape alone: anything that has to match
   for two rows to share a forward belongs in it (the latent grid, text length
   and conditioning layout, but equally whether CFG is on).
 * Every span a forward attends over must be declared: the default is one
@@ -461,8 +461,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
         )
 
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1):
-        from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig
+    def get_accelerator_graph_configs(self, device: torch.device, tp_world_size: int = 1):
+        from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
 
         configs = []
         for walk, bucket_key in self.capture_buckets:
@@ -474,7 +474,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             single = NodeInputs(
                 tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=bucket_key,
             )
-            configs.append(BatchedCudaGraphConfig(
+            configs.append(BatchedAcceleratorGraphConfig(
                 capture_graph_walk=walk,
                 replay_graph_walks=[walk, *self.replay_walks.get(walk, ())],
                 single_request_inputs=single,

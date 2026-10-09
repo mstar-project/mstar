@@ -93,7 +93,7 @@ def meta() -> dict:
 @pytest.fixture(scope="module")
 def model() -> Flux2KleinModel:
     # SDPA backend: the reference kernel, so the per-step gates can be bit-exact.
-    m = Flux2KleinModel(model_path_hf=MODEL_REPO, attention_backend="sdpa", compile=False, cuda_graph=False)
+    m = Flux2KleinModel(model_path_hf=MODEL_REPO, attention_backend="sdpa", compile=False, accelerator_graph=False)
     m.set_config(Flux2KleinConfig.from_snapshot(resolve_snapshot_dir(MODEL_REPO)))
     return m
 

@@ -459,8 +459,8 @@ class Worker:
         # erase the overlap. The side stream waits on
         # ``output.completion_event`` (recorded after GPU(N)) and then runs
         # an isolated D→H, so the main thread only blocks on the copy.
-        # Lazy-initialized — workers without CUDA never touch it.
-        self._d2h_stream: "torch.cuda.Stream | None" = None
+        # Lazy-initialized — CPU workers never touch it.
+        self._d2h_stream: torch.Stream | None = None
         self._pinned_d2h_buffers: dict[
             tuple[str, torch.dtype, int], list[torch.Tensor]
         ] = defaultdict(list)
@@ -3053,7 +3053,7 @@ class Worker:
 
 
     def _d2h_batched(
-        self, buffers: dict, side: torch.cuda.Stream,
+        self, buffers: dict, side: torch.Stream,
     ) -> dict[str, torch.Tensor]:
         """One device-to-host copy per named buffer, landed before this returns.
 
@@ -3065,9 +3065,13 @@ class Worker:
         reused by the next step.
         """
         host: dict[str, torch.Tensor] = {}
-        with torch.cuda.stream(side):
+        device_module = getattr(torch, self.device.type)
+        with device_module.stream(side):
             for index, (name, tensor) in enumerate(buffers.items()):
-                if not (torch.is_tensor(tensor) and tensor.is_cuda):
+                if not (
+                    torch.is_tensor(tensor)
+                    and tensor.device.type == self.device.type
+                ):
                     host[name] = tensor
                     continue
                 buf = self._get_pinned_d2h_buffer(
@@ -3100,20 +3104,20 @@ class Worker:
     def _prematerialize_for_check_stop(
         self,
         outputs: "BatchedModelOutput",
-        completion_event: torch.cuda.Event | None,
+        completion_event: torch.Event | None,
         request_ids: list[int] | None = None,
     ) -> tuple[dict[int, NameToTensorList], HostRows | None]:
-        """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
+        """Side-stream D→H of every device tensor in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
         don't trigger a default-stream sync. With same-thread async,
         GPU(N+1)'s kernels are already queued on default stream behind
         N's outputs by the time we get here — a default-stream sync would
         block waiting for N+1 to finish, defeating the overlap.
 
-        Returns per-rid outputs with the CUDA tensors replaced by CPU
+        Returns per-rid outputs with the device tensors replaced by CPU
         copies, plus ``HostRows`` when the submodule handed over row-addressed
-        buffers, for a batched stop check. Skipped (returns ``outputs`` unchanged) when there's no completion
-        event (CPU execution) or when CUDA is unavailable.
+        buffers, for a batched stop check. Uses existing host buffers when
+        there's no completion event (CPU execution) or the device is unavailable.
 
         AR engines emit small per-rid output dicts (sampled token + maybe
         a code) so the cost is negligible. If a future engine emits large
@@ -3130,7 +3134,15 @@ class Worker:
             list(outputs.row_request_ids)
             if outputs.row_request_ids is not None else request_ids
         )
-        if not torch.cuda.is_available() or completion_event is None:
+        device_module = (
+            getattr(torch, self.device.type)
+            if self.device.type in {"cuda", "xpu"} else None
+        )
+        if (
+            completion_event is None
+            or device_module is None
+            or not device_module.is_available()
+        ):
             if outputs.check_stop_buffers is not None and row_rids is not None:
                 # host tensors already (a CPU device): only the re-keying
                 host = outputs.check_stop_buffers
@@ -3143,7 +3155,7 @@ class Worker:
             return source, None
 
         if self._d2h_stream is None:
-            self._d2h_stream = torch.cuda.Stream(device=self.device)
+            self._d2h_stream = device_module.Stream(device=self.device)
         side = self._d2h_stream
         side.wait_event(completion_event)
 
@@ -3156,7 +3168,7 @@ class Worker:
 
         cpu_per_rid: dict = {}
         buffer_indices: dict[tuple[str, torch.dtype, int], int] = defaultdict(int)
-        with torch.cuda.stream(side):
+        with device_module.stream(side):
             for rid, name_to_list in source.items():
                 if not isinstance(name_to_list, dict):
                     cpu_per_rid[rid] = name_to_list
@@ -3168,7 +3180,7 @@ class Worker:
                         continue
                     new_list = []
                     for t in tensors:
-                        if torch.is_tensor(t) and t.is_cuda:
+                        if torch.is_tensor(t) and t.device.type == self.device.type:
                             # by size class, not shape: a per-shape count gives two shapes in one class the same buffer
                             key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
                             idx = buffer_indices[key]
@@ -3381,7 +3393,7 @@ class Worker:
                 )
 
         # Bound the load-time asymmetry between workers before any
-        # subgroup NCCL collective fires inside the per-bs CUDA-graph
+        # subgroup NCCL collective fires inside the per-bs accelerator graph
         # capture loop. Without this fence, a worker with a small model
         # (e.g. an 8B Talker) can finish loading, enter warmup, and hit
         # its first subgroup barrier while a worker with a 30B Thinker
@@ -3394,11 +3406,11 @@ class Worker:
         self.parallel_groups.barrier_all()
         self._verify_tp_async_sched_agrees()
 
-        # CUDA graph capture before entering the main loop
+        # accelerator graph capture before entering the main loop
         self.engine_manager.warmup_all()
 
         # Sync every worker before the main loop opens. Per-batch-size
-        # captures inside CudaGraphRunner are already barriered on the
+        # captures inside AcceleratorGraphRunner are already barriered on the
         # node-local TP group, but that doesn't bound the time between
         # ``warmup_and_capture`` returning and ``run()`` starting to
         # schedule. Without this fence, a TP leader can finish warmup
@@ -3421,7 +3433,7 @@ class Worker:
             "permanent generation", self.worker_id, gc.get_freeze_count(),
         )
 
-        # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
+        # Setup (weight load + warmup + accelerator graph capture) is complete. Tell
         # the conductor this worker is ready. The conductor blocks its main
         # loop until every worker reports in, so the API server only advertises
         # readiness once all workers can actually serve.

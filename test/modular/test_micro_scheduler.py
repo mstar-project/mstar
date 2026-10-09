@@ -743,7 +743,7 @@ def _capture_group(split=True, captured=(WALK,)):
 
     runner = SimpleNamespace(captures_walk=lambda walk: walk in captured)
     engine = SimpleNamespace(_submodules={
-        NODE: SimpleNamespace(submodule=_Submodule(split), cuda_graph_runner=runner),
+        NODE: SimpleNamespace(submodule=_Submodule(split), accelerator_graph_runner=runner),
     })
     return Engine.capture_group(engine, NODE, WALK, 0, SimpleNamespace(guided=True))
 

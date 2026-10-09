@@ -99,7 +99,7 @@ def ulysses_attention(
 
     ``prefer_all_gather`` selects the all-gather collective instead of the
     all-to-all (see :func:`_ulysses_attention_via_all_gather`). The caller sets
-    it on the denoise forward that the CUDA graph captures: the all-to-all is
+    it on the denoise forward that the accelerator graph captures: the all-to-all is
     grouped point-to-point send/recv and does not replay from a captured graph,
     whereas all-gather (a true collective, like the TP all-reduce) does. It must
     be set consistently across warmup, capture and replay so the all-gather
@@ -128,13 +128,13 @@ def _ulysses_attention_via_all_gather(
     v: torch.Tensor,
     run_attention: Callable[..., torch.Tensor],
 ) -> torch.Tensor:
-    """CUDA-graph-capturable Ulysses attention built from all-gather.
+    """accelerator graph-capturable Ulysses attention built from all-gather.
 
     Same result as :func:`ulysses_attention`'s all-to-all, different collective:
     each rank all-gathers the full sequence and attends over its own head-group,
     then all-gathers the full heads back and keeps its own sequence shard. The
     all-to-all would move fewer bytes, but it is grouped send/recv and does not
-    replay from a CUDA graph; all-gather is a true collective and does. Assumes
+    replay from an accelerator graph; all-gather is a true collective and does. Assumes
     an even sequence split across the group (the captured resolutions guarantee
     it). Head counts are divisible by the group size (the Ulysses constraint)."""
     world_size, rank = sp_group.world_size, sp_group.rank

@@ -26,7 +26,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -177,7 +181,7 @@ class T3Submodule(ARNodeSubmodule):
     label-major into one plan (``CFG_LABEL``); the forward then sees ``2B``
     rows, combines the two logit halves with the per-request ``cfg_weight``
     and samples ``B`` tokens. Guidance on/off is the capture key, so a decode
-    batch of either kind replays its own CUDA graph.
+    batch of either kind replays its own accelerator graph.
     """
 
     # Sampling, guidance and the min-p mask are plain tensor ops but the
@@ -464,7 +468,9 @@ class T3Submodule(ARNodeSubmodule):
             resource_step_info=requires_cfg,
         )
 
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[AcceleratorGraphConfig]:
         del tp_world_size
         dtype = self.model.speech_emb.weight.dtype
         configs = []
@@ -472,7 +478,7 @@ class T3Submodule(ARNodeSubmodule):
             if self.config.t3_prefill_graphs:
                 # both prefill walks replay the same captures; the packed
                 # layout pads the batch's tokens up to the bucket
-                configs.append(PackedCudaGraphConfig(
+                configs.append(PackedAcceleratorGraphConfig(
                     capture_graph_walk="prefill",
                     replay_graph_walks=list(PREFILL_WALKS),
                     capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -484,7 +490,7 @@ class T3Submodule(ARNodeSubmodule):
                     # guidance packs the cond and uncond streams into one plan
                     total_tokens_multiplier=2 if requires_cfg else 1,
                 ))
-            configs.append(BatchedCudaGraphConfig(
+            configs.append(BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(1, self.t3.hidden_size, dtype=dtype, device=device),
@@ -502,12 +508,12 @@ class T3Submodule(ARNodeSubmodule):
             ))
         return configs
 
-    def can_use_cuda_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_use_accelerator_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         if not self.can_batch(batch, model_inputs):
             return False
         if batch.graph_walk in PREFILL_WALKS and not self.config.t3_prefill_graphs:
             return False
-        return super().can_use_cuda_graphs(batch, model_inputs)
+        return super().can_use_accelerator_graphs(batch, model_inputs)
 
 
 # ===========================================================================

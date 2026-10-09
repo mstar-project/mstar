@@ -987,6 +987,11 @@ def sample_cuda_graphable_gpu(
         output is int32; we cast to int64 so the caller can index
         ``nn.Embedding`` modules (which require int64 indices) directly.
     """
+    if logits.device.type != "cuda":
+        raise NotImplementedError(
+            "Graph-captured token sampling requires the CUDA FlashInfer backend; "
+            f"use eager sampling on {logits.device.type}"
+        )
     import flashinfer
 
     with torch.cuda.device(logits.device):
@@ -1027,7 +1032,7 @@ class CudaGraphableSampler(BaseSampler):
     min_p_buf: torch.Tensor | None = None
     tp_group: "CommGroup | None" = None  # noqa: F821
 
-    # Set during graph capture, and used by the cuda graph runner to determine
+    # Set during graph capture, and used by the accelerator graph runner to determine
     # whether requests' seen token buffers should be synced post-replay
     applied_penalty_in_graph: bool = False
 
@@ -1356,7 +1361,10 @@ class SamplerBuffers:
         would surface if accidentally indexed. ``cg_slots`` double-buffers the
         per-step tensors so the sampler can pre-plan.
         """
-        pinned = torch.cuda.is_available() and device.type == "cuda"
+        pinned = (
+            device.type in {"cuda", "xpu"}
+            and getattr(torch, device.type).is_available()
+        )
         cap = max_batch_size
 
         def mk(dtype: torch.dtype, default: float) -> HostBuffer:
@@ -1440,7 +1448,7 @@ class SamplerBuffers:
         """Double-and-copy the master buffers up to at least ``new_capacity``.
 
         Triggered when concurrently-registered requests exceed the current
-        master capacity. Per-step buffers (sized to the cuda-graph max_bs) are
+        master capacity. Per-step buffers (sized to the graph capture max_bs) are
         NOT resized — the gather only reads ``padded_bs`` rows from master.
         """
         for buf in self._scalar_buffers():

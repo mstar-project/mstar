@@ -47,12 +47,12 @@ class NoiseStager:
         self._depth = depth
         self._numel = 0
         self._bufs: list[torch.Tensor] = []
-        self._events: list[torch.cuda.Event | None] = [None] * depth
+        self._events: list[torch.Event | None] = [None] * depth
         self._next = 0
         self._lock = threading.Lock()
-        # Without CUDA there is nothing to pin and nothing to overlap; the staging
+        # Without an accelerator there is nothing to pin or overlap; the staging
         # degrades to a plain copy so callers need no branch of their own.
-        self._pinned = torch.cuda.is_available()
+        self._pinned = torch.accelerator.is_available()
         if numel:
             self._grow(numel)
         # One generator, re-seeded per request: the draw is seeded from the
@@ -106,7 +106,7 @@ class NoiseStager:
         numel = 1
         for dim in shape:
             numel *= dim
-        if device.type != "cuda" or not self._pinned:
+        if device.type not in {"cuda", "xpu"} or not self._pinned:
             return self.randn(shape, seed).to(device)
 
         out = torch.empty(shape, dtype=self.dtype, device=device)
@@ -140,8 +140,8 @@ class NoiseStager:
 
     def _record(self, index: int, event, device: torch.device) -> None:
         if event is None:
-            event = self._events[index] = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(device))
+            event = self._events[index] = torch.Event(device=device)
+        event.record(torch.accelerator.current_stream(device))
 
     def to_device(self, tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
         """``tensor`` on ``device``, copied from pinned memory without blocking.
@@ -151,7 +151,7 @@ class NoiseStager:
         needs that stream to wait on this one, as for any async copy.
         """
         device = torch.device(device)
-        if device.type != "cuda" or not self._pinned:
+        if device.type not in {"cuda", "xpu"} or not self._pinned:
             return tensor.to(device)
         if tensor.dtype != self.dtype:
             raise ValueError(f"stager holds {self.dtype}, got {tensor.dtype}")

@@ -96,8 +96,9 @@ class _StubWorker:
 
     _pinned_d2h_buffers: dict = {}
 
-    def __init__(self):
+    def __init__(self, device):
         from collections import defaultdict
+        self.device = device
         self._pinned_d2h_buffers = defaultdict(list)
 
     _get_pinned_d2h_buffer = Worker._get_pinned_d2h_buffer
@@ -109,30 +110,42 @@ class _StubWorker:
         return Worker._rows_to_per_rid(self._d2h_batched(buffers, side), request_ids)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_batched_prematerialize_keeps_row_to_request_order():
+@pytest.fixture(params=["cuda", "xpu"])
+def accelerator_device(request):
+    runtime = getattr(torch, request.param)
+    if not runtime.is_available():
+        pytest.skip(f"{request.param} is unavailable")
+    return torch.device(request.param, 0)
+
+
+def test_batched_prematerialize_keeps_row_to_request_order(accelerator_device):
     """Row i must land on request i — the bug this would hide is requests
     stopping on each other's tokens."""
     rids = [f"r{i}" for i in range(6)]
     # a padded replay leaves rows past the real ones; they must be ignored
-    tokens = torch.arange(100, 110, device="cuda")
-    worker = _StubWorker()
+    tokens = torch.arange(100, 110, device=accelerator_device)
+    worker = _StubWorker(accelerator_device)
+    runtime = getattr(torch, accelerator_device.type)
+    side = runtime.Stream(device=accelerator_device)
+    side.wait_stream(runtime.current_stream(accelerator_device))
     got = worker._prematerialize_batched(
-        {"new_token": tokens}, torch.cuda.Stream(), rids,
+        {"new_token": tokens}, side, rids,
     )
     assert list(got) == rids
     for i, rid in enumerate(rids):
         assert got[rid]["new_token"][0].item() == 100 + i
-        assert not got[rid]["new_token"][0].is_cuda, "must land on the host"
+        assert got[rid]["new_token"][0].device.type == "cpu", "must land on the host"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_batched_matches_what_the_per_rid_walk_would_give():
+def test_batched_matches_what_the_per_rid_walk_would_give(accelerator_device):
     rids = [f"r{i}" for i in range(4)]
-    tokens = torch.tensor([7, 8, 9, 10], device="cuda")
-    worker = _StubWorker()
+    tokens = torch.tensor([7, 8, 9, 10], device=accelerator_device)
+    worker = _StubWorker(accelerator_device)
+    runtime = getattr(torch, accelerator_device.type)
+    side = runtime.Stream(device=accelerator_device)
+    side.wait_stream(runtime.current_stream(accelerator_device))
     got = worker._prematerialize_batched(
-        {"new_token": tokens}, torch.cuda.Stream(), rids,
+        {"new_token": tokens}, side, rids,
     )
     want = {
         rid: {"new_token": [tokens[i : i + 1].cpu()]}

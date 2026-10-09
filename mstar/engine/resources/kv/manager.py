@@ -425,7 +425,7 @@ class KVManager(AttentionResource):
             needs_remote_transfer=info.needs_remote_transfer,
         )
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ):
         del slots, max_bs

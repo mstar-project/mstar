@@ -71,7 +71,7 @@ DEVICE = torch.device("cuda")
 
 @pytest.fixture(scope="module")
 def model() -> Flux2KleinModel:
-    m = Flux2KleinModel(model_path_hf=MODEL_REPO, attention_backend="sdpa", compile=False, cuda_graph=False)
+    m = Flux2KleinModel(model_path_hf=MODEL_REPO, attention_backend="sdpa", compile=False, accelerator_graph=False)
     m.set_config(Flux2KleinConfig.from_snapshot(resolve_snapshot_dir(MODEL_REPO)))
     return m
 

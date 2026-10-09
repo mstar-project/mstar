@@ -5,7 +5,7 @@ decoder (reference ``chatterbox/models/s3gen/utils/mel.py``); ``kaldi_fbank_80``
 is the CAMPPlus speaker-encoder feature (reference
 ``chatterbox/models/s3gen/xvector.py:extract_feature``). Both take a waveform
 tensor and run wherever it lives; the mel keeps its filter bank and window as
-buffers so it can be captured in a CUDA graph.
+buffers so it can be captured in an accelerator graph.
 """
 
 from __future__ import annotations

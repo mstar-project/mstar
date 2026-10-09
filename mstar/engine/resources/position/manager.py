@@ -264,7 +264,7 @@ class RopeManager(PositionManager):
 
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
-            "preplan requires a cuda graph step: the eager path hands back a "
+            "preplan requires an accelerator graph step: the eager path hands back a "
             "fresh tensor rather than writing a slot's buffer"
         )
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(

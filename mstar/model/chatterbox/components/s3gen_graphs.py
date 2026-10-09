@@ -1,11 +1,11 @@
-"""CUDA-graph replay of S3Gen's stages: the flow solve, the flow encoder and the vocoder.
+"""Accelerator graph replay of S3Gen's flow solve, encoder and vocoder.
 
 The flow-matching estimator is 56 small transformer blocks of width 256 over
 a few hundred mel frames. One Euler step launches several hundred kernels of
 a few microseconds each, so a solve (10 steps, guidance doubling the rows)
 is bound by kernel launches rather than by arithmetic, whatever the batch;
 the conformer encoder in front of it and the HiFT vocoder behind it have the
-same profile at chunk sizes. Capturing each stage as one CUDA graph per
+same profile at chunk sizes. Capturing each stage as one accelerator graph per
 input shape and replaying it removes that overhead.
 
 ``ShapeGraphs`` holds the mechanics: static input buffers per shape, capture
@@ -27,7 +27,12 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.cuda_graph_runner import capture_into_graph
+from mstar.engine.accelerator_graph_backend import (
+    CapturedGraph,
+    get_accelerator_graph_backend,
+    supports_accelerator_graphs,
+)
+from mstar.engine.accelerator_graph_runner import capture_into_graph
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +42,7 @@ Output = torch.Tensor | tuple[torch.Tensor, ...]
 
 @dataclass
 class _CapturedGraph:
-    graph: object  # torch.cuda.CUDAGraph (or a stand-in with ``replay``)
+    graph: CapturedGraph
     inputs: Tensors  # static buffers the graph reads
     output: Output  # static tensors the graph writes
 
@@ -49,7 +54,7 @@ def _clone(output: Output) -> Output:
 
 
 class ShapeGraphs:
-    """Replays ``fn(tensors, extra)`` from a captured CUDA graph per input shape.
+    """Replay ``fn(tensors, extra)`` from an accelerator graph per input shape.
 
     ``fn`` takes a dict of same-device tensors plus a tuple of hashable
     extras (step counts, flags) and returns a tensor or a tuple of tensors; it
@@ -128,7 +133,7 @@ class ShapeGraphs:
 
     @staticmethod
     def _capturable(tensors: Tensors) -> bool:
-        return next(iter(tensors.values())).is_cuda
+        return supports_accelerator_graphs(next(iter(tensors.values())).device)
 
     @staticmethod
     def _load(entry: _CapturedGraph, tensors: Tensors) -> None:
@@ -150,20 +155,23 @@ class ShapeGraphs:
         return entry
 
     def _record(self, run: Callable[[], Output], device: torch.device):
-        """Warm ``run`` up on a side stream (cuBLAS/cuDNN pick their kernels;
-        twice before the very first capture), then capture it into the shared
-        pool with the engine's capture helper, which undoes a failed capture's
-        allocator and stream state."""
-        with torch.cuda.device(device):
+        """Warm ``run`` up on a side stream, then capture into the shared pool.
+
+        Warmup selects kernels twice before the first capture, once thereafter.
+        The engine's helper restores allocator and stream state after a failure.
+        """
+        backend = get_accelerator_graph_backend(device)
+        index = device.index if device.index is not None else torch.accelerator.current_device_index()
+        with torch.accelerator.device_index(index):
             if self._pool is None:
-                self._pool = torch.cuda.graph_pool_handle()
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
+                self._pool = backend.graph_pool_handle()
+            stream = backend.new_stream()
+            stream.wait_stream(backend.current_stream())
+            with backend.stream_context(stream):
                 for _ in range(2 if self.captures == 0 else 1):
                     run()
-            torch.cuda.current_stream().wait_stream(stream)
-            torch.cuda.synchronize(device)
+            backend.current_stream().wait_stream(stream)
+            backend.synchronize()
             return capture_into_graph(run, self._pool, device, autocast_dtype=None)
 
 

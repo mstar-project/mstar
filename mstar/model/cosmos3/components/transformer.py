@@ -150,7 +150,7 @@ class Cosmos3RotaryEmbedding(nn.Module):
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)  # [3,B,N]
         # Outer product position ⊗ inv_freq via broadcast multiply. The original
         # form built stride-0 broadcast views and ran a batched matmul whose
-        # output the CUDA-graph memory pool can mis-capture at some sequence
+        # output the captured graph's memory pool can mis-capture at some sequence
         # lengths (the rotary table comes out wrong on replay, scrambling the
         # image). A plain broadcast multiply produces a fresh contiguous tensor
         # and is capture-faithful — bit-identical eagerly.
@@ -416,7 +416,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
         # tp*sp head-degree, then the result is re-sharded back. Trivial SP
         # group -> passthrough (byte-identical to the non-SP path). The captured
         # denoise forward sets prefer_all_gather (the all-to-all does not replay
-        # from a CUDA graph; all-gather does).
+        # from an accelerator graph; all-gather does).
         out = ulysses_attention(
             self.sp_group, q, k, v, attend, seq_sizes,
             prefer_all_gather=prefer_all_gather,

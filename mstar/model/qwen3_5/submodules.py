@@ -14,13 +14,13 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    CudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
-    PiecewiseCudaGraphConfig,
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
@@ -108,10 +108,13 @@ class LLMSubmodule(ARNodeSubmodule):
     # Engine lifecycle
     # ------------------------------------------------------------------
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """Decode, text prefill and vision prefill all capture."""
+        if device.type != "cuda":
+            return []
+
         def dummy(n: int) -> ARNodeInputs:
             return ARNodeInputs(
                 input_ids=torch.zeros(n, dtype=torch.long, device=device),
@@ -138,18 +141,18 @@ class LLMSubmodule(ARNodeSubmodule):
             )
 
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=dummy(1),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=dummy,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_vision",
                 capture_token_lengths=self.PREFILL_VISION_TOKEN_BUCKETS,
                 make_node_input=vision_dummy,
@@ -611,16 +614,19 @@ class VisionEncoderSubmodule(NodeSubmodule):
         # one request a step, so it can take the captured block loop
         return 1
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype,
         tp_world_size: int = 1, **kwargs,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """The block loop, one prompt per replay, by patch-count bucket.
 
         Patch embed, position resample and rope run eagerly before it, the
         merger after (it quarters the row count, which a region's output view
         cannot express). Batch size 1: one replay is one prompt's segments.
         """
+        if device.type != "cuda":
+            return {}
+
         hidden, head_dim = self.config.hidden_size, self.config.head_dim
 
         def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:

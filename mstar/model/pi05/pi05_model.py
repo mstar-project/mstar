@@ -152,7 +152,7 @@ class Pi05Model(Model):
         self.skip_weight_loading = skip_weight_loading
         # Yaml-driven Pi05Config overrides forwarded by the entrypoint
         # (e.g. {"action_horizon": 15} for the DROID benchmark variant).
-        # Applied inside _load_config() *before* weights or CUDA graphs
+        # Applied inside _load_config() *before* weights or accelerator graphs
         # are materialized so weight shapes and graph captures use
         # consistent values.
         self._yaml_config_overrides: dict = dict(kwargs)

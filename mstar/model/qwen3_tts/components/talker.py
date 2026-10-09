@@ -175,7 +175,7 @@ class Qwen3TTSTalkerModel(nn.Module):
 # ---------------------------------------------------------------------------
 # Qwen3-Omni has the same high-level residual-code loop, but currently uses a
 # different attention primitive, checkpoint/config namespace, sampling policy,
-# and CUDA-graph capture path.  Sharing the loop before the auxiliary-sampler
+# and accelerator graph capture path.  Sharing the loop before the auxiliary-sampler
 # work tracked in #199 would couple two independently validated model ports;
 # factor the common implementation after that engine interface is available.
 
@@ -229,7 +229,7 @@ class Qwen3TTSCodePredictor(nn.Module):
     ``forward_depth_unrolled`` performs one position on the group-depth axis.
     Callers first write the Talker hidden state at position 0, then repeatedly
     feed the preceding codec embedding at positions 1-15. Keeping this as
-    tensor-only code allows the complete depth loop to be CUDA-graph captured.
+    tensor-only code allows the complete depth loop to be accelerator graph captured.
 
     Every depth input arrives in the Talker width and passes through
     ``small_to_mtp_projection`` (a biased linear layer on the 1.7B
@@ -255,7 +255,7 @@ class Qwen3TTSCodePredictor(nn.Module):
         self.register_buffer(
             # Populated after weight loading. A single contiguous tensor lets
             # the piecewise loop select a residual head without traversing a
-            # Python ModuleList during CUDA Graph replay.
+            # Python ModuleList during accelerator graph replay.
             "lm_head_weight",
             torch.empty(
                 config.num_code_groups - 1,
