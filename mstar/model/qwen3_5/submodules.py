@@ -315,15 +315,16 @@ class LLMSubmodule(ARNodeSubmodule):
         return frozenset()
 
     @staticmethod
-    def _captured_decode(engine_inputs: ModelInputsFromEngine) -> bool:
-        """A decode step replayed on a leased slot (or being captured for one)."""
+    def _captured_decode(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+        """A decode step replayed on a leased slot, or being captured for one.
+        The caller's walk decides (a capture's own context carries the
+        piecewise walk), the lease says the slot's static buffers are in
+        play."""
+        if graph_walk != "decode":
+            return False
         step = getattr(engine_inputs, "step", None)
         ctx = getattr(step, "ctx", None) if step is not None else None
-        return (
-            ctx is not None
-            and getattr(ctx, "slot_lease", None) is not None
-            and getattr(ctx, "graph_walk", None) == "decode"
-        )
+        return ctx is not None and getattr(ctx, "slot_lease", None) is not None
 
     def _decode_cos_sin(
         self, engine_inputs: ModelInputsFromEngine, num_tokens: int,
@@ -378,7 +379,7 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
-        captured = self._captured_decode(engine_inputs)
+        captured = self._captured_decode(engine_inputs, graph_walk)
         if inputs[0].input_ids is None and inputs[0].input_embeds is None:
             if captured and ingraph_decode_tokens():
                 # the captured forward gathers the ids itself (see _forward)
@@ -474,13 +475,20 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> torch.Tensor:
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        if input_ids is None and input_embeds is None:
+        captured = self._captured_decode(engine_inputs, graph_walk)
+        if captured and ingraph_decode_tokens():
             # MSTAR_INGRAPH_DECODE_TOKENS: the gather off the slot master is
-            # recorded in the graph
+            # recorded in the graph. The capture hands over the slot's static
+            # input_ids as well; they stay unread, as a replay never refills them
             input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
-        if cos_3d is None or sin_3d is None:
-            # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned positions
-            cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, input_ids.shape[0])
+            input_embeds = None
+        elif input_ids is None and input_embeds is None:
+            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+        if (captured and ingraph_decode_rope()) or cos_3d is None or sin_3d is None:
+            # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned
+            # positions, inside the graph; the static cos/sin stay unread
+            num_tokens = (input_ids if input_ids is not None else input_embeds).shape[0]
+            cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)
 
         embeds = (
             self.model.model.embed_tokens(input_ids)
