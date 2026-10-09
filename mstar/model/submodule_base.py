@@ -85,6 +85,10 @@ class BatchedModelOutput:
     # of a batch clone: name -> the views, row i for ``row_request_ids[i]``.
     # The store describes such rows without reading each view.
     row_views: dict[str, tuple[torch.Tensor, ...]] | None = None
+    # The stop buffers' host copy, staged by the gpu thread on the execution
+    # stream behind the step so the step's completion event covers it; the
+    # main thread reads it after waiting on that event.
+    host_rows: HostRows | None = None
 
     @classmethod
     def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:
