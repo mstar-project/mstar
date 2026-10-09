@@ -184,3 +184,14 @@ def test_a_rows_only_step_threads_its_loop_back_signal_as_present():
     assert speculation.continuing_rids == {"r"}
     assert batch.per_request_input_tensors["r"] == {"loop": []}
     assert batch.request_ids == ["r"] and "s" not in batch.per_request_input_tensors
+
+
+def test_stream_polls_are_skipped_only_when_no_request_owns_a_buffer():
+    worker = _worker()
+    assert Worker._streams_possible(worker), "unknown (a bare instance): poll"
+    worker._stream_buffer_rids = None
+    assert Worker._streams_possible(worker)
+    worker._stream_buffer_rids = set()
+    assert not Worker._streams_possible(worker)
+    worker._stream_buffer_rids.add(7)
+    assert Worker._streams_possible(worker)
