@@ -52,6 +52,7 @@ from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
+from mstar.streaming.topology import Connection, ProducerWalkCtx
 from mstar.utils.containers import ParallelList, RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessage,
@@ -75,7 +76,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.node_manager_utils import AssignedWalk, RequestStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -485,17 +486,20 @@ class Worker:
                 if any(n in my_node_names for n in self._get_node_names_for_partition(conn.to_partition, model)):
                     self._my_consumer_connections.append(conn)
 
-        # edge_name -> the consumer's walk for each chunk, on connections that
-        # drive their consumer's walk
-        self._consumer_walk_fns = {
-            conn.edge_name: conn.consumer_walk
-            for conn in self._my_consumer_connections
-            if conn.consumer_walk is not None
-        }
-        self._producer_triggered_partitions: set[str] = (
-            self.partition_topology.producer_triggered_partitions()
-            if self.partition_topology else set()
+        # producer-triggered partition -> the connection that decides its walk
+        self._walk_drivers: dict[str, Connection] = (
+            self.partition_topology.walk_drivers()
+            if self.partition_topology else {}
         )
+        self._producer_triggered_partitions = set(self._walk_drivers)
+        # consumer side: walk-driven edge here -> its consumer partition
+        self._walk_driven_edges = {
+            conn.edge_name: conn.to_partition
+            for conn in self._my_consumer_connections
+            if conn.to_partition in self._walk_drivers
+        }
+        # producer side: (node, walk) -> the walk drivers it emits for
+        self._emitted_walk_drivers: dict[tuple[str, str], list[Connection]] = {}
 
         # Set of edge names that arrive via streaming (used to distinguish
         # streaming inputs from conductor-triggered non-streaming inputs
@@ -958,12 +962,11 @@ class Worker:
             self.wakeup_event.register_futures(futures)
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
+                walk = body.request_info.stream_consumer_walks.get(
+                    self._walk_driven_edges.get(edge.name)
+                )
                 for info in edge.tensor_info:
-                    # The sender's fwd_info: a producer's walk only changes
-                    # after its WORKER_GRAPHS_DONE, which follows these sends
-                    stream_buf.pre_read_register(
-                        info.uuid, body.request_info.graph_walk,
-                    )
+                    stream_buf.pre_read_register(info.uuid, walk)
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("process_new_inputs.process_inputs")
@@ -1083,6 +1086,50 @@ class Worker:
         for body in replay:
             self._process_new_inputs(body)
 
+    def _assign_consumer_walks(
+        self, batch_N: PendingBatch, rids: list[int],
+    ) -> dict[int, dict[str, str]]:
+        """Decide the consumer walk of this pass's streamed items, per rid and
+        producer-triggered consumer partition, and stamp it on the fwd_info
+        that rides with the remote sends."""
+        key = (batch_N.node_name, batch_N.graph_walk)
+        drivers = self._emitted_walk_drivers.get(key)
+        if drivers is None:
+            signals = set(self._graph_runtime.get_output_signals(*key))
+            emitted = {
+                conn.to_partition for conn in self.partition_topology.connections
+                if conn.edge_name in signals
+            } if self.partition_topology else set()
+            drivers = [
+                conn for partition, conn in self._walk_drivers.items()
+                if partition in emitted
+            ]
+            self._emitted_walk_drivers[key] = drivers
+        if not drivers:
+            return {}
+        walk = batch_N.graph_walk
+        assigned: dict[int, dict[str, str]] = {}
+        for rid in rids:
+            req_info = self.request_state.per_request_info.get(rid)
+            if req_info is None:
+                continue
+            fwd_info = req_info.per_partition_info[batch_N.partition].current_fwd_info
+            walks = {}
+            for conn in drivers:
+                last = req_info.assigned_walks.get(conn.to_partition)
+                n = last.pass_in_walk + 1 if last and last.producer_walk == walk else 0
+                consumer_walk = conn.consumer_walk(ProducerWalkCtx(
+                    walk, n, last.consumer_walk if last else None,
+                    fwd_info.step_metadata,
+                ))
+                req_info.assigned_walks[conn.to_partition] = AssignedWalk(
+                    consumer_walk, walk, n,
+                )
+                walks[conn.to_partition] = consumer_walk
+            fwd_info.stream_consumer_walks = walks
+            assigned[rid] = walks
+        return assigned
+
     def _enter_chunk_walk(
         self, sbuf: StreamBuffer, edge_name: str, request_id: int,
         allow_walk_change: bool,
@@ -1090,14 +1137,10 @@ class Worker:
         """Put the consumer in the walk the next chunk runs under. False when
         the chunk has to wait: the partition is mid-pass in its current walk,
         or the caller cannot change walks (speculation)."""
-        walk_fn = self._consumer_walk_fns.get(edge_name)
-        ctx = sbuf.peek_walk() if walk_fn is not None else None
-        if ctx is None:
+        walk = sbuf.peek_walk()
+        if walk is None:
             return True
-        partition = self.request_state.get_partition_for_node(
-            self._consumer_node_cache[edge_name]
-        )
-        walk = walk_fn(ctx)
+        partition = self._walk_driven_edges[edge_name]
         if walk == self._partition_walk(request_id, partition):
             return True
         if not allow_walk_change or not self._graph_runtime.is_partition_idle(
@@ -3048,14 +3091,21 @@ class Worker:
             flat_rids, flat_uuids, signals, signal_idxs,
         )
 
+        # Before the sends below: remote consumers read the walks off the
+        # fwd_info that rides with the streamed edges.
+        assigned_walks = self._assign_consumer_walks(batch_N, rids)
+
         # Local streaming stays here: a StreamBuffer holds real tensors, so it
         # cannot move behind the runtime's contract.
         streamed: list[int] = []
         for signal, per_signal in route_output.local_streaming_by_signal.items():
+            consumer = self._walk_driven_edges.get(signal)
             for rid, uuid in per_signal:
                 req_info = self.request_state.per_request_info[rid]
                 stream_buf = req_info.stream_buffers[signal]
-                stream_buf.pre_read_register(uuid, batch_N.graph_walk)
+                stream_buf.pre_read_register(
+                    uuid, assigned_walks.get(rid, {}).get(consumer),
+                )
                 tensor = self.tensor_manager.get_tensor(uuid)
                 stream_buf.put(uuid, tensor.clone())
                 streamed.append(uuid)

@@ -1750,22 +1750,23 @@ The consuming partition's ``get_partition_forward_pass_args`` reads
 uses them to decide when to run.
 
 A consumer whose walk should follow the producer's progress, rather than a count fixed at
-ingest, sets ``consumer_walk`` on each of its incoming connections. It maps a
-``WalkTransitionCtx`` (the producer walk a chunk was emitted under, and whether the chunk
-starts a run of that walk) to the consumer walk the chunk runs under. Such a partition is
-*producer-triggered*:
+ingest, is *producer-triggered*: the producer decides the consumer's walk. Set the same
+``consumer_walk`` function on every connection into the consumer, all from one producer
+partition. The producer worker calls it for each pass that emits on those edges, with a
+``ProducerWalkCtx``: the producer's walk, the pass's index among its consecutive passes
+in that walk, the consumer walk it last assigned, and the producer's ``step_metadata``.
+The pass's streamed items run under the walk it returns.
 
-- every streamed item carries its producer walk, and a chunk never spans two producer
-  walks, so these connections need a ``FixedChunkPolicy``;
-- the worker switches the consumer's walk before popping a chunk, and only once the
-  partition has no pass under way;
-- conductor inputs for a walk the stream has not reached yet wait on the worker, and the
+- Each streamed item carries its assigned walk, and a chunk never spans two walks, so
+  these connections need a ``FixedChunkPolicy``.
+- The consumer's worker switches walk before popping a chunk, and only once the partition
+  has no pass under way.
+- Conductor inputs for a walk the stream has not reached yet wait on the worker, and the
   conductor learns each pass's walk from the worker's ``WORKER_GRAPHS_DONE``.
 
-The mapping sees only the stream, so every connection into the partition agrees on each
-item's walk. Qwen3-Omni's Talker (``_talker_walk``) is the reference: Thinker prefill
-states run ``talker_prefill``, the first decode state runs ``talker_last_prefill``, and
-later ones run ``talker_decode``.
+Qwen3-Omni's Talker (``_talker_walk``) is the reference: Thinker prefill passes run
+``talker_prefill``, the first decode pass runs ``talker_last_prefill``, and later ones run
+``talker_decode``.
 
 Checklist
 ---------

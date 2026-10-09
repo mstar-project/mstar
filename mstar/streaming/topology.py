@@ -20,13 +20,17 @@ class StreamingGraphEdge(GraphEdge):
         self.is_streaming = True
 
 
-class WalkTransitionCtx(NamedTuple):
-    """What a chunk tells its consumer about the producer's progress."""
-    # The producer's graph walk when it emitted the chunk's items
+class ProducerWalkCtx(NamedTuple):
+    """The producer's state for one pass that emits on a walk-driving edge."""
     producer_walk: str
-    # Whether this is the first chunk of a run of that walk; a walk the
-    # producer re-enters (e.g. a later decode turn) starts a new run
-    starts_producer_walk: bool
+    # This pass's index among the producer worker's consecutive passes in
+    # producer_walk that emitted on the edge; re-entering a walk restarts at 0
+    pass_in_walk: int
+    # The walk this producer worker last assigned the consumer; None before
+    # its first emission
+    consumer_walk: str | None
+    # The producer's step_metadata for this pass, as its model set it
+    step_metadata: dict
 
 
 @dataclass
@@ -36,12 +40,11 @@ class Connection:
     to_partition: str
     edge_name: str
     chunk_policy_factory: Callable[[], ChunkPolicy]
-    # Set on the connections into a producer-triggered partition: maps each
-    # chunk to the consumer walk it runs under, so the consumer moves through
-    # its walks in step with the producer instead of on conductor triggers.
-    # It sees only the stream, so every connection into one partition maps
-    # the same items to the same walk.
-    consumer_walk: Callable[[WalkTransitionCtx], str] | None = None
+    # Set on the connections into a producer-triggered partition. The
+    # producer worker calls it for each pass that emits on the edge, and the
+    # pass's items run under the consumer walk it returns: the producer, which
+    # owns the consumer's walk, decides it, and the consumer only applies it.
+    consumer_walk: Callable[[ProducerWalkCtx], str] | None = None
 
 
 @dataclass
@@ -61,20 +64,32 @@ class PartitionTopology:
             if conn.consumer_walk is not None
         }
 
+    def walk_drivers(self) -> dict[str, Connection]:
+        """Producer-triggered partition -> the connection whose consumer_walk
+        decides its walk (any one of them; check_walk_driving_connections
+        makes them agree)."""
+        return {
+            conn.to_partition: conn for conn in self.connections
+            if conn.consumer_walk is not None
+        }
+
     def check_walk_driving_connections(self) -> None:
-        """Every connection into a producer-triggered partition must map its
-        chunks to walks, or its chunks would land in whatever walk the others
-        chose; and its chunks must not overlap, since a chunk spans exactly
-        one producer walk."""
-        driven = self.producer_triggered_partitions()
+        """A producer-triggered partition has one authority over its walk: all
+        its incoming connections come from one producer and share one
+        consumer_walk, so every edge's items agree on the walk. Its chunks
+        must not overlap either, since a chunk runs under exactly one walk."""
+        drivers = self.walk_drivers()
         for conn in self.connections:
-            if conn.to_partition not in driven:
+            driver = drivers.get(conn.to_partition)
+            if driver is None:
                 continue
-            if conn.consumer_walk is None:
+            if (conn.from_partition != driver.from_partition
+                    or conn.consumer_walk is not driver.consumer_walk):
                 raise ValueError(
                     f"Partition {conn.to_partition!r} is producer-triggered, "
-                    f"but its incoming edge {conn.edge_name!r} has no "
-                    "consumer_walk"
+                    f"so its incoming edge {conn.edge_name!r} must come from "
+                    f"{driver.from_partition!r} and share edge "
+                    f"{driver.edge_name!r}'s consumer_walk"
                 )
             policy = conn.chunk_policy_factory()
             if not isinstance(policy, FixedChunkPolicy):

@@ -16,8 +16,8 @@ Streaming topology:
     Talker  --[codec_tokens,  FixedChunkPolicy(25)]--> Code2Wav
 
 Producer-triggered Talker walks:
-    The Thinker's streamed states drive the Talker's walk (see
-    ``_talker_walk``).  States from a Thinker prefill walk extend the Talker
+    The Thinker assigns its streamed states the Talker walk they run under
+    (see ``_talker_walk``).  States from a Thinker prefill walk extend the Talker
     KV cache in ``talker_prefill``; the first ``thinker_decode`` state runs
     ``talker_last_prefill``, which samples the first codec token, and the
     rest feed ``talker_decode``.  The Talker never needs to know how many
@@ -83,19 +83,19 @@ from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolic
 from mstar.streaming.topology import (
     Connection,
     PartitionTopology,
+    ProducerWalkCtx,
     StreamingGraphEdge,
-    WalkTransitionCtx,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _talker_walk(ctx: WalkTransitionCtx) -> str:
-    """The Talker walk a streamed Thinker state runs under."""
+def _talker_walk(ctx: ProducerWalkCtx) -> str:
+    """The Talker walk a Thinker pass's streamed states run under."""
     if ctx.producer_walk != "thinker_decode":
         return "talker_prefill"
-    # The first decoded state closes the prefill and samples the first codec
-    return "talker_last_prefill" if ctx.starts_producer_walk else "talker_decode"
+    # The first decode pass closes the prefill and samples the first codec
+    return "talker_last_prefill" if ctx.pass_in_walk == 0 else "talker_decode"
 
 # ---------------------------------------------------------------------------
 # Helpers
