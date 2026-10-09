@@ -316,6 +316,30 @@ def test_a_runner_captures_its_costliest_bucket_first(capture_loop):
     assert runner.tried == [_PREFILL, _DECODE], "the costliest graph must go first, so the rest reuse its pool"
 
 
+@pytest.mark.parametrize(
+    ("fraction", "reserved", "planned"), [(None, 30, 8), (0.45, 30, 4), (0.45, 40, 0)],
+    ids=["uncapped", "capped", "over_the_cap"],
+)
+def test_the_cap_bounds_the_plan(monkeypatch, fraction, reserved, planned):
+    """Two workers share GPU 0 in qwen3tts_1p7b_split. Each saw the other's
+    memory as used, never as held back, so the first to capture could take the
+    other's room. Under 0.45 of 80 GiB, a worker holding 30 GiB has 6 left: the
+    2 GiB eager step and four 1 GiB graphs."""
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (50 * _GIB, 80 * _GIB))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: reserved * _GIB)
+    # graphs that share no scratch, so each takes its full GiB
+    costs = {bs: CaptureCost(peak=2 * _GIB, graph=_GIB, kept=_GIB, slots=1) for bs in range(8)}
+    talker = SimpleNamespace(size_captures=lambda: costs)
+    engine = SimpleNamespace(
+        _device=torch.device("cuda", 0), _submodules={"Talker": None}, _gpu_memory_fraction=fraction,
+    )
+
+    plan = Engine._plan_captures(engine, {"Talker": talker}, {"Talker": {}})
+
+    assert len(plan.buckets["Talker"]) == planned, "the worker's graphs and eager step must fit under its cap"
+
+
 def test_a_runner_with_no_graphs_keeps_its_largest_bucket_as_its_batch_cap():
     """A runner that captured nothing runs every bucket eager, and the floor
     covers eager steps only up to its largest bucket."""
