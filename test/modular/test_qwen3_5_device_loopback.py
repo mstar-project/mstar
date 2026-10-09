@@ -78,3 +78,16 @@ def test_preprocess_reads_the_step_tokens_off_the_sampler():
     assert out["input_ids"].tolist() == [3, 4, 0, 0]
     assert sampler.asked == ["r1", "r2", "pad1", "pad2"]
     assert "input_embeds" not in out and seen["n"] == 4
+
+
+def test_the_loop_back_decode_row_is_uniform(monkeypatch):
+    from mstar.model.submodule_base import ARNodeInputs
+
+    sub = _sub(_Sampler(masters=True))
+    row = LLMSubmodule.uniform_row_inputs(sub, "decode")
+    assert isinstance(row, ARNodeInputs) and row.input_seq_len == 1
+    assert row.input_ids is None and row.input_embeds is None
+    assert LLMSubmodule.uniform_row_inputs(sub, "prefill_text") is None
+    assert LLMSubmodule.uniform_row_inputs(_sub(_Sampler(masters=False)), "decode") is None
+    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
+    assert LLMSubmodule.uniform_row_inputs(sub, "decode") is None
