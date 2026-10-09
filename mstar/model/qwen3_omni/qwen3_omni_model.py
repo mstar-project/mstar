@@ -22,6 +22,9 @@ Conductor-triggered pipelined prefill (Approach C):
     trigger extends the Talker KV cache with the new Thinker hidden
     states.  The final trigger (when thinker_decode starts) tells the
     Talker to sample its first codec token and transition to decode.
+    A chunked Thinker prefill streams each chunk's states as it lands
+    (``allow_partial``); the Talker extends on each, and only the walk's
+    last chunk counts toward the trigger.
 
 Text-only mode:
     When output_modalities does not include "audio", only the Thinker
@@ -555,13 +558,17 @@ class Qwen3OmniModel(Model):
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_states",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    chunk_policy_factory=lambda: FixedChunkPolicy(
+                        chunk_size=1, continue_after_done=True, allow_partial=True,
+                    ),
                 ),
                 Connection(
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_mask",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    chunk_policy_factory=lambda: FixedChunkPolicy(
+                        chunk_size=1, continue_after_done=True, allow_partial=True,
+                    ),
                 ),
                 Connection(
                     from_partition="Talker",
