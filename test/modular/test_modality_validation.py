@@ -194,6 +194,10 @@ ACCEPTED = [
     ("chatterbox_turbo", ["text", "audio"], ["audio"]),
     ("qwen3_5_0.8b", ["text"], ["text"]),
     ("qwen3_5_0.8b", ["image", "text"], ["text"]),
+    # images/generations and images/edits
+    ("flux2_klein", ["text"], ["image"]),
+    ("flux2_klein", ["image", "text"], ["image"]),
+    ("z_image_turbo", ["text"], ["image"]),
 ]
 
 # Combinations a model has no encoder/decoder for; "audio is required" isn't
@@ -228,6 +232,9 @@ REJECTED = [
     # no timestamp tokens for video yet
     ("qwen3_5_0.8b", ["video", "text"], ["text"]),
     ("qwen3_5_0.8b", ["text"], ["audio"]),
+    ("flux2_klein", ["text"], ["text"]),
+    # the shared image adapter opens /edits, but Z-Image-Turbo has no edit path
+    ("z_image_turbo", ["image", "text"], ["image"]),
 ]
 
 
