@@ -1126,7 +1126,9 @@ class Worker:
                 request_id, outputs.persist
             )
 
-        if outputs.new_token_outputs:
+        # The conductor only absorbs new-token counts from TP rank 0, and other
+        # ranks may have already released these tensors.
+        if outputs.new_token_outputs and outputs.is_first_tp_rank:
             name_to_count: dict[str, int] = {}
             for signal in outputs.new_token_outputs:
                 if signal.name in name_to_count:
