@@ -1,3 +1,4 @@
+import itertools
 import logging
 import os
 import threading
@@ -28,6 +29,7 @@ from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import fingerprint, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
+    HostLens,
     KVPlanOutput,
     KVPlanOutputs,
     PagedIndptrs,
@@ -48,7 +50,7 @@ from mstar.engine.resources.step import (
     StepContext,
 )
 from mstar.utils.h2d import PinnedStager
-from mstar.utils.knobs import kv_chain_lazy_steps
+from mstar.utils.knobs import kv_chain_lazy_steps, kv_plan_cache
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +327,37 @@ class KVPlanState:
         self.total_tokens = n
 
 
+class _LabelRows:
+    """One plan label's rows of the last decode plan, as the plan cache keeps
+    them: the real rows first (their streams, lengths, page lists), then the
+    padding rows, which never change."""
+
+    __slots__ = (
+        "rids", "labels", "streams", "lens", "npages", "row_pages", "last_page",
+        "qo_indptr", "kv_indptr", "indices", "pad_views", "pad_npages",
+        "pad_last", "pad_last_page", "pad_indices",
+    )
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw[k])
+
+
+class _DecodePlanCache:
+    __slots__ = ("segments", "rows", "rids", "epoch", "labels", "pending")
+
+    def __init__(self, segments, rows, epoch, labels):
+        self.segments = segments
+        # the (request, label) pairs of the real rows: a commit of any of them
+        # in another batch invalidates, a commit of other rows is ignored
+        self.rows = rows
+        self.rids = frozenset(rid for rid, _ in rows)
+        self.epoch = epoch
+        self.labels = labels
+        # commits of these same segments since the plan the cache describes
+        self.pending = 0
+
+
 class KVManager(AttentionResource):
     prefix_skip_safe = True
 
@@ -403,6 +436,12 @@ class KVManager(AttentionResource):
         # copy-only H2D into those, see `_stage_decode_plan_state`
         self._plan_stager = PinnedStager(torch.long)
         self._cg_max_seq_len = 0
+        # the plan cache (`_fast_decode_plan`): bumped by everything that
+        # changes a stream's pages or length other than a step's commit
+        self._plan_epoch = 0
+        self._decode_plan_cache: _DecodePlanCache | None = None
+        self._plan_cache_mode = kv_plan_cache()
+        self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
         self._current_plan_states: dict[str, KVPlanState] = {}
         self.reset_default_cursors()
 
@@ -621,6 +660,7 @@ class KVManager(AttentionResource):
         leased: the read is issued under this same lock, so nothing can come
         between the two.
         """
+        self._touch_plan_cache()
         if (
             self._index is None
             or not rooted
@@ -893,6 +933,7 @@ class KVManager(AttentionResource):
         )
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
+        self._touch_plan_cache(rid)
         if rid in self._chain_drained:
             # the handle comes back while steps under its old name still wait
             self.flush_chain_backlog()
@@ -918,6 +959,7 @@ class KVManager(AttentionResource):
         graph_walk: str,
         published: PublishedKVInfo | None
     ) -> AdmitOutcome:
+        self._touch_plan_cache(rid)
         if published is None:
             return ADMIT_OK
 
@@ -1070,6 +1112,7 @@ class KVManager(AttentionResource):
                 ):
                     # drop the empty pages a refused batch admit left, before taking the lease
                     self._arena.release(stream.page_indices)
+                    self._plan_epoch += 1
                     stream.page_indices = list(stream.lease)
                     stream.stored_len = (
                         len(stream.lease) * self.config.page_size
@@ -1164,6 +1207,7 @@ class KVManager(AttentionResource):
         only be dropped off the tail. If something else has extended the stream
         since, the tail can no longer be safely removed.
         """
+        self._touch_plan_cache()
         del step, ctx
         with self._lock:
             reserved, self._admit_reserved_pages = self._admit_reserved_pages, {}
@@ -1316,11 +1360,12 @@ class KVManager(AttentionResource):
 
     def _stage_decode_plan_state(
         self, views: list[SequenceView], static_state: KVPlanState,
-        capture_len: int,
+        capture_len: int, pages=None, offsets=None,
     ) -> KVPlanState:
         """``_decode_plan_state`` + ``KVPlanState.copy_`` with no device staging
         tensor; rows past the real tokens get SINK_PAGE / 0."""
-        pages, offsets = self._decode_locations(views)
+        if pages is None or offsets is None:
+            pages, offsets = self._decode_locations(views)
         self._plan_stager.copy_(
             static_state.token_to_page[:capture_len], pages, pad_value=SINK_PAGE,
         )
@@ -1342,6 +1387,7 @@ class KVManager(AttentionResource):
                 plan_state = self._stage_decode_plan_state(
                     indptrs.views, self._static_plan_state(lease.slot, label),
                     lease.bucket.num_tokens,
+                    pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
                 )
                 if ctx.is_preplan:
                     self._preplan_states[label] = plan_state
@@ -1371,6 +1417,193 @@ class KVManager(AttentionResource):
             cpu_indptrs=build_paged_indptrs(views, self.kv_cache.page_size),
             views=views,
         )
+
+    def _touch_plan_cache(self, rid: str | None = None) -> None:
+        """A stream of ``rid`` (any stream, when None) changed other than by a
+        commit: the plan cache no longer describes the streams if it holds
+        that request."""
+        cache = self._decode_plan_cache
+        if cache is not None and (rid is None or rid in cache.rids):
+            self._plan_epoch += 1
+
+    def _remember_decode_plan(
+        self, step: KVStep, ctx: StepContext, res: "KVPlanOutputs",
+    ) -> None:
+        """Keep a leased decode step's plan so the next step of the same
+        batch can be planned off it (`_fast_decode_plan`). Any other plan
+        leaves the cache alone: the epoch and the commit bookkeeping say
+        whether it still describes the streams."""
+        lease = ctx.slot_lease
+        if lease is None or ctx.capture or step.pre_forks or step.post_forks:
+            return
+        page_size = self.kv_cache.page_size
+        labels: dict[str, _LabelRows] = {}
+        for label, out in res.items():
+            views = out.views
+            if not views:
+                return
+            n_real = 0
+            for v in views:
+                if ctx.is_padding_row(v.request_id):
+                    break
+                n_real += 1
+            real, pad = views[:n_real], views[n_real:]
+            if any(v.to_compute != 1 for v in views) or any(
+                not ctx.is_padding_row(v.request_id) for v in pad
+            ):
+                return
+            streams = []
+            for v in real:
+                stream = self._streams.get(v.request_id, {}).get(v.label)
+                if stream is None or len(v.page_idxs) != -(-v.length // page_size):
+                    return
+                streams.append(stream)
+            row_pages = [v.page_idxs for v in real]
+            indptrs = out.cpu_indptrs
+            labels[label] = _LabelRows(
+                rids=[v.request_id for v in real],
+                labels=[v.label for v in real],
+                streams=streams,
+                lens=np.fromiter((v.length for v in real), np.int64, n_real),
+                npages=np.fromiter((len(p) for p in row_pages), np.int64, n_real),
+                row_pages=row_pages,
+                last_page=np.fromiter((p[-1] for p in row_pages), np.int64, n_real),
+                qo_indptr=indptrs.qo_indptr.numpy().copy(),
+                kv_indptr=indptrs.paged_kv_indptr.numpy().copy(),
+                indices=indptrs.paged_kv_indices.numpy().copy(),
+                pad_views=pad,
+                pad_npages=np.fromiter((len(v.page_idxs) for v in pad), np.int64, len(pad)),
+                pad_last=np.fromiter(
+                    (v.last_page_len(page_size) or page_size for v in pad), np.int64, len(pad),
+                ),
+                pad_last_page=np.fromiter((v.page_idxs[-1] for v in pad), np.int64, len(pad)),
+                pad_indices=np.fromiter(
+                    itertools.chain.from_iterable(v.page_idxs for v in pad), np.int32,
+                    sum(len(v.page_idxs) for v in pad),
+                ),
+            )
+        self._decode_plan_cache = _DecodePlanCache(
+            segments=step.segments,
+            rows=frozenset(
+                (rid, lab) for rows in labels.values()
+                for rid, lab in zip(rows.rids, rows.labels, strict=True)
+            ),
+            epoch=self._plan_epoch, labels=labels,
+        )
+
+    def _fast_decode_plan(
+        self, step: KVStep, ctx: StepContext,
+    ) -> "KVPlanOutputs | None":
+        """The plan of a leased decode step off the previous step's, when the
+        batch is the same rows in the same order and only that step's commit
+        touched the streams (`_plan_epoch`, `pending`): every length
+        is one more, a page is new only where a row crossed a page boundary,
+        and the index arrays come from numpy. None means plan from the
+        streams."""
+        cache = self._decode_plan_cache
+        stats = self.plan_cache_stats
+        if (
+            cache is None
+            or ctx.slot_lease is None
+            or ctx.capture
+            or step.pre_forks
+            or step.post_forks
+        ):
+            return None
+        if (
+            cache.epoch != self._plan_epoch
+            or cache.pending != 1
+            or step.segments != cache.segments
+        ):
+            stats["miss"] += 1
+            return None
+        page_size = self.kv_cache.page_size
+        out: dict[str, KVPlanOutput] = {}
+        for label, rows in cache.labels.items():
+            lens = rows.lens + 1
+            last = (lens - 1) % page_size + 1
+            npages = (lens + page_size - 1) // page_size
+            crossed = np.flatnonzero(npages != rows.npages)
+            if crossed.size:
+                for i in crossed.tolist():
+                    want = int(npages[i])
+                    held = rows.streams[i].page_indices
+                    if len(held) < want:
+                        stats["miss"] += 1
+                        return None
+                    pages = held[:want]
+                    rows.row_pages[i] = pages
+                    rows.last_page[i] = pages[-1]
+                n_real = int(npages.sum())
+                real_indices = np.fromiter(
+                    itertools.chain.from_iterable(rows.row_pages), np.int32, n_real,
+                )
+                rows.indices = (
+                    np.concatenate((real_indices, rows.pad_indices))
+                    if rows.pad_indices.size else real_indices
+                )
+                counts = (
+                    np.concatenate((npages, rows.pad_npages))
+                    if rows.pad_npages.size else npages
+                )
+                rows.kv_indptr = np.concatenate(
+                    (np.zeros(1, np.int64), np.cumsum(counts)),
+                ).astype(np.int32)
+            rows.lens = lens
+            rows.npages = npages
+            if rows.pad_npages.size:
+                last_all = np.concatenate((last, rows.pad_last))
+                npages_all = np.concatenate((npages, rows.pad_npages))
+                pages_all = np.concatenate((rows.last_page, rows.pad_last_page))
+            else:
+                last_all, npages_all, pages_all = last, npages, rows.last_page.copy()
+            kv_lens = (npages_all - 1) * page_size + last_all
+            views = [
+                SequenceView(rid, lab, pages, length, 1, 0, stream.generation)
+                for rid, lab, pages, length, stream in zip(
+                    rows.rids, rows.labels, rows.row_pages, lens.tolist(), rows.streams,
+                    strict=True,
+                )
+            ]
+            views.extend(rows.pad_views)
+            out[label] = KVPlanOutput(
+                cpu_indptrs=PagedIndptrs(
+                    qo_indptr=torch.from_numpy(rows.qo_indptr),
+                    paged_kv_indptr=torch.from_numpy(rows.kv_indptr),
+                    paged_kv_indices=torch.from_numpy(rows.indices),
+                    paged_kv_last_page_len=torch.from_numpy(last_all.astype(np.int32)),
+                    kv_lens=torch.from_numpy(kv_lens.astype(np.int32)).as_subclass(HostLens),
+                ),
+                views=views,
+                decode_pages=pages_all,
+                decode_offsets=last_all - 1,
+            )
+        cache.pending = 0
+        stats["hit"] += 1
+        return KVPlanOutputs(out, pre_forks=step.pre_forks, post_forks=step.post_forks)
+
+    @staticmethod
+    def _same_plan(a: "KVPlanOutputs", b: "KVPlanOutputs") -> bool:
+        """The cached plan against the full one (MSTAR_KV_PLAN_CACHE=2)."""
+        if a.keys() != b.keys():
+            return False
+        for label, x in a.items():
+            y = b[label]
+            if len(x.views) != len(y.views):
+                return False
+            for u, v in zip(x.views, y.views, strict=True):
+                if u[:5] != v[:5]:
+                    return False
+            for p, q in zip(x.cpu_indptrs[:5], y.cpu_indptrs[:5], strict=True):
+                if (p is None) != (q is None) or (
+                    p is not None and not torch.equal(p, q)
+                ):
+                    return False
+            if x.decode_pages is not None:
+                pages = [v.page_idxs[-1] for v in y.views]
+                if x.decode_pages.tolist() != pages:
+                    return False
+        return True
 
     def _maybe_apply_forks(self, step: KVStep, ctx: StepContext):
         for (from_label, to_label) in step.pre_forks:
@@ -1440,18 +1673,34 @@ class KVManager(AttentionResource):
             pending = {}
             self._maybe_apply_forks(step, ctx)
 
-        res = KVPlanOutputs(
-            {
-                plan_label: self._plan_output(
-                    self._sequence_views(segments, pending, ctx)
+        res = None
+        if self._plan_cache_mode and not pending:
+            res = self._fast_decode_plan(step, ctx)
+        if res is None or self._plan_cache_mode == 2:
+            full = KVPlanOutputs(
+                {
+                    plan_label: self._plan_output(
+                        self._sequence_views(segments, pending, ctx)
+                    )
+                    for plan_label, segments in group_by_plan_label(
+                        step.segments, step.combined_labels
+                    ).items()
+                },
+                pre_forks=step.pre_forks,
+                post_forks=step.post_forks,
+            )
+            if res is not None and not self._same_plan(res, full):
+                self.plan_cache_stats["mismatch"] += 1
+                logger.error(
+                    "KV %s: the plan cache disagrees with the full plan for "
+                    "%d segments; using the full plan (MSTAR_KV_PLAN_CACHE=2)",
+                    self.name, len(step.segments),
                 )
-                for plan_label, segments in group_by_plan_label(
-                    step.segments, step.combined_labels
-                ).items()
-            },
-            pre_forks=step.pre_forks,
-            post_forks=step.post_forks,
-        )
+                res = None
+            if res is None:
+                res = full
+                if self._plan_cache_mode and not pending:
+                    self._remember_decode_plan(step, ctx, res)
         self._setup_plan_states(res, ctx, ctx.slot_lease)
         if ctx.is_preplan:
             self._preplan_key = self._plan_key(step, ctx)
@@ -1471,6 +1720,7 @@ class KVManager(AttentionResource):
         return tuple(step.segments), (lease.slot if lease is not None else None)
 
     def clear_preplan(self):
+        self._touch_plan_cache()
         # the staged step is not going to run, so undo what it did to live
         # state. the pre-forks need no rewinding — staging only read them —
         # but admit's reservations are real pages and real streams
@@ -1497,6 +1747,18 @@ class KVManager(AttentionResource):
     def commit(self, step: KVStep, ctx: StepContext):
         streams = self._streams
         retention = step.retention
+        # what the plan cache may assume of the next step: this step's spans
+        # landed, nothing else (a step that keeps no tokens is "something else")
+        cache = self._decode_plan_cache
+        if cache is not None:
+            if step.segments == cache.segments:
+                cache.pending += 1
+            elif any(
+                (seg.request_id, seg.label) in cache.rows for seg in step.segments
+            ):
+                self._plan_epoch += 1
+        if not step.commit:
+            self._plan_epoch += 1
         # the index only sees real rows of a non-capture step; checked once
         index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread
@@ -1522,6 +1784,7 @@ class KVManager(AttentionResource):
                             self.name, segment.span,
                             segment.request_id, segment.label,
                         )
+                        self._plan_epoch += 1
                         continue
                     stream.stored_len += segment.span
                     # committed, so there is no refused admit left for a re-probe to answer
@@ -1627,6 +1890,7 @@ class KVManager(AttentionResource):
     def _release_oldest_locked(self, stream: CacheStream, num_tokens: int) -> int:
         """The page-floored front release shared by ``release_oldest`` and the
         commit-time retention. Under the lock."""
+        self._touch_plan_cache()
         page_size = self.config.page_size
         first = (stream.protected_prefix + page_size - 1) // page_size
         releasable = stream.stored_len // page_size - first
@@ -1792,6 +2056,7 @@ class KVManager(AttentionResource):
         have a torn host copy, and that fork's source is one of these streams,
         so the whole request stays on device rather than half of it.
         """
+        self._touch_plan_cache(rid)
         with self._lock:
             streams = self._streams.get(rid, {})
             for claim in moved:
@@ -1857,6 +2122,7 @@ class KVManager(AttentionResource):
         False when the device can't fit them right now; nothing moves in that
         case, so the caller can evict further and try again.
         """
+        self._touch_plan_cache(rid)
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
@@ -2089,6 +2355,7 @@ class KVManager(AttentionResource):
         )
 
     def reset_request(self, rid: str, free: bool=False):
+        self._touch_plan_cache(rid)
         self.flush_chain_backlog()
         streams = self._streams.get(rid)
         if streams is None:
@@ -2121,6 +2388,7 @@ class KVManager(AttentionResource):
                 self.assert_pages_conserved()
 
     def remove_request(self, rid: str):
+        self._touch_plan_cache(rid)
         with self._lock:
             # its waiting tokens first, before the handle can name another request
             self._drain_chain_backlog(rid)
@@ -2320,6 +2588,7 @@ class KVManager(AttentionResource):
         Locked (reentrant): called from plan (pre-forks, else unguarded) and
         from the already-locked commit (post-forks).
         """
+        self._touch_plan_cache(rid)
         with self._lock:
             if from_label not in self._streams[rid]:
                 return
