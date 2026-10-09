@@ -79,7 +79,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_SAMPLER,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import Operation, WeightConverter
+from mstar.model.utils import Operation, WeightConverter, drop_stop_tokens
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -1228,12 +1228,7 @@ class Qwen3OmniModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            ids = output.reshape(-1).tolist()
-            # the end token closes the turn, not the reply: a client sends the
-            # reply back as an assistant message, whose template writes it again.
-            # Under ignore_eos it closes nothing and stays, one chunk per token
-            if not (request_kwargs or {}).get("ignore_eos"):
-                ids = [i for i in ids if i != self.config.im_end_token_id]
+            ids = drop_stop_tokens(output, (self.config.im_end_token_id,), request_kwargs)
             detok = self.tokenizer.decode(ids)
             return detok.encode("utf-8")
         elif modality == "audio":

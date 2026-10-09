@@ -62,6 +62,7 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5VisionConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import drop_stop_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -452,12 +453,7 @@ class Qwen3_5DenseModel(Model):
             request_kwargs: dict | None = None,
         ) -> bytes:
             if modality == "text":
-                ids = output.reshape(-1).tolist()
-                # the stop token ends the turn, not the reply: a client sends the
-                # reply back as an assistant message, whose template closes it.
-                # Under ignore_eos it ends nothing and stays, one chunk per token
-                if not (request_kwargs or {}).get("ignore_eos"):
-                    ids = [i for i in ids if i not in self.config.stop_token_ids]
+                ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
                 detok = self.tokenizer.decode(ids)
                 return detok.encode("utf-8")
             raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
