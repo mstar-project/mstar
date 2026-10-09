@@ -11,6 +11,7 @@ from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
+    LoopStateRegistry,
     NameAndDest,
     NodeAndGraphWalk,
     TensorPointerInfo,
@@ -426,12 +427,23 @@ class PythonGraphRuntime(GraphRuntime):
 
     def cleanup_consumed_inputs(
         self, node_name: str, rids: list[int], wg_ids: list[int],
+        completes_node: list[bool] | None = None,
+        completes_walk: list[bool] | None = None,
     ) -> FreedTensors:
-        for rid, wg_id in zip(rids, wg_ids, strict=True):
+        for i, (rid, wg_id) in enumerate(zip(rids, wg_ids, strict=True)):
+            if completes_node is not None and not completes_node[i]:
+                continue
             wgio = self._queues[wg_id].per_request_queues.get(rid)
             if wgio is not None:
-                wgio.get_node(node_name).ready_signals.clear()
+                node = wgio.get_node(node_name)
                 wgio.ready_node_names.discard(node_name)
+                if completes_walk is not None and not completes_walk[i]:
+                    node.ready_signals.clear_streaming()
+                    # missing only its streamed inputs again: the next chunk can land
+                    if node.ready_signals.is_ready_for_streaming and not node._in_flight:
+                        wgio.ready_for_streaming.add(node_name)
+                else:
+                    node.ready_signals.clear()
         # ``clear`` dereferences through the tensor manager this runtime was
         # built with, which runs the teardown as it goes. Nothing is left for
         # the caller.
@@ -1321,6 +1333,21 @@ class PythonGraphRuntime(GraphRuntime):
     ) -> RouteOutput:
         rids, wg_ids = input.wg_ids.keys, input.wg_ids.values
         n_signals = len(input.output_signals)
+        node_done = input.completes_node or [True] * len(rids)
+        walk_done = [
+            done and (input.completes_walk is None or input.completes_walk[i])
+            for i, done in enumerate(node_done)
+        ]
+        # an unfinished walk leaves its node live, which a loop member cannot be
+        for i, wg_id in enumerate(wg_ids):
+            if not walk_done[i] and isinstance(
+                self._queues[wg_id].per_request_queues[rids[i]]
+                .get_node(input.node_name)._managing_registry, LoopStateRegistry,
+            ):
+                raise ValueError(
+                    f"complete_and_route_batch: node {input.node_name!r} is in a "
+                    "loop, so its step must finish its walk"
+                )
         uuid_to_idx = {uuid: i for i, uuid in enumerate(input.tensors)}
         # Drop the previous pass's outputs here rather than making the caller
         # remember: this is the only thing that writes them, so the reset
@@ -1363,13 +1390,25 @@ class PythonGraphRuntime(GraphRuntime):
             nested_idxs[rid] = wgio.get_nested_loop_idxs_for_node(
                 input.node_name
             )
-            completion = self._mark_node_complete(rid, wg_id, input.node_name)
+            if walk_done[i]:
+                out_edges = [
+                    edge.clone() for edge in
+                    self._mark_node_complete(rid, wg_id, input.node_name).output_edges
+                ]
+            else:
+                # routed as they are, the node left live for its next step
+                out_edges = [
+                    edge.clone() for edge in node.outputs
+                    if node_done[i] or (edge.is_streaming and edge.tensor_info)
+                ]
+                for edge in out_edges:
+                    edge.finished_graph_walk = False
             walk = input.graph_walk
             if input.walks is not None:
                 walk = rid_walk[rid] = input.walks[input.rid_walk_idx[i]]
             routing = self._process_node_outputs(
                 rid, node_name=input.node_name,
-                outputs=[edge.clone() for edge in completion.output_edges],
+                outputs=out_edges,
                 graph_walk=walk,
             )
             routing_per_rid[rid] = routing

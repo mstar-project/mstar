@@ -136,6 +136,9 @@ pub struct RoutedEdge {
     /// remote edge, as Python does.
     pub declined_local: bool,
     pub worker: Option<Sym>,
+    /// False when the producing step did not finish its walk (a chunked
+    /// prefill's non-final chunk, or a consumer of one).
+    pub finished_graph_walk: bool,
 }
 
 fn routed(e: &EdgeSpec, tensors: Vec<TensorRef>) -> RoutedEdge {
@@ -143,8 +146,24 @@ fn routed(e: &EdgeSpec, tensors: Vec<TensorRef>) -> RoutedEdge {
         name: e.name, dest: e.dest, dest_sym: e.dest_sym, persist: e.persist,
         new_token: e.new_token, streaming: e.streaming, modality: e.modality,
         tensors, persist_for_loop: false, declined_local: false,
-        worker: None,
+        worker: None, finished_graph_walk: true,
     }
+}
+
+/// A step that ran without finishing its walk: its outputs, routed as they
+/// are, without touching the node's state. Without `all_outputs`, only the
+/// streaming edges that carry tensors (a non-final chunk's partial outputs).
+pub fn routed_without_completing(
+    g: &CompiledGraph, node: NodeId, out_tensors: &[Vec<TensorRef>],
+    all_outputs: bool,
+) -> Vec<RoutedEdge> {
+    g.node(node)
+        .outputs
+        .iter()
+        .zip(out_tensors)
+        .filter(|(e, t)| all_outputs || (e.streaming && !t.is_empty()))
+        .map(|(e, t)| RoutedEdge { finished_graph_walk: false, ..routed(e, t.clone()) })
+        .collect()
 }
 
 /// What `RequestState::complete` hands back.
@@ -438,16 +457,17 @@ impl RequestState {
     /// so they are excluded -- and that is structural, from the spec's
     /// `external_inputs`, not per-request state.
     pub fn clear_consumed_inputs(
-        &mut self, g: &CompiledGraph, node: NodeId,
+        &mut self, g: &CompiledGraph, node: NodeId, streaming_only: bool,
     ) -> Vec<u64> {
         let spec = g.node(node);
-        let held = spec.held_mask;
+        // a step that did not finish its walk keeps its non-streaming inputs for the next one
+        let held = if streaming_only { spec.held_mask | !spec.streaming_mask } else { spec.held_mask };
 
         let st = &mut self.nodes[node as usize];
         let mut freed = Vec::new();
         for i in 0..spec.inputs.len() {
             if held >> i & 1 == 1 {
-                continue; // an enclosing loop re-injects this one
+                continue; // re-injected by an enclosing loop, or kept for the next step
             }
             if let Some(tensors) = st.cur.tensors[i].take() {
                 freed.extend(tensors.iter().map(|t| t.uuid));
@@ -456,6 +476,10 @@ impl RequestState {
             st.cur.final_chunk &= !(1 << i);
         }
         self.refresh_ready(node);
+        if streaming_only {
+            // missing only its streamed inputs again: the next chunk can land
+            self.note_ingested_for_streaming(node);
+        }
         freed
     }
 
@@ -681,7 +705,7 @@ impl RequestState {
                 persist: false, new_token: false,
                 streaming: false, modality: 0, tensors: t,
                 persist_for_loop: true, declined_local: false,
-                worker: None,
+                worker: None, finished_graph_walk: true,
             });
         }
     }
@@ -922,7 +946,7 @@ mod tests {
         let mut st = RequestState::new(g.clone());
 
         st.ingest(&g, enc, 0, &[t(1)], false, false);
-        assert_eq!(st.clear_consumed_inputs(&g, enc), vec![1]);
+        assert_eq!(st.clear_consumed_inputs(&g, enc, false), vec![1]);
         st.complete(&g, enc, &[vec![t(2)], vec![t(3)]]);
         st.ingest(&g, dec, 0, &[t(2)], true, false);
         st.ingest(&g, dec, 1, &[t(3)], true, false);
@@ -931,7 +955,7 @@ mod tests {
         for i in 0..3u64 {
             assert!(st.is_ready(dec), "iteration {i}");
             // `h` is held for re-injection; only the loop-back input goes.
-            assert_eq!(st.clear_consumed_inputs(&g, dec), vec![last_tok]);
+            assert_eq!(st.clear_consumed_inputs(&g, dec, false), vec![last_tok]);
             let (new_tok, frame) = (10 * (i + 1), 10 * (i + 1) + 1);
             let done = st.complete(&g, dec, &[vec![t(new_tok)], vec![t(frame)]]);
             // maybe_cache_output takes one reference per cached tensor.
@@ -1001,7 +1025,7 @@ mod tests {
         st.ingest(&g, dec, 1, &[t(3)], true, false);
         let lb = st.register_loop_finish(0).to_vec();
         assert_eq!(lb, vec![(it.get("tok").unwrap(), dec)]);
-        st.clear_consumed_inputs(&g, dec);
+        st.clear_consumed_inputs(&g, dec, false);
         let done = st.complete(&g, dec, &[vec![t(10)], vec![t(11)]]);
         assert!(st.loop_finished(0));
         assert_eq!(st.loop_iter(0), 0);
@@ -1057,7 +1081,7 @@ mod tests {
         assert!(st.is_ready(snac));
         assert!(!st.is_ready_for_streaming(snac), "full, so plainly ready");
 
-        st.clear_consumed_inputs(&g, snac);
+        st.clear_consumed_inputs(&g, snac, false);
         st.complete(&g, snac, &[vec![t(100)]]);
 
         // Inputs are gone, so it is no longer plain-ready -- but it takes

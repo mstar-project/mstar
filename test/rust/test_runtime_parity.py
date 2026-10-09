@@ -2160,3 +2160,133 @@ def test_an_unread_loop_back_sends_nothing():
         ),
     )
     assert out.rids_needing_request_info == frozenset()
+
+
+# --- a step that does not finish its walk ------------------------------------
+#
+# A chunked prefill streams a non-final chunk's output to a consumer that opted
+# into partial input. The producer's step does not finish its node; the
+# consumer's finishes its node but not its walk. Neither completes the node.
+
+@pytest.fixture(params=["python", "rust"])
+def partial_stream(request):
+    """``thinker`` streams ``states`` into ``talker``, which also waits on a
+    non-streaming ``trigger``: the Qwen3-Omni shape."""
+    talker = GraphNode(
+        name="talker", input_names={"trigger", "states"},
+        outputs=[GraphEdge(name="codes", next_node=EMIT_TO_CLIENT)],
+    )
+    talker._register_streaming({"states"})
+    thinker = WorkerGraph(
+        section=GraphNode(
+            name="thinker", input_names={"prompt"},
+            outputs=[
+                GraphEdge(name="states", next_node="talker", is_streaming=True),
+                GraphEdge(name="text", next_node=EMIT_TO_CLIENT),
+            ],
+        ),
+        graph_walks={WALK}, ranks=[0], worker_graph_id=0,
+    )
+    talker_wg = WorkerGraph(
+        section=talker, graph_walks={"talk"}, ranks=[0], worker_graph_id=1,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[thinker, talker_wg],
+        all_wg_ids_to_graph_walks={0: {WALK}, 1: {"talk"}},
+        all_wg_ids_to_dyn_loops={0: set(), 1: set()},
+        all_wg_ids_to_nodes={0: {"thinker"}, 1: {"talker"}},
+        node_to_partition={"thinker": "default", "talker": "TALKER"},
+        sharding_config=_sharding(),
+    )
+    if request.param == "python":
+        book = PythonTensorBookkeeping()
+        tm = _StubTensorManager(book)
+        return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
+                                   **common), book, tm.tensor_store)
+    book = RustTensorBookkeeping()
+    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
+
+
+def _admit_both(rt, partition="default", walk=WALK):
+    return rt.add_request(
+        request_id="r1", partition=partition, graph_walk=walk,
+        partition_worker_graph_ids=[0, 1],
+        worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+    )
+
+
+def _held(book, *uuids):
+    for uuid in uuids:
+        book.put_tensor(uuid, _info(uuid))
+        book.increment_ref(uuid, 1)
+
+
+def test_a_non_final_chunk_routes_only_its_streamed_output(partial_stream):
+    rt, book, _store = partial_stream
+    rid = _admit_both(rt)
+    _held(book, 1, 2, 3)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "thinker", [1])]))
+    rt.pop_rids("thinker", WALK, [rid])
+
+    rt.cleanup_consumed_inputs("thinker", [rid], [0], completes_node=[False])
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="thinker",
+        output_signals=["states", "text"], wg_ids=ParallelList([rid], [0]),
+        tensors=[2, 3], num_tensors=[1, 1], completes_node=[False],
+    ))
+
+    assert out.local_streaming_by_signal["states"].values == [2]
+    assert 3 not in out.register_uuids, "a non-streaming output waits for the last chunk"
+    assert not _released(book, 1), "the next chunk reads the prompt again"
+
+
+@pytest.mark.parametrize("walk_done", [True, False])
+def test_a_consumer_whose_walk_is_not_done_runs_again_on_the_next_chunk(
+    partial_stream, walk_done,
+):
+    rt, book, _store = partial_stream
+    rid = _admit_both(rt, partition="TALKER", walk="talk")
+    _held(book, 1, 2, 3, 4)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("trigger", "talker", [1])]))
+    rt.ingest_inputs_batch(
+        _ingest_block([rid], [_spec("states", "talker", [2])]), is_streaming=True,
+    )
+    assert _ready(rt) == [("talker", "talk", [rid])]
+    rt.pop_rids("talker", "talk", [rid])
+
+    flags = None if walk_done else [False]
+    rt.cleanup_consumed_inputs("talker", [rid], [1], completes_walk=flags)
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="TALKER", graph_walk="talk", node_name="talker",
+        output_signals=["codes"], wg_ids=ParallelList([rid], [1]),
+        tensors=[3], num_tensors=[1], completes_walk=flags,
+    ))
+    assert 3 in out.register_uuids, "its outputs are routed either way"
+    assert _released(book, 2), "the consumed chunk is released either way"
+    assert _released(book, 1) == walk_done, "the trigger stays for the next chunk"
+
+    rt.ingest_inputs_batch(
+        _ingest_block([rid], [_spec("states", "talker", [4])]), is_streaming=True,
+    )
+    # finished, the worker graph was reset and waits for a new trigger
+    assert _ready(rt) == ([] if walk_done else [("talker", "talk", [rid])])
+
+
+def test_a_loop_member_must_finish_its_walk(pair):
+    rt, book, _store = pair
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
+    rt.pop_rids("prefill", WALK, [rid])
+    _held(book, 1, 2)
+    rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="prefill",
+        output_signals=["token", "kv_cache"], wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[1, 2], num_tensors=[1, 1],
+    ))
+    rt.pop_rids("ar_decode", WALK, [rid])
+    with pytest.raises(ValueError, match="in a loop"):
+        rt.complete_and_route_batch(RouteInput(
+            partition="default", graph_walk=WALK, node_name="ar_decode",
+            output_signals=["token", "kv_cache"], wg_ids=ParallelList([rid], [WG_ID]),
+            tensors=[], num_tensors=[0, 0], completes_walk=[False],
+        ))

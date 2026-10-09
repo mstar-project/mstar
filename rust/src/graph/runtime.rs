@@ -6,7 +6,9 @@ use crate::graph::compile::{EMIT_TO_CLIENT, EMPTY_DESTINATION, LoopArg, NodeArg,
 use crate::graph::shard::{FanoutDest, GroupTemplate, ShardingTemplate};
 use crate::graph::spec::*;
 use crate::graph::request::{LoopStopTime, RequestInfo, WgIndex, WorkerGraphMeta};
-use crate::graph::state::{RequestState, RoutedEdge, SpecNode, TensorRef};
+use crate::graph::state::{
+    routed_without_completing, Completed, RequestState, RoutedEdge, SpecNode, TensorRef,
+};
 use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
 use crate::communicator::RawZmqCommunicator;
 use crate::PyZmqCommunicator;
@@ -529,6 +531,7 @@ pub struct GraphRuntime {
                 new_token: e.new_token,
                 streaming: e.streaming,
                 modality: e.modality,
+                finished_graph_walk: true,
                 tensors: vec![],
                 persist_for_loop: false,
                 declined_local: false,
@@ -813,7 +816,7 @@ pub struct GraphRuntime {
                 new_token: e.new_token, streaming: e.streaming,
                 modality: e.modality, tensors: vec![],
                 persist_for_loop: false, declined_local: false,
-                worker: None,
+                worker: None, finished_graph_walk: true,
             })
             .collect();
         state.ingest_for_speculation(&g, curr_node, &source_edges);
@@ -1118,6 +1121,7 @@ pub struct WireEdge {
     pub streaming: bool,
     pub shard_dim: Option<u32>,
     pub total_fanin: u32,
+    pub finished_graph_walk: bool,
 }
 
 /// What a completion has to send. Grouped by kind rather than by message so
@@ -1160,6 +1164,11 @@ pub struct RouteArg {
     /// None, every row ran `graph_walk`.
     #[pyo3(item)] walks: Option<Vec<String>>,
     #[pyo3(item)] rid_walk_idx: Option<Vec<u32>>,
+    /// Per row; None, every row finished. A row whose step did not finish its
+    /// node routes only its streaming outputs; one that finished its node but
+    /// not its walk routes all of them. Neither completes the node.
+    #[pyo3(item)] completes_node: Option<Vec<bool>>,
+    #[pyo3(item)] completes_walk: Option<Vec<bool>>,
 }
 
 /// `RouteOutput`.
@@ -1961,21 +1970,34 @@ impl GraphRuntime {
     /// Python. Dropping them here and saying nothing is what left a consumed
     /// input's shm file sitting until the request was torn down: the Python
     /// runtime dereferences through the manager and reclaims as it goes.
+    /// A row whose step did not finish its node (`completes_node`) keeps
+    /// every input; one that did not finish its walk (`completes_walk`) gives
+    /// up only its streaming inputs.
+    #[pyo3(signature = (node_name, rids, wg_ids, completes_node = None, completes_walk = None))]
     fn cleanup_consumed_inputs(
         &mut self, node_name: &str, rids: Vec<u32>, wg_ids: Vec<u32>,
+        completes_node: Option<Vec<bool>>, completes_walk: Option<Vec<bool>>,
     ) -> PyResult<(Vec<u64>, Vec<bool>)> {
-        if rids.len() != wg_ids.len() {
+        if rids.len() != wg_ids.len()
+            || completes_node.as_ref().is_some_and(|v| v.len() != rids.len())
+            || completes_walk.as_ref().is_some_and(|v| v.len() != rids.len())
+        {
             return Err(PyValueError::new_err(
-                "cleanup_consumed_inputs: rids and wg_ids must be the same length",
+                "cleanup_consumed_inputs: rids, wg_ids and the completes_* flags \
+                 must be the same length",
             ));
         }
         let mut freed: Vec<u64> = Vec::new();
-        for (rid, wg_id) in rids.into_iter().zip(wg_ids) {
+        for (i, (rid, wg_id)) in rids.into_iter().zip(wg_ids).enumerate() {
+            if completes_node.as_ref().is_some_and(|v| !v[i]) {
+                continue;
+            }
+            let streaming_only = completes_walk.as_ref().is_some_and(|v| !v[i]);
             let Some(wg) = self.wg_index(wg_id) else { continue };
             let Some(node) = self.nid(wg, node_name) else { continue };
             let g = &self.graphs[wg as usize];
             if let Some(state) = Self::state_in(&mut self.states, wg, rid) {
-                freed.extend(state.clear_consumed_inputs(g, node));
+                freed.extend(state.clear_consumed_inputs(g, node, streaming_only));
             }
         }
         if freed.is_empty() {
@@ -2282,6 +2304,28 @@ impl GraphRuntime {
                 "complete_and_route_batch: rid_walk_idx must index walks, one per rid",
             ));
         }
+        let n_rows = input.rids.len();
+        if input.completes_node.as_ref().is_some_and(|v| v.len() != n_rows)
+            || input.completes_walk.as_ref().is_some_and(|v| v.len() != n_rows)
+        {
+            return Err(PyValueError::new_err(
+                "complete_and_route_batch: completes_node and completes_walk need one flag per rid",
+            ));
+        }
+        let finishes = |i: usize| -> (bool, bool) {
+            let node_done = input.completes_node.as_ref().is_none_or(|v| v[i]);
+            (node_done, node_done && input.completes_walk.as_ref().is_none_or(|v| v[i]))
+        };
+        // an unfinished walk leaves its node live, which a loop member cannot be
+        for i in 0..n_rows {
+            let ctx = &ctxs[rid_walk_idx[i] as usize];
+            if !finishes(i).1 && ctx.2.node(ctx.1).loop_id.is_some() {
+                return Err(PyValueError::new_err(format!(
+                    "complete_and_route_batch: node {:?} is in a loop, so its step must finish its walk",
+                    input.node_name,
+                )));
+            }
+        }
         let signals: Vec<Option<Sym>> = input
             .output_signals
             .iter()
@@ -2357,7 +2401,15 @@ impl GraphRuntime {
             };
             // Before complete(), which clears the flag.
             let was_speculative = state.is_in_flight(node);
-            let completed = state.complete(&g, node, &out_tensors);
+            let (node_done, walk_done) = finishes(i);
+            let completed = if walk_done {
+                state.complete(&g, node, &out_tensors)
+            } else {
+                Completed {
+                    edges: routed_without_completing(&g, node, &out_tensors, node_done),
+                    filtered: vec![], freed: vec![], taken: vec![],
+                }
+            };
             let mut pre_shard_edges = completed.edges;
             let freed_inputs = completed.freed;
             // A loop that cached this node's outputs holds a reference on
@@ -3062,6 +3114,7 @@ impl GraphRuntime {
                         name: w.signal, next_node: w.next_node,
                         is_streaming: w.streaming, infos,
                         shard_dim: w.shard_dim, total_fanin: w.total_fanin,
+                        finished_graph_walk: w.finished_graph_walk,
                     };
                     match at.get(&key) {
                         Some(&i) => grouped[i].1.push(edge),
@@ -3288,6 +3341,7 @@ impl GraphRuntime {
                                 streaming: e.streaming,
                                 shard_dim,
                                 total_fanin,
+                                finished_graph_walk: e.finished_graph_walk,
                             });
                         }
                     }
@@ -3309,6 +3363,7 @@ impl GraphRuntime {
                             streaming: e.streaming,
                             shard_dim,
                             total_fanin,
+                            finished_graph_walk: e.finished_graph_walk,
                         });
                     }
                     Dest::Local(_) | Dest::Empty => {}

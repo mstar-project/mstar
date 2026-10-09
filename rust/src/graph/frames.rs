@@ -321,6 +321,7 @@ fn graph_edge(
     infos: &[TensorPointerInfo],
     shard_dim: Option<u32>,
     total_fanin: u32,
+    finished_graph_walk: bool,
 ) {
     w_map_counted(out, |m| {
         w_str(m.key("next_node"), next_node);
@@ -337,6 +338,7 @@ fn graph_edge(
         w_str(m.key("output_modality"), modality);
         w_bool(m.key("_persist_for_loop"), false);
         w_bool(m.key("_final_stream_chunk"), false);
+        w_bool(m.key("finished_graph_walk"), finished_graph_walk);
         w_u64(m.key("_total_fanin"), total_fanin as u64);
         // `_shard_dim` defaults to None, and wire.py omits a
         // None-with-a-default, so a replicated signal must NOT carry the key.
@@ -356,6 +358,8 @@ pub struct OutEdge {
     /// receiver how to put a sharded signal back together.
     pub shard_dim: Option<u32>,
     pub total_fanin: u32,
+    /// False on an edge from a step that did not finish its walk.
+    pub finished_graph_walk: bool,
 }
 
 /// INPUT_SIGNALS to a peer worker. One frame per (request, worker): the plan
@@ -381,7 +385,7 @@ impl InputSignals<'_> {
             for e in self.edges {
                 graph_edge(
                     m.buf(), bk, &e.name, &e.next_node, "", e.is_streaming,
-                    &e.infos, e.shard_dim, e.total_fanin,
+                    &e.infos, e.shard_dim, e.total_fanin, e.finished_graph_walk,
                 );
             }
             match self.request_info_encoded {
@@ -421,7 +425,7 @@ impl ResultTensors<'_> {
             w_str(m.key("modality"), self.modality);
             graph_edge(
                 m.key("graph_edge"), bk, self.signal, EMIT_TO_CLIENT,
-                self.modality, false, &self.infos, None, 1,
+                self.modality, false, &self.infos, None, 1, true,
             );
             match &self.loop_indices {
                 Some((order, idxs, fwd)) => {
