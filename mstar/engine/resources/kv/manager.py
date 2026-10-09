@@ -378,6 +378,9 @@ class KVManager(AttentionResource):
         # commit tolerates a chain that lags by that many tokens
         self._chain_pending: Counter = Counter()
         self._chain_backlog_width = 0
+        # requests whose waiting tokens went out early (a removal): the next
+        # flush leaves them out
+        self._chain_drained: set[str] = set()
         # its entity id is the worker id, and one worker is one copy of a node
         self._replica = (
             transfer_engine_info.my_entity_id
@@ -769,18 +772,64 @@ class KVManager(AttentionResource):
             steps, self._chain_backlog = self._chain_backlog, []
             self._chain_pending = Counter()
             self._chain_backlog_width = 0
+            drained, self._chain_drained = self._chain_drained, set()
             # runs of steps with the same rows and batch go out as one extend
             # per request; a change of batch composition starts a new run
             run: list = []
             for st in steps:
                 if run and run[0][:4] != st[:4]:
-                    self._extend_chains_from(run)
+                    self._extend_chains_from(run, drained)
                     run = []
                 run.append(st)
             if run:
-                self._extend_chains_from(run)
+                self._extend_chains_from(run, drained)
 
-    def _extend_chains_from(self, steps: list) -> None:
+    def _drain_chain_backlog(self, rid: str) -> None:
+        """Under the lock: extend one request's chain with its tokens waiting
+        in the backlog, and leave them out of the next flush. A removal does
+        this instead of a flush, which at high concurrency would come every
+        step or two."""
+        if not self._chain_backlog or rid in self._chain_drained:
+            return
+        self._chain_drained.add(rid)
+        self._chain_pending.pop(rid, None)
+        parts: list[tuple] = []
+        for st in self._chain_backlog:
+            try:
+                i = st[0].index(rid)
+            except ValueError:
+                continue
+            if rid in st[3]:
+                parts.append((st, i))
+        if not parts:
+            return
+        st0 = parts[0][0]
+        entry = self._chain_lookup.get(rid, {}).get((st0[1], st0[2]))
+        if entry is None:
+            label = self._keyed_label(rid, st0[1], st0[2])
+            tensor = (
+                (self._overrides[rid].prefix_decode or {}).get(label)
+                if label is not None else None
+            )
+        else:
+            label, tensor = entry
+        if label is None or not tensor:
+            return
+        stream = self._streams.get(rid, {}).get(label)
+        if stream is None or stream.chain is None or stream.chain.unkeyed is None:
+            return
+        if stream.released:
+            stream.chain = None
+            return
+        tokens: list[int] = []
+        for st, i in parts:
+            arr = st[4].get(tensor)
+            if arr is not None and i < arr.shape[0]:
+                tokens.extend(arr[i].tolist())
+        if tokens:
+            stream.chain.extend(tokens, self.config.page_size)
+
+    def _extend_chains_from(self, steps: list, drained: set[str] = frozenset()) -> None:
         """Under the lock: one extend per request with the tokens of
         ``steps`` (same rows and batch) in step order."""
         rows, node_name, graph_walk, request_ids, _ = steps[0]
@@ -790,6 +839,8 @@ class KVManager(AttentionResource):
         lookup = self._chain_lookup
         cols: dict[str, object] = {}
         for rid in request_ids:
+            if rid in drained:
+                continue
             # the label and buffer name do not change over a request's
             # life (its overrides are set at ingest), so each is looked up
             # once instead of on every decode step
@@ -842,6 +893,9 @@ class KVManager(AttentionResource):
         )
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
+        if rid in self._chain_drained:
+            # the handle comes back while steps under its old name still wait
+            self.flush_chain_backlog()
         if overrides is None:
             overrides = KVReqConfig()
         # guards `_streams`/`_overrides` against a concurrent admit/plan/commit
@@ -2067,8 +2121,9 @@ class KVManager(AttentionResource):
                 self.assert_pages_conserved()
 
     def remove_request(self, rid: str):
-        # its waiting tokens first, before the handle can name another request
-        self.flush_chain_backlog()
+        with self._lock:
+            # its waiting tokens first, before the handle can name another request
+            self._drain_chain_backlog(rid)
         streams = self._streams.get(rid)
         if streams is not None:
             # drain in-flight reads outside the lock; see reset_request
