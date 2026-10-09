@@ -483,6 +483,9 @@ class Glm52Model(Model):
         loops too."""
         return self.context_limit() - 1
 
+    def stop_token_ids(self) -> frozenset[int]:
+        return frozenset(self.config.eos_token_ids)
+
     def get_max_output_tokens(self, **model_kwargs):
         # the request's budget, held to the window: a one-token prompt emits at
         # most ``context_limit`` tokens (the last is never stored), so a larger

@@ -589,3 +589,42 @@ def test_glm_chat_refuses_a_required_tool_choice(client_and_stub):
         "tools": _GLM_TOOLS, "tool_choice": "required",
     })
     assert r.status_code == 400 and "constrained decoding" in r.json()["error"]["message"]
+
+
+def _usage_chunks(*parts, stop=True):
+    """Text chunks as the data worker tags them: per-chunk token counts and the prompt's."""
+    return [_Chunk("text", text, {"tokens": n, "prompt_tokens": 11, "stop_token": stop and i == len(parts) - 1})
+            for i, (text, n) in enumerate(parts)]
+
+
+@pytest.mark.parametrize("stop, finish", [(True, "stop"), (False, "length")])
+def test_chat_reports_usage_and_why_it_stopped(client_and_stub, stop, finish):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    stub.next_chunks = _usage_chunks((b"Plan</think>", 2), (b"Hello", 1), stop=stop)
+    body = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "hi"}]}).json()
+    assert body["usage"] == {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14}
+    assert body["choices"][0]["finish_reason"] == finish
+
+
+def test_chat_stream_sends_usage_when_asked(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    stub.next_chunks = _usage_chunks((b"Plan</think>", 2), (b"Hello", 1), stop=False)
+    text = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stream": True,
+        "stream_options": {"include_usage": True},
+    }).text
+    events = [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
+    assert events[-2]["choices"][0]["finish_reason"] == "length"
+    assert events[-1]["choices"] == [] and events[-1]["usage"]["completion_tokens"] == 3
+
+
+def test_chat_refuses_bad_stream_options_before_running(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    stub.last_submit = None
+    r = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "hi"}], "stream": True, "stream_options": True})
+    assert r.status_code == 400 and stub.last_submit is None
