@@ -266,6 +266,8 @@ class _FakeExecEngine:
 
     _exec_per_request = Engine._exec_per_request
     _declare_and_admit = Engine._declare_and_admit
+    _check_follower_refusal = Engine._check_follower_refusal
+    _tp_follower_nodes = frozenset()  # a single rank: no follower to check
 
     def __init__(
         self, fail_on: str | None = None, num_slots: int = 1, next_slot: int = 0,

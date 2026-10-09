@@ -94,3 +94,12 @@ test/modular/test_glm52_step_tokens.py
 test/modular/test_kv_correct_len.py
 test/modular/test_kv_host_plan.py
 test/modular/test_piecewise_dummy_rows.py
+test/modular/test_check_stop_batched_loop_counts.py
+test/modular/test_kda_resource.py
+test/modular/test_loader_pread.py
+test/modular/test_loader_stacked_matcher.py
+test/modular/test_recurrent_rank_symmetry.py
+test/modular/test_recurrent_rollback.py
+test/modular/test_recurrent_slot_blocks.py
+test/modular/test_tp_follower_refusal.py
+test/modular/test_worker_runtime_metadata.py

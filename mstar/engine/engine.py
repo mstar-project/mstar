@@ -22,6 +22,7 @@ from mstar.engine.cuda_graph_runner import (
 )
 from mstar.engine.resources import (
     AdmitFailedReason,
+    AllocationFailed,
     FullAdmitOutcome,
     NodeResourceSpec,
     PublishedInfo,
@@ -1073,10 +1074,34 @@ class Engine:
                 range_pop()
 
         if not admit_outcome.ok:
+            self._check_follower_refusal(batch, admit_outcome)
             batch.register_admit_error(
                 admit_outcome.reason, admit_outcome.failed_resource,
             )
         return admit_outcome, step
+
+    def _check_follower_refusal(
+        self, batch: ExecutingBatch, outcome: FullAdmitOutcome,
+    ) -> None:
+        """Raise when a TP follower refuses a step rank 0 cannot have refused.
+
+        Rank 0 schedules within ``get_max_batch_size``, so a batch past this
+        rank's own cap, refused for capacity, means the ranks' capacity has
+        diverged: rank 0 admitted a step this rank cannot join, and re-queueing
+        it would leave rank 0 in that step's collectives alone.
+        """
+        node = batch.node_name
+        if node not in self._tp_follower_nodes or not isinstance(outcome.reason, AllocationFailed):
+            return
+        walk = batch.step_context.graph_walk
+        cap = self.get_max_batch_size(node, walk)
+        rows = len(batch.request_ids)
+        if cap is not None and rows > cap:
+            raise RuntimeError(
+                f"TP follower refused {rows} requests on {node}/{walk} that rank 0 "
+                f"scheduled, past this rank's cap of {cap}: the ranks' "
+                f"{outcome.failed_resource} state has diverged. {outcome.reason.message}"
+            )
 
     def _maybe_lease_piecewise_regions(
         self, node_name: str, ctx: StepContext, inputs: list[NodeInputs],
