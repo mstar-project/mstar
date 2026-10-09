@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components import ExpertParallelSparseMoeBlock, SparseMoeBlock
+from mstar.model.components import ExpertParallelSparseMoeBlock, ParallelSparseMoeBlock, SparseMoeBlock
 
 HIDDEN, INTER, NUM_EXPERTS, TOP_K = 64, 32, 16, 4
 
@@ -44,6 +44,10 @@ class _FakeCommGroup(CommGroup):
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         self.all_reduce_calls += 1
         return input_
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        # Every peer routed alike; a test overrides this to disagree.
+        return torch.cat([input_] * self.world_size, dim=dim)
 
 
 class _StatefulRouter(nn.Module):
@@ -222,3 +226,124 @@ def test_ep_loaders_survive_module_apply():
 def test_ep_rejects_uneven_experts():
     with pytest.raises(AssertionError, match="not divisible"):
         ExpertParallelSparseMoeBlock(HIDDEN, 10, TOP_K, INTER, comm_group=_FakeCommGroup(0, 4))
+
+
+def _routing(block, x):
+    _, ids, _ = block.gate(x.view(-1, HIDDEN))
+    return ids
+
+
+@pytest.mark.parametrize("dev", _DEVICES)
+def test_ep_expert_load_counts_every_expert(dev):
+    """Rank 0 counts slots for all experts, including other ranks' ones."""
+    device, dtype = dev
+    router_w = torch.randn(NUM_EXPERTS, HIDDEN)
+    block = ExpertParallelSparseMoeBlock(
+        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(0, 2), track_expert_load=True,
+    )
+    with torch.no_grad():
+        block.gate.weight.copy_(router_w)
+    block = block.to(device, dtype)
+    _load(block, _checkpoint())
+
+    x1, x2 = (torch.randn(n, HIDDEN, device=device, dtype=dtype) for n in (5, 9))
+    with torch.no_grad():
+        block(x1)
+        block(x2)
+        ids = torch.cat([_routing(block, x1), _routing(block, x2)])
+    expected = torch.bincount(ids.flatten().cpu(), minlength=NUM_EXPERTS)
+    assert torch.equal(block.pop_expert_load(), expected)
+    assert block.pop_expert_load().sum() == 0
+
+
+def test_ep_expert_load_zeroed_after_to_empty():
+    with torch.device("meta"):
+        block = ExpertParallelSparseMoeBlock(HIDDEN, NUM_EXPERTS, TOP_K, INTER, track_expert_load=True)
+    block.to_empty(device="cpu")
+    assert block.expert_load.dtype == torch.int64
+    assert (block.expert_load == 0).all()
+    # Not a checkpoint tensor, so the loader never sees it.
+    assert "expert_load" not in block.state_dict()
+
+
+def test_ep_expert_load_off_by_default():
+    block = ExpertParallelSparseMoeBlock(HIDDEN, NUM_EXPERTS, TOP_K, INTER)
+    assert not hasattr(block, "expert_load")
+
+
+def test_ep_routing_check_passes_when_ranks_agree():
+    block = ExpertParallelSparseMoeBlock(
+        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(1, 4), debug_check_routing=True,
+    )
+    _load(block, _checkpoint())
+    with torch.no_grad():
+        block(torch.randn(6, HIDDEN))
+
+
+def test_ep_routing_check_catches_disagreement():
+    class _Disagreeing(_FakeCommGroup):
+        def all_gather(self, input_, dim=-1):
+            out = super().all_gather(input_, dim)
+            # The last peer picked a different expert for its first slot.
+            out[-input_.shape[0]] = (out[-input_.shape[0]] + 1) % NUM_EXPERTS
+            return out
+
+    block = ExpertParallelSparseMoeBlock(
+        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_Disagreeing(0, 2), debug_check_routing=True,
+    )
+    _load(block, _checkpoint())
+    with torch.no_grad(), pytest.raises(RuntimeError, match="routing disagrees"):
+        block(torch.randn(3, HIDDEN))
+
+
+def _rank_blocks(cls, world_size, ckpt, router_w, device, dtype, **kwargs):
+    blocks = []
+    for rank in range(world_size):
+        block = cls(HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(rank, world_size), **kwargs)
+        with torch.no_grad():
+            block.gate.weight.copy_(router_w)
+        block = block.to(device, dtype)
+        _load(block, ckpt)
+        blocks.append(block)
+    return blocks
+
+
+_CPU, _CUDA = ("cpu", torch.float32), ("cuda", torch.bfloat16)
+_SCHEMES = [
+    pytest.param(ExpertParallelSparseMoeBlock, 1, _CPU, id="ep1-naive-cpu"),
+    pytest.param(ExpertParallelSparseMoeBlock, 4, _CPU, id="ep4-naive-cpu"),
+    pytest.param(ExpertParallelSparseMoeBlock, 4, _CUDA, id="ep4-fused-cuda", marks=_needs_cuda),
+    pytest.param(ParallelSparseMoeBlock, 1, _CPU, id="tp1-naive-cpu"),
+    pytest.param(ParallelSparseMoeBlock, 1, _CUDA, id="tp1-fused-cuda", marks=_needs_cuda),
+    # TP > 1 dispatches through the fused kernel only.
+    pytest.param(ParallelSparseMoeBlock, 4, _CUDA, id="tp4-fused-cuda", marks=_needs_cuda),
+]
+
+
+@pytest.mark.parametrize("cls, world_size, dev", _SCHEMES)
+def test_padding_rows_skip_every_gemm(cls, world_size, dev):
+    """Masked rows contribute zero; real rows match the unmasked forward."""
+    device, dtype = dev
+    blocks = _rank_blocks(cls, world_size, _checkpoint(), torch.randn(NUM_EXPERTS, HIDDEN), device, dtype)
+    x = torch.randn(9, HIDDEN, device=device, dtype=dtype)
+    num_real = 6
+    valid = torch.arange(9, device=device) < torch.tensor([num_real], device=device)
+    with torch.no_grad():
+        full = torch.stack([b(x).float() for b in blocks]).sum(0)
+        masked = torch.stack([b(x, token_valid=valid).float() for b in blocks]).sum(0)
+    torch.testing.assert_close(masked[:num_real], full[:num_real], **_tol(dtype))
+    assert (masked[num_real:] == 0).all()
+
+
+def test_ep_expert_load_ignores_padding():
+    router_w = torch.randn(NUM_EXPERTS, HIDDEN)
+    (block,) = _rank_blocks(
+        ExpertParallelSparseMoeBlock, 1, _checkpoint(), router_w, "cpu", torch.float32, track_expert_load=True,
+    )
+    x = torch.randn(7, HIDDEN)
+    valid = torch.tensor([True] * 4 + [False] * 3)
+    with torch.no_grad():
+        block(x, token_valid=valid)
+        ids = _routing(block, x[:4])
+    expected = torch.bincount(ids.flatten(), minlength=NUM_EXPERTS)
+    assert torch.equal(block.pop_expert_load(), expected)

@@ -116,10 +116,15 @@ class Qwen3OmniModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        thinker_moe: dict | None = None,
         **kwargs,
     ):
+        from mstar.model.qwen3_omni.components.thinker import ThinkerMoeParallelConfig
+
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
+        # yaml ``model_kwargs.thinker_moe``: TP or EP for the Thinker's experts.
+        self.thinker_moe = ThinkerMoeParallelConfig.from_yaml(thinker_moe)
 
         self.CONVERTER = [
             WeightConverter(
@@ -1402,7 +1407,9 @@ class Qwen3OmniModel(Model):
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
 
         with torch.device("meta"):
-            thinker_model = Qwen3OmniThinkerModel(self.config, comm_group=tp_group)
+            thinker_model = Qwen3OmniThinkerModel(
+                self.config, comm_group=tp_group, moe_parallel=self.thinker_moe,
+            )
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
         if autocast_dtype is not None:
