@@ -121,10 +121,10 @@ def flatten_messages(
             role, content = msg.get("role"), msg.get("content")
         else:
             role, content = getattr(msg, "role", None), getattr(msg, "content", None)
-        # any other role reads as user, where every message went before, not as
-        # itself: Qwen3-Omni's template drops a developer message, text and all
-        if role not in ("system", "assistant"):
-            role = "user"
+        if role == "developer":  # OpenAI's newer name for system
+            role = "system"
+        elif role not in ("system", "user", "assistant"):
+            raise ValueError(f"a message's role must be system, developer, user or assistant, not {role!r}")
         if content is None:
             continue
         if isinstance(content, str):

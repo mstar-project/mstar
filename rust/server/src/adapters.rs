@@ -89,11 +89,14 @@ pub fn flatten_messages(
     let mut file_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for msg in messages {
-        // any other role reads as user, where every message went before, not as
-        // itself: Qwen3-Omni's template drops a developer message, text and all
         let role = match msg.role.as_str() {
-            "system" | "assistant" => msg.role.as_str(),
-            _ => "user",
+            "developer" => "system", // OpenAI's newer name for system
+            role @ ("system" | "user" | "assistant") => role,
+            other => {
+                return Err(format!(
+                    "a message's role must be system, developer, user or assistant, not '{other}'"
+                ))
+            }
         };
         let content = match &msg.content {
             None => continue,
