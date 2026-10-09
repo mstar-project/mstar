@@ -125,3 +125,68 @@ def test_in_graph_decode_inputs_are_two_separate_knobs(monkeypatch):
     )
     out = LLMSubmodule.preprocess(sub, "decode", eager, rows)
     assert out["input_ids"].tolist() == [3, 4] and "cos_3d" in out
+
+
+def test_forward_in_graph_knobs_read_the_slot_buffers_at_capture(monkeypatch):
+    """A capture hands the region the slot's static input_ids and rotary
+    tables. With a knob on, the forward reads the sampler master / the
+    planned positions instead, so the graph records those reads; the
+    capture's own context carries the piecewise walk, not "decode"."""
+    from mstar.model.qwen3_5.config import ATTN, ROPE
+
+    calls = {}
+
+    class _Embed:
+        weight = torch.zeros(1)
+
+        def __call__(self, ids):
+            calls["ids"] = ids.tolist()
+            return ids.float()
+
+    class _Inner:
+        embed_tokens = _Embed()
+
+        def __call__(self, embeds, label, cos_sin):
+            calls["cos"] = cos_sin[0]
+            return embeds
+
+        def build_cos_sin(self, pos, dtype):
+            calls["built"] = pos
+            return pos, pos
+
+    sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]))
+    sampler.sample = lambda rids, logits: ("sampled", list(rids))
+    sub = _sub(sampler)
+    sub.node_resources[ROPE] = SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20]))
+    sub.model = SimpleNamespace(model=_Inner(), lm_head=lambda h: h)
+    static_ids, static_cos = torch.tensor([9, 9]), torch.full((3, 2), 7.0)
+
+    def run(lease):
+        calls.clear()
+        engine_inputs = SimpleNamespace(
+            resources={SAMPLER: sampler, ATTN: object()}, request_ids=["r1", "r2"],
+            step=SimpleNamespace(ctx=SimpleNamespace(slot_lease=lease, graph_walk="__piecewise__")),
+        )
+        out = LLMSubmodule._forward(
+            sub, "decode", engine_inputs, cos_3d=static_cos, sin_3d=static_cos, input_ids=static_ids,
+        )
+        assert out == ("sampled", ["r1", "r2"])
+        return dict(calls)
+
+    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_TOKENS", raising=False)
+    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_ROPE", raising=False)
+    c = run(object())
+    assert c["ids"] == [9, 9] and c["cos"] is static_cos and "built" not in c
+    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_TOKENS", "1")
+    c = run(object())
+    assert c["ids"] == [3, 4] and c["cos"] is static_cos
+    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_TOKENS", raising=False)
+    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_ROPE", "1")
+    c = run(object())
+    assert c["ids"] == [9, 9] and c["built"].tolist() == [[10, 20]] * 3 and c["cos"] is not static_cos
+    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_TOKENS", "1")
+    c = run(object())
+    assert c["ids"] == [3, 4] and "built" in c
+    # no lease (an eager step): the knobs do not apply, the inputs are used
+    c = run(None)
+    assert c["ids"] == [9, 9] and c["cos"] is static_cos and "built" not in c
