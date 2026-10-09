@@ -129,6 +129,14 @@ class RecurrentStatePool(Resource):
         """One layer's contiguous slot-major view of a block: ``[max_slots, *shape]``."""
         return self._blocks[name][layer_idx]
 
+    def slot_index(self, rid: str, label: str = "main") -> int | None:
+        """The slot ``rid`` holds under ``label``, or None. For a backend that
+        runs its rows one at a time on the slot's own view
+        (``block(name, layer)[index]``) rather than on the step's addressing."""
+        with self._lock:
+            slot = self._slots.get(rid, {}).get(label)
+            return None if slot is None else slot.index
+
     @property
     def num_free_slots(self) -> int:
         return len(self._free)
