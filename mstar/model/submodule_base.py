@@ -80,6 +80,10 @@ class BatchedModelOutput:
     # the stop check, and slicing rows against that list would hand one
     # request another's token. None when there are no row-addressed buffers.
     row_request_ids: tuple[str, ...] | None = None
+    # Set by ``Engine._collect_outputs`` when every per-rid entry is a row view
+    # of a batch clone: name -> the views, row i for ``row_request_ids[i]``.
+    # The store describes such rows without reading each view.
+    row_views: dict[str, tuple[torch.Tensor, ...]] | None = None
 
     @classmethod
     def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:
@@ -109,14 +113,29 @@ class BatchedModelOutput:
         alone, and the caller takes the request out of the batch instead."""
         return self.per_rid_outputs.pop(request_id, default)
 
-    def clone_check_stop_buffers(self):
+    def clone_check_stop_buffers(
+        self, reuse: dict[str, torch.Tensor] | None = None,
+    ):
         """A detached copy: the next replay overwrites a captured graph's
-        buffers before the stop check reads them."""
+        buffers before the stop check reads them.
+
+        ``reuse`` holds clones already taken of the row outputs (see
+        ``clone_row_outputs``); a stop buffer that is the very same tensor as a
+        row output takes that clone instead of a second copy. The row clone is
+        narrowed to the real rows, which is every row the stop check reads.
+        """
         if self.check_stop_buffers is None:
             return None
+        rows = self.row_outputs or {}
 
-        def _clone(value):
+        def _clone(value, name=None):
             if isinstance(value, torch.Tensor):
+                if (
+                    reuse is not None and name is not None
+                    and value is rows.get(name)
+                    and isinstance(reuse.get(name), torch.Tensor)
+                ):
+                    return reuse[name]
                 return value.clone()
             if isinstance(value, list):
                 return [
@@ -127,7 +146,7 @@ class BatchedModelOutput:
             # pass anything else through: dropping it could lose a stop signal
             return value
 
-        return {k: _clone(v) for k, v in self.check_stop_buffers.items()}
+        return {k: _clone(v, k) for k, v in self.check_stop_buffers.items()}
 
     def clone_row_outputs(self, num_rows: int) -> dict[str, torch.Tensor]:
         """One clone per row-addressed batch tensor, narrowed to the real rows
@@ -154,6 +173,8 @@ class BatchedModelOutput:
         other = self.coerce(other)
         self.per_rid_outputs.update(other.per_rid_outputs)
         self.packed_outputs.update(other.packed_outputs)
+        # merged entries are no longer exactly one batch's row views
+        self.row_views = None
         # Row-addressed buffers describe one forward, so keep them only when
         # exactly one side had any; otherwise the stop check falls back to the
         # per-rid outputs.
@@ -661,6 +682,24 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """Drop keys a real request shouldn't receive. A captured forward emits
         a fixed key set for graph compat, so the filtering happens here."""
         return outputs
+
+    def step_is_input_free(self, graph_walk: str) -> bool:
+        """Whether ``declare_step`` for this walk reads nothing from the inputs
+        but their spans, and every real row has the span of the template row.
+        Then the step a pre-plan declared over the bucket's template rows is
+        the step the forward would declare, and the engine runs it instead of
+        declaring and admitting a second time."""
+        del graph_walk
+        return False
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        """Output signals whose client-facing value is one scalar per row that
+        the stop check already copies to the host, as signal name -> the name
+        of the row-addressed stop buffer holding it. The worker then sends
+        those values inline, one frame per step, instead of one tensor per
+        request. Only for a walk whose emit edge is not persisted."""
+        del graph_walk
+        return {}
 
     def unpack_packed_outputs(
         self,

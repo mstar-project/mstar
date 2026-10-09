@@ -10,6 +10,7 @@ import itertools
 from dataclasses import dataclass
 from typing import NamedTuple
 
+import numpy as np
 import torch
 
 from mstar.engine.resources.step import Segment
@@ -102,11 +103,12 @@ def build_paged_indptrs(
     segments: list[SequenceView],
     page_size: int,
 ) -> PagedIndptrs:
-    # TODO: ~90% of this is the four `torch.tensor(list)` conversions. Holding
-    # `CacheStream.page_indices` as a doubling int32 numpy array instead makes
-    # the pages copy a memcpy: measured 52us -> 13us at bs=16/1024 pages, for
-    # +0.3us on the per-step append. Not done because page_indices also crosses
-    # publish/ZMQ, offload/reload, forks and the CPU pool.
+    # Most of this is the five list-to-tensor conversions; they go through
+    # numpy, which builds an int32 array from a list of ints in about half
+    # the time `torch.tensor(list)` takes (42 -> 29 us at bs=32, 10 pages a
+    # row). Holding `CacheStream.page_indices` as a numpy array would cut the
+    # pages copy further, but it also crosses publish/ZMQ, offload/reload,
+    # forks and the CPU pool.
     qo_indptr = [0]
     kv_indptr = [0]
     all_pages: list[int] = []
@@ -122,12 +124,16 @@ def build_paged_indptrs(
         # FlashInfer's `get_seq_lens`, on the ints already here
         kv_lens.append(max(num_pages - 1, 0) * page_size + last)
     return PagedIndptrs(
-        qo_indptr=torch.tensor(qo_indptr, dtype=torch.int32),
-        paged_kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32),
-        paged_kv_indices=torch.tensor(all_pages, dtype=torch.int32),
-        paged_kv_last_page_len=torch.tensor(last_page_lens, dtype=torch.int32),
-        kv_lens=torch.tensor(kv_lens, dtype=torch.int32),
+        qo_indptr=_int32_tensor(qo_indptr),
+        paged_kv_indptr=_int32_tensor(kv_indptr),
+        paged_kv_indices=_int32_tensor(all_pages),
+        paged_kv_last_page_len=_int32_tensor(last_page_lens),
+        kv_lens=_int32_tensor(kv_lens),
     )
+
+
+def _int32_tensor(values: list[int]) -> torch.Tensor:
+    return torch.from_numpy(np.array(values, dtype=np.int32))
 
 
 @dataclass

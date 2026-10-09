@@ -75,6 +75,13 @@ logger = logging.getLogger(__name__)
 # launch queue and block a launch (machine/driver dependent).
 _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 
+# Publish resource state lazily: finalize_batch records a cheap snapshot per
+# request and the worker finishes it only for the requests whose frame or
+# completion carries it. Eager (0) builds the full publication for every
+# request on every step; in a decode loop nothing reads it until the loop
+# stops, and it was a quarter of the gpu thread's host time at batch 32.
+_LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
+
 
 
 def checkpoint_identity(path: str | Path) -> bytes:
@@ -202,6 +209,29 @@ class ForwardPassInfoWrapper:
     info: CurrentForwardPassInfo
     metadata: InputMetadata
 
+    # The attributes every per-row step reads (prepare_inputs, the stop
+    # check) resolve without the ``__getattr__`` fallback, which costs a
+    # failed lookup plus a Python call per read.
+    @property
+    def dynamic_loop_iter_counts(self):
+        return self.metadata.dynamic_loop_iter_counts
+
+    @property
+    def resource_configs(self):
+        return self.info.resource_configs
+
+    @property
+    def max_tokens(self):
+        return self.info.max_tokens
+
+    @property
+    def graph_walk(self):
+        return self.info.graph_walk
+
+    @property
+    def step_metadata(self):
+        return self.info.step_metadata
+
     def __getattr__(self, name):
         if name == "dynamic_loop_iter_counts":
             return self.metadata.dynamic_loop_iter_counts
@@ -274,6 +304,9 @@ class ExecutingBatch:
     resource_publish_info: dict[str, dict[str, PublishedInfo]] = field(
         default_factory=dict
     )
+    # What finalize_batch snapshotted instead of publishing (MSTAR_LAZY_PUBLISH);
+    # ``Engine.materialize_publish`` turns entries into resource_publish_info.
+    publish_snapshots: dict[str, dict[str, Any]] | None = None
 
     # The next step reads N's outputs, and plans against N's committed state.
     # Two separate dependencies, so two events: whoever prepares N+1 can start
@@ -706,22 +739,35 @@ class Engine:
                 range_pop()
 
     def _prepare_inputs(self, batch: ExecutingBatch) -> None:
-        submodule = self._submodules[batch.node_name].submodule
+        mgmt = self._submodules[batch.node_name]
+        submodule = mgmt.submodule
         node_inputs: list[NodeInputs] = []
+        # hoisted out of the per-request loop: the same for every row
+        walk = batch.step_context.graph_walk
+        prepare = submodule.prepare_inputs
+        resources = mgmt.resources
+        wrapped = batch.per_request_info_wrapped
+        tensors = batch.per_request_input_tensors
+        metadata = batch.per_request_input_metadata
+        final_rids = batch.final_stream_rids
+        # only a keyed walk probes the prefix cache (see _skip_cached_prefix);
+        # read leniently, as the probe itself was only reached per prepared row
+        keyed = getattr(self, "_keyed_walks", None)
+        probe_prefix = bool(keyed) and walk in keyed.get(batch.node_name, ())
         for rid in batch.request_ids:
             try:
-                req_inputs = submodule.prepare_inputs(
-                    graph_walk=batch.step_context.graph_walk,
-                    fwd_info=batch.per_request_info_wrapped[rid],
-                    inputs=batch.per_request_input_tensors.get(rid, {}),
-                    resources=self._submodules[batch.node_name].resources,
+                req_inputs = prepare(
+                    graph_walk=walk,
+                    fwd_info=wrapped[rid],
+                    inputs=tensors.get(rid, {}),
+                    resources=resources,
                     # the step that ends the last of the node's streams: it must
                     # flush whatever it held back (a vocoder's crossfade tail, the
                     # look-ahead frames a token encoder withholds)
-                    is_final_stream_chunk=rid in batch.final_stream_rids,
-                    input_metadata=batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA),
+                    is_final_stream_chunk=rid in final_rids,
+                    input_metadata=metadata.get(rid, EMPTY_INPUT_METADATA),
                 )
-                if req_inputs is not None:
+                if req_inputs is not None and probe_prefix:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
             except Exception as error:
                 logger.exception(
@@ -741,16 +787,35 @@ class Engine:
             batch=batch, model_inputs=node_inputs
         )
 
+    def inline_client_signals(
+        self, node_name: str, graph_walk: str,
+    ) -> dict[str, str]:
+        """The node's client signals that can ride inline this walk."""
+        mgmt = self._submodules.get(node_name)
+        if mgmt is None:
+            return {}
+        return mgmt.submodule.inline_client_signals(graph_walk)
+
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        host_rows: HostRows | None = None,
     ) -> None:
         """Key what this step generated, from the stop check's host copy."""
+        keys = self._runner.prefix_chain_keys(batch.node_name)
+        if not keys:
+            return
         walk = batch.step_context.graph_walk
+        if host_rows is not None:
+            self._runner.extend_prefix_chains_batch(
+                batch.request_ids, batch.node_name, walk, host_rows, outputs,
+                keys=keys,
+            )
+            return
         for rid in batch.request_ids:
             per_rid = outputs.get(rid)
             if isinstance(per_rid, dict):
                 self._runner.extend_prefix_chains(
-                    rid, batch.node_name, walk, per_rid,
+                    rid, batch.node_name, walk, per_rid, keys=keys,
                 )
 
     def _skip_cached_prefix(
@@ -1378,10 +1443,23 @@ class Engine:
         if self._enable_nvtx:
             range_push("engine.finalize_batch")
         try:
+            rids = (
+                batch.request_ids if publish_request_ids is None
+                else publish_request_ids
+            )
+            if _LAZY_PUBLISH:
+                # Snapshot now, on the gpu thread, so the lengths are this
+                # step's; finish in ``materialize_publish`` for the rids whose
+                # frame or completion carries the publication.
+                batch.publish_snapshots = self._runner.publish_snapshot(
+                    rids,
+                    node_name=batch.node_name,
+                    graph_walk=batch.step_context.graph_walk,
+                )
+                return batch.resource_publish_info
             # Returns rid -> {resource label -> published info}
             published = self._runner.publish(
-                batch.request_ids if publish_request_ids is None
-                else publish_request_ids,
+                rids,
                 node_name=batch.node_name,
                 graph_walk=batch.step_context.graph_walk,
             )
@@ -1393,6 +1471,32 @@ class Engine:
         finally:
             if self._enable_nvtx:
                 range_pop()
+
+    def materialize_publish(
+        self, batch: ExecutingBatch, request_ids: list[int],
+    ) -> None:
+        """Finish the publication ``finalize_batch`` snapshotted, for the rids
+        whose frame or completion carries it. Idempotent per rid."""
+        snaps = batch.publish_snapshots
+        if not snaps:
+            return
+        todo = [
+            rid for rid in request_ids
+            if rid in snaps and rid not in batch.resource_publish_info
+        ]
+        if not todo:
+            return
+        published = self._runner.publish_from_snapshots(
+            snaps, todo,
+            node_name=batch.node_name,
+            graph_walk=batch.step_context.graph_walk,
+        )
+        for rid in todo:
+            per_key = published.get(rid) or {}
+            batch.resource_publish_info[rid] = per_key
+            info = batch.per_request_info.get(rid)
+            if info is not None and per_key:
+                info.update_publish_info(per_key)
 
     def finalize_stopped_requests(
         self,
@@ -1437,7 +1541,7 @@ class Engine:
         )
         outputs: dict[str, NameToTensorList] = {}
 
-        self._merge_per_rid(
+        row_clones, row_views = self._merge_per_rid(
             outputs, raw_outputs, request_ids, out_ids, submodule, req_info,
         )
         self._merge_unpacked(
@@ -1446,10 +1550,15 @@ class Engine:
         )
         return BatchedModelOutput(
             per_rid_outputs=outputs,
-            check_stop_buffers=raw_outputs.clone_check_stop_buffers(),
+            # the stop buffer that is a row output shares its clone: one copy
+            # of the sampled tokens per step, not two
+            check_stop_buffers=raw_outputs.clone_check_stop_buffers(
+                reuse=row_clones,
+            ),
             # row i is request_ids[i] as the forward ran them, not the
             # worker's later-rewritten request list
             row_request_ids=tuple(request_ids),
+            row_views=row_views,
         )
 
     def _merge_per_rid(
@@ -1460,14 +1569,39 @@ class Engine:
         out_ids: list[str],
         submodule: NodeSubmodule,
         req_info: Mapping[str, CurrentForwardPassInfo],
-    ) -> None:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[torch.Tensor, ...]] | None]:
         """Fold the forward's per-rid entries into ``outputs``.
 
         ``row_outputs`` are cloned once for the batch and handed out as row
         views; per-rid entries are cloned individually after
         ``filter_batched_output``. A name in both resolves to the per-rid one.
+        Returns the row clones so the caller can share them, and on the
+        rows-only path the views themselves (name -> views, row i for
+        ``request_ids[i]``), which the store describes without reading each.
         """
         row_clones = raw_outputs.clone_row_outputs(len(request_ids))
+        # The common decode case: only row outputs, and a submodule that does
+        # not filter per request. One ``split`` per output makes every row
+        # view in a single call, the same ``tensor[i:i+1]`` views the loop
+        # below would slice one at a time, and the per-rid dicts are built
+        # without the candidate/from_rows bookkeeping.
+        if (
+            not raw_outputs.per_rid_outputs
+            and type(submodule).filter_batched_output
+            is NodeSubmodule.filter_batched_output
+        ):
+            row_views = {
+                name: tensor.split(1)
+                for name, tensor in row_clones.items()
+                if isinstance(tensor, torch.Tensor) and tensor.dim()
+            }
+            if row_views:
+                for i, rid in enumerate(request_ids):
+                    merged = outputs.setdefault(rid, {})
+                    for name, views in row_views.items():
+                        if i < len(views):
+                            merged[name] = [views[i]]
+            return row_clones, (row_views or None)
         for i, (rid, out_id) in enumerate(
             zip(request_ids, out_ids, strict=False)
         ):
@@ -1500,6 +1634,7 @@ class Engine:
                     merged[key] = [value.clone()]
                 else:
                     merged[key] = value
+        return row_clones, None
 
     def _merge_unpacked(
         self,
@@ -1515,6 +1650,13 @@ class Engine:
         A captured region can't do this itself: the per-request slice ends
         depend on the real seq_lens, which only reach it through the plan.
         """
+        if (
+            not raw_outputs.packed_outputs
+            and type(submodule).unpack_packed_outputs
+            is NodeSubmodule.unpack_packed_outputs
+        ):
+            # nothing packed and the base no-op: skip the per-rid lengths
+            return
         unpacked = submodule.unpack_packed_outputs(
             static_output=raw_outputs.packed_outputs,
             request_ids=request_ids,
@@ -1709,7 +1851,14 @@ class Engine:
         )
         if step is None:
             return False
-        if batch.inputs is not None:
+        if batch.inputs is not None or (
+            not submodule_mgmt.piecewise_runners
+            and submodule_mgmt.submodule.step_is_input_free(
+                batch.step_context.graph_walk,
+            )
+        ):
+            # exec drives this step as declared here (its admit ran as
+            # pre_admit), instead of declaring and admitting again
             batch.step = step
 
         batch.step_context.is_preplan = True
@@ -1752,6 +1901,10 @@ class Engine:
                 mark(f"engine.preplan_discarded.{batch.node_name}")
             batch.preplan_event = None
             batch.preplanned_rids = None
+            if batch.inputs is None:
+                # declared over template rows for a step that is now stale:
+                # exec declares again over the real ones
+                batch.step = None
             lease = batch.step_context.slot_lease
             cg_runner = self._submodules[batch.node_name].cuda_graph_runner
             if lease is not None and cg_runner is not None:

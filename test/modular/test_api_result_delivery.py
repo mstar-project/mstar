@@ -235,3 +235,71 @@ def test_stream_carries_error_as_final_chunk():
     chunks = asyncio.run(_collect())
     assert [c.modality for c in chunks] == ["text", "error"]
     assert chunks[-1].metadata["status"] == 500
+
+
+def test_a_chunk_from_another_thread_wakes_the_stream_at_once():
+    """The handler sleeps on an event the message thread sets, so a chunk is
+    delivered without waiting out a poll interval (the backstop is 50 ms)."""
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    req = _pending_request()
+    server.pending_requests["r4"] = req
+
+    async def _collect():
+        loop = asyncio.get_running_loop()
+        times = []
+
+        def producer():
+            time.sleep(0.2)
+            for i in range(3):
+                time.sleep(0.15)
+                with server.request_lock:
+                    req.chunks.append(ResultChunk(request_id="r4", modality="text", data=f"c{i}".encode()))
+                    req.notify()
+                times.append(time.perf_counter())
+            time.sleep(0.15)
+            with server.request_lock:
+                req.event.set()
+                req.notify()
+
+        threading.Thread(target=producer, daemon=True).start()
+        got = []
+        async for chunk in server.iter_result_chunks("r4"):
+            got.append((chunk.data, time.perf_counter()))
+        del loop
+        return got, times
+
+    got, times = asyncio.run(_collect())
+    assert [d for d, _ in got] == [b"c0", b"c1", b"c2"]
+    # each chunk reached the handler within the 50 ms backstop, not a poll later
+    for (_, t_got), t_put in zip(got, times, strict=True):
+        assert t_got - t_put < 0.05, f"chunk took {1000 * (t_got - t_put):.1f} ms"
+
+
+def test_notify_many_wakes_every_handler_with_one_loop_call():
+    """A pass that delivered chunks to many requests wakes their handlers
+    through one call into the loop, and skips requests with no handler."""
+    from mstar.api_server.entrypoint import notify_many
+
+    class _Loop:
+        def __init__(self):
+            self.calls = []
+
+        def call_soon_threadsafe(self, fn, *args):
+            self.calls.append((fn, args))
+            fn(*args)
+
+    class _Closed:
+        def call_soon_threadsafe(self, fn, *args):
+            raise RuntimeError("Event loop is closed")
+
+    loop = _Loop()
+    reqs = [_pending_request() for _ in range(4)]
+    for req in reqs[:3]:
+        req.loop, req.wake = loop, asyncio.Event()
+    reqs[3].loop, reqs[3].wake = _Closed(), asyncio.Event()
+    orphan = _pending_request()  # no handler attached yet
+    notify_many(reqs + [orphan])
+    assert len(loop.calls) == 1
+    assert all(req.wake.is_set() for req in reqs[:3])
+    assert not reqs[3].wake.is_set()

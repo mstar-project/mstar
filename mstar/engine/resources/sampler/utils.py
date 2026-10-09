@@ -1327,6 +1327,8 @@ class SamplerBuffers:
     _static_key: dict[int, tuple[tuple[str, ...], int, int]] = field(
         default_factory=dict, repr=False
     )
+    # (padded_bs, cg slot) -> the sampler over that slot's views; see sampler_for
+    _samplers: dict = field(default_factory=dict, repr=False)
 
     @property
     def tracks_seen_tokens(self) -> bool:
@@ -1596,16 +1598,18 @@ class SamplerBuffers:
         update, never step to step.
 
         Skipped when ``cg_slot`` last gathered this same batch and no master row
-        changed since. Never skipped with a slot awaiting init, which also
-        catches a request id re-registered onto a new slot."""
+        changed since. Never skipped while a row of this batch awaits init,
+        which also catches a request id re-registered onto a new slot. Slots
+        awaiting init that belong to requests outside the batch (registered,
+        still queued) do not block the skip: their rows are not read here, and
+        their init runs on the gather that first includes them."""
         rids = tuple(request_ids)
-        if (
-            not self._pending_init
-            and self._static_key.get(cg_slot)
-            == (rids, padded_bs, self._config_version)
-        ):
-            self._last_real_bs[cg_slot] = len(request_ids)
-            return
+        if self._static_key.get(cg_slot) == (rids, padded_bs, self._config_version):
+            pending = self._pending_init
+            get = self._rid_to_slot.get
+            if not pending or not any(get(rid) in pending for rid in request_ids):
+                self._last_real_bs[cg_slot] = len(request_ids)
+                return
         self._stage_slot_idx(request_ids, padded_bs, cg_slot)
         # H2D copies only (pre-plan, see HostBuffer); gather_dynamic uploads
         # the device-side index row
@@ -1645,8 +1649,18 @@ class SamplerBuffers:
 
     def sampler_for(self, padded_bs: int, cg_slot: int) -> "CudaGraphableSampler":
         """A sampler bound to ``cg_slot``'s per-step buffer views (zero-copy).
-        Valid regardless of when the buffers are (re)gathered into."""
-        return CudaGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
+        Valid regardless of when the buffers are (re)gathered into.
+
+        Cached per (bucket, slot): the per-step buffers are allocated once and
+        never rebound, so the views are the same every step, and the sampler
+        itself keeps no per-step state the next step could read."""
+        key = (padded_bs, cg_slot)
+        sampler = self._samplers.get(key)
+        if sampler is None:
+            sampler = CudaGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
+            self._samplers[key] = sampler
+        sampler.applied_penalty_in_graph = False
+        return sampler
 
     def scatter_offset(self, cg_slot: int = 0) -> None:
         """Persist the (in-graph advanced) per-step offsets back to their slot

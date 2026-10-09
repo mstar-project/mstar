@@ -295,10 +295,49 @@ Worker scheduling
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
        thread.
+   * - ``MSTAR_QWEN35_DECODE_BUCKETS``
+     - ``1,2,4,8,16,32,48,64,96,128``
+     - The decode batch sizes Qwen3.5 captures as CUDA graphs. A decode step
+       runs at the smallest bucket that holds its rows, so the ladder bounds
+       both the rows per step and the graph memory; narrow it (for example
+       ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
+       former ladder.
+   * - ``MSTAR_EARLY_SPEC``
+     - ``1``
+     - Build and pre-plan step N+2 while N+1 runs, between the stop and
+       routing halves of step N's post-processing, so the pre-plan overlaps
+       work the main thread does anyway instead of the next launch. ``0``
+       builds each speculation at the top of the next iteration, after the
+       whole post-processing, which left the plan thread idle during it.
+       Non-parallel (TP1) nodes only; a tensor-parallel node keeps the old
+       order so the followers see heads in the order they settle them.
+   * - ``MSTAR_LAZY_PUBLISH``
+     - ``1``
+     - Publish resource state (KV pages, positions) only for the requests
+       whose frame or completion carries it: ``finalize_batch`` keeps a
+       cheap per-request snapshot and the worker finishes it on demand.
+       ``0`` builds the full publication for every request on every step,
+       the old behaviour; it was a quarter of the GPU thread's host time at
+       batch 32 in a decode loop that never reads it.
    * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
        other ready work.
+   * - ``MSTAR_SPEC_YIELD_HOLD_MS``
+     - ``0``
+     - How long (ms) the speculative decode loop keeps going after another
+       step becomes ready, typically the prefill of requests that just
+       arrived. With ``0`` the loop yields at the next iteration and every
+       arrival tends to get a prefill step of its own; a hold of a few
+       milliseconds lets the arrivals of that window prefill together, which
+       is worth decode throughput at high concurrency and costs up to that
+       much time to first token.
+   * - ``MSTAR_RUST_SEND_TIMING``
+     - unset
+     - ``1`` makes the Rust runtime print, every 500 calls, how long the
+       worker's per-step send spends in its own work against the whole call
+       (which includes taking the GIL back when the send had to release it).
+       A diagnostic for the host-overhead work; off by default.
    * - ``MSTAR_SPEC_PEEK_FOR_FAIRNESS``
      - ``1``
      - Yield the speculation chain only when another (node, walk) is

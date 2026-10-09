@@ -535,7 +535,7 @@ class KVManager(AttentionResource):
         if (
             self._index is None
             or ctx.capture
-            or segment.request_id not in ctx.request_ids
+            or not ctx.is_real_row(segment.request_id)
             or chain is None
         ):
             return
@@ -676,6 +676,10 @@ class KVManager(AttentionResource):
         tail = list((overrides.prefix_tail or {}).get(label) or ())
         stream.chain = PrefixChain.seed(keys, tail, self.config.page_size)
 
+    @property
+    def keys_prefix_chains(self) -> bool:
+        return self._index is not None
+
     def extend_prefix_chain(
         self, rid: str, node_name: str, graph_walk: str, outputs,
     ) -> None:
@@ -701,6 +705,43 @@ class KVManager(AttentionResource):
                 stream.chain = None
                 return
             stream.chain.extend(sampled[0].flatten().tolist(), self.config.page_size)
+
+    def extend_prefix_chains_batch(
+        self, request_ids: list[str], node_name: str, graph_walk: str,
+        host_rows,
+    ) -> None:
+        """``extend_prefix_chain`` for a step, from the stop check's row
+        buffers (``HostRows``: row i of every buffer belongs to
+        ``host_rows.request_ids[i]``). One lock, one ``tolist`` per buffer
+        instead of one per request."""
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        buffers = host_rows.buffers
+        rows_of: dict[str, list] = {}
+        page_size = self.config.page_size
+        with self._lock:
+            for rid in request_ids:
+                label = self._keyed_label(rid, node_name, graph_walk)
+                if label is None:
+                    continue
+                tensor = (self._overrides[rid].prefix_decode or {}).get(label)
+                if not tensor:
+                    continue
+                rows = rows_of.get(tensor)
+                if rows is None:
+                    buf = buffers.get(tensor)
+                    if not torch.is_tensor(buf) or buf.dim() == 0:
+                        continue
+                    rows = rows_of[tensor] = buf.reshape(buf.shape[0], -1).tolist()
+                i = row_of.get(rid)
+                if i is None or i >= len(rows):
+                    continue
+                stream = self._streams.get(rid, {}).get(label)
+                if stream is None or stream.chain is None or stream.chain.unkeyed is None:
+                    continue
+                if stream.released:
+                    stream.chain = None
+                    continue
+                stream.chain.extend(rows[i], page_size)
 
     def _release_lease(self, stream: CacheStream) -> None:
         """Give back a lease `admit` never converted; a converted one is released
@@ -865,7 +906,10 @@ class KVManager(AttentionResource):
         # moved — re-admitting it allocates nothing and re-copies nothing.
         # A post-fork copies the source *after* this step's spans land, so its
         # reservation covers them.
-        growth = self._label_growth(step) if step.commit else {}
+        # only a post-fork reads the growth, so a decode step does not build it
+        growth = (
+            self._label_growth(step) if step.commit and step.post_forks else {}
+        )
         forks = [(pre, 0) for pre in step.pre_forks] + [
             (post, growth) for post in step.post_forks
         ]
@@ -923,6 +967,7 @@ class KVManager(AttentionResource):
                         self._admit_reserved_pages.setdefault(
                             (rid, to_label), []).extend(alloc_res.new_pages)
 
+            page_size = self.config.page_size
             for segment in step.segments:
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
@@ -930,10 +975,16 @@ class KVManager(AttentionResource):
                 if segment.span == 0 or ctx.is_padding_row(segment.request_id):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
+                seq_len = segment.span + stream.stored_len
+                # the common decode row: its pages already cover the token it
+                # appends, so there is nothing to acquire and nothing to record
+                if (
+                    not stream.offloaded
+                    and len(stream.page_indices) * page_size >= seq_len
+                ):
+                    continue
                 alloc_res = self._alloc(
-                    segment.request_id,
-                    segment.label,
-                    segment.span + stream.stored_len
+                    segment.request_id, segment.label, seq_len,
                 )
                 if not alloc_res.success:
                     return AdmitOutcome(ok=False, reason=alloc_res.error)
@@ -1306,6 +1357,10 @@ class KVManager(AttentionResource):
         self._cached_plan_output = None
 
     def commit(self, step: KVStep, ctx: StepContext):
+        streams = self._streams
+        retention = step.retention
+        # the index only sees real rows of a non-capture step; checked once
+        index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
             # committed, so there is nothing left to unwind
@@ -1313,7 +1368,7 @@ class KVManager(AttentionResource):
             for segment in step.segments:
                 if ctx.is_padding_row(segment.request_id):
                     continue  # ran against SINK_PAGE, holds nothing
-                stream = self._streams[segment.request_id][segment.label]
+                stream = streams[segment.request_id][segment.label]
                 # cleared before the `step.commit` test: a step that keeps no
                 # tokens (image_gen, action_gen) still read these pages, and
                 # leaving the mark set would make the request unevictable
@@ -1333,10 +1388,14 @@ class KVManager(AttentionResource):
                     stream.stored_len += segment.span
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
-                    policy = step.retention.get((segment.request_id, segment.label))
+                    policy = (
+                        retention.get((segment.request_id, segment.label))
+                        if retention else None
+                    )
                     if policy is not None:
                         self._adopt_retention(stream, policy, segment)
-                    self._index_filled_pages(segment, stream, ctx)
+                    if index_on and stream.chain is not None:
+                        self._index_filled_pages(segment, stream, ctx)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
@@ -1770,6 +1829,112 @@ class KVManager(AttentionResource):
     ):
         return self.publish(
             request_id, node_name=node_name, graph_walk=graph_walk,
+        )
+
+    def publish_snapshot_batch(
+        self,
+        request_ids: list[str],
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> list:
+        """``publish_snapshot_for_step`` for a batch: one lock acquisition and
+        a plain loop, which is what the gpu thread can afford per row."""
+        out = []
+        append = out.append
+        streams_of = self._streams.get
+        overrides_of = self._overrides.get
+        with self._lock:
+            for request_id in request_ids:
+                streams = streams_of(request_id)
+                overrides = overrides_of(request_id)
+                if streams is None or overrides is None:
+                    append(None)
+                    continue
+                labels = overrides.get_publish_labels(
+                    node_name, graph_walk, list(streams), final=False,
+                )
+                if not labels:
+                    append(None)
+                    continue
+                snap = []
+                for label in labels:
+                    stream = streams.get(label)
+                    if stream is not None:
+                        snap.append((
+                            label, stream.stored_len, len(stream.page_indices),
+                            stream.reset_generation,
+                        ))
+                append(tuple(snap) if snap else None)
+        return out
+
+    def publish_snapshot_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        """Per label the length, page count and generation ``publish`` would
+        export now. The page list itself is copied only when the publication
+        is finished, which in a steady decode loop is never: this ran for every
+        request on every step and was a quarter of the gpu thread's host time.
+        """
+        with self._lock:
+            streams = self._streams.get(request_id)
+            overrides = self._overrides.get(request_id)
+            if streams is None or overrides is None:
+                return None
+            labels = overrides.get_publish_labels(
+                node_name, graph_walk, list(streams), final=False,
+            )
+            if not labels:
+                return None
+            snap = tuple(
+                (label, stream.stored_len, len(stream.page_indices),
+                 stream.reset_generation)
+                for label in labels
+                if (stream := streams.get(label)) is not None
+            )
+        return snap or None
+
+    def publish_from_snapshot(
+        self,
+        request_id: str,
+        snapshot,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        """``publish`` as of the snapshot: the lengths are the snapshot's, so a
+        step that committed in between (the next one is already running when
+        the worker finishes a publication) does not leak into it."""
+        del node_name, graph_walk
+        if not snapshot:
+            return None
+        with self._lock:
+            streams = self._streams.get(request_id)
+            if streams is None:
+                return None
+            seq_info = {}
+            for label, seq_len, num_pages, reset_generation in snapshot:
+                stream = streams.get(label)
+                if stream is None:
+                    continue
+                pages = list(stream.page_indices[:num_pages])
+                seq_info[label] = KVSequenceInfo(
+                    seq_len=seq_len,
+                    latest_kv_transfer_info=self._transfer.get_kv_transfer_info(
+                        request_id=request_id,
+                        label=label,
+                        page_indices=pages,
+                        seq_len=seq_len,
+                        reset_generation=reset_generation,
+                    ),
+                    page_indices=pages,
+                    reset_generation=reset_generation,
+                )
+        if not seq_info:
+            return None
+        return PublishedKVInfo.build_for_rank(
+            rank=self._rank, world_size=self._world_size, seq_info=seq_info,
         )
 
     def publish_after_stop(

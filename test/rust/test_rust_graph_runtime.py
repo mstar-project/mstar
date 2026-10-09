@@ -459,6 +459,20 @@ def test_dynamic_loop_iters_for_an_unknown_partition_are_empty(runtime):
     assert runtime.get_dynamic_loop_iters([rid], "nope").values == [{}]
 
 
+def test_update_dynamic_loop_iters_matches_the_per_rid_form(runtime):
+    from types import SimpleNamespace
+    rid = _admit(runtime)
+    infos = {rid: SimpleNamespace(dynamic_loop_iter_counts={"stale": 7})}
+    runtime.update_dynamic_loop_iters(infos, "default")
+    expect = dict(runtime.get_dynamic_loop_iters([rid], "default").values[0])
+    expect["stale"] = 7
+    assert infos[rid].dynamic_loop_iter_counts == expect
+    infos = {rid: SimpleNamespace(dynamic_loop_iter_counts={})}
+    runtime.update_dynamic_loop_iters(infos, "nope")
+    assert infos[rid].dynamic_loop_iter_counts == {}
+    runtime.update_dynamic_loop_iters({}, "default")
+
+
 # --- scheduling --------------------------------------------------------------
 
 def test_a_ready_node_is_reported(runtime):
@@ -904,3 +918,110 @@ def test_a_local_only_batch_sends_nothing_to_peers(runtime):
 
     peers = [e for e, _ in rec.sent if e not in ("conductor", "api_server")]
     assert peers == []
+
+
+# --- inline emit -------------------------------------------------------------
+
+def _client_loop_runtime():
+    """A decode node whose token goes back to itself AND to the client."""
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+    section = Sequential(sections=[
+        GraphNode(
+            name="prefill", input_names={"prompt"},
+            outputs=[GraphEdge(name="token", next_node="dec")],
+        ),
+        Loop(
+            name="loop",
+            section=GraphNode(
+                name="dec", input_names={"token"},
+                outputs=[
+                    GraphEdge(name="token", next_node="dec"),
+                    GraphEdge(name="token", next_node=EMIT_TO_CLIENT, output_modality="text"),
+                ],
+            ),
+            outputs=[],
+            max_iters=50,
+        ),
+    ])
+    wg = WorkerGraph(section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID)
+    book = RustTensorBookkeeping()
+    rt = rust_runtime.RustGraphRuntime(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: {"loop"}},
+        all_wg_ids_to_nodes={WG_ID: {"prefill", "dec"}},
+        node_to_partition={"prefill": "default", "dec": "default"},
+        sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+        bookkeeping=book,
+    )
+    rt._bookkeeping_for_test = book
+    return rt
+
+
+def _run_dec_step(rt, rid, uuid, inline_value=None):
+    bk = rt._bookkeeping_for_test
+    bk.put_tensor(uuid, _tensor_info(uuid))
+    bk.increment_ref(uuid, 1)  # the worker's safety hold
+    kwargs = {}
+    if inline_value is not None:
+        kwargs = dict(inline_signal="token", inline_values=[inline_value])
+    return rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="dec",
+        output_signals=["token"],
+        wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[uuid], num_tensors=[1], **kwargs,
+    ))
+
+
+def _reach_dec(rt, rid, uuid):
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
+    rt.pop_rids("prefill", WALK, [rid])
+    bk = rt._bookkeeping_for_test
+    bk.put_tensor(uuid, _tensor_info(uuid))
+    bk.increment_ref(uuid, 1)
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="prefill",
+        output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[uuid], num_tensors=[1],
+    ))
+    rt.send_outputs(_send_input(rid, out.completion_id))
+    rt.pop_rids("dec", WALK, [rid])
+
+
+def test_the_rust_runtime_offers_inline_emit():
+    assert rust_runtime.RustGraphRuntime.supports_inline_emit is True
+    assert rust_runtime_base.GraphRuntime.supports_inline_emit is False
+
+
+def test_an_inline_emit_is_not_staged_for_the_client():
+    rt = _client_loop_runtime()
+    rid = _admit(rt)
+    rt._communicator = _Recorder()
+    _reach_dec(rt, rid, 100)
+    # the tensor path stages the client's copy
+    out = _run_dec_step(rt, rid, 101)
+    assert 101 in out.register_uuids
+    rt.send_outputs(_send_input(rid, out.completion_id))
+    rt.pop_rids("dec", WALK, [rid])
+    # the inline path does not: the value rides in the frame
+    out = _run_dec_step(rt, rid, 102, inline_value=151645)
+    assert 102 not in out.register_uuids
+    rt.send_outputs(_send_input(rid, out.completion_id))
+    # the loop-back still fed the node, so the next step is ready
+    assert rt.pop_rids("dec", WALK, [rid]) is not None
+
+
+def test_inline_values_must_cover_every_rid_or_are_ignored():
+    rt = _client_loop_runtime()
+    rid = _admit(rt)
+    _reach_dec(rt, rid, 200)
+    bk = rt._bookkeeping_for_test
+    bk.put_tensor(201, _tensor_info(201))
+    bk.increment_ref(201, 1)
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="dec",
+        output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[201], num_tensors=[1], inline_signal="token", inline_values=[],
+    ))
+    assert 201 in out.register_uuids, "no values, so the tensor path"
+    rt.send_outputs(_send_input(rid, out.completion_id))

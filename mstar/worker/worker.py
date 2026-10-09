@@ -206,6 +206,67 @@ class EvictionPolicy(Enum):
     # resource to consult.
 
 
+@dataclass
+class _PostprocessState:
+    """What the first half of post-processing (stops, store, route) hands the
+    send stage."""
+    cpu_outputs: dict
+    host_rows: "HostRows | None"
+    buffered_publish: set[int]
+    route_output: object = None
+    rids: list = field(default_factory=list)
+    signals: object = None
+    flat_rids: list = field(default_factory=list)
+    flat_uuids: list = field(default_factory=list)
+    signal_idxs: object = None
+
+
+class _LazyPerRid:
+    """``Worker._rows_to_per_rid`` on demand: the per-rid host dicts are built
+    the first time a consumer reads them. The batched stop check, the row store
+    and the inline emit read the rows directly, so in the common decode step
+    nobody does, and the per-request dicts are never built."""
+
+    __slots__ = ("_host", "_request_ids", "_built")
+
+    def __init__(self, host: dict, request_ids: list[int]):
+        self._host = host
+        self._request_ids = request_ids
+        self._built: dict | None = None
+
+    def _dict(self) -> dict:
+        if self._built is None:
+            self._built = Worker._rows_to_per_rid(self._host, self._request_ids)
+        return self._built
+
+    def get(self, key, default=None):
+        return self._dict().get(key, default)
+
+    def __getitem__(self, key):
+        return self._dict()[key]
+
+    def __contains__(self, key) -> bool:
+        return key in self._dict()
+
+    def __iter__(self):
+        return iter(self._dict())
+
+    def __len__(self) -> int:
+        return len(self._request_ids)
+
+    def __bool__(self) -> bool:
+        return bool(self._request_ids)
+
+    def items(self):
+        return self._dict().items()
+
+    def keys(self):
+        return self._dict().keys()
+
+    def values(self):
+        return self._dict().values()
+
+
 class Worker:
     """
     Real worker that integrates RequestStateManager, EngineManager,
@@ -433,6 +494,9 @@ class Worker:
         #   speculation; REMOVE_REQUEST for these is deferred.
         # _pending_removes: deferred REMOVE_REQUESTs.
         self._in_flight_rids: set[int] = set()
+        # rids of a speculation built and armed ahead (early speculation);
+        # kept in flight so a REMOVE for them is deferred until it ran
+        self._armed_spec_rids: set[int] = set()
         self._pending_removes: set[int] = set()
 
         # step seq -> rids rank 0 released after that step, held until this rank
@@ -1562,6 +1626,23 @@ class Worker:
             for edge_name, sbuf in req_info.stream_buffers.items()
         }
 
+    def _stream_consumption_batch(
+        self, rids: list[int],
+    ) -> list[tuple[int, dict[str, int]]]:
+        """``_stream_consumption`` for the rids that have stream buffers at
+        all; the rest would report an empty dict."""
+        infos = self.request_state.per_request_info
+        out: list[tuple[int, dict[str, int]]] = []
+        for rid in rids:
+            req_info = infos.get(rid)
+            if req_info is None or not req_info.stream_buffers:
+                continue
+            out.append((rid, {
+                edge_name: sbuf._consumed
+                for edge_name, sbuf in req_info.stream_buffers.items()
+            }))
+        return out
+
     def _profiling_payloads(self, rids: list[int]) -> ParallelList:
         """rx/tx/timings for each rid's WORKER_GRAPHS_DONE."""
         return ParallelList(rids, [
@@ -2670,6 +2751,23 @@ class Worker:
         self, batch_N: PendingBatch,
         outputs: BatchedModelOutput,
     ):
+        """Both halves back to back: the stop decisions, then the routing."""
+        state = self._postprocess_batch_stops(batch_N, outputs)
+        if state is not None:
+            self._postprocess_batch_send(batch_N, outputs, state)
+
+    def _postprocess_batch_stops(
+        self, batch_N: PendingBatch,
+        outputs: BatchedModelOutput,
+    ) -> "_PostprocessState | None":
+        """Post-processing N up to and including the routing: reclaim its
+        inputs, apply the stops decided a step ago, pull the sampled tokens to
+        the host, decide this step's stops, publish what stopped, store and
+        route the outputs (which advances the loop counters). Returns None when
+        nothing is left to send. The send stage is ``_postprocess_batch_send``;
+        the split lets the loop build the next speculation in between, once
+        N's stops and loop counters are settled and while N+1 runs.
+        """
         # Stage stopwatch named like the NVTX ranges below; a clock stamp, not
         # a nested `_span`, because of the two early returns.
         _pp_t = _time.perf_counter() if self._phase_period else 0.0
@@ -2717,7 +2815,7 @@ class Worker:
         if not valid_rids:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
-            return
+            return None
 
         # pending stops are only needed for one iteration, so can be cleared now
         self._graph_runtime.clear_pending_loop_stops()
@@ -2780,7 +2878,7 @@ class Worker:
                 "worker.postprocess.check_stop", _time.perf_counter() - _t_stop,
             )
         # the same host copy, before stops, so a request ending here still indexes its pages
-        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs)
+        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
 
         # Stream-terminated loop: a stream-consuming node inside a loop has no
         # internal stop signal (unlike a self-EOS loop), so when it consumes the
@@ -2808,7 +2906,7 @@ class Worker:
             if not batch_N.node_batch.request_ids:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
-                return
+                return None
 
         _pp_stage("check_stop")
         if self.enable_nvtx:
@@ -2835,22 +2933,27 @@ class Worker:
 
         # Ordinary publication precedes stop detection on the GPU thread.
         # Export final-only state now, after the last iteration committed and
-        # before routing reports the completed loop to the conductor.
+        # before routing reports the completed loop to the conductor. The
+        # ordinary publication of a stopping request is finished first, so the
+        # completion carries both, as it did when every step published.
         if stopped_rids:
+            engine.materialize_publish(batch_N.node_batch, stopped_rids)
             engine.finalize_stopped_requests(batch_N.node_batch, stopped_rids)
 
         # CurrentForwardPassInfo also contains publication inherited from peer
         # ranks. Buffer only what this worker produced for the conductor.
-        for rid in batch_N.node_batch.request_ids:
-            self.request_state.buffer_publish_info(
-                rid,
-                batch_N.partition,
-                batch_N.node_batch.resource_publish_info.get(rid, {}),
-            )
+        buffered_publish: set[int] = set()
+        for rid, published in batch_N.node_batch.resource_publish_info.items():
+            if published:
+                self.request_state.buffer_publish_info(
+                    rid, batch_N.partition, published,
+                )
+                buffered_publish.add(rid)
 
         _pp_stage("stop_loops")
         if self.enable_nvtx:
             range_pop(synchronize=False)
+        if self.enable_nvtx:
             range_push("worker.postprocess.route_outputs", synchronize=False)
         # Store this batch's output tensors, then hand the runtime their
         # uuids. The store keeps the descriptors, so routing needs no
@@ -2869,13 +2972,24 @@ class Worker:
         # Pass the stop check's host copies so a host-memory transport needn't
         # copy the rows again. They are views of pinned buffers the next step
         # reuses; safe because the sends below are their last reader.
-        stored = self.tensor_manager.store_and_return_tensor_info_batch(
-            rids, outputs, signals,
-            node_name=batch_N.node_name,
-            graph_walk=batch_N.graph_walk,
-            skip_cuda_sync=True,
-            cpu_tensors=cpu_outputs,
-        )
+        # Row views of one batch clone (a decode step) are described from one
+        # row; anything else goes through the general per-tensor path.
+        stored = None
+        if outputs.row_views and outputs.row_request_ids is not None:
+            stored = self.tensor_manager.store_row_outputs_batch(
+                rids, outputs, signals, outputs.row_views, outputs.row_request_ids,
+                node_name=batch_N.node_name,
+                graph_walk=batch_N.graph_walk,
+                host_rows=host_rows,
+            )
+        if stored is None:
+            stored = self.tensor_manager.store_and_return_tensor_info_batch(
+                rids, outputs, signals,
+                node_name=batch_N.node_name,
+                graph_walk=batch_N.graph_walk,
+                skip_cuda_sync=True,
+                cpu_tensors=cpu_outputs,
+            )
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
         signal_idxs = stored.signal_idxs
@@ -2894,6 +3008,9 @@ class Worker:
 
         # The graph runtime's own share of postprocess: the routing call.
         _t_route = _time.perf_counter() if self._phase_period else 0.0
+        inline_signal, inline_values = self._inline_emit_values(
+            engine, batch_N, host_rows, rids, signals,
+        )
         route_output = self._graph_runtime.complete_and_route_batch(
             RouteInput(
                 partition=batch_N.partition,
@@ -2906,6 +3023,8 @@ class Worker:
                 ),
                 tensors=flat_uuids,
                 num_tensors=num_tensors,
+                inline_signal=inline_signal,
+                inline_values=inline_values,
             ),
         )
         if self._phase_period:
@@ -2913,11 +3032,9 @@ class Worker:
                 "worker.postprocess.route", _time.perf_counter() - _t_route,
             )
 
-        per_request_info = batch_N.node_batch.per_request_info
-        for rid, new_iters in self._graph_runtime.get_dynamic_loop_iters(
-            list(per_request_info), partition=batch_N.partition,
-        ):
-            per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
+        self._graph_runtime.update_dynamic_loop_iters(
+            batch_N.node_batch.per_request_info, batch_N.partition,
+        )
 
         # Normally empty: cleanup_consumed_inputs ran above and took them. Not
         # empty if a completion ever precedes it, and then nobody else will.
@@ -2931,6 +3048,36 @@ class Worker:
         with self._span("worker.postprocess.register_outputs"):
             self._register_outputs(route_output)
         _pp_stage("register_outputs")
+
+        return _PostprocessState(
+            cpu_outputs=cpu_outputs, host_rows=host_rows,
+            buffered_publish=buffered_publish, route_output=route_output,
+            rids=rids, signals=signals, flat_rids=flat_rids,
+            flat_uuids=flat_uuids, signal_idxs=signal_idxs,
+        )
+
+    def _postprocess_batch_send(
+        self, batch_N: PendingBatch,
+        outputs: BatchedModelOutput,
+        state: "_PostprocessState",
+    ) -> None:
+        """The last stage of post-processing N: the frames to peers, the
+        api server and the conductor. Split off so the loop can build the next
+        speculation before it, once N's routing advanced the loop counters."""
+        del outputs
+        route_output = state.route_output
+        rids, signals = state.rids, state.signals
+        flat_rids, flat_uuids, signal_idxs = state.flat_rids, state.flat_uuids, state.signal_idxs
+        buffered_publish = state.buffered_publish
+        engine = self.engine_manager.get_engine(batch_N.node_name)
+        _pp_t = _time.perf_counter() if self._phase_period else 0.0
+        def _pp_stage(name: str) -> None:
+            nonlocal _pp_t
+            if not self._phase_period:
+                return
+            now = _time.perf_counter()
+            self._phase_buf[f"worker.postprocess.{name}"].append(now - _pp_t)
+            _pp_t = now
 
         # send outputs
         if self.enable_nvtx:
@@ -2984,6 +3131,26 @@ class Worker:
             send_rids if needs_info is None
             else [rid for rid in send_rids if rid in needs_info]
         )
+        # A frame to a peer or the conductor carries this step's publication:
+        # finish the snapshot for those rids (the stopped ones already are).
+        if info_rids:
+            engine.materialize_publish(batch_N.node_batch, info_rids)
+            for rid in info_rids:
+                if rid in buffered_publish:
+                    continue
+                published = batch_N.node_batch.resource_publish_info.get(rid)
+                if published:
+                    self.request_state.buffer_publish_info(
+                        rid, batch_N.partition, published,
+                    )
+                    buffered_publish.add(rid)
+        # Only the rids with something to report cross: a decode step has no
+        # new-token counts (the inline token is not counted) and no stream
+        # buffers, and an empty entry per rid cost a dict each to build and to
+        # extract on the runtime side. A rid left out gets nothing added,
+        # which is what an empty entry did.
+        ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
+        consumed = self._stream_consumption_batch(send_rids)
         send_input = SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
@@ -2994,12 +3161,10 @@ class Worker:
                 ],
             ),
             new_token_counts=ParallelList(
-                send_rids,
-                [new_token_counts.get(rid, {}) for rid in send_rids],
+                ntc_rids, [new_token_counts[rid] for rid in ntc_rids],
             ),
             stream_tokens_consumed=ParallelList(
-                send_rids,
-                [self._stream_consumption(rid) for rid in send_rids],
+                [rid for rid, _ in consumed], [c for _, c in consumed],
             ),
             profiling=self._profiling_payloads(send_rids) if self.enable_prof
             else None,
@@ -3030,6 +3195,37 @@ class Worker:
         _pp_stage("send_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
+
+    def _inline_emit_values(
+        self, engine, batch_N: PendingBatch, host_rows: "HostRows | None",
+        rids: list[int], signals,
+    ) -> tuple[str | None, list[int]]:
+        """The values of a client signal that can ride inline this step.
+
+        Taken off the stop check's host copy, one ``tolist`` for the batch.
+        Every rid must have a row, or the step keeps the tensor path for the
+        whole batch: the runtime applies the values positionally.
+        """
+        if host_rows is None or not self._graph_runtime.supports_inline_emit:
+            return None, []
+        candidates = engine.inline_client_signals(
+            batch_N.node_name, batch_N.graph_walk,
+        )
+        if not candidates:
+            return None, []
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        for signal, buffer_name in candidates.items():
+            if signal not in signals:
+                continue
+            buf = host_rows.buffers.get(buffer_name)
+            if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
+                continue
+            values = buf.reshape(buf.shape[0], -1)[:, 0].tolist()
+            try:
+                return signal, [values[row_of[rid]] for rid in rids]
+            except (KeyError, IndexError):
+                return None, []
+        return None, []
 
     def _get_pinned_d2h_buffer(
         self,
@@ -3150,7 +3346,7 @@ class Worker:
         if outputs.check_stop_buffers is not None and row_rids is not None:
             host = self._d2h_batched(outputs.check_stop_buffers, side)
             return (
-                Worker._rows_to_per_rid(host, row_rids),
+                _LazyPerRid(host, row_rids),
                 HostRows(tuple(row_rids), host),
             )
 
@@ -3254,6 +3450,7 @@ class Worker:
         in_flight: "tuple[PendingBatch | None, ...]",
         batch: ScheduledBatch | None,
         speculation: "Speculation | None" = None,
+        next_speculation: "Speculation | None" = None,
     ) -> None:
         """Fail everything the crashed iteration touched and drain its futures.
 
@@ -3297,7 +3494,19 @@ class Worker:
         if batch is not None:
             failed_rids.update(batch.request_to_worker_graph)
             self._clear_in_flight_flag(batch)
-        if speculation is not None and speculation.plan_future is not None:
+        self._armed_spec_rids = set()
+        for spec in (speculation, next_speculation):
+            if spec is None:
+                continue
+            self._unwind_speculation(spec, failed_rids)
+
+        self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
+
+    def _unwind_speculation(
+        self, speculation: "Speculation", failed_rids: set[int],
+    ) -> None:
+        """Drain an armed speculation's pre-plan and give its fresh rids back."""
+        if speculation.plan_future is not None:
             # Armed but never submitted: the plan thread may still be staging
             # a pre-plan for a step that will now never run. Drain it, then
             # drop the stage, or the next step to lease that slot would find
@@ -3329,8 +3538,6 @@ class Worker:
                 self._graph_runtime.push_back_node(
                     sb.node_name, list(fresh), list(fresh.values()),
                 )
-
-        self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
 
     def _fail_requests(self, errors: dict[int, str]) -> None:
         """Report requests this worker can no longer serve to the conductor.
@@ -3485,13 +3692,139 @@ class Worker:
         spec_peek_for_fairness = (
             os.environ.get("MSTAR_SPEC_PEEK_FOR_FAIRNESS", "1") == "1"
         )
+        # How long the loop keeps speculating once another step is ready, so
+        # that at high concurrency the requests arriving over that window
+        # prefill in one step rather than one step each. 0 yields at once.
+        spec_yield_hold_s = float(os.environ.get("MSTAR_SPEC_YIELD_HOLD_MS", "0")) / 1000.0
+        fairness_ready_since: list[float | None] = [None]
         consecutive_spec_steps = 0
         yield_away_from_target: tuple[str, str] | None = None
+        # Build N+2 while N+1 runs, between the two halves of N's
+        # post-processing: its pre-plan then overlaps the routing half rather
+        # than the next launch. TP1 nodes only; a parallel node keeps the head
+        # broadcast in the order the followers settle it.
+        early_spec = os.environ.get("MSTAR_EARLY_SPEC", "1") == "1"
+        next_speculation: Speculation | None = None
+        next_yield_away: tuple[str, str] | None = None
+        from mstar.utils.profiler import range_pop, range_push
+
+        def _build_speculation(
+            pending: PendingBatch | None, consecutive: int,
+        ) -> tuple[Speculation | None, tuple[str, str] | None]:
+            """Speculate the step after ``pending`` (N+1 from N), or a
+            yield-away batch when fairness says so. Returns the speculation
+            and the (node, walk) to exclude on the non-speculative path."""
+            speculation = None
+            yield_away_from_target = None
+            batch = None
+            admit_refused = (
+                pending is not None
+                and pending.node_batch.admit_error is not None
+            )
+
+            if pending is not None and self._can_speculate(pending.batch):
+                # Fairness check (peek-based, replaces the old iter-
+                # counter cap): only break the spec chain when there's
+                # another (node, walk) actually ready to schedule on
+                # this worker. On single-walk workers (Orpheus LLM,
+                # Orpheus SNAC) this returns False and we always speculate.
+                other_ready = (
+                    spec_peek_for_fairness
+                    and consecutive >= 1
+                    and self.scheduler.has_ready_excluding(
+                        self.request_state,
+                        (pending.node_name, pending.graph_walk),
+                    )
+                )
+                if other_ready:
+                    now = _time.perf_counter()
+                    if fairness_ready_since[0] is None:
+                        fairness_ready_since[0] = now
+                    must_yield_for_fairness = (
+                        now - fairness_ready_since[0] >= spec_yield_hold_s
+                    )
+                else:
+                    fairness_ready_since[0] = None
+                    must_yield_for_fairness = False
+                must_yield_away = (
+                    consecutive >= max_consecutive_spec
+                    or must_yield_for_fairness
+                )
+                if must_yield_away:
+                    fairness_ready_since[0] = None
+                if not must_yield_away and not admit_refused:
+                    if self.enable_nvtx:
+                        range_push("worker.speculate", synchronize=False)
+                    _t0 = _time.perf_counter() if phase_period else 0.0
+                    speculation = self._try_speculate_next(pending)
+                    if phase_period:
+                        _phase_record("speculate", _time.perf_counter() - _t0)
+                    if self.enable_nvtx:
+                        range_pop(synchronize=False)
+                    if speculation is not None:
+                        # Broadcast the head now, during forward N, so
+                        # followers build it during theirs (-1: not parallel).
+                        speculation.tp_seq = self.maybe_send_zmq_to_tp_followers(
+                            speculation.node_batch,
+                            speculative=True, spec_from_seq=pending.tp_seq,
+                        )
+                if self._tp_lead_needs_marker(pending, speculation):
+                    self._broadcast_tp_nospec(pending)
+                # ``yield_away_from_target`` stays None when the admit
+                # refused, so the non-speculative path below schedules
+                # without the fairness exclusion — it should be free to pick
+                # up the batch ``_handle_admit_failure`` just pushed back.
+                if speculation is None and not admit_refused:
+                    yield_away_from_target = (
+                        pending.node_name,
+                        pending.graph_walk,
+                    ) if must_yield_away else None
+                    with self._span("worker.schedule_yield_away"):
+                        batch = self.scheduler.get_next_batch(
+                            self.request_state,
+                            exclude_target=yield_away_from_target,
+                        )
+                    if batch is not None:
+                        node_batch = self._build_executing_batch(batch)
+                        batch_partition = self.request_state.get_partition_for_node(batch.node_name)
+                        logger.debug(f"Yield away: {batch.node_name} {node_batch.request_ids}")
+                        speculation = Speculation(
+                            scheduled_batch=batch,
+                            node_batch=node_batch,
+                            consumed_edges=set(),
+                            continuing_rids=set(), # n/a
+                            partition=batch_partition,
+                            is_new_iter=False,
+                            is_same_node=False,
+                            is_yield_away=True
+                        )
+
+                        # A leader stamps the seq it sends; a follower's
+                        # batch keeps the one it came off the FIFO with.
+                        ya_seq = self.maybe_send_zmq_to_tp_followers(node_batch)
+                        speculation.tp_seq = ya_seq if ya_seq >= 0 else batch.tp_seq
+
+            return speculation, yield_away_from_target
+
+        def _arm_speculation(
+            spec: Speculation, pending_for: PendingBatch | None = None,
+        ) -> None:
+            # Hand N+1 to the plan thread NOW. It waits on N's
+            # commit event, then reserves a slot and pre-plans —
+            # while the main thread sits in await_gpu with the GIL
+            # released and N's kernels are still running.
+            if plan_executor is not None:
+                spec.plan_future = plan_executor.submit(
+                    self._preplan_spec,
+                    pending if pending_for is None else pending_for, spec,
+                )
 
         def _set_pending(p: PendingBatch):
             nonlocal pending
             pending = p
-            self._in_flight_rids = set(p.batch.request_to_worker_graph) if p else set()
+            self._in_flight_rids = (
+                set(p.batch.request_to_worker_graph) if p else set()
+            ) | self._armed_spec_rids
 
         # Per-phase wall-clock instrumentation, gated by MSTAR_PHASE_TIMING.
         # When enabled, every Nth speculative iter logs a histogram so we can
@@ -3546,7 +3879,6 @@ class Worker:
         speculation: Speculation | None = None
 
         while True:
-            from mstar.utils.profiler import range_pop, range_push
             try:
                 batch = None
                 spec_pending = None
@@ -3592,105 +3924,20 @@ class Worker:
                 # Only when (a) there's a pending step and (b) it's AR-engine.
                 # For non-AR or non-loop-body steps, falls through to the
                 # non-speculative path below (drain, then schedule).
-                speculation = None
-                yield_away_from_target = None
-
-                # Build nothing on a refusal; the fence above is what makes it
-                # knowable here. Ordinary speculation would be dropped anyway,
-                # but a yield-away batch survives ``_maybe_clear_spec`` and is
-                # already broadcast — so the eviction below would land after its
-                # head went out, and the follower would admit it a delta behind.
-                # Skipping keeps that eviction in the gap between steps.
-                #
-                # The marker below stays outside this: a follower settles N on
-                # exactly one of {head, marker}, and it moves no pages.
-                admit_refused = (
-                    pending is not None
-                    and pending.node_batch.admit_error is not None
-                )
-
-                if pending is not None and self._can_speculate(pending.batch):
-                    # Fairness check (peek-based, replaces the old iter-
-                    # counter cap): only break the spec chain when there's
-                    # another (node, walk) actually ready to schedule on
-                    # this worker. On single-walk workers (Orpheus LLM,
-                    # Orpheus SNAC) this returns False and we always speculate.
-                    must_yield_for_fairness = (
-                        spec_peek_for_fairness
-                        and consecutive_spec_steps >= 1
-                        and self.scheduler.has_ready_excluding(
-                            self.request_state,
-                            (pending.node_name, pending.graph_walk),
-                        )
+                if next_speculation is not None:
+                    # Built and armed during the previous iteration's
+                    # post-processing (early speculation, below).
+                    speculation = next_speculation
+                    yield_away_from_target = next_yield_away
+                    next_speculation = next_yield_away = None
+                    self._armed_spec_rids = set()
+                else:
+                    speculation, yield_away_from_target = _build_speculation(
+                        pending, consecutive_spec_steps,
                     )
-                    must_yield_away = (
-                        consecutive_spec_steps >= max_consecutive_spec
-                        or must_yield_for_fairness
-                    )
-                    if not must_yield_away and not admit_refused:
-                        if self.enable_nvtx:
-                            range_push("worker.speculate", synchronize=False)
-                        _t0 = _time.perf_counter() if phase_period else 0.0
-                        speculation = self._try_speculate_next(pending)
-                        if phase_period:
-                            _phase_record("speculate", _time.perf_counter() - _t0)
-                        if self.enable_nvtx:
-                            range_pop(synchronize=False)
-                        if speculation is not None:
-                            # Broadcast the head now, during forward N, so
-                            # followers build it during theirs (-1: not parallel).
-                            speculation.tp_seq = self.maybe_send_zmq_to_tp_followers(
-                                speculation.node_batch,
-                                speculative=True, spec_from_seq=pending.tp_seq,
-                            )
-                    if self._tp_lead_needs_marker(pending, speculation):
-                        self._broadcast_tp_nospec(pending)
-                    # ``yield_away_from_target`` stays None when the admit
-                    # refused, so the non-speculative path below schedules
-                    # without the fairness exclusion — it should be free to pick
-                    # up the batch ``_handle_admit_failure`` just pushed back.
-                    if speculation is None and not admit_refused:
-                        yield_away_from_target = (
-                            pending.node_name,
-                            pending.graph_walk,
-                        ) if must_yield_away else None
-                        with self._span("worker.schedule_yield_away"):
-                            batch = self.scheduler.get_next_batch(
-                                self.request_state,
-                                exclude_target=yield_away_from_target,
-                            )
-                        if batch is not None:
-                            node_batch = self._build_executing_batch(batch)
-                            batch_partition = self.request_state.get_partition_for_node(batch.node_name)
-                            logger.debug(f"Yield away: {batch.node_name} {node_batch.request_ids}")
-                            speculation = Speculation(
-                                scheduled_batch=batch,
-                                node_batch=node_batch,
-                                consumed_edges=set(),
-                                continuing_rids=set(), # n/a
-                                partition=batch_partition,
-                                is_new_iter=False,
-                                is_same_node=False,
-                                is_yield_away=True
-                            )
+                    if speculation is not None:
+                        _arm_speculation(speculation)
 
-                            # A leader stamps the seq it sends; a follower's
-                            # batch keeps the one it came off the FIFO with.
-                            ya_seq = self.maybe_send_zmq_to_tp_followers(node_batch)
-                            speculation.tp_seq = ya_seq if ya_seq >= 0 else batch.tp_seq
-
-                def _arm_speculation(spec: Speculation) -> None:
-                    # Hand N+1 to the plan thread NOW. It waits on N's
-                    # commit event, then reserves a slot and pre-plans —
-                    # while the main thread sits in await_gpu with the GIL
-                    # released and N's kernels are still running.
-                    if plan_executor is not None:
-                        spec.plan_future = plan_executor.submit(
-                            self._preplan_spec, pending, spec,
-                        )
-
-                if speculation is not None:
-                    _arm_speculation(speculation)
 
                 # 3. If pending: await GPU(N), submit speculated GPU(N+1)
                 # asap, then post-process N (fast then slow) overlapping
@@ -3868,11 +4115,42 @@ class Worker:
                     # failed rids upstream.
                     if pending.node_batch.admit_error is None:
                         with self._span("worker.postprocess_batch"):
-                            self._postprocess_batch(pending, outputs)
+                            pp_state = self._postprocess_batch_stops(pending, outputs)
+                            if (
+                                early_spec and pp_state is not None
+                                and spec_pending is not None
+                                and spec_pending.node_name not in self.parallel_nodes
+                            ):
+                                # N's stops are decided and N+1 is launched:
+                                # build N+2 now and hand its pre-plan to the
+                                # plan thread, so it overlaps the routing half
+                                # below instead of the next launch. The fence
+                                # first: the build moves pages, which must not
+                                # happen while N+1's admit is outstanding.
+                                with self._span("worker.speculate_early"):
+                                    self._await_admit_settled(spec_pending)
+                                    if spec_pending.node_batch.admit_error is None:
+                                        next_speculation, next_yield_away = (
+                                            _build_speculation(
+                                                spec_pending,
+                                                consecutive_spec_steps + 1,
+                                            )
+                                        )
+                                        if next_speculation is not None:
+                                            self._armed_spec_rids = set(
+                                                next_speculation.scheduled_batch
+                                                .request_to_worker_graph
+                                            )
+                                            self._in_flight_rids |= self._armed_spec_rids
+                                            _arm_speculation(next_speculation, spec_pending)
+                            if pp_state is not None:
+                                self._postprocess_batch_send(pending, outputs, pp_state)
 
-                    # Removes for any rid not in the in-flight spec step
-                    # are safe to apply now.
-                    in_flight = set(spec_pending.batch.request_to_worker_graph) if spec_pending else set()
+                    # Removes for any rid not in the in-flight spec step (or in
+                    # a speculation armed ahead) are safe to apply now.
+                    in_flight = (
+                        set(spec_pending.batch.request_to_worker_graph) if spec_pending else set()
+                    ) | self._armed_spec_rids
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
                     _set_pending(None)
@@ -3948,7 +4226,11 @@ class Worker:
                     phase_iter[0] += 1
                     _phase_flush()
             except Exception as e:
-                self._handle_main_loop_error(e, (pending, spec_pending), batch, speculation)
+                self._handle_main_loop_error(
+                    e, (pending, spec_pending), batch, speculation, next_speculation,
+                )
+                next_speculation = next_yield_away = None
+                self._armed_spec_rids = set()
                 # Follower: a head from a step that raised must not sit at the
                 # FIFO front with failed rids.
                 if pending is not None and self._is_tp_follow_pending(pending):

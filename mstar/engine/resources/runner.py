@@ -135,14 +135,54 @@ class StepRunner:
                 rid, node_name, graph_walk, inputs, matched_len,
             )
 
+    def prefix_chain_keys(self, node_name: str | None) -> list[str]:
+        """The node's resources with a prefix cache open right now. Empty in
+        the common case, which lets the caller skip a per-request sweep that
+        was six no-op calls per request per step."""
+        keys: list[str] = []
+        for key in self._sweep(self._node_order, self._order, node_name):
+            resource = self._resources[key]
+            if resource.keys_prefix_chains:
+                keys.append(key)
+                continue
+            # a resource that overrides the hook without saying when it keys
+            # is swept as before the skip existed
+            cls = type(resource)
+            if (
+                cls.extend_prefix_chain is not Resource.extend_prefix_chain
+                and cls.keys_prefix_chains is Resource.keys_prefix_chains
+            ):
+                keys.append(key)
+        return keys
+
     def extend_prefix_chains(
         self, rid: str, node_name: str, graph_walk: str, outputs,
+        keys: list[str] | None = None,
     ) -> None:
         """Offer this step's sampled tokens to the node's own resources."""
-        for key in self._sweep(self._node_order, self._order, node_name):
+        if keys is None:
+            keys = self._sweep(self._node_order, self._order, node_name)
+        for key in keys:
             self._resources[key].extend_prefix_chain(
                 rid, node_name, graph_walk, outputs,
             )
+
+    def extend_prefix_chains_batch(
+        self, request_ids: list[str], node_name: str, graph_walk: str,
+        host_rows, outputs, keys: list[str],
+    ) -> None:
+        """``extend_prefix_chains`` for a step: a resource with a batch form
+        takes the host rows; the others are offered each request's host copy."""
+        for key in keys:
+            resource = self._resources[key]
+            batched = getattr(resource, "extend_prefix_chains_batch", None)
+            if batched is not None:
+                batched(request_ids, node_name, graph_walk, host_rows)
+                continue
+            for rid in request_ids:
+                per_rid = outputs.get(rid)
+                if isinstance(per_rid, dict):
+                    resource.extend_prefix_chain(rid, node_name, graph_walk, per_rid)
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
@@ -464,6 +504,61 @@ class StepRunner:
             for key, resource in publishers:
                 info = resource.publish_for_step(
                     rid, node_name=node_name, graph_walk=graph_walk,
+                )
+                if info is not None:
+                    per_key[key] = info
+            out[rid] = per_key
+        return out
+
+    def publish_snapshot(
+        self,
+        request_ids: list[str],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """``publish``, deferred: per rid the snapshot each publisher took.
+
+        Finished by ``publish_from_snapshots`` for the rids that need it. A rid
+        with nothing to publish has no entry."""
+        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        if not order:
+            return {}
+        # one call per publisher for the whole batch, then one dict per
+        # request that has anything to publish
+        columns = [
+            (key, self._resources[key].publish_snapshot_batch(
+                request_ids, node_name=node_name, graph_walk=graph_walk,
+            ))
+            for key in order
+        ]
+        out: dict[str, dict[str, Any]] = {}
+        for i, rid in enumerate(request_ids):
+            per_key: dict[str, Any] = {}
+            for key, snaps in columns:
+                snap = snaps[i]
+                if snap is not None:
+                    per_key[key] = snap
+            if per_key:
+                out[rid] = per_key
+        return out
+
+    def publish_from_snapshots(
+        self,
+        snapshots: dict[str, dict[str, Any]],
+        request_ids: list[str],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+    ) -> dict[str, dict[str, PublishedInfo]]:
+        """The published info of ``request_ids`` from their snapshots."""
+        out: dict[str, dict[str, PublishedInfo]] = {}
+        for rid in request_ids:
+            snaps = snapshots.get(rid)
+            if not snaps:
+                continue
+            per_key: dict[str, PublishedInfo] = {}
+            for key, snap in snaps.items():
+                info = self._resources[key].publish_from_snapshot(
+                    rid, snap, node_name=node_name, graph_walk=graph_walk,
                 )
                 if info is not None:
                     per_key[key] = info

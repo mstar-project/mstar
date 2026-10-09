@@ -759,3 +759,69 @@ def test_a_submodule_that_does_not_opt_in_is_never_split():
 
 def test_a_walk_without_a_capture_is_never_split():
     assert _capture_group(captured=()) is None
+
+
+# ── bounded readiness checks on the backlog ──────────────────────────────
+
+
+class _CountingEngine(_Engine):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.checked: list[str] = []
+
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        self.checked.append(rid)
+        return super().check_ready(node_name, rid, fwd_info, allow_reload)
+
+
+def test_the_backlog_is_checked_only_up_to_a_steps_worth():
+    """A step takes the first `max_bs` ready rids in backlog order; the rids
+    past that point are not asked (an engine sweep each) and keep their place."""
+    engine = _CountingEngine(max_bs=2)
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch([f"r{i}" for i in range(8)])
+
+    batch = _next_batch(sched, _Manager([]))
+
+    assert list(batch.request_to_worker_graph) == ["r0", "r1"]
+    assert engine.checked == ["r0", "r1"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == [
+        f"r{i}" for i in range(2, 8)
+    ]
+
+
+def test_an_unready_rid_is_skipped_and_the_scan_goes_one_further():
+    engine = _CountingEngine(max_bs=2, not_ready={"r1"})
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch([f"r{i}" for i in range(6)])
+
+    batch = _next_batch(sched, _Manager([]))
+
+    assert list(batch.request_to_worker_graph) == ["r0", "r2"]
+    assert engine.checked == ["r0", "r1", "r2"]
+    # the unready rid goes to the back, the unchecked ones keep their order
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == [
+        "r3", "r4", "r5", "r1",
+    ]
+
+
+def test_a_full_caller_batch_checks_nothing_in_the_backlog():
+    engine = _CountingEngine(max_bs=2)
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch(["r0", "r1", "r2"])
+
+    assert _next_batch(sched, _Manager([]), pre_existing_batch_size=2) is None
+    assert engine.checked == []
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r0", "r1", "r2"]
+
+
+def test_the_group_anchor_is_applied_to_the_checked_rids_only():
+    engine = _CountingEngine(max_bs=2, groups={"r0": "a", "r1": "b", "r2": "a", "r3": "a"})
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch(["r0", "r1", "r2", "r3"])
+
+    batch = _next_batch(sched, _Manager([]))
+
+    assert list(batch.request_to_worker_graph) == ["r0", "r2"]
+    assert engine.checked == ["r0", "r1", "r2"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r3", "r1"]

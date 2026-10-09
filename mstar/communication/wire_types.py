@@ -16,6 +16,7 @@ from mstar.api_server.request_types import (
     RequestFailed,
     ResultChunk,
     ResultTensors,
+    ResultTokens,
 )
 from mstar.communication.wire import _set_polymorphic, register
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -74,6 +75,7 @@ _TYPES: dict[str, type] = {
     "fail_requests": FailRequests,
     # api-server bodies
     "result_tensors": ResultTensors,
+    "result_tokens": ResultTokens,
     "request_complete": RequestComplete,
     "request_failed": RequestFailed,
     "result_chunk": ResultChunk,

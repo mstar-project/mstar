@@ -51,3 +51,14 @@ test/modular/test_mamba2_resource.py
 test/modular/test_streams.py
 test/modular/test_batched_model_output.py
 test/modular/test_qwen3_5_check_stop_batched.py
+test/modular/test_lazy_publish.py
+test/modular/test_collect_outputs_fast_path.py
+test/modular/test_inline_tokens.py
+test/modular/test_sampler_static_gather_skip.py
+test/modular/test_row_output_store.py
+test/modular/test_lazy_per_rid.py
+test/modular/test_step_context_rows.py
+test/modular/test_publish_snapshot_batch.py
+test/modular/test_sampler_for_cache.py
+test/modular/test_send_prep_entries.py
+test/modular/test_kv_prefix_batch.py
