@@ -1,10 +1,12 @@
 import logging
 import os
 import threading
+from collections import Counter
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 
 from mstar.distributed.communication import JointGroups
@@ -46,6 +48,7 @@ from mstar.engine.resources.step import (
     StepContext,
 )
 from mstar.utils.h2d import PinnedStager
+from mstar.utils.knobs import kv_chain_lazy_steps
 
 logger = logging.getLogger(__name__)
 
@@ -368,6 +371,13 @@ class KVManager(AttentionResource):
         # (node, walk) -> (label, stop buffer name) per request, for the
         # decode-step chain extension; dropped with the request
         self._chain_lookup: dict[str, dict[tuple[str, str], tuple]] = {}
+        # decode steps of sampled tokens waiting to extend the chains (lazy)
+        self._chain_backlog: list[tuple] = []
+        self._chain_lazy_steps = kv_chain_lazy_steps()
+        # steps waiting per request, and the widest row among them: a
+        # commit tolerates a chain that lags by that many tokens
+        self._chain_pending: Counter = Counter()
+        self._chain_backlog_width = 0
         # its entity id is the worker id, and one worker is one copy of a node
         self._replica = (
             transfer_engine_info.my_entity_id
@@ -548,8 +558,13 @@ class KVManager(AttentionResource):
             stream.chain = None
             return
         # what was here before this write, not after: a decode step can commit
-        # before the token it writes is read back and counted
-        if stream.released or stream.stored_len - segment.span > chain.covered_len:
+        # before the token it writes is read back and counted. the lazy chain
+        # extension holds back a few steps more (`extend_prefix_chains_batch`)
+        lag = (
+            self._chain_pending.get(segment.request_id, 0) * self._chain_backlog_width
+            if self._chain_backlog else 0
+        )
+        if stream.released or stream.stored_len - segment.span > chain.covered_len + lag:
             stream.chain = None
             return
         filled = chain.pages_filled(stream.stored_len, self.config.page_size)
@@ -691,6 +706,7 @@ class KVManager(AttentionResource):
         The ids come from the stop check's host copy, which can land after their
         step commits, so a later commit indexes the page.
         """
+        self.flush_chain_backlog()
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
             if label is None:
@@ -715,49 +731,101 @@ class KVManager(AttentionResource):
     ) -> None:
         """``extend_prefix_chain`` for a step, from the stop check's row
         buffers (``HostRows``: row i of every buffer belongs to
-        ``host_rows.request_ids[i]``). One lock, one ``tolist`` per buffer
-        instead of one per request."""
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
-        buffers = host_rows.buffers
-        rows_of: dict[str, list] = {}
+        ``host_rows.request_ids[i]``).
+
+        Lazy by default: the step's rows are copied aside and the chains are
+        extended once every ``MSTAR_KV_CHAIN_LAZY_STEPS`` steps, one extend per
+        request with all its tokens since the last flush, so the per-row Python
+        runs once per batch of steps instead of every step. A key can thus
+        appear a few steps late and is indexed by a later commit, as the
+        single-request path allows. Removals and resets flush first."""
+        step = (
+            tuple(host_rows.request_ids), node_name, graph_walk, tuple(request_ids),
+            {
+                name: buf.reshape(buf.shape[0], -1).cpu().numpy().copy()
+                for name, buf in host_rows.buffers.items()
+                if torch.is_tensor(buf) and buf.dim() != 0
+            },
+        )
+        if self._chain_lazy_steps <= 1:
+            with self._lock:
+                self._extend_chains_from([step])
+            return
+        width = max((a.shape[1] for a in step[4].values()), default=0)
+        with self._lock:
+            self._chain_backlog.append(step)
+            self._chain_pending.update(step[0])
+            self._chain_backlog_width = max(self._chain_backlog_width, width)
+            if len(self._chain_backlog) >= self._chain_lazy_steps:
+                self.flush_chain_backlog()
+
+    def flush_chain_backlog(self) -> None:
+        """Extend the chains with every step waiting in the backlog."""
+        if not self._chain_backlog:
+            return
+        with self._lock:
+            # the swap under the lock, so two flushing threads (the stop check
+            # and a removal) cannot both take the same steps
+            steps, self._chain_backlog = self._chain_backlog, []
+            self._chain_pending = Counter()
+            self._chain_backlog_width = 0
+            # runs of steps with the same rows and batch go out as one extend
+            # per request; a change of batch composition starts a new run
+            run: list = []
+            for st in steps:
+                if run and run[0][:4] != st[:4]:
+                    self._extend_chains_from(run)
+                    run = []
+                run.append(st)
+            if run:
+                self._extend_chains_from(run)
+
+    def _extend_chains_from(self, steps: list) -> None:
+        """Under the lock: one extend per request with the tokens of
+        ``steps`` (same rows and batch) in step order."""
+        rows, node_name, graph_walk, request_ids, _ = steps[0]
+        row_of = {rid: i for i, rid in enumerate(rows)}
         page_size = self.config.page_size
         key = (node_name, graph_walk)
         lookup = self._chain_lookup
-        with self._lock:
-            for rid in request_ids:
-                # the label and buffer name do not change over a request's
-                # life (its overrides are set at ingest), so each is looked up
-                # once instead of on every decode step
-                per_rid = lookup.get(rid)
-                if per_rid is None:
-                    per_rid = lookup[rid] = {}
-                entry = per_rid.get(key)
-                if entry is None:
-                    label = self._keyed_label(rid, node_name, graph_walk)
-                    tensor = (
-                        (self._overrides[rid].prefix_decode or {}).get(label)
-                        if label is not None else None
-                    )
-                    entry = per_rid[key] = (label, tensor)
-                label, tensor = entry
-                if label is None or not tensor:
+        cols: dict[str, object] = {}
+        for rid in request_ids:
+            # the label and buffer name do not change over a request's
+            # life (its overrides are set at ingest), so each is looked up
+            # once instead of on every decode step
+            per_rid = lookup.get(rid)
+            if per_rid is None:
+                per_rid = lookup[rid] = {}
+            entry = per_rid.get(key)
+            if entry is None:
+                label = self._keyed_label(rid, node_name, graph_walk)
+                tensor = (
+                    (self._overrides[rid].prefix_decode or {}).get(label)
+                    if label is not None else None
+                )
+                entry = per_rid[key] = (label, tensor)
+            label, tensor = entry
+            if label is None or not tensor:
+                continue
+            i = row_of.get(rid)
+            if i is None:
+                continue
+            col = cols.get(tensor)
+            if col is None:
+                parts = [st[4][tensor] for st in steps if tensor in st[4]]
+                if not parts or i >= parts[0].shape[0]:
                     continue
-                rows = rows_of.get(tensor)
-                if rows is None:
-                    buf = buffers.get(tensor)
-                    if not torch.is_tensor(buf) or buf.dim() == 0:
-                        continue
-                    rows = rows_of[tensor] = buf.reshape(buf.shape[0], -1).tolist()
-                i = row_of.get(rid)
-                if i is None or i >= len(rows):
-                    continue
-                stream = self._streams.get(rid, {}).get(label)
-                if stream is None or stream.chain is None or stream.chain.unkeyed is None:
-                    continue
-                if stream.released:
-                    stream.chain = None
-                    continue
-                stream.chain.extend(rows[i], page_size)
+                # (steps * values per row) tokens for every row, in step order
+                col = cols[tensor] = np.concatenate(parts, axis=1)
+            if i >= col.shape[0]:
+                continue
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None or stream.chain is None or stream.chain.unkeyed is None:
+                continue
+            if stream.released:
+                stream.chain = None
+                continue
+            stream.chain.extend(col[i].tolist(), page_size)
 
     def _release_lease(self, stream: CacheStream) -> None:
         """Give back a lease `admit` never converted; a converted one is released
@@ -1967,6 +2035,7 @@ class KVManager(AttentionResource):
         )
 
     def reset_request(self, rid: str, free: bool=False):
+        self.flush_chain_backlog()
         streams = self._streams.get(rid)
         if streams is None:
             return
@@ -1998,6 +2067,8 @@ class KVManager(AttentionResource):
                 self.assert_pages_conserved()
 
     def remove_request(self, rid: str):
+        # its waiting tokens first, before the handle can name another request
+        self.flush_chain_backlog()
         streams = self._streams.get(rid)
         if streams is not None:
             # drain in-flight reads outside the lock; see reset_request
