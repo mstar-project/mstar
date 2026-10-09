@@ -1105,6 +1105,7 @@ class Buffer:
     master: torch.Tensor
     default: float
     dtype: torch.dtype
+    _slot_views: dict = field(default_factory=dict)
 
     @classmethod
     def allocate(
@@ -1133,8 +1134,18 @@ class Buffer:
 
     def slot_view(self, cg_slot: int, bs: int) -> torch.Tensor:
         """This slot's per-step row (clamped: a single-buffered buffer — the
-        RNG offset, gathered inline and used serialized — ignores ``cg_slot``)."""
-        return self.buf[cg_slot if self.buf.shape[0] > 1 else 0, :bs]
+        RNG offset, gathered inline and used serialized — ignores ``cg_slot``).
+
+        Memoized per (slot, rows): ``buf`` is never reallocated, and the view
+        is taken on the gpu thread every step, where each tensor call is a
+        GIL release the main thread's postprocess can win."""
+        key = (cg_slot, bs)
+        view = self._slot_views.get(key)
+        if view is None:
+            view = self._slot_views[key] = self.buf[
+                cg_slot if self.buf.shape[0] > 1 else 0, :bs
+            ]
+        return view
 
     def gather(self, idx_view: torch.Tensor, padded_bs: int, cg_slot: int) -> None:
         torch.index_select(self.master, 0, idx_view, out=self.slot_view(cg_slot, padded_bs))
@@ -1146,7 +1157,7 @@ class Buffer:
         graph (the RNG offset). REAL rows only: padding rows all gather from
         slot 0 and get advanced too, so scattering them would clobber slot 0.
         """
-        self.master.index_copy_(0, idx_view[:real_bs], self.slot_view(cg_slot, real_bs))
+        self.master.index_copy_(0, idx_view, self.slot_view(cg_slot, real_bs))
 
 
 @dataclass
@@ -1314,6 +1325,8 @@ class SamplerBuffers:
     # Real (unpadded) batch size of the last gather per cg slot — the
     # scatter-back writes only these rows (padding rows all map to slot 0).
     _last_real_bs: list[int] = field(default_factory=list, repr=False)
+    # memoized per (slot, real rows): see ``_scatter_idx``
+    _scatter_idx_views: dict = field(default_factory=dict, repr=False)
     # cg slot -> the (rids, padded_bs) its pinned index row currently holds, so
     # gather_dynamic can re-issue the H2D without redoing the O(bs) CPU fill
     _staged_rids: dict[int, tuple[tuple[str, ...], int]] = field(
@@ -1679,13 +1692,22 @@ class SamplerBuffers:
         sampler.applied_penalty_in_graph = False
         return sampler
 
+    def _scatter_idx(self, cg_slot: int) -> tuple[torch.Tensor, int]:
+        """The slot's device index row narrowed to the real rows, memoized per
+        (slot, rows) like ``Buffer.slot_view`` (the index buffer is static)."""
+        real_bs = self._last_real_bs[cg_slot]
+        key = (cg_slot, real_bs)
+        idx = self._scatter_idx_views.get(key)
+        if idx is None:
+            idx = self._scatter_idx_views[key] = self._slot_idx_gpu[cg_slot, :real_bs]
+        return idx, real_bs
+
     def scatter_offset(self, cg_slot: int = 0) -> None:
         """Persist the (in-graph advanced) per-step offsets back to their slot
         masters. Call once AFTER the graph replay for the gather on ``cg_slot``;
         GPU-only, real rows only (padding rows all map to slot 0)."""
-        self.offset.scatter(
-            self._slot_idx_gpu[cg_slot], self._last_real_bs[cg_slot], cg_slot
-        )
+        idx, real_bs = self._scatter_idx(cg_slot)
+        self.offset.scatter(idx, real_bs, cg_slot)
 
     # ------------------------------------------------------------------
     # Last sampled token: written by the sample, read by the next step
@@ -1694,9 +1716,8 @@ class SamplerBuffers:
         """Persist the tokens the captured sample wrote into ``cg_slot``'s
         per-step row to their slot masters. Same contract as ``scatter_offset``:
         after the replay, real rows only."""
-        self.last_token.scatter(
-            self._slot_idx_gpu[cg_slot], self._last_real_bs[cg_slot], cg_slot
-        )
+        idx, real_bs = self._scatter_idx(cg_slot)
+        self.last_token.scatter(idx, real_bs, cg_slot)
 
     def gather_last_tokens(self, cg_slot: int, padded_bs: int) -> torch.Tensor:
         """``[padded_bs]`` last tokens of the batch staged on ``cg_slot``, in
