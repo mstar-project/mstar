@@ -599,23 +599,31 @@ class LLMSubmodule(ARNodeSubmodule):
         if not torch.is_tensor(tokens) or tokens.dim() == 0:
             return None
         values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        rows = host_rows.request_ids
+        if len(rows) >= len(request_ids) and all(
+            a == b for a, b in zip(request_ids, rows, strict=False)
+        ):
+            # the common case: the batch in forward order, no row map needed
+            pairs = zip(request_ids, values, strict=False)
+        else:
+            row_of = {rid: i for i, rid in enumerate(rows)}
+            pairs = (
+                (rid, values[i]) for rid in request_ids
+                if (i := row_of.get(rid)) is not None and i < len(values)
+            )  # no row, no output: the per-request path skips it too
         stop_ids = self.config.stop_token_ids
         stops: dict[str, set[str]] = {}
-        for rid in request_ids:
-            i = row_of.get(rid)
-            if i is None or i >= len(values):
-                continue  # no row, no output: the per-request path skips it too
+        for rid, value in pairs:
             info = request_infos[rid]
-            hit_eos = (
-                not info.resource_configs[SAMPLER].ignore_eos
-                and values[i] in stop_ids
-            )
-            out_of_budget = (
+            # the set test first: a stop id is rare, the config read behind it
+            # goes through the wrapper
+            if (
+                value in stop_ids
+                and not info.resource_configs[SAMPLER].ignore_eos
+            ) or (
                 info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
                 >= info.max_tokens
-            )
-            if hit_eos or out_of_budget:
+            ):
                 stops[rid] = {"decode_loop"}
         return stops
 
