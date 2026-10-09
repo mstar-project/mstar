@@ -1059,7 +1059,8 @@ class WarmupMedia:
 class WarmupRequest:
     """One entry of the deployment's ``warmup_requests``: a ``/generate``
     request in yaml form. ``files`` are the media inputs in prompt order
-    (any modality, any number), followed by ``text`` as on ``/generate``."""
+    (any modality, any number), followed by ``text`` as on ``/generate``,
+    ``repeat`` times over (a long prompt for a long-context path)."""
 
     text: str | None = None
     files: list[WarmupMedia] = field(default_factory=list)
@@ -1070,9 +1071,17 @@ class WarmupRequest:
     def from_config(cls, spec: Any) -> "WarmupRequest":
         if not isinstance(spec, dict):
             raise ValueError("not a mapping")
-        unknown = set(spec) - {"text", "files", "output_modalities", "model_kwargs"}
+        unknown = set(spec) - {"text", "files", "output_modalities", "model_kwargs", "repeat"}
         if unknown:
             raise ValueError(f"unknown key(s) {sorted(unknown)}")
+        text = spec.get("text")
+        if text is not None and not isinstance(text, str):
+            raise ValueError("text must be a string")
+        repeat = spec.get("repeat", 1)
+        if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
+            raise ValueError(f"repeat must be a positive integer, got {repeat!r}")
+        if repeat > 1 and not text:
+            raise ValueError("repeat needs text")
         out_mods = spec.get("output_modalities") or ["text"]
         if isinstance(out_mods, str):
             out_mods = [m.strip() for m in out_mods.split(",") if m.strip()]
@@ -1083,7 +1092,7 @@ class WarmupRequest:
         if model_kwargs is not None and not isinstance(model_kwargs, dict):
             raise ValueError("model_kwargs must be a mapping")
         return cls(
-            text=spec.get("text") or None,
+            text=(text or "") * repeat or None,
             files=[WarmupMedia.from_config(f) for f in files],
             output_modalities=list(out_mods),
             model_kwargs=model_kwargs,
@@ -1130,7 +1139,7 @@ def _run_warmup_requests(server: APIServer, specs: list) -> None:
     for index, spec in enumerate(specs):
         try:
             request = WarmupRequest.from_config(spec)
-        except ValueError as exc:
+        except Exception as exc:  # noqa: BLE001 — a repeat too large to build, say
             logger.warning("warmup_requests[%d] skipped: %s", index, exc)
             continue
         t0 = time.perf_counter()

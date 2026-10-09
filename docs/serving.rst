@@ -191,8 +191,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``output_modalities``, ``model_kwargs``, and ``files``, a list of media
        inputs in prompt order (text follows them). A file is a path or
        ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
-       comes from the extension, or give ``{path: ..., modality: ...}``. A
-       malformed or failing warmup is logged and skipped.
+       comes from the extension, or give ``{path: ..., modality: ...}``.
+       ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
+       long prompts take (a long-context prefill). A malformed or failing warmup
+       is logged and skipped.
    * - ``dist_timeout_s``
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel
        subgroups. Unset keeps PyTorch's default; ``MSTAR_DIST_TIMEOUT_S`` overrides.
