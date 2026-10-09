@@ -62,6 +62,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
        attention interleaved with full attention, plus a ViT tower.
+   * - ``minicpm_o`` *(Beta)*
+     - ``openbmb/MiniCPM-o-4_5``
+     - Omni-modal chat (text/image/audio in, text out): Qwen3-8B over a navit SigLIP +
+       resampler and a Whisper-medium encoder. Half-duplex only.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
