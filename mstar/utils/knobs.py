@@ -72,5 +72,17 @@ def kv_chain_lazy_steps() -> int:
     (the per-row Python of that extension was 0.3-0.4 ms a step at 128
     rows). A page key then appears up to that many steps late, and a later
     commit indexes it, which the single-request path already allows for.
-    ``1`` extends every step as before."""
-    return max(1, int(os.environ.get("MSTAR_KV_CHAIN_LAZY_STEPS", "16")))
+    ``1`` (the default) extends every step: 16 measured as noise at c64/c128
+    on 0.8B (the extension is a small part of the stop check's tail)."""
+    return max(1, int(os.environ.get("MSTAR_KV_CHAIN_LAZY_STEPS", "1")))
+
+
+def kv_plan_cache() -> int:
+    """``MSTAR_KV_PLAN_CACHE`` (default 1): the KV manager plans a leased
+    decode step from the previous step's plan when the batch is the same
+    rows in the same order and nothing but that step's commit touched the
+    streams: lengths advance by one, pages change only where a row crossed
+    a page boundary, and the five index arrays come from numpy instead of a
+    per-row Python pass. ``0`` plans every step from the streams; ``2`` does
+    both and logs any difference (a correctness check for runs)."""
+    return int(os.environ.get("MSTAR_KV_PLAN_CACHE", "1"))
