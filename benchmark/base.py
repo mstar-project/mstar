@@ -438,11 +438,14 @@ class MiniCPMO45(Model):
         # defaults. The TTS keeps each system's own sampling defaults (both
         # upstream's temperature 0.8 / top-p 0.85 / top-k 25), since
         # vllm-omni applies the request's temperature to stage 0 only.
+        # A spoken reply gets room to end on its own: vllm-omni's talker fails a
+        # reply the LLM's cap cut off before <|tts_eos|>.
+        cap = 1024 if speech else 256
         kwargs = {
             "temperature": 0.0,
             "repetition_penalty": 1.0,
-            "max_tokens": 256,
-            "max_output_tokens": 256,
+            "max_tokens": cap,
+            "max_output_tokens": cap,
             # vllm-omni only: the template thinks unless told not to, and
             # speaks only with the TTS template
             "chat_template_kwargs": {"enable_thinking": False, "use_tts_template": speech},

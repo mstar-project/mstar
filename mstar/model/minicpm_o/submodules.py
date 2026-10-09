@@ -20,6 +20,8 @@ from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     CudaGraphConfig,
     PackedCudaGraphConfig,
+    PiecewiseBatchedConfig,
+    PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseCudaGraphConfig,
     PiecewisePackedConfig,
@@ -753,10 +755,21 @@ class Token2WavSubmodule(NodeSubmodule):
     the voice's prepared state on the first window. Their host-side lengths ride
     in the request's state.
 
-    Runs eagerly in float32, one request at a time: every length in the flow
-    depends on the voice and the window, and the module is exact against the
-    reference at full precision.
+    Float32, batched straight on the pool. A voice's full non-last windows enter
+    the caches at one of three lengths (the first window, the second, and every
+    later one), so rows of one (voice, phase) batch and replay a piecewise
+    capture (``t2w/<voice>/<phase>``), bucketed by batch size; the inverse STFT
+    and cross-fade stay eager. A last window after the steady phase has one
+    of 25 lengths, each its own one-row capture (``t2w/<voice>/last<n>``);
+    other last windows (replies under three windows) run eagerly, batched by
+    length. One row at a time it is bit-exact against the
+    reference at full fp32 matmul precision; batched rows differ by GEMM
+    kernel choice.
     """
+
+    WINDOW_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    # a request ends once, so last windows of one length rarely meet in a pass
+    LAST_CAPTURE_BATCH_SIZES = [1]
 
     disable_torch_compile = True
     disable_autocast = True
@@ -780,10 +793,10 @@ class Token2WavSubmodule(NodeSubmodule):
         codes = inputs["tts_code"][0].reshape(-1).tolist() if inputs.get("tts_code") else []
         # the TTS's stop code is streamed before its stop is seen; it is not speech
         codes = [c for c in codes if c != self.eos_code]
-        # keyed by the worker handle, as the forward and the engine's cleanup are
         if not codes:
             # a text-only reply's stream closes with one empty chunk
             return None
+        # keyed by the worker handle, as the forward and the engine's cleanup are
         state = self.request_state(fwd_info.rid_handle)
         if not state.get("started", False):
             codes = [SILENCE_CODE] * LEAD_SILENCE + codes
@@ -800,19 +813,70 @@ class Token2WavSubmodule(NodeSubmodule):
             steps={T2W_STATE: RecurrentStep()},
         )
 
-    def _state(self, pool, rid, voice):
-        from mstar.model.minicpm_o.components.token2wav import state_from_slot, state_lengths
+    @staticmethod
+    def window_region(voice: str, phase: int) -> str:
+        return f"t2w/{voice}/{phase}"
 
-        slot = pool.slot_index(rid)
-        blocks = {name: pool.block(name, 0)[slot] for name in pool.config.blocks}
-        req = self.request_state(rid)
-        if not req.get("started", False):
-            state = state_from_slot(blocks, state_lengths(voice.initial))
-            state.copy_from(voice.initial)
-            req.add("started", True)
-        else:
-            state = state_from_slot(blocks, req["lengths"])
-        return state
+    @staticmethod
+    def last_window_region(voice: str, num_tokens: int) -> str:
+        return f"t2w/{voice}/last{num_tokens}"
+
+    def get_piecewise_cuda_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs,
+    ) -> dict[str, PiecewiseCudaGraphConfig]:
+        from mstar.model.minicpm_o.components.token2wav import (
+            LAST_WINDOW_TOKENS,
+            PHASE_FIRST,
+            PHASE_SECOND,
+            PHASE_STEADY,
+            WINDOW,
+            phase_lengths,
+        )
+
+        def static_inputs(num_tokens: int):
+            def make(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
+                return {"tokens": torch.zeros(shape.bs, num_tokens, dtype=torch.int32, device=device)}
+            return make
+
+        def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
+            return SubmoduleStep(
+                segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
+                steps={T2W_STATE: RecurrentStep()},
+            )
+
+        def region(voice, phase, last):
+            lengths = phase_lengths(voice.initial.prompt_frames, phase)
+
+            def capture(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+                pool = call.resources[T2W_STATE]
+                tokens = call.static_inputs["tokens"]
+                return self.model.window_spectrum(
+                    {name: pool.block(name, 0) for name in pool.config.blocks},
+                    pool.addressing("main").slot_indices[: tokens.shape[0]],
+                    voice, lengths, tokens, last,
+                )
+            return capture
+
+        configs = {}
+        for name, voice in self.voices.items():
+            for phase in (PHASE_FIRST, PHASE_SECOND, PHASE_STEADY):
+                configs[self.window_region(name, phase)] = PiecewiseBatchedConfig(
+                    capture_fn=region(voice, phase, last=False),
+                    make_static_inputs=static_inputs(WINDOW),
+                    declare_step=declare_step,
+                    seq_len=WINDOW,
+                    capture_batch_sizes=self.WINDOW_CAPTURE_BATCH_SIZES,
+                )
+            # a reply's last window, entering after at least two full ones
+            for n in LAST_WINDOW_TOKENS:
+                configs[self.last_window_region(name, n)] = PiecewiseBatchedConfig(
+                    capture_fn=region(voice, PHASE_STEADY, last=True),
+                    make_static_inputs=static_inputs(n),
+                    declare_step=declare_step,
+                    seq_len=n,
+                    capture_batch_sizes=self.LAST_CAPTURE_BATCH_SIZES,
+                )
+        return configs
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
         return self.forward_batched(graph_walk, engine_inputs, **kwargs)[engine_inputs.request_ids[0]]
@@ -831,14 +895,58 @@ class Token2WavSubmodule(NodeSubmodule):
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, rows: list, **kwargs,
     ) -> dict[str, NameToTensorList]:
-        from mstar.model.minicpm_o.components.token2wav import state_lengths
+        from mstar.model.minicpm_o.components.token2wav import (
+            PHASE_STEADY,
+            entering_phase,
+            state_lengths,
+            window_batch_key,
+        )
 
+        # Rows of one voice with the same window_batch_key run as one batch: a
+        # captured phase when one fits, else the same computation eagerly.
+        # Each row advances its own lengths.
+        groups: dict[tuple, list[tuple[str, torch.Tensor, dict[str, int]]]] = {}
+        for rid, (codes, last, voice_name) in zip(engine_inputs.request_ids, rows, strict=True):
+            req = self.request_state(rid)
+            lengths = req["lengths"] if "lengths" in req else state_lengths(self.voices[voice_name].initial)
+            key = (voice_name, *window_batch_key(lengths, codes.shape[1], last))
+            groups.setdefault(key, []).append((rid, codes, lengths))
         pool = engine_inputs.resources[T2W_STATE]
         out = {}
-        for rid, (codes, last, voice_name) in zip(engine_inputs.request_ids, rows, strict=True):
-            voice = self.voices[voice_name]
-            state = self._state(pool, rid, voice)
-            wav = self.model.stream(state, voice, codes, last)
-            self.request_state(rid).add("lengths", state_lengths(state))
-            out[rid] = {"audio_chunk": [wav.reshape(-1)]}
+        for key, group in groups.items():
+            voice_name, phase, shared, num_tokens, last = key
+            shared = dict(shared)
+            if phase is not None:
+                region, cap = self.window_region(voice_name, phase), self.WINDOW_CAPTURE_BATCH_SIZES[-1]
+            elif last and entering_phase(shared) == PHASE_STEADY:
+                region, cap = self.last_window_region(voice_name, num_tokens), self.LAST_CAPTURE_BATCH_SIZES[-1]
+            else:
+                region, cap = None, len(group)
+            for i in range(0, len(group), cap):
+                out.update(self._windows(engine_inputs, pool, voice_name, region, shared, last, group[i:i + cap]))
+        return out
+
+    @torch.compiler.disable
+    def _windows(self, engine_inputs, pool, voice_name, region, lengths, last, group) -> dict[str, NameToTensorList]:
+        from mstar.model.minicpm_o.components.token2wav import lengths_after
+
+        rids = [rid for rid, _, _ in group]
+        tokens = torch.cat([codes for _, codes, _ in group])
+        blocks = {name: pool.block(name, 0) for name in pool.config.blocks}
+        slots = torch.tensor([pool.slot_index(rid) for rid in rids], dtype=torch.long, device=tokens.device)
+        voice = self.voices[voice_name]
+        runner = None if region is None else engine_inputs.piecewise_runners.get(region)
+        if runner is not None and runner.can_run(len(rids)):
+            spectrum = runner.run(static_inputs={"tokens": tokens}, request_ids=rids, real_bs=len(rids))
+            wav = self.model.window_finish(
+                blocks, slots, spectrum.get_view("magnitude"), spectrum.get_view("phase"), lengths, last,
+            )
+        else:
+            wav = self.model.stream_batched(blocks, slots, voice, lengths, tokens, last)
+        out = {}
+        for i, (rid, _, row_lengths) in enumerate(group):
+            req = self.request_state(rid)
+            req.add("lengths", lengths_after(row_lengths, tokens.shape[1], last))
+            req.add("started", True)
+            out[rid] = {"audio_chunk": [wav[i]]}
         return out
