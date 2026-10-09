@@ -350,7 +350,7 @@ Worker scheduling
        spends 78 ms of wall time on 36 ms of kernels. The default now reaches
        8192; narrow it to save graph memory and capture time, or extend it.
    * - ``MSTAR_KV_CHAIN_LAZY_STEPS``
-     - ``16``
+     - ``1``
      - How many decode steps of sampled ids the KV manager holds back before
        it extends the requests' prefix chains (the per-page keys the prefix
        cache is indexed by), one extend per request per batch of steps instead
@@ -358,7 +358,19 @@ Worker scheduling
        0.4 ms a step at 128 rows. A page key then appears up to that many
        steps late and a later commit indexes it, as the single-request path
        already allows; a request that finishes in between may leave its last
-       page unindexed. ``1`` extends on every step as before.
+       page unindexed. The default ``1`` extends on every step: ``16``
+       measured as noise at c64/c128 on 0.8B (the extension is a small part
+       of the stop check's tail).
+   * - ``MSTAR_KV_PLAN_CACHE``
+     - ``1``
+     - The KV manager plans a captured decode step off the previous step's
+       plan when the batch is the same rows in the same order and nothing
+       but that step's commit touched the streams: every length is one
+       more, pages change only where a row crossed a page boundary, and the
+       five FlashInfer index arrays come from numpy instead of a per-row
+       Python pass (about 0.2 ms of the plan thread's step at 128 rows).
+       ``0`` plans every step from the streams. ``2`` runs both and logs a
+       difference, for checking a run.
    * - ``MSTAR_GC_FREEZE``
      - ``1``
      - Once a process has finished its set-up (the API server and the
