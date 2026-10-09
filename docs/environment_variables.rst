@@ -349,6 +349,16 @@ Worker scheduling
        prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
        spends 78 ms of wall time on 36 ms of kernels. The default now reaches
        8192; narrow it to save graph memory and capture time, or extend it.
+   * - ``MSTAR_KV_CHAIN_LAZY_STEPS``
+     - ``16``
+     - How many decode steps of sampled ids the KV manager holds back before
+       it extends the requests' prefix chains (the per-page keys the prefix
+       cache is indexed by), one extend per request per batch of steps instead
+       of one per step. The per-request Python of that extension was 0.3 to
+       0.4 ms a step at 128 rows. A page key then appears up to that many
+       steps late and a later commit indexes it, as the single-request path
+       already allows; a request that finishes in between may leave its last
+       page unindexed. ``1`` extends on every step as before.
    * - ``MSTAR_GC_FREEZE``
      - ``1``
      - Once a process has finished its set-up (the API server and the
