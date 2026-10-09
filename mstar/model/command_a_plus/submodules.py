@@ -1,5 +1,6 @@
 """Packed prefill and one-token-per-request decode for Command A+."""
 
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -7,6 +8,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
 from mstar.engine.resources import (
     AttentionStep,
     KVStep,
@@ -29,14 +31,30 @@ from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInput
 
 
 class CommandAPlusLLMSubmodule(ARNodeSubmodule):
-    # Start with eager execution. Model-level compilation/capture gets its own
-    # parity checks after the full generation path works.
+    # Decode replays CUDA graphs of the same eager kernels; torch.compile stays
+    # off until compiled numerics get their own parity checks.
     disable_torch_compile = True
 
     def __init__(self, language_model: CommandAPlusForCausalLM, config: CommandAPlusTextConfig):
         super().__init__()
         self.language_model = language_model
         self.config = config
+
+    def get_cuda_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[CudaGraphConfig]:
+        if os.environ.get("COMMAND_A_PLUS_DISABLE_CUDA_GRAPH"):
+            return []
+        return [
+            BatchedCudaGraphConfig(
+                capture_graph_walk="decode",
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                    input_seq_len=1,
+                ),
+                compile=False,
+            ),
+        ]
 
     @staticmethod
     def _check_walk(graph_walk: str) -> None:
@@ -93,7 +111,7 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
 
     def _sample(self, graph_walk, engine_inputs, text_inputs):
         self._check_walk(graph_walk)
-        embeddings = self.language_model.model.embed_tokens(text_inputs)
+        embeddings = self.language_model.model.embed(text_inputs)
         hidden = self.language_model(embeddings, label="main")
         if graph_walk == "prefill":
             # Both managers have the same packing. Pick the final real prompt
