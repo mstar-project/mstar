@@ -141,7 +141,7 @@ class EngineManager:
         # return — the latter doubles the load-time VRAM peak. The cast below
         # applies the same resolved dtype, so allocation and runtime agree.
         submodules: dict[str, torch.nn.Module] = {}
-        for name in node_names:
+        for name in sorted(node_names):
             # Sequence parallelism is opt-in per node; only forward the SP
             # group when this node actually participates in one, so models
             # that don't support SP keep their existing get_submodule call.
