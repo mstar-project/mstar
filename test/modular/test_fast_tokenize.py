@@ -55,3 +55,35 @@ def test_chunked_ids_are_identical_to_one_encode_on_the_benchmark_prompts():
         whole = tok(t).input_ids
         assert encode_ids(tok, t, chunk_chars=2048, max_chunks=8) == whole
         assert encode_ids(tok, t, chunk_chars=512, max_chunks=16) == whole
+
+
+def test_chunked_encode_turns_the_crate_parallelism_on(monkeypatch):
+    """The Rust backend only runs a batch in parallel while
+    TOKENIZERS_PARALLELISM reads true; a serving environment that exported
+    it false gets it flipped before the batch, unless the knob says no."""
+    from mstar.utils.fast_tokenize import encode_ids
+
+    class _Enc:
+        def __init__(self, ids):
+            self.ids = ids
+
+    class _Backend:
+        def encode_batch(self, parts, add_special_tokens=False):
+            return [_Enc([len(p)]) for p in parts]
+
+    class _Tok:
+        backend_tokenizer = _Backend()
+
+        def __call__(self, text):
+            raise AssertionError("the chunked path was expected")
+
+    text = "word " * 4000
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
+    monkeypatch.delenv("MSTAR_TOKENIZE_PARALLEL", raising=False)
+    ids = encode_ids(_Tok(), text, chunk_chars=4096, max_chunks=8)
+    assert sum(ids) == len(text) and os.environ["TOKENIZERS_PARALLELISM"] == "true"
+
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
+    monkeypatch.setenv("MSTAR_TOKENIZE_PARALLEL", "0")
+    encode_ids(_Tok(), text, chunk_chars=4096, max_chunks=8)
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "false"
