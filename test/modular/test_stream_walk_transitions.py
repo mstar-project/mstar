@@ -20,7 +20,6 @@ from mstar.conductor.request_info import (
 )
 from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.graph_io import WorkerGraphIO
-from mstar.model.qwen3_omni.qwen3_omni_model import _talker_walk
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.streaming.topology import Connection, PartitionTopology, ProducerWalkCtx
@@ -52,6 +51,15 @@ def _drain(sbuf):
         chunk = sbuf.pop_chunk()
         out.append((walk, chunk.num_items))
     return out
+
+
+def _talker_walk(ctx: ProducerWalkCtx) -> str:
+    """Qwen3-Omni's Talker rule, restated: importing the model needs flashinfer,
+    which the CPU suite does not have (its own copy is tested in
+    test_qwen3_omni_talker_walk.py)."""
+    if ctx.producer_walk != "thinker_decode":
+        return "talker_prefill"
+    return "talker_last_prefill" if ctx.pass_in_walk == 0 else "talker_decode"
 
 
 # --- StreamBuffer ------------------------------------------------------------
