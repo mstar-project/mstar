@@ -35,6 +35,8 @@ What to extract:
 
 If a vLLM or SGLang port exists, record what it did — registration, cache config, attention backend, multimodal processor, batching hooks, special-cased code — and what it explicitly did not support.
 
+Diff your `state_dict()` against the checkpoint's safetensors index by **name and shape** before running anything — on `meta` device, so it costs nothing. A full match proves loading needs no reshaping or splitting, and it catches a misread projection layout before it becomes a parity hunt.
+
 ## Phase 2 — Decompose into a graph
 
 **Split by when things run.** Once-per-request work is one walk; repeated work is another; nodes fall out of what each walk emits to the client. Then:
@@ -63,6 +65,8 @@ Keep resident capacity separate from one-step batching: a pool may retain many s
 
 Grep for callers before overriding any base-model or submodule hook — the hook surface contains refactored-out methods that nothing calls, and overriding one is a silent no-op.
 
+The engine calls `submodule.to(device, dtype)` *after* `get_submodule` (`mstar/worker/engine_manager.py:82`), so per-parameter dtype fixes applied at construction do not survive. If a module has dtype-sensitive parameters — FlashInfer's GDN kernels assert fp32 on the decay terms — enforce it in the module's own `_apply`, so it holds against any caller rather than one loader.
+
 Reuse from `mstar/model/components/`, and put anything reusable across models there rather than in your package. For MoE models, CUDA-graph compatibility comes from the vLLM kernels shipped in `mstar/model/components/moe.py`.
 
 Validate in this order:
@@ -73,7 +77,21 @@ Validate in this order:
 4. Walks, resource declarations, request configs and step declarations on CPU, before weights (`pytest test/modular/`, dummy mode, `get_submodule` returns `None`).
 5. Live serving against the oracle on deterministic input.
 
+When a parity check fails, diff per-layer hidden states against the oracle, then split the first bad layer into its parts — each norm, the mixer, the MLP. A mixer compared in isolation can pass while its enclosing layer is wrong, because the isolated comparison feeds both sides the same input; the norms and the residual are where convention mismatches live.
+
+Make the weight loader raise if any parameter goes unfilled. A silently half-loaded model produces plausible output instead of an error.
+
 Record the oracle once and keep the parity suite; rerun it after every performance commit, and add a parity test per performance commit. Do not add CUDA-graph configs while chasing parity — capture makes every discrepancy harder to localize and the two kinds of debugging do not mix.
+
+## Small details to double-check
+
+Each of these is a one-line convention that a reference implementation states somewhere unobvious, runs fine when wrong, and produces output that reads as plausible. They are cheap to verify up front and expensive to find by bisection.
+
+- **Which RoPE variant.** Llama-style scaling applied where it doesn't belong (or omitted where it does) has manifested as a TTS model skipping words and phrases — fluent output, missing content.
+- **mRoPE position ids for multimodal spans.** Whether a component should be constant across a media span or advance per token is a per-model decision; the wrong choice has produced plausible but wrong audio transcription.
+- **Whether a norm is Gemma-style.** `(1 + weight)` versus `weight`, and a model can use both — Qwen3.5's plain `RMSNorm` scales by `(1 + weight)` while its gated norm does not. The tell is in the checkpoint: a weight tensor whose mean is ~0 rather than ~1 is storing `weight - 1`. Reading `mean()` off one norm tensor is faster than any amount of parity debugging.
+- **Stop tokens: trust the tokenizer over `config.json`.** Qwen3.5's `config.json` names `<|endoftext|>` while `tokenizer.eos_token` is `<|im_end|>`, which is what a chat turn actually ends on. Stopping on the config's alone means every reply runs to `max_tokens`, which reads as a sampler or scheduler bug. Union the two.
+- **Base versus instruct.** Variants may differ only by a suffix — Qwen tags base checkpoints `-Base`, so the unsuffixed repo is the instruct one and needs the chat template. Applying no template to an instruct model gives fluent, wrong continuations.
 
 ## Phase 5 — Batching and CUDA graphs
 

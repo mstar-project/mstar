@@ -196,6 +196,8 @@ The modular tests exist because these are the parts that are easy to get wrong: 
 
 Note that modular tests run models in **dummy mode**, where `get_submodule` returns `None`, and that several fakes stub worker internals **by name** — renaming a private on `Worker` can break them without any grep hit at the definition. Run the suite, don't just grep.
 
+If a bug only reproduces through a running server, write a standalone harness before the third attempt. A server restart can be minutes of compilation, while a harness that builds the resources directly, drives `admit`/`plan`/`commit` by hand, and captures and replays a graph runs in seconds — [test/modular/test_gdn_cuda_graph.py](test/modular/test_gdn_cuda_graph.py) is the shape to copy. Where the bug is inside a captured graph, intermediates are invisible after a replay; returning `torch.isfinite(x).all()` per layer as an extra graph output gives a flag tensor readable afterwards, which names the first bad kernel instead of the first place the damage shows.
+
 Before attributing a test failure to your change, check whether it also fails on `main`; some modular tests have pre-existing failures. Compare the set of failing tests against main, not just the count.
 
 When rebasing onto a `main` that moved, check each resolution for hunks that kept **both** sides. Two got through one rebase here: one reinstated a behaviour the commit existed to remove, and the other defeated a guard's fall-through so a step admitted with nothing reserved. Both read as plausible merges, and neither conflicted again afterwards — the modular tests caught them, which is the argument for running them per step rather than at the end.
