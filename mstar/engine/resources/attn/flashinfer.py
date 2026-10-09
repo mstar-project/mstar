@@ -265,3 +265,4 @@ class FlashInferManager(AttentionManager):
         if o.dtype != q.dtype:
             o = o.to(q.dtype)
         return o
+

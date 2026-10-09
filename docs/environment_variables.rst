@@ -201,6 +201,17 @@ model, so they are named for it.
      - Cosmos3: any nonempty value disables only the understanding-tower
        prefill capture. Denoise and reasoner decode captures remain eligible
        when ``model_kwargs.accelerator_graph`` is true.
+   * - ``COMMAND_A_PLUS_UNFUSED``
+     - unset
+     - Command A+: skip ``fuse_for_inference`` and run the unfused reference
+       path, which reduces attention, routed and shared experts separately.
+   * - ``COMMAND_A_PLUS_NCCL_ALLREDUCE``
+     - unset
+     - Command A+: use NCCL for every per-layer all-reduce instead of
+       FlashInfer's one-shot kernel.
+   * - ``COMMAND_A_PLUS_DISABLE_CUDA_GRAPH``
+     - unset
+     - Command A+: run decode eagerly instead of in CUDA graphs.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
      - OmniVoice: load weights from this local directory instead of the
