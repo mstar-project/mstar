@@ -167,12 +167,18 @@ class KVPlanOutput:
     # only the packed write addressing needs these on device, and only the
     # resource that builds them reads them; see KVManager._setup_plan_states
     cuda_indptrs: PagedIndptrs | None = None
+    # a decode step planned off the previous one (KVManager's plan cache):
+    # each row's write page and offset in it, so staging need not walk the views
+    decode_pages: np.ndarray | None = None
+    decode_offsets: np.ndarray | None = None
 
     def get_total_len(self):
         return int(self.cpu_indptrs.qo_indptr[-1])
 
     @property
     def is_decode(self) -> bool:
+        if self.decode_pages is not None:
+            return True
         return all(view.to_compute == 1 for view in self.views)
 
 
