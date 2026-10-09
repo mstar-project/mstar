@@ -2,7 +2,8 @@ import logging
 import os
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, is_dataclass, replace
+from functools import partial
 from typing import Any, Callable, Iterator, Mapping, NamedTuple
 
 import torch
@@ -195,46 +196,65 @@ def _stop_recording_to_pool(device, pool) -> None:
     try:
         end(index, pool)
     except RuntimeError:
-        # the capture failed before the allocator started recording
-        pass
+        # not recording: it never started, or capture_end stopped it and the graph releases the pool
+        return
+    # still recording, so the capture never ended and no graph will release the pool
+    torch._C._cuda_releasePool(index, pool)
 
 
-class EagerStep(NamedTuple):
-    """What one eager forward of a bucket took on the device."""
-    # bytes allocated at the peak, above what was live
+class CaptureCost(NamedTuple):
+    """What one bucket costs on the device, from its warm-up and a capture thrown away."""
+    # bytes the eager forward allocated at its peak, above what was live
     peak: int
-    # bytes a pool of its own reserved for it: what its capture takes; None
-    # when nothing can size its capture
-    reserved: int | None
+    # bytes one slot's graph holds, in its pool and out; None if it can't be captured
+    graph: int | None
+    # what of ``graph`` no later graph in the pool reuses: outputs, and a region's inputs
+    kept: int
 
 
-def _eager_step(device: torch.device, run: Callable[[], Any]) -> EagerStep:
-    """Run ``run`` in a pool of its own, for what its capture takes, then as
-    serving runs it, for its peak.
+def _tensor_bytes(value: Any) -> int:
+    """Bytes of the distinct storages behind every tensor in ``value``, however nested."""
+    storages: dict[int, int] = {}
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, torch.Tensor):
+            storages[item.untyped_storage().data_ptr()] = item.untyped_storage().nbytes()
+        elif isinstance(item, Mapping):
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+        elif is_dataclass(item):
+            pending.extend(vars(item).values())
+    return sum(storages.values())
 
-    A capture pays for every segment its allocations round up to, about twice
-    the peak for a conv (Code2Wav bs=32: 3.3 GiB peak, 6.9 GiB reserved). Short
-    of room in the pool, cuDNN swaps a conv's cached plan for a smaller
-    workspace and keeps it, so the peak comes after; a forward that overflows
-    the pool leaves ``reserved`` None.
+
+def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> tuple[int | None, int]:
+    """Run ``capture`` into a pool of its own and hand it all back: what the
+    pool took (None if it failed), and what ``capture`` returned.
+
+    A capture records kernels and collectives without running them, so a rank
+    short of memory fails its own capture here and no other rank waits on it.
     """
-    # blocks cached in the shared pool are no use to a pool of its own
     torch.cuda.empty_cache()
-    pool = torch.cuda.MemPool()
+    pool = torch.cuda.graph_pool_handle()
     try:
-        with torch.cuda.use_mem_pool(pool):
-            run()
-        torch.cuda.synchronize(device)
-        reserved = sum(segment["total_size"] for segment in pool.snapshot())
-    except torch.OutOfMemoryError:
-        reserved = None
-    del pool
+        graph, outputs = capture(pool=pool)
+    except RuntimeError:
+        logger.warning("Could not capture %s to size it", what, exc_info=True)
+        graph = outputs = None
+    # shortcut: an executable graph's own memory (about 3 KiB a kernel) is
+    # outside the allocator and not counted; measure it if capture eats the floor
+    taken = None if graph is None else sum(
+        segment["total_size"] for segment in torch.cuda.memory_snapshot(pool, include_traces=False)
+    )
+    returned = _tensor_bytes(outputs)
+    del graph, outputs
+    if taken is None:
+        # a capture that never ended keeps its stream's cuBLAS workspace in the pool; no real graph uses it yet
+        torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
-    live = torch.cuda.memory_allocated(device)
-    torch.cuda.reset_peak_memory_stats(device)
-    run()
-    torch.cuda.synchronize(device)
-    return EagerStep(peak=torch.cuda.max_memory_allocated(device) - live, reserved=reserved)
+    return taken, returned
 
 
 @dataclass(frozen=True)
@@ -263,8 +283,8 @@ class CaptureBudget:
         if device is None or device.type != "cuda":
             return None
         floor = max((
-            step.peak for runner in runners
-            for step in runner.measure_eager_steps().values()
+            cost.peak for runner in runners
+            for cost in runner.size_captures().values()
         ), default=0)
         logger.info(
             "CaptureBudget[%s]: the largest eager step takes %.0f MiB",
@@ -372,6 +392,8 @@ class WarmedSpec(NamedTuple):
     static_input_keys: tuple[str, ...]
     dummy_rids: list[int]
     dummy_metadata: dict[int, CurrentForwardPassInfo]
+    # bytes the last warm-up forward allocated at its peak, above what was live
+    peak: int
 
 
 class CudaGraphRunner:
@@ -415,8 +437,8 @@ class CudaGraphRunner:
         self.dropped_buckets: list[BucketKey] = []
         # set by prepare_for_capture; capture reuses it rather than re-deriving
         self._prepared_slot_specs: list[CGSlotSpec] | None = None
-        # bucket -> its eager step, from measure_eager_steps
-        self._eager_steps: dict[BucketKey, EagerStep] = {}
+        # bucket -> what it costs, from size_captures
+        self._capture_costs: dict[BucketKey, CaptureCost] = {}
 
         # (config_idx, tensor_key) → max-bucket static buffer. Lazily populated
         # by _intern_static_buffer on the first capture. Smaller-bucket captures
@@ -515,42 +537,42 @@ class CudaGraphRunner:
             self._prepared_slot_specs = slot_specs
         return self._prepared_slot_specs
 
-    def measure_eager_steps(self) -> dict[BucketKey, EagerStep]:
-        """Warm every spec up before any runner captures, and measure each bucket once.
+    def size_captures(self) -> dict[BucketKey, CaptureCost]:
+        """Warm every spec up, and capture each bucket's first slot once, thrown
+        away, before any runner captures for real.
 
         Every bucket rather than the first in capture order: that order leads
         with batch size, so it can open on a decode bucket while a one-row
         prefill of thousands of tokens peaks far higher. And every slot: a
-        slot's padding rows keep state of their own from their first forward.
-        Warming them all here spends that, and what compiling every shape
-        takes, before the first capture is weighed against the floor.
+        slot's first plan builds state of its own (FlashInfer's graph wrappers
+        and their workspace, 750 MiB for the Talker's second slot), which has
+        to be spent before free memory is read.
         """
         for spec in self.prepare_for_capture():
-            # the forward may hold collectives; every rank runs these specs, in
+            # the warm-up may hold collectives; every rank sizes these specs, in
             # config order, as it does the captures
             self._comm_group.tp_group.barrier()
             self._comm_group.sp_group.barrier()
             try:
                 with self._warmed(spec) as warmed:
-                    # at slot 0 alone, so every rank runs the same forwards
-                    if spec.slot == 0 and spec.bucket not in self._eager_steps:
-                        # more forwards where the capture would go, measured
-                        # there and nowhere else: whatever outlives a measured
-                        # call pins its pool
-                        with autocast_scope(self._autocast_dtype):
-                            self._eager_steps[spec.bucket] = _eager_step(self._device, warmed.run)
+                    if spec.slot == 0:
+                        graph, kept = _capture_thrown_away(
+                            partial(
+                                capture_into_graph, warmed.run, device=self._device,
+                                autocast_dtype=self._autocast_dtype,
+                            ),
+                            f"{self._submodule_name} {spec}",
+                        )
+                        self._capture_costs[spec.bucket] = CaptureCost(warmed.peak, graph, kept)
             except Exception:
-                # this slot's state would land after the floor: keep the peak, never capture
-                if (step := self._eager_steps.get(spec.bucket)) is not None:
-                    self._eager_steps[spec.bucket] = step._replace(reserved=None)
+                # a slot that can't run can't be captured, and neither can its bucket
+                if (cost := self._capture_costs.get(spec.bucket)) is not None:
+                    self._capture_costs[spec.bucket] = cost._replace(graph=None)
                 logger.warning(
                     "CudaGraphRunner[%s]: could not run %s eagerly to size its "
                     "capture", self._submodule_name, spec, exc_info=True,
                 )
-        # hand the pages back: held through the captures, they would shift every
-        # admit after them on a node that shares the resource
-        self._dummy_rows.release_all()
-        return self._eager_steps
+        return self._capture_costs
 
     def warmup_and_capture(self, budget: CaptureBudget | None = None):
         """Capture graphs for all configs and batch sizes."""
@@ -638,13 +660,13 @@ class CudaGraphRunner:
         wanted only while its bucket is whole, and only if the budget can spare
         it and the slots after it.
         """
-        step = self._eager_steps.get(spec.bucket)
-        # a bucket whose eager run failed left nothing to size its capture by
+        cost = self._capture_costs.get(spec.bucket)
+        # a bucket that could not be sized is never captured
         wanted = (
             len(captured.get(spec.bucket, ())) == spec.slot
-            and step is not None and step.reserved is not None
+            and cost is not None and cost.graph is not None
             and budget.fits(
-                step.reserved * (self._num_slots - spec.slot), f"{self._submodule_name} {spec}",
+                cost.graph * (self._num_slots - spec.slot), f"{self._submodule_name} {spec}",
             )
         )
         return agree_across_ranks(self._comm_group, [wanted], self._device)[0]
@@ -808,8 +830,12 @@ class CudaGraphRunner:
             torch.cuda.set_device(self._device)
             torch.cuda.synchronize()
             for _ in range(self.NUM_WARMUP):
+                # the last forward's peak, not the first's: that one may compile and autotune
+                live = torch.cuda.memory_allocated(self._device)
+                torch.cuda.reset_peak_memory_stats(self._device)
                 with autocast_scope(self._autocast_dtype):
                     run_forward()
+                peak = torch.cuda.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the same shapes the first prepare did
                 self._dummy_rows.reset(dummy_rids)
@@ -822,6 +848,7 @@ class CudaGraphRunner:
                 static_input_keys=static_input_keys,
                 dummy_rids=dummy_rids,
                 dummy_metadata=engine_inputs.per_request_info,
+                peak=peak,
             )
         finally:
             # Capture ran the dummy rows as real requests; free their storage
@@ -1260,6 +1287,7 @@ class WarmedRegion(NamedTuple):
     static_inputs: dict[str, torch.Tensor]
     dummy_rids: list[int]
     warm_outputs: dict[str, torch.Tensor]
+    peak: int
 
 
 class PiecewiseCudaGraphRunner:
@@ -1310,8 +1338,8 @@ class PiecewiseCudaGraphRunner:
         self._memory_pool = memory_pool
         # (bs, total_tokens) shapes that failed to capture and run eagerly
         self.dropped_shapes: list[tuple[int, int]] = []
-        # bucket -> its eager step, from measure_eager_steps
-        self._eager_steps: dict[BucketKey, EagerStep] = {}
+        # bucket -> what it costs, from size_captures
+        self._capture_costs: dict[BucketKey, CaptureCost] = {}
         self._dummy_rows = DummyRowPool(
             prefix=f"pw_{label}", step_runner=step_runner, resources=resources,
         )
@@ -1386,9 +1414,9 @@ class PiecewiseCudaGraphRunner:
             self._prepared_shapes = shapes
         return self._prepared_shapes
 
-    def measure_eager_steps(self) -> dict[BucketKey, EagerStep]:
-        """Warm every shape and slot up, measuring each shape once; see
-        ``CudaGraphRunner.measure_eager_steps``."""
+    def size_captures(self) -> dict[BucketKey, CaptureCost]:
+        """Warm every shape up and capture it once, thrown away; see
+        `CudaGraphRunner.size_captures`."""
         torch.cuda.set_device(self._device)
         shapes = sorted(
             self.prepare_for_capture(), key=lambda s: (s.bs, s.total_tokens), reverse=True,
@@ -1401,21 +1429,31 @@ class PiecewiseCudaGraphRunner:
                 try:
                     with self._warmed(shape, slot) as warmed:
                         if slot == 0:
-                            with autocast_scope(self._autocast_dtype):
-                                self._eager_steps[self._bucket(shape)] = _eager_step(
-                                    self._device, warmed.run,
-                                )
+                            graph, kept = _capture_thrown_away(
+                                partial(
+                                    capture_with_static_outputs, warmed.run, warmed.warm_outputs,
+                                    device=self._device, autocast_dtype=self._autocast_dtype,
+                                ),
+                                f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}",
+                            )
+                            # a region's outputs and inputs live outside the pool, a set per graph
+                            kept += _tensor_bytes(warmed.static_inputs)
+                            self._capture_costs[self._bucket(shape)] = CaptureCost(
+                                warmed.peak, None if graph is None else graph + kept, kept,
+                            )
                 except Exception:
-                    # as in `CudaGraphRunner.measure_eager_steps`
-                    if (step := self._eager_steps.get(self._bucket(shape))) is not None:
-                        self._eager_steps[self._bucket(shape)] = step._replace(reserved=None)
+                    # as in `CudaGraphRunner.size_captures`
+                    if (cost := self._capture_costs.get(self._bucket(shape))) is not None:
+                        self._capture_costs[self._bucket(shape)] = cost._replace(graph=None)
                     logger.warning(
                         "PiecewiseCudaGraphRunner[%s]: could not run bs=%d total_tokens=%d "
                         "slot=%d eagerly to size its capture", self._label, shape.bs,
                         shape.total_tokens, slot, exc_info=True,
                     )
+        # hand the pages back: held through the captures, they would shift every
+        # admit after them on a node that shares the resource
         self._dummy_rows.release_all()
-        return self._eager_steps
+        return self._capture_costs
 
     def warmup_and_capture(self, budget: CaptureBudget | None = None) -> None:
         if self._device is None or not torch.cuda.is_available():
@@ -1511,11 +1549,11 @@ class PiecewiseCudaGraphRunner:
         self, shape: PiecewiseCaptureShape, slot: int, whole: bool, budget: CaptureBudget,
     ) -> bool:
         """Whether every rank captures ``shape`` into ``slot``; see ``CudaGraphRunner._wanted``."""
-        step = self._eager_steps.get(self._bucket(shape))
+        cost = self._capture_costs.get(self._bucket(shape))
         wanted = (
-            whole and step is not None and step.reserved is not None
+            whole and cost is not None and cost.graph is not None
             and budget.fits(
-                step.reserved * (self._num_slots - slot),
+                cost.graph * (self._num_slots - slot),
                 f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens} slot={slot}",
             )
         )
@@ -1569,8 +1607,12 @@ class PiecewiseCudaGraphRunner:
             torch.cuda.synchronize()
             warm_outputs = None
             for _ in range(self.NUM_WARMUP):
+                # as in `CudaGraphRunner._warmed`
+                live = torch.cuda.memory_allocated(self._device)
+                torch.cuda.reset_peak_memory_stats(self._device)
                 with autocast_scope(self._autocast_dtype):
                     warm_outputs = run_fn()
+                peak = torch.cuda.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the shapes the first plan did
                 self._dummy_rows.reset(dummy_rids)
@@ -1579,7 +1621,7 @@ class PiecewiseCudaGraphRunner:
 
             yield WarmedRegion(
                 run=run_fn, static_inputs=static_inputs,
-                dummy_rids=dummy_rids, warm_outputs=warm_outputs,
+                dummy_rids=dummy_rids, warm_outputs=warm_outputs, peak=peak,
             )
         finally:
             # pages stay with the dummy streams: replay's padding rows address

@@ -23,8 +23,8 @@ from mstar.engine import cuda_graph_runner
 from mstar.engine.cuda_graph_config import PiecewiseCaptureShape
 from mstar.engine.cuda_graph_runner import (
     CaptureBudget,
+    CaptureCost,
     CudaGraphRunner,
-    EagerStep,
     PiecewiseCudaGraphRunner,
     WarmedRegion,
     WarmedSpec,
@@ -44,19 +44,18 @@ _PREFILL = _bucket("prefill_vision", 1, 16384)
 
 
 class _StubMeasuredRunner:
-    """`measure_eager_steps` over stub warm-ups of ``steps``, two slots each, in capture order."""
+    """`size_captures` over stub warm-ups of ``steps``, two slots each, in capture order."""
 
-    measure_eager_steps = CudaGraphRunner.measure_eager_steps
+    size_captures = CudaGraphRunner.size_captures
 
-    def __init__(self, device: torch.device, steps: dict[BucketKey, EagerStep]):
+    def __init__(self, device: torch.device, steps: dict[BucketKey, CaptureCost]):
         self._steps = steps
         self._device = device
         self._autocast_dtype = None
         self._submodule_name = "Thinker"
-        self._eager_steps = {}
+        self._capture_costs = {}
         group = SimpleNamespace(world_size=1, barrier=lambda: None)
         self._comm_group = SimpleNamespace(tp_group=group, sp_group=group)
-        self._dummy_rows = SimpleNamespace(release_all=lambda: None)
 
     def prepare_for_capture(self):
         return [CGSlotSpec(bucket=b, slot=s, config=SimpleNamespace()) for b in self._steps for s in (0, 1)]
@@ -66,26 +65,33 @@ class _StubMeasuredRunner:
         step = self._steps[spec.bucket]
         yield WarmedSpec(
             run=lambda: step, static_inputs={}, static_input_keys=(), dummy_rids=[], dummy_metadata={},
+            peak=step.peak,
         )
 
 
 @pytest.fixture
 def measured(monkeypatch):
-    """Each measured forward's step, with the pool it would run in stubbed out."""
+    """Each sized bucket's cost, with the throwaway capture stubbed out."""
     runs = []
 
-    def measure(device, run):
-        runs.append(run())
-        return runs[-1]
+    def capture(capture, what):
+        _, cost = capture(pool=None)
+        runs.append(cost)
+        return cost.graph, cost.kept
 
-    monkeypatch.setattr(cuda_graph_runner, "_eager_step", measure)
+    monkeypatch.setattr(cuda_graph_runner, "_capture_thrown_away", capture)
+    monkeypatch.setattr(
+        cuda_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, run()),
+    )
     return runs
 
 
 def test_the_floor_is_the_largest_eager_peak_on_the_device(measured):
     cuda = torch.device("cuda", 0)
-    talker = _StubMeasuredRunner(cuda, {_DECODE: EagerStep(peak=_GIB, reserved=2 * _GIB)})
-    code2wav = _StubMeasuredRunner(cuda, {_DECODE: talker._steps[_DECODE], _PREFILL: EagerStep(3 * _GIB, 6 * _GIB)})
+    talker = _StubMeasuredRunner(cuda, {_DECODE: CaptureCost(peak=_GIB, graph=2 * _GIB, kept=0)})
+    code2wav = _StubMeasuredRunner(
+        cuda, {_DECODE: talker._steps[_DECODE], _PREFILL: CaptureCost(3 * _GIB, 6 * _GIB, 0)},
+    )
 
     budget = CaptureBudget.measure(cuda, [talker, code2wav])
 
@@ -96,9 +102,9 @@ def test_every_bucket_is_measured_once_before_any_capture(measured):
     """The first spec in capture order is a 32-row decode; the one-row 16k-token
     prefill behind it peaks ten times higher. Measuring only the first would
     set the floor far too low."""
-    steps = {_DECODE: EagerStep(peak=_GIB // 10, reserved=_GIB // 5), _PREFILL: EagerStep(peak=_GIB, reserved=2 * _GIB)}
+    steps = {_DECODE: CaptureCost(_GIB // 10, _GIB // 5, 0), _PREFILL: CaptureCost(_GIB, 2 * _GIB, 0)}
 
-    kept = _StubMeasuredRunner(torch.device("cuda", 0), steps).measure_eager_steps()
+    kept = _StubMeasuredRunner(torch.device("cuda", 0), steps).size_captures()
 
     assert measured == list(steps.values()), "each bucket is measured once, in capture order"
     assert kept == steps, "every bucket's step must be kept to size its capture"
@@ -111,7 +117,7 @@ def test_a_cpu_device_never_asks_the_driver(monkeypatch):
     driver_calls = []
     for name in ("mem_get_info", "synchronize", "empty_cache", "MemPool", "use_mem_pool"):
         monkeypatch.setattr(torch.cuda, name, lambda *args, name=name, **kwargs: driver_calls.append(name))
-    runner = _StubMeasuredRunner(torch.device("cpu"), {_DECODE: EagerStep(peak=_GIB, reserved=2 * _GIB)})
+    runner = _StubMeasuredRunner(torch.device("cpu"), {_DECODE: CaptureCost(peak=_GIB, graph=2 * _GIB, kept=0)})
 
     budget = CaptureBudget.measure(torch.device("cpu"), [runner])
 
@@ -150,8 +156,8 @@ class _StubCaptureRunner:
         self._device = torch.device("cuda", 0)
         self._autocast_dtype = None
         self._buckets = {}
-        self._eager_steps = {
-            _bucket("decode", bs, bs): EagerStep(peak=size // 2, reserved=size) for bs, size in reserved.items()
+        self._capture_costs = {
+            _bucket("decode", bs, bs): CaptureCost(peak=size // 2, graph=size, kept=0) for bs, size in reserved.items()
         }
         group = SimpleNamespace(world_size=1, barrier=lambda: None)
         self._comm_group = SimpleNamespace(tp_group=group, sp_group=group)
@@ -159,15 +165,15 @@ class _StubCaptureRunner:
         self.tried: list[int] = []
 
     def prepare_for_capture(self):
-        buckets = sorted(self._eager_steps, key=lambda bucket: bucket.bs, reverse=True)
+        buckets = sorted(self._capture_costs, key=lambda bucket: bucket.bs, reverse=True)
         return [CGSlotSpec(bucket=bucket, slot=0, config=SimpleNamespace()) for bucket in buckets]
 
     @contextmanager
     def _warmed(self, spec):
         self.tried.append(spec.bs)
         yield WarmedSpec(
-            run=_taking(self._gpu, self._eager_steps[spec.bucket].reserved), static_inputs={},
-            static_input_keys=(), dummy_rids=[], dummy_metadata={},
+            run=_taking(self._gpu, self._capture_costs[spec.bucket].graph), static_inputs={},
+            static_input_keys=(), dummy_rids=[], dummy_metadata={}, peak=0,
         )
 
     _get_addtl_slot_specs = staticmethod(lambda spec: [])
@@ -198,8 +204,8 @@ class _StubCaptureRegion:
         self._num_slots = 1
         self._graphs = {}
         self.dropped_shapes = []
-        self._eager_steps = {
-            self._bucket(shape): EagerStep(peak=size // 2, reserved=size)
+        self._capture_costs = {
+            self._bucket(shape): CaptureCost(peak=size // 2, graph=size, kept=0)
             for shape, size in zip(self._shapes, reserved.values(), strict=True)
         }
         self.tried: list[tuple[int, int]] = []
@@ -213,8 +219,8 @@ class _StubCaptureRegion:
     def _warmed(self, shape, slot):
         self.tried.append((shape.bs, shape.total_tokens))
         yield WarmedRegion(
-            run=_taking(self._gpu, self._eager_steps[self._bucket(shape)].reserved), static_inputs={}, dummy_rids=[],
-            warm_outputs={},
+            run=_taking(self._gpu, self._capture_costs[self._bucket(shape)].graph), static_inputs={}, dummy_rids=[],
+            warm_outputs={}, peak=0,
         )
 
 
