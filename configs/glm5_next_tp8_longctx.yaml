@@ -9,6 +9,7 @@ max_concurrent_requests: 64
 # warning, where NVLink multicast is unavailable.
 tp_allreduce: "symm_multimem"
 tp_allreduce_max_kb: 32768
+tp_async_sched: true
 model_kwargs:
   moe_quant_kernel: "auto"
   mtp_num_draft_tokens: 0
