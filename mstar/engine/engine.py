@@ -760,6 +760,18 @@ class Engine:
         # read leniently, as the probe itself was only reached per prepared row
         keyed = getattr(self, "_keyed_walks", None)
         probe_prefix = bool(keyed) and walk in keyed.get(batch.node_name, ())
+        if not probe_prefix:
+            uniform = submodule.uniform_row_inputs(walk)
+            if uniform is not None:
+                # one object for all the step's rows: the per-row call would
+                # return an equal one each time (128 calls at a full decode
+                # batch, on the gpu thread before the launch)
+                node_inputs = [uniform] * len(batch.request_ids)
+                batch.register_prepare_batch(node_inputs)
+                batch.running_batched = submodule.can_batch(
+                    batch=batch, model_inputs=node_inputs
+                )
+                return
         for rid in batch.request_ids:
             try:
                 req_inputs = prepare(
