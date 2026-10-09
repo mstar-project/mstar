@@ -237,6 +237,13 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_MAX_BODY_MB``
      - ``128``
      - Request body limit (multipart uploads included).
+   * - ``MSTAR_TOKENIZE_PARALLEL``
+     - ``1``
+     - When a long prompt is encoded as parallel chunks, set
+       ``TOKENIZERS_PARALLELISM=true`` for the process first: the Rust
+       tokenizer only uses its thread pool while that variable reads true,
+       and serving environments often export it false. ``0`` leaves the
+       variable as it is (the chunked encode then runs serially).
    * - ``MSTAR_TOKENIZER``
      - unset
      - Path to a HuggingFace ``tokenizer.json`` enabling frontend
