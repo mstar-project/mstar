@@ -95,6 +95,7 @@ def kv_pinned_indptrs() -> bool:
     ring of page-locked host buffers, and the decode wrapper copies the
     indices straight into its captured device buffer from there. The copies
     are then really asynchronous; from pageable memory the driver stages each
-    one, and FlashInfer makes the indices copy blocking. ``0`` keeps the
-    pageable arrays."""
-    return os.environ.get("MSTAR_KV_PINNED_INDPTRS", "1") == "1"
+    one, and FlashInfer makes the indices copy blocking. Off by default: the
+    event bookkeeping per take cost about what the staged copies did at
+    c32-c128 on 0.8B (measured neutral to slightly negative)."""
+    return os.environ.get("MSTAR_KV_PINNED_INDPTRS", "0") == "1"
