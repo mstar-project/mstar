@@ -840,3 +840,70 @@ def test_register_for_send_uuids_writes_every_request_not_just_the_first():
             for info in infos:
                 assert info.uuid in mgr._shm_files, f"{rid} never written"
                 assert os.path.exists(mgr._shm_files[info.uuid])
+
+
+# ---------------------------------------------------------------------------
+# Host copies: a transport that sends from host memory reuses the producer's
+# ---------------------------------------------------------------------------
+
+def _send_and_read(sender, receiver, rid, edges):
+    sender.register_for_send(rid, edges[0].tensor_info)
+    receiver.start_read_tensors(rid, edges, graph_walk="decode")
+    receiver.get_ready_tensors(graph_walk="decode")
+    return receiver.get_tensor(edges[0].tensor_info[0].uuid)
+
+
+def test_shm_sends_the_stored_host_copy():
+    """The send reads the host copy when there is one. The copy differs from
+    the stored tensor here only so the test can tell which one was sent."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sender = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        receiver = _make_manager(tmpdir, entity_id="worker_1", request_id="req1")
+        assert sender.needs_cpu_tensor
+
+        tensor, host = torch.zeros(1, 4), torch.arange(4.0).reshape(1, 4)
+        infos = sender.store_and_return_tensor_info(
+            "req1", {"tok": [tensor]}, cpu_tensors={"tok": [host]},
+        )
+        assert sender.tensor_store.get_cpu_tensor(infos["tok"][0].uuid) is host
+        edges = [GraphEdge(next_node="LLM", name="tok", tensor_info=infos["tok"])]
+        assert torch.equal(_send_and_read(sender, receiver, "req1", edges), host)
+
+
+def test_host_copy_follows_a_renamed_output():
+    """A submodule that rebinds an output under its signal name (Qwen3.5's
+    ``new_token`` -> ``text_inputs``) aliases the tensor; the stop check's
+    copy, keyed by the original name, still reaches the stored signal."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir)
+        token = [torch.zeros(1, dtype=torch.int64)]
+        outputs = {7: {"new_token": token, "text_inputs": token}}
+        host = torch.ones(1, dtype=torch.int64)
+        stored = mgr.store_and_return_tensor_info_batch(
+            [7], outputs, ["text_inputs"],
+            cpu_tensors={7: {"new_token": [host]}},
+        )
+        assert mgr.tensor_store.get_cpu_tensor(stored.flat_uuids[0]) is host
+
+
+def test_host_copies_not_kept_for_device_transports():
+    """TCP / RDMA read device memory, so a host copy would only be held."""
+    assert not MooncakeCommunicationManager.needs_cpu_tensor.fget(object())
+
+    class _DeviceTransport(SharedMemoryCommunicationManager):
+        needs_cpu_tensor = False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _DeviceTransport(
+            my_entity_id="worker_0", hostname="localhost", device="cpu",
+            communicator=MockCommunicator(), shm_dir=tmpdir,
+        )
+        infos = mgr.store_and_return_tensor_info(
+            "req1", {"tok": [torch.zeros(1)]}, cpu_tensors={"tok": [torch.ones(1)]},
+        )
+        stored = mgr.store_and_return_tensor_info_batch(
+            [1], {1: {"tok": [torch.zeros(1)]}}, ["tok"],
+            cpu_tensors={1: {"tok": [torch.ones(1)]}},
+        )
+        for uuid in [infos["tok"][0].uuid, *stored.flat_uuids]:
+            assert mgr.tensor_store.get_cpu_tensor(uuid) is None

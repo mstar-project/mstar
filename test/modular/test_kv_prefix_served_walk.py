@@ -30,7 +30,7 @@ from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.graph.runtime.base import FreedTensors, RouteOutput
 from mstar.model.base import PrefixStream
-from mstar.model.submodule_base import ARNodeInputs
+from mstar.model.submodule_base import ARNodeInputs, BatchedModelOutput
 from mstar.worker.worker import PendingBatch, Worker
 
 RID = 7
@@ -101,7 +101,7 @@ def _worker() -> Worker:
     w._graph_runtime = _StubGraphRuntime()
     w.tensor_manager = _StubTensorManager()
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
-        check_stop_for_batch=lambda batch, outputs: {},
+        check_stop_for_batch=lambda batch, outputs, **kwargs: {},
         extend_prefix_chains=lambda batch, outputs: None,
     ))
     w.request_state = SimpleNamespace(
@@ -114,6 +114,7 @@ def _worker() -> Worker:
     w.enable_prof = False
     w._phase_period = 0
     w._last_active = {}
+    w._innermost_loop_by_node = {}
     return w
 
 
@@ -130,7 +131,7 @@ def test_a_served_walk_is_routed_with_no_tensors():
         graph_walk=WALK, future=None,
     )
 
-    worker._postprocess_batch(pending, {})
+    worker._postprocess_batch(pending, BatchedModelOutput())
 
     routed = worker._graph_runtime.routed
     assert routed is not None and list(routed.wg_ids.keys) == [RID], (

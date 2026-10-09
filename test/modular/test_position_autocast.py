@@ -16,7 +16,9 @@ def test_apply_qk_uses_autocast_for_the_tensor_device(monkeypatch):
         record_kernel_dtypes,
     )
 
-    manager = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
+    manager = RopeManager(
+        PositionConfig(kv_cache="kv"), torch.device("cpu"), max_seq_len=8,
+    )
     manager._current_pos_ids["main"] = torch.arange(1)
     q = torch.ones((1, 1, 2), dtype=torch.float32)
     k = q.clone()

@@ -32,6 +32,7 @@ def _edge(name: str) -> StreamingEdge:
 def _speculation(rids: list[str]) -> Speculation:
     return Speculation(
         scheduled_batch=SimpleNamespace(
+            node_name=NODE,
             request_to_worker_graph={r: "wg" for r in rids},
         ),
         node_batch=SimpleNamespace(
@@ -53,8 +54,21 @@ def _speculation(rids: list[str]) -> Speculation:
 
 def test_dropped_rid_gets_its_own_edges_back():
     returned: list[tuple[str, str]] = []
+    committed: list[tuple] = []
     worker = SimpleNamespace(
         _return_streaming_edge=lambda rid, se: returned.append((rid, se.edge.name)),
+        # The staged ingests are settled per rid before the chunks go back, so
+        # the chunk leaves the node's slot first; see Worker._settle_speculation.
+        _graph_runtime=SimpleNamespace(
+            commit_speculation=lambda sid, ok, dropped, **kw: committed.append(
+                (sid, ok, sorted(dropped), kw.get('scheduled_rids'))
+            ),
+        ),
+    )
+    worker._set_in_flight_flag = lambda batch, value: None
+    worker._settle_speculation = (
+        lambda spec, success, dropped_rids=frozenset():
+        Worker._settle_speculation(worker, spec, success, dropped_rids)
     )
     # The dropped rid goes first: the threading loop leaves its variable bound
     # to the LAST rid it visited, so a cleanup that read that leftover would
@@ -75,6 +89,36 @@ def test_dropped_rid_gets_its_own_edges_back():
     ):
         assert set(table) == {"keep"}
 
-    # drop's chunk went back to drop's buffer; keep's stays consumed.
+    # Settling is the caller's, keyed off ``dropped``: the threading reports
+    # the rid and leaves the chunks alone.
+    assert returned == [] and committed == []
+    assert set(spec.consumed_streaming_edges) == {"drop", "keep"}
+
+    # What the caller then does with it: only drop's staged ingest is undone,
+    # and the undo precedes the hand-back or the chunk is in two places.
+    worker._settle_speculation(spec, True, spec.dropped)
+    # One crossing, two different rid sets: the undo targets the dropped rid,
+    # the speculative-scheduled flag goes on the one that still runs.
+    assert committed == [(spec.spec_id, True, ["drop"], ["keep"])]
     assert returned == [("drop", "audio_drop")]
-    assert set(spec.consumed_streaming_edges) == {"keep"}
+    # keep's chunk now belongs to the step, so the settle forgets it.
+    assert spec.consumed_streaming_edges == {} and spec.spec_id == 0
+
+
+def test_failed_settle_after_success_returns_nothing():
+    """An error between the success settle and submit settles again with
+    ``success=False``. The runtime stage is gone by then, so the kept chunk
+    stays in its slot; returning it to its buffer would track it twice.
+    """
+    returned: list[tuple[str, str]] = []
+    worker = SimpleNamespace(
+        _return_streaming_edge=lambda rid, se: returned.append((rid, se.edge.name)),
+        _graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None),
+    )
+    spec = _speculation(["keep"])
+    spec.spec_id = 5
+
+    Worker._settle_speculation(worker, spec, True)
+    Worker._settle_speculation(worker, spec, False)
+
+    assert returned == []

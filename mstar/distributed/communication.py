@@ -26,7 +26,13 @@ class CommGroup:
         self.group_members = group_members
         self.world_size = len(group_members)
         self.device_group = None
+        # gloo twin of ``device_group``, for object collectives (workspace
+        # rendezvous) that should not go through NCCL
+        self.cpu_group = None
         self.initialized = False
+        # see ``init_allreduce_fusion``
+        self._ar_fusion_ws: int | None = None
+        self._ar_fusion_max_tokens = 0
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -69,6 +75,42 @@ class CommGroup:
             return input_
         dist.all_reduce(input_, group=self.device_group)
         return input_
+
+    def init_allreduce_fusion(
+        self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
+    ) -> bool:
+        """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
+        hidden]`` inputs; larger inputs keep the NCCL path. Collective: every
+        member calls it at the same point. Returns whether it is available."""
+        if self.world_size == 1 or self._ar_fusion_ws is not None:
+            return self._ar_fusion_ws is not None
+        from mstar.distributed.ar_fusion import create_workspace
+
+        self._ar_fusion_ws = create_workspace(
+            self.rank, self.world_size, self.cpu_group, max_tokens, hidden, dtype,
+        )
+        self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
+        return self._ar_fusion_ws is not None
+
+    def allreduce_add_rmsnorm(
+        self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+        eps: float, weight_bias: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``r = all_reduce(x) + residual``; returns ``(rms_norm(r), r)``,
+        scaling by ``weight + weight_bias``. ``x`` is a row-parallel
+        projection's partial sum (its linear skipped ``reduce_results``)."""
+        if (self._ar_fusion_ws is not None
+                and x.shape[0] <= self._ar_fusion_max_tokens
+                and x.is_contiguous() and residual.is_contiguous()):
+            from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
+
+            return allreduce_add_rmsnorm(
+                x, residual, weight, eps, weight_bias, self._ar_fusion_ws,
+            )
+        r = self.all_reduce(x) + residual
+        v = r.float()
+        v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
+        return (v * (weight.float() + weight_bias)).to(r.dtype), r
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
@@ -300,8 +342,16 @@ class WorkerParallelGroups:
         # tag-ordered (see the field comment). A tuple shared by a TP and
         # an SP group (degenerate meshes) maps to one subgroup.
         rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
+        rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
             rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
+            # Members only: with the default group bound to a device, a
+            # non-member's subgroup creation joins an ncclCommSplit that
+            # members never call for a gloo group, and blocks forever.
+            rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
+                ranks=list(rank_tuple), backend="gloo",
+                use_local_synchronization=True,
+            )
 
         seen: set[int] = set()
         for comm_group in (
@@ -314,6 +364,7 @@ class WorkerParallelGroups:
                 comm_group.initialized = True
                 continue
             comm_group.device_group = rank_tuple_to_pg[tuple(comm_group.group_members)]
+            comm_group.cpu_group = rank_tuple_to_cpu_pg[tuple(comm_group.group_members)]
             comm_group.initialized = True
 
     def get_tp_config_for_node(self, node: str) -> CommGroup:

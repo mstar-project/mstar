@@ -12,8 +12,10 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
+from mstar.graph.runtime.base import GraphRuntime
 from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
 from mstar.model.base import Model
+from mstar.utils.streams import reset_device_scheduling
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +149,7 @@ class EngineManager:
         parallel_groups: WorkerParallelGroups,
         transfer_engine_info: TransferEngineInfo,
         model: Model,
+        graph_runtime: GraphRuntime,
         enable_nvtx: bool = False,
         enable_prof: bool=False,
     ) -> "EngineManager":
@@ -202,6 +205,7 @@ class EngineManager:
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
 
         engine = Engine(
+            graph_runtime=graph_runtime,
             autocast_dtype=autocast_dtype,
             enable_nvtx=enable_nvtx,
             enable_profile=enable_prof,
@@ -223,6 +227,9 @@ class EngineManager:
         """CUDA graph capture, for the whole forward and any piecewise region."""
         with torch.no_grad():
             self.engine.warmup()
+        # warmup ran side-stream work beside graph replays; start serving from
+        # a clean scheduling state (see reset_device_scheduling)
+        reset_device_scheduling(self.engine._device)
 
     def get_engine(self, node_name: str) -> Engine:
         del node_name  # one engine serves every node

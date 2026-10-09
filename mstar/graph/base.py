@@ -242,7 +242,9 @@ class GraphNode(GraphSection):
     # Whether this node is currently speculatively being executed: if so, we
     # don't want to queue it in a "ready" queue because it's already being
     # executed, but we do want to update everything else as normal.
-    _speculatively_scheduled: bool = False
+    # Set while a batch carrying this node is in flight (speculative or not):
+    # gates ready-queue adds so the node is not double-queued underneath it.
+    _in_flight: bool = False
 
     _streaming_inputs: set[str] = field(default_factory=set)
 
@@ -796,25 +798,25 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
 
     def register_ingested_input(self, graph_edge: GraphEdge):
         node = self.nodes[graph_edge.next_node]
-        # If node._speculatively_scheduled, the node is already executing as
-        # a spec batch. We don't want to double-queue it (either for the
+        # If node._in_flight, the node is already executing as part of a
+        # batch. We don't want to double-queue it (either for the
         # current iter via ``ready_names`` or for the next iter via
         # ``ready_next_iter`` — both eventually feed the scheduler) so we
         # gate every queue add on the flag.
         if node.ready_signals.is_ready:
-            if not node._speculatively_scheduled:
+            if not node._in_flight:
                 self.ready_names.add(node.name)
             self.ready_for_streaming.discard(node.name)
         elif node.ready_signals.is_ready_for_streaming:
-            if not node._speculatively_scheduled:
+            if not node._in_flight:
                 self.ready_for_streaming.add(node.name)
 
         if node.ready_next_iter.is_ready:
-            if not node._speculatively_scheduled:
+            if not node._in_flight:
                 self.ready_next_iter.add(node.name)
             self.ready_streaming_next_iter.discard(node.name)
         elif node.ready_next_iter.is_ready_for_streaming:
-            if not node._speculatively_scheduled:
+            if not node._in_flight:
                 self.ready_streaming_next_iter.add(node.name)
 
     def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:

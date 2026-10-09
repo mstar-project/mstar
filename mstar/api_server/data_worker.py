@@ -395,7 +395,7 @@ class PreprocessWorkerThread:
         # This thread turns each output tensor into client-ready bytes. At 720p
         # that is an 11 MiB SHM read plus a postprocess copy per engine step,
         # downstream of the last worker-side NVTX range.
-        self.enable_nvtx = enable_nvtx
+        self.enable_nvtx = profiler.nvtx_enabled(enable_nvtx)
 
         self.in_flight_requests = set()
         self.tensor_uuid_to_metadata_per_request = {}

@@ -143,10 +143,19 @@ def test_a_dropped_speculative_rid_neither_flushes_nor_reports_done():
     speculation = SimpleNamespace(
         node_batch=batch, continuing_rids={"r"}, consumed_edges=[("loop", None)],
         scheduled_batch=SimpleNamespace(request_to_worker_graph={"r": 0}),
-        consumed_streaming_edges={"r": [edge]},
+        consumed_streaming_edges={"r": [edge]}, spec_id=0,
+    )
+    # The dropped rid's staged ingest is undone before its chunk goes back.
+    worker._graph_runtime = SimpleNamespace(commit_speculation=lambda *a, **kw: None)
+    worker._set_in_flight_flag = lambda batch, value: None
+    worker._settle_speculation = (
+        lambda spec, success, dropped_rids=frozenset():
+        Worker._settle_speculation(worker, spec, success, dropped_rids)
     )
 
     Worker._thread_outputs_to_speculative(worker, speculation, outputs_N={})
+    # The caller settles, keyed off ``dropped``; that is what reopens the stream.
+    worker._settle_speculation(speculation, True, speculation.dropped)
 
     assert speculation.dropped == {"r"}
     assert (batch.final_stream_rids, batch.stream_partition_done_rids) == (set(), set())

@@ -42,12 +42,20 @@ def _fake_worker() -> Worker:
     w._pending_drains = set()
     w._draining_rids = set()
     w.scheduler = SimpleNamespace(failed_rids=set())
+    w.settled = []
     w._graph_runtime = SimpleNamespace(
         push_back_node=lambda node_name, rids, wg_ids: w.pushed_back.extend(rids),
-        set_speculatively_scheduled=(
+        set_in_flight=(
             lambda node_name, wg_id, rids, value: w.despeculated.extend(rids)
         ),
+        commit_speculation=(
+            lambda spec_id, success, dropped, **kw: w.settled.append(
+                (success, dropped)
+            )
+        ),
     )
+    # No stream buffers in the fake, so _return_streaming_edge no-ops.
+    w.request_state = SimpleNamespace(per_request_info={})
     return w
 
 
@@ -92,6 +100,10 @@ def test_main_loop_error_drops_an_armed_unsubmitted_speculation() -> None:
     assert sorted(w.despeculated) == ["a", "b"]
     assert w.pushed_back == ["b"]
     assert w.failed == [{"a": "Error in worker: RuntimeError: boom"}]
+    # The step never ran, so its staged stream chunks are un-ingested and go
+    # back to their buffers -- the fresh rid pushed back above would otherwise
+    # hold one in a slot the next ingest can overtake.
+    assert w.settled == [(False, [])]
 
 
 def test_main_loop_error_leaves_a_submitted_speculation_alone() -> None:

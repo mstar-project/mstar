@@ -49,7 +49,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
-from mstar.utils.profiler import range_pop, range_push
+from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
@@ -304,7 +304,6 @@ class Conductor:
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
-        self.enable_nvtx = enable_nvtx
         self.enable_prof = enable_prof
         self.tensor_comm_protocol = tensor_comm_protocol
         self.tcp_transfer_device = tcp_transfer_device
@@ -321,6 +320,7 @@ class Conductor:
             self.model_config = yaml.safe_load(f)
         accelerator = torch.accelerator.current_accelerator(check_available=True)
         self.device_type = accelerator.type if accelerator is not None else "cpu"
+        self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
@@ -1384,6 +1384,19 @@ class Conductor:
         )
         pstate.metadata = fwd_args.full_metadata
         pstate.metadata.kwargs.update(fwd_args.step_metadata)
+
+        # The worker's signal is authoritative for a stream-terminated
+        # partition: the pass that consumed the stream's final chunk has run.
+        # Treat it as the partition's own `request_done` so its downstream
+        # connections get `producer_done` and the chain closes. A model that
+        # inferred the end from the connection counters instead
+        # (`consumed_count >= token_count`) could race: `consumed_count` counts
+        # chunks popped for execution, and every worker-graphs-done report from
+        # a worker carries every buffer's count, so a colocated consumer's report
+        # could finish this partition while its last step was still running,
+        # and that step's output arrived for a request already gone.
+        if incoming_connections and partition_done_from_worker:
+            fwd_args.request_done = True
 
         # Check max output tokens for partitions that produce tokens
         if pstate.num_output_tokens >= request_data.max_output_tokens:

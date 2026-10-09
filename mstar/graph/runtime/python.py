@@ -158,6 +158,11 @@ class PythonGraphRuntime(GraphRuntime):
         self._completions: dict[int, CompletionState] = {}
         self._completion_counter = 0
 
+        # Streaming ingests a prep staged, parked until commit_speculation
+        # settles them: spec_id -> [(rid, node, into_signals, into_next_iter)].
+        self._staged_specs: dict[int, list[tuple]] = {}
+        self._spec_counter = 0
+
         # worker graph info
         self._queues = {
             worker_graph.worker_graph_id: WorkerGraphQueues(
@@ -272,6 +277,16 @@ class PythonGraphRuntime(GraphRuntime):
             del self._completions[cid]
         for c in self._completions.values():
             c.routing.pop(rid, None)
+        # Same recycling hazard for a staged speculation nobody settled: its
+        # undo would otherwise run against whichever request gets this handle
+        # next. The node objects go away with the queues below anyway.
+        for sid in [
+            sid for sid, staged in self._staged_specs.items()
+            if all(s[0] == rid for s in staged)
+        ]:
+            del self._staged_specs[sid]
+        for sid, staged in self._staged_specs.items():
+            self._staged_specs[sid] = [s for s in staged if s[0] != rid]
 
         info = self._request_info.pop(rid)
         for wg_id in info.worker_graph_ids:
@@ -310,21 +325,21 @@ class PythonGraphRuntime(GraphRuntime):
             if walk in self._all_wg_ids_to_graph_walks[wg_id]
         ]
 
-    def set_speculatively_scheduled(
+    def set_in_flight(
         self, node: str, wg_id: int, rids: list[int],
-        speculatively_scheduled: bool
+        in_flight: bool,
     ):
         queues = self._queues[wg_id].per_request_queues
         for rid in rids:
             if rid not in queues:
                 continue
-            queues[rid].get_node(node)._speculatively_scheduled = speculatively_scheduled
+            queues[rid].get_node(node)._in_flight = in_flight
 
-    def is_speculatively_scheduled(
+    def is_in_flight(
         self, node: str, wg_id: int, rid: int,
     ) -> bool:
         wgio = self._queues[wg_id].per_request_queues.get(rid)
-        return wgio is not None and wgio.get_node(node)._speculatively_scheduled
+        return wgio is not None and wgio.get_node(node)._in_flight
 
     def get_dynamic_loop_iters(
         self, request_ids: list[int],
@@ -759,6 +774,7 @@ class PythonGraphRuntime(GraphRuntime):
             ready_rids=[p.rid for p in prepped],
             wg_ids=[wg_id] * len(prepped),
             input_edges=edges,
+            spec_id=self._stage_spec(prepped),
         )
 
     def prep_spec_rids(
@@ -782,6 +798,7 @@ class PythonGraphRuntime(GraphRuntime):
         consumed_idxs: list[int] = []
         ready_rids: list[int] = []
         wg_ids: list[int] = []
+        staged: list["_SpecRidPrep"] = []
         edges = ColumnarEdgeSpecs.empty()
 
         for rid, indexed_edges in per_rid_edges:
@@ -809,6 +826,7 @@ class PythonGraphRuntime(GraphRuntime):
             consumed_idxs.extend(prepped.consumed_idxs)
             ready_rids.append(rid)
             wg_ids.append(wg_id)
+            staged.append(prepped)
             for signal, uuids, final_chunk in prepped.input_edges:
                 edges.add(rid, signal, uuids, final_chunk)
 
@@ -817,7 +835,42 @@ class PythonGraphRuntime(GraphRuntime):
             ready_rids=ready_rids,
             wg_ids=wg_ids,
             input_edges=edges,
+            spec_id=self._stage_spec(staged),
         )
+
+    def _stage_spec(self, prepped: list["_SpecRidPrep"]) -> int:
+        """Park what a prep ingested, for ``commit_speculation`` to settle.
+
+        0 when nothing was ingested: there is no stage to undo, so the caller
+        has nothing to settle and does not need an id to forget.
+        """
+        staged = [
+            (p.rid, p.node, p.into_signals, p.into_next_iter) for p in prepped
+            if p.into_signals or p.into_next_iter
+        ]
+        if not staged:
+            return 0
+        self._spec_counter += 1
+        self._staged_specs[self._spec_counter] = staged
+        return self._spec_counter
+
+    def commit_speculation(
+        self, spec_id: int, success: bool, dropped_rids: list[int] = (),
+        node: str | None = None, wg_id: int | None = None,
+        scheduled_rids: list[int] = (),
+    ):
+        if success and node is not None and wg_id is not None:
+            self.set_in_flight(
+                node, wg_id, list(scheduled_rids), True,
+            )
+        staged = self._staged_specs.pop(spec_id, None)
+        if staged is None:
+            return
+        dropped = set(dropped_rids)
+        for rid, staged_node, into_signals, into_next_iter in staged:
+            if success and rid not in dropped:
+                continue
+            self._undo_spec_ingest(staged_node, into_signals, into_next_iter)
 
     def _can_continue_loop(
         self, rid: int, wgio, spec_info, graph_walk: str,
@@ -844,7 +897,7 @@ class PythonGraphRuntime(GraphRuntime):
 
         The two slots are removed from separately, which is why the ingest
         tracks which one each chunk landed in. Registry state was never
-        touched -- _speculatively_scheduled was held True across the ingest --
+        touched -- _in_flight was held True across the ingest --
         so the caller only has to return the chunks to their StreamBuffers.
         """
         for _idx, name in into_signals:
@@ -863,8 +916,11 @@ class PythonGraphRuntime(GraphRuntime):
         """
         node = wgio.nodes[spec_node_name]
         # Held True across the ingest so a streaming input cannot re-add the
-        # node to the ready queue underneath us.
-        node._speculatively_scheduled = True
+        # node to the ready queue underneath us. Saved rather than assumed
+        # False: the node may already be in flight from a committed batch, and
+        # forcing it down here would drop that batch's protection.
+        was_in_flight = node._in_flight
+        node._in_flight = True
 
         # ingest_input reports success without saying WHICH slot it used, so
         # the slot is inferred by peeking before the call. The rollback below
@@ -887,7 +943,7 @@ class PythonGraphRuntime(GraphRuntime):
             check_next_iter=same_node, allow_streaming=False,
         )
         wgio.clear_speculative_inputs()
-        node._speculatively_scheduled = False  # reset in case the rid is dropped
+        node._in_flight = was_in_flight  # restore; the node may still be in flight
 
         if not fully_ready:
             self._undo_spec_ingest(node, into_signals, into_next_iter)
@@ -932,14 +988,19 @@ class PythonGraphRuntime(GraphRuntime):
         streaming_edges = [edge for edge in outputs if edge.is_streaming]
         non_streaming_outputs = [edge for edge in outputs if not edge.is_streaming]
 
-        # (1) find persist (to-conductor) and new-token-output edges
-        to_conductor = [edge for edge in non_streaming_outputs if edge.persist]
-        new_token_outputs = [edge for edge in non_streaming_outputs if edge.conductor_new_token]
-
         sharding_config = self.get_sharding_config(rid)
         group = sharding_config.get_sharding_group(node_name, graph_walk)
         # No group → singleton/non-TP; treat as rank 0.
         is_first_tp_rank = group is None or group._tp_rank == 0
+
+        # (1) find persist (to-conductor) and new-token-output edges
+        to_conductor = [edge for edge in non_streaming_outputs if edge.persist]
+        # Leader only: the conductor discards a follower's counts anyway, and
+        # `_send_outputs` sizes each one from a store `_register_outputs` never
+        # filled on a follower.
+        new_token_outputs = [
+            edge for edge in non_streaming_outputs if edge.conductor_new_token
+        ] if is_first_tp_rank else []
 
         # (2) route each output edge to its destination worker graph via the
         # inverted index. Compute the per-rank fanout first; ingest *this
@@ -1429,7 +1490,7 @@ class PythonGraphRuntime(GraphRuntime):
                 ].per_request_queues.get(rid)
                 speculative = node is not None and node.get_node(
                     completion.node_name
-                )._speculatively_scheduled
+                )._in_flight
                 self._send_worker_graphs_done(
                     rid, routing, info, fwd_info, partition,
                     resource_publish_info=publications.get(rid, {}),
