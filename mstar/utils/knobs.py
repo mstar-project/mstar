@@ -86,3 +86,14 @@ def kv_plan_cache() -> int:
     per-row Python pass. ``0`` plans every step from the streams; ``2`` does
     both and logs any difference (a correctness check for runs)."""
     return int(os.environ.get("MSTAR_KV_PLAN_CACHE", "1"))
+
+
+def kv_pinned_indptrs() -> bool:
+    """``MSTAR_KV_PINNED_INDPTRS`` (default 1): the KV plan writes FlashInfer's
+    index arrays (qo_indptr, kv_indptr, kv_indices, last_page_len) into a
+    ring of page-locked host buffers, and the decode wrapper copies the
+    indices straight into its captured device buffer from there. The copies
+    are then really asynchronous; from pageable memory the driver stages each
+    one, and FlashInfer makes the indices copy blocking. ``0`` keeps the
+    pageable arrays."""
+    return os.environ.get("MSTAR_KV_PINNED_INDPTRS", "1") == "1"
