@@ -199,6 +199,18 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         ``SOLVER_STATE`` adds that scheduler's initial state here."""
         return {self.LATENTS: self.seed_latents(fwd_info, bucket_key, generator)}
 
+    def initial_loop_back(
+        self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, bucket_key: Hashable,
+        generator: torch.Generator,
+    ) -> dict[str, torch.Tensor]:
+        """Iteration 0's loop-back values, with the step's inputs in view.
+
+        Default: :meth:`seed_loop_back`, i.e. a loop that starts from noise. A loop that
+        starts from given latents instead (a refinement stage, image-to-image) overrides
+        this and reads them from ``inputs``, the edges the walk routed to this node."""
+        del inputs
+        return self.seed_loop_back(fwd_info, bucket_key, generator)
+
     def request_inputs(
         self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, bucket_key: Hashable,
     ) -> dict[str, torch.Tensor]:
@@ -281,11 +293,14 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         state = self.request_state(fwd_info.rid_handle)
         k = self.step_index(fwd_info)
         device = self.get_device()
-        if "schedule" not in state:
+        # One schedule per (request, walk): a request whose walks run this node in
+        # successive stages (a draft loop, then a refinement loop) gets a fresh shape
+        # and schedule for each.
+        if state.get("schedule_walk") != graph_walk:
             bucket_key = self.bucket_key_for(fwd_info)
             schedule = self.schedule_for(fwd_info, bucket_key)
             state.add_all(
-                schedule=schedule, bucket_key=bucket_key, num_steps=schedule.num_steps,
+                schedule=schedule, bucket_key=bucket_key, num_steps=schedule.num_steps, schedule_walk=graph_walk,
                 **self._step_scalar_sources(schedule, device),
             )
         bucket_key, num_steps = state["bucket_key"], state["num_steps"]
@@ -351,7 +366,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         Past iteration 0 a missing edge is a routing bug: raise rather than reseed."""
         if k == 0:
             generator = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
-            seeds = self.seed_loop_back(fwd_info, bucket_key, generator)
+            seeds = self.initial_loop_back(fwd_info, inputs, bucket_key, generator)
             if self.seed_to_device(fwd_info.graph_walk):
                 # The model drew straight onto the device through a stager; staging
                 # again would copy a device tensor out to the host and back.
