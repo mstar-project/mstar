@@ -63,3 +63,14 @@ def ingraph_decode_rope() -> bool:
     builds its rotary tables inside the graph from the position resource's
     planned positions instead of staging them before the replay."""
     return os.environ.get("MSTAR_INGRAPH_DECODE_ROPE", "0") == "1"
+
+
+def kv_chain_lazy_steps() -> int:
+    """``MSTAR_KV_CHAIN_LAZY_STEPS`` (default 16): how many decode steps of
+    sampled tokens the KV manager batches before extending the requests'
+    prefix chains, one extend per request per batch instead of one per step
+    (the per-row Python of that extension was 0.3-0.4 ms a step at 128
+    rows). A page key then appears up to that many steps late, and a later
+    commit indexes it, which the single-request path already allows for.
+    ``1`` extends every step as before."""
+    return max(1, int(os.environ.get("MSTAR_KV_CHAIN_LAZY_STEPS", "16")))
