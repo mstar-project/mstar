@@ -1,13 +1,13 @@
 """Text-to-image, then an edit of the result, via the Python SDK.
 
-Start a server for an image model that serves edits first, e.g.:  mstar serve bagel
+Start a server for an image model that serves edits first, e.g.:  mstar serve flux2_klein
 """
 
 from mstar import MStarClient
 
 client = MStarClient("http://localhost:8000")
 
-png = client.generate_image("a cat holding a sign that says hello world", seed=0)
+png = client.generate_image("a cat holding a sign that says hello world", width=1024, height=1024, seed=0)
 with open("out.png", "wb") as f:
     f.write(png)
 print(f"wrote out.png - {len(png)} bytes")
