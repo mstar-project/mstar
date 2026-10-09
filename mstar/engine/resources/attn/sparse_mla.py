@@ -19,6 +19,19 @@ WORKSPACE_BYTES = 128 << 20
 SHARD_MIN_ROWS = 64
 
 
+def check_flashinfer() -> None:
+    """Refuse an installed FlashInfer older than 0.6.18: both DSA paths pass ``page_size`` to
+    ``top_k_page_table_transform``, which takes it from 0.6.18 on."""
+    try:
+        import flashinfer
+        from packaging.version import Version
+    except ImportError:
+        return
+    installed = getattr(flashinfer, "__version__", None)  # None: a stub, as CPU tests install
+    if installed is not None and Version(installed) < Version("0.6.18"):
+        raise ValueError(f"DSA long context needs FlashInfer >= 0.6.18, found {installed}")
+
+
 def uses_kernel(q_nope: torch.Tensor, latent: torch.Tensor) -> bool:
     from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports
 

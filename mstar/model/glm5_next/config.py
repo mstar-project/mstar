@@ -390,6 +390,9 @@ class Glm5NextModelConfig:
             # flashinfer's page-table transform takes power-of-two pools per page
             raise ValueError(f"page_size={page_size} over index_kpool={self.index_kpool} "
                              "must be a power of two")
+        from mstar.engine.resources.attn.sparse_mla import check_flashinfer
+
+        check_flashinfer()
 
     @property
     def kv_rows(self) -> int:
