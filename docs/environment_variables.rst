@@ -362,14 +362,15 @@ Worker scheduling
        measured as noise at c64/c128 on 0.8B (the extension is a small part
        of the stop check's tail).
    * - ``MSTAR_KV_PINNED_INDPTRS``
-     - ``1``
+     - ``0``
      - The KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,
        kv_indices, last_page_len) into a ring of page-locked host buffers and
        the decode wrapper copies the indices straight into its captured
        device buffer from there, so the copies FlashInfer's ``plan`` issues
        are really asynchronous. From pageable memory the driver stages each
-       one and FlashInfer makes the indices copy blocking. ``0`` keeps the
-       pageable arrays.
+       one and FlashInfer makes the indices copy blocking. Measured neutral
+       to slightly negative at c32-c128 on 0.8B (the event bookkeeping per
+       take costs about what it saves), so it is off by default.
    * - ``MSTAR_KV_PLAN_CACHE``
      - ``0``
      - The KV manager plans a captured decode step off the previous step's
