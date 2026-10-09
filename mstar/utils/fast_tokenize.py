@@ -24,7 +24,9 @@ DEFAULT_CHUNK_CHARS = int(os.environ.get("MSTAR_TOKENIZE_CHUNK_CHARS", "4096"))
 DEFAULT_MAX_CHUNKS = int(os.environ.get("MSTAR_TOKENIZE_MAX_CHUNKS", "8"))
 
 
-def cut_points(text: str, chunk_chars: int = DEFAULT_CHUNK_CHARS, max_chunks: int = DEFAULT_MAX_CHUNKS) -> list[int]:
+def cut_points(
+    text: str, chunk_chars: int = DEFAULT_CHUNK_CHARS, max_chunks: int = DEFAULT_MAX_CHUNKS,
+) -> list[int]:
     """Indices where ``text`` may be cut: each is a space that starts a
     whitespace run, at or after the next chunk target. Empty when the text is
     short or no safe cut exists."""
@@ -59,7 +61,10 @@ def split_at(text: str, cuts: list[int]) -> list[str]:
     return parts
 
 
-def encode_ids(tokenizer, text: str, chunk_chars: int = DEFAULT_CHUNK_CHARS, max_chunks: int = DEFAULT_MAX_CHUNKS) -> list[int]:
+def encode_ids(
+    tokenizer, text: str, chunk_chars: int = DEFAULT_CHUNK_CHARS,
+    max_chunks: int = DEFAULT_MAX_CHUNKS,
+) -> list[int]:
     """Token ids of ``text`` with the tokenizer's defaults for special
     tokens: a long text goes through the Rust backend as a batch of chunks,
     a short one (or a tokenizer without a Rust backend) through ``tokenizer``
