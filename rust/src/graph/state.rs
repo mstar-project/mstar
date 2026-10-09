@@ -150,9 +150,9 @@ fn routed(e: &EdgeSpec, tensors: Vec<TensorRef>) -> RoutedEdge {
     }
 }
 
-/// A step that ran without finishing its walk: its outputs, routed as they
-/// are, without touching the node's state. Without `all_outputs`, only the
-/// streaming edges that carry tensors (a non-final chunk's partial outputs).
+/// A step that ran without finishing its walk: the outputs it produced,
+/// routed without touching the node's state. Without `all_outputs`, only the
+/// streaming ones (a non-final chunk's partial outputs).
 pub fn routed_without_completing(
     g: &CompiledGraph, node: NodeId, out_tensors: &[Vec<TensorRef>],
     all_outputs: bool,
@@ -161,7 +161,8 @@ pub fn routed_without_completing(
         .outputs
         .iter()
         .zip(out_tensors)
-        .filter(|(e, t)| all_outputs || (e.streaming && !t.is_empty()))
+        // an edge with nothing on it would satisfy its consumer, or persist nothing
+        .filter(|(e, t)| !t.is_empty() && (all_outputs || e.streaming))
         .map(|(e, t)| RoutedEdge { finished_graph_walk: false, ..routed(e, t.clone()) })
         .collect()
 }
