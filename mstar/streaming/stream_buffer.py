@@ -6,6 +6,7 @@ import torch
 
 from mstar.graph.base import GraphEdge
 from mstar.streaming.chunk_policy import ChunkPolicy
+from mstar.streaming.topology import WalkTransitionCtx
 
 
 @dataclass
@@ -58,12 +59,18 @@ class StreamBuffer:
     edge_name: str
     from_partition: str
     policy: ChunkPolicy
+    # Items carry the producer's walk, and a chunk never spans two walks
+    # (set for connections that drive their consumer's walk)
+    walk_tagged: bool = False
 
     _waiting_graph_edges: deque[StreamingEdge] = field(default_factory=deque)
     # last chunk the graph accepted; read by the batch that consumes it
     ingested_chunk: StreamChunkInfo | None = None
 
     _buffer: list = field(default_factory=list)
+    # _buffer's producer walks as [walk, item count] runs, when walk_tagged
+    _walk_runs: deque[list] = field(default_factory=deque)
+    _last_popped_walk: str | None = None
     _tensor_ids_in_order: deque = field(default_factory=deque)
     _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
@@ -87,9 +94,9 @@ class StreamBuffer:
         self.policy.prime(context_items)
         self._delivered_end = context_items
 
-    def pre_read_register(self, tensor_id: str):
+    def pre_read_register(self, tensor_id: str, producer_walk: str | None = None):
         self._num_tensors_registered += 1
-        self._tensor_ids_in_order.append(tensor_id)
+        self._tensor_ids_in_order.append((tensor_id, producer_walk))
 
     def put(self, tensor_id: str, item: torch.Tensor) -> None:
         """Called when a tensor arrives via normal RDMA routing."""
@@ -97,11 +104,16 @@ class StreamBuffer:
 
     def _update_buffer(self):
         while len(self._tensor_ids_in_order) > 0:
-            tensor_id = self._tensor_ids_in_order[0]
+            tensor_id, producer_walk = self._tensor_ids_in_order[0]
             if tensor_id not in self._id_to_tensor:
                 return
             self._tensor_ids_in_order.popleft()
             self._buffer.append(self._id_to_tensor[tensor_id])
+            if self.walk_tagged:
+                if self._walk_runs and self._walk_runs[-1][0] == producer_walk:
+                    self._walk_runs[-1][1] += 1
+                else:
+                    self._walk_runs.append([producer_walk, 1])
             self._num_buffer_writes += 1
             del self._id_to_tensor[tensor_id]
 
@@ -116,9 +128,28 @@ class StreamBuffer:
         if len(self._waiting_graph_edges) > 0:
             return self._waiting_graph_edges.popleft()
 
+    def _walk_run_len(self) -> int:
+        """Leading items emitted under the same producer walk as the first."""
+        if not self._walk_runs:
+            return len(self._buffer)
+        return self._walk_runs[0][1]
+
+    def peek_walk(self) -> WalkTransitionCtx | None:
+        """The producer walk of the next chunk, without popping it. None when
+        untagged or nothing is buffered."""
+        self._update_buffer()
+        if not self._walk_runs:
+            return None
+        walk = self._walk_runs[0][0]
+        return WalkTransitionCtx(walk, walk != self._last_popped_walk)
+
     def has_chunk_ready(self) -> bool:
         self._update_buffer()
         buf_len = len(self._buffer)
+
+        # A later walk's item is buffered, so the leading run is complete
+        if self._walk_run_len() < buf_len:
+            return True
 
         if not self._producer_done_and_all_read():
             return self.policy.is_ready(buf_len)
@@ -149,7 +180,15 @@ class StreamBuffer:
         window = self.policy.window_size()
         offset = self._consumed  # global position of buffer[0]
 
-        if self._producer_done_and_all_read() and not self.policy.is_ready(buf_len):
+        run = self._walk_run_len()
+
+        if run < buf_len and not self.policy.is_ready(run):
+            # The producer moved on to another walk: flush this walk's run
+            items = self._buffer[:run]
+            self._buffer = self._buffer[run:]
+            self._consumed += run
+            stride = run
+        elif self._producer_done_and_all_read() and not self.policy.is_ready(buf_len):
             # Flush remainder — return whatever is left (may be empty)
             items = list(self._buffer)
             self._buffer.clear()
@@ -163,6 +202,13 @@ class StreamBuffer:
             self._buffer = self._buffer[stride:]
             self._consumed += stride
         self.policy.register_chunk(stride)
+        if self._walk_runs and stride:
+            # A chunk never spans two walks, so the stride is within one run
+            run = self._walk_runs[0]
+            self._last_popped_walk = run[0]
+            run[1] -= stride
+            if run[1] == 0:
+                self._walk_runs.popleft()
 
         is_final = self._producer_done_and_all_read() and len(self._buffer) == 0
         # When continue_after_producer_done, never mark as final — the

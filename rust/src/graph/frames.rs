@@ -238,6 +238,7 @@ pub struct WorkerGraphsDone<'a> {
     pub output_signal_names: Vec<Sym>,
     pub partition_name: &'a str,
     pub partition_done: bool,
+    pub graph_walk: &'a str,
     pub stream_tokens_consumed: &'a [(String, i64)],
     pub output_loop_indices: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
     /// `dict[str, PublishedInfo]` -- abstract, so it stays Python's. Read
@@ -272,6 +273,7 @@ impl WorkerGraphsDone<'_> {
             }
             w_str(m.key("partition_name"), self.partition_name);
             w_bool(m.key("partition_done"), self.partition_done);
+            w_str(m.key("graph_walk"), self.graph_walk);
             str_counts(
                 m.key("stream_tokens_consumed"), self.stream_tokens_consumed,
             );

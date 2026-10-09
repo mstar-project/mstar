@@ -1749,6 +1749,24 @@ The consuming partition's ``get_partition_forward_pass_args`` reads
 ``incoming_connections``, which provides token counts and a ``producer_done`` flag, and
 uses them to decide when to run.
 
+A consumer whose walk should follow the producer's progress, rather than a count fixed at
+ingest, sets ``consumer_walk`` on each of its incoming connections. It maps a
+``WalkTransitionCtx`` (the producer walk a chunk was emitted under, and whether the chunk
+starts a run of that walk) to the consumer walk the chunk runs under. Such a partition is
+*producer-triggered*:
+
+- every streamed item carries its producer walk, and a chunk never spans two producer
+  walks, so these connections need a ``FixedChunkPolicy``;
+- the worker switches the consumer's walk before popping a chunk, and only once the
+  partition has no pass under way;
+- conductor inputs for a walk the stream has not reached yet wait on the worker, and the
+  conductor learns each pass's walk from the worker's ``WORKER_GRAPHS_DONE``.
+
+The mapping sees only the stream, so every connection into the partition agrees on each
+item's walk. Qwen3-Omni's Talker (``_talker_walk``) is the reference: Thinker prefill
+states run ``talker_prefill``, the first decode state runs ``talker_last_prefill``, and
+later ones run ``talker_decode``.
+
 Checklist
 ---------
 

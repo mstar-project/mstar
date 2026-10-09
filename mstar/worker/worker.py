@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import partial
 from time import sleep
@@ -485,6 +485,18 @@ class Worker:
                 if any(n in my_node_names for n in self._get_node_names_for_partition(conn.to_partition, model)):
                     self._my_consumer_connections.append(conn)
 
+        # edge_name -> the consumer's walk for each chunk, on connections that
+        # drive their consumer's walk
+        self._consumer_walk_fns = {
+            conn.edge_name: conn.consumer_walk
+            for conn in self._my_consumer_connections
+            if conn.consumer_walk is not None
+        }
+        self._producer_triggered_partitions: set[str] = (
+            self.partition_topology.producer_triggered_partitions()
+            if self.partition_topology else set()
+        )
+
         # Set of edge names that arrive via streaming (used to distinguish
         # streaming inputs from conductor-triggered non-streaming inputs
         # when checking whether a target node is ready for ingestion).
@@ -637,6 +649,7 @@ class Worker:
                     edge_name=conn.edge_name,
                     from_partition=conn.from_partition,
                     policy=conn.chunk_policy_factory(),
+                    walk_tagged=conn.consumer_walk is not None,
                 )
                 req_info.stream_buffers[conn.edge_name] = sbuf
                 consumer = self._consumer_node_cache.get(conn.edge_name, "")
@@ -878,6 +891,19 @@ class Worker:
             return
         req_info = self.request_state.per_request_info.get(request_id)
 
+        if (
+            req_info is not None
+            and body.partition_name in self._producer_triggered_partitions
+            and body.inputs
+            and not any(edge.is_streaming for edge in body.inputs)
+            and body.request_info.graph_walk
+            != self._partition_walk(request_id, body.partition_name)
+        ):
+            # The conductor's inputs for a walk the stream has not moved the
+            # partition into yet; replayed by _switch_partition_walk
+            req_info.parked_inputs.append(body)
+            return
+
         if self.enable_nvtx:
             range_push("process_new_inputs.routing_update")
         # Handle producer_done signal: mark all StreamBuffers for this request as done
@@ -933,7 +959,11 @@ class Worker:
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
                 for info in edge.tensor_info:
-                    stream_buf.pre_read_register(info.uuid)
+                    # The sender's fwd_info: a producer's walk only changes
+                    # after its WORKER_GRAPHS_DONE, which follows these sends
+                    stream_buf.pre_read_register(
+                        info.uuid, body.request_info.graph_walk,
+                    )
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("process_new_inputs.process_inputs")
@@ -1025,14 +1055,69 @@ class Worker:
             [info.uuid for info in edge.tensor_info]
         )
 
+    def _partition_walk(self, request_id: int, partition: str) -> str | None:
+        req_info = self.request_state.per_request_info.get(request_id)
+        part_info = req_info and req_info.per_partition_info.get(partition)
+        return part_info.current_fwd_info.graph_walk if part_info else None
+
+    def _switch_partition_walk(
+        self, request_id: int, partition: str, walk: str,
+    ) -> None:
+        """Move a producer-triggered partition into ``walk``, then replay the
+        conductor inputs that were waiting for it."""
+        self._graph_runtime.set_walk(request_id, partition, walk)
+        fwd_info = self.request_state.get_fwd_info(request_id, partition)
+        self.request_state.update_request_info(
+            request_id, partition,
+            current_fwd_info=replace(fwd_info, graph_walk=walk),
+        )
+        req_info = self.request_state.per_request_info[request_id]
+        replay, keep = [], []
+        for body in req_info.parked_inputs:
+            ready = (
+                body.partition_name == partition
+                and body.request_info.graph_walk == walk
+            )
+            (replay if ready else keep).append(body)
+        req_info.parked_inputs = keep
+        for body in replay:
+            self._process_new_inputs(body)
+
+    def _enter_chunk_walk(
+        self, sbuf: StreamBuffer, edge_name: str, request_id: int,
+        allow_walk_change: bool,
+    ) -> bool:
+        """Put the consumer in the walk the next chunk runs under. False when
+        the chunk has to wait: the partition is mid-pass in its current walk,
+        or the caller cannot change walks (speculation)."""
+        walk_fn = self._consumer_walk_fns.get(edge_name)
+        ctx = sbuf.peek_walk() if walk_fn is not None else None
+        if ctx is None:
+            return True
+        partition = self.request_state.get_partition_for_node(
+            self._consumer_node_cache[edge_name]
+        )
+        walk = walk_fn(ctx)
+        if walk == self._partition_walk(request_id, partition):
+            return True
+        if not allow_walk_change or not self._graph_runtime.is_partition_idle(
+            request_id, partition,
+        ):
+            return False
+        self._switch_partition_walk(request_id, partition, walk)
+        return True
+
     def _pop_streaming_edge(
-        self, sbuf: StreamBuffer, edge_name: str, request_id: int
+        self, sbuf: StreamBuffer, edge_name: str, request_id: int,
+        allow_walk_change: bool = True,
     ) -> StreamingEdge | None:
         consumer_node = self._consumer_node_cache.get(edge_name, "")
         waiting = sbuf.pop_waiting_edge()
         if waiting is not None:
             return waiting
-        if sbuf.has_chunk_ready():
+        if sbuf.has_chunk_ready() and self._enter_chunk_walk(
+            sbuf, edge_name, request_id, allow_walk_change,
+        ):
             chunk = sbuf.pop_chunk()
             chunk_tensor = chunk.data.get("data")
             if chunk_tensor is None:
@@ -1073,7 +1158,10 @@ class Worker:
         if req_info is None:
             return []
         for edge_name, sbuf in req_info.stream_buffers_by_consumer.get(node_name, {}).items():
-            edge = self._pop_streaming_edge(sbuf, edge_name, request_id)
+            # The speculated step was built for the current walk
+            edge = self._pop_streaming_edge(
+                sbuf, edge_name, request_id, allow_walk_change=False,
+            )
             if edge is not None:
                 result.append(edge)
         return result
@@ -2967,7 +3055,7 @@ class Worker:
             for rid, uuid in per_signal:
                 req_info = self.request_state.per_request_info[rid]
                 stream_buf = req_info.stream_buffers[signal]
-                stream_buf.pre_read_register(uuid)
+                stream_buf.pre_read_register(uuid, batch_N.graph_walk)
                 tensor = self.tensor_manager.get_tensor(uuid)
                 stream_buf.put(uuid, tensor.clone())
                 streamed.append(uuid)

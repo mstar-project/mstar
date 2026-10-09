@@ -294,6 +294,7 @@ pub struct GraphRuntime {
         worker_graph_ids: &[u32],
         is_first_tp_rank: bool,
         partition_name: &str,
+        graph_walk: &str,
         stream_tokens_consumed: &[(String, i64)],
         publication_encoded: Option<&[u8]>,
         profiling_encoded: Option<&[u8]>,
@@ -330,6 +331,7 @@ pub struct GraphRuntime {
             output_signal_names: output_signals,
             partition_name,
             partition_done,
+            graph_walk,
             stream_tokens_consumed,
             output_loop_indices: loop_indices,
             resource_publish_info: frames::spliced_value(publication_encoded),
@@ -1070,6 +1072,8 @@ pub struct WireEdge {
 #[derive(Default)]
 pub struct SendPlan {
     #[pyo3(get)] pub partition: String,
+    /// The walk the completed pass ran under, reported on WORKER_GRAPHS_DONE.
+    pub graph_walk: String,
     pub to_workers: Vec<WireEdge>,
     /// (rid, signal, uuids). Python's `to_conductor` is built BEFORE the
     /// fanout, so a persist signal reports the whole tensor.
@@ -1619,6 +1623,18 @@ impl GraphRuntime {
             return false;
         };
         info.set_walk(p, walk_sym, || live)
+    }
+
+    /// Python's `is_partition_idle`: whether the walk can change without
+    /// stranding state in the current walk's worker graphs.
+    fn is_partition_idle(&self, rid: u32, partition: &str) -> bool {
+        let Some(p) = self.interner.get(partition) else { return false };
+        let Some(part) = self.info(rid).and_then(|i| i.partitions.get(&p)) else {
+            return false;
+        };
+        part.walk_worker_graphs
+            .iter()
+            .all(|&wg| self.state(wg, rid).is_none_or(|s| s.is_idle()))
     }
 
     fn mark_stream_partition_done(&mut self, rid: u32, partition: &str) {
@@ -2914,6 +2930,7 @@ impl GraphRuntime {
                 .unwrap_or_default();
             let mut plan = self.take_send_plan(completion_id)?;
             let partition = plan.partition.clone();
+            let graph_walk = plan.graph_walk.clone();
             let encoded: FxHashMap<u32, Option<Vec<u8>>> =
                 request_infos.into_iter().collect();
             let profiling: FxHashMap<u32, Option<Vec<u8>>> =
@@ -3021,7 +3038,7 @@ impl GraphRuntime {
 
             for (rid, wg_ids, is_first_tp_rank) in plan.completed {
                 let bytes = self.worker_graphs_done_frame(
-                    rid, &wg_ids, is_first_tp_rank, &partition,
+                    rid, &wg_ids, is_first_tp_rank, &partition, &graph_walk,
                     consumed.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]),
                     publications.get(&rid).and_then(|b| b.as_deref()),
                     profiling.get(&rid).and_then(|b| b.as_deref()),
@@ -3071,6 +3088,7 @@ impl GraphRuntime {
         let g = self.graphs[c.wg as usize].clone();
         let mut plan = SendPlan {
             partition: c.partition.clone(),
+            graph_walk: c.graph_walk.clone(),
             nested: c.nested.clone(),
             ..Default::default()
         };
