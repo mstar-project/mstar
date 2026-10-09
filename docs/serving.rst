@@ -193,6 +193,20 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
        comes from the extension, or give ``{path: ..., modality: ...}``. A
        malformed or failing warmup is logged and skipped.
+   * - ``dist_timeout_s``
+     - *(optional)* Timeout in seconds for the NCCL world group and its parallel
+       subgroups. Unset keeps PyTorch's default; ``MSTAR_DIST_TIMEOUT_S`` overrides.
+   * - ``tp_allreduce``
+     - *(optional)* Small-message all-reduce path: ``nccl`` (default),
+       ``symm_oneshot`` or ``symm_multimem`` (see ``MSTAR_TP_ALLREDUCE``, which
+       overrides it).
+   * - ``tp_allreduce_max_kb``
+     - *(optional)* Largest message, in KiB, the symmetric-memory path takes;
+       larger ones go to NCCL. Default 512; ``MSTAR_TP_SYMM_AR_MAX_KB`` overrides.
+   * - ``tp_async_sched``
+     - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
+       (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
+       overrides it).
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /

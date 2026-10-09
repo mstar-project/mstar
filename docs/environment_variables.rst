@@ -65,6 +65,43 @@ Communication
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
+   * - ``MSTAR_GRAPH_COMPILE_MODE``
+     - unset
+     - Overrides the ``torch.compile`` mode of every captured forward
+       (whole forwards and piecewise regions). Unset, each capture config's
+       ``compile_mode`` applies, else ``max-autotune-no-cudagraphs``.
+       ``default`` keeps Inductor's fusion but takes cuBLAS for every GEMM
+       and skips autotuning. An unknown or empty mode fails at import, and so
+       does one with Inductor's own CUDA graphs (``reduce-overhead``,
+       ``max-autotune``).
+   * - ``MSTAR_DIST_TIMEOUT_S``
+     - config's ``dist_timeout_s``
+     - Timeout in seconds for the NCCL world group and its parallel
+       subgroups (:func:`mstar.distributed.communication.resolve_dist_timeout`).
+       Overrides the deployment config's ``dist_timeout_s``; with neither set,
+       PyTorch's default applies. Raise it only where weight load, JIT or
+       CUDA-graph capture can exceed that default; a hung collective takes
+       correspondingly longer to abort. Must be set before the conductor
+       spawns workers, which inherit it.
+   * - ``MSTAR_TP_ALLREDUCE``
+     - config's ``tp_allreduce``, else ``nccl``
+     - Backend for small TP all-reduces (``CommGroup.all_reduce``); overrides
+       the deployment config's ``tp_allreduce``.
+       ``nccl``: torch.distributed's NCCL ring/tree for every message.
+       ``symm_oneshot`` / ``symm_multimem``: contiguous CUDA messages up to
+       ``MSTAR_TP_SYMM_AR_MAX_KB`` go through torch symmetric memory —
+       one-shot reads every peer's buffer over NVLink and reduces locally;
+       multimem uses NVLS multicast (needs NVSwitch + driver support).
+       Larger messages (prefill) stay on NCCL. At batch-1 decode a TP8 step
+       issues ~160-230 all-reduces of ~10 KB, where NCCL's per-call latency
+       (~15-30 us) dominates and a one-shot kernel is ~5-10 us. Both are
+       CUDA-graph capturable. Reduction order differs from NCCL's, so bf16
+       results can differ at the last bit — measure before flipping. Falls
+       back to NCCL with a warning if symmetric memory cannot be set up.
+   * - ``MSTAR_TP_SYMM_AR_MAX_KB``
+     - ``512``
+     - Size cutoff (KiB) for the symmetric-memory all-reduce path; also the
+       size of the one persistent buffer rendezvoused per comm group.
    * - ``MSTAR_SHM_ARENA``
      - ``0``
      - SHM tensor-transport implementation. ``0``: per-uuid files.
@@ -272,8 +309,9 @@ Worker scheduling
      - Default
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
-     - ``0``
-     - Async scheduling for lockstep-parallel (TP / SP) nodes. ``1``: the
+     - config's ``tp_async_sched``, else ``0``
+     - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
+       deployment config's ``tp_async_sched``. ``1``: the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
        opened) and broadcasts it at once as a speculative
@@ -313,6 +351,14 @@ Worker scheduling
        ``remove_request``, check the KV page bookkeeping (free list, owner
        counts, seals) against the streams holding the pages. Walks every
        live stream; tests and debugging only.
+   * - ``MSTAR_MLA_DECODE_BACKEND``
+     - ``flashinfer``
+     - Which kernel the MLA attention resource runs for plain decode plans (one causal query per
+       row): ``flashinfer`` (FlashInfer's Hopper MLA kernel) or ``flashmla`` (DeepSeek's FlashMLA,
+       where it is built for the GPU: sm90, latent 512 + rope 64). On an H100 the two cost about the
+       same per call (15 us at one row, 26 against 31 us at 32 rows, 48 against 50 at 64), so
+       FlashMLA is an option, not the default. Prefill, verify blocks and context-only reads stay on
+       FlashInfer either way.
 
 Compilation
 -----------

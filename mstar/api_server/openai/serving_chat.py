@@ -9,6 +9,7 @@ then maps the resulting modality chunks back to OpenAI shapes: text into
 from __future__ import annotations
 
 import base64
+import codecs
 
 from fastapi import HTTPException
 
@@ -39,18 +40,19 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
 
 
 def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
-    text_parts: list[str] = []
+    text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
     for c in chunks:
         if c.modality == "text":
-            text_parts.append(c.data.decode("utf-8", "replace"))
+            text_parts.append(c.data)
         elif c.modality == "audio":
             audio_pcm.append(c.data)
         elif c.modality == "image":
             images.append(c.data)
 
-    text = "".join(text_parts)
+    # a byte-level BPE token's bytes can end inside a character
+    text = b"".join(text_parts).decode("utf-8", "replace")
     message: dict = {"role": "assistant", "content": text}
 
     if audio_pcm:
@@ -94,17 +96,24 @@ async def _stream(api, model_name, request_id, sample_rate):
     def error(message: str, status: int) -> str:
         return sse({"error": {"message": message, "type": error_type(status), "code": status}})
 
-    yield chunk({"role": "assistant"})
+    # The role rides on the first delta: clients time the first token from the
+    # first chunk, so nothing may go out before the model has produced one.
+    role = {"role": "assistant"}
     failed = False
+    # a byte-level BPE token's bytes can end inside a character: hold them
+    text = codecs.getincrementaldecoder("utf-8")("replace")
     try:
         async for c in api.iter_result_chunks(request_id):
             if c.modality == "text":
-                yield chunk({"content": c.data.decode("utf-8", "replace")})
+                content = text.decode(c.data)
+                if not content:
+                    continue
+                delta = {"content": content}
             elif c.modality == "audio":
                 # Streaming audio deltas are base64 16-bit PCM at the model rate.
-                yield chunk({"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}})
+                delta = {"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}}
             elif c.modality == "image":
-                yield chunk({"content": media_io.png_to_data_url(c.data)})
+                delta = {"content": media_io.png_to_data_url(c.data)}
             elif c.modality == "error":
                 # The request failed after the stream opened (an engine error
                 # mid generation, a preprocess error); the HTTP status is
@@ -116,11 +125,17 @@ async def _stream(api, model_name, request_id, sample_rate):
                 # request that is already gone.
                 failed = True
                 yield error(c.data.decode("utf-8", "replace"), int(c.metadata.get("status", 500)))
+                continue
+            else:
+                continue
+            yield chunk({**role, **delta})
+            role = {}
     except HTTPException as exc:
         # The delivery timeout raises out of the iterator (which aborts the
         # request on its way out); report it the same way.
         failed = True
         yield error(str(exc.detail), exc.status_code)
     if not failed:
-        yield chunk({}, finish="stop")
+        tail = text.decode(b"", final=True)
+        yield chunk({**role, "content": tail} if tail else role, finish="stop")
     yield SSE_DONE

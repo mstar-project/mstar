@@ -19,7 +19,10 @@ if TYPE_CHECKING:
 
 class KVLayout(Enum):
     NHD = "NHD"
-    # TODO: can add more, like HND, MLA
+    # Multi-head Latent Attention: one compressed latent per token per layer,
+    # ``[num_layers, max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim]``.
+    # No K/V axis and a single (replicated) KV head; only query heads shard.
+    MLA = "MLA"
 
 
 @dataclass(kw_only=True)
@@ -86,6 +89,29 @@ class PagedKVConfig(KVConfig):
     # folded into the root, not checked at match time
     prefix_cache_salt: str = ""
     prefix_cache: bool = True
+    # MLA only: the latent is ``[ckv (kv_lora_rank) | kpe (qk_rope_head_dim)]``
+    kv_lora_rank: int | None = None
+    qk_rope_head_dim: int | None = None
+    # MLA: whether num_qo_heads was given. Unset it defaults to the one latent KV head, which
+    # the attention backend would plan; a cache only stored (index keys) needs no query heads
+    qo_heads_given: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        if self.layout == KVLayout.MLA:
+            if self.kv_lora_rank is None or self.qk_rope_head_dim is None:
+                raise ValueError("KVLayout.MLA needs kv_lora_rank and qk_rope_head_dim")
+            self.qo_heads_given = self.num_qo_heads is not None
+            # the cache stores one latent per token: a single KV "head" of the
+            # latent width, whatever the model's head counts are
+            self.num_kv_heads = 1
+            self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        super().__post_init__()
+
+    @property
+    def latent_dim(self) -> int:
+        """Per-token cache width under MLA."""
+        assert self.layout == KVLayout.MLA
+        return self.kv_lora_rank + self.qk_rope_head_dim
 
     def apply_yaml_overrides(
         self,

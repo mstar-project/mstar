@@ -582,9 +582,12 @@ class ShmKVTransferEngine(KVTransferEngine):
                 weights_only=True,
             )
             for layer, packed_page, local_page, token_start, token_end in chunk_copies:
-                source = packed[
-                    layer, packed_page, :, token_start:token_end,
-                ].to(self._kv_cache.device)
+                if self._kv_cache.layout == KVLayout.MLA:
+                    # one latent row per token: [layers, pages, page_size, latent]
+                    source = packed[layer, packed_page, token_start:token_end]
+                else:
+                    source = packed[layer, packed_page, :, token_start:token_end]
+                source = source.to(self._kv_cache.device)
                 destination = self._kv_cache.chunk_view(
                     layer_idx=layer,
                     page_idx=local_page,
