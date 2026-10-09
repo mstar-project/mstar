@@ -137,3 +137,20 @@ def test_rows_only_keeps_the_views_and_builds_no_per_rid_dicts():
     outputs = {}
     eng._merge_per_rid(outputs, _raw(bs=4), rids, rids, _Sub(), {})
     assert set(outputs) == set(rids)
+
+
+def test_rows_only_collect_takes_no_clone():
+    """On a rows-only step the gpu thread copies the rows to the host right
+    behind the step, so the graph's own output buffer is handed over as is."""
+    from types import SimpleNamespace
+
+    rids = [1, 2, 3, 4]
+    raw = _raw(bs=4)
+    eng = Engine.__new__(Engine)
+    out = eng._collect_outputs(
+        SimpleNamespace(submodule=_Sub(), cuda_graph_runner=None), None, raw,
+        [], {}, request_ids=rids, step_request_ids=tuple(rids), rows_only=True,
+    )
+    assert out.rows_only and out.per_rid_outputs == {} and out.row_views is None
+    assert out.check_stop_buffers["new_token"] is raw.check_stop_buffers["new_token"]
+    assert out.row_request_ids == (1, 2, 3, 4)
