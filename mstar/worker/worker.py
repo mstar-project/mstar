@@ -2771,7 +2771,6 @@ class Worker:
         # a row mid-prefill keeps its inputs, since its next chunk reads them
         # again; one whose walk is not done keeps all but its streamed inputs
         rids = list(batch_N.batch.request_to_worker_graph)
-        completes_node, completes_walk = self._completion_flags(batch_N, rids)
         # What the runtime dereferenced to zero and cannot reclaim itself: a
         # runtime behind the contract has the bookkeeper, not the shm files or
         # the registered memory.
@@ -2779,7 +2778,7 @@ class Worker:
             *self._graph_runtime.cleanup_consumed_inputs(
                 batch_N.batch.node_name, rids,
                 [batch_N.batch.request_to_worker_graph[r] for r in rids],
-                completes_node, completes_walk,
+                batch_N.batch.incomplete_node_rids, batch_N.node_batch.incomplete_walk_rids,
             )
         )
         _pp_stage("cleanup_inputs")
@@ -3011,19 +3010,6 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
-    @staticmethod
-    def _completion_flags(
-        batch_N: PendingBatch, rids: list[int],
-    ) -> tuple[list[bool] | None, list[bool] | None]:
-        """Per row of ``rids``: whether its step finished its node, and its
-        walk. None for either when every row did, the common case."""
-        mid_node = batch_N.batch.incomplete_node_rids
-        mid_walk = batch_N.node_batch.incomplete_walk_rids
-        return (
-            [r not in mid_node for r in rids] if mid_node else None,
-            [r not in mid_walk for r in rids] if mid_walk else None,
-        )
-
     def _settle_chunks(
         self, batch_N: PendingBatch, step_outputs: BatchedModelOutput,
     ) -> bool:
@@ -3131,7 +3117,6 @@ class Worker:
 
         # The graph runtime's own share of postprocess: the routing call.
         _t_route = _time.perf_counter() if self._phase_period else 0.0
-        completes_node, completes_walk = self._completion_flags(batch_N, rids)
         route_output = self._graph_runtime.complete_and_route_batch(
             RouteInput(
                 partition=batch_N.partition,
@@ -3146,8 +3131,8 @@ class Worker:
                 num_tensors=num_tensors,
                 walks=walks if rid_walk_idx is not None else None,
                 rid_walk_idx=rid_walk_idx,
-                completes_node=completes_node,
-                completes_walk=completes_walk,
+                incomplete_node_rids=batch_N.batch.incomplete_node_rids,
+                incomplete_walk_rids=batch_N.node_batch.incomplete_walk_rids,
             ),
         )
         if self._phase_period:

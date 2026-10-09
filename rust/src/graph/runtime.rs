@@ -1164,12 +1164,12 @@ pub struct RouteArg {
     /// None, every row ran `graph_walk`.
     #[pyo3(item)] walks: Option<Vec<String>>,
     #[pyo3(item)] rid_walk_idx: Option<Vec<u32>>,
-    /// Per row; None, every row finished. A row whose step did not finish its
-    /// node routes only its streaming outputs; one that finished its node but
-    /// not its walk routes all of them. Either routes only outputs that carry
-    /// tensors, and neither completes the node.
-    #[pyo3(item)] completes_node: Option<Vec<bool>>,
-    #[pyo3(item)] completes_walk: Option<Vec<bool>>,
+    /// Rows whose step did not finish their node route only their streaming
+    /// outputs; rows that finished their node but not their walk route all of
+    /// them. Either routes only outputs that carry tensors, and neither
+    /// completes the node. Usually empty.
+    #[pyo3(item)] incomplete_node_rids: Vec<u32>,
+    #[pyo3(item)] incomplete_walk_rids: Vec<u32>,
 }
 
 /// `RouteOutput`.
@@ -1971,29 +1971,24 @@ impl GraphRuntime {
     /// Python. Dropping them here and saying nothing is what left a consumed
     /// input's shm file sitting until the request was torn down: the Python
     /// runtime dereferences through the manager and reclaims as it goes.
-    /// A row whose step did not finish its node (`completes_node`) keeps
-    /// every input; one that did not finish its walk (`completes_walk`) gives
-    /// up only its streaming inputs.
-    #[pyo3(signature = (node_name, rids, wg_ids, completes_node = None, completes_walk = None))]
+    /// A row whose step did not finish its node keeps every input; one that
+    /// did not finish its walk gives up only its streaming inputs.
+    #[pyo3(signature = (node_name, rids, wg_ids, incomplete_node_rids = vec![], incomplete_walk_rids = vec![]))]
     fn cleanup_consumed_inputs(
         &mut self, node_name: &str, rids: Vec<u32>, wg_ids: Vec<u32>,
-        completes_node: Option<Vec<bool>>, completes_walk: Option<Vec<bool>>,
+        incomplete_node_rids: Vec<u32>, incomplete_walk_rids: Vec<u32>,
     ) -> PyResult<(Vec<u64>, Vec<bool>)> {
-        if rids.len() != wg_ids.len()
-            || completes_node.as_ref().is_some_and(|v| v.len() != rids.len())
-            || completes_walk.as_ref().is_some_and(|v| v.len() != rids.len())
-        {
+        if rids.len() != wg_ids.len() {
             return Err(PyValueError::new_err(
-                "cleanup_consumed_inputs: rids, wg_ids and the completes_* flags \
-                 must be the same length",
+                "cleanup_consumed_inputs: rids and wg_ids must be the same length",
             ));
         }
         let mut freed: Vec<u64> = Vec::new();
-        for (i, (rid, wg_id)) in rids.into_iter().zip(wg_ids).enumerate() {
-            if completes_node.as_ref().is_some_and(|v| !v[i]) {
+        for (rid, wg_id) in rids.into_iter().zip(wg_ids) {
+            if incomplete_node_rids.contains(&rid) {
                 continue;
             }
-            let streaming_only = completes_walk.as_ref().is_some_and(|v| !v[i]);
+            let streaming_only = incomplete_walk_rids.contains(&rid);
             let Some(wg) = self.wg_index(wg_id) else { continue };
             let Some(node) = self.nid(wg, node_name) else { continue };
             let g = &self.graphs[wg as usize];
@@ -2306,16 +2301,11 @@ impl GraphRuntime {
             ));
         }
         let n_rows = input.rids.len();
-        if input.completes_node.as_ref().is_some_and(|v| v.len() != n_rows)
-            || input.completes_walk.as_ref().is_some_and(|v| v.len() != n_rows)
-        {
-            return Err(PyValueError::new_err(
-                "complete_and_route_batch: completes_node and completes_walk need one flag per rid",
-            ));
-        }
+        // (node finished, walk finished) for row i; the sets are small and usually empty
         let finishes = |i: usize| -> (bool, bool) {
-            let node_done = input.completes_node.as_ref().is_none_or(|v| v[i]);
-            (node_done, node_done && input.completes_walk.as_ref().is_none_or(|v| v[i]))
+            let rid = input.rids[i];
+            let node_done = !input.incomplete_node_rids.contains(&rid);
+            (node_done, node_done && !input.incomplete_walk_rids.contains(&rid))
         };
         // an unfinished walk leaves its node live, which a loop member cannot be
         for i in 0..n_rows {

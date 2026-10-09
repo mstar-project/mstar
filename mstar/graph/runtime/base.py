@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -449,15 +450,14 @@ class RouteInput(NamedTuple):
     # walks[rid_walk_idx[i]]. None, every row ran graph_walk.
     walks: list[str] | None = None
     rid_walk_idx: list[int] | None = None
-    # Per row; None, every row finished. A row whose step did not finish its
-    # node (a chunked prefill's non-final chunk) routes only its streaming
-    # outputs; one that finished its node but not its walk (a consumer of
-    # such a chunk) routes all of them. Either routes only outputs that carry
-    # tensors. Neither completes the node, so no
-    # worker graph is reported done. The streamed edges of a row mid-node
-    # carry finished_graph_walk=False.
-    completes_node: list[bool] | None = None
-    completes_walk: list[bool] | None = None
+    # Rows whose step did not finish their node (a chunked prefill's
+    # non-final chunk) route only their streaming outputs; rows whose step
+    # finished their node but not their walk (a consumer of such a chunk)
+    # route all of them. Either routes only outputs that carry tensors and
+    # leaves the node uncompleted, so no worker graph is reported done. The
+    # streamed edges of a row mid-node carry finished_graph_walk=False.
+    incomplete_node_rids: Collection[int] = ()
+    incomplete_walk_rids: Collection[int] = ()
 
 
 class RouteOutput(NamedTuple):
@@ -645,13 +645,13 @@ class GraphRuntime(ABC):
     @abstractmethod
     def cleanup_consumed_inputs(
         self, node_name: str, rids: list[int], wg_ids: list[int],
-        completes_node: list[bool] | None = None,
-        completes_walk: list[bool] | None = None,
+        incomplete_node_rids: Collection[int] = (),
+        incomplete_walk_rids: Collection[int] = (),
     ) -> FreedTensors:
         """Release the input tensors the just-executed node consumed.
 
-        Per row, as ``RouteInput``: a row that did not finish its node keeps
-        every input, and one that did not finish its walk gives up only its
+        As ``RouteInput``: a row that did not finish its node keeps every
+        input, and one that did not finish its walk gives up only its
         streaming inputs, so its node runs again on the next chunk.
 
         Returns the ones that became collectable and so still need the

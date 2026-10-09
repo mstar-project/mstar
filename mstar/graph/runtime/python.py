@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 
 from mstar.api_server.request_types import APIServerMessage, ResultTensors
@@ -427,17 +427,17 @@ class PythonGraphRuntime(GraphRuntime):
 
     def cleanup_consumed_inputs(
         self, node_name: str, rids: list[int], wg_ids: list[int],
-        completes_node: list[bool] | None = None,
-        completes_walk: list[bool] | None = None,
+        incomplete_node_rids: Collection[int] = (),
+        incomplete_walk_rids: Collection[int] = (),
     ) -> FreedTensors:
-        for i, (rid, wg_id) in enumerate(zip(rids, wg_ids, strict=True)):
-            if completes_node is not None and not completes_node[i]:
+        for rid, wg_id in zip(rids, wg_ids, strict=True):
+            if rid in incomplete_node_rids:
                 continue
             wgio = self._queues[wg_id].per_request_queues.get(rid)
             if wgio is not None:
                 node = wgio.get_node(node_name)
                 wgio.ready_node_names.discard(node_name)
-                if completes_walk is not None and not completes_walk[i]:
+                if rid in incomplete_walk_rids:
                     node.ready_signals.clear_streaming()
                     # missing only its streamed inputs again: the next chunk can land
                     if node.ready_signals.is_ready_for_streaming and not node._in_flight:
@@ -1333,11 +1333,9 @@ class PythonGraphRuntime(GraphRuntime):
     ) -> RouteOutput:
         rids, wg_ids = input.wg_ids.keys, input.wg_ids.values
         n_signals = len(input.output_signals)
-        node_done = input.completes_node or [True] * len(rids)
-        walk_done = [
-            done and (input.completes_walk is None or input.completes_walk[i])
-            for i, done in enumerate(node_done)
-        ]
+        mid_node, mid_walk = input.incomplete_node_rids, input.incomplete_walk_rids
+        node_done = [rid not in mid_node for rid in rids]
+        walk_done = [done and rid not in mid_walk for rid, done in zip(rids, node_done, strict=True)]
         # an unfinished walk leaves its node live, which a loop member cannot be
         for i, wg_id in enumerate(wg_ids):
             if not walk_done[i] and isinstance(

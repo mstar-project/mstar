@@ -2233,11 +2233,11 @@ def test_a_non_final_chunk_routes_only_its_streamed_output(partial_stream):
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "thinker", [1])]))
     rt.pop_rids("thinker", WALK, [rid])
 
-    rt.cleanup_consumed_inputs("thinker", [rid], [0], completes_node=[False])
+    rt.cleanup_consumed_inputs("thinker", [rid], [0], incomplete_node_rids={rid})
     out = rt.complete_and_route_batch(RouteInput(
         partition="default", graph_walk=WALK, node_name="thinker",
         output_signals=["states", "text"], wg_ids=ParallelList([rid], [0]),
-        tensors=[2, 3], num_tensors=[1, 1], completes_node=[False],
+        tensors=[2, 3], num_tensors=[1, 1], incomplete_node_rids={rid},
     ))
 
     assert out.local_streaming_by_signal["states"].values == [2]
@@ -2259,12 +2259,12 @@ def test_a_consumer_whose_walk_is_not_done_runs_again_on_the_next_chunk(
     assert _ready(rt) == [("talker", "talk", [rid])]
     rt.pop_rids("talker", "talk", [rid])
 
-    flags = None if walk_done else [False]
-    rt.cleanup_consumed_inputs("talker", [rid], [1], completes_walk=flags)
+    mid_walk = set() if walk_done else {rid}
+    rt.cleanup_consumed_inputs("talker", [rid], [1], incomplete_walk_rids=mid_walk)
     out = rt.complete_and_route_batch(RouteInput(
         partition="TALKER", graph_walk="talk", node_name="talker",
         output_signals=["codes", "embeds"], wg_ids=ParallelList([rid], [1]),
-        tensors=[3], num_tensors=[1, 0], completes_walk=flags,
+        tensors=[3], num_tensors=[1, 0], incomplete_walk_rids=mid_walk,
     ))
     assert 3 in out.register_uuids, "its outputs are routed either way"
     assert _released(book, 2), "the consumed chunk is released either way"
@@ -2296,5 +2296,5 @@ def test_a_loop_member_must_finish_its_walk(pair):
         rt.complete_and_route_batch(RouteInput(
             partition="default", graph_walk=WALK, node_name="ar_decode",
             output_signals=["token", "kv_cache"], wg_ids=ParallelList([rid], [WG_ID]),
-            tensors=[], num_tensors=[0, 0], completes_walk=[False],
+            tensors=[], num_tensors=[0, 0], incomplete_walk_rids={rid},
         ))
