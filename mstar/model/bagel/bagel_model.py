@@ -721,11 +721,13 @@ class BagelModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
+            ids = output.reshape(-1).tolist()
             # the end token closes the turn, not the reply: a client sends the
-            # reply back as an assistant message, whose template writes it again
-            detok = self.tokenizer.decode(
-                [i for i in output.reshape(-1).tolist() if i != self.eos_token_id]
-            )
+            # reply back as an assistant message, whose template writes it again.
+            # Under ignore_eos it closes nothing and stays, one chunk per token
+            if not (request_kwargs or {}).get("ignore_eos"):
+                ids = [i for i in ids if i != self.eos_token_id]
+            detok = self.tokenizer.decode(ids)
             logger.debug("OUTPUT TEXT %s", detok)
             return detok.encode("utf-8")
         if modality == "image":
