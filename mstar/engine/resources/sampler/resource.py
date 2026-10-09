@@ -14,7 +14,7 @@ from mstar.engine.resources.sampler.config import (
 )
 from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
 from mstar.engine.resources.step import SlotLease, StepContext
-from mstar.utils.knobs import device_loopback_enabled
+from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 
@@ -126,6 +126,7 @@ class SamplerResource(Resource):
             vocab_size=self._vocab_size,
             cg_slots=self._cg_slots,
             enable_min_p=self._enable_min_p,
+            ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter(),
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
@@ -320,6 +321,13 @@ class SamplerResource(Resource):
     def commit(self, step: SamplerStep, ctx: StepContext):
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
+            return
+        if self._cg_buffers.ingraph_scatter:
+            # the captured sample scattered both rows itself
+            if self._penalty_needed_this_step:
+                self._cg_sampler.sync_seen_token_masks(
+                    [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
+                )
             return
         t0 = perf_counter() if PHASE_PERIOD else 0.0
         self._cg_buffers.scatter_offset(ctx.slot_lease.slot)
