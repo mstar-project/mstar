@@ -74,7 +74,7 @@ class _FakeEngine:
 
 
 def _batch():
-    return SimpleNamespace(request_ids=["r0", "r1"], admit_error=None)
+    return SimpleNamespace(request_ids=["r0", "r1"], admit_error=None, rows_only=False)
 
 
 @pytest.mark.parametrize(

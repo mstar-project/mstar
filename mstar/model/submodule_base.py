@@ -13,6 +13,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
+from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 
 class HostRows(NamedTuple):
@@ -84,6 +85,13 @@ class BatchedModelOutput:
     # of a batch clone: name -> the views, row i for ``row_request_ids[i]``.
     # The store describes such rows without reading each view.
     row_views: dict[str, tuple[torch.Tensor, ...]] | None = None
+    # The stop buffers' host copy, staged by the gpu thread on the execution
+    # stream behind the step so the step's completion event covers it; the
+    # main thread reads it after waiting on that event.
+    host_rows: HostRows | None = None
+    # No per-rid entries were built: every output signal of the step stays on
+    # the device (see ``ExecutingBatch.rows_only``). Readers use the rows.
+    rows_only: bool = False
 
     @classmethod
     def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:
@@ -683,6 +691,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
         a fixed key set for graph compat, so the filtering happens here."""
         return outputs
 
+    def uniform_row_inputs(self, graph_walk: str) -> "NodeInputs | None":
+        """The inputs every row of this walk gets, when ``prepare_inputs``
+        would return an equal object for each regardless of the request, its
+        routed signals and its metadata (a decode walk that reads its token
+        off the device). The engine then prepares the batch with one call and
+        shares the object across the step's rows, so it must not be mutated
+        per row. None (the default) prepares row by row."""
+        del graph_walk
+        return None
+
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs
         but their spans, and every real row has the span of the template row.
@@ -691,6 +709,20 @@ class NodeSubmodule(torch.nn.Module, ABC):
         declaring and admitting a second time."""
         del graph_walk
         return False
+
+    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        """Loop-back input signals of this walk whose per-row value the node
+        keeps on the device itself (a sampler's slot master), so the worker
+        routes them with no tensor: the next step reads the value in
+        ``preprocess`` and every fallback batch arrives with the signal
+        empty. Only sound when ``prepare_inputs`` accepts the empty signal on
+        this walk. On a walk whose output signals all stay on the device the
+        engine builds no per-request output dicts and does not call
+        ``postprocess``: the stop check, the inline emit and the next step's
+        speculation read the step's rows instead. Empty by default;
+        ``MSTAR_DEVICE_LOOPBACK=0`` keeps every node on the tensor path."""
+        del graph_walk
+        return frozenset()
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         """Output signals whose client-facing value is one scalar per row that

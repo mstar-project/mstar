@@ -365,6 +365,9 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
+        # (node, walk) -> (label, stop buffer name) per request, for the
+        # decode-step chain extension; dropped with the request
+        self._chain_lookup: dict[str, dict[tuple[str, str], tuple]] = {}
         # its entity id is the worker id, and one worker is one copy of a node
         self._replica = (
             transfer_engine_info.my_entity_id
@@ -718,13 +721,26 @@ class KVManager(AttentionResource):
         buffers = host_rows.buffers
         rows_of: dict[str, list] = {}
         page_size = self.config.page_size
+        key = (node_name, graph_walk)
+        lookup = self._chain_lookup
         with self._lock:
             for rid in request_ids:
-                label = self._keyed_label(rid, node_name, graph_walk)
-                if label is None:
-                    continue
-                tensor = (self._overrides[rid].prefix_decode or {}).get(label)
-                if not tensor:
+                # the label and buffer name do not change over a request's
+                # life (its overrides are set at ingest), so each is looked up
+                # once instead of on every decode step
+                per_rid = lookup.get(rid)
+                if per_rid is None:
+                    per_rid = lookup[rid] = {}
+                entry = per_rid.get(key)
+                if entry is None:
+                    label = self._keyed_label(rid, node_name, graph_walk)
+                    tensor = (
+                        (self._overrides[rid].prefix_decode or {}).get(label)
+                        if label is not None else None
+                    )
+                    entry = per_rid[key] = (label, tensor)
+                label, tensor = entry
+                if label is None or not tensor:
                     continue
                 rows = rows_of.get(tensor)
                 if rows is None:
@@ -2000,6 +2016,7 @@ class KVManager(AttentionResource):
             self._forget_reservations(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
+            self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()

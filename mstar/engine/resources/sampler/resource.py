@@ -1,6 +1,7 @@
 
 
 from dataclasses import asdict
+from time import perf_counter
 
 import torch
 
@@ -13,6 +14,8 @@ from mstar.engine.resources.sampler.config import (
 )
 from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
+from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 
 class SamplerResource(Resource):
@@ -70,6 +73,11 @@ class SamplerResource(Resource):
         self._preplan_cg_sampler: CudaGraphableSampler | None = None
         self._preplan_key = None
         self._preplanned = False
+        # (cg slot, padded bs) of the step planned last, for the last-token
+        # read in ``loopback_tokens``; None on an eager step
+        self._step_slot: tuple[int, int] | None = None
+        # whether the last sampled token is persisted by slot at all
+        self._keep_last_token = device_loopback_enabled()
         # rid -> the prompt tokens a cache hit kept out of this step's inputs
         self._cached_prefix: dict[str, torch.Tensor] = {}
 
@@ -118,6 +126,7 @@ class SamplerResource(Resource):
             vocab_size=self._vocab_size,
             cg_slots=self._cg_slots,
             enable_min_p=self._enable_min_p,
+            ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter(),
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
@@ -259,12 +268,14 @@ class SamplerResource(Resource):
                 self._cg_sampler = self._preplan_cg_sampler
                 self._preplan_cg_sampler = None
                 self._preplanned = False
+                self._step_slot = (ctx.slot_lease.slot, ctx.slot_lease.bucket.bs)
                 return
 
         # invalidated on the inline path here (not in commit, which now runs
         # before output collection); a preplan must leave the in-flight one be
         if not ctx.is_preplan:
             self._cg_sampler = None
+            self._step_slot = None
         lease = ctx.slot_lease
         if self._cg_buffers is None or lease is None:
             return
@@ -286,6 +297,7 @@ class SamplerResource(Resource):
             # fresh inline (capture / no preplan): gather the per-step state too
             self._gather_dynamic(ctx, lease)
             self._cg_sampler = sampler
+            self._step_slot = (cg_slot, padded_bs)
 
     def _gather_dynamic(self, ctx: StepContext, lease: SlotLease):
         """Gather the per-step RNG offset + seen-token mask into this step's
@@ -310,7 +322,22 @@ class SamplerResource(Resource):
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return
+        if self._cg_buffers.ingraph_scatter:
+            # the captured sample scattered both rows itself
+            if self._penalty_needed_this_step:
+                self._cg_sampler.sync_seen_token_masks(
+                    [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
+                )
+            return
+        t0 = perf_counter() if PHASE_PERIOD else 0.0
         self._cg_buffers.scatter_offset(ctx.slot_lease.slot)
+        if PHASE_PERIOD:
+            phase_record("res.commit.sampler.offset", perf_counter() - t0)
+            t0 = perf_counter()
+        if self._keep_last_token:
+            self._cg_buffers.scatter_last_token(ctx.slot_lease.slot)
+            if PHASE_PERIOD:
+                phase_record("res.commit.sampler.last_token", perf_counter() - t0)
         # Skipped when nothing read the mask this step: there is then nothing to
         # copy back, and the rows go stale only for requests at penalty 1.0,
         # which never read them. See `_penalty_live` for why that stays sound.
@@ -341,4 +368,33 @@ class SamplerResource(Resource):
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step
             )
-        return self._sampler.sample(request_ids, logits)
+        tokens = self._sampler.sample(request_ids, logits)
+        # An eager step has no per-step row to scatter from: write the masters
+        # by request, so the next step can still read its token on the device.
+        bufs = self._cg_buffers
+        if (
+            self._keep_last_token and bufs is not None
+            and all(bufs.has_slot(rid) for rid in request_ids)
+        ):
+            bufs.write_last_tokens(request_ids, tokens)
+        return tokens
+
+    @property
+    def has_slot_masters(self) -> bool:
+        """Whether the last sampled token of every request is kept on the
+        device by slot (the graph-buffer path): what the device-side
+        loop-back needs. False on an eager-only node or with the knob off."""
+        return self._cg_buffers is not None and self._keep_last_token
+
+    def loopback_tokens(self, request_ids: list[str]) -> torch.Tensor:
+        """The last sampled token of each row of this step, as its input ids,
+        read on the device. Under a slot lease the planned slot's index row
+        orders them (padding rows read slot 0); an eager step looks its
+        requests up by slot. Call after ``plan``."""
+        bufs = self._cg_buffers
+        if bufs is None:
+            raise RuntimeError("device loop-back needs the sampler's slot masters")
+        if self._cg_sampler is not None and self._step_slot is not None:
+            cg_slot, padded_bs = self._step_slot
+            return bufs.gather_last_tokens(cg_slot, padded_bs)
+        return bufs.last_tokens_for(request_ids)

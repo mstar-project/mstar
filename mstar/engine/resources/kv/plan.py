@@ -128,12 +128,32 @@ def build_paged_indptrs(
         paged_kv_indptr=_int32_tensor(kv_indptr),
         paged_kv_indices=_int32_tensor(all_pages),
         paged_kv_last_page_len=_int32_tensor(last_page_lens),
-        kv_lens=_int32_tensor(kv_lens),
+        kv_lens=_host_lens(kv_lens),
     )
 
 
 def _int32_tensor(values: list[int]) -> torch.Tensor:
     return torch.from_numpy(np.array(values, dtype=np.int32))
+
+
+class HostLens(torch.Tensor):
+    """A host int32 row whose iteration yields numpy scalars.
+
+    FlashInfer's decode ``plan`` takes the longest row with the Python builtin
+    ``max(seq_lens)`` and ``.item()`` on the result; iterating a tensor hands
+    out one 0-d tensor per row, about 2 us each (0.35 ms at 128 rows, on the
+    plan thread every decode step). Iterating the numpy view costs 0.1 us a
+    row and the numpy scalar has ``.item()`` too. Everything else FlashInfer
+    does with the row (``.cpu()``, ``.min()``, ``len``, a ``copy_`` into its
+    device buffer) is plain tensor behaviour.
+    """
+
+    def __iter__(self):
+        return iter(self.numpy())
+
+
+def _host_lens(values: list[int]) -> torch.Tensor:
+    return _int32_tensor(values).as_subclass(HostLens)
 
 
 @dataclass

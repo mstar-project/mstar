@@ -160,3 +160,38 @@ def test_a_dropped_speculative_rid_neither_flushes_nor_reports_done():
     assert speculation.dropped == {"r"}
     assert (batch.final_stream_rids, batch.stream_partition_done_rids) == (set(), set())
     assert _step(worker, "vocoder", {"r": {"pitch"}}) == ({"r"}, {"r"})
+
+
+def test_a_rows_only_step_threads_its_loop_back_signal_as_present():
+    """With every output of the step on the device, a continuing rid that
+    ran is spliced with an empty loop-back signal (what the walk's fallback
+    batches carry too); one that did not run is dropped."""
+    worker = _worker()
+    batch = Worker._make_executing_batch(
+        worker, node_name="vocoder", graph_walk="chunk", request_ids=["r", "s"],
+        per_request_input_tensors={"r": {}, "s": {}},
+        per_request_info={"r": None, "s": None},
+    )
+    speculation = SimpleNamespace(
+        node_batch=batch, continuing_rids={"r", "s"}, consumed_edges=[("loop", None)],
+        scheduled_batch=SimpleNamespace(request_to_worker_graph={"r": 0, "s": 0}),
+        consumed_streaming_edges={}, spec_id=0,
+    )
+    outputs_N = SimpleNamespace(rows_only=True, row_request_ids=("r",))
+
+    Worker._thread_outputs_to_speculative(worker, speculation, outputs_N)
+
+    assert speculation.continuing_rids == {"r"}
+    assert batch.per_request_input_tensors["r"] == {"loop": []}
+    assert batch.request_ids == ["r"] and "s" not in batch.per_request_input_tensors
+
+
+def test_stream_polls_are_skipped_only_when_no_request_owns_a_buffer():
+    worker = _worker()
+    assert Worker._streams_possible(worker), "unknown (a bare instance): poll"
+    worker._stream_buffer_rids = None
+    assert Worker._streams_possible(worker)
+    worker._stream_buffer_rids = set()
+    assert not Worker._streams_possible(worker)
+    worker._stream_buffer_rids.add(7)
+    assert Worker._streams_possible(worker)

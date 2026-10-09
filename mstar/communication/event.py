@@ -9,6 +9,10 @@ class EventWakeup:
     def _wake(self, _fut): # runs on whatever thread finished the future
         os.eventfd_write(self.event, 1) # one syscall, thread-safe, async-signal-safe
 
+    def signal(self):
+        """Wake the poller from any thread (a producer with new work)."""
+        os.eventfd_write(self.event, 1)
+
     def register_future(self, future: Future):
         if future.done():
             return

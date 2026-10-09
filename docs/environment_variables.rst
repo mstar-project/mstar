@@ -237,6 +237,13 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_MAX_BODY_MB``
      - ``128``
      - Request body limit (multipart uploads included).
+   * - ``MSTAR_TOKENIZE_PARALLEL``
+     - ``1``
+     - When a long prompt is encoded as parallel chunks, set
+       ``TOKENIZERS_PARALLELISM=true`` for the process first: the Rust
+       tokenizer only uses its thread pool while that variable reads true,
+       and serving environments often export it false. ``0`` leaves the
+       variable as it is (the chunked encode then runs serially).
    * - ``MSTAR_TOKENIZER``
      - unset
      - Path to a HuggingFace ``tokenizer.json`` enabling frontend
@@ -309,8 +316,11 @@ Worker scheduling
        work the main thread does anyway instead of the next launch. ``0``
        builds each speculation at the top of the next iteration, after the
        whole post-processing, which left the plan thread idle during it.
-       Non-parallel (TP1) nodes only; a tensor-parallel node keeps the old
-       order so the followers see heads in the order they settle them.
+       On a tensor-parallel node the leader's early build commits only when
+       it finds a head (it broadcasts it at once); when it finds nothing it
+       sends no marker and schedules no yield-away, and the top of the next
+       iteration decides, so the followers still settle every step on
+       exactly one decision.
    * - ``MSTAR_LAZY_PUBLISH``
      - ``1``
      - Publish resource state (KV pages, positions) only for the requests
@@ -332,6 +342,58 @@ Worker scheduling
        milliseconds lets the arrivals of that window prefill together, which
        is worth decode throughput at high concurrency and costs up to that
        much time to first token.
+   * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
+     - ``32,64,128,256,512,1024,2048,4096,8192``
+     - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
+       graph (one per bucket and batch size). A prompt past the top bucket
+       prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
+       spends 78 ms of wall time on 36 ms of kernels. The default now reaches
+       8192; narrow it to save graph memory and capture time, or extend it.
+   * - ``MSTAR_GC_FREEZE``
+     - ``1``
+     - Once a process has finished its set-up (the API server and the
+       conductor when every worker is ready, the worker after warm-up and
+       graph capture), collect once and ``gc.freeze()`` the heap, so later
+       gen-2 collections do not walk the long-lived set-up objects. Measured
+       on the API server process: 200 ms per gen-2 pass every ~20 s under
+       load before, which stalled request admission and token delivery for
+       that long. ``0`` leaves the collector alone.
+   * - ``MSTAR_DEVICE_LOOPBACK``
+     - ``1``
+     - Whether a decode node may keep its loop-back token on the device:
+       the sampler writes each request's last token to a slot-addressed
+       master and the next step reads its input ids from it, so the worker
+       routes the signal with no tensor (no per-request store, hold or
+       cleanup per step). Only nodes that opt in (Qwen3.5 decode) and only
+       when the sampler has graph buffers; ``0`` keeps every node on the
+       per-request tensor path.
+   * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
+     - ``0``
+     - The captured sampler gathers its RNG offsets from the slot masters
+       and scatters the advanced offsets and the sampled tokens back inside
+       the graph, so a replayed decode step issues none of those launches on
+       the gpu thread afterwards (each one is a GIL release the main thread's
+       postprocess wins). Padding rows then address a trash master row and
+       the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` concurrent
+       requests (default 4096, a hard cap with this on). Only with the device
+       loop-back on. An experiment knob; measure before turning it on.
+   * - ``MSTAR_TP_EARLY_SPEC``
+     - ``0``
+     - Let a tensor-parallel leader build its next speculation early, during
+       the current step's postprocess, committing only once it holds a head
+       (``MSTAR_EARLY_SPEC`` covers single-GPU nodes). Off by default: with
+       the device loop-back on a 4-way group every request stalled once for
+       about 1.2 s (27B TP4 at c8: 674 vs 1009 tok/s with it off), and the
+       tensor-parallel cells are GPU-bound, so there is nothing to buy.
+   * - ``MSTAR_LAUNCH_SIGNAL_AFTER_COMMIT``
+     - ``0``
+     - Release the thread that submitted a step only once the gpu thread
+       has also committed it and staged its outputs, instead of at the
+       replay launch. Every torch call after the launch releases the GIL and
+       the woken main thread keeps it for its whole postprocess stretch, so
+       the first such call waits that long; signalling later costs the main
+       thread the uncontended commit and collect instead. An experiment
+       knob; measure before turning it on.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset
      - ``1`` makes the Rust runtime print, every 500 calls, how long the

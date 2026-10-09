@@ -199,3 +199,62 @@ def test_merging_two_row_addressed_outputs_drops_the_buffers():
     ))
     assert merged.check_stop_buffers is None and merged.row_request_ids is None
     assert merged.get_check_stop_input()["b"]["new_token"][0].item() == 2
+
+
+class _StagingWorker(_StubWorker):
+    """The gpu-thread side of the host rows: stage behind the step, hand
+    the landed rows to the stop check without a sync of its own."""
+
+    _host_rows_slot = 0
+    _d2h_stream = None
+    device = torch.device("cpu")
+    _stage_host_rows = Worker._stage_host_rows
+    _prematerialize_for_check_stop = Worker._prematerialize_for_check_stop
+
+
+def test_landed_host_rows_skip_the_side_stream_copy():
+    """Rows staged by the gpu thread are what the stop check reads: no
+    side stream, no second copy, row i still request i."""
+    rids = ("a", "b", "c")
+    tokens = torch.tensor([5, 6, 7])
+    out = BatchedModelOutput(
+        check_stop_buffers={"new_token": tokens}, row_request_ids=rids,
+    )
+    worker = _StagingWorker()
+    worker._stage_host_rows(out)
+    assert out.host_rows is not None and out.host_rows.request_ids == rids
+    # a host tensor is passed through as is
+    assert out.host_rows.buffers["new_token"] is tokens
+
+    per_rid, host_rows = worker._prematerialize_for_check_stop(
+        out, completion_event=object(), request_ids=list(rids),
+    )
+    assert host_rows is out.host_rows
+    assert per_rid["b"]["new_token"][0].item() == 6
+    assert worker._d2h_stream is None, "no side stream was needed"
+
+
+def test_nothing_to_stage_without_row_buffers():
+    out = BatchedModelOutput(per_rid_outputs={"a": {"new_token": [torch.tensor([1])]}})
+    worker = _StagingWorker()
+    worker._stage_host_rows(out)
+    assert out.host_rows is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_staged_rows_land_behind_the_stream_and_rotate_buffers():
+    rids = tuple(f"r{i}" for i in range(6))
+    worker = _StagingWorker()
+    seen = set()
+    for step in range(3):
+        tokens = torch.arange(100 * step, 100 * step + 6, device="cuda")
+        out = BatchedModelOutput(
+            check_stop_buffers={"new_token": tokens}, row_request_ids=rids,
+        )
+        worker._stage_host_rows(out)
+        buf = out.host_rows.buffers["new_token"]
+        assert not buf.is_cuda and buf.is_pinned()
+        torch.cuda.synchronize()
+        assert buf.tolist() == list(range(100 * step, 100 * step + 6))
+        seen.add(buf.data_ptr())
+    assert len(seen) == 3, "consecutive steps use different pinned buffers"

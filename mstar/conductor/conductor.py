@@ -33,6 +33,7 @@ from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.exitcode import describe_exitcode
+from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -1537,6 +1538,8 @@ class Conductor:
         from mstar.utils.profiler import range_pop, range_push
 
         self._wait_for_workers_ready()
+        # the set-up heap is complete: keep gen-2 collections off it
+        freeze_after_setup("Conductor")
 
         self.communicator.send(
             "api_server",
