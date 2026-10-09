@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Callable, NamedTuple
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphEdge
 from mstar.streaming.chunk_policy import ChunkPolicy, FixedChunkPolicy
 
@@ -29,8 +30,9 @@ class ProducerWalkCtx(NamedTuple):
     # The walk this producer worker last assigned the consumer; None before
     # its first emission
     consumer_walk: str | None
-    # The producer's step_metadata for this pass, as its model set it
-    step_metadata: dict
+    # The producer's forward-pass info for this pass (step_metadata and all);
+    # the hook runs on the producer, so nothing here crosses the wire
+    fwd_info: CurrentForwardPassInfo
 
 
 @dataclass

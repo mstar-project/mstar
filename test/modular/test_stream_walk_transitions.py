@@ -266,15 +266,17 @@ def test_the_hook_sees_the_producers_state():
     for conn in w.partition_topology.connections:
         conn.consumer_walk = record
     w._walk_drivers = w.partition_topology.walk_drivers()
-    w.request_state.get_fwd_info(0, "Thinker").step_metadata = {"is_last_prefill": True}
+    fwd = w.request_state.get_fwd_info(0, "Thinker")
+    fwd.step_metadata = {"is_last_prefill": True}
     _pass(w, "Thinker", "prefill_text")
     _pass(w, "Thinker", "prefill_text")
     _pass(w, "Thinker", "thinker_decode")
     assert seen == [
-        ProducerWalkCtx("prefill_text", 0, None, {"is_last_prefill": True}),
-        ProducerWalkCtx("prefill_text", 1, "talker_prefill", {"is_last_prefill": True}),
-        ProducerWalkCtx("thinker_decode", 0, "talker_prefill", {"is_last_prefill": True}),
+        ProducerWalkCtx("prefill_text", 0, None, fwd),
+        ProducerWalkCtx("prefill_text", 1, "talker_prefill", fwd),
+        ProducerWalkCtx("thinker_decode", 0, "talker_prefill", fwd),
     ]
+    assert seen[0].fwd_info.step_metadata == {"is_last_prefill": True}
 
 
 # --- conductor ---------------------------------------------------------------

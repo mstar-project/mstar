@@ -1119,8 +1119,7 @@ class Worker:
                 last = req_info.assigned_walks.get(conn.to_partition)
                 n = last.pass_in_walk + 1 if last and last.producer_walk == walk else 0
                 consumer_walk = conn.consumer_walk(ProducerWalkCtx(
-                    walk, n, last.consumer_walk if last else None,
-                    fwd_info.step_metadata,
+                    walk, n, last.consumer_walk if last else None, fwd_info,
                 ))
                 req_info.assigned_walks[conn.to_partition] = AssignedWalk(
                     consumer_walk, walk, n,
