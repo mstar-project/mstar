@@ -102,6 +102,7 @@ class PagedIndptrs(NamedTuple):
 def build_paged_indptrs(
     segments: list[SequenceView],
     page_size: int,
+    ring: "PinnedIndexRing | None" = None,
 ) -> PagedIndptrs:
     # Most of this is the five list-to-tensor conversions; they go through
     # numpy, which builds an int32 array from a list of ints in about half
@@ -123,17 +124,81 @@ def build_paged_indptrs(
         last_page_lens.append(last)
         # FlashInfer's `get_seq_lens`, on the ints already here
         kv_lens.append(max(num_pages - 1, 0) * page_size + last)
+    make = ring.take if ring is not None else _int32_tensor
     return PagedIndptrs(
-        qo_indptr=_int32_tensor(qo_indptr),
-        paged_kv_indptr=_int32_tensor(kv_indptr),
-        paged_kv_indices=_int32_tensor(all_pages),
-        paged_kv_last_page_len=_int32_tensor(last_page_lens),
+        qo_indptr=make(qo_indptr),
+        paged_kv_indptr=make(kv_indptr),
+        paged_kv_indices=make(all_pages),
+        paged_kv_last_page_len=make(last_page_lens),
         kv_lens=_host_lens(kv_lens),
     )
 
 
 def _int32_tensor(values: list[int]) -> torch.Tensor:
     return torch.from_numpy(np.array(values, dtype=np.int32))
+
+
+class PinnedIndexRing:
+    """A ring of page-locked int32 host buffers for the index arrays a plan
+    hands FlashInfer, so its ``copy_(non_blocking=True)`` calls are really
+    asynchronous (from pageable memory the driver stages each one).
+
+    ``take`` fills the next buffer and returns a view of it. A buffer is
+    rewritten only after the copies out of it have completed: the stream a
+    plan ran on records an event when the next ``take`` happens on that
+    stream (by then the plan's copies were issued), and a slot waits on its
+    event before reuse. Plans do not overlap, so one pending slot suffices.
+    Without CUDA the buffers are plain tensors and nothing is recorded.
+    """
+
+    def __init__(self, numel: int = 4096, depth: int = 8):
+        self._depth = depth
+        self._numel = 0
+        self._pinned = torch.cuda.is_available()
+        self._bufs: list[torch.Tensor] = []
+        self._events: list = [None] * depth
+        self._streams: list = [None] * depth
+        self._next = 0
+        self._last: int | None = None
+        self._grow(numel)
+
+    def _grow(self, numel: int) -> None:
+        numel = max(numel, self._numel * 2, 256)
+        self._bufs = [
+            torch.empty(numel, dtype=torch.int32, pin_memory=self._pinned)
+            for _ in range(self._depth)
+        ]
+        self._numel = numel
+
+    def take(self, values) -> torch.Tensor:
+        n = len(values)
+        if n > self._numel:
+            self._grow(n)
+        if self._pinned:
+            stream = torch.cuda.current_stream()
+            if self._last is not None and self._streams[self._last] is not stream:
+                # the previous plan's copies were issued on another stream
+                # (an inline plan on the gpu thread after a pre-plan): record
+                # there, where they are
+                ev = self._events[self._last] or torch.cuda.Event()
+                self._events[self._last] = ev
+                ev.record(self._streams[self._last])
+            elif self._last is not None:
+                ev = self._events[self._last] or torch.cuda.Event()
+                self._events[self._last] = ev
+                ev.record(stream)
+            i = self._next
+            ev = self._events[i]
+            if ev is not None:
+                ev.synchronize()
+            self._streams[i] = stream
+        else:
+            i = self._next
+        self._next = (i + 1) % self._depth
+        self._last = i
+        out = self._bufs[i][:n]
+        out.numpy()[:] = values
+        return out
 
 
 class HostLens(torch.Tensor):
