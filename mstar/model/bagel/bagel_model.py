@@ -493,10 +493,6 @@ class BagelModel(Model):
     )
     VLM_UNDERSTANDING_SUFFIX = "\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
-    # For text-to-text, BAGEL doesn't seem to do as well with the "user... assistant..." format
-    VLM_UNDERSTANDING_TEMPLATE = "<|im_start|>{system_prompt}<|im_end|>" + \
-        "<|im_start|>{prompt}<|im_end|><|im_start|>"
-
     # Image generation (T2I/I2I): bare wrapping, no system prompt or roles. Input
     # image (I2I) is positioned before this by the prefill_vae/vit walks.
     GEN_TEMPLATE = "<|im_start|>{prompt}<|im_end|><|im_start|>"
@@ -532,9 +528,9 @@ class BagelModel(Model):
 
         Understanding writes each turn in its own role block. A text run
         following an attachment carries the newline the old suffix supplied,
-        and a turn ending on one closes after a newline too, so every layout a
-        single user turn could express renders to the string that template
-        gave. Generation leaves attachments outside the turn — the
+        and a turn ending on one closes after a newline too, so every image
+        layout a single user turn could express renders to the string that
+        template gave. Generation leaves attachments outside the turn — the
         prefill_vae/vit walks put the input image ahead of the prompt — and
         wraps what follows.
         """
@@ -617,7 +613,8 @@ class BagelModel(Model):
             if prompt_parts is not None:
                 texts = [p.text or "" for p in prompt_parts if p.modality == TEXT]
                 roles = [p.role for p in prompt_parts]
-            parts = parts_from_modalities(input_modalities, texts, roles)
+            # a legacy layout can lack a text slot, and its prompt still needs one
+            parts = parts_from_modalities(input_modalities or [TEXT], texts, roles)
             unsupported = {p.modality for p in parts} - {TEXT, "image"}
             if unsupported:
                 raise ValueError(
@@ -637,24 +634,15 @@ class BagelModel(Model):
             if think_mode and is_understanding:
                 system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
 
+            text = self._render_prompt(
+                body,
+                is_understanding=is_understanding,
+                system_prompt=system_prompt,
+            )
             if is_understanding and not has_image:
                 # No attachment: one span, one walk, nothing to scan.
-                segments = [self._encode_text(
-                    self.VLM_UNDERSTANDING_TEMPLATE.format(
-                        system_prompt=system_prompt,
-                        # one bare block per turn, joined on the template's own seam; a
-                        # legacy layout can lack a text slot, so its prompt goes as sent
-                        prompt=prompt if prompt_parts is None else "<|im_end|><|im_start|>".join(
-                            "".join(p.text or "" for p in turn.parts) for turn in chat_turns(body)
-                        ),
-                    )
-                )]
+                segments = [self._encode_text(text)]
             else:
-                text = self._render_prompt(
-                    body,
-                    is_understanding=is_understanding,
-                    system_prompt=system_prompt,
-                )
                 input_ids = self._encode_text(text)
                 spans = find_media_spans(input_ids, self._placeholder_specs())
                 segments = split_around_spans(input_ids, spans)
