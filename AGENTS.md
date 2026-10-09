@@ -6,6 +6,8 @@ A human submitter must understand and defend every line of an AI-assisted PR, an
 
 When explaining a correctness or performance result (in a PR description, a review, or to the person you're working with), point to the evidence for the mechanism: the code path, a profile, `TORCH_LOGS` output, a test that fails without the fix. A mechanism that sounds right but hasn't been checked should be labeled as a hypothesis. Plausible, unverified explanations have been wrong often enough in this codebase that they cost more than they save.
 
+If a hang, crash, or other bug has several plausible causes, the tempting fix is to add a mechanism per cause. Every mechanism must satisfy the invariants if possible, and must be logically defensible. If a mechanism doesn't work, cannot be reasoned to be independently correct, or breaks an invariant, then it should be removed. Especially in tricky concurrency-sensitive places like TP lockstep, high-level reasoning can go a longer way than trying out several plausible fixes. Don't add a second mechanism while the first is unproven.
+
 ## Layer map
 
 | Layer | Path | Owns |
@@ -86,6 +88,7 @@ Things to be wary of that have caused issues in the past, by no means a comprehe
 - Per-tensor computation / data transfer that could naturally be batched
 - Passing many small objects through the Python <> Rust boundary. For instance, a `list[tuple]` or `list[dataclass]` is going to have a lot more overhead on the boundary than a parallel/columnar format. Specifically: `requests: list[int], values: list[int]` is preferable to `request_vals: list[tuple[int, int]]`.
 - Sending large objects over ZMQ
+- A field on a per-step message whose declared type the wire codec has no encoder for. It falls back to pickle silently, once per peer per step; `wire._encoder(T).__name__` says which path a type takes. A `@dataclass` of lists encodes typed where a `NamedTuple` of `deque`s does not.
 - Work repeated every pass for requests that are waiting. When the ready set exceeds a batch cap, some rows wait in the backlog across many steps, so anything done per pass for them (re-measuring sequence lengths, rebuilding input tensors, readiness checks) is paid every step at high concurrency. Do the cheap checks (e.g., "is the caller's batch already full?") before touching queues or the backlog.
 
 Removing redundant computation and memoizing where possible is good low-hanging fruit. E.g., a backlogged row's inputs don't change while it waits, so its measured length can be computed once and carried on the batch, and a plain readiness check followed by a length-aware one is the same engine call twice. Prefer storing derived per-row facts on the object that already carries the row over a side dict that needs its own invalidation.
@@ -139,7 +142,7 @@ A PR that changes a hot path, e.g., scheduling, attention planning, capture buck
 
 Two things about what the number is for. **Don't optimize against one benchmark.** Being better than or on par with the competition across a comprehensive set is the goal; a win on a single configuration usually means it was tuned for. And **check the workloads you didn't measure**: an optimization that helps `image_to_text` at the expense of `text_to_text` or a mixed workload is a regression, and it is the cross-workload analogue of invariant 5. Say which workloads you checked, not just which one improved.
 
-**Situation-dependent.** Invariants 11-13 will not apply to every task and PR, but should be kept in mind if relevant.
+**Situation-dependent.** Invariants 11-14 will not apply to every task and PR, but should be kept in mind if relevant.
 
 ### 11. Ranks in a lockstep instance must stay in lockstep
 
@@ -148,6 +151,14 @@ A node's TP×SP block is its **lockstep instance** ([mstar/distributed/communica
 The failure mode that actually happens: a readiness scan, admission check, capture decision or early `return` that consults **per-rank** state, so one rank takes a branch the others don't and the instance deadlocks on the next collective. Anything that decides control flow for the instance must be derived from state all ranks agree on, or reduced across the group first — `cuda_graph_runner.py` ANDs capture flags across the joint group for exactly this reason, and barriers once per spec whether it passed or failed.
 
 Review any new early return, `continue`, or exception path in worker and engine loops against this. A hang is much more expensive to debug than an error.
+
+Lockstep is also about **when** something is run, not only whether. The main thread runs ahead of the GPU thread within a single step (invariant 7), so "one step in flight" does not mean "that step has admitted": admit is on the GPU thread while the main thread is already applying teardowns and scanning readiness, both of which move the state admit reads. A rank can then admit a step in a window that exists only between two of its own state changes, and a rank replaying those changes in order admits the same step from a different state. Every mutation of replicated state has to land before the step is broadcast or after that step has admitted, never between.
+
+**Replicating a decision the other ranks can't derive.** For instance, with KV cache eviction, LRU orders on wall clock, so the ranks could pick different victims if left to their own devices. One rank decides and the others replay its decisions, which puts four requirements on the journal.
+
+Some lessons learned from debugging KV cache symmetry across TP ranks:
+- **Ordered, not summarized.** A set of offloads plus a set of reloads cannot say whether a request ended up resident; the order of actions must be sent, and replayed verbatim.
+- **Many parts of the code affect resource state.** A teardown releases pages without offloading anything, so no resident-set delta accounts for it: it has to carry the step it followed, and the rank that stamped it has to honour its own stamp.
 
 Process-group creation is a collective too. `dist.new_group(ranks, backend="gloo")` while the default group is a device-bound NCCL group sends ranks *outside* `ranks` into an `ncclCommSplit` they never return from, which looks like a startup protocol hang. Create subgroups with `use_local_synchronization=True` so only members participate.
 
@@ -160,6 +171,14 @@ Distinct from the async worker in invariant 7. An **async partition** keeps its 
 ### 13. Cross-request prefix reuse
 
 Prefix caching is also its own skill: [.claude/skills/prefix-caching/SKILL.md](.claude/skills/prefix-caching/SKILL.md). Prefix caching retains a finished request's KV pages so the next request with the same prefix skips recomputing them, and has a contract that a contributor needs to understand before touching the KV cache.
+
+### 14. Worker-local request handles don't leave the process
+
+A worker keys its own state by a small integer handle ([mstar/worker/rid_table.py](mstar/worker/rid_table.py)); messages carry the request id string, and the two are translated at the process boundary. Handles are minted per worker and **recycled**, which has three consequences.
+
+- **A handle on the wire is a bug.** Rank 0's handle names a different request on rank 1, so translate at the send site. The same goes for a log line meant to be matched across ranks: with per-rank handles, the two ranks' lines can't be lined up, which is usually the only reason the line exists.
+- **New handle-keyed state has to be purged when the handle is released**, or it silently attaches to whichever request is given that handle next. `rid_table.py` lists the state known to be handle-keyed; add to it. Clearing at the top of a per-step routine is not a substitute, because early returns skip it.
+- **An unknown rid off the wire is expected; an unknown rid from local state is a bug.** A message can name a request this rank has already removed, so the lookup returns `None` rather than raising — handle that case explicitly at each call site, and say which of the two it is.
 
 ## Testing
 
@@ -178,6 +197,8 @@ The modular tests exist because these are the parts that are easy to get wrong: 
 Note that modular tests run models in **dummy mode**, where `get_submodule` returns `None`, and that several fakes stub worker internals **by name** — renaming a private on `Worker` can break them without any grep hit at the definition. Run the suite, don't just grep.
 
 Before attributing a test failure to your change, check whether it also fails on `main`; some modular tests have pre-existing failures. Compare the set of failing tests against main, not just the count.
+
+When rebasing onto a `main` that moved, check each resolution for hunks that kept **both** sides. Two got through one rebase here: one reinstated a behaviour the commit existed to remove, and the other defeated a guard's fall-through so a step admitted with nothing reserved. Both read as plausible merges, and neither conflicted again afterwards — the modular tests caught them, which is the argument for running them per step rather than at the end.
 
 The Rust extension under `rust/` is a build artifact, so it goes stale after merging or rebasing onto a `main` that changed `rust/`. A stale build imports fine and then fails at request time (often as an unexpected-keyword `TypeError` from a runtime call), and tests that need it (e.g., `test_graph_runtime_factory.py`) fail in a checkout where it isn't built. Rebuild before believing either.
 
