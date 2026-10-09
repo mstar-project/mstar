@@ -335,6 +335,13 @@ Worker scheduling
        milliseconds lets the arrivals of that window prefill together, which
        is worth decode throughput at high concurrency and costs up to that
        much time to first token.
+   * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
+     - ``32,64,128,256,512,1024,2048,4096,8192``
+     - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
+       graph (one per bucket and batch size). A prompt past the top bucket
+       prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
+       spends 78 ms of wall time on 36 ms of kernels. The default now reaches
+       8192; narrow it to save graph memory and capture time, or extend it.
    * - ``MSTAR_GC_FREEZE``
      - ``1``
      - Once a process has finished its set-up (the API server and the
