@@ -296,6 +296,12 @@ class LLMSubmodule(ARNodeSubmodule):
         input_ids = inputs["text_inputs"][0]
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
 
+    def uniform_row_inputs(self, graph_walk: str) -> ARNodeInputs | None:
+        # the loop-back decode row above, built once for the step's rows
+        if graph_walk == "decode" and self._device_loopback():
+            return ARNodeInputs(input_seq_len=1)
+        return None
+
     def _device_loopback(self) -> bool:
         return (
             device_loopback_enabled()
