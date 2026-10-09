@@ -79,9 +79,10 @@ def test_ingraph_scatter_rows_land_by_slot_and_padding_hits_the_trash_row():
     for rid in ("a", "b", "c"):
         bufs.register_request(rid)
     bufs.write_last_tokens(["a", "b", "c"], torch.tensor([1, 2, 3]))
-    bufs.offset.master[bufs._rid_to_slot["a"]] = 10
     bufs.gather_static(["b", "a"], 4, 1)
     bufs.gather_dynamic(["b", "a"], 4, 1)  # uploads the index row, no offset gather
+    # (a fresh slot's offset reset ran there; an advanced offset survives)
+    bufs.offset.master[bufs._rid_to_slot["a"]] = 10
     assert bufs._slot_idx_gpu[1, :4].tolist()[2:] == [8, 8]
     s = bufs.sampler_for(4, 1)
     assert s.ingraph_scatter and s.slot_idx_view.tolist()[:2] == [bufs._rid_to_slot[r] for r in ("b", "a")]
