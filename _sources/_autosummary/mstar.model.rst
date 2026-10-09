@@ -31,6 +31,7 @@
    chatterbox
    components
    cosmos3
+   flux2_klein
    higgs_audio
    kokoro
    loader
@@ -48,4 +49,5 @@
    wan22
    waypoint
    whisper
+   z_image
 

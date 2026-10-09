@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>mstar.model.components.diffusion.text_encoder &#8212; M* v0.2.1 Documentation</title>
+    <title>mstar.model.flux2_klein.components.vae &#8212; M* v0.2.1 Documentation</title>
   
   
   
@@ -46,16 +46,16 @@
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = '_autosummary/mstar.model.components.diffusion.text_encoder';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_autosummary/mstar.model.flux2_klein.components.vae';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.model.components.distributed" href="mstar.model.components.distributed.html" />
-    <link rel="prev" title="mstar.model.components.diffusion.rope" href="mstar.model.components.diffusion.rope.html" />
+    <link rel="next" title="mstar.model.flux2_klein.config" href="mstar.model.flux2_klein.config.html" />
+    <link rel="prev" title="mstar.model.flux2_klein.components.transformer" href="mstar.model.flux2_klein.components.transformer.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 08, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 09, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -273,12 +273,12 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
 </ul>
 </details></li>
-<li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.model.components.html">mstar.model.components</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.components.html">mstar.model.components</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.attention.html">mstar.model.components.attention</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.audio_features.html">mstar.model.components.audio_features</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.aut_encoder.html">mstar.model.components.aut_encoder</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
-<li class="toctree-l4 current active"><a class="reference internal" href="mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear.html">mstar.model.components.linear</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear_attn.html">mstar.model.components.linear_attn</a></li>
@@ -296,6 +296,12 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l4 current active"><a class="reference internal" href="mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.flux2_klein.config.html">mstar.model.flux2_klein.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.flux2_klein.submodules.html">mstar.model.flux2_klein.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -360,6 +366,12 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.z_image.html">mstar.model.z_image</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.z_image.components.html">mstar.model.z_image.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.z_image.config.html">mstar.model.z_image.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.z_image.submodules.html">mstar.model.z_image.submodules</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -373,6 +385,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.h2d.html">mstar.utils.h2d</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
@@ -467,7 +480,7 @@
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/_autosummary/mstar.model.components.diffusion.text_encoder.rst?plain=1" target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/_autosummary/mstar.model.flux2_klein.components.vae.rst?plain=1" target="_blank"
    class="btn btn-sm btn-source-file-button dropdown-item"
    title="Show source"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -484,7 +497,7 @@
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_autosummary/mstar.model.components.diffusion.text_encoder.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_autosummary/mstar.model.flux2_klein.components.vae.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -514,7 +527,7 @@
       
       
       
-      <li><a href="../_sources/_autosummary/mstar.model.components.diffusion.text_encoder.rst" target="_blank"
+      <li><a href="../_sources/_autosummary/mstar.model.flux2_klein.components.vae.rst" target="_blank"
    class="btn btn-sm btn-download-source-button dropdown-item"
    title="Download source file"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -597,7 +610,7 @@
               
 
 <div id="jb-print-docs-body" class="onlyprint">
-    <h1>mstar.model.components.diffusion.text_encoder</h1>
+    <h1>mstar.model.flux2_klein.components.vae</h1>
     <!-- Table of contents -->
     <div id="print-main-content">
         <div id="jb-print-toc">
@@ -607,23 +620,12 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3EncoderAttention"><code class="docutils literal notranslate"><span class="pre">Qwen3EncoderAttention</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3EncoderAttention.forward"><code class="docutils literal notranslate"><span class="pre">Qwen3EncoderAttention.forward()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.flux2_klein.components.vae.Flux2VAE"><code class="docutils literal notranslate"><span class="pre">Flux2VAE</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.flux2_klein.components.vae.Flux2VAE.denormalize_latents"><code class="docutils literal notranslate"><span class="pre">Flux2VAE.denormalize_latents()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.flux2_klein.components.vae.Flux2VAE.normalize_latents"><code class="docutils literal notranslate"><span class="pre">Flux2VAE.normalize_latents()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder"><code class="docutils literal notranslate"><span class="pre">Qwen3HiddenStateEncoder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder.dtype"><code class="docutils literal notranslate"><span class="pre">Qwen3HiddenStateEncoder.dtype</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder.forward"><code class="docutils literal notranslate"><span class="pre">Qwen3HiddenStateEncoder.forward()</span></code></a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3RMSNorm"><code class="docutils literal notranslate"><span class="pre">Qwen3RMSNorm</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3RMSNorm.forward"><code class="docutils literal notranslate"><span class="pre">Qwen3RMSNorm.forward()</span></code></a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.padded_causal_mask"><code class="docutils literal notranslate"><span class="pre">padded_causal_mask()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.qwen3_inv_freq"><code class="docutils literal notranslate"><span class="pre">qwen3_inv_freq()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.qwen3_rotary_tables"><code class="docutils literal notranslate"><span class="pre">qwen3_rotary_tables()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.rotate_half"><code class="docutils literal notranslate"><span class="pre">rotate_half()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.flux2_klein.components.vae.remap_flux2_vae_key"><code class="docutils literal notranslate"><span class="pre">remap_flux2_vae_key()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -635,35 +637,20 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="module-mstar.model.components.diffusion.text_encoder">
-<span id="mstar-model-components-diffusion-text-encoder"></span><h1>mstar.model.components.diffusion.text_encoder<a class="headerlink" href="#module-mstar.model.components.diffusion.text_encoder" title="Link to this heading">#</a></h1>
-<p>Native Qwen3-family prompt encoder that returns tapped hidden states.</p>
-<p>FLUX.2 [klein] and Z-Image condition their DiTs on intermediate hidden states of
-a Qwen3 language model (klein: layers 9/18/27 of Qwen3-4B/8B concatenated), not on
-its logits. This module is that encoder built from M*’s transformer components:
-<code class="docutils literal notranslate"><span class="pre">DecoderLayer</span></code> + <code class="docutils literal notranslate"><span class="pre">GatedMLP</span></code> + an HF-order RMSNorm with a GQA attention that carries
-per-head q/k RMSNorm and plain RoPE, run only through the deepest tapped layer
-(klein skips the last quarter of the LM).</p>
-<p>Prompts arrive right-padded to one length (the pipelines pad to
-<code class="docutils literal notranslate"><span class="pre">max_sequence_length</span></code> and feed every position, pad tokens included, to the
-DiT), so the padded positions’ hidden states must be exactly what the reference
-LM computes for them: a query at position <code class="docutils literal notranslate"><span class="pre">i</span></code> attends causally to keys <code class="docutils literal notranslate"><span class="pre">&lt;=</span> <span class="pre">i</span></code>
-that are not padding. That mask is built once per batch and handed to SDPA, the
-reference’s own kernel.</p>
+  <section id="module-mstar.model.flux2_klein.components.vae">
+<span id="mstar-model-flux2-klein-components-vae"></span><h1>mstar.model.flux2_klein.components.vae<a class="headerlink" href="#module-mstar.model.flux2_klein.components.vae" title="Link to this heading">#</a></h1>
+<p>FLUX.2 VAE: the shared KL autoencoder plus the checkpoint’s BatchNorm latent statistics.</p>
+<p><code class="docutils literal notranslate"><span class="pre">AutoencoderKLFlux2</span></code> is the SD-style KL autoencoder with a 32-channel latent; the only
+FLUX.2-specific part is that the pipelines normalize the 2x2-patchified latents
+(<code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">128,</span> <span class="pre">h,</span> <span class="pre">w]</span></code>) with the <code class="docutils literal notranslate"><span class="pre">BatchNorm2d</span></code> running statistics stored in the checkpoint
+(<code class="docutils literal notranslate"><span class="pre">bn.running_mean</span></code> / <code class="docutils literal notranslate"><span class="pre">bn.running_var</span></code>), applied explicitly with the reference’s op order
+(<code class="xref py py-meth docutils literal notranslate"><span class="pre">normalize_latents()</span></code> / <code class="xref py py-meth docutils literal notranslate"><span class="pre">denormalize_latents()</span></code>). They are kept in the checkpoint
+dtype as frozen parameters so the streaming loader fills and completeness-checks them.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.components.diffusion.text_encoder.padded_causal_mask" title="mstar.model.components.diffusion.text_encoder.padded_causal_mask"><code class="xref py py-obj docutils literal notranslate"><span class="pre">padded_causal_mask</span></code></a>(attention_mask)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">1,</span> <span class="pre">S,</span> <span class="pre">S]</span></code> boolean SDPA mask: causal, and keys that are padding are never attended (the reference <code class="docutils literal notranslate"><span class="pre">create_causal_mask</span></code> semantics for a right-padded batch).</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.components.diffusion.text_encoder.qwen3_inv_freq" title="mstar.model.components.diffusion.text_encoder.qwen3_inv_freq"><code class="xref py py-obj docutils literal notranslate"><span class="pre">qwen3_inv_freq</span></code></a>(head_dim, theta)</p></td>
-<td><p>HF's default RoPE <code class="docutils literal notranslate"><span class="pre">inv_freq</span></code> (<code class="docutils literal notranslate"><span class="pre">_compute_default_rope_parameters</span></code>), computed on the CPU as the reference does at module init: CPU and GPU <code class="docutils literal notranslate"><span class="pre">pow</span></code> differ in the last ulp for some entries, and that ulp survives into the bf16 sin table and the attention output.</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.components.diffusion.text_encoder.qwen3_rotary_tables" title="mstar.model.components.diffusion.text_encoder.qwen3_rotary_tables"><code class="xref py py-obj docutils literal notranslate"><span class="pre">qwen3_rotary_tables</span></code></a>(positions, head_dim, theta)</p></td>
-<td><p>HF <code class="docutils literal notranslate"><span class="pre">Qwen3RotaryEmbedding.forward</span></code>: fp32 <code class="docutils literal notranslate"><span class="pre">cos,</span> <span class="pre">sin</span> <span class="pre">[S,</span> <span class="pre">head_dim]</span></code> laid out <code class="docutils literal notranslate"><span class="pre">[freqs</span> <span class="pre">|</span> <span class="pre">freqs]</span></code>, the angles from the same K=1 matmul on the positions' device.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.components.diffusion.text_encoder.rotate_half" title="mstar.model.components.diffusion.text_encoder.rotate_half"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rotate_half</span></code></a>(x)</p></td>
-<td><p></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.flux2_klein.components.vae.remap_flux2_vae_key" title="mstar.model.flux2_klein.components.vae.remap_flux2_vae_key"><code class="xref py py-obj docutils literal notranslate"><span class="pre">remap_flux2_vae_key</span></code></a>(name)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AutoencoderKLFlux2</span></code> checkpoint key -&gt; native path (the KL remap + the BN statistics).</p></td>
 </tr>
 </tbody>
 </table>
@@ -671,140 +658,42 @@ reference’s own kernel.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.components.diffusion.text_encoder.Qwen3EncoderAttention" title="mstar.model.components.diffusion.text_encoder.Qwen3EncoderAttention"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Qwen3EncoderAttention</span></code></a>(hidden_size, ...)</p></td>
-<td><p>GQA self-attention with per-head q/k RMSNorm (Qwen3), fused qkv GEMM, masked SDPA.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder" title="mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Qwen3HiddenStateEncoder</span></code></a>(vocab_size, ...)</p></td>
-<td><p>Embeddings + the first <code class="docutils literal notranslate"><span class="pre">max(tap_layers)</span></code> decoder layers of a Qwen3 LM; returns the hidden states after each tapped layer, concatenated along the feature dim (<code class="docutils literal notranslate"><span class="pre">hidden_states[k]</span></code> in HF indexing == output of layer <code class="docutils literal notranslate"><span class="pre">k</span></code>).</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.components.diffusion.text_encoder.Qwen3RMSNorm" title="mstar.model.components.diffusion.text_encoder.Qwen3RMSNorm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Qwen3RMSNorm</span></code></a>(dim, eps)</p></td>
-<td><p>RMSNorm in the HF <code class="docutils literal notranslate"><span class="pre">Qwen3RMSNorm</span></code> rounding order: normalize in fp32, round to the input dtype, then multiply by the weight.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.flux2_klein.components.vae.Flux2VAE" title="mstar.model.flux2_klein.components.vae.Flux2VAE"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Flux2VAE</span></code></a>(config)</p></td>
+<td><p></p></td>
 </tr>
 </tbody>
 </table>
 </div>
 <dl class="py class">
-<dt class="sig sig-object py" id="mstar.model.components.diffusion.text_encoder.Qwen3EncoderAttention">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.diffusion.text_encoder.</span></span><span class="sig-name descname"><span class="pre">Qwen3EncoderAttention</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">eps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rope_theta</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/text_encoder.html#Qwen3EncoderAttention"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.text_encoder.Qwen3EncoderAttention" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
-<p>GQA self-attention with per-head q/k RMSNorm (Qwen3), fused qkv GEMM, masked SDPA.</p>
+<dt class="sig sig-object py" id="mstar.model.flux2_klein.components.vae.Flux2VAE">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.flux2_klein.components.vae.</span></span><span class="sig-name descname"><span class="pre">Flux2VAE</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/flux2_klein/components/vae.html#Flux2VAE"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.flux2_klein.components.vae.Flux2VAE" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="mstar.model.components.diffusion.autoencoder_kl.html#mstar.model.components.diffusion.autoencoder_kl.AutoencoderKL" title="mstar.model.components.diffusion.autoencoder_kl.AutoencoderKL"><code class="xref py py-class docutils literal notranslate"><span class="pre">AutoencoderKL</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>num_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>eps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>rope_theta</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-</ul>
+<dd class="field-odd"><p><strong>config</strong> (<a class="reference internal" href="mstar.model.flux2_klein.config.html#mstar.model.flux2_klein.config.Flux2VaeConfig" title="mstar.model.flux2_klein.config.Flux2VaeConfig"><em>Flux2VaeConfig</em></a>)</p>
 </dd>
 </dl>
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.model.components.diffusion.text_encoder.Qwen3EncoderAttention.forward">
-<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/text_encoder.html#Qwen3EncoderAttention.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.text_encoder.Qwen3EncoderAttention.forward" title="Link to this definition">#</a></dt>
-<dd><p>Define the computation performed at every call.</p>
-<p>Should be overridden by all subclasses.</p>
-<div class="admonition note">
-<p class="admonition-title">Note</p>
-<p>Although the recipe for forward pass needs to be defined within
-this function, one should call the <code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code> instance afterwards
-instead of this since the former takes care of running the
-registered hooks while the latter silently ignores them.</p>
-</div>
+<dt class="sig sig-object py" id="mstar.model.flux2_klein.components.vae.Flux2VAE.denormalize_latents">
+<span class="sig-name descname"><span class="pre">denormalize_latents</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">patched</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/flux2_klein/components/vae.html#Flux2VAE.denormalize_latents"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.flux2_klein.components.vae.Flux2VAE.denormalize_latents" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">*</span> <span class="pre">std</span> <span class="pre">+</span> <span class="pre">mean</span></code> (decode side).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>hidden_states</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
+<dd class="field-odd"><p><strong>patched</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
 </dd>
 </dl>
 </dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py" id="mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.diffusion.text_encoder.</span></span><span class="sig-name descname"><span class="pre">Qwen3HiddenStateEncoder</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">vocab_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rms_norm_eps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rope_theta</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tap_layers</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/text_encoder.html#Qwen3HiddenStateEncoder"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
-<p>Embeddings + the first <code class="docutils literal notranslate"><span class="pre">max(tap_layers)</span></code> decoder layers of a Qwen3 LM; returns the
-hidden states after each tapped layer, concatenated along the feature dim
-(<code class="docutils literal notranslate"><span class="pre">hidden_states[k]</span></code> in HF indexing == output of layer <code class="docutils literal notranslate"><span class="pre">k</span></code>).</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>vocab_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>intermediate_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>num_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>rms_norm_eps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>rope_theta</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>tap_layers</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
-</ul>
-</dd>
-</dl>
-<dl class="py property">
-<dt class="sig sig-object py" id="mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder.dtype">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">dtype</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><span class="pre">dtype</span></a></span><a class="headerlink" href="#mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder.dtype" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder.forward">
-<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">attention_mask</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/text_encoder.html#Qwen3HiddenStateEncoder.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder.forward" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">input_ids,</span> <span class="pre">attention_mask</span> <span class="pre">[B,</span> <span class="pre">S]</span></code> (right padded) -&gt; <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">S,</span> <span class="pre">len(taps)</span> <span class="pre">*</span> <span class="pre">hidden]</span></code>.</p>
-<p>Follows HF’s two attention paths exactly: a batch without padding attends mask-free
-(<code class="docutils literal notranslate"><span class="pre">is_causal</span></code> + native GQA), a padded one through a boolean causal-and-key-padding
-mask; the two pick different SDPA kernels, so the choice is part of parity.</p>
+<dt class="sig sig-object py" id="mstar.model.flux2_klein.components.vae.Flux2VAE.normalize_latents">
+<span class="sig-name descname"><span class="pre">normalize_latents</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">patched</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/flux2_klein/components/vae.html#Flux2VAE.normalize_latents"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.flux2_klein.components.vae.Flux2VAE.normalize_latents" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">(x</span> <span class="pre">-</span> <span class="pre">mean)</span> <span class="pre">/</span> <span class="pre">std</span></code> over <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">128,</span> <span class="pre">h,</span> <span class="pre">w]</span></code> patchified latents (encode side).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>input_ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>attention_mask</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py" id="mstar.model.components.diffusion.text_encoder.Qwen3RMSNorm">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.diffusion.text_encoder.</span></span><span class="sig-name descname"><span class="pre">Qwen3RMSNorm</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">eps</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/text_encoder.html#Qwen3RMSNorm"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.text_encoder.Qwen3RMSNorm" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
-<p>RMSNorm in the HF <code class="docutils literal notranslate"><span class="pre">Qwen3RMSNorm</span></code> rounding order: normalize in fp32, round to the
-input dtype, then multiply by the weight. In bf16 this is bit-exact with the reference
-encoder; <code class="docutils literal notranslate"><span class="pre">mstar.model.components.RMSNorm</span></code> rounds <code class="docutils literal notranslate"><span class="pre">rsqrt</span></code> first (portable path) or the
-whole product once (FlashInfer kernel), and either differs in the last bit, which the
-27 to 35 layers below a tap then amplify.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>eps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-</ul>
-</dd>
-</dl>
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.model.components.diffusion.text_encoder.Qwen3RMSNorm.forward">
-<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/text_encoder.html#Qwen3RMSNorm.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.text_encoder.Qwen3RMSNorm.forward" title="Link to this definition">#</a></dt>
-<dd><p>Define the computation performed at every call.</p>
-<p>Should be overridden by all subclasses.</p>
-<div class="admonition note">
-<p class="admonition-title">Note</p>
-<p>Although the recipe for forward pass needs to be defined within
-this function, one should call the <code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code> instance afterwards
-instead of this since the former takes care of running the
-registered hooks while the latter silently ignores them.</p>
-</div>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
+<dd class="field-odd"><p><strong>patched</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
@@ -815,67 +704,15 @@ registered hooks while the latter silently ignores them.</p>
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.components.diffusion.text_encoder.padded_causal_mask">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.components.diffusion.text_encoder.</span></span><span class="sig-name descname"><span class="pre">padded_causal_mask</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">attention_mask</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/text_encoder.html#padded_causal_mask"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.text_encoder.padded_causal_mask" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">1,</span> <span class="pre">S,</span> <span class="pre">S]</span></code> boolean SDPA mask: causal, and keys that are padding are never
-attended (the reference <code class="docutils literal notranslate"><span class="pre">create_causal_mask</span></code> semantics for a right-padded batch).</p>
+<dt class="sig sig-object py" id="mstar.model.flux2_klein.components.vae.remap_flux2_vae_key">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.flux2_klein.components.vae.</span></span><span class="sig-name descname"><span class="pre">remap_flux2_vae_key</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/flux2_klein/components/vae.html#remap_flux2_vae_key"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.flux2_klein.components.vae.remap_flux2_vae_key" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">AutoencoderKLFlux2</span></code> checkpoint key -&gt; native path (the KL remap + the BN statistics).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>attention_mask</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
+<dd class="field-odd"><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.components.diffusion.text_encoder.qwen3_inv_freq">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.components.diffusion.text_encoder.</span></span><span class="sig-name descname"><span class="pre">qwen3_inv_freq</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">theta</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/text_encoder.html#qwen3_inv_freq"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.text_encoder.qwen3_inv_freq" title="Link to this definition">#</a></dt>
-<dd><p>HF’s default RoPE <code class="docutils literal notranslate"><span class="pre">inv_freq</span></code> (<code class="docutils literal notranslate"><span class="pre">_compute_default_rope_parameters</span></code>), computed on the
-CPU as the reference does at module init: CPU and GPU <code class="docutils literal notranslate"><span class="pre">pow</span></code> differ in the last ulp for
-some entries, and that ulp survives into the bf16 sin table and the attention output.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>theta</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.components.diffusion.text_encoder.qwen3_rotary_tables">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.components.diffusion.text_encoder.</span></span><span class="sig-name descname"><span class="pre">qwen3_rotary_tables</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">positions</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">theta</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/text_encoder.html#qwen3_rotary_tables"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.text_encoder.qwen3_rotary_tables" title="Link to this definition">#</a></dt>
-<dd><p>HF <code class="docutils literal notranslate"><span class="pre">Qwen3RotaryEmbedding.forward</span></code>: fp32 <code class="docutils literal notranslate"><span class="pre">cos,</span> <span class="pre">sin</span> <span class="pre">[S,</span> <span class="pre">head_dim]</span></code> laid out <code class="docutils literal notranslate"><span class="pre">[freqs</span> <span class="pre">|</span> <span class="pre">freqs]</span></code>,
-the angles from the same K=1 matmul on the positions’ device.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>positions</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>theta</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>]</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.components.diffusion.text_encoder.rotate_half">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.components.diffusion.text_encoder.</span></span><span class="sig-name descname"><span class="pre">rotate_half</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/text_encoder.html#rotate_half"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.text_encoder.rotate_half" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -894,20 +731,20 @@ the angles from the same K=1 matmul on the positions’ device.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.model.components.diffusion.rope.html"
+       href="mstar.model.flux2_klein.components.transformer.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.model.components.diffusion.rope</p>
+        <p class="prev-next-title">mstar.model.flux2_klein.components.transformer</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.model.components.distributed.html"
+       href="mstar.model.flux2_klein.config.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.model.components.distributed</p>
+        <p class="prev-next-title">mstar.model.flux2_klein.config</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -929,23 +766,12 @@ the angles from the same K=1 matmul on the positions’ device.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3EncoderAttention"><code class="docutils literal notranslate"><span class="pre">Qwen3EncoderAttention</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3EncoderAttention.forward"><code class="docutils literal notranslate"><span class="pre">Qwen3EncoderAttention.forward()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.flux2_klein.components.vae.Flux2VAE"><code class="docutils literal notranslate"><span class="pre">Flux2VAE</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.flux2_klein.components.vae.Flux2VAE.denormalize_latents"><code class="docutils literal notranslate"><span class="pre">Flux2VAE.denormalize_latents()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.flux2_klein.components.vae.Flux2VAE.normalize_latents"><code class="docutils literal notranslate"><span class="pre">Flux2VAE.normalize_latents()</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder"><code class="docutils literal notranslate"><span class="pre">Qwen3HiddenStateEncoder</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder.dtype"><code class="docutils literal notranslate"><span class="pre">Qwen3HiddenStateEncoder.dtype</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3HiddenStateEncoder.forward"><code class="docutils literal notranslate"><span class="pre">Qwen3HiddenStateEncoder.forward()</span></code></a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3RMSNorm"><code class="docutils literal notranslate"><span class="pre">Qwen3RMSNorm</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.Qwen3RMSNorm.forward"><code class="docutils literal notranslate"><span class="pre">Qwen3RMSNorm.forward()</span></code></a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.padded_causal_mask"><code class="docutils literal notranslate"><span class="pre">padded_causal_mask()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.qwen3_inv_freq"><code class="docutils literal notranslate"><span class="pre">qwen3_inv_freq()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.qwen3_rotary_tables"><code class="docutils literal notranslate"><span class="pre">qwen3_rotary_tables()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.text_encoder.rotate_half"><code class="docutils literal notranslate"><span class="pre">rotate_half()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.flux2_klein.components.vae.remap_flux2_vae_key"><code class="docutils literal notranslate"><span class="pre">remap_flux2_vae_key()</span></code></a></li>
 </ul>
   </nav></div>
 
@@ -979,7 +805,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 08, 2026.
+  Last updated on Oct 09, 2026.
   <br/>
 </p>
   </div>

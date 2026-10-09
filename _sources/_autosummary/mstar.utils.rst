@@ -34,6 +34,7 @@
    exitcode
    fused_moe
    h2d
+   hf_snapshot
    ipc_format
    logging_config
    orphan

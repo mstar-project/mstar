@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 08, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 09, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -298,6 +298,12 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.config.html">mstar.model.flux2_klein.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.submodules.html">mstar.model.flux2_klein.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
@@ -360,6 +366,12 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.z_image.html">mstar.model.z_image</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.z_image.components.html">mstar.model.z_image.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.z_image.config.html">mstar.model.z_image.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.z_image.submodules.html">mstar.model.z_image.submodules</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -373,6 +385,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
@@ -619,6 +632,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-edge-reasoner-and-action-loop">Cosmos3-Edge reasoner and action loop</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-streaming-rollout-windowed-video">Cosmos3 streaming rollout (windowed video)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#wan2-2-wan22">Wan2.2 (<code class="docutils literal notranslate"><span class="pre">wan22</span></code>)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flux-2-klein-flux2-klein-flux2-klein-9b">FLUX.2 [klein] (<code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code> / <code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code>)</a></li>
 </ul>
             </nav>
         </div>
@@ -754,6 +768,21 @@ backbone + audio codec. Clones a voice from a reference clip.</p></td>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code></p></td>
 <td><p>Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-4B</span></code></p></td>
+<td><p>FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
+image editing; Qwen3-4B hidden-state text encoder + FLUX.2 VAE. Apache-2.0.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-9B</span></code></p></td>
+<td><p>FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
+the FLUX Non-Commercial License; check it before deploying.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Tongyi-MAI/Z-Image-Turbo</span></code></p></td>
+<td><p>Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
+encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1342,6 +1371,108 @@ Requests are therefore independent and the loop is resumable across ranks.</p>
 offload, and the VAE decode is always tiled (which bounds its workspace so the
 untiled conv3d cannot OOM a 32 GiB card).</p>
 </section>
+<section id="flux-2-klein-flux2-klein-flux2-klein-9b">
+<h2>FLUX.2 [klein] (<code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code> / <code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code>)<a class="headerlink" href="#flux-2-klein-flux2-klein-flux2-klein-9b" title="Link to this heading">#</a></h2>
+<p>Text-to-image and reference-image editing on the step-distilled <strong>FLUX.2 [klein]</strong>
+checkpoints. Four stateless nodes: a native Qwen3 encoder that runs only the 27 layers
+whose hidden states the DiT consumes (taps 9/18/27 concatenated), the rectified-flow
+transformer as the body of a <code class="docutils literal notranslate"><span class="pre">denoise_loop</span></code> (one Euler step per iteration, 4 by
+default, no classifier-free guidance), the FLUX.2 VAE encode of reference images and
+the VAE decode. All of them are exact ports; the CPU suite pins them bit-for-bit against
+the diffusers modules on tiny random configs and the GPU suite compares real-weight
+trajectories and PSNR against a recorded pipeline run
+(<code class="docutils literal notranslate"><span class="pre">test/flux2_klein/record_oracle.py</span></code>).</p>
+<p>Serve on one GPU and generate:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">mstar</span> <span class="n">serve</span> <span class="n">flux2_klein</span> <span class="o">--</span><span class="n">gpus</span> <span class="mi">0</span>
+<span class="n">python</span> <span class="o">-</span> <span class="o">&lt;&lt;</span><span class="s1">'PY'</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar</span><span class="w"> </span><span class="kn">import</span> <span class="n">MStarClient</span>
+<span class="n">client</span> <span class="o">=</span> <span class="n">MStarClient</span><span class="p">(</span><span class="s2">"http://localhost:8000"</span><span class="p">)</span>
+<span class="n">png</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">generate_image</span><span class="p">(</span><span class="s2">"a cat holding a sign that says hello world"</span><span class="p">,</span> <span class="n">width</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span> <span class="n">height</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span> <span class="n">seed</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+<span class="nb">open</span><span class="p">(</span><span class="s2">"cat.png"</span><span class="p">,</span> <span class="s2">"wb"</span><span class="p">)</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">png</span><span class="p">)</span>
+<span class="nb">open</span><span class="p">(</span><span class="s2">"edit.png"</span><span class="p">,</span> <span class="s2">"wb"</span><span class="p">)</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">client</span><span class="o">.</span><span class="n">edit_image</span><span class="p">(</span><span class="s2">"make it a watercolor painting"</span><span class="p">,</span> <span class="s2">"cat.png"</span><span class="p">,</span> <span class="n">seed</span><span class="o">=</span><span class="mi">1</span><span class="p">))</span>
+<span class="n">PY</span>
+</pre></div>
+</div>
+<p>The OpenAI routes are <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/generations</span></code> (<code class="docutils literal notranslate"><span class="pre">size</span></code> as <code class="docutils literal notranslate"><span class="pre">WxH</span></code>, <code class="docutils literal notranslate"><span class="pre">seed</span></code>,
+<code class="docutils literal notranslate"><span class="pre">n</span></code>; <code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code> through <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>) and <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/edits</span></code>
+(multipart <code class="docutils literal notranslate"><span class="pre">image</span></code> + <code class="docutils literal notranslate"><span class="pre">prompt</span></code>; up to four reference images are concatenated as
+conditioning tokens, in order).</p>
+<p>Deployment knobs live under <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> in <code class="docutils literal notranslate"><span class="pre">configs/flux2_klein.yaml</span></code>:</p>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">attention_backend</span></code></dt><dd><p><code class="docutils literal notranslate"><span class="pre">sdpa</span></code> (default) is the reference kernel, cuDNN on an H100 and measured as fast as
+FlashInfer in the served path. <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> runs the DiT’s joint attention on the
+engine’s ragged FlashInfer resource; both are CUDA-graph replayable.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">compile</span></code></dt><dd><p><code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> of the transformer, one trace per shape.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">compile_eager_rounding</span></code></dt><dd><p>Inductor rounds intermediates where eager PyTorch does, and fuses no FMAs.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">compile_exact_ops</span></code></dt><dd><p><code class="docutils literal notranslate"><span class="pre">true</span></code>, or a list of op classes among <code class="docutils literal notranslate"><span class="pre">norms</span></code> and <code class="docutils literal notranslate"><span class="pre">activations</span></code>: those modules
+stay on the eager kernels inside the compiled forward, so inductor only fuses the
+chains around the GEMMs and attention. Each excluded module is a graph break, so this
+is a latency-for-exactness trade:</p>
+<ul class="simple">
+<li><p>The norms alone make the transformer bit-exact with eager (measured on klein-4B and
+9B). The shipped <code class="docutils literal notranslate"><span class="pre">[norms]</span></code> costs klein-4B 4% of its B=1 latency (0.371 vs
+0.356 s); excluding the activations too adds cost and nothing else.</p></li>
+<li><p>Z-Image’s 180 norms per step cost 45% (1.25 vs 0.86 s at B=1), so it ships <code class="docutils literal notranslate"><span class="pre">false</span></code>
+and lands at a median 34 dB. <code class="docutils literal notranslate"><span class="pre">[norms]</span></code> turns it reference-faithful (at least
+55.9 dB on every prompt).</p></li>
+<li><p>Without it, the plain compile — even with eager rounding — lands at a median 35 to
+38 dB PSNR from eager over the 100 protocol prompts, because a 4- or 8-step
+distilled sampler amplifies the last bit of inductor’s own reductions and activation
+decompositions.</p></li>
+</ul>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cuda_graph</span></code>, <code class="docutils literal notranslate"><span class="pre">capture_sizes</span></code>, <code class="docutils literal notranslate"><span class="pre">capture_batch_sizes</span></code></dt><dd><p>The denoise step, Euler update included, is captured per listed <code class="docutils literal notranslate"><span class="pre">[height,</span> <span class="pre">width]</span></code>
+and batch size. Other shapes run the eager batched path.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">capture_edit_sizes</span></code></dt><dd><p>klein only: edit buckets with one reference image of the output size, the shape of an
+edit that keeps its reference’s size. Defaults to <code class="docutils literal notranslate"><span class="pre">capture_sizes</span></code>; <code class="docutils literal notranslate"><span class="pre">[]</span></code> captures
+none. The eight edit buckets of the 1024² default cost about 8 GiB of peak VRAM on
+klein-4B and 6 GiB on 9B, and every extra capture size adds roughly 7 minutes of
+startup.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">async_scheduling</span></code></dt><dd><p>The engine’s speculative scheduling of the image nodes: the worker assembles a batch’s
+next denoise step while the current one runs and merges requests that became ready
+meanwhile, so requests at different steps share a forward. On by default; a step a
+request speculates past its schedule is vetoed before any forward, and <code class="docutils literal notranslate"><span class="pre">false</span></code>
+restores lockstep. Measured on one H100 back to back against lockstep: klein-4B 0.365
+to 0.372 s vs 0.377 to 0.390 s at B=1 and about 3% more images per second at 4 and 16
+concurrent requests, klein-9B 2%, Z-Image neutral, served images unchanged — the
+denoise phase is compute-bound either way.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code></dt><dd><p>Rows batched per denoise step.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">vae_compile</span></code></dt><dd><p><code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> of the VAE decode with inductor autotuning: 89 to 29 ms at 1024² on
+an H100. Its fused reductions move the image by about 55 dB PSNR from the eager decode
+on every prompt, and the autotuner may pick different conv kernels in another server
+process, so set it to <code class="docutils literal notranslate"><span class="pre">false</span></code> for bit-exact, repeatable output — which is how the
+parity suite runs. The compiled decode is warmed at load for the <code class="docutils literal notranslate"><span class="pre">capture_sizes</span></code>
+grids and the decode batch sizes; any other latent shape decodes eagerly rather than
+paying a 40 to 100 s autotune inside a request. Memory cuts the other way: the eager
+decode of an 8-image batch at 1024² allocates about 40 GiB of activations, for served
+peaks of 75 GiB on klein-4B and 77 GiB on Z-Image at 16 concurrent requests against
+36 to 44 GiB compiled.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">max_image_area</span></code></dt><dd><p>Pixels, default 2048². Bounds the output size a request may ask for; larger requests
+are rejected with a 400 before scheduling instead of occupying the worker for minutes
+(an 8192² request means 262k tokens of quadratic attention).</p>
+</dd>
+</dl>
+<p>With the klein defaults every served image is within 53 dB of the eager path on all 100
+protocol prompts, and with <code class="docutils literal notranslate"><span class="pre">vae_compile:</span> <span class="pre">false</span></code> it is bit-exact. For scale, the served
+images of the other engines are 10 to 16 dB from the diffusers reference for the same
+seeds.
+Requests at the same output size batch across users in every node, including the
+text encoder, whose input is always 512 tokens. <code class="docutils literal notranslate"><span class="pre">lora</span></code> lists adapters to fold into the
+transformer weights at load time (<code class="docutils literal notranslate"><span class="pre">[{path:</span> <span class="pre">...,</span> <span class="pre">scale:</span> <span class="pre">...}]</span></code>; diffusers/PEFT-format or
+BFL-layout safetensors), so a styled deployment runs at the base model’s speed. The adapter’s
+own scaling follows PEFT: an <code class="docutils literal notranslate"><span class="pre">alpha</span></code> key in the weights, else the <code class="docutils literal notranslate"><span class="pre">lora_alpha</span></code> (and
+<code class="docutils literal notranslate"><span class="pre">use_rslora</span></code>) of an <code class="docutils literal notranslate"><span class="pre">adapter_config.json</span></code> / <code class="docutils literal notranslate"><span class="pre">config.json</span></code> next to them, else <code class="docutils literal notranslate"><span class="pre">alpha</span> <span class="pre">=</span> <span class="pre">r</span></code>;
+<code class="docutils literal notranslate"><span class="pre">scale</span></code> multiplies that (a public rank-64 rsLoRA adapter lands within 53 dB of diffusers’
+fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).</p>
+</section>
 </section>
 
 
@@ -1403,6 +1534,7 @@ untiled conv3d cannot OOM a 32 GiB card).</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-edge-reasoner-and-action-loop">Cosmos3-Edge reasoner and action loop</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-streaming-rollout-windowed-video">Cosmos3 streaming rollout (windowed video)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#wan2-2-wan22">Wan2.2 (<code class="docutils literal notranslate"><span class="pre">wan22</span></code>)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flux-2-klein-flux2-klein-flux2-klein-9b">FLUX.2 [klein] (<code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code> / <code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code>)</a></li>
 </ul>
   </nav></div>
 
@@ -1436,7 +1568,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 08, 2026.
+  Last updated on Oct 09, 2026.
   <br/>
 </p>
   </div>

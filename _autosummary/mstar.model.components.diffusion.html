@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 08, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 09, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -294,6 +294,12 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.flux2_klein.config.html">mstar.model.flux2_klein.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.flux2_klein.submodules.html">mstar.model.flux2_klein.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
@@ -356,6 +362,12 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.z_image.html">mstar.model.z_image</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.z_image.components.html">mstar.model.z_image.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.z_image.config.html">mstar.model.z_image.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.z_image.submodules.html">mstar.model.z_image.submodules</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -369,6 +381,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.h2d.html">mstar.utils.h2d</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
@@ -619,7 +632,11 @@ component ports, a weight loader and a thin graph file:</p>
 </dd>
 </dl>
 </li>
-<li><p><code class="docutils literal notranslate"><span class="pre">text_encoder</span></code> a native Qwen3-family encoder returning tapped hidden states</p></li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">qwen3</span></code>        the native Qwen3-family prompt encoder the DiTs condition on, and the</dt><dd><p>checkpoint rules that fill it (model-specific, hence its own package)</p>
+</dd>
+</dl>
+</li>
 <li><dl class="simple">
 <dt><code class="docutils literal notranslate"><span class="pre">denoise_loop</span></code> the Loop-body submodule: seeded noise, equal-shape request batching, per-step</dt><dd><p>CUDA graphs, stop at the request’s step count</p>
 </dd>
@@ -627,6 +644,12 @@ component ports, a weight loader and a thin graph file:</p>
 </li>
 <li><p><code class="docutils literal notranslate"><span class="pre">image_io</span></code>     pixel/latent packing helpers and PNG encoding</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">lora</span></code>         static LoRA merging at load time</p></li>
+<li><dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">compile_utils</span></code>/<code class="docutils literal notranslate"><span class="pre">decode_utils</span></code>  the transformer/VAE <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> wrappers, the exact-op</dt><dd><p>exclusions, and the batch splitting that keeps a compiled decode on warm shapes</p>
+</dd>
+</dl>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">weight_loading</span></code>  model-agnostic component streaming under the completeness contract</p></li>
 </ul>
 <p class="rubric">Modules</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
@@ -636,6 +659,12 @@ component ports, a weight loader and a thin graph file:</p>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.diffusion.autoencoder_kl.html#module-mstar.model.components.diffusion.autoencoder_kl" title="mstar.model.components.diffusion.autoencoder_kl"><code class="xref py py-obj docutils literal notranslate"><span class="pre">autoencoder_kl</span></code></a></p></td>
 <td><p>Native KL autoencoder (the SD / FLUX family VAE) for the image DiTs.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.diffusion.compile_utils.html#module-mstar.model.components.diffusion.compile_utils" title="mstar.model.components.diffusion.compile_utils"><code class="xref py py-obj docutils literal notranslate"><span class="pre">compile_utils</span></code></a></p></td>
+<td><p>Compiling a flow transformer: which modules stay eager, and the inductor rounding the compiled region is traced under.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.diffusion.decode_utils.html#module-mstar.model.components.diffusion.decode_utils" title="mstar.model.components.diffusion.decode_utils"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_utils</span></code></a></p></td>
+<td><p>VAE decode for the DiT scaffold: the compiled decode and the batch splitting that keeps it on shapes it was warmed with.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.diffusion.denoise_loop.html#module-mstar.model.components.diffusion.denoise_loop" title="mstar.model.components.diffusion.denoise_loop"><code class="xref py py-obj docutils literal notranslate"><span class="pre">denoise_loop</span></code></a></p></td>
 <td><p>The DiT scaffold's Loop body: one flow-matching denoise step per iteration.</p></td>
@@ -649,11 +678,14 @@ component ports, a weight loader and a thin graph file:</p>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.diffusion.lora.html#module-mstar.model.components.diffusion.lora" title="mstar.model.components.diffusion.lora"><code class="xref py py-obj docutils literal notranslate"><span class="pre">lora</span></code></a></p></td>
 <td><p>Static LoRA merging for the DiT scaffold.</p></td>
 </tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.diffusion.noise.html#module-mstar.model.components.diffusion.noise" title="mstar.model.components.diffusion.noise"><code class="xref py py-obj docutils literal notranslate"><span class="pre">noise</span></code></a></p></td>
+<td><p>Staging a request's seeded noise to the device without stalling the caller.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.diffusion.qwen3.html#module-mstar.model.components.diffusion.qwen3" title="mstar.model.components.diffusion.qwen3"><code class="xref py py-obj docutils literal notranslate"><span class="pre">qwen3</span></code></a></p></td>
+<td><p>The Qwen3 prompt encoder the scaffold's DiTs condition on.</p></td>
+</tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.diffusion.rope.html#module-mstar.model.components.diffusion.rope" title="mstar.model.components.diffusion.rope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rope</span></code></a></p></td>
 <td><p>Multi-axis rotary position embeddings for FLUX-family DiTs.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.diffusion.text_encoder.html#module-mstar.model.components.diffusion.text_encoder" title="mstar.model.components.diffusion.text_encoder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">text_encoder</span></code></a></p></td>
-<td><p>Native Qwen3-family prompt encoder that returns tapped hidden states.</p></td>
 </tr>
 </tbody>
 </table>
@@ -724,7 +756,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 08, 2026.
+  Last updated on Oct 09, 2026.
   <br/>
 </p>
   </div>

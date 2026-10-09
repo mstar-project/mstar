@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 08, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 09, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -298,6 +298,12 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.config.html">mstar.model.flux2_klein.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.submodules.html">mstar.model.flux2_klein.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
@@ -360,6 +366,12 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.z_image.html">mstar.model.z_image</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.z_image.components.html">mstar.model.z_image.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.z_image.config.html">mstar.model.z_image.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.z_image.submodules.html">mstar.model.z_image.submodules</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -373,6 +385,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
@@ -782,7 +795,7 @@ when <code class="docutils literal notranslate"><span class="pre">stream=False</
 <td><p>Text generation (and, with <code class="docutils literal notranslate"><span class="pre">output_modalities=(&quot;text&quot;,</span> <span class="pre">&quot;audio&quot;)</span></code>, speech).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">generate_image(prompt,</span> <span class="pre">**kw)</span></code></p></td>
-<td><p>PNG <code class="docutils literal notranslate"><span class="pre">bytes</span></code> (e.g. BAGEL text-to-image).</p></td>
+<td><p>PNG <code class="docutils literal notranslate"><span class="pre">bytes</span></code> (e.g. BAGEL, FLUX.2 klein text-to-image).</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">edit_image(prompt,</span> <span class="pre">image,</span> <span class="pre">**kw)</span></code></p></td>
 <td><p>PNG <code class="docutils literal notranslate"><span class="pre">bytes</span></code> for an edit of <code class="docutils literal notranslate"><span class="pre">image</span></code> (a path, bytes, or a list of them for
@@ -918,6 +931,10 @@ Waypoint emits live RGB frame chunks and is not routed through the encoded-video
 <ul class="simple">
 <li><p><strong>BAGEL</strong> — chat returns text only; use <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code> and
 <code class="docutils literal notranslate"><span class="pre">/v1/images/edits</span></code> for image output.</p></li>
+<li><p><strong>FLUX.2 klein / Z-Image</strong> — <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code> (and <code class="docutils literal notranslate"><span class="pre">/v1/images/edits</span></code> for
+klein) only: <code class="docutils literal notranslate"><span class="pre">size</span></code> as <code class="docutils literal notranslate"><span class="pre">WxH</span></code> (multiples of 16); <code class="docutils literal notranslate"><span class="pre">seed</span></code>; <code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code>,
+<code class="docutils literal notranslate"><span class="pre">output_format</span></code> (<code class="docutils literal notranslate"><span class="pre">png</span></code> default, <code class="docutils literal notranslate"><span class="pre">jpeg</span></code>, <code class="docutils literal notranslate"><span class="pre">webp</span></code>), <code class="docutils literal notranslate"><span class="pre">output_compression</span></code> (JPEG /
+WebP quality) and <code class="docutils literal notranslate"><span class="pre">png_compress_level</span></code> (0-9, default 1) via <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.</p></li>
 <li><p><strong>Qwen3-Omni</strong> — text sampling uses <code class="docutils literal notranslate"><span class="pre">thinker_*</span></code> keys, speech uses <code class="docutils literal notranslate"><span class="pre">talker_*</span></code>, and the
 residual codec groups use <code class="docutils literal notranslate"><span class="pre">code_predictor_*</span></code>; set the speaker with <code class="docutils literal notranslate"><span class="pre">voice</span></code> (default
 <code class="docutils literal notranslate"><span class="pre">Ethan</span></code>) and request audio output by including <code class="docutils literal notranslate"><span class="pre">&quot;audio&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">modalities</span></code>.
@@ -1043,7 +1060,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 08, 2026.
+  Last updated on Oct 09, 2026.
   <br/>
 </p>
   </div>

@@ -1,7 +1,7 @@
-mstar.model.components.diffusion.text\_encoder
+mstar.model.components.diffusion.qwen3.encoder
 ==============================================
 
-.. automodule:: mstar.model.components.diffusion.text_encoder
+.. automodule:: mstar.model.components.diffusion.qwen3.encoder
 
    
    
@@ -27,6 +27,7 @@ mstar.model.components.diffusion.text\_encoder
    .. autosummary::
    
       Qwen3EncoderAttention
+      Qwen3EncoderConfig
       Qwen3HiddenStateEncoder
       Qwen3RMSNorm
    

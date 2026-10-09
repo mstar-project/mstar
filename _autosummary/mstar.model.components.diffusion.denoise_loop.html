@@ -51,11 +51,11 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="mstar.model.components.diffusion.flow_match" href="mstar.model.components.diffusion.flow_match.html" />
-    <link rel="prev" title="mstar.model.components.diffusion.autoencoder_kl" href="mstar.model.components.diffusion.autoencoder_kl.html" />
+    <link rel="prev" title="mstar.model.components.diffusion.decode_utils" href="mstar.model.components.diffusion.decode_utils.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 08, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 09, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -298,6 +298,12 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.flux2_klein.config.html">mstar.model.flux2_klein.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.flux2_klein.submodules.html">mstar.model.flux2_klein.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
@@ -360,6 +366,12 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.z_image.html">mstar.model.z_image</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.z_image.components.html">mstar.model.z_image.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.z_image.config.html">mstar.model.z_image.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.z_image.submodules.html">mstar.model.z_image.submodules</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -373,6 +385,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.h2d.html">mstar.utils.h2d</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
@@ -629,6 +642,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.layout"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.layout()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.loop_back_names"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.loop_back_names</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.max_batch_size"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.max_batch_size()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.noise_stager"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.noise_stager()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.num_tokens"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.num_tokens()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.preprocess()</span></code></a></li>
@@ -637,6 +651,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.schedule_for"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.schedule_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.seed_latents"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.seed_latents()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.seed_loop_back"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.seed_loop_back()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.seed_to_device"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.seed_to_device()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.stage_seed"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.stage_seed()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.step_index"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.step_index()</span></code></a></li>
 </ul>
 </li>
@@ -849,7 +865,7 @@ middle of a forward.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.cg_key_info">
-<span class="sig-name descname"><span class="pre">cg_key_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_request_info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/denoise_loop.html#DenoiseLoopSubmodule.cg_key_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.cg_key_info" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">cg_key_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_request_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_request_input_metadata</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/denoise_loop.html#DenoiseLoopSubmodule.cg_key_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.cg_key_info" title="Link to this definition">#</a></dt>
 <dd><p>Which of this walk’s capture buckets a batch belongs to.</p>
 <p>A walk can be captured more than once when the batch’s <em>shape</em> is not
 the whole story — bagel captures decode twice, guidance on and off,
@@ -890,7 +906,7 @@ will run for that rid and its output discarded — the standard
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>request_info</strong> (<a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>)</p></li>
 </ul>
 </dd>
@@ -1048,6 +1064,22 @@ returns True.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.noise_stager">
+<span class="sig-name descname"><span class="pre">noise_stager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/denoise_loop.html#DenoiseLoopSubmodule.noise_stager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.noise_stager" title="Link to this definition">#</a></dt>
+<dd><p>This node’s pinned staging ring for <code class="docutils literal notranslate"><span class="pre">dtype</span></code>, built on first use.</p>
+<p>A benign race between the plan and GPU threads can build two and keep one;
+a stager holds no buffers until it stages something, so that costs nothing.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.model.components.diffusion.noise.html#mstar.model.components.diffusion.noise.NoiseStager" title="mstar.model.components.diffusion.noise.NoiseStager"><em>NoiseStager</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.num_tokens">
 <span class="sig-name descname"><span class="pre">num_tokens</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">bucket_key</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/denoise_loop.html#DenoiseLoopSubmodule.num_tokens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.num_tokens" title="Link to this definition">#</a></dt>
 <dd><p>Tokens one request contributes to the step (sizes the attention segment / buckets).</p>
@@ -1186,6 +1218,46 @@ per step would recompile it every step until dynamo gave up.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.seed_to_device">
+<span class="sig-name descname"><span class="pre">seed_to_device</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/denoise_loop.html#DenoiseLoopSubmodule.seed_to_device"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.seed_to_device" title="Link to this definition">#</a></dt>
+<dd><p>Whether <a class="reference internal" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.seed_loop_back" title="mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.seed_loop_back"><code class="xref py py-meth docutils literal notranslate"><span class="pre">seed_loop_back()</span></code></a> returns tensors already on the device.</p>
+<p>False by default: the base stages the CPU draw itself, which costs one host
+memcpy and asks nothing of the model. A model whose seeding is layout-only
+after the draw – a reshape, a permute – can override this to draw straight
+into the stager’s pinned buffer (<a class="reference internal" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.noise_stager" title="mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.noise_stager"><code class="xref py py-meth docutils literal notranslate"><span class="pre">noise_stager()</span></code></a>) and skip that memcpy.
+A model doing real host work on the noise must not.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.stage_seed">
+<span class="sig-name descname"><span class="pre">stage_seed</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/denoise_loop.html#DenoiseLoopSubmodule.stage_seed"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.stage_seed" title="Link to this definition">#</a></dt>
+<dd><p>Seed tensor on <code class="docutils literal notranslate"><span class="pre">device</span></code>, copied from pinned memory without stalling.</p>
+<p><code class="docutils literal notranslate"><span class="pre">tensor.to(device)</span></code> would copy from pageable host memory, which blocks the
+calling thread until it retires – and this runs on the GPU thread, where
+that stalls the pre-plan and the overlap with the previous step’s
+postprocess. See <a class="reference internal" href="mstar.model.components.diffusion.noise.html#module-mstar.model.components.diffusion.noise" title="mstar.model.components.diffusion.noise"><code class="xref py py-mod docutils literal notranslate"><span class="pre">mstar.model.components.diffusion.noise</span></code></a>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>tensor</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.step_index">
 <span class="sig-name descname"><span class="pre">step_index</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">fwd_info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/diffusion/denoise_loop.html#DenoiseLoopSubmodule.step_index"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.step_index" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -1257,12 +1329,12 @@ shares one forward (see the module docstring).</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.model.components.diffusion.autoencoder_kl.html"
+       href="mstar.model.components.diffusion.decode_utils.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.model.components.diffusion.autoencoder_kl</p>
+        <p class="prev-next-title">mstar.model.components.diffusion.decode_utils</p>
       </div>
     </a>
     <a class="right-next"
@@ -1314,6 +1386,7 @@ shares one forward (see the module docstring).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.layout"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.layout()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.loop_back_names"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.loop_back_names</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.max_batch_size"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.max_batch_size()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.noise_stager"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.noise_stager()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.num_tokens"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.num_tokens()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.preprocess()</span></code></a></li>
@@ -1322,6 +1395,8 @@ shares one forward (see the module docstring).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.schedule_for"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.schedule_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.seed_latents"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.seed_latents()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.seed_loop_back"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.seed_loop_back()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.seed_to_device"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.seed_to_device()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.stage_seed"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.stage_seed()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.step_index"><code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule.step_index()</span></code></a></li>
 </ul>
 </li>
@@ -1365,7 +1440,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 08, 2026.
+  Last updated on Oct 09, 2026.
   <br/>
 </p>
   </div>

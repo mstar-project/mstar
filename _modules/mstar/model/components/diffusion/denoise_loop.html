@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 08, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 09, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -651,6 +651,12 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.flux2_klein.config.html">mstar.model.flux2_klein.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.flux2_klein.submodules.html">mstar.model.flux2_klein.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
@@ -713,6 +719,12 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.z_image.html">mstar.model.z_image</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.z_image.components.html">mstar.model.z_image.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.z_image.config.html">mstar.model.z_image.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.z_image.submodules.html">mstar.model.z_image.submodules</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -726,6 +738,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
@@ -955,6 +968,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">Segment</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.convenience</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedAttentionCallable</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.diffusion.flow_match</span><span class="w"> </span><span class="kn">import</span> <span class="n">FlowMatchSchedule</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.diffusion.noise</span><span class="w"> </span><span class="kn">import</span> <span class="n">NoiseStager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span><span class="p">,</span> <span class="n">NodeSubmodule</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
@@ -1033,6 +1047,9 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># Per-key derived tensors (rotary tables, ...) built on first use and never</span>
         <span class="c1"># evicted: a captured graph reads them at fixed addresses.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_layouts</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Hashable</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># Pinned staging rings for the seeded noise, one per dtype, built on first</span>
+        <span class="c1"># use (a stager allocates nothing until it stages something).</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_noise_stagers</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">NoiseStager</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="c1"># One callable per attention label for the life of a binding; see</span>
         <span class="c1"># :meth:`ragged_for`.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_ragged_fns</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">RaggedAttentionCallable</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1063,6 +1080,50 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Initial noise for one request, ``[L, C]`` on the CPU generator's device."""</span>
         <span class="k">raise</span> <span class="ne">NotImplementedError</span></div>
+
+
+<div class="viewcode-block" id="DenoiseLoopSubmodule.seed_to_device">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.diffusion.denoise_loop.html#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.seed_to_device">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">seed_to_device</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether :meth:`seed_loop_back` returns tensors already on the device.</span>
+
+<span class="sd">        False by default: the base stages the CPU draw itself, which costs one host</span>
+<span class="sd">        memcpy and asks nothing of the model. A model whose seeding is layout-only</span>
+<span class="sd">        after the draw -- a reshape, a permute -- can override this to draw straight</span>
+<span class="sd">        into the stager's pinned buffer (:meth:`noise_stager`) and skip that memcpy.</span>
+<span class="sd">        A model doing real host work on the noise must not.</span>
+<span class="sd">        """</span>
+        <span class="k">del</span> <span class="n">graph_walk</span>
+        <span class="k">return</span> <span class="kc">False</span></div>
+
+
+<div class="viewcode-block" id="DenoiseLoopSubmodule.noise_stager">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.diffusion.denoise_loop.html#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.noise_stager">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">noise_stager</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NoiseStager</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""This node's pinned staging ring for ``dtype``, built on first use.</span>
+
+<span class="sd">        A benign race between the plan and GPU threads can build two and keep one;</span>
+<span class="sd">        a stager holds no buffers until it stages something, so that costs nothing.</span>
+<span class="sd">        """</span>
+        <span class="n">stager</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_noise_stagers</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">stager</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">stager</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_noise_stagers</span><span class="p">[</span><span class="n">dtype</span><span class="p">]</span> <span class="o">=</span> <span class="n">NoiseStager</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">stager</span></div>
+
+
+<div class="viewcode-block" id="DenoiseLoopSubmodule.stage_seed">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.diffusion.denoise_loop.html#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.stage_seed">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">stage_seed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tensor</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Seed tensor on ``device``, copied from pinned memory without stalling.</span>
+
+<span class="sd">        ``tensor.to(device)`` would copy from pageable host memory, which blocks the</span>
+<span class="sd">        calling thread until it retires -- and this runs on the GPU thread, where</span>
+<span class="sd">        that stalls the pre-plan and the overlap with the previous step's</span>
+<span class="sd">        postprocess. See :mod:`mstar.model.components.diffusion.noise`.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="n">tensor</span><span class="o">.</span><span class="n">device</span> <span class="o">==</span> <span class="n">device</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">tensor</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">noise_stager</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">to_device</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="DenoiseLoopSubmodule.seed_loop_back">
@@ -1186,7 +1247,9 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span> <span class="n">inputs</span><span class="p">:</span> <span class="n">NameToTensorList</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeInputs</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">fwd_info</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
+        <span class="c1"># Keyed by the integer rid_handle, NOT by request_id. The handle is what</span>
+        <span class="c1"># the engine keys batches by and what it hands check_stop</span>
+        <span class="n">state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">fwd_info</span><span class="o">.</span><span class="n">rid_handle</span><span class="p">)</span>
         <span class="n">k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">step_index</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">)</span>
         <span class="n">device</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_device</span><span class="p">()</span>
         <span class="k">if</span> <span class="s2">"schedule"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">state</span><span class="p">:</span>
@@ -1200,8 +1263,10 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">k</span> <span class="o">&gt;=</span> <span class="n">num_steps</span><span class="p">:</span>
             <span class="c1"># Async scheduling dispatched an iteration past this request's stop; None</span>
             <span class="c1"># makes the engine skip the forward (the cosmos3 / wan22 veto).</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"</span><span class="si">%s</span><span class="s2">: skipping overshoot iteration </span><span class="si">%d</span><span class="s2"> (request </span><span class="si">%s</span><span class="s2"> runs </span><span class="si">%d</span><span class="s2"> steps)"</span><span class="p">,</span>
-                        <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">fwd_info</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">num_steps</span><span class="p">)</span>
+            <span class="c1"># debug, not info: one line per vetoed step per request (1.9k lines in a</span>
+            <span class="c1"># 36-minute served run), and it is the expected outcome of speculation.</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"</span><span class="si">%s</span><span class="s2">: skipping overshoot iteration </span><span class="si">%d</span><span class="s2"> (request </span><span class="si">%s</span><span class="s2"> runs </span><span class="si">%d</span><span class="s2"> steps)"</span><span class="p">,</span>
+                         <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">fwd_info</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">num_steps</span><span class="p">)</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="n">tensors</span> <span class="o">=</span> <span class="p">{</span>
             <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_carried_inputs</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">bucket_key</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">device</span><span class="p">),</span>
@@ -1258,10 +1323,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Past iteration 0 a missing edge is a routing bug: raise rather than reseed."""</span>
         <span class="k">if</span> <span class="n">k</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">generator</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">)</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="n">fwd_info</span><span class="o">.</span><span class="n">random_seed</span><span class="p">)</span>
-            <span class="k">return</span> <span class="p">{</span>
-                <span class="n">name</span><span class="p">:</span> <span class="n">tensor</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-                <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">tensor</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">seed_loop_back</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">bucket_key</span><span class="p">,</span> <span class="n">generator</span><span class="p">)</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
-            <span class="p">}</span>
+            <span class="n">seeds</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">seed_loop_back</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">bucket_key</span><span class="p">,</span> <span class="n">generator</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">seed_to_device</span><span class="p">(</span><span class="n">fwd_info</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">):</span>
+                <span class="c1"># The model drew straight onto the device through a stager; staging</span>
+                <span class="c1"># again would copy a device tensor out to the host and back.</span>
+                <span class="k">return</span> <span class="nb">dict</span><span class="p">(</span><span class="n">seeds</span><span class="p">)</span>
+            <span class="k">return</span> <span class="p">{</span><span class="n">name</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">stage_seed</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">tensor</span> <span class="ow">in</span> <span class="n">seeds</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
         <span class="n">missing</span> <span class="o">=</span> <span class="p">[</span><span class="n">name</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop_back_names</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)]</span>
         <span class="k">if</span> <span class="n">missing</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
@@ -1326,14 +1393,26 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="DenoiseLoopSubmodule.check_stop">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.diffusion.denoise_loop.html#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.check_stop">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">check_stop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">request_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span> <span class="n">outputs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_stop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">request_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span> <span class="n">outputs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="c1"># ``request_id`` is the engine's integer rid handle, the same key</span>
+        <span class="c1"># prepare_inputs stored under.</span>
         <span class="n">state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">state</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="s2">"num_steps"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">state</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">"</span><span class="si">%s</span><span class="s2">: check_stop found no schedule for request </span><span class="si">%r</span><span class="s2"> (state=</span><span class="si">%s</span><span class="s2">); the loop "</span>
+                <span class="s2">"will not be stopped by this pass"</span><span class="p">,</span>
+                <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="s2">"absent"</span> <span class="k">if</span> <span class="n">state</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="s2">"no num_steps"</span><span class="p">,</span>
+            <span class="p">)</span>
             <span class="k">return</span> <span class="nb">set</span><span class="p">()</span>
         <span class="c1"># iteration k is being postprocessed while the counter reads k, so N steps stop at k == N - 1</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">step_index</span><span class="p">(</span><span class="n">request_info</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">&gt;=</span> <span class="nb">int</span><span class="p">(</span><span class="n">state</span><span class="p">[</span><span class="s2">"num_steps"</span><span class="p">]):</span>
-            <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">loop_name</span><span class="p">}</span>
-        <span class="k">return</span> <span class="nb">set</span><span class="p">()</span></div>
+        <span class="n">k</span><span class="p">,</span> <span class="n">num_steps</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">step_index</span><span class="p">(</span><span class="n">request_info</span><span class="p">),</span> <span class="nb">int</span><span class="p">(</span><span class="n">state</span><span class="p">[</span><span class="s2">"num_steps"</span><span class="p">])</span>
+        <span class="n">stop</span> <span class="o">=</span> <span class="n">k</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">&gt;=</span> <span class="n">num_steps</span>
+        <span class="c1"># debug, not info: one line per request per step on the GPU thread -- 19.8k of</span>
+        <span class="c1"># the 49.7k lines in a 36-minute served run. Invaluable when debugging the loop</span>
+        <span class="c1"># counter, far too loud for a served default.</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"</span><span class="si">%s</span><span class="s2">: check_stop request </span><span class="si">%s</span><span class="s2"> k=</span><span class="si">%d</span><span class="s2">/</span><span class="si">%d</span><span class="s2"> -&gt; </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span>
+                     <span class="n">request_id</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">num_steps</span><span class="p">,</span> <span class="s2">"STOP"</span> <span class="k">if</span> <span class="n">stop</span> <span class="k">else</span> <span class="s2">"continue"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">loop_name</span><span class="p">}</span> <span class="k">if</span> <span class="n">stop</span> <span class="k">else</span> <span class="nb">set</span><span class="p">()</span></div>
 
 
     <span class="c1"># ------------------------------------------------------------ resources</span>
@@ -1343,7 +1422,13 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="DenoiseLoopSubmodule.cg_key_info">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.diffusion.denoise_loop.html#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.cg_key_info">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">cg_key_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">per_request_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">]):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">cg_key_info</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">per_request_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
+        <span class="n">per_request_input_metadata</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="k">del</span> <span class="n">per_request_input_metadata</span><span class="p">,</span> <span class="n">kwargs</span>
         <span class="c1"># Padding rows (a captured bucket's dummy requests) carry no step metadata; the</span>
         <span class="c1"># real rows decide the bucket.</span>
         <span class="n">keys</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">bucket_key_for</span><span class="p">(</span><span class="n">info</span><span class="p">)</span> <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">per_request_info</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">step_metadata</span><span class="p">]</span>
@@ -1458,7 +1543,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 08, 2026.
+  Last updated on Oct 09, 2026.
   <br/>
 </p>
   </div>
