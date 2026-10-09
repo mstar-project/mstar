@@ -443,12 +443,9 @@ class Qwen3_5DenseModel(Model):
         return result
 
 
-    # inline tokens arrive as ids; the tokenizer decodes a list as it does a tensor
-    inline_postprocess_takes_ids = True
-
     def postprocess(
             self,
-            output: "torch.Tensor | list[int]",
+            output: torch.Tensor,
             modality: str,
             request_kwargs: dict | None = None,
         ) -> bytes:
