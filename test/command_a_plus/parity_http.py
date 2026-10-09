@@ -81,7 +81,7 @@ def main():
             print(f"{kind}: {same}/{len(PROMPTS)} outputs identical to {args.compare}", flush=True)
             for a, b in zip(result[kind], reference[kind], strict=True):
                 if a["text"] != b["text"]:
-                    prefix = next((i for i, (x, y) in enumerate(zip(a["text"], b["text"])) if x != y),
+                    prefix = next((i for i, (x, y) in enumerate(zip(a["text"], b["text"], strict=False)) if x != y),
                                   min(len(a["text"]), len(b["text"])))
                     print(f"  differs at char {prefix}: {a['prompt']!r}\n    new: {a['text'][prefix:prefix + 60]!r}"
                           f"\n    ref: {b['text'][prefix:prefix + 60]!r}", flush=True)

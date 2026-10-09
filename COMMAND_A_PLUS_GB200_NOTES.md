@@ -68,6 +68,8 @@ Every build from the fused one onward was checked three ways before it shipped.
    | v2, v3 | 0.0510 / 0.1745 | 0.99807 | 96/96 | 3/3 |
    | v4, v5 | 0.0517 / 0.1451 | 0.99807 | 96/96 | 3/3 |
 
+   The unfused row was measured when that path also reduced once per layer; it
+   now reduces each branch separately, as it did originally.
    The fused builds are slightly closer to HF than the unfused path, most likely
    because the routed sum and the all-reduce now accumulate in fp32 and round to
    bf16 once. v3 is numerically identical to v2
@@ -108,13 +110,14 @@ a per-run RNG offset. The graph path now keeps `temperature = 0` and always pass
 `include_greedy=True`, decided per row on device, so ties resolve to the lowest
 vocab index in both paths. This affected every model using the graph sampler.
 
-### 4. One all-reduce per layer instead of three (`language_model.py` and the TP components)
+### 4. One all-reduce per layer instead of three (`language_model.py`)
 
 Command A+'s decoder layer is a parallel block, so attention, routed-expert and
 shared-MLP partials are summed on-rank and reduced once:
-`x + AR(attn + (routed + shared) / 2)`. Done with a `reduce_results` flag (default
-`True`) on `ParallelAttention`, `ParallelGatedMLP` and `ParallelSparseMoeBlock`.
-Cut all-reduces from 97 to 33 per step.
+`x + AR(attn + (routed + shared) / 2)`. Cuts all-reduces from 97 to 33 per step.
+This is done in the fused path (`CommandAPlusDecoderLayer.fused_branches`), which
+computes the branches with its own GEMMs; the unfused reference path keeps the
+shared TP modules unchanged, each reducing its own output.
 
 ### 5. CUDA toolchain (pod-only, not a repo change)
 
@@ -367,9 +370,6 @@ mstar/worker/worker.py                                   change 1
 mstar/model/command_a_plus/submodules.py                 changes 2, 9
 mstar/engine/resources/sampler/utils.py                  changes 3, 12
 mstar/model/command_a_plus/components/language_model.py  changes 4, 6, 8, 9, 11, 14, 15
-mstar/model/components/distributed/attention.py          change 4 (reduce_results flag)
-mstar/model/components/distributed/mlp.py                change 4 (reduce_results flag)
-mstar/model/components/moe.py                            change 4 (reduce_results flag)
 mstar/model/command_a_plus/kernels.py                    new: changes 6, 11, 14, 15
 mstar/model/command_a_plus/command_a_plus_model.py       changes 6, 16
 mstar/engine/resources/kv/cache.py                       change 10

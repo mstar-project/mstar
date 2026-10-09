@@ -87,6 +87,8 @@ def _kv_scatter_nhd_eager(
         cache.is_cuda and tokens > 0
         and k.stride(2) == 1 and v.stride(2) == 1
         and layer.stride(3) == head_dim and layer.stride(4) == 1
+        and page_idx.is_contiguous() and cache_idx.is_contiguous()
+        and all(t.device == cache.device for t in (k, v, page_idx, cache_idx))
     ):
         # One launch for K and V instead of two index_put kernels.
         _kv_scatter_nhd_kernel[(tokens,)](

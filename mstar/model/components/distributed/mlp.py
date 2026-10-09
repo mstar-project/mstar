@@ -52,7 +52,6 @@ class ParallelGatedMLP(nn.Module):
         comm_group: CommGroup | None = None,
         activation: str | Callable = "silu",
         bias: bool = False,
-        reduce_results: bool = True,
     ):
         super().__init__()
         if comm_group is None:
@@ -68,15 +67,13 @@ class ParallelGatedMLP(nn.Module):
             bias=bias,
             gather_output=False,
         )
-        # ``reduce_results=False`` returns this rank's partial instead; see
-        # ``ParallelAttention`` for when that is the right thing to ask for.
         self.down_proj = RowParallelLinear(
             comm_group=comm_group,
             input_size=intermediate_size,
             output_size=hidden_size,
             bias=bias,
             input_is_parallel=True,
-            reduce_results=reduce_results,
+            reduce_results=True,
         )
 
         self.intermediate_size_per_partition = (

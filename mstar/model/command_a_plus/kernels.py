@@ -296,7 +296,7 @@ def _moe_combine_kernel(
     tl.store(out_ptr + row * stride_o + offs, (base + scale * acc).to(out_ptr.dtype.element_ty), mask=mask)
 
 
-def moe_combine(base: torch.Tensor, cache3: torch.Tensor, scale: float, out: torch.Tensor | None = None) -> torch.Tensor:
+def moe_combine(base: torch.Tensor, cache3: torch.Tensor, scale: float) -> torch.Tensor:
     """``out = base + scale * cache3.sum(1)``, accumulated in fp32 and rounded once.
 
     ``base`` is ``[tokens, hidden]``, or ``[splits, tokens, hidden]`` split-K
@@ -305,8 +305,7 @@ def moe_combine(base: torch.Tensor, cache3: torch.Tensor, scale: float, out: tor
     tokens, topk, hidden = cache3.shape
     base3 = base if base.dim() == 3 else base.unsqueeze(0)
     assert base3.shape[1:] == (tokens, hidden) and cache3.stride(2) == 1 and base3.stride(2) == 1
-    if out is None:
-        out = torch.empty((tokens, hidden), dtype=cache3.dtype, device=cache3.device)
+    out = torch.empty((tokens, hidden), dtype=cache3.dtype, device=cache3.device)
     block = 1024
     if tokens:
         _moe_combine_kernel[(tokens, triton.cdiv(hidden, block))](

@@ -79,8 +79,9 @@ def tune(experts: int, inter: int, hidden: int, top_k: int, rotations: int = 16)
             for gemm, (a, b, c, k) in {
                 "up": (x, w1, cache1, top_k), "down": (cache2, w2, cache3, 1),
             }.items():
-                def launch(a=a, b=b, c=c, k=k, cfg=cfg, gemm=gemm):
-                    for ids, (sorted_ids, expert_ids, padded) in zip(routings, aligned[bm]):
+                def launch(a=a, b=b, c=c, k=k, cfg=cfg, gemm=gemm, weights=weights,
+                           batches=list(zip(routings, aligned[bm], strict=True))):
+                    for ids, (sorted_ids, expert_ids, padded) in batches:
                         invoke_fused_moe_kernel(
                             A=a, B=b, C=c, topk_weights=weights, topk_ids=ids,
                             sorted_token_ids=sorted_ids, expert_ids=expert_ids,

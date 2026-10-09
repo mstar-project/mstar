@@ -66,11 +66,9 @@ class CommandAPlusRouter(nn.Module):
 class CommandAPlusMoeBlock(ParallelSparseMoeBlock):
     """Average sigmoid-routed experts with an always-active shared SwiGLU MLP.
 
-    Both branches use the same tensor-parallel group. Neither reduces on its
-    own: the average is a per-rank partial that ``CommandAPlusDecoderLayer``
-    all-reduces once, together with attention's. Inheriting the routed branch
-    preserves the ``gate`` and ``experts`` parameter paths used by checkpoint
-    loading.
+    Both branches use the same tensor-parallel group and independently reduce
+    their outputs before averaging. Inheriting the routed branch preserves the
+    ``gate`` and ``experts`` parameter paths used by checkpoint loading.
     """
 
     def __init__(
@@ -87,7 +85,6 @@ class CommandAPlusMoeBlock(ParallelSparseMoeBlock):
                 config.hidden_size, config.num_experts, config.num_experts_per_tok,
             ),
             comm_group=comm_group,
-            reduce_results=False,
         )
         self.shared_experts = ParallelGatedMLP(
             hidden_size=config.hidden_size,
@@ -95,7 +92,6 @@ class CommandAPlusMoeBlock(ParallelSparseMoeBlock):
             comm_group=self.comm_group,
             activation="silu",
             bias=False,
-            reduce_results=False,
         )
 
     def forward(
@@ -105,7 +101,6 @@ class CommandAPlusMoeBlock(ParallelSparseMoeBlock):
         *,
         return_router_states: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, None]:
-        """This rank's partial of ``(routed + shared) / 2``, NOT reduced."""
         routed, next_state = super().forward(
             hidden_states, router_states, return_router_states=True,
         )
@@ -127,8 +122,6 @@ class CommandAPlusAttention(ParallelAttention):
             raise ValueError(f"layer_idx out of range: {layer_idx}")
         is_local = config.layer_types[layer_idx] == "sliding_attention"
         super().__init__(
-            # the decoder layer reduces this partial with the MoE branch's
-            reduce_results=False,
             comm_group=comm_group,
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -178,7 +171,6 @@ class CommandAPlusDecoderLayer(nn.Module):
         comm_group: CommGroup | None = None,
     ) -> None:
         super().__init__()
-        self.comm_group = comm_group if comm_group is not None else CommGroup.trivial()
         self.input_layernorm = CommandAPlusLayerNorm(
             config.hidden_size, eps=config.layer_norm_eps,
         )
@@ -215,8 +207,13 @@ class CommandAPlusDecoderLayer(nn.Module):
             start += w.shape[1]
         self._attn_width = rows[0].shape[1]
 
-    def _fused_branches(self, normalized: torch.Tensor) -> torch.Tensor:
-        """This rank's unreduced ``attn + (routed + shared) / 2``, five GEMMs in two."""
+    def fused_branches(self, normalized: torch.Tensor) -> torch.Tensor:
+        """This rank's unreduced ``attn + (routed + shared) / 2``, five GEMMs in two.
+
+        Both branches read the same input, so the caller sums them on-rank and
+        all-reduces once per layer instead of three times. Requires
+        ``fuse_weights``.
+        """
         from mstar.model.command_a_plus.kernels import (
             ROUTE_ALIGN_MAX_SLOTS,
             moe_combine,
@@ -251,7 +248,7 @@ class CommandAPlusDecoderLayer(nn.Module):
 
         top_k, w1 = moe.num_experts_per_tok, moe.experts.gate_up_proj
         alignment = None
-        if tokens * top_k <= ROUTE_ALIGN_MAX_SLOTS and (top_k & (top_k - 1)) == 0:
+        if tokens * top_k <= ROUTE_ALIGN_MAX_SLOTS:
             weights, ids, alignment = route_align(
                 router_logits, top_k, moe_block_m(tokens, w1, top_k), normalized.dtype,
             )
@@ -267,24 +264,12 @@ class CommandAPlusDecoderLayer(nn.Module):
             row_output = F.linear(torch.cat((attn_out, shared_act), dim=-1), self.output_weight)
         return moe_combine(row_output, routed, scale=0.5)
 
-    def branches(self, normalized: torch.Tensor) -> torch.Tensor:
-        """This rank's unreduced partial of ``attn(x) + moe(x)`` for normalized ``x``."""
-        if self.input_weight is not None:
-            return self._fused_branches(normalized)
-        partial = self.self_attn(normalized)
-        partial += self.mlp(normalized)
-        return partial
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Both branches run on the same input, so their partials can be summed
-        on-rank and reduced together: one all-reduce per layer instead of three
-        (attention's o_proj, the routed experts', and the shared MLP's). The
-        collectives here are [tokens, 4096] bf16 and latency-bound, so at decode
-        batch sizes the count matters far more than the bytes. Reassociating the
-        sum is exact in real arithmetic and reorders bf16 rounding; prefill and
-        decode both go through here, so the two stay consistent."""
+        residual = hidden_states
         normalized = self.input_layernorm(hidden_states)
-        return hidden_states + self.comm_group.all_reduce(self.branches(normalized))
+        attn_output = self.self_attn(normalized)
+        moe_output = self.mlp(normalized)
+        return residual + attn_output + moe_output
 
 
 class CommandAPlusLanguageModel(nn.Module):
@@ -315,6 +300,9 @@ class CommandAPlusLanguageModel(nn.Module):
         ])
         self.norm = CommandAPlusLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.fused = False
+        self._replicated_embedding: torch.Tensor | None = None
+        self._allreduce_workspace = None
+        self._allreduce_max_tokens = 0
 
     def fuse_for_inference(self, max_allreduce_tokens: int = 2048) -> None:
         """Switch to fused kernels and concatenated GEMMs. CUDA only, after loading.
@@ -325,7 +313,6 @@ class CommandAPlusLanguageModel(nn.Module):
         for layer in self.layers:
             layer.fuse_weights()
         self.fused = True
-        self._allreduce_workspace = None
         group = self.comm_group
         if group.world_size > 1:
             # A replicated table makes the lookup a plain gather. The sharded
@@ -350,23 +337,21 @@ class CommandAPlusLanguageModel(nn.Module):
             self._allreduce_max_tokens = max_allreduce_tokens
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        table = getattr(self, "_replicated_embedding", None)
-        if table is None:
+        if self._replicated_embedding is None:
             return self.embed_tokens(input_ids)
-        return F.embedding(input_ids, table)
+        return F.embedding(input_ids, self._replicated_embedding)
 
     def _all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         """Small reductions (decode, short prefill) take FlashInfer's one-shot
         NVLink all-reduce, ~4x lower latency than NCCL at decode sizes; larger
         ones go through NCCL. Both give every rank identical sums."""
-        workspace = getattr(self, "_allreduce_workspace", None)
-        if workspace is None or x.shape[0] > self._allreduce_max_tokens:
+        if self._allreduce_workspace is None or x.shape[0] > self._allreduce_max_tokens:
             return self.comm_group.all_reduce(x)
         from flashinfer.comm import AllReduceFusionPattern, allreduce_fusion
 
         out = torch.empty_like(x)
         allreduce_fusion(
-            input=x, workspace=workspace, pattern=AllReduceFusionPattern.kAllReduce,
+            input=x, workspace=self._allreduce_workspace, pattern=AllReduceFusionPattern.kAllReduce,
             output=out, fp32_acc=True,
         )
         return out
@@ -384,8 +369,9 @@ class CommandAPlusLanguageModel(nn.Module):
         return self.norm(query_sequence)
 
     def _fused_forward(self, query_sequence: torch.Tensor, *, label: str) -> torch.Tensor:
-        """Same math as ``forward``, with each layer's residual add fused into
-        the next layer's LayerNorm."""
+        """Same math as ``forward``, with one all-reduce per layer (attention and
+        MoE partials summed on-rank first) and each layer's residual add fused
+        into the next layer's LayerNorm."""
         from mstar.model.command_a_plus.kernels import add_layernorm
 
         norms = [layer.input_layernorm for layer in self.layers] + [self.norm]
@@ -393,7 +379,7 @@ class CommandAPlusLanguageModel(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             layer.self_attn.attend.bind_step(label)
             layer.self_attn.attend.set_layer_idx(layer_idx)
-            delta = self._all_reduce(layer.branches(normalized))
+            delta = self._all_reduce(layer.fused_branches(normalized))
             norm = norms[layer_idx + 1]
             residual, normalized = add_layernorm(residual, delta, norm.weight, norm.eps)
         return normalized

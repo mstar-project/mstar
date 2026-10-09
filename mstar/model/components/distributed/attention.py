@@ -57,7 +57,6 @@ class ParallelAttention(nn.Module):
         attn_key: str = "attn",
         kv_key: str = "kv",
         pos_key: str | None = "rope",
-        reduce_results: bool = True,
     ):
         super().__init__()
         # resource labels this layer calls; see components/attention.py
@@ -87,16 +86,13 @@ class ParallelAttention(nn.Module):
         self.num_heads = self.qkv_proj.num_heads
         self.num_kv_heads = self.qkv_proj.num_kv_heads
 
-        # ``reduce_results=False`` returns this rank's partial instead. Only for
-        # a caller that sums the partial with other branches of the same block
-        # and all-reduces once; the result is otherwise not the layer output.
         self.o_proj = RowParallelLinear(
             comm_group=comm_group,
             input_size=num_heads * head_dim,
             output_size=self.input_hidden_size,
             bias=o_bias,
             input_is_parallel=True,
-            reduce_results=reduce_results,
+            reduce_results=True,
         )
 
         self.rope_theta = rope_theta
