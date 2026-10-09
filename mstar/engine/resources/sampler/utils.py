@@ -28,6 +28,7 @@ import triton
 import triton.language as tl
 
 from mstar.utils.h2d import PinnedStager
+from mstar.utils.knobs import sampler_slots
 
 logger = logging.getLogger(__name__)
 
@@ -1030,16 +1031,40 @@ class CudaGraphableSampler(BaseSampler):
     # the slot master so the next step can read the token on the device.
     last_token_buf: torch.Tensor | None = None
     tp_group: "CommGroup | None" = None  # noqa: F821
+    # In-graph gather/scatter (``MSTAR_SAMPLER_INGRAPH_SCATTER``): the slot
+    # masters and this slot's padded index row, all static, so the captured
+    # sample reads its offsets from the masters and writes the advanced
+    # offsets and the sampled tokens back without a launch after the replay.
+    offset_master: torch.Tensor | None = None
+    last_token_master: torch.Tensor | None = None
+    slot_idx_view: torch.Tensor | None = None
+    ingraph_scatter: bool = False
 
     # Set during graph capture, and used by the cuda graph runner to determine
     # whether requests' seen token buffers should be synced post-replay
     applied_penalty_in_graph: bool = False
+
+    def gather_in_graph(self) -> None:
+        """Offsets of this step's rows off the master, inside the graph."""
+        torch.index_select(
+            self.offset_master, 0, self.slot_idx_view, out=self.offset_buf,
+        )
+
+    def scatter_in_graph(self, codes: torch.Tensor) -> None:
+        """Advanced offsets and sampled tokens back to the masters, inside the
+        graph: every row, padding rows into the trash row."""
+        self.offset_master.index_copy_(0, self.slot_idx_view, self.offset_buf)
+        self.last_token_master.index_copy_(
+            0, self.slot_idx_view, codes.to(self.last_token_master.dtype),
+        )
 
     @torch.compiler.disable
     def sample(
         self, request_ids: list[str], logits: torch.Tensor,
         apply_penalty: bool = False,
     ):
+        if self.ingraph_scatter:
+            self.gather_in_graph()
         codes = sample_cuda_graphable_gpu(
             logits, self.temperature_buf,
             self.top_k_buf, self.top_p_buf,
@@ -1053,6 +1078,8 @@ class CudaGraphableSampler(BaseSampler):
         codes = self._broadcast_tokens(codes)
         if self.last_token_buf is not None:
             self.last_token_buf.copy_(codes)
+        if self.ingraph_scatter:
+            self.scatter_in_graph(codes)
         if apply_penalty and self.seen_tokens_buf is not None:
             self.applied_penalty_in_graph = True
             # Record the (broadcast, TP-agreed) token in the seen-token buffer so
@@ -1311,6 +1338,10 @@ class SamplerBuffers:
     # Master cache capacity (grown by doubling when more requests are
     # concurrently registered than the per-step buffer holds).
     _master_capacity: int = field(default=0, repr=False)
+    # the in-graph scatter (knob): padding rows address ``_trash_slot``, one
+    # master row past the capacity that no request is ever given
+    ingraph_scatter: bool = False
+    _trash_slot: int = 0
     # Number of double-buffer slots (per-step buffers carry this leading dim).
     cg_slots: int = 1
     # Per-step slot-index staging, per cg slot. ``_slot_idx_cpu`` is pinned so
@@ -1376,8 +1407,14 @@ class SamplerBuffers:
         vocab_size: int | None = None,
         cg_slots: int = 1,
         enable_min_p: bool = False,
+        ingraph_scatter: bool = False,
+        slots: int | None = None,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
+
+        With ``ingraph_scatter`` the masters hold ``slots`` rows (the knob's
+        4096 by default) plus one trash row for padding, allocated once: the
+        captured graphs keep their addresses, so they never grow.
 
         ``vocab_size`` (when not None) enables the seen-token mask buffer for the
         repetition penalty. The master rows default to a ``SamplingConfig()`` row
@@ -1387,16 +1424,21 @@ class SamplerBuffers:
         """
         pinned = torch.cuda.is_available() and device.type == "cuda"
         cap = max_batch_size
+        if ingraph_scatter:
+            cap = max(max_batch_size, slots if slots is not None else sampler_slots())
+        # one row past the capacity is the trash row for padding when the
+        # in-graph scatter is on (harmless, never read for a request)
+        rows = cap + 1 if ingraph_scatter else cap
 
         def mk(dtype: torch.dtype, default: float) -> HostBuffer:
             return HostBuffer.allocate(
-                max_batch_size, cap, device, dtype, default, cg_slots
+                max_batch_size, rows, device, dtype, default, cg_slots
             )
 
         # seen token mask is not double-buffered, as it depends on the GPU
         # value of the previous step. Same goes for offset
         seen_tokens = (
-            MaskBuffer.allocate(max_batch_size, cap, vocab_size, device, cg_slots=1)
+            MaskBuffer.allocate(max_batch_size, rows, vocab_size, device, cg_slots=1)
             if vocab_size is not None else None
         )
         return cls(
@@ -1406,12 +1448,14 @@ class SamplerBuffers:
             top_p=mk(torch.float32, 1.0),
             seed=mk(torch.long, 0),
             rep_penalty=mk(torch.float32, 1.0),
-            offset=Buffer.allocate(max_batch_size, cap, device, torch.long, 0, 1),
-            last_token=Buffer.allocate(max_batch_size, cap, device, torch.long, 0, cg_slots),
+            offset=Buffer.allocate(max_batch_size, rows, device, torch.long, 0, 1),
+            last_token=Buffer.allocate(max_batch_size, rows, device, torch.long, 0, cg_slots),
             tp_group=tp_group,
             seen_tokens=seen_tokens,
             min_p=mk(torch.float32, 0.0) if enable_min_p else None,
             _master_capacity=cap,
+            ingraph_scatter=ingraph_scatter,
+            _trash_slot=cap if ingraph_scatter else 0,
             cg_slots=cg_slots,
             _slot_idx_cpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, pin_memory=pinned),
             _slot_idx_gpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, device=device),
@@ -1435,6 +1479,10 @@ class SamplerBuffers:
             "min_p_buf": self.min_p.slot_view(cg_slot, bs) if self.min_p is not None else None,
             "last_token_buf": self.last_token.slot_view(cg_slot, bs),
             "tp_group": self.tp_group,
+            "offset_master": self.offset.master,
+            "last_token_master": self.last_token.master,
+            "slot_idx_view": self._slot_idx_gpu[cg_slot, :bs],
+            "ingraph_scatter": self.ingraph_scatter,
         }
 
     # ------------------------------------------------------------------
@@ -1474,6 +1522,12 @@ class SamplerBuffers:
         master capacity. Per-step buffers (sized to the cuda-graph max_bs) are
         NOT resized — the gather only reads ``padded_bs`` rows from master.
         """
+        if self.ingraph_scatter:
+            raise RuntimeError(
+                f"more than {self._master_capacity} concurrent requests on the "
+                "sampler with the in-graph scatter on; raise MSTAR_SAMPLER_SLOTS "
+                "or set MSTAR_SAMPLER_INGRAPH_SCATTER=0"
+            )
         for buf in self._scalar_buffers():
             buf.grow_master(new_capacity)
         self.offset.grow_master(new_capacity)
@@ -1610,7 +1664,7 @@ class SamplerBuffers:
                 self._init_slot(slot, rid)
             rows.append(slot)
         if len(rows) < padded_bs:
-            rows.extend([0] * (padded_bs - len(rows)))
+            rows.extend([self._trash_slot] * (padded_bs - len(rows)))
         self._slot_idx_np[cg_slot, :padded_bs] = rows
         self._staged_rids[cg_slot] = (tuple(request_ids), padded_bs)
 
@@ -1673,7 +1727,9 @@ class SamplerBuffers:
         for slot in resets:
             self.offset.master[slot:slot + 1].zero_()
         idx_view = self._upload_slot_idx(padded_bs, cg_slot)
-        self.offset.gather(idx_view, padded_bs, cg_slot)
+        if not self.ingraph_scatter:
+            # with it on, the captured sample gathers off the master itself
+            self.offset.gather(idx_view, padded_bs, cg_slot)
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
 
