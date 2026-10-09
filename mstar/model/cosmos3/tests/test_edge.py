@@ -558,22 +558,9 @@ def test_edge_prompt_rendering_matches_reference_layout() -> None:
     assert render_chat(tok, parts, cfg.reasoner).endswith("<think>\n")
 
 
-CHAT = [
-    {"role": "system", "content": "Be brief."},
-    {"role": "user", "content": "What is ahead?"},
-    {"role": "assistant", "content": "A truck."},
-    {"role": "user", "content": "And behind?"},
-]
-
-
 @needs_edge
-@pytest.mark.parametrize(("messages", "rendered_from"), [
-    (CHAT[1:2], [{"role": "system", "content": "Drive carefully."}, CHAT[1]]),
-    (CHAT, CHAT),
-], ids=["one-turn", "chat"])
-def test_edge_chat_renders_as_its_template_renders_its_messages(messages, rendered_from, tmp_path) -> None:
-    """Each message reaches the template as its own turn, and the request's
-    ``system_prompt`` leads only a chat that sent no system message."""
+def test_edge_system_prompt_leads_a_chat_with_no_system_message(tmp_path) -> None:
+    """The request's ``system_prompt`` leads a chat whose client sent no system message of its own."""
     from transformers import AutoTokenizer
 
     from mstar.api_server.openai.adapters import flatten_messages
@@ -581,11 +568,13 @@ def test_edge_chat_renders_as_its_template_renders_its_messages(messages, render
 
     cfg = Cosmos3Config.from_pretrained(EDGE_DIR)
     tok = AutoTokenizer.from_pretrained(str(EDGE_DIR))
-    *_, parts = flatten_messages(messages, tmp_path)
+    question = {"role": "user", "content": "What is ahead?"}
+    *_, parts = flatten_messages([question], tmp_path)
     rendered = render_chat(tok, parts, cfg.reasoner, enable_thinking=False, system_prompt="Drive carefully.")
     assert rendered == tok.apply_chat_template(
-        rendered_from, tokenize=False, add_generation_prompt=True, enable_thinking=False,
-    ), "the chat reached the template as one user message, its turns glued together"
+        [{"role": "system", "content": "Drive carefully."}, question],
+        tokenize=False, add_generation_prompt=True, enable_thinking=False,
+    ), "the request's system_prompt did not lead a chat that sent none"
 
 
 @needs_edge

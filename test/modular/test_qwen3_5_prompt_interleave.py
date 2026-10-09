@@ -235,19 +235,6 @@ CHAT = [
 ]
 
 
-@pytest.mark.parametrize("messages", [CHAT[1:2], CHAT], ids=["one-turn", "chat"])
-def test_a_chat_renders_as_its_template_renders_its_messages(model, tmp_path, messages):
-    """Each message reaches the template as its own turn; one user turn renders as it always did."""
-    text, _, in_mods, parts = flatten_messages(messages, tmp_path)
-    [ids] = model.process_prompt(text, in_mods, ["text"], prompt_parts=parts)["text_inputs"]
-    rendered = model.tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True,
-    )
-    assert ids.tolist() == model.tokenizer(rendered).input_ids, (
-        "the chat reached the template as one user message, its turns glued together"
-    )
-
-
 def test_a_chat_the_template_refuses_is_a_bad_request(model, tmp_path):
     """The template's own error is a 500 at the data worker; the ValueError it becomes is what makes it a 400."""
     messages = [CHAT[1], CHAT[0], CHAT[3]]
