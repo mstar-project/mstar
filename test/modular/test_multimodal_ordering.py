@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from mstar.api_server.openai.adapters import flatten_messages
+from mstar.api_server.openai.serving_chat import _build_response
 from mstar.model.multimodal import (
     PromptPart,
     check_attachments,
@@ -440,6 +441,28 @@ def test_an_image_chat_puts_each_turn_in_its_own_role_block(bagel, tmp_path):
         "<|im_start|>user\nIts color?<|im_end|>\n"
         "<|im_start|>assistant\n"
     ), "the chat was flattened into one user turn"
+
+
+def test_a_replys_image_comes_back_in_the_next_user_turn(bagel, tmp_path):
+    """A client appends the assistant message a chat response carries and goes on."""
+    reply = _build_response("bagel", "chatcmpl-0", [
+        SimpleNamespace(modality="text", data=b"Here it is."),
+        SimpleNamespace(modality="image", data=b"\x89PNG"),
+    ], 24000)["choices"][0]["message"]
+    messages = [
+        {"role": "user", "content": "Draw a red cube."},
+        reply,
+        {"role": "user", "content": "Make it blue."},
+    ]
+    text, _, in_mods, parts = flatten_messages(messages, tmp_path)
+    spans = bagel.process_prompt(text, in_mods, ["text"], prompt_parts=parts)["text_inputs"]
+    assert bagel.IMAGE_PLACEHOLDER.join(_decoded(bagel, spans)) == (
+        f"<|im_start|>system\n{bagel.BAGEL_DEFAULT_SYSTEM_PROMPT}<|im_end|>\n"
+        "<|im_start|>user\nDraw a red cube.<|im_end|>\n"
+        "<|im_start|>assistant\nHere it is.<|im_end|>\n"
+        f"<|im_start|>user\n{bagel.IMAGE_PLACEHOLDER}\nMake it blue.<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    ), "the reply's image did not land in the next user turn"
 
 
 def test_an_image_chat_puts_a_leading_system_message_in_the_system_block(bagel, tmp_path):

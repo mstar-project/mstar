@@ -694,6 +694,31 @@ mod tests {
     }
 
     #[test]
+    fn an_image_in_a_reply_lands_in_the_next_user_turn() {
+        let (_, file_paths, in_mods, parts) = flatten(
+            r#"[{"role":"user","content":"Draw a red cube."},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"Here it is."},
+                    {"type":"image_url","image_url":{"url":"/in/a.png"}}]},
+                {"role":"user","content":"Make it blue."}]"#,
+            Path::new("/unused"),
+        )
+        .unwrap();
+        assert_eq!(file_paths["image"], ["/in/a.png"]);
+        assert_eq!(in_mods, ["text", "text", "image", "text"]);
+        assert_eq!(
+            described(&parts),
+            [
+                ("text", "user", Some("Draw a red cube."), 0),
+                ("text", "assistant", Some("Here it is."), 0),
+                ("image", "user", None, 0),
+                ("text", "user", Some("Make it blue."), 0),
+            ],
+            "the reply's image did not land in the next user turn"
+        );
+    }
+
+    #[test]
     fn two_images_are_indexed_in_order() {
         let (_, file_paths, in_mods, parts) = flatten(
             r#"[{"role":"user","content":[
