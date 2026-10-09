@@ -3,7 +3,8 @@
 Translates an OpenAI chat request into a submit_request via the model adapter,
 then maps the resulting modality chunks back to OpenAI shapes: text into
 ``message.content``, audio into ``message.audio`` (base64 WAV), images into
-``image_url`` data-URL content parts.
+``image_url`` data-URL content parts. An adapter's output parser splits a text
+reply into ``content``, ``reasoning_content`` and ``tool_calls``.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     args = adapter.chat_to_request(req, api.upload_dir)
+    parser = adapter.make_output_parser(req)
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 
@@ -34,12 +36,12 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
     )
 
     if req.stream:
-        return _stream(api, model_name, request_id, sample_rate)
+        return _stream(api, model_name, request_id, sample_rate, parser)
     chunks = await api.collect_results(request_id, raw_request)
-    return _build_response(model_name, request_id, chunks, sample_rate)
+    return _build_response(model_name, request_id, chunks, sample_rate, parser)
 
 
-def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
+def _build_response(model_name, request_id, chunks, sample_rate, parser=None) -> dict:
     text_parts: list[bytes] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
@@ -54,6 +56,10 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
     # a byte-level BPE token's bytes can end inside a character
     text = b"".join(text_parts).decode("utf-8", "replace")
     message: dict = {"role": "assistant", "content": text}
+    finish_reason = "stop"
+    if parser is not None:
+        message = parser.message(text)
+        finish_reason = parser.finish_reason
 
     if audio_pcm:
         wav = media_io.pcm16_to_wav_bytes(b"".join(audio_pcm), sample_rate)
@@ -76,12 +82,12 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 
-async def _stream(api, model_name, request_id, sample_rate):
+async def _stream(api, model_name, request_id, sample_rate, parser=None):
     created = now()
 
     def chunk(delta, finish=None) -> str:
@@ -107,6 +113,11 @@ async def _stream(api, model_name, request_id, sample_rate):
             if c.modality == "text":
                 content = text.decode(c.data)
                 if not content:
+                    continue
+                if parser is not None:
+                    for delta in parser.feed(content):
+                        yield chunk({**role, **delta})
+                        role = {}
                     continue
                 delta = {"content": content}
             elif c.modality == "audio":
@@ -137,5 +148,12 @@ async def _stream(api, model_name, request_id, sample_rate):
         yield error(str(exc.detail), exc.status_code)
     if not failed:
         tail = text.decode(b"", final=True)
-        yield chunk({**role, "content": tail} if tail else role, finish="stop")
+        if parser is None:
+            yield chunk({**role, "content": tail} if tail else role, finish="stop")
+        else:
+            deltas = parser.feed(tail) + parser.finish()
+            for delta in deltas[:-1]:
+                yield chunk({**role, **delta})
+                role = {}
+            yield chunk({**role, **(deltas[-1] if deltas else {})}, finish=parser.finish_reason)
     yield SSE_DONE

@@ -82,6 +82,7 @@ test/modular/test_glm52_loading_guards.py
 test/modular/test_kv_stored_len.py
 test/modular/test_pinned_staging.py
 test/modular/test_openai_adapters.py
+test/modular/test_glm_chat.py
 test/modular/test_glm52_dense_fp8_model.py
 test/modular/test_glm52_fused_add_rmsnorm.py
 test/modular/test_glm52_mla_prep.py

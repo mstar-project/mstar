@@ -541,3 +541,51 @@ def test_speech_stream_pcm_has_no_wav_header(client_and_stub):
     r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True})
     assert r.headers["content-type"].startswith("audio/wav") and r.content[:4] == b"RIFF"
     assert r.content[44:] == _pcm([1, 2, 3])
+
+
+_GLM_TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {
+    "type": "object", "properties": {"city": {"type": "string"}}}}}]
+_GLM_REPLY = [b"Need the ", b"weather.</th", b"ink>\n<tool_call>get_weather<arg_key>city",
+              b"</arg_key><arg_value>Paris</arg_value></tool_call>"]
+
+
+def test_glm_chat_returns_reasoning_and_tool_calls(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    stub.next_chunks = [_Chunk("text", b) for b in _GLM_REPLY]
+    choice = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "weather?"}], "tools": _GLM_TOOLS,
+    }).json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    message = choice["message"]
+    assert message["content"] is None and message["reasoning_content"] == "Need the weather."
+    assert message["tool_calls"][0]["function"] == {"name": "get_weather", "arguments": '{"city": "Paris"}'}
+    assert stub.last_submit["model_kwargs"]["tools"] == _GLM_TOOLS
+
+
+def test_glm_chat_streams_reasoning_then_the_call(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    stub.next_chunks = [_Chunk("text", b) for b in _GLM_REPLY]
+    text = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "weather?"}],
+        "tools": _GLM_TOOLS, "stream": True,
+    }).text
+    events = [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
+    deltas = [e["choices"][0]["delta"] for e in events]
+    assert deltas[0] == {"role": "assistant", "reasoning_content": "Need the "}
+    assert "".join(d.get("reasoning_content", "") for d in deltas) == "Need the weather."
+    assert not any(d.get("content") for d in deltas)
+    (call,) = [c for d in deltas for c in d.get("tool_calls", [])]
+    assert call["index"] == 0 and call["function"]["arguments"] == '{"city": "Paris"}'
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_glm_chat_refuses_a_required_tool_choice(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "glm52"
+    r = client.post("/v1/chat/completions", json={
+        "model": "glm52", "messages": [{"role": "user", "content": "hi"}],
+        "tools": _GLM_TOOLS, "tool_choice": "required",
+    })
+    assert r.status_code == 400 and "constrained decoding" in r.json()["error"]["message"]
