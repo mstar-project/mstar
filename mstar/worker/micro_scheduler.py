@@ -542,14 +542,20 @@ class MicroScheduler:
         pre_existing_walk = target[1] if target is not None and pre_existing_batch_size else None
         target = None if target is None else self._key(*target)
         exclude_target = None if exclude_target is None else self._key(*exclude_target)
-        scan = True
-        if target is not None:
-            room = self._room_left(target, pre_existing_walk, pre_existing_batch_size)
-            if room == 0:
-                return None  # the caller is full: nothing to scan for
-            # the caller and its backlog fill the step, so no fresh row could join
-            scan = room is None or len(self._live_backlog(target)) < room
-        ready = self._scan_ready(request_state, target, exclude_target) if scan else {}
+        if target is not None and self._room_left(
+            target, pre_existing_walk, pre_existing_batch_size,
+        ) == 0:
+            return None  # the caller is full: nothing to scan for
+        # scanned only once a step could take fresh rows
+        ready: dict[tuple[str, str], list[ReadyNodeEntry]] | None = None
+
+        def schedule(key, entries):
+            return self._schedule_key(
+                request_state, key, entries,
+                pre_existing_batch_size=pre_existing_batch_size,
+                capture_group_of=capture_group_of,
+                pre_existing_walk=pre_existing_walk,
+            )
 
         # A backlogged key goes first, oldest first, so a split set drains
         # before anything else starts; its fresh rows ride along. A key whose
@@ -557,19 +563,23 @@ class MicroScheduler:
         # rather than leaving the worker idle behind it. `exclude_target` is
         # only a fairness hint, and finishing a split set beats fairness.
         keys = [k for k in self.backlog if target is None or k == target]
-        rr_key = self._select_node_rr(ready)
-        if rr_key is not None and rr_key not in keys:
-            keys.append(rr_key)
         for key in keys:
-            scheduled = self._schedule_key(
-                request_state, key, ready.get(key, []),
-                pre_existing_batch_size=pre_existing_batch_size,
-                capture_group_of=capture_group_of,
-                pre_existing_walk=pre_existing_walk,
-            )
+            # no fresh row could join a step its backlog fills, unless every backlogged row is blocked
+            if self._backlog_fills(key, pre_existing_walk, pre_existing_batch_size):
+                scheduled = schedule(key, [])
+                if scheduled is not None:
+                    return scheduled
+            if ready is None:
+                ready = self._scan_ready(request_state, target, exclude_target)
+            scheduled = schedule(key, ready.get(key, []))
             if scheduled is not None:
                 return scheduled
-        return None
+        if ready is None:
+            ready = self._scan_ready(request_state, target, exclude_target)
+        rr_key = self._select_node_rr(ready)
+        if rr_key is None or rr_key in keys:
+            return None
+        return schedule(rr_key, ready.get(rr_key, []))
 
     def _scan_ready(
         self, request_state: RequestStateManager,
@@ -702,6 +712,18 @@ class MicroScheduler:
             self.backlog[target], live, rid,
             functools.partial(self._capture_group, request_state, *target),
         )
+
+    def _backlog_fills(
+        self, key: tuple[str, str], pre_existing_walk: str | None,
+        pre_existing_batch_size: int,
+    ) -> bool:
+        """Whether ``key``'s live backlog alone fills any step it could run,
+        beside the caller's own rows, so a scan for fresh rows is wasted."""
+        room = self._room_left(key, pre_existing_walk, pre_existing_batch_size)
+        if room is None and not pre_existing_batch_size:
+            caps = self._walk_caps(key).values()
+            room = None if None in caps else max(caps)
+        return room is not None and len(self._live_backlog(key)) >= room
 
     def _live_backlog(self, node_walk: tuple[str, str]) -> set[int]:
         """``node_walk``'s backlogged rids that are not failed, removed or held."""

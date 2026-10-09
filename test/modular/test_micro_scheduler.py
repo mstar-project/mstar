@@ -532,6 +532,21 @@ def test_a_caller_filled_by_its_backlog_does_not_scan():
     assert not {"f0", "f1"} & set(engine.checked), "the ready queue was scanned"
 
 
+def test_a_backlog_that_fills_the_step_runs_without_a_scan():
+    """The worker's own scheduling pass too: fresh rows could not join, so
+    checking and popping them only to park them again is wasted."""
+    engine = _Engine(max_bs=4)
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch([f"b{i}" for i in range(4)])
+    manager = _Manager(["f0", "f1"])
+
+    batch = _next_batch(sched, manager)
+
+    assert set(batch.request_to_worker_graph) == {f"b{i}" for i in range(4)}
+    assert not {"f0", "f1"} & set(engine.checked), "the ready queue was scanned"
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"f0", "f1"}
+
+
 def test_a_held_backlog_row_does_not_count_toward_skipping_the_scan():
     engine = _Engine(max_bs=16)
     sched = _scheduler(engine)
