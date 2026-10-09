@@ -2,6 +2,7 @@
 captured sample writes a per-step row, commit scatters it to the slot master,
 the next step gathers its input ids by slot; an eager step writes and reads
 the master by request."""
+import pytest
 import torch
 
 from mstar.engine.resources.sampler.utils import SamplerBuffers
@@ -59,3 +60,51 @@ def test_growth_and_slot_reuse_keep_the_tokens():
     bufs.register_request("d")  # reuses a's slot; its first step writes it
     bufs.write_last_tokens(["d"], torch.tensor([8]))
     assert bufs.last_tokens_for(["d", "b", "c"]).tolist() == [8, 6, 7]
+
+
+def _ingraph(max_bs=4, cg_slots=2, slots=8):
+    return SamplerBuffers.allocate(
+        max_batch_size=max_bs, device=torch.device("cpu"), cg_slots=cg_slots,
+        ingraph_scatter=True, slots=slots,
+    )
+
+
+def test_ingraph_scatter_rows_land_by_slot_and_padding_hits_the_trash_row():
+    """What the captured sample does with the knob on, step by step on the
+    CPU views: gather the offsets off the master, advance, scatter offsets
+    and tokens back; padding rows read and write the trash row only."""
+    bufs = _ingraph()
+    assert bufs.ingraph_scatter and bufs._trash_slot == 8
+    assert bufs.last_token.master.shape[0] == 9 and bufs.offset.master.shape[0] == 9
+    for rid in ("a", "b", "c"):
+        bufs.register_request(rid)
+    bufs.write_last_tokens(["a", "b", "c"], torch.tensor([1, 2, 3]))
+    bufs.offset.master[bufs._rid_to_slot["a"]] = 10
+    bufs.gather_static(["b", "a"], 4, 1)
+    bufs.gather_dynamic(["b", "a"], 4, 1)  # uploads the index row, no offset gather
+    assert bufs._slot_idx_gpu[1, :4].tolist()[2:] == [8, 8]
+    s = bufs.sampler_for(4, 1)
+    assert s.ingraph_scatter and s.slot_idx_view.tolist()[:2] == [bufs._rid_to_slot[r] for r in ("b", "a")]
+    s.gather_in_graph()
+    assert s.offset_buf.tolist()[1] == 10
+    s.offset_buf += 1
+    s.scatter_in_graph(torch.tensor([22, 21, 99, 98]))
+    assert bufs.last_tokens_for(["a", "b", "c"]).tolist() == [21, 22, 3]
+    assert bufs.offset.master[bufs._rid_to_slot["a"]].item() == 11
+    assert bufs.last_token.master[8].item() in (99, 98)
+    # the next step's input ids: real rows by slot, padding rows the trash row
+    got = bufs.gather_last_tokens(1, 4).tolist()
+    assert got[:2] == [22, 21] and got[2] == got[3] == bufs.last_token.master[8].item()
+
+
+def test_ingraph_scatter_masters_never_grow():
+    bufs = _ingraph(max_bs=2, slots=2)
+    bufs.register_request("a")
+    bufs.register_request("b")
+    with pytest.raises(RuntimeError, match="MSTAR_SAMPLER_SLOTS"):
+        bufs.register_request("c")
+    # the default path still grows
+    plain = SamplerBuffers.allocate(max_batch_size=2, device=torch.device("cpu"))
+    for rid in ("a", "b", "c"):
+        plain.register_request(rid)
+    assert plain.last_token.master.shape[0] >= 3 and not plain.ingraph_scatter
