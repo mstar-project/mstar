@@ -1271,7 +1271,7 @@ class PiecewiseCudaGraphRunner:
             dummy_rids, shape.seq_lens, self._bucket(shape), capture=True,
             slot=slot
         )
-        call = self._call_inputs(static_inputs, dummy_rids)
+        call = self._call_inputs(static_inputs, dummy_rids, step)
 
         fn = self._config.capture_fn
         if self._config.compile:
@@ -1319,12 +1319,16 @@ class PiecewiseCudaGraphRunner:
         self,
         static_inputs: dict[str, torch.Tensor],
         step_ids: list[int],
+        step=None,
     ) -> PiecewiseCallInputs:
         """What the region is handed, over the padded capture batch.
 
         Built once, for the capture: the region's Python runs only there, so
         the rows are the runner's padding ids and the only thing a replay
-        changes is the contents of the static buffers.
+        changes is the contents of the static buffers. ``step`` is the
+        capture's declaration, so the region can tell it runs on a leased
+        slot (its context names the lease) and record the in-graph reads of
+        the slot's buffers a replay relies on.
         """
         return PiecewiseCallInputs(
             static_inputs=static_inputs,
@@ -1332,6 +1336,7 @@ class PiecewiseCudaGraphRunner:
                 request_ids=list(step_ids),
                 per_request_info=dummy_metadata(step_ids, PIECEWISE_WALK),
                 resources=dict(self._resources),
+                step=step,
             ),
             kwargs=self._config.forward_kwargs,
         )
