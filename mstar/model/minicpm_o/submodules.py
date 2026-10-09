@@ -26,9 +26,11 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.attn.base import AttentionManager
+from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
+from mstar.model.minicpm_o.components.tts import next_history, windowed_frequency_penalty
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
@@ -39,6 +41,11 @@ from mstar.model.minicpm_o.config import (
     PATCHES,
     QUERIES,
     RESAMPLER_ATTN,
+    T2W_STATE,
+    TTS_ATTN,
+    TTS_KV,
+    TTS_POS,
+    TTS_SAMPLER,
     VISION_ATTN,
     MiniCPMOConfig,
 )
@@ -142,18 +149,24 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
+        """``new_token``, and on decode ``tts_hidden``: the post-norm hidden of
+        each row's input token, which a spoken reply's TTS reads."""
         attn: AttentionManager = engine_inputs.resources[LLM_ATTN]
         sampler: SamplerResource = engine_inputs.resources[LLM_SAMPLER]
         hidden = self.model(input_embeds, label="main")
-        if graph_walk != DECODE:
+        out = {}
+        if graph_walk == DECODE:
+            out["tts_hidden"] = hidden
+        else:
             hidden = attn.select_last_hidden(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+        out["new_token"] = sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+        return out
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor, **kwargs,
     ) -> NameToTensorList:
-        return {"new_token": self._forward(graph_walk, engine_inputs, input_embeds)}
+        return {k: [v] for k, v in self._forward(graph_walk, engine_inputs, input_embeds).items()}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
@@ -161,10 +174,10 @@ class LLMSubmodule(ARNodeSubmodule):
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor, **kwargs,
     ) -> BatchedModelOutput:
-        new_tokens = self._forward(graph_walk, engine_inputs, input_embeds)
+        out = self._forward(graph_walk, engine_inputs, input_embeds)
         return BatchedModelOutput(
-            row_outputs={"new_token": new_tokens},
-            check_stop_buffers={"new_token": new_tokens},
+            row_outputs=out,
+            check_stop_buffers={"new_token": out["new_token"]},
         )
 
     # ------------------------------------------------------------------
@@ -176,12 +189,21 @@ class LLMSubmodule(ARNodeSubmodule):
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
+        inputs: NodeInputs | None = None,
         **kwargs,
     ):
         # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is
         # tested in `check_stop`, off the GPU thread.
         if "new_token" in outputs:
             outputs["text_inputs"] = outputs["new_token"]
+        if "tts_hidden" not in outputs:
+            return
+        if request_info.step_metadata.get("audio_output", False):
+            # the decode loop accumulates (input token, its hidden) pairs: the
+            # reply's TTS condition, available whole when the loop ends
+            outputs["tts_ids"] = [inputs.input_ids]
+        else:
+            outputs.pop("tts_hidden")
 
     def _stops(self, token: int, info: CurrentForwardPassInfo) -> bool:
         hit_eos = (
@@ -391,3 +413,284 @@ class AudioEncoderSubmodule(NodeSubmodule):
             rid: {"audio_embeds": [out]}
             for rid, out in zip(engine_inputs.request_ids, embeds.split(tokens_per_request), strict=True)
         }
+
+
+TTS_PREFILL = "tts_prefill"
+TTS_DECODE = "tts_decode"
+TTS_DECODE_LOOP = "tts_decode_loop"
+
+
+class TTSSubmodule(ARNodeSubmodule):
+    """The speech-token LM. ``tts_prefill`` reads the whole reply (upstream's
+    ``chat`` speaks only once the text is done) and samples the first code;
+    ``tts_decode`` feeds each code back until the EOS code.
+
+    Upstream's per-step logits processing, in its order:
+      * the window-16 frequency penalty (skipped for the first code), applied
+        here as a pure tensor op over the last codes;
+      * EOS masked until ``min_new_tokens`` codes exist.
+    Both read ``tts_history``, which rides the loop edge instead of living in
+    host state: the last ``penalty_window`` codes (-1 for none yet), then the
+    number of codes generated so far. Nothing per row crosses from the host.
+    then the sampler resource: temperature, top-k/top-p, draw.
+    """
+
+    def __init__(self, model, config: MiniCPMOConfig, sampling):
+        super().__init__()
+        self.model = model
+        self.config = config
+        self.sampling = sampling
+
+    # ------------------------------------------------------------------
+    # Inputs
+    # ------------------------------------------------------------------
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs: Any,
+    ) -> ARNodeInputs:
+        device = self.get_device()
+        if graph_walk == TTS_PREFILL:
+            ids = torch.cat([t.reshape(-1) for t in inputs["tts_ids"]]).to(device)
+            hidden = torch.cat([t.reshape(-1, t.shape[-1]) for t in inputs["tts_hidden"]]).to(device)
+            embeds = self.model.condition(ids, hidden)
+            history = self._empty_history(device)
+        else:
+            embeds = None
+            history = inputs["tts_history"][0].reshape(-1).to(device)
+        return ARNodeInputs(
+            input_seq_len=1 if embeds is None else embeds.shape[0],
+            input_ids=None if embeds is not None else inputs["tts_code"][0].reshape(1).to(device),
+            input_embeds=embeds,
+            tensor_inputs={"history": history},
+        )
+
+    def _empty_history(self, device: torch.device) -> torch.Tensor:
+        """No codes yet: ``penalty_window`` empty slots and a count of 0. Cloned
+        from a cached template, so a prefill launches one copy and no H2D."""
+        template = getattr(self, "_history_template", None)
+        if template is None or template.device != device:
+            template = torch.full((self.sampling.penalty_window + 1,), -1, dtype=torch.long)
+            template[-1] = 0
+            self._history_template = template = template.to(device)
+        return template.clone()
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs],
+    ) -> dict[str, Any]:
+        if inputs[0].input_ids is not None:
+            embeds = self.model.emb_code(torch.cat([inp.input_ids for inp in inputs]))
+        else:
+            embeds = torch.cat([inp.input_embeds for inp in inputs])
+        return {
+            "input_embeds": embeds,
+            "history": torch.stack([inp.tensor_inputs["history"] for inp in inputs]),
+        }
+
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs],
+        **kwargs,
+    ) -> SubmoduleStep:
+        return SubmoduleStep(
+            segments=[
+                Segment(request_id=rid, label="main", span=inp.input_seq_len)
+                for rid, inp in zip(request_ids, inputs, strict=True)
+            ],
+            steps={
+                TTS_KV: KVStep(),
+                TTS_ATTN: AttentionStep(causal=True),
+                TTS_POS: PositionStep(),
+                # the window penalty is applied before sampling, here
+                TTS_SAMPLER: SamplerStep(apply_penalty=False),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def _forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        input_embeds: torch.Tensor,
+        history: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        attn: AttentionManager = engine_inputs.resources[TTS_ATTN]
+        sampler: SamplerResource = engine_inputs.resources[TTS_SAMPLER]
+        hidden = self.model.model(input_embeds, label="main")
+        if graph_walk != TTS_DECODE:
+            hidden = attn.select_last_hidden(hidden)
+        logits = self.model.logits(hidden)
+        recent, generated = history[:, :-1], history[:, -1:]
+        if graph_walk == TTS_DECODE:
+            logits = windowed_frequency_penalty(logits, recent, self.sampling.repetition_penalty)
+        eos = self.model.config.eos_code
+        suppress_eos = generated[:, 0] < self.sampling.min_new_tokens
+        logits[:, eos] = torch.where(suppress_eos, float("-inf"), logits[:, eos])
+        code = sampler.sample(engine_inputs.request_ids, logits=logits)
+        return {
+            "tts_code": code,
+            "tts_history": next_history(history, code),
+        }
+
+    def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
+        return {k: [v] for k, v in self._forward(graph_walk, engine_inputs, **kwargs).items()}
+
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
+        return True
+
+    def forward_batched(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> BatchedModelOutput:
+        out = self._forward(graph_walk, engine_inputs, **kwargs)
+        return BatchedModelOutput(row_outputs=out, check_stop_buffers={"tts_code": out["tts_code"]})
+
+    # ------------------------------------------------------------------
+    # Post-step
+    # ------------------------------------------------------------------
+
+    def _stops(self, code: int, info: CurrentForwardPassInfo) -> bool:
+        generated = info.dynamic_loop_iter_counts.get(TTS_DECODE_LOOP, 0) + 2
+        return code == self.model.config.eos_code or generated >= self.sampling.max_new_tokens
+
+    def check_stop(
+        self,
+        request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> set[str]:
+        if request_info.graph_walk != TTS_DECODE or "tts_code" not in outputs:
+            return set()
+        return {TTS_DECODE_LOOP} if self._stops(outputs["tts_code"][0].item(), request_info) else set()
+
+    def check_stop_batched(
+        self,
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+    ) -> dict[str, set[str]] | None:
+        codes = host_rows.buffers.get("tts_code")
+        if not torch.is_tensor(codes) or codes.dim() == 0:
+            return None
+        values = codes.reshape(codes.shape[0], -1)[:, 0].tolist()
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        stops: dict[str, set[str]] = {}
+        for rid in request_ids:
+            i = row_of.get(rid)
+            info = request_infos[rid]
+            if i is None or i >= len(values) or info.graph_walk != TTS_DECODE:
+                continue
+            if self._stops(values[i], info):
+                stops[rid] = {TTS_DECODE_LOOP}
+        return stops
+
+
+class Token2WavSubmodule(NodeSubmodule):
+    """Speech codes -> 24 kHz audio, one stream window per step: upstream's
+    ``Token2wav.stream``, fed the way its ``streaming_generate`` feeds it (three
+    silence codes first, 28-code windows advancing by 25, a last flush).
+
+    The windows are the ``LeftContextChunkPolicy(25, 3)`` stream from the TTS;
+    the first window gets the silence prepended here. A request's caches live
+    in its slot of the ``T2W_STATE`` pool (``RecurrentStatePool``), which this
+    node uses as its backend: it works on the slot's own views, initialised from
+    the voice's prepared state on the first window. Their host-side lengths ride
+    in the request's state.
+
+    Runs eagerly in float32, one request at a time: every length in the flow
+    depends on the voice and the window, and the module is exact against the
+    reference at full precision.
+    """
+
+    disable_torch_compile = True
+    disable_autocast = True
+
+    def __init__(self, model, voices: dict, eos_code: int):
+        super().__init__()
+        self.model = model
+        self.voices = voices
+        self.eos_code = eos_code
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        is_final_stream_chunk: bool = False,
+        **kwargs: Any,
+    ) -> NodeInputs | None:
+        from mstar.model.minicpm_o.components.token2wav import LEAD_SILENCE, SILENCE_CODE
+
+        codes = inputs["tts_code"][0].reshape(-1).tolist() if inputs.get("tts_code") else []
+        # the TTS's stop code is streamed before its stop is seen; it is not speech
+        codes = [c for c in codes if c != self.eos_code]
+        # keyed by the worker handle, as the forward and the engine's cleanup are
+        if not codes:
+            # a text-only reply's stream closes with one empty chunk
+            return None
+        state = self.request_state(fwd_info.rid_handle)
+        if not state.get("started", False):
+            codes = [SILENCE_CODE] * LEAD_SILENCE + codes
+        return NodeInputs(
+            tensor_inputs={"codes": torch.tensor([codes], dtype=torch.int32)},
+            kwargs={"last": is_final_stream_chunk, "voice": fwd_info.step_metadata.get("voice")},
+        )
+
+    def declare_step(
+        self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
+    ) -> SubmoduleStep:
+        return SubmoduleStep(
+            segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
+            steps={T2W_STATE: RecurrentStep()},
+        )
+
+    def _state(self, pool, rid, voice):
+        from mstar.model.minicpm_o.components.token2wav import state_from_slot, state_lengths
+
+        slot = pool.slot_index(rid)
+        blocks = {name: pool.block(name, 0)[slot] for name in pool.config.blocks}
+        req = self.request_state(rid)
+        if not req.get("started", False):
+            state = state_from_slot(blocks, state_lengths(voice.initial))
+            state.copy_from(voice.initial)
+            req.add("started", True)
+        else:
+            state = state_from_slot(blocks, req["lengths"])
+        return state
+
+    def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
+        return self.forward_batched(graph_walk, engine_inputs, **kwargs)[engine_inputs.request_ids[0]]
+
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
+        return True
+
+    def preprocess(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs],
+    ) -> dict[str, Any]:
+        device = self.get_device()
+        return {"rows": [
+            (inp.tensor_inputs["codes"].to(device), inp.kwargs["last"], inp.kwargs["voice"]) for inp in inputs
+        ]}
+
+    def forward_batched(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, rows: list, **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        from mstar.model.minicpm_o.components.token2wav import state_lengths
+
+        pool = engine_inputs.resources[T2W_STATE]
+        out = {}
+        for rid, (codes, last, voice_name) in zip(engine_inputs.request_ids, rows, strict=True):
+            voice = self.voices[voice_name]
+            state = self._state(pool, rid, voice)
+            wav = self.model.stream(state, voice, codes, last)
+            self.request_state(rid).add("lengths", state_lengths(state))
+            out[rid] = {"audio_chunk": [wav.reshape(-1)]}
+        return out

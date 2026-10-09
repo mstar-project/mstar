@@ -81,6 +81,21 @@ dynamo = [
     "uvloop",
 ]
 
+# MiniCPM-o 4.5. `onnx` only reads the voice-prompt tokenizer's and speaker
+# encoder's weights out of the checkpoint's .onnx files; nothing runs on
+# onnxruntime.
+minicpm_o = [
+    "flashinfer-python>=0.6.14",
+    "huggingface-hub",
+    "onnx",
+    "Pillow",
+    "safetensors",
+    "soundfile",
+    "torchaudio",
+    "torchcodec",
+    "transformers",
+]
+
 bagel = [
     "einops",
     "flashinfer-python>=0.6.14",
@@ -282,6 +297,7 @@ asr = [
 ]
 
 all = [
+    "onnx",  # minicpm_o
     "ruff",
     "pytest>=8.2",
     "soundfile",

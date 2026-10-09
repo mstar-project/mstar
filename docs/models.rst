@@ -64,8 +64,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        attention interleaved with full attention, plus a ViT tower.
    * - ``minicpm_o`` *(Beta)*
      - ``openbmb/MiniCPM-o-4_5``
-     - Omni-modal chat (text/image/audio in, text out): Qwen3-8B over a navit SigLIP +
-       resampler and a Whisper-medium encoder. Half-duplex only.
+     - Omni-modal chat (text/image/audio in, text and speech out): Qwen3-8B over a navit
+       SigLIP + resampler and a Whisper-medium encoder; a Llama TTS and a streaming
+       flow-matching vocoder for speech. Half-duplex only.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
