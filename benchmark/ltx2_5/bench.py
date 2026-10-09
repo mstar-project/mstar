@@ -26,7 +26,7 @@ def one(port, prompt, seed, args):
     t0 = time.perf_counter()
     res = client.generate(
         text=prompt, output_modalities=("video", "audio"), seed=seed,
-        height=args.height, width=args.width, num_frames=args.num_frames,
+        height=args.height, width=args.width, num_frames=args.num_frames, recipe=args.recipe,
     )
     elapsed = time.perf_counter() - t0
     ok = any(c.get("modality") == "video" and c["bytes"] for c in res.raw) and res.audio is not None
@@ -61,6 +61,7 @@ def main():
     p.add_argument("--height", type=int, default=544)
     p.add_argument("--width", type=int, default=960)
     p.add_argument("--num-frames", type=int, default=121)
+    p.add_argument("--recipe", default="single", choices=("single", "two_stage"))
     p.add_argument("--label", default="mstar")
     p.add_argument("--out", required=True)
     args = p.parse_args()

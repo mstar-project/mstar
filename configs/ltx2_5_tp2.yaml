@@ -1,0 +1,25 @@
+model: "ltx2_5"
+
+max_seq_len: 1024
+
+# LTX-2.5 distilled, the DiT tensor-parallel over both GPUs (19 GB of weights each);
+# the Gemma-4 text encoder + connectors on rank 1, both decoders and the latent
+# upsampler on rank 0. The placement of the non-DiT nodes measured within noise of
+# the alternatives (integration notes in the PR).
+model_kwargs:
+  attention_backend: flashinfer
+  max_batch_size: 4
+  # CUDA graphs for the single-stage default, and for the two-stage recipe's
+  # 1088x1920 stage 2 (its stage 1 replays the 544x960 capture)
+  capture_shapes: [[544, 960, 121, 24]]
+  capture_refine_shapes: [[1088, 1920, 121, 24]]
+  capture_batch_sizes: [1, 2]
+
+node_groups:
+  - node_names: [dit]
+    ranks: [0, 1]
+    tp_size: 2
+  - node_names: [text_encoder]
+    ranks: [1]
+  - node_names: [vae_decoder, audio_decoder, latent_upsampler]
+    ranks: [0]
