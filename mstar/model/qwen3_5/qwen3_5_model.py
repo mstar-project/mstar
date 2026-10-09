@@ -452,7 +452,13 @@ class Qwen3_5DenseModel(Model):
             request_kwargs: dict | None = None,
         ) -> bytes:
             if modality == "text":
-                detok = self.tokenizer.decode(output)
+                ids = output.reshape(-1).tolist()
+                # the stop token ends the turn, not the reply: a client sends the
+                # reply back as an assistant message, whose template closes it.
+                # Under ignore_eos it ends nothing and stays, one chunk per token
+                if not (request_kwargs or {}).get("ignore_eos"):
+                    ids = [i for i in ids if i not in self.config.stop_token_ids]
+                detok = self.tokenizer.decode(ids)
                 return detok.encode("utf-8")
             raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
 
