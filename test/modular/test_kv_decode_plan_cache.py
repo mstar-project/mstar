@@ -201,3 +201,29 @@ def test_a_prefill_of_another_request_keeps_the_cache():
         _decode(m, ("b",), slot=1)
     assert _flat(_decode(kv, ("a", "b", "c"), slot=0)[0]) == _flat(_decode(ref, ("a", "b", "c"), slot=0)[0])
     assert kv.plan_cache_stats["miss"] == 3 and kv.plan_cache_stats["hit"] == 3
+
+
+def test_padding_rows_may_change_their_dummy_ids_between_steps():
+    """A replay's padding rows are the slot's dummy requests, so consecutive
+    steps carry different dummy ids with the same layout: the cache keys on
+    the real rows and rebuilds the padding part per step."""
+    ref = _manager(0)
+    kv = _manager(1)
+    for m in (ref, kv):
+        _prefill(m, "a", 5)
+        _prefill(m, "b", 6)
+    plans = {0: [], 1: []}
+    for t in range(6):
+        for mode, m in ((0, ref), (1, kv)):
+            rids = ("a", "b")
+            padded = rids + (f"slot{t % 2}_pad0", f"slot{t % 2}_pad1")
+            step = KVStep(segments=tuple(Segment(r, "main", 1) for r in padded))
+            bucket = BucketKey(graph_walk=WALK, bs=4, num_tokens=4)
+            ctx = StepContext(request_ids=rids, graph_walk=WALK, slot=t % 2, capture=False,
+                              slot_lease=SlotLease(slot=t % 2, bucket=bucket))
+            ctx.set_padded_rids(padded)
+            assert m.admit(step, ctx).ok
+            plans[mode].append(_flat(m.plan(step, ctx)))
+            m.commit(step, ctx)
+    assert plans[1] == plans[0]
+    assert kv.plan_cache_stats == {"hit": 5, "miss": 0, "mismatch": 0}
