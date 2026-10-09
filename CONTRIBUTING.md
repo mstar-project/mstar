@@ -18,6 +18,14 @@ General questions are welcome too — a plain issue or an email to <atindra@cs.s
 3. Run `ruff check .` (CI enforces it).
 4. Open a PR against `main`. It runs CI and gets a review before merging.
 
+### Automated review
+
+A bot posts an advisory review comment on every non-draft PR. It checks the invariants in [AGENTS.md](AGENTS.md) — the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables — and cites them by number. It is not a merge gate and a maintainer still reviews your PR. Push a fix or reply to disagree; apply the `skip-ai-review` label to turn it off for a PR. Details in [.github/review/](.github/review/).
+
+### AI-assisted contributions
+
+These are welcome, with two conditions: read [AGENTS.md](AGENTS.md) first (point your agent at it, or symlink it to whatever filename your tooling expects), and say in the PR description that AI assistance was used, which tests you ran, and what the results were. You need to understand and be able to defend every line you submit.
+
 ### CPU core tests
 
 The **CPU Core** CI job runs the graph I/O, resource runner, admission failure,

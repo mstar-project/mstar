@@ -17,11 +17,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``bagel``
      - ``ByteDance-Seed/BAGEL-7B-MoT``
      - Unified multimodal model (text + image understanding and generation).
-   * - ``chatterbox`` / ``chatterbox_turbo``
+   * - ``chatterbox`` / ``chatterbox_multilingual`` / ``chatterbox_turbo``
      - ``ResembleAI/chatterbox``, ``ResembleAI/chatterbox-turbo``
      - Zero-shot voice-cloning TTS: T3 speech-token LM (Llama-520M, or GPT-2-medium
        for Turbo) with CFG and exaggeration control, S3Gen flow-matching decoder,
-       HiFT vocoder, PerTh watermark. 24 kHz.
+       HiFT vocoder, PerTh watermark. 24 kHz. Multilingual covers 23 languages.
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
@@ -96,6 +96,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
+   * - ``waypoint``
+     - ``Overworld/Waypoint-1.5-1B``
+     - Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
+       frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.
 
 Notes
 -----
