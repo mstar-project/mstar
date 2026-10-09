@@ -92,3 +92,12 @@ def test_a_tp1_early_build_decides_on_the_spot():
     w._tp_lead_needs_marker = lambda pending, spec: False  # not a parallel node
     spec, target = w._build_speculation(_pending(), 1, _fair(), decide=True)
     assert spec is None and w.markers == [] and w.scheduler.get_next_calls == 1
+
+
+def test_the_tp_early_build_is_behind_a_knob(monkeypatch):
+    from mstar.utils.knobs import tp_early_spec
+
+    monkeypatch.delenv("MSTAR_TP_EARLY_SPEC", raising=False)
+    assert not tp_early_spec()
+    monkeypatch.setenv("MSTAR_TP_EARLY_SPEC", "1")
+    assert tp_early_spec()
