@@ -61,3 +61,4 @@ test/modular/test_qwen3_5_device_loopback.py
 test/modular/test_worker_device_loopback.py
 test/modular/test_tp_early_spec_decision.py
 test/modular/test_gc_freeze.py
+test/modular/test_qwen3_5_bucket_knobs.py
