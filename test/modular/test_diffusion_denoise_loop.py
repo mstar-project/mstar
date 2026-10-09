@@ -437,3 +437,51 @@ def test_check_stop_finds_the_schedule_under_the_engines_key():
     # the wire string is NOT the key: a lookup by it finds nothing, and the
     # scaffold warns rather than silently declining to stop
     assert info.request_id not in sub.request_states
+
+
+class ToyRefine(ToyDenoise):
+    """A loop that starts from the latents routed to it (a refinement stage)."""
+
+    def initial_loop_back(self, fwd_info, inputs, bucket_key, generator):
+        return {LATENTS: inputs["init"][0] + 0.1 * torch.randn(bucket_key[0], 4, generator=generator)}
+
+
+def test_initial_loop_back_defaults_to_seeding_from_noise():
+    sub = ToyDenoise()
+    gen = torch.Generator().manual_seed(7)
+    got = sub.prepare_inputs(WALK, _info("ra", 0, seed=7), _inputs()).tensor_inputs[LATENTS]
+    assert torch.equal(got, torch.randn(8, 4, generator=gen))
+
+
+def test_initial_loop_back_sees_the_steps_inputs_on_iteration_zero_only():
+    sub = ToyRefine()
+    init = torch.full((8, 4), 3.0)
+    first = sub.prepare_inputs(WALK, _info("rb", 0, seed=1), {**_inputs(), "init": [init]})
+    expected = init + 0.1 * torch.randn(8, 4, generator=torch.Generator().manual_seed(1))
+    assert torch.equal(first.tensor_inputs[LATENTS], expected)
+    # past iteration 0 the loop-back edge is carried as usual; "init" is not read again
+    carried = torch.zeros(8, 4)
+    later = sub.prepare_inputs(WALK, _info("rb", 1, seed=1), _inputs(carried))
+    assert torch.equal(later.tensor_inputs[LATENTS], carried)
+
+
+def test_a_second_walk_through_the_node_gets_its_own_shape_and_schedule():
+    """Two stages of one request run the node in successive walks (draft, then refine);
+    the second must not reuse the first's cached schedule or bucket."""
+    sub = ToyDenoise()
+    sub.prepare_inputs(WALK, _info("rs", 0, steps=4, tokens=8), _inputs())
+    refine = CurrentForwardPassInfo(
+        request_id="rs", graph_walk="refine", fwd_index=0, random_seed=0, max_tokens=0, rid_handle=_handle("rs"),
+        step_metadata={"tokens": 16, "num_inference_steps": 2}, dynamic_loop_iter_counts={LOOP: 0},
+    )
+    out = sub.prepare_inputs("refine", refine, _inputs())
+    state = sub.request_state(_handle("rs"))
+    assert state["num_steps"] == 2 and state["bucket_key"] == (16, 3)
+    assert out.tensor_inputs[LATENTS].shape == (16, 4)
+    assert sub.check_stop(_handle("rs"), dataclasses_replace(refine, dynamic_loop_iter_counts={LOOP: 1}), {}) == {LOOP}
+
+
+def dataclasses_replace(info, **changes):
+    import dataclasses
+
+    return dataclasses.replace(info, **changes)

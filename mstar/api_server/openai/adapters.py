@@ -789,7 +789,7 @@ class LTX25Adapter(OpenAIAdapter):
     Returns one mp4 with the generated audio muxed in as an AAC track by default;
     ``audio: false`` in ``extra_body`` asks for video alone. ``size`` ("WxH") maps to
     the model's ``width`` / ``height``; ``seed``, ``num_frames`` and ``fps`` are
-    first-class fields, and any other knobs pass through via
+    first-class fields, and the model's other knobs (``recipe``) pass through via
     ``extra_body``. No image or video conditioning yet.
     """
 
