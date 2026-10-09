@@ -846,25 +846,26 @@ class Engine:
         """The one-forward path: batched (a lease replay or ``forward_batched``)
         or a single eager request."""
         submodule_mgmt = self._submodules[batch.node_name]
-        # On the GPU thread, right before the forward: point the region runners
-        # at this batch's slot so the piecewise lease and replay agree with it.
-        submodule_mgmt.set_piecewise_slot(batch.slot or 0)
         cg_runner = submodule_mgmt.cuda_graph_runner
         lease = batch.step_context.slot_lease
         real_bs = len(batch.request_ids)
 
-        inputs = batch.inputs
-        req_info = batch.per_request_info_wrapped
-        if lease is not None:
-            inputs = cg_runner.pad_inputs(lease, inputs)
-            req_info = cg_runner.step_metadata(
-                lease, batch.request_ids, req_info
-            )
-            batch.step_context.set_padded_rids(
-                cg_runner.step_ids(lease, batch.request_ids)
-            )
-
+        committed = False
         try:
+            # On the GPU thread, right before the forward: point the region runners
+            # at this batch's slot so the piecewise lease and replay agree with it.
+            submodule_mgmt.set_piecewise_slot(batch.slot or 0)
+            inputs = batch.inputs
+            req_info = batch.per_request_info_wrapped
+            if lease is not None:
+                inputs = cg_runner.pad_inputs(lease, inputs)
+                req_info = cg_runner.step_metadata(
+                    lease, batch.request_ids, req_info
+                )
+                batch.step_context.set_padded_rids(
+                    cg_runner.step_ids(lease, batch.request_ids)
+                )
+
             admit, batch.step = self._declare_and_admit(
                 # padded: `inputs` was padded to the bucket above, and the
                 # model declares one segment per row it will run
@@ -883,6 +884,7 @@ class Engine:
                 batch.step_context, lease, batch.running_batched,
                 step=batch.step, set_launch=True,
             )
+            committed = True
             if raw is None:
                 return BatchedModelOutput(
                     per_rid_outputs={rid: {} for rid in batch.request_ids}
@@ -919,6 +921,11 @@ class Engine:
                     if self._enable_nvtx:
                         range_pop()
             return out
+        except Exception:
+            # commit never ran, so release what admit/plan still hold
+            if not committed and batch.step is not None:
+                self._runner.abort_step(batch.step)
+            raise
         finally:
             if lease is not None:
                 cg_runner.release(lease, real_bs)
@@ -947,26 +954,37 @@ class Engine:
         slot = batch.slot or 0
         steps: dict[str, SubmoduleStep] = {}
         ctxs: dict[str, StepContext] = {}
-        for i, (rid, inp) in enumerate(
-            zip(batch.request_ids, batch.inputs, strict=True)
-        ):
-            ctxs[rid] = StepContext(
-                request_ids=(rid,),
-                graph_walk=batch.step_context.graph_walk,
-                slot=slot, capture=False,
-            )
-            if i != len(batch.request_ids) - 1:
-                slot = submodule_mgmt.lease_slot()
-            # declare (here) and drive (below) are separate loops, so the
-            # region runners are pointed at the slot in both
-            submodule_mgmt.set_piecewise_slot(ctxs[rid].slot)
-            admit_outcome, steps[rid] = self._declare_and_admit(
-                batch, rids=[rid], inputs=[inp],
-                submodule=submodule_mgmt.submodule,
-                ctx=ctxs[rid], nvtx=nvtx
-            )
-            if not admit_outcome.ok:
-                return merged
+        try:
+            for i, (rid, inp) in enumerate(
+                zip(batch.request_ids, batch.inputs, strict=True)
+            ):
+                ctxs[rid] = StepContext(
+                    request_ids=(rid,),
+                    graph_walk=batch.step_context.graph_walk,
+                    slot=slot, capture=False,
+                )
+                if i != len(batch.request_ids) - 1:
+                    slot = submodule_mgmt.lease_slot()
+                # declare (here) and drive (below) are separate loops, so the
+                # region runners are pointed at the slot in both
+                submodule_mgmt.set_piecewise_slot(ctxs[rid].slot)
+                admit_outcome, steps[rid] = self._declare_and_admit(
+                    batch, rids=[rid], inputs=[inp],
+                    submodule=submodule_mgmt.submodule,
+                    ctx=ctxs[rid], nvtx=nvtx
+                )
+                if not admit_outcome.ok:
+                    # the rids admitted before this one will never run
+                    for prev in batch.request_ids[:i]:
+                        if steps[prev] is not None:
+                            self._runner.abort_step(steps[prev])
+                    return merged
+        except Exception:
+            # a raise, unlike a refusal, fails the batch: none of these will run
+            for step in steps.values():
+                if step is not None:
+                    self._runner.abort_step(step)
+            raise
 
         # Step 2: drive step, plan -> forward -> commit loop.
         # Nothing stages before here, so only this loop fences, in two places:
@@ -975,46 +993,72 @@ class Engine:
         fence = submodule_mgmt.needs_slot_fence and self._device.type == "cuda"
         slot_events: dict[int, torch.cuda.Event] = {}
 
-        for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
-            req_info = {rid: batch.per_request_info_wrapped[rid]}
-            slot = ctxs[rid].slot
-            submodule_mgmt.set_piecewise_slot(slot)
-            in_flight = slot_events.get(slot)
-            if in_flight is not None:
-                in_flight.synchronize()
+        # A raise outside the per-rid try below belongs to no one request, so
+        # it fails the batch; the loop's exits still drain and release
+        driven = 0
+        try:
+            for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
+                req_info = {rid: batch.per_request_info_wrapped[rid]}
+                slot = ctxs[rid].slot
+                submodule_mgmt.set_piecewise_slot(slot)
+                in_flight = slot_events.get(slot)
+                if in_flight is not None:
+                    in_flight.synchronize()
 
-            if nvtx:
-                range_push(f"engine.per_request.{rid}")
-            try:
-                raw, _ = self._drive_step(
-                    batch, submodule_mgmt, [rid], [inp], req_info, ctxs[rid],
-                    lease=None, running_batched=False,
-                    step=steps[rid], set_launch=not launched,
-                )
-                if raw is None:
-                    continue
-                launched = True
-                if fence:
-                    slot_events[slot] = torch.cuda.Event()
-                    slot_events[slot].record()
-
-                merged.update(self._collect_outputs(
-                    submodule_mgmt, None, raw, [inp], req_info,
-                    request_ids=[rid], step_request_ids=(rid,),
-                ))
-            finally:
                 if nvtx:
-                    range_pop()
+                    range_push(f"engine.per_request.{rid}")
+                committed = False
+                driven += 1
+                try:
+                    raw, _ = self._drive_step(
+                        batch, submodule_mgmt, [rid], [inp], req_info, ctxs[rid],
+                        lease=None, running_batched=False,
+                        step=steps[rid], set_launch=not launched,
+                    )
+                    committed = True
+                    if raw is None:
+                        continue
+                    launched = True
 
-        # Releasing `commit_done` lets the plan thread pre-plan the next batch,
-        # which stages `next_slot` while this batch's work may still be queued.
-        # Only that slot needs draining: every other one the loop touched is
-        # re-consumed a batch or more later, by which point the worker has
-        # synced on this step.
-        event = slot_events.get(submodule_mgmt.next_slot)
-        if event is not None:
-            event.synchronize()
-        batch.commit_done.set()
+                    merged.update(self._collect_outputs(
+                        submodule_mgmt, None, raw, [inp], req_info,
+                        request_ids=[rid], step_request_ids=(rid,),
+                    ))
+                except Exception as error:
+                    # fail only this rid; under TP/SP that keeps the ranks in step
+                    # only if every rank raised here
+                    logger.exception(
+                        "forward failed for request %s (node=%s, walk=%s)",
+                        rid, batch.node_name, batch.step_context.graph_walk,
+                    )
+                    batch.register_failure(rid, error)
+                    # commit never ran, so release what admit/plan still hold
+                    if not committed and steps[rid] is not None:
+                        self._runner.abort_step(steps[rid])
+                finally:
+                    # on every exit: a raise after plan can leave this slot's
+                    # staging copy queued
+                    if fence:
+                        slot_events[slot] = torch.cuda.Event()
+                        slot_events[slot].record()
+                    if nvtx:
+                        range_pop()
+        except Exception:
+            # the rids the loop never drove still hold their admitted steps
+            for rid in batch.request_ids[driven:]:
+                if steps[rid] is not None:
+                    self._runner.abort_step(steps[rid])
+            raise
+        finally:
+            # Releasing `commit_done` lets the plan thread pre-plan the next
+            # batch, which stages `next_slot` while this batch's work may still
+            # be queued. Only that slot needs draining: every other one the
+            # loop touched is re-consumed a batch or more later, by which point
+            # the worker has synced on this step.
+            event = slot_events.get(submodule_mgmt.next_slot)
+            if event is not None:
+                event.synchronize()
+            batch.commit_done.set()
         # Same optional 1-step launch throttle as _exec_single. This path is
         # always eager (never capturing), but the guard is kept for parity.
         if _ENGINE_STEP_SYNC and not torch.cuda.is_current_stream_capturing():
@@ -1290,6 +1334,10 @@ class Engine:
     ) -> None:
         submodule = self._submodules[batch.node_name].submodule
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
+            if rid in batch.failed_requests:
+                # its forward raised: no outputs to finish, and a second raise
+                # here would replace the error the client gets
+                continue
             try:
                 submodule.postprocess(
                     request_id=rid,

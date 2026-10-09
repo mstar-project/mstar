@@ -137,6 +137,11 @@ def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
 
+    # VLA: camera frames + task text, emits an action chunk. Robot state
+    # arrives in model_kwargs, not as a modality.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"action"})
+
     PREFILL_WALK = "prefill"
     ACTION_GEN_WALK = "action_gen"
 
@@ -502,6 +507,10 @@ class Pi05Model(Model):
         here so the resulting ``text_inputs`` stream matches the production
         format.
         """
+        # the LLM waits on the vision tower's img_emb, so no image would hang;
+        # before the fallback, which a server whose tokenizer failed to load runs
+        if not (kwargs.get("tensors") or {}).get("image_inputs"):
+            raise ValueError("Pi0.5 requires at least one camera image")
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             if prompt is not None:

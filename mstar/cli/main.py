@@ -159,9 +159,16 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model == "qwen3_tts_base":
         lines.append("    client.tts(\"Hello there\", reference_audio=\"ref.wav\", "
                      "ref_text=\"...\").to_wav(\"out.wav\")")
-    if model in ("pi05", "vjepa2", "vjepa2_ac"):
-        lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
-                     ("action" if model == "pi05" else "video") + "\",))")
+    if model == "pi05":
+        lines.append("    res = client.generate(text=\"pick up the block\", "
+                     "images=[\"base.png\", \"left.png\", \"right.png\"],")
+        lines.append("                          output_modalities=(\"action\",))  "
+                     "# optional: robot_state=[...]")
+    if model == "vjepa2":
+        lines.append("    res = client.generate(video=\"clip.mp4\", output_modalities=(\"video\",))")
+    if model == "vjepa2_ac":
+        lines.append("    res = client.generate(video=\"clip.mp4\", output_modalities=(\"video\",),")
+        lines.append("                          actions=[[0.0] * 7] * 32, states=[[0.0] * 7] * 32)")
     if model in ("whisper_large", "higgs_audio"):
         lines.append("    res = client.generate(text=\"\", audio=\"speech.wav\", "
                      "input_modalities=(\"audio\",\"text\"))")

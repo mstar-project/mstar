@@ -156,6 +156,11 @@ def _preprocess_video(
 class VJepa2Model(Model):
     """V-JEPA 2 model (encoder + optional predictor)."""
 
+    # Video in, predicted frames out; actions/states come in model_kwargs.
+    # Text is tolerated, not read: the benchmark sends a prompt with the video.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"video", "text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"video"})
+
     PREFILL_VIDEO = "prefill_video"
     PREFILL_VIDEO_ENCODER_ONLY = "prefill_video_encoder_only"
     PREFILL_VIDEO_ROLLOUT = "prefill_video_rollout"
@@ -672,6 +677,9 @@ class VJepa2Model(Model):
             )
             out["video_frames"] = [processed]
             logger.info("process_prompt: video_frames shape=%s", tuple(processed.shape))
+        else:
+            # text is tolerated but not read; without a video the walk hangs
+            raise ValueError("V-JEPA 2 requires a video input")
 
         if self.config.predictor_kind == "ac":
             actions = kwargs.get("actions")
@@ -1091,6 +1099,10 @@ class VJepa2ACModel(VJepa2Model):
         "num_attention_heads": 22,
         "mlp_ratio": 48 / 11,
     }
+
+    # the MPC walk adds the best-action index and the per-candidate costs
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"video", "scalar", "tensor"})
+    DEFAULT_OUTPUT_MODALITIES = ("video",)
 
     def __init__(
         self,

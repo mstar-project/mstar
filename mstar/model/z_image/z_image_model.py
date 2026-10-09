@@ -53,6 +53,10 @@ ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 
 
 class ZImageModel(Model):
+    # Text-to-image only
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"image"})
+
     def __init__(
         self,
         model_path_hf: str = Z_IMAGE_TURBO,

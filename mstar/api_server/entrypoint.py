@@ -28,6 +28,7 @@ from mstar.api_server import media_io
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.model.base import MODALITIES
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.profile.display import pretty_print_profile
@@ -39,9 +40,7 @@ from mstar.utils.orphan import watch_parent
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODALITIES = frozenset({
-    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
-})
+SUPPORTED_MODALITIES = MODALITIES
 STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
 
 NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
@@ -49,6 +48,15 @@ NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
 # rather than shared with ``mstar.client.media`` so the SDK keeps its stdlib-only
 # import contract; ``test_binary_framing.py`` asserts the two stay equal.
 BINARY_STREAM_MEDIA_TYPE = "application/vnd.mstar.frames"
+
+
+class UnsupportedModalityError(ValueError):
+    """A request asked for a modality the loaded model can't handle. Raised at
+    intake so the HTTP layer returns 400 instead of accepting it and failing
+    downstream."""
+
+    status_code = 400
+
 
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
@@ -404,16 +412,35 @@ class APIServer:
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
+        # A request that names no output gets the model's own (audio for TTS)
+        if not output_modalities:
+            output_modalities = (
+                list(self.model.default_output_modalities())
+                if self.model is not None else ["text"]
+            )
 
-        for m in input_modalities + output_modalities:
-            if m not in SUPPORTED_MODALITIES:
-                raise ValueError(f"Unsupported modality: {m!r}")
-        if "video_frame" in input_modalities:
-            raise ValueError("'video_frame' is an output-only modality")
+        # Reject at intake anything the loaded model has no encoder/decoder for.
+        # Uploads count too: the data worker loads every file_paths key
+        arrived = list(dict.fromkeys([*input_modalities, *(file_paths or {})]))
+        if self.model is not None:
+            bad = self.model.unsupported_modalities(arrived, output_modalities)
+            if bad:
+                detail = ", ".join(f"{m!r} ({direction})" for m, direction in bad)
+                raise UnsupportedModalityError(
+                    f"model {self.model_name!r} does not support: {detail}; it takes "
+                    f"{', '.join(sorted(self.model.SUPPORTED_INPUT_MODALITIES))} in and "
+                    f"{', '.join(sorted(self.model.SUPPORTED_OUTPUT_MODALITIES))} out"
+                )
+        else:
+            for m in arrived + output_modalities:
+                if m not in SUPPORTED_MODALITIES:
+                    raise UnsupportedModalityError(f"unsupported modality: {m!r}")
+        if "video_frame" in arrived:
+            raise UnsupportedModalityError("'video_frame' is an output-only modality")
         streaming_only = STREAMING_ONLY_MODALITIES.intersection(output_modalities)
         if streaming_only and not streaming:
             names = ", ".join(sorted(streaming_only))
-            raise ValueError(
+            raise UnsupportedModalityError(
                 f"Output modality {names} requires streaming=True; raw frame "
                 "chunks cannot be returned as an aggregated response."
             )
@@ -950,7 +977,8 @@ class WarmupRequest:
 
     text: str | None = None
     files: list[WarmupMedia] = field(default_factory=list)
-    output_modalities: list[str] = field(default_factory=lambda: ["text"])
+    # empty: the model's default, as on /generate
+    output_modalities: list[str] = field(default_factory=list)
     model_kwargs: dict | None = None
 
     @classmethod
@@ -960,7 +988,7 @@ class WarmupRequest:
         unknown = set(spec) - {"text", "files", "output_modalities", "model_kwargs"}
         if unknown:
             raise ValueError(f"unknown key(s) {sorted(unknown)}")
-        out_mods = spec.get("output_modalities") or ["text"]
+        out_mods = spec.get("output_modalities") or []
         if isinstance(out_mods, str):
             out_mods = [m.strip() for m in out_mods.split(",") if m.strip()]
         files = spec.get("files") or []
@@ -1032,7 +1060,7 @@ def _run_warmup_requests(server: APIServer, specs: list) -> None:
             continue
         logger.info(
             "warmup request %d/%d (%s) done in %.1f s",
-            index + 1, len(specs), ",".join(request.output_modalities),
+            index + 1, len(specs), ",".join(request.output_modalities) or "default",
             time.perf_counter() - t0,
         )
 
@@ -1195,7 +1223,8 @@ async def generate_ws(websocket: WebSocket):
         try:
             if request_id is not None and not isinstance(request_id, str):
                 raise ValueError("request_id must be a string")
-            out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or ["text"]
+            # none named: the model's default, as on /generate
+            out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or []
             text = message.get("text")
             if text is not None and not isinstance(text, str):
                 raise ValueError("text must be a string")
@@ -1288,7 +1317,7 @@ async def generate(
     text: Optional[str] = Form(None),
     files: Optional[list[UploadFile]] = File(None),
     input_modalities: Optional[str] = Form(None),
-    output_modalities: str = Form("text"),
+    output_modalities: Optional[str] = Form(None),
     streaming: bool = Form(True),
     model_kwargs: Optional[str] = Form(None),
     request_id: Optional[str] = Form(None),
@@ -1301,8 +1330,8 @@ async def generate(
             each file is inferred from its extension.
         input_modalities: Comma-separated list of input modalities.  When
             omitted, modalities are auto-detected from the provided data.
-        output_modalities: Comma-separated list of desired output modalities
-            (default ``"text"``).
+        output_modalities: Comma-separated list of desired output modalities.
+            When omitted, the model's default (e.g. ``"audio"`` for a TTS model).
         streaming: If ``True``, return an NDJSON stream of result chunks.
         model_kwargs: Optional JSON string of model-specific parameters.
         request_id: Optional client-supplied request id. When omitted, the
@@ -1313,7 +1342,7 @@ async def generate(
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
 
-    out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
+    out_mods = [m.strip() for m in (output_modalities or "").split(",") if m.strip()]
     streaming_only = STREAMING_ONLY_MODALITIES.intersection(out_mods)
     if streaming_only and not streaming:
         names = ", ".join(sorted(streaming_only))
@@ -1424,6 +1453,8 @@ async def generate(
 
     except HTTPException:
         raise
+    except UnsupportedModalityError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     finally:

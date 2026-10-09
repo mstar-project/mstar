@@ -136,6 +136,10 @@ class Qwen3_5DenseModel(Model):
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
 
+    # no video path yet (see process_prompt)
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text"})
+
     def __init__(
         self,
         model_path_hf: str,
@@ -148,8 +152,10 @@ class Qwen3_5DenseModel(Model):
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
         # None on a text-only checkpoint (`_create_submodule` then refuses a
-        # vision_encoder node)
+        # vision_encoder node, and intake refuses images)
         self.vision_config = Qwen3_5VisionConfig.from_hf_or_none(self.local_dir)
+        if self.vision_config is None:
+            self.SUPPORTED_INPUT_MODALITIES = self.SUPPORTED_INPUT_MODALITIES - {"image"}
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.local_dir,

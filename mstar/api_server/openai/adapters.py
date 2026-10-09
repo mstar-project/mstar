@@ -256,7 +256,9 @@ class OpenAIAdapter:
         raise NotImplementedError("video generation is not supported by this model")
 
     def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:  # noqa: ARG002
-        raise NotImplementedError("image editing is not supported by this model")
+        # reachable: supports_images also opens /edits, so this is a bad
+        # request (400), not a server error
+        raise ValueError("image editing is not supported by this model")
 
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("audio/transcriptions is not supported by this model")
@@ -471,8 +473,8 @@ class OmniVoiceAdapter(OpenAIAdapter):
         ref_audio = mk.pop("ref_audio", None)
         input_modalities = ["text"]
         if ref_audio:
-            # A data URL, a base64 blob, a local path or (when allowed) a URL.
-            path, _mime = media_io.resolve_media_ref(
+            # A data URL, a local path or (when allowed) a URL.
+            _, path = media_io.resolve_media_ref(
                 ref_audio, upload_dir, allow_remote=True
             )
             # Keyed by modality: the data worker iterates the dict and

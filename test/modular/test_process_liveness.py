@@ -323,6 +323,7 @@ def _pending_request():
 
 def _api_server(conductor_proc, inbox=()):
     server = object.__new__(APIServer)
+    server.model = None
     server.pending_requests = {}
     server.recently_completed = collections.OrderedDict()
     server._recently_completed_ttl = 15.0

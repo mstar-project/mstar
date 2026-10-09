@@ -33,6 +33,14 @@ test/modular/test_bagel_cfg_parallel.py
 test/modular/test_kv_publish_retrieve.py
 test/modular/test_parallel_groups.py
 test/modular/test_preplan_error_paths.py
+test/modular/test_preplan_guard.py
+test/modular/test_kv_abort_step.py
+test/modular/test_modality_validation.py
+test/modular/test_openai_router.py
+test/modular/test_generate_route.py
+test/modular/test_generate_ws.py
+test/modular/test_startup_warmup.py
+test/modular/test_worker_message_handling.py
 test/modular/test_diffusion_denoise_loop.py
 test/modular/test_diffusion_noise_stager.py
 test/modular/test_flux2_klein_model.py

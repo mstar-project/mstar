@@ -243,3 +243,14 @@ def test_uploads_are_cleaned_up(monkeypatch, tmp_path):
     assert scheduled == [fake.submitted[0]["file_paths"]]
     saved = sorted(f.name.split("_", 1)[1] for f in tmp_path.iterdir())
     assert saved == ["a.png", "b.wav"], saved
+
+
+def test_a_message_naming_no_output_gets_the_models_default(monkeypatch, tmp_path):
+    # as on /generate: submit_request fills in the model's own output
+    fake = _FakeServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"text": "a drone over a coast", "request_id": "r1"}))
+        _recv_until_finish(ws, binary=False)
+    (sub,) = fake.submitted
+    assert sub["output_modalities"] == []

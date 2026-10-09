@@ -9,9 +9,10 @@ protocol are untouched):
 
     frontend -> bridge:  {t:"submit", rid, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
-                          streaming} | {t:"abort", rid}
-    bridge -> frontend:  {t:"chunk", rid, modality, data(bin), metadata}
-                       | {t:"err", rid, msg} | {t:"done", rid}
+                          streaming} | {t:"abort", rid} | {t:"ping", rid}
+    bridge -> frontend:  {t:"ok", rid} (past intake; sent before any chunk)
+                       | {t:"chunk", rid, modality, data(bin), metadata}
+                       | {t:"err", rid, msg} | {t:"done", rid} | {t:"pong", rid}
 
 The submit shape is ``APIServer.submit_request``'s signature verbatim — the
 protocol was designed by flattening it. The bridge mesh lives in its own
@@ -119,15 +120,27 @@ class RustFrontendBridge:
                 text=msg.get("text"),
                 file_paths=msg.get("file_paths") or None,
                 input_modalities=list(msg.get("input_modalities") or []),
-                output_modalities=list(msg.get("output_modalities") or ["text"]),
+                output_modalities=list(msg.get("output_modalities") or []),
                 model_kwargs=dict(msg.get("model_kwargs") or {}),
                 streaming=bool(msg.get("streaming", True)),
                 request_id=rid,
             )
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the loop
             logger.warning("submit %s failed: %r", rid, e)
-            self._err(rid, repr(e))
+            status = getattr(e, "status_code", None)
+            if status is None:
+                self._err(rid, repr(e))
+            else:
+                # `err` is always a 500; the in-band error chunk carries the
+                # status, so an intake rejection stays a 400
+                self._send({
+                    "t": "chunk", "rid": rid, "modality": "error",
+                    "data": str(getattr(e, "detail", e)).encode(),
+                    "metadata": {"status": status},
+                })
             return
+        # past intake: a streaming response waits for this before its headers
+        self._send({"t": "ok", "rid": rid})
         asyncio.get_running_loop().create_task(self._relay(rid))
 
     async def _relay(self, rid: str) -> None:

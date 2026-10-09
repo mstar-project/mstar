@@ -241,12 +241,19 @@ def test_a_hold_on_another_walk_is_logged_inside_the_interval(monkeypatch, caplo
 class _FakeMgmt:
     """``SubmoduleManagement``'s slot rotation, as `_exec_per_request` uses it."""
 
-    def __init__(self, submodule, num_slots: int, next_slot: int, seen: list):
+    def __init__(
+        self, submodule, num_slots: int, next_slot: int, seen: list, world_size: int = 1,
+        slot_raise_at: int | None = None,
+    ):
         self.submodule = submodule
         self.num_slots = num_slots
         self.needs_slot_fence = False
+        self.joint_comm_group = SimpleNamespace(world_size=world_size)
+        # eager only: with no lease `_exec_single` never calls the runner
+        self.cuda_graph_runner = None
         self._next_slot = next_slot
         self._seen = seen
+        self._slot_raise_at = slot_raise_at
 
     @property
     def next_slot(self) -> int:
@@ -259,19 +266,28 @@ class _FakeMgmt:
 
     def set_piecewise_slot(self, slot: int) -> None:
         self._seen.append(slot)
+        if len(self._seen) == self._slot_raise_at:
+            raise RuntimeError("slot setup failed")
 
 
 class _FakeExecEngine:
     """Engine internals bound onto stubs, to drive `_exec_per_request` alone."""
 
     _exec_per_request = Engine._exec_per_request
+    _exec_single = Engine._exec_single
     _declare_and_admit = Engine._declare_and_admit
 
     def __init__(
-        self, fail_on: str | None = None, num_slots: int = 1, next_slot: int = 0,
+        self, fail_on: str | None = None, raise_on: str | None = None,
+        num_slots: int = 1, next_slot: int = 0,
+        collect_raise_on: str | None = None, world_size: int = 1,
+        slot_raise_at: int | None = None, admit_raise_on: str | None = None,
     ):
         self._enable_nvtx = False
         self._fail_on = fail_on
+        self._admit_raise_on = admit_raise_on
+        self._raise_on = raise_on
+        self._collect_raise_on = collect_raise_on
         # ordered log, so the test can assert admit-all-then-run
         self.events: list[tuple[str, str]] = []
         # which rids were driven with `set_launch` — the real path signals
@@ -282,7 +298,10 @@ class _FakeExecEngine:
         # the per-request path's slots; no fence, so no CUDA event is recorded
         self.piecewise_slots: list[int] = []
         self.run_slots: list[int] = []
-        self.mgmt = _FakeMgmt(self, num_slots, next_slot, self.piecewise_slots)
+        self.mgmt = _FakeMgmt(
+            self, num_slots, next_slot, self.piecewise_slots, world_size=world_size,
+            slot_raise_at=slot_raise_at,
+        )
         self._submodules = {"node": self.mgmt}
 
     # --- submodule surface
@@ -298,11 +317,16 @@ class _FakeExecEngine:
     def admit(self, step):
         rid = step.ctx.request_ids[0]
         self.events.append(("admit", rid))
+        if rid == self._admit_raise_on:
+            raise RuntimeError(f"admit raised for {rid}")
         if rid == self._fail_on:
             return FullAdmitOutcome(
                 AdmitOutcome(ok=False, reason=_alloc_failed(rid)), "kv",
             )
         return FullAdmitOutcome(AdmitOutcome(ok=True))
+
+    def abort_step(self, step):
+        self.events.append(("abort", step.ctx.request_ids[0]))
 
     # --- engine internals the path calls into
     def _drive_step(
@@ -317,12 +341,16 @@ class _FakeExecEngine:
             # stands in for `_forward` releasing `launch_started_event`
             self.launch_signals.append(rid)
             self.events.append(("launch", rid))
+        if rid == self._raise_on:
+            raise RuntimeError(f"forward failed for {rid}")
         self.events.append(("run", rid))
         self.run_slots.append(ctx.slot)
         return {rid: {"token": 1}}, step
 
     def _collect_outputs(self, *a, **kw):
         del a
+        if kw["request_ids"][0] == self._collect_raise_on:
+            raise RuntimeError("collect failed")
         return dict(kw["request_ids"] and {kw["request_ids"][0]: {"token": 1}})
 
 
@@ -366,6 +394,8 @@ def test_per_request_runs_nothing_when_a_later_rid_fails_admit():
     assert not any(kind == "run" for kind, _ in engine.events)
     assert out.per_rid_outputs == {"a": {}, "b": {}}
     assert isinstance(batch.admit_error, AllocationFailed)
+    # a was admitted and will never commit; b's admit was refused
+    assert [e for e in engine.events if e[0] == "abort"] == [("abort", "a")]
 
 
 def test_a_refused_batch_never_signals_the_launch():
@@ -422,3 +452,157 @@ def test_per_request_keeps_one_slot_when_the_node_is_single_buffered():
 
     assert engine.run_slots == [0, 0, 0]
     assert engine.mgmt.next_slot == 0
+
+
+def test_per_request_isolates_a_forward_error_to_the_failing_rid():
+    """A forward error is attributable to one request, not full batch: the other
+    rids in an unbatchable batch still run, and only the failing one is recorded
+    in ``failed_requests`` for the worker to drop."""
+    engine = _FakeExecEngine(raise_on="b")
+    batch = _exec_batch(["a", "b", "c"])
+
+    out = engine._exec_per_request(batch)
+
+    # a and c ran despite b's forward raising, and only b's step was aborted
+    assert [e for e in engine.events if e[0] in ("run", "abort")] == [
+        ("run", "a"), ("abort", "b"), ("run", "c"),
+    ]
+    assert out.per_rid_outputs["a"] == {"token": 1}
+    assert out.per_rid_outputs["c"] == {"token": 1}
+    assert out.per_rid_outputs["b"] == {}
+    # only b is failed
+    assert set(batch.failed_requests) == {"b"}
+    assert "RuntimeError" in batch.failed_requests["b"]
+
+
+def test_per_request_does_not_abort_a_step_that_committed():
+    """Collecting outputs runs after commit; a raise there fails the rid but
+    there is nothing left to abort."""
+    engine = _FakeExecEngine(collect_raise_on="b")
+    batch = _exec_batch(["a", "b"])
+
+    out = engine._exec_per_request(batch)
+
+    assert not any(kind == "abort" for kind, _ in engine.events)
+    assert set(batch.failed_requests) == {"b"}
+    assert out.per_rid_outputs["a"] == {"token": 1} and out.per_rid_outputs["b"] == {}
+
+
+def test_per_request_runs_on_after_a_failed_forward_on_a_sharded_node():
+    """Every rank raised on b and every rank runs c: one rank stopping here
+    would leave c's collectives unpaired on the others."""
+    engine = _FakeExecEngine(raise_on="b", world_size=2)
+    batch = _exec_batch(["a", "b", "c"])
+
+    out = engine._exec_per_request(batch)
+
+    assert [e for e in engine.events if e[0] in ("run", "abort")] == [
+        ("run", "a"), ("abort", "b"), ("run", "c"),
+    ]
+    assert out.per_rid_outputs["c"] == {"token": 1}
+    assert set(batch.failed_requests) == {"b"}
+
+
+def test_per_request_keeps_going_after_a_committed_step_on_a_sharded_node():
+    # the raise came after commit, so every rank finished b's collectives
+    engine = _FakeExecEngine(collect_raise_on="b", world_size=2)
+    batch = _exec_batch(["a", "b", "c"])
+
+    engine._exec_per_request(batch)
+
+    assert ("run", "c") in engine.events
+    assert set(batch.failed_requests) == {"b"}
+
+
+def test_per_request_releases_the_batch_when_the_loop_itself_raises():
+    """A raise outside the per-rid try (here, pointing the region runners at b's
+    slot) belongs to no one request, so it fails the batch. The way out still
+    releases the plan thread and aborts the steps the loop never drove."""
+    # three declare-loop calls, then a's slot, then b's raises
+    engine = _FakeExecEngine(slot_raise_at=5)
+    batch = _exec_batch(["a", "b", "c"])
+
+    with pytest.raises(RuntimeError, match="slot setup failed"):
+        engine._exec_per_request(batch)
+
+    assert batch.commit_done.is_set()
+    assert [e for e in engine.events if e[0] in ("run", "abort")] == [
+        ("run", "a"), ("abort", "b"), ("abort", "c"),
+    ]
+    assert not batch.failed_requests  # the worker fails the whole batch
+
+
+def test_single_aborts_a_step_whose_forward_raised():
+    """The one-forward path raises to the worker, which fails the batch; the
+    step it admitted is aborted on the way, as on the per-request path."""
+    engine = _FakeExecEngine(raise_on="a")
+    batch = _exec_batch(["a"])
+
+    with pytest.raises(RuntimeError, match="forward failed for a"):
+        engine._exec_single(batch)
+
+    assert [e for e in engine.events if e[0] in ("admit", "abort")] == [
+        ("admit", "a"), ("abort", "a"),
+    ]
+
+
+def test_single_does_not_abort_a_step_that_committed():
+    engine = _FakeExecEngine(collect_raise_on="a")
+
+    with pytest.raises(RuntimeError, match="collect failed"):
+        engine._exec_single(_exec_batch(["a"]))
+
+    assert not any(kind == "abort" for kind, _ in engine.events)
+
+
+
+def test_per_request_aborts_the_admitted_steps_when_an_admit_raises():
+    """A raise is not a refusal: the batch fails, so a's admitted step goes too
+    (b's own partial marks are the runner's to unwind)."""
+    engine = _FakeExecEngine(admit_raise_on="b")
+    batch = _exec_batch(["a", "b", "c"])
+
+    with pytest.raises(RuntimeError, match="admit raised for b"):
+        engine._exec_per_request(batch)
+
+    assert [e for e in engine.events if e[0] == "abort"] == [("abort", "a")]
+    assert not any(kind == "run" for kind, _ in engine.events)
+
+
+def test_single_releases_its_lease_when_setup_raises():
+    # pointing the region runners at the slot is the first thing that can fail
+    released = []
+    engine = _FakeExecEngine(slot_raise_at=1)
+    engine.mgmt.cuda_graph_runner = SimpleNamespace(
+        release=lambda lease, bs: released.append(bs),
+    )
+    batch = _exec_batch(["a"])
+    batch.step_context.slot_lease = object()
+
+    with pytest.raises(RuntimeError, match="slot setup failed"):
+        engine._exec_single(batch)
+
+    assert released == [1]
+
+class _TailSubmodule:
+    def __init__(self):
+        self.postprocessed: list[str] = []
+
+    def postprocess(self, request_id, request_info, outputs, inputs):
+        del request_info, inputs
+        self.postprocessed.append(request_id)
+        outputs["token"]  # an empty output can't be finished
+
+
+def test_postprocess_skips_a_rid_whose_forward_raised():
+    """The per-request path fails one rid and carries on; the tail must not run
+    over its empty outputs, which would raise again and replace its error."""
+    submodule = _TailSubmodule()
+    engine = SimpleNamespace(_submodules={"node": SimpleNamespace(submodule=submodule)})
+    batch = _exec_batch(["a", "b"])
+    batch.register_failure("b", RuntimeError("forward failed for b"))
+
+    Engine._postprocess_batch(engine, batch, {"a": {"token": 1}, "b": {}})
+
+    assert submodule.postprocessed == ["a"]
+    assert batch.failed_requests == {"b": "RuntimeError: forward failed for b"}

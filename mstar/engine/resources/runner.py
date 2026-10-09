@@ -8,7 +8,7 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from time import perf_counter
 from typing import Any
 
@@ -331,6 +331,10 @@ class StepRunner:
             t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
+            except Exception:
+                # a raise fails the step, so the marks taken above go too
+                self._abort(step, admitted)
+                raise
             finally:
                 if PHASE_PERIOD:
                     phase_record(f"res.admit.{key}", perf_counter() - t0)
@@ -345,6 +349,12 @@ class StepRunner:
                     self._resources[done].rollback_admit(
                         step.get(done), step.ctx,
                     )
+                # a staged pre-plan's pages just went back, so its stage goes
+                # too; a refused step never commits, so drop its in-flight marks,
+                # which would block offload
+                if self._staged is not None:
+                    self.clear_preplan()
+                self._abort(step, admitted)
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready
@@ -441,6 +451,18 @@ class StepRunner:
                     phase_record(f"res.commit.{key}", perf_counter() - t0)
                 if self._nvtx:
                     range_pop()
+
+    def abort_step(self, step: SubmoduleStep) -> None:
+        """the failure-path counterpart of `commit`; one resource raising
+        doesn't stop the rest"""
+        self._abort(step, self._keys_for(step))
+
+    def _abort(self, step: SubmoduleStep, keys: Iterable[str]) -> None:
+        for key in keys:
+            try:
+                self._resources[key].abort_step(step.get(key), step.ctx)
+            except Exception:
+                logger.exception("abort_step failed for resource %s", key)
 
     def publish(
         self,
