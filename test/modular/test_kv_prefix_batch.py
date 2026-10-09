@@ -26,6 +26,12 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(H.manager_mod, "KVTransferManager", H._StubTransfer)
 
 
+@pytest.fixture
+def eager(monkeypatch):
+    """Extend the chains on every step, as before the lazy batching."""
+    monkeypatch.setenv("MSTAR_KV_CHAIN_LAZY_STEPS", "1")
+
+
 def _chain_state(kv, rid):
     stream = kv._streams[rid]["main"]
     chain = stream.chain
@@ -35,8 +41,10 @@ def _chain_state(kv, rid):
             chain.unkeyed if hasattr(chain, "unkeyed") else None)
 
 
-def _run(batched: bool):
+def _run(batched: bool, lazy_steps: int | None = None, flush: bool = False):
     kv = H._manager()
+    if lazy_steps is not None:
+        kv._chain_lazy_steps = lazy_steps
     rids = ["r0", "r1"]
     prompts = {"r0": list(range(100)), "r1": list(range(50, 50 + H.PAGE_SIZE + 10))}
     for rid in rids:
@@ -67,17 +75,77 @@ def _run(batched: bool):
             for rid in rids:
                 kv.extend_prefix_chain(rid, H.NODE, H.WALK, {H.TENSOR: [torch.tensor([tokens[rid]])]})
     kv.assert_pages_conserved()
+    if flush:
+        kv.flush_chain_backlog()
     return H._indexed(kv), {rid: _chain_state(kv, rid) for rid in rids}
 
 
-def test_batched_extension_keys_the_same_pages():
+def test_batched_extension_keys_the_same_pages(eager):
     per_rid = _run(batched=False)
     batched = _run(batched=True)
     assert per_rid == batched
     assert per_rid[0] >= 3, "the generated pages were not indexed"
 
 
-def test_batched_extension_skips_rows_it_does_not_have():
+def test_lazy_extension_keys_the_same_pages_once_flushed(eager):
+    per_rid = _run(batched=False)
+    for lazy in (3, 7, H.PAGE_SIZE):
+        lazy_run = _run(batched=True, lazy_steps=lazy)
+        # the tokens of the last steps are still waiting, so flush them and
+        # compare the chains; the pages a later commit would have indexed
+        # from the eager form are a subset of what was indexed
+        assert lazy_run[0] <= per_rid[0]
+        kv_state = lazy_run[1]
+        # every chain is at most `lazy` tokens behind and never ahead
+        for rid in per_rid[1]:
+            eager_len = per_rid[1][rid][0]
+            lazy_len = kv_state[rid][0]
+            assert eager_len - lazy < lazy_len <= eager_len, (rid, lazy, eager_len, lazy_len)
+        # once the waiting steps go out the chains are the eager ones
+        flushed = _run(batched=True, lazy_steps=lazy, flush=True)
+        assert flushed[1] == per_rid[1]
+        assert flushed[0] <= per_rid[0]
+
+
+def test_lazy_extension_flushes_at_the_threshold_and_on_removal(eager):
+    kv = H._manager()
+    kv._chain_lazy_steps = 4
+    rids = ["r0", "r1"]
+    prompts = {"r0": list(range(H.PAGE_SIZE)), "r1": list(range(50, 50 + H.PAGE_SIZE))}
+    for rid in rids:
+        H._ingest(kv, rid, prompts[rid])
+        H._step(kv, rid, len(prompts[rid]))
+    before = {rid: _chain_state(kv, rid) for rid in rids}
+
+    def step(t, order):
+        rows = HostRows(request_ids=tuple(order), buffers={
+            H.TENSOR: torch.tensor([[9000 + t if r == "r0" else 9100 + t] for r in order]),
+        })
+        kv.extend_prefix_chains_batch(rids, H.NODE, H.WALK, rows)
+
+    # three steps wait in the backlog, the chains do not move
+    for t in range(3):
+        step(t, rids)
+    assert {rid: _chain_state(kv, rid) for rid in rids} == before
+    assert len(kv._chain_backlog) == 3
+    # the fourth step flushes: both runs (the rows change order at t=2) land
+    step(3, list(reversed(rids)))
+    assert kv._chain_backlog == []
+    assert _chain_state(kv, "r0")[2] == [9000, 9001, 9002, 9003]
+    assert _chain_state(kv, "r1")[2] == [9100, 9101, 9102, 9103]
+    # a removal flushes what waits before the request goes
+    step(4, rids)
+    step(5, rids)
+    kv.remove_request("r1")
+    assert kv._chain_backlog == []
+    assert _chain_state(kv, "r0")[2] == [9000, 9001, 9002, 9003, 9004, 9005]
+    assert "r1" not in kv._streams
+    # a flush with nothing waiting is a no-op
+    kv.flush_chain_backlog()
+    assert _chain_state(kv, "r0")[2] == [9000, 9001, 9002, 9003, 9004, 9005]
+
+
+def test_batched_extension_skips_rows_it_does_not_have(eager):
     kv = H._manager()
     prompt = list(range(H.PAGE_SIZE))
     H._ingest(kv, "r0", prompt)
