@@ -142,6 +142,66 @@ class WhisperDecoderModel(nn.Module):
         # proj_out is tied to embed_tokens in the HF checkpoint.
         return F.linear(hidden_states, self.embed_tokens.weight)
 
+    @torch.no_grad()
+    def cross_attention_weights(
+        self,
+        tokens: torch.Tensor,
+        encoder_states: torch.Tensor,
+        heads: list[tuple[int, int]],
+    ) -> torch.Tensor:
+        """Teacher-forced pass over one token sequence, outside the paged
+        resources, returning the cross-attention probabilities of the given
+        ``(layer, head)`` pairs: ``(len(heads), len(tokens), enc_len)``.
+
+        The same weights as the served decoder, applied with plain causal
+        self-attention and an explicit softmax over the encoder positions.
+        That is the alignment signal word-level timestamps are read from
+        (:mod:`.alignment`); one request at a time, so it stays eager.
+        """
+        wanted: dict[int, list[int]] = {}
+        for layer_idx, head_idx in heads:
+            wanted.setdefault(layer_idx, []).append(head_idx)
+        num_tokens = tokens.shape[0]
+        enc_len = encoder_states.shape[0]
+        dtype = self.embed_tokens.weight.dtype
+        encoder_states = encoder_states.to(dtype)
+        positions = torch.arange(num_tokens, device=tokens.device)
+        hidden = self.embed(tokens, positions)
+        out: list[torch.Tensor] = []
+        for layer_idx, layer in enumerate(self.layers):
+            attn = layer.self_attn
+            if attn.num_heads != attn.total_num_heads:
+                raise NotImplementedError("word timestamps need the decoder unsharded (TP=1)")
+            heads_n, head_dim = attn.num_heads, attn.head_dim
+            h = layer.self_attn_layer_norm(hidden)
+            qkv = F.linear(h, attn.qkv_proj.weight, attn.qkv_proj.bias)
+            kv_size = attn.num_kv_heads * head_dim
+            q, k, v = qkv.split([heads_n * head_dim, kv_size, kv_size], dim=-1)
+            q = q.view(num_tokens, heads_n, head_dim).transpose(0, 1)
+            k = k.view(num_tokens, attn.num_kv_heads, head_dim).transpose(0, 1)
+            v = v.view(num_tokens, attn.num_kv_heads, head_dim).transpose(0, 1)
+            a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            a = a.transpose(0, 1).reshape(num_tokens, heads_n * head_dim)
+            hidden = hidden + F.linear(a, attn.o_proj.weight, attn.o_proj.bias)
+
+            cross = layer.encoder_attn
+            h = layer.encoder_attn_layer_norm(hidden)
+            q = F.linear(h, cross.q_proj.weight, cross.q_proj.bias).view(num_tokens, heads_n, head_dim).transpose(0, 1)
+            k, v = cross.compute_kv(encoder_states)  # (enc_len, heads, head_dim)
+            k = k.transpose(0, 1)
+            v = v.transpose(0, 1)
+            scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * head_dim ** -0.5
+            probs = scores.softmax(dim=-1)  # (heads, tokens, enc_len)
+            for head_idx in wanted.get(layer_idx, []):
+                out.append(probs[head_idx])
+            a = torch.matmul(probs.to(v.dtype), v).transpose(0, 1).reshape(num_tokens, heads_n * head_dim)
+            hidden = hidden + F.linear(a, cross.out_proj.weight, cross.out_proj.bias)
+
+            h = layer.final_layer_norm(hidden)
+            hidden = hidden + layer.fc2(F.gelu(layer.fc1(h)))
+        del enc_len
+        return torch.stack(out) if out else torch.zeros(0, num_tokens, encoder_states.shape[0], device=tokens.device)
+
     def forward(
         self,
         input_embeds: torch.Tensor,

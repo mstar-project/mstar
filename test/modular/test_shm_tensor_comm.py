@@ -870,6 +870,25 @@ def test_shm_sends_the_stored_host_copy():
         assert torch.equal(_send_and_read(sender, receiver, "req1", edges), host)
 
 
+def test_a_later_send_does_not_read_a_dropped_host_copy():
+    """The stop check's host copies are views of pinned buffers the next step
+    reuses, so the worker drops them after the step's sends. A loop's
+    accumulated tokens go out when the loop ends, after that reuse."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sender = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        receiver = _make_manager(tmpdir, entity_id="worker_1", request_id="req1")
+        pinned = torch.tensor([[5, 6]])
+        stored = sender.store_and_return_tensor_info_batch(
+            ["req1"], {"req1": {"tok": [torch.tensor([[5, 6]])]}}, ["tok"],
+            cpu_tensors={"req1": {"tok": [pinned[:1]]}},
+        )
+        sender.drop_host_copies(stored.flat_uuids)  # end of the producing step
+        pinned.fill_(9)  # the next step's stop check
+        infos = [sender.tensor_store.get_info(u) for u in stored.flat_uuids]
+        edges = [GraphEdge(next_node="LLM", name="tok", tensor_info=infos)]
+        assert _send_and_read(sender, receiver, "req1", edges).tolist() == [[5, 6]]
+
+
 def test_host_copy_follows_a_renamed_output():
     """A submodule that rebinds an output under its signal name (Qwen3.5's
     ``new_token`` -> ``text_inputs``) aliases the tensor; the stop check's

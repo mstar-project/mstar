@@ -842,6 +842,8 @@ _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
 # Whisper's word timings follow the transcript after this marker, one
 # ``<|start|> word <|end|>`` per word in the same timestamp vocabulary
 _WORDS_MARKER = "<|startoflm|>"
+# Qwen3-ASR writes ``language {Name}<asr_text>{text}``
+ASR_TEXT_TAG = "<asr_text>"
 
 
 # sampling knobs the engine reads as numbers; a string there fails every
@@ -975,6 +977,76 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
         # an open segment at the end of the stream: keep its text, no end
         parts.append("".join(buffer).strip())
     return language, segments, parts, start is not None
+class Qwen3ASRAdapter(OpenAIAdapter):
+    """Qwen3-ASR: an LLM decoder that writes ``language {Name}<asr_text>{text}``
+    (or the text alone when the language is forced). Hears up to 20 minutes
+    per request, longer uploads are windowed at that; continues a hypothesis through
+    ``assistant_prefix``, which is what the realtime session needs."""
+
+    supports_transcriptions = True
+    supports_realtime_transcription = True
+    max_audio_seconds = 1200.0
+    # 2.4 is Whisper's bound for a 30 s window. The ratio grows with length,
+    # so a 20 minute transcript of ordinary speech can pass it.
+    compression_ratio_threshold = None
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        kwargs = _transcription_kwargs(req)
+        # checked here too so a streaming request gets a 400 before it starts
+        if "<|audio_pad|>" in str(kwargs.get("initial_prompt") or ""):
+            raise ValueError("the prompt must not contain <|audio_pad|>")
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=kwargs,
+        )
+
+    def realtime_step_request(self, req: TranscriptionRequest, audio_path: str, prefix: str) -> SubmitArgs:
+        args = self.transcription_to_request(req, audio_path)
+        if prefix:
+            args.model_kwargs["assistant_prefix"] = prefix
+        return args
+
+    def stream_text(self, raw: str) -> str:
+        # A detected language opens the stream as ``language X<asr_text>``.
+        # Hold the text back until the tag has arrived and show what follows
+        # it. A forced language skips the line, so plain text streams as is.
+        if ASR_TEXT_TAG in raw:
+            return raw.split(ASR_TEXT_TAG, 1)[1]
+        head = raw.lstrip()
+        if head.startswith("language") and len(head) < 40 and "\n" not in head:
+            return ""
+        return raw
+
+    def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
+        raw = text.strip()
+        if ASR_TEXT_TAG not in raw:
+            return Transcript(text=raw, language=req.language)
+        meta, body = raw.split(ASR_TEXT_TAG, 1)
+        language = None
+        for line in meta.splitlines():
+            line = line.strip()
+            if line.lower().startswith("language "):
+                language = line[len("language "):].strip() or None
+                break
+        if language and language.lower() == "none":
+            language = None
+        return Transcript(text=body.strip(), language=req.language or _qwen3_language_code(language))
+
+
+def _qwen3_language_code(name: str | None) -> str | None:
+    """The ISO code clients expect (what Whisper reports too) for a language
+    name Qwen3-ASR wrote; a name outside its list passes through."""
+    if not name:
+        return None
+    from mstar.model.qwen3_asr.config import LANGUAGE_CODES
+
+    for code, canonical in LANGUAGE_CODES.items():
+        if canonical.lower() == name.lower():
+            return code
+    return name
 
 
 class HiggsAudioAdapter(OpenAIAdapter):
@@ -1019,6 +1091,9 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_super_t2i_4step": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
     "whisper_large": WhisperAdapter(),
+    "whisper_large_v3_turbo": WhisperAdapter(),
+    "qwen3_asr": Qwen3ASRAdapter(),
+    "qwen3_asr_realtime": Qwen3ASRAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
     "flux2_klein": DiffusionImageAdapter(),
     "flux2_klein_9b": DiffusionImageAdapter(),

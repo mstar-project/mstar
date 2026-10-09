@@ -1126,6 +1126,12 @@ class TensorCommunicationManager(ABC):
     def increment_ref(self, uuid: int, n: int = 1):
         self.tensor_store.increment_ref(uuid, n=n)
 
+    def drop_host_copies(self, uuids: list[int]):
+        """Forget the host copies stored with ``uuids``. The producer reuses
+        their memory next step, so only this step's sends may read them; a
+        later send copies from the device tensor."""
+        self.tensor_store.drop_cpu_tensors(uuids)
+
     def increment_ref_batch_uniform(self, uuids: list[int], n: int = 1):
         """``increment_ref_batch`` for a uniform count, which is what the
         safety hold on a stored output batch always is."""
