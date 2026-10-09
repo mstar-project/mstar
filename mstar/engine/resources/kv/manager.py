@@ -613,6 +613,7 @@ class KVManager(AttentionResource):
         if chain.done and stream.lease is not None:
             keep, partial = divmod(chain.consumed, self.config.page_size)
             if partial:
+                # a served walk never runs again, and its last slots sit on a shared page this stream may not write
                 raise RuntimeError(
                     f"KV {self.name}: {rid}/{label}: the walks the cache served end "
                     f"inside a page ({chain.consumed} slots), so their KV cannot be kept"
