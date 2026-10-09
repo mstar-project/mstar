@@ -377,6 +377,14 @@ Worker scheduling
        the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` concurrent
        requests (default 4096, a hard cap with this on). Only with the device
        loop-back on. An experiment knob; measure before turning it on.
+   * - ``MSTAR_TP_EARLY_SPEC``
+     - ``0``
+     - Let a tensor-parallel leader build its next speculation early, during
+       the current step's postprocess, committing only once it holds a head
+       (``MSTAR_EARLY_SPEC`` covers single-GPU nodes). Off by default: with
+       the device loop-back on a 4-way group every request stalled once for
+       about 1.2 s (27B TP4 at c8: 674 vs 1009 tok/s with it off), and the
+       tensor-parallel cells are GPU-bound, so there is nothing to buy.
    * - ``MSTAR_LAUNCH_SIGNAL_AFTER_COMMIT``
      - ``0``
      - Release the thread that submitted a step only once the gpu thread
