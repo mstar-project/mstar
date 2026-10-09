@@ -111,7 +111,7 @@ def wrapper(**overrides) -> RaggedPrefillWrapper:
 
 def graph_wrapper() -> RaggedPrefillWrapper:
     return wrapper(
-        max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, use_cuda_graph=True
+        max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True
     )
 
 
@@ -249,7 +249,7 @@ def test_graph_mode_priming_survives_a_small_first_plan():
 
 def test_graph_mode_requires_bucket_bounds():
     with pytest.raises(AssertionError, match="max_num_segments required"):
-        wrapper(use_cuda_graph=True)
+        wrapper(accelerator_graph=True)
 
 
 # --- the resource ----------------------------------------------------------
@@ -384,7 +384,7 @@ def test_cg_wrapper_is_sized_by_the_config_not_the_first_plan():
     w = mgr._current_plan_states["main"]
     assert w.max_num_segments == 2 * 3
     assert w.max_total_tokens == MAX_TOKENS
-    assert w.use_cuda_graph
+    assert w.accelerator_graph
 
 
 def test_cg_wrapper_is_per_bucket_slot_and_label():

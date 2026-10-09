@@ -185,7 +185,7 @@ text anywhere in the prompt, and prefill follows the order they were written::
 Most layers are gated DeltaNet, so a request holds a recurrent-state slot as
 well as a KV allocation. Set ``gdn_state.max_slots`` in
 ``configs/qwen3_5_*.yaml`` to the concurrency you want plus one for the sink;
-CUDA-graph capture and padded replays use the sink, not slots. A slot is
+Accelerator graph capture and padded replays use the sink, not slots. A slot is
 ~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half that in bf16), hence
 not the 256-slot default. The state defaults to the checkpoint's
 ``mamba_ssm_dtype`` (fp32 for the released checkpoints, as in vLLM);
@@ -409,7 +409,7 @@ Chatterbox notes
   window stays as close to the whole-utterance decode as the full history
   does (log-mel correlation 0.988 vs 0.985 on CPU). Requests whose chunks
   are ready together share one padded flow solve (up to 8 per step).
-- S3Gen runs from CUDA graphs by default (``s3gen_graphs``): the flow solve
+- S3Gen runs from accelerator graphs by default (``s3gen_graphs``): the flow solve
   (one graph per rows x frames x steps; the estimator's hundreds of tiny
   kernels per Euler step make the eager solve launch-bound, 170 ms vs 45 ms
   for one row on an H100), the token encoder (per rows x token bucket) and
@@ -425,7 +425,7 @@ Chatterbox notes
   float32 (within 0.02-0.15 of the float32 log-mel; ``bfloat16`` is as fast
   and further off; ``float32`` is the reference path, bit-exact with the
   package at a fixed seed). ``t3_prefill_graphs`` (default on) captures T3
-  prefill as packed CUDA graphs by token bucket for batches of up to four
+  prefill as packed accelerator graphs by token bucket for batches of up to four
   requests; decode graphs are always captured. ``s3gen_graphs: false`` gives
   the eager path; ``s3gen_compile: true`` is the older alternative and turns
   the graphs off.

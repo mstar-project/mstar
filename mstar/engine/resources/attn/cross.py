@@ -340,7 +340,7 @@ class FlashInferCrossManager(CrossAttentionManager):
                     ),
                     batch_size=num_rows,
                     max_total_tokens=lease.bucket.num_tokens,
-                    use_cuda_graph=True,
+                    accelerator_graph=True,
                     **self._wrapper_kv_kwargs,
                 )
             return key, wrapper

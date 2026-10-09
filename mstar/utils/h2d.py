@@ -1,4 +1,4 @@
-"""Copy-only host-to-device staging, for work that runs beside a live CUDA graph.
+"""Copy-only host-to-device staging beside a live accelerator graph.
 
 Pre-planning builds step N+1's small tensors on the plan stream while step N's
 graph replays. Any SM work it issues (a kernel, a ``fill_``, a D2D copy) slows
@@ -63,10 +63,10 @@ class PinnedStager:
         self._numel = 0
         self._bufs: list[torch.Tensor] = []
         self._views: list[np.ndarray] = []
-        self._events: list[torch.cuda.Event | None] = [None] * depth
+        self._events: list[torch.Event | None] = [None] * depth
         self._next = 0
         self._lock = threading.Lock()
-        self._pinned = torch.cuda.is_available()
+        self._pinned = torch.accelerator.is_available()
         self._grow(numel)
 
     def _grow(self, numel: int) -> None:
@@ -107,7 +107,7 @@ class PinnedStager:
         if mirror is not None:
             values = np.asarray(values, dtype=self._np_dtype)
             key = (total, pad_value)
-        if dst.device.type != "cuda":
+        if dst.device.type not in {"cuda", "xpu"} or not self._pinned:
             host = np.asarray(values)
             dst.view(-1)[:n].copy_(torch.as_tensor(host, dtype=self.dtype))
             if pad_value is not None:
@@ -129,7 +129,7 @@ class PinnedStager:
                 view[n:total] = pad_value
             dst.view(-1)[:total].copy_(self._bufs[i][:total], non_blocking=True)
             if ev is None:
-                ev = self._events[i] = torch.cuda.Event()
-            ev.record(torch.cuda.current_stream(dst.device))
+                ev = self._events[i] = torch.Event(device=dst.device)
+            ev.record(torch.accelerator.current_stream(dst.device))
             if mirror is not None:
                 mirror.record(key, values)

@@ -191,7 +191,7 @@ class GDNManager(LinearAttnManager):
                     sm_scale=self.config.sm_scale,
                     qk_l2norm=self.config.qk_l2norm,
                     bs=bs,
-                    cuda_graph=lease is not None,
+                    accelerator_graph=lease is not None,
                     null_slot_id=null_slot_id,
                 )
             else:
@@ -203,7 +203,7 @@ class GDNManager(LinearAttnManager):
                     prefill_dtype=self._prefill_dtype,
                     bs=bs,
                     num_tokens=tok,
-                    cuda_graph=lease is not None,
+                    accelerator_graph=lease is not None,
                     has_sink_state=self._has_sink,
                     null_slot_id=null_slot_id,
                 )

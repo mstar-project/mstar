@@ -78,7 +78,7 @@ class FlashInferRaggedManager(RaggedAttnManager):
         )
         wrapper = RaggedPrefillWrapper(
             workspace_buffer=self._workspaces.get(label, lease.slot),
-            use_cuda_graph=True,
+            accelerator_graph=True,
             max_num_segments=max_segments,
             max_total_tokens=max_tokens,
             **self._kwargs,

@@ -188,3 +188,54 @@ def test_worker_output_copy_on_accelerator(graph_device, batched):
     else:
         assert host_rows is None
         torch.testing.assert_close(copied[7]["token"][0], torch.arange(16))
+
+
+def test_pinned_staging_keeps_copies_intact_across_reuse_and_growth(graph_device):
+    from mstar.utils.h2d import H2DMirror, PinnedStager
+
+    stager = PinnedStager(torch.float32, numel=2, depth=2)
+    backend = get_accelerator_graph_backend(graph_device)
+    side = backend.new_stream()
+    side.wait_stream(backend.current_stream())
+    outputs = []
+    with backend.stream_context(side):
+        for i in range(10):
+            size = 2 if i < 3 else 64
+            dst = torch.empty(size, device=graph_device)
+            stager.copy_(dst, [float(i), -float(i)], pad_value=0)
+            outputs.append(dst)
+    side.synchronize()
+    assert all(buffer.is_pinned() for buffer in stager._bufs)
+    for i, dst in enumerate(outputs):
+        expected = torch.zeros(dst.numel())
+        expected[:2] = torch.tensor([float(i), -float(i)])
+        torch.testing.assert_close(dst.cpu(), expected)
+
+    mirror = H2DMirror()
+    stager.copy_(outputs[-1], [3., 4.], pad_value=0, mirror=mirror)
+    stager.copy_(outputs[-1], [3., 4.], pad_value=0, mirror=mirror)
+    outputs[-1].fill_(9)
+    mirror.invalidate()
+    stager.copy_(outputs[-1], [3., 4.], pad_value=0, mirror=mirror)
+    backend.synchronize()
+    torch.testing.assert_close(outputs[-1][:2].cpu(), torch.tensor([3., 4.]))
+    assert outputs[-1][2:].count_nonzero().item() == 0
+
+
+def test_chatterbox_shape_graphs_keep_results_across_replays(graph_device):
+    from mstar.model.chatterbox.components.s3gen_graphs import ShapeGraphs
+
+    graphs = ShapeGraphs(lambda tensors, extra: tensors["x"] * extra[0] + 1)
+    source = torch.arange(8, device=graph_device, dtype=torch.float32)
+    first = graphs.run({"x": source}, (2,))
+    second = graphs.run({"x": source + 10}, (3,))
+    third = graphs.run({"x": source + 20}, (2,))
+    backend = get_accelerator_graph_backend(graph_device)
+    backend.synchronize()
+
+    assert not graphs.disabled
+    assert graphs.captures == 2 and graphs.replays == 3
+    host_source = torch.arange(8, dtype=torch.float32)
+    torch.testing.assert_close(first.cpu(), host_source * 2 + 1)
+    torch.testing.assert_close(second.cpu(), (host_source + 10) * 3 + 1)
+    torch.testing.assert_close(third.cpu(), (host_source + 20) * 2 + 1)
