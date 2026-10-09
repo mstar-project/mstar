@@ -13,7 +13,7 @@ from mstar.model.glm52.components.language_model import (
 )
 from mstar.model.glm52.components.rope import Glm52RotaryEmbedding
 from mstar.model.glm52.config import Glm52ModelConfig
-from mstar.model.glm52.dsa import Glm52DsaForwardContext
+from mstar.model.glm52.dsa_paged import Glm52DsaPagedContext
 
 
 class Glm52LanguageModel(nn.Module):
@@ -41,7 +41,7 @@ class Glm52LanguageModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        dsa_ctx: Glm52DsaForwardContext | None = None,
+        dsa_ctx: Glm52DsaPagedContext | None = None,
         rows: torch.Tensor | None = None,
         return_prenorm: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:

@@ -18,6 +18,19 @@ def is_full_indexer_layer(config: Glm52ModelConfig, layer_idx: int) -> bool:
     return not skip
 
 
+def full_indexer_layers(config: Glm52ModelConfig) -> list[int]:
+    """The trunk's FULL layers in order: a FULL layer's index in this list is its layer in
+    the paged index-key store."""
+    return [i for i in range(config.num_hidden_layers) if is_full_indexer_layer(config, i)]
+
+
+def index_store_layer(config: Glm52ModelConfig, layer_idx: int) -> int:
+    """A FULL layer's layer in the paged index-key store; the MTP layer's (past the
+    trunk) comes after the trunk's, as its latent plane does."""
+    full = full_indexer_layers(config)
+    return len(full) if layer_idx >= config.num_hidden_layers else full.index(layer_idx)
+
+
 def select_topk_causal(
     scores: torch.Tensor, positions: torch.Tensor, topk: int
 ) -> torch.Tensor:
@@ -83,6 +96,15 @@ class Glm52Indexer(nn.Module):
         k = self.k_norm(self.wk(hidden_states))  # (T, D)
         return self._rope_first_dims(k.unsqueeze(1), positions).squeeze(1)
 
+    def query_and_weights(
+        self, q_c: torch.Tensor, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The score's roped query heads ``(T, H, D)`` and fp32 head weights ``(T, H)``."""
+        q = self.wq_b(q_c).view(q_c.shape[0], self.n_heads, self.head_dim)
+        q = self._rope_first_dims(q, positions)
+        w = self.weights_proj(hidden_states).float() * self.weight_scale
+        return q, w
+
     def compute_selection(
         self,
         q_c: torch.Tensor,
@@ -99,9 +121,8 @@ class Glm52Indexer(nn.Module):
                 f"{int(positions.max())}; the causal window includes self"
             )
 
-        q = self.wq_b(q_c).view(num_tokens, self.n_heads, self.head_dim)
-        q = self._rope_first_dims(q, positions).float()
-        w = self.weights_proj(hidden_states).float() * self.weight_scale  # (T, H)
+        q, w = self.query_and_weights(q_c, hidden_states, positions)
+        q = q.float()
 
         # score[t, s] = sum_h w[t, h] * relu(q[t, h] . k[s]), in fp32: per-head
         # ReLU BEFORE the weighted sum; the raw weights get no softmax/sigmoid.

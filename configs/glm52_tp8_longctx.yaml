@@ -1,36 +1,55 @@
 model: "glm52"
-# GLM-5.2 TP8 with the DSA long-context path. Same box shape as
-# glm52_tp8.yaml, minus its speedups, plus the model_kwargs below.
+# GLM-5.2 TP8 past index_topk (2048) on the DSA path, with glm52_tp8.yaml's kernels.
+# Every query row keeps its top-2048 earlier tokens by the indexer's score: the index keys
+# live in a second KV resource (kv_index), selection and sparse MLA run on device, decode and
+# short prefills are captured, and a prefill longer than prefill_chunk_tokens runs the trunk
+# over row chunks.
 #
-# dsa_long_context lifts the context <= index_topk (2048) guard to
-# max_seq_len. Indexer layers then keep a per-request k-store outside the
-# paged pool: fp32 on CUDA (k_norm autocasts to fp32), ~10.75 KB/token/rank
-# across the 21 full-attention layers, ~2.1 GB/rank at 24 x 8192 tokens.
-# Decode beyond 2048 runs sparse absorbed attention over each token's
-# top-2048 latents. A request that stays within 2048 runs the dense paged
-# path, bit-identical to this config without dsa_long_context (not to
-# glm52_tp8.yaml, whose speedups change numerics); batched with a longer one it takes
-# the sparse gather instead (fp32, outside the engine's bf16 autocast): same
-# selection, but not bitwise equal to the dense path.
-#
-# Limits, both follow-ups in components/attention.py: prefill prompts must
-# still fit index_topk, and serving is eager only, since the indexer's
-# per-request host work would not replay in a captured graph.
-max_seq_len: 8192
+# KV per token per rank: 78 MLA layers x (512 + 64) x 2 B + 21 index layers x 128 x 2 B
+# ~= 93 KB. With ~96 GB/rank of weights, 8 GPUs of 141 GB hold about 300k tokens, so the
+# window is 256k (the model's own is 1M); 8 GPUs of 80 GB cannot hold the weights.
+max_seq_len: 262144
+# The KV pools below hold about one full window: they admit by prompt, and when the live
+# contexts outgrow them, decode holds requests until they time out (no eviction).
+max_concurrent_requests: 64
+# A 750 GB load outruns PyTorch's default process-group timeout.
 dist_timeout_s: 7200
-# A full-window request holds 64 pages (8191 rows): 24 of them fit the pool
-# below, so a decode step never finds it empty.
-max_concurrent_requests: 24
+# NVLS multicast all-reduce, one-shot up to 32 KiB; stays on NCCL, with a
+# warning, where NVLink multicast is unavailable.
+tp_allreduce: "symm_multimem"
+tp_allreduce_max_kb: 32768
+tp_async_sched: true
 model_kwargs:
   dsa_long_context: true
-  # Becomes config.max_seq_len: the guard bound and the KV sizing input.
-  # Must stay <= max_num_pages * page_size per rank.
-  max_seq_len: 8192
+  # the guard bound and the KV sizing input; keep it <= the pages below x page_size
+  max_seq_len: 262144
+  # rows per trunk pass of a long prefill: its activations, whatever the prompt's length
+  prefill_chunk_tokens: 8192
+  # each rank selects a block of a long prompt's rows (the indexer grows as the prompt squared)
+  dsa_shard_prefill: true
+  fused_add_rmsnorm: true
+  dense_fp8: true
+  moe_decode_kernel: true
+  moe_prefill_kernel: true
+  moe_fused_allreduce: true
+  moe_router_kernel: true
+  # glm52_tp8.yaml's prefill graphs: prompts to 4096 tokens prefill captured, several to a step
+  # (a bucket's rows select on their own); a longer prompt takes a step of its own and runs
+  # eager, in row chunks past prefill_chunk_tokens
+  prefill_token_buckets: [
+    64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
+    832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
+    1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
+  prefill_batched_token_buckets: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
+  prefill_capture_batch_sizes: [1, 4, 16]
+  prefill_max_step_tokens: "auto"
 resources:
   kv:
-    # 24 x 64 pages + the sink page the manager holds back. At 1.15
-    # KB/token/layer, ~17.7 GB/rank.
-    max_num_pages: 1537
+    # 2304 x 128-token pages = 295k tokens/rank: one full window and change
+    max_num_pages: 2304
+    page_size: 128
+  kv_index:
+    max_num_pages: 2304
     page_size: 128
 node_groups:
   - node_names: [LLM]

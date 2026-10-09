@@ -128,7 +128,12 @@ def build_cpu_resources(
     from mstar.engine.resources.kv import manager as manager_mod
     from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
     from mstar.engine.resources.kv.manager import KVManager
-    from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, SAMPLER_RESOURCE
+    from mstar.model.glm52.config import (
+        ATTN_RESOURCE,
+        INDEX_KV_RESOURCE,
+        KV_RESOURCE,
+        SAMPLER_RESOURCE,
+    )
 
     num_layers = config.num_hidden_layers + (1 if config.mtp_num_draft_tokens > 0 else 0)
     device = torch.device("cpu")
@@ -170,10 +175,71 @@ def build_cpu_resources(
                 transfer_engine_info=None, device=device, dtype=torch.float32,
             )
             attn = ReferenceAttentionResource(KV_RESOURCE)
+        index = None
+        if config.dsa_long_context:
+            from mstar.model.glm52.components.indexer import full_indexer_layers
+
+            d = config.index_head_dim
+            index = KVManager(
+                cfg=PagedKVConfig(
+                    num_layers=len(full_indexer_layers(config)) + (
+                        1 if config.mtp_num_draft_tokens > 0 else 0),
+                    num_kv_heads=1, head_dim=d,
+                    max_seq_len=config.max_seq_len, max_num_pages=max_num_pages,
+                    page_size=page_size, layout=KVLayout.MLA, kv_lora_rank=d,
+                    qk_rope_head_dim=0),
+                name=INDEX_KV_RESOURCE, joint_comm_group=None, transfer_engine_info=None,
+                device=device, dtype=torch.float32,
+            )
     finally:
         manager_mod.KVTransferManager = stub
     resources = {KV_RESOURCE: kv, ATTN_RESOURCE: attn, SAMPLER_RESOURCE: GreedySampler()}
+    if index is not None:
+        resources[INDEX_KV_RESOURCE] = index
     runner = StepRunner(resources, node_resources={"LLM": list(resources)})
     for rid in request_ids:
         runner.ingest_request(rid)
     return resources, runner
+
+
+def build_random_model(cfg, seed: int):
+    """A reduced absorbed model with EVERY parameter randomized (MoE expert containers are raw
+    ``torch.empty`` at construction — garbage in them NaNs the logits)."""
+    from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
+    from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
+    from mstar.model.glm52.quantization import process_weights_after_loading
+
+    torch.manual_seed(seed)
+    model = Glm52ForCausalLM(cfg)
+    model.model.embed_tokens.weight.data.normal_(0, 0.05)
+    model.model.norm.weight.data.normal_(1.0, 0.02)
+    model.lm_head.weight.data.normal_(0, 0.02)
+    for layer in model.model.layers:
+        a = layer.self_attn
+        for lin in (a.q_a_proj, a.q_b_proj, a.kv_a_proj_with_mqa,
+                    a.kv_b_proj, a.o_proj):
+            lin.weight.data.normal_(0, 0.03)
+        for norm in (a.q_a_layernorm, a.kv_a_layernorm):
+            norm.weight.data.normal_(1.0, 0.02)
+        if a.indexer is not None:
+            a.indexer.wq_b.weight.data.normal_(0, 0.05)
+            a.indexer.wk.weight.data.normal_(0, 0.05)
+            a.indexer.weights_proj.weight.data.normal_(0, 0.05)
+            a.indexer.k_norm.weight.data.normal_(1.0, 0.02)
+            a.indexer.k_norm.bias.data.normal_(0, 0.02)
+        layer.input_layernorm.weight.data.normal_(1.0, 0.02)
+        layer.post_attention_layernorm.weight.data.normal_(1.0, 0.02)
+        mlp = layer.mlp
+        if isinstance(mlp, Glm52SparseMoeBlock):
+            mlp.gate.weight.data.normal_(0, 1)
+            mlp.gate.e_score_correction_bias.data = torch.randn(
+                cfg.n_routed_experts, dtype=torch.float32)
+            mlp.experts.gate_up_proj.data.normal_(0, 0.05)
+            mlp.experts.down_proj.data.normal_(0, 0.05)
+            mlp.shared_expert.gate_up_proj.weight.data.normal_(0, 0.05)
+            mlp.shared_expert.down_proj.weight.data.normal_(0, 0.05)
+        else:
+            mlp.gate_up_proj.weight.data.normal_(0, 0.05)
+            mlp.down_proj.weight.data.normal_(0, 0.05)
+    process_weights_after_loading(model, torch.device("cpu"))
+    return model.eval()
