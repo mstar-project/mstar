@@ -371,15 +371,17 @@ Worker scheduling
        one and FlashInfer makes the indices copy blocking. ``0`` keeps the
        pageable arrays.
    * - ``MSTAR_KV_PLAN_CACHE``
-     - ``1``
+     - ``0``
      - The KV manager plans a captured decode step off the previous step's
        plan when the batch is the same rows in the same order and nothing
        but that step's commit touched the streams: every length is one
        more, pages change only where a row crossed a page boundary, and the
        five FlashInfer index arrays come from numpy instead of a per-row
-       Python pass (about 0.2 ms of the plan thread's step at 128 rows).
-       ``0`` plans every step from the streams. ``2`` runs both and logs a
-       difference, for checking a run.
+       Python pass. The first version measured a loss at c64/c128 on 0.8B
+       (batches change every step or two there, and a hit still rebuilt the
+       views); the reworked path keeps the views lazy and is off by default
+       until measured. ``0`` plans every step from the streams. ``2`` runs
+       both and logs a difference, for checking a run.
    * - ``MSTAR_GC_FREEZE``
      - ``1``
      - Once a process has finished its set-up (the API server and the
