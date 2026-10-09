@@ -7,10 +7,10 @@ Ported from Step-Audio2's ``CausalMaskedDiffWithXvec`` (``cosyvoice2/flow/flow.p
 
 The reference keeps its streaming caches in buffers shared by every caller. Here every
 attention layer is handed a ``KVCache`` saying where its keys|values live: ``DenseKV`` over a
-request's own cache tensor (any window, one request), or ``PoolKV`` straight over the rows of a
-slot pool (a batch of steady-state windows, gathered and scattered by slot index, so it can be
-captured). Ops, operand layouts and concatenation orders follow the reference so the result is
-bit-identical: the conformer appends new keys after its cache, the DiT puts them in front of it.
+request's own cache tensor (any window, one request; ops, operand layouts and concatenation
+orders follow the reference so the result is bit-identical), ``PoolKV`` straight over the rows
+of a slot pool (the conformer's caches for a batch of windows, gathered and scattered by slot
+index so it can be captured), or ``RingKV`` (the DiT's caches on the pool, updated in place).
 
 Classifier-free guidance runs the conditional and unconditional rows of a request side by side
 (rows ``2b`` and ``2b + 1``), which is also how the DiT caches store them.
@@ -116,6 +116,94 @@ class PoolKV(KVCache):
             for half, part in ((slice(0, d), k), (slice(d, 2 * d), v)):
                 part = part[:, :, keep].unflatten(0, rows)
                 self.view[..., dst:dst + part.shape[-2], half].index_copy_(0, self.slots, part)
+
+
+class RingKV(KVCache):
+    """A DiT layer's cache for a batch of windows on the slot pool, in place.
+
+    The reference attends ``[new, old]`` and then keeps the first ``2P`` entries and a fixed
+    ``2P..2P+100`` tail. Followed through the windows, the head is the newest generated
+    frames then a shrinking prefix of the voice prompt's, dropping from its end, and the rest
+    is always a slice of the voice's own cache: ``voice[2P - n : 2P]`` with ``n = length -
+    2P`` (0, 50, then 100). DiT attention has no mask and no positions, so only that multiset
+    matters, not its order: the head lives in a ring of ``2P`` frames per slot (``view [S, 2,
+    H, >= 2P, 2d]``) whose newest chunk starts at the slot's ``head`` index, and the tail is
+    read from the voice (``voice [2, H, >= 2P, 2d]``). A window writes only its own frames, at
+    ``[head - T, head)`` mod ``2P``, which is exactly what the reference drops; the caller
+    moves ``head`` once per window (``advance_heads``). A request's first window reads the
+    voice as its ring (``fresh``) and copies it into the slot before writing."""
+
+    def __init__(
+        self,
+        view: torch.Tensor,
+        heads: torch.Tensor,
+        slots: torch.Tensor,
+        voice: torch.Tensor,
+        prompt_frames: int,
+        length: int,
+        fresh: bool,
+        write: bool,
+    ):
+        self.view = view
+        self.heads = heads
+        self.slots = slots
+        self.voice = voice
+        self.p2 = prompt_frames
+        self.length = length
+        self.fresh = fresh
+        self.write_back = write
+
+    def keys_values(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The cached entries ``[2B, H, 2P + n, 2d]``: the ring (or the voice, fresh) then the
+        voice's tail."""
+        b, p2 = self.slots.shape[0], self.p2
+        if self.fresh:
+            ring = self.voice[None, :, :, :p2].expand(b, -1, -1, -1, -1)
+        else:
+            ring = self.view[:, :, :, :p2].index_select(0, self.slots)
+        tail = self.voice[None, :, :, p2 - (self.length - p2):p2].expand(b, -1, -1, -1, -1)
+        return torch.cat([ring, tail], dim=3).flatten(0, 1).chunk(2, dim=-1)
+
+    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """The CUDA path: attention straight over the ring and the voice (Triton), then this
+        window's ``k, v`` into the ring. Returns ``[2B, T, H, d]``."""
+        from mstar.model.minicpm_o.components.token2wav_kernels import ring_attention, ring_store
+
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        out = ring_attention(q, k, v, self.view, self.slots, self.voice, self.p2,
+                             self.length - self.p2, self.fresh)
+        if self.write_back:
+            if self.fresh:
+                b = self.slots.shape[0]
+                self.view[:, :, :, :self.p2].index_copy_(
+                    0, self.slots, self.voice[None, :, :, :self.p2].expand(b, -1, -1, -1, -1))
+            ring_store(k, v, self.view, self.slots, self.heads, self.p2, self.fresh)
+        return out
+
+    def ring_positions(self, frames: int) -> torch.Tensor:
+        """``[B, frames]`` ring indices this window's frames go to."""
+        head = torch.zeros_like(self.slots) if self.fresh else self.heads.index_select(0, self.slots).long()
+        offsets = torch.arange(frames, device=self.slots.device) - frames
+        return (head[:, None] + offsets[None, :]) % self.p2
+
+    def store(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        """This window's ``k, v [2B, H, T, d]`` into the ring."""
+        if not self.write_back:
+            return
+        b = self.slots.shape[0]
+        if self.fresh:
+            self.view[:, :, :, :self.p2].index_copy_(
+                0, self.slots, self.voice[None, :, :, :self.p2].expand(b, -1, -1, -1, -1))
+        new = torch.cat([k, v], dim=-1).unflatten(0, (b, 2))  # [B, 2, H, T, 2d]
+        pos = self.ring_positions(new.shape[3])
+        self.view[self.slots[:, None], :, :, pos] = new.permute(0, 3, 1, 2, 4)
+
+    @staticmethod
+    def advance_heads(heads: torch.Tensor, slots: torch.Tensor, frames: int, prompt_frames: int,
+                      fresh: bool) -> None:
+        """After a window's last layer: the newest chunk now starts ``frames`` earlier."""
+        head = torch.zeros_like(slots) if fresh else heads.index_select(0, slots).long()
+        heads.index_copy_(0, slots, ((head - frames) % prompt_frames).to(heads.dtype))
 
 
 def rel_position_table(d_model: int, max_len: int = 5000) -> torch.Tensor:
@@ -359,6 +447,14 @@ class DiTAttention(nn.Module):
         q = self.q_norm(self._heads(self.to_q(x)))
         k = self.k_norm(self._heads(self.to_k(x)))
         v = self._heads(self.to_v(x))
+        if isinstance(kv, RingKV):
+            if q.is_cuda:
+                x = kv.attend(q, k, v)  # [b, t, H, d]
+                return self.proj(x.reshape(b, t, -1))
+            k_cache, v_cache = kv.keys_values()
+            x = F.scaled_dot_product_attention(q, torch.cat([k, k_cache], dim=2), torch.cat([v, v_cache], dim=2))
+            kv.store(k, v)
+            return self.proj(x.transpose(1, 2).reshape(b, t, -1))
         cached = kv.read()
         if cached is not None:
             k_cache, v_cache = cached.chunk(2, dim=3)
@@ -478,6 +574,10 @@ class DiT(nn.Module):
         """``x, mu, cond [N, 80, T]``, ``spks [N, 80]``; ``mods [depth, 9, r, 1, 512]`` /
         ``final_mod [2, r, 1, 512]`` the step's time modulations (``ChunkCFM.constants``),
         ``cnn_cache [depth, N, 1024, 2]`` and ``kv`` (one per block) its caches."""
+        if x.is_cuda and kv and isinstance(kv[0], RingKV):
+            from mstar.model.minicpm_o.components.token2wav_kernels import dit_forward
+
+            return dit_forward(self, x, mu, mods, final_mod, spks, cond, cnn_cache, kv)
         x = torch.cat([x, mu, spks.unsqueeze(-1).expand(-1, -1, x.shape[-1]), cond], dim=1)
         x = self.in_proj(x.transpose(1, 2))
         for i, block in enumerate(self.blocks):

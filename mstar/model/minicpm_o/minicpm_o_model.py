@@ -98,7 +98,7 @@ TTS_DECODE_LOOP = "tts_decode_loop"
 TTS_SAMPLING = TTSSampling()
 
 # Voices shipped in the checkpoint's assets, by the name a request picks.
-# The vocoder's per-request state grows with the longest voice prompt (~0.6 GB
+# The vocoder's per-request state grows with the longest voice prompt (~0.4 GB
 # a request for this 6 s clip), so the checkpoint's 11 s and 17 s system
 # voices are left out.
 VOICES = {"default": "HT_ref_audio.wav"}
@@ -264,27 +264,27 @@ class MiniCPMOModel(Model):
                 config=RecurrentStateConfig(
                     num_layers=1,
                     blocks={
-                        name: RecurrentBlockConfig(shape=shape, dtype=torch.float32)
-                        for name, shape in self._t2w_block_shapes().items()
+                        name: RecurrentBlockConfig(shape=block.shape, dtype=block.dtype)
+                        for name, block in self._t2w_slot_layout().items()
                     },
-                    # ~0.6 GB a slot (one speaking request) for the bundled
+                    # ~0.4 GB a slot (one speaking request) for the bundled
                     # voices; `t2w_state.max_slots` in the yaml sizes it
                     max_slots=T2W_DEFAULT_SLOTS,
                 ),
             ),
         ]
 
-    def _t2w_block_shapes(self) -> dict[str, tuple[int, ...]]:
+    def _t2w_slot_layout(self) -> dict:
         """Token2wav's per-request slot, sized for the longest bundled voice."""
         import soundfile as sf
 
-        from mstar.model.minicpm_o.components.token2wav import CacheCapacity, state_block_shapes
+        from mstar.model.minicpm_o.components.token2wav import CacheCapacity, slot_layout
 
         seconds = max(
             sf.info(str(Path(self.local_dir) / "assets" / f)).duration for f in VOICES.values()
         )
         # the s3 tokenizer runs at 25 Hz; one token of slack for rounding
-        return state_block_shapes(CacheCapacity(int(seconds * 25) + 1))
+        return slot_layout(CacheCapacity(int(seconds * 25) + 1))
 
     def _tts_resources(self) -> list[NodeResourceSpec]:
         tts = self.tts_config

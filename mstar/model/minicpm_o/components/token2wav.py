@@ -18,11 +18,12 @@ so they are host integers, and every shape an eager call sees is a slice of the 
 A voice's full non-last windows enter their caches at one of three lengths (the first window,
 the second, and every later one; ``window_phase``), and its last window writes no caches.
 ``Token2Wav.window_spectrum`` runs a batch of windows of one such entry state directly on the
-rows of a slot pool, gathering each layer's cache by slot index and scattering the
-already-truncated result back, with fixed shapes and no host syncs, so it can be captured per
-(voice, phase, batch size); ``window_finish`` does the inverse STFT and cross-fade after it. One
-row is bit-identical to ``stream``; more rows differ only by the GEMMs' batch-size-dependent
-kernels.
+rows of a slot pool with fixed shapes and no host syncs, so it can be captured per (voice,
+phase, batch size); ``window_finish`` does the inverse STFT and cross-fade after it. The
+conformer's caches are gathered by slot index and scattered back already truncated; the
+DiT's live in a per-slot ring updated in place (``RingKV``), and on CUDA its blocks run on
+fused kernels (``token2wav_kernels``). The result matches ``stream`` to summation order (the
+DiT attends the same keys in another order) and, on CUDA, TF32.
 
 Randomness: the flow's initial noise is a slice of a fixed buffer (``ChunkCFM.rand_noise``),
 and HiFT draws its excitation per call (``StepAudioHiFT``) from the global RNG unless given a
@@ -59,6 +60,7 @@ from mstar.model.minicpm_o.components.token2wav_flow import (
     DenseKV,
     KVCache,
     PoolKV,
+    RingKV,
     Token2WavFlow,
 )
 from mstar.model.minicpm_o.components.voice_prompt import (
@@ -230,18 +232,28 @@ class Token2WavState:
 _BATCH_AXIS = {"enc_cnn": 0, "enc_kv1": 1, "enc_kv2": 1, "hift_mel": 0, "hift_source": 0, "hift_speech": 0}
 
 
-def state_block_shapes(capacity: CacheCapacity) -> dict[str, tuple[int, ...]]:
-    """Per-request slot layout for voices of up to ``capacity.prompt_tokens`` tokens."""
+class SlotBlock(NamedTuple):
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
+def slot_layout(capacity: CacheCapacity) -> dict[str, SlotBlock]:
+    """Per-request slot of the batched path, for voices of up to ``capacity.prompt_tokens``
+    tokens: ``Token2WavState``'s tensors without their batch axes, except that the DiT
+    caches are a ring of ``2P`` frames (``RingKV``) with its ``dit_head`` index."""
     meta = Token2WavState.allocate(capacity, "meta")
-    shapes = {}
+    layout = {}
     for f in fields(Token2WavState):
         t = getattr(meta, f.name)
         if isinstance(t, torch.Tensor):
             shape = list(t.shape)
             if f.name in _BATCH_AXIS:
                 del shape[_BATCH_AXIS[f.name]]
-            shapes[f.name] = tuple(shape)
-    return shapes
+            if f.name == "dit_kv":
+                shape[-2] = UP_RATE * capacity.prompt_tokens
+            layout[f.name] = SlotBlock(tuple(shape), torch.float32)
+    layout["dit_head"] = SlotBlock((1,), torch.int32)
+    return layout
 
 
 def state_from_slot(blocks: dict[str, torch.Tensor], lengths: dict[str, int]) -> Token2WavState:
@@ -462,7 +474,7 @@ class Token2Wav(nn.Module):
         """The flow, and HiFT up to its output spectrum, for ``B`` windows of one voice that
         enter their caches at the same ``lengths`` (``state_lengths``), straight on the slot
         pool. ``blocks`` maps each ``Token2WavState`` field to its pool tensor ``[max_slots,
-        *state_block_shapes]``, ``slots [B]`` (int, device) the rows' slots (padding rows may
+        *slot_layout]``, ``slots [B]`` (int, device) the rows' slots (padding rows may
         share a sink slot), ``tokens [B, n]``.
 
         A request's first window (``calls == 0``) reads the voice's initial state and writes
@@ -489,11 +501,15 @@ class Token2Wav(nn.Module):
 
         kv1 = [kv("enc_kv1", (i,), lengths["enc_len1"], plan.enc_kv1) for i in range(ENC_BLOCKS)]
         kv2 = [kv("enc_kv2", (i,), lengths["enc_len2"], plan.enc_kv2) for i in range(ENC_UP_BLOCKS)]
+        p2, heads = lengths["prompt_frames"], blocks["dit_head"][:, 0]
         dit_kv = [
-            [kv("dit_kv", (step, i), lengths["dit_len"], plan.dit_kv) for i in range(DIT_DEPTH)]
+            [RingKV(blocks["dit_kv"][:, step, i], heads, slots, voice.initial.dit_kv[step, i],
+                    p2, lengths["dit_len"], fresh, write=not last) for i in range(DIT_DEPTH)]
             for step in range(N_TIMESTEPS)
         ]
         mel = self.flow(tokens, voice.spk.expand(b, -1), None, last, enc_cnn, kv1, kv2, dit_cnn, dit_kv)
+        if not last:
+            RingKV.advance_heads(heads, slots, mel.shape[2], p2, fresh)
 
         if fresh:
             hift_mel, cache_source = mel, None

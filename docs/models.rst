@@ -165,6 +165,37 @@ needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
 via ``extra_body``.
 
+MiniCPM-o 4.5 (``minicpm_o``)
+------------------------------
+
+Text, image and audio in; text, or text and speech (24 kHz), out, as upstream's
+half-duplex ``chat()``: the LLM (Qwen3-8B) writes the whole reply, a Llama TTS
+reads it into speech codes, and a flow-matching vocoder (Step-Audio2's token2wav)
+streams audio as the codes arrive. Ask for speech with ``output_modalities``
+including ``"audio"``; the bundled ``default`` voice (the checkpoint's
+``HT_ref_audio``) is the only one. As upstream does, a spoken reply's system
+message carries the voice's reference clip; ``voice_prompt: false`` in the
+request's kwargs uses the request's ``system_prompt`` instead (the reply is still
+in the voice), which is what vllm-omni sends and shortens the speech by ~11% for
+the same text. Interleaved text/speech generation (upstream's
+``streaming_generate``), video input and full duplex are not supported.
+
+``configs/minicpm_o.yaml`` runs everything on one GPU in three workers
+(``rank_devices``): the LLM with the image and audio encoders, the TTS, and the
+vocoder, so a vocoder step never holds up the TTS's or the LLM's. Each spoken
+reply holds a vocoder slot (``t2w_state``, ~0.4 GiB) from its first audio to its
+last; size ``t2w_state.max_slots`` to the concurrent spoken replies you want plus
+one, since a reply waits for a slot before its first audio. Run it under CUDA MPS
+when the GPU is busy (see *Several workers on one GPU* in :doc:`serving`): on an
+H100 at 32 concurrent spoken replies it raised throughput from 50 to 71 audio
+seconds per second.
+
+The vocoder's batched path keeps each request's DiT caches as a ring in its slot
+and runs the DiT on fused Triton kernels (TF32), matching the per-request
+reference path to summation order; the per-request path reproduces upstream bit
+for bit at full fp32. The ``minicpm_o`` extra installs ``onnx``, used only to read
+the voice-prompt tokenizer's and speaker encoder's weights out of the checkpoint.
+
 Kokoro notes
 ------------
 

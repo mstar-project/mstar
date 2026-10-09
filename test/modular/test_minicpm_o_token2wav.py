@@ -28,7 +28,7 @@ from mstar.model.minicpm_o.components.token2wav import (
     fade_in_out,
     lengths_after,
     num_windows,
-    state_block_shapes,
+    slot_layout,
     state_from_slot,
     state_lengths,
     stream_windows,
@@ -240,38 +240,66 @@ def test_lengths_after_matches_state(random_token2wav):
         assert state_lengths(st) == want
 
 
-def test_batched_windows_on_pool(random_token2wav):
-    """Every window of an utterance batched on pool slots: one row is bit-identical to
-    ``stream`` (samples, and the slot against the state after every window: first window
-    read from the voice, truncation, last window), and two rows agree with it to the
-    batch-size dependence of the GEMMs."""
+def _assert_same_frames(a: torch.Tensor, b: torch.Tensor, tol: float = 1e-2) -> None:
+    """``[..., L, 2d]`` caches holding the same L frames in any order: every frame of each
+    has a match in the other (frames are ~10 apart; tol is summation-order drift)."""
+    assert a.shape == b.shape
+    a, b = a.flatten(0, -3), b.flatten(0, -3)
+    for i in range(a.shape[0]):
+        d = torch.cdist(a[i], b[i])
+        worst = max(d.min(dim=1).values.max().item(), d.min(dim=0).values.max().item())
+        assert worst < tol, (i, worst)
+
+
+@pytest.mark.parametrize("device", [
+    "cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+])
+def test_batched_windows_on_pool(random_token2wav, device):
+    """Every window of an utterance batched on pool slots, the DiT ring wrapping several
+    times: one row matches ``stream`` (samples; the slot against the reference state after
+    every window, the DiT caches as a multiset since only that enters attention), to the
+    summation order of attending the same keys in another order; two rows agree with it to
+    the batch-size dependence of the GEMMs."""
+    import copy
+
     from mstar.model.chatterbox.components.s3gen_hift import HiFTNoise
 
-    model = random_token2wav
+    model = copy.deepcopy(random_token2wav).to(device)
+    # the CUDA path's attention kernel multiplies in TF32, as served
+    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=1e-3)
     p = 50
     torch.manual_seed(1)
     voice = model.prepare_voice(VoicePrompt(
-        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32), spk_emb=torch.randn(1, 192),
-        mel=torch.randn(1, 2 * p, 80),
+        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32).to(device),
+        spk_emb=torch.randn(1, 192).to(device), mel=torch.randn(1, 2 * p, 80).to(device),
     ))
-    shapes = state_block_shapes(CacheCapacity(p))
-    blocks = {name: torch.zeros((3, *shape)) for name, shape in shapes.items()}
-    codes = [torch.randint(0, 6561, (90,)).tolist() for _ in range(2)]
-    wins = [list(stream_windows(c)) for c in codes]  # 4 windows each, the last of 18 tokens
+    one, two = torch.tensor([1], device=device), torch.tensor([1, 2], device=device)
+    layout = slot_layout(CacheCapacity(p))
+    blocks = {name: torch.zeros((3, *blk.shape), dtype=blk.dtype, device=device) for name, blk in layout.items()}
+    codes = [torch.randint(0, 6561, (215,)).tolist() for _ in range(2)]
+    wins = [list(stream_windows(c)) for c in codes]  # 9 windows each, the last of 18 tokens
     gen = torch.Generator().manual_seed(9)
 
     def noise(rows, calls, win, last):
         frames = window_frames(len(win), last) + (0 if calls == 0 else 8)
-        return model.hift.m_source.draw_noise(rows, frames * 480, torch.float32, "cpu", gen)
+        nz = model.hift.m_source.draw_noise(rows, frames * 480, torch.float32, "cpu", gen)
+        return HiFTNoise(phase=nz.phase.to(device), harmonic=nz.harmonic.to(device))
 
     def check_slot(slot, st):
-        view = state_from_slot({n: t[slot] for n, t in blocks.items()}, state_lengths(st))
-        for name in shapes:
+        fields_ = {n: t[slot] for n, t in blocks.items() if n != "dit_head"}
+        view = state_from_slot(fields_, state_lengths(st))
+        for name in fields_:
             a, b = getattr(view, name), getattr(st, name)
-            n = {"enc_kv1": st.enc_len1, "enc_kv2": st.enc_len2, "dit_kv": st.dit_len}.get(name)
+            if name == "dit_kv":
+                p2, n = st.prompt_frames, st.dit_len
+                tail = voice.initial.dit_kv[..., p2 - (n - p2):p2, :]
+                a = torch.cat([a[..., :p2, :], tail], dim=-2)
+                _assert_same_frames(a, b[..., :n, :], tol=1e-2 if device == "cpu" else 0.5)
+                continue
+            n = {"enc_kv1": st.enc_len1, "enc_kv2": st.enc_len2}.get(name)
             if n is not None:
                 a, b = a[..., :n, :], b[..., :n, :]
-            assert torch.equal(a, b), name
+            torch.testing.assert_close(a, b, **tol, msg=name)
 
     ref = model.new_state(voice)
     lengths = state_lengths(voice.initial)
@@ -279,12 +307,13 @@ def test_batched_windows_on_pool(random_token2wav):
     for win, last in wins[0]:
         nz = noise(2, lengths["calls"], win, last)
         row0 = HiFTNoise(phase=nz.phase[:1], harmonic=nz.harmonic[:1])
-        mel = model.flow_chunk(ref, voice, torch.tensor([win], dtype=torch.int32), last)
+        mel = model.flow_chunk(ref, voice, torch.tensor([win], dtype=torch.int32, device=device), last)
         want = model.vocode_chunk(ref, mel, last, noise=row0)
-        tokens = torch.tensor([win], dtype=torch.int32)
-        out = model.window_spectrum(blocks, torch.tensor([1]), voice, lengths, tokens, last, row0)
-        got = model.window_finish(blocks, torch.tensor([1]), out["magnitude"], out["phase"], lengths, last)
-        assert torch.equal(got, want) and torch.equal(out["mel"], mel)
+        tokens = torch.tensor([win], dtype=torch.int32, device=device)
+        out = model.window_spectrum(blocks, one, voice, lengths, tokens, last, row0)
+        got = model.window_finish(blocks, one, out["magnitude"], out["phase"], lengths, last)
+        torch.testing.assert_close(out["mel"], mel, **tol)
+        torch.testing.assert_close(got, want, **tol)
         if not last:
             check_slot(1, ref)
         lengths = lengths_after(lengths, len(win), last)
@@ -295,9 +324,9 @@ def test_batched_windows_on_pool(random_token2wav):
         t.zero_()
     lengths = state_lengths(voice.initial)
     for k, ((w0, last), (w1, _)) in enumerate(zip(wins[0], wins[1], strict=True)):
-        tokens = torch.tensor([w0, w1], dtype=torch.int32)
-        out = model.window_spectrum(blocks, torch.tensor([1, 2]), voice, lengths, tokens, last, noises[k])
-        torch.testing.assert_close(out["mel"][:1], mels[k], rtol=1e-4, atol=1e-4)
+        tokens = torch.tensor([w0, w1], dtype=torch.int32, device=device)
+        out = model.window_spectrum(blocks, two, voice, lengths, tokens, last, noises[k])
+        torch.testing.assert_close(out["mel"][:1], mels[k], **tol)
         lengths = lengths_after(lengths, len(w0), last)
 
 

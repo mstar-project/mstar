@@ -762,9 +762,9 @@ class Token2WavSubmodule(NodeSubmodule):
     and cross-fade stay eager. A last window after the steady phase has one
     of 25 lengths, each its own one-row capture (``t2w/<voice>/last<n>``);
     other last windows (replies under three windows) run eagerly, batched by
-    length. One row at a time it is bit-exact against the
-    reference at full fp32 matmul precision; batched rows differ by GEMM
-    kernel choice.
+    length. The per-request ``Token2Wav.stream`` path is bit-exact against
+    the reference at full fp32; this batched path attends the DiT's cache
+    in another order and runs its blocks on fused TF32 kernels.
     """
 
     WINDOW_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]

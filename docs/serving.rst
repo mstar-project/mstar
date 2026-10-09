@@ -257,6 +257,24 @@ never waits for a light node's steps on its worker loop (a TTS talker and its co
      - {node_names: [Codec], ranks: [1]}
    rank_devices: {1: 0}
 
+Workers sharing a GPU are separate processes, so without CUDA MPS the GPU time-slices
+between them rather than running their kernels side by side; a node stepping at small
+batch (an LLM decoding the last few requests of a burst) then takes GPU time out of
+proportion to its work. A user-level MPS daemon lets their kernels overlap:
+
+.. code-block:: bash
+
+   export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_$USER/pipe CUDA_MPS_LOG_DIRECTORY=/tmp/mps_$USER/log
+   CUDA_VISIBLE_DEVICES=0 nvidia-cuda-mps-control -d     # one daemon per physical GPU
+   mstar serve <model> --config <split config> --gpus 0   # same two variables exported
+
+MPS clients see the daemon's GPU as device 0 whatever its physical index, so start one
+daemon per GPU and give each server ``--gpus 0`` with that daemon's pipe directory. CUPTI
+(and so Nsight Systems kernel traces) sees nothing from MPS clients; profile without it.
+Measured gains are per model: MiniCPM-o's three-worker config went from 50 to 71 audio
+seconds per second at 32 concurrent spoken replies, Qwen3-TTS's split config about a
+fifth.
+
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
 
