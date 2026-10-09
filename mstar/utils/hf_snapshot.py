@@ -9,13 +9,19 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def resolve_snapshot_dir(model_path_hf: str, cache_dir: str | None = None) -> Path:
+def resolve_snapshot_dir(
+    model_path_hf: str, cache_dir: str | None = None, allow_patterns: list[str] | None = None,
+) -> Path:
     """Local snapshot directory of a pipeline repo: a local path is used as-is,
     a hub id resolves through the HF cache (configs + weights of every
-    component, offline when ``HF_HUB_OFFLINE`` is set)."""
+    component, offline when ``HF_HUB_OFFLINE`` is set).
+
+    ``allow_patterns`` limits a download to the components the model serves, for
+    repos that ship alternatives (a second transformer, a prompt enhancer) the
+    deployment never loads."""
     local = Path(model_path_hf)
     if local.is_dir():
         return local
     from huggingface_hub import snapshot_download
 
-    return Path(snapshot_download(model_path_hf, cache_dir=cache_dir))
+    return Path(snapshot_download(model_path_hf, cache_dir=cache_dir, allow_patterns=allow_patterns))

@@ -22,6 +22,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.compile_utils import ExactOps, compile_transformer_forward
 from mstar.model.components.diffusion.decode_utils import (
     VAE_DECODE_BATCH_SIZES,
@@ -42,7 +43,7 @@ from mstar.model.components.diffusion.image_io import (
 )
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
 from mstar.model.flux2_klein.config import Flux2KleinConfig
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
@@ -81,22 +82,11 @@ def shape_from_metadata(config: Flux2KleinConfig, step_metadata: dict) -> KleinS
     )
 
 
-class _BatchedRows:
-    """``forward_batched`` for nodes whose ``forward`` already takes a stacked batch and
-    returns one output per row: split the rows back out by request id."""
-
-    output_key: str
-
-    def forward_batched(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs):
-        out = self.forward(graph_walk, engine_inputs=engine_inputs, **kwargs)[self.output_key][0]
-        return {rid: {self.output_key: [out[i:i + 1]]} for i, rid in enumerate(engine_inputs.request_ids)}
-
-
 # ---------------------------------------------------------------------------
 # text_encoder
 # ---------------------------------------------------------------------------
 
-class KleinTextEncoderSubmodule(_BatchedRows, NodeSubmodule):
+class KleinTextEncoderSubmodule(BatchedRows, NodeSubmodule):
     """Qwen3 hidden-state taps over the chat-templated, 512-token right-padded prompt.
 
     Every request has the same token count, so the node batches unconditionally:
@@ -106,7 +96,8 @@ class KleinTextEncoderSubmodule(_BatchedRows, NodeSubmodule):
     """
 
     disable_torch_compile = True
-    output_key = TEXT_EMBEDS
+    output_keys = (TEXT_EMBEDS,)
+    keep_batch_dim = True
 
     def __init__(self, encoder: nn.Module, config: Flux2KleinConfig, max_batch_size: int = 16):
         super().__init__()
@@ -132,10 +123,10 @@ class KleinTextEncoderSubmodule(_BatchedRows, NodeSubmodule):
             TEXT_MASK: torch.stack([inp.tensor_inputs[TEXT_MASK] for inp in inputs]),
         }
 
-    def forward(self, graph_walk, engine_inputs, text_inputs: torch.Tensor, text_mask: torch.Tensor, **kwargs):
+    def run_batch(self, text_inputs: torch.Tensor, text_mask: torch.Tensor, **kwargs):
         device = self.get_device()
         embeds = self.encoder(text_inputs.to(device=device, dtype=torch.long), text_mask.to(device=device))
-        return {TEXT_EMBEDS: [embeds.to(self.encoder.dtype)]}
+        return {TEXT_EMBEDS: embeds.to(self.encoder.dtype)}
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +289,7 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
 # vae_decoder
 # ---------------------------------------------------------------------------
 
-class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
+class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
     """Final packed tokens ``[L, 128]`` per request -> uint8 images ``[B, 3, H, W]``.
 
     Unpacks to the grid, undoes the BatchNorm normalization (bf16, as the reference),
@@ -308,7 +299,8 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
     """
 
     disable_torch_compile = True
-    output_key = IMAGE_OUTPUT
+    output_keys = (IMAGE_OUTPUT,)
+    keep_batch_dim = True
 
     def __init__(
         self, vae: nn.Module, config: Flux2KleinConfig, max_batch_size: int = 8, compile_decode: bool = False,
@@ -378,8 +370,8 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
             "grid": inputs[0].resource_step_info,
         }
 
-    def forward(self, graph_walk, engine_inputs, latents: torch.Tensor, grid: tuple[int, int], **kwargs):
+    def run_batch(self, latents: torch.Tensor, grid: tuple[int, int], **kwargs):
         latents = latents.to(device=self.get_device(), dtype=self.vae.dtype)
         patched = self.vae.denormalize_latents(unpack_latents(latents, *grid))
         image = self._decode(unpatchify_latents(patched))
-        return {IMAGE_OUTPUT: [pixels_to_uint8(image)]}
+        return {IMAGE_OUTPUT: pixels_to_uint8(image)}

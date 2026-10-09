@@ -783,6 +783,41 @@ class Wan22Adapter(OpenAIAdapter):
         )
 
 
+class LTX25Adapter(OpenAIAdapter):
+    """LTX-2.5: text-to-audio+video generation.
+
+    Returns one mp4 with the generated audio muxed in as an AAC track by default;
+    ``audio: false`` in ``extra_body`` asks for video alone. ``size`` ("WxH") maps to
+    the model's ``width`` / ``height``; ``seed``, ``num_frames`` and ``fps`` are
+    first-class fields, and any other knobs pass through via
+    ``extra_body``. No image or video conditioning yet.
+    """
+
+    supports_videos = True
+
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        if getattr(req, "image", None) or getattr(req, "video", None):
+            raise ValueError("LTX-2.5 (this port) is text-to-video only; omit 'image' and 'video'.")
+        mk = _passthrough(req)
+        with_audio = mk.pop("audio", True)
+        if getattr(req, "size", None):
+            try:
+                width, height = (int(v) for v in req.size.lower().split("x"))
+            except ValueError:
+                raise ValueError(f"size must be 'WxH' (e.g. '960x544'); got {req.size!r}") from None
+            mk.setdefault("width", width)
+            mk.setdefault("height", height)
+        for name in ("seed", "num_frames", "fps"):
+            if getattr(req, name, None) is not None:
+                mk.setdefault(name, getattr(req, name))
+        return SubmitArgs(
+            text=req.prompt,
+            input_modalities=["text"],
+            output_modalities=["video", "audio"] if with_audio else ["video"],
+            model_kwargs=mk,
+        )
+
+
 class DiffusionImageAdapter(OpenAIAdapter):
     """Generic adapter for the DiT-scaffold image models (FLUX.2 klein, Z-Image, ...):
     text-to-image and reference-image editing.
@@ -1018,6 +1053,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_super_i2v_4step": Cosmos3Adapter(),
     "cosmos3_super_t2i_4step": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
+    "ltx2_5": LTX25Adapter(),
     "whisper_large": WhisperAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
     "flux2_klein": DiffusionImageAdapter(),

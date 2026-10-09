@@ -19,6 +19,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
+    "ltx2_5": ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
@@ -73,6 +74,9 @@ HF_MODELS: dict[str, dict] = {
     # editing (Qwen3 hidden-state text encoder, FLUX.2 VAE). 4B is Apache-2.0; 9B is
     # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.
     "flux2_klein": {"model_path_hf": "black-forest-labs/FLUX.2-klein-4B"},
+    # Lightricks LTX-2.5: 22B joint audio-video DiT (distilled), Gemma-4 12B text
+    # encoder, video + audio VAEs and a 48 kHz vocoder. Gated on Hugging Face.
+    "ltx2_5": {"model_path_hf": "Lightricks/LTX-2.5-Diffusers"},
     "flux2_klein_9b": {"model_path_hf": "black-forest-labs/FLUX.2-klein-9B"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)

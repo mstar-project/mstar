@@ -104,6 +104,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``black-forest-labs/FLUX.2-klein-9B``
      - FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
        the FLUX Non-Commercial License; check it before deploying.
+   * - ``ltx2_5`` *(Beta)*
+     - ``Lightricks/LTX-2.5-Diffusers``
+     - LTX-2.5 (22B) text-to-audio+video: the distilled 8-step recipe, no guidance; native
+       joint audio-video DiT and Gemma-4 text encoder, emitting an H.264 video and 48 kHz
+       stereo audio. Gated; LTX-2.x Community License.
    * - ``z_image_turbo``
      - ``Tongyi-MAI/Z-Image-Turbo``
      - Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
@@ -677,6 +682,51 @@ Requests are therefore independent and the loop is resumable across ranks.
 ``torch.compile``, no CUDA-graph capture, no continuous batching, no component
 offload, and the VAE decode is always tiled (which bounds its workspace so the
 untiled conv3d cannot OOM a 32 GiB card).
+
+LTX-2.5 (``ltx2_5``)
+--------------------
+
+Text-to-audio+video on **Lightricks LTX-2.5** (``Lightricks/LTX-2.5-Diffusers``, gated):
+a 22B joint audio-video DiT, a Gemma-4 12B text encoder, and video/audio VAEs with a
+48 kHz vocoder. The distilled checkpoint runs the model card's recipes without
+guidance (single-stage: 8 sigmas); the two-stage recipe, the full (SFT) transformer,
+image-to-video and the duration head are not ported yet.
+
+Four nodes: ``text_encoder`` (native Gemma-4 + the text connectors), ``dit`` (the
+DiT scaffold's denoise loop; video and audio latents carried in fp32; every attention
+through two ragged attention resources), ``vae_decoder`` and ``audio_decoder``. The walk follows the requested output
+modalities, so ``["video"]`` skips the audio decode (the model still denoises both).
+
+.. code-block:: bash
+
+   mstar serve ltx2_5            # configs/ltx2_5.yaml: DiT on GPU 0, the other nodes on GPU 1
+
+Request knobs (``model_kwargs``): ``height`` / ``width`` (multiples of 32; default
+544x960), ``num_frames`` (8k+1; default 121), ``fps``, ``seed``. Frames above 720p
+decode in VAE tiles (``vae_tile_min_pixels``) to bound the decode's memory.
+
+Outputs are an H.264 ``video`` and a 48 kHz stereo ``audio`` chunk (16-bit PCM).
+``POST /v1/videos/generations`` returns one mp4 with the audio muxed in as AAC
+(``"audio": false`` in the body for video alone); the mux needs the ``ffmpeg`` binary
+on the server's ``PATH`` and falls back to video only without it.
+
+Performance (2x H100, warm, against diffusers 0.41 with the same recipe and seeds):
+
+======================================  ==============  ==============
+                                        diffusers       ``ltx2_5``
+======================================  ==============  ==============
+544x960x121, one request                7.87 s          6.23 s
+544x960x121, 2 concurrent               7.6 videos/min  12.7 videos/min
+544x960x121, 4 concurrent               7.6 videos/min  14.0 videos/min
+======================================  ==============  ==============
+
+Concurrency pays because the text encoder and decoders run on the second GPU while the
+DiT denoises another request; the DiT itself is GPU-bound (batching two requests costs
+two steps' time).
+
+The DiT is compiled and its denoise step captured per shape (``capture_shapes``);
+other shapes run the compiled eager path, and the first request of a new shape pays
+its compile.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------

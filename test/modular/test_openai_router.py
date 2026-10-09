@@ -252,6 +252,48 @@ def test_videos_generations_wan22_rejects_video_conditioning(client_and_stub):
     assert "video" in r.json()["error"]["message"]
 
 
+def test_videos_generations_ltx2_5_requests_audio_and_muxes(client_and_stub, monkeypatch):
+    # LTX-2.5 generates audio with the video: the route asks the model for both and
+    # muxes the PCM chunk into the mp4 with its sample rate and channel count.
+    from mstar.api_server import media_io
+
+    client, stub = client_and_stub
+    stub.model_name = "ltx2_5"
+    mp4, pcm = b"\x00\x00\x00 ftypisommp4fake", b"\x01\x00\x02\x00"
+    stub.next_chunks = [_Chunk("video", mp4), _Chunk("audio", pcm, {"sample_rate": 48000, "num_channels": 2})]
+    muxed = {}
+
+    def fake_mux(video, audio, sample_rate, num_channels, video_fps=None):
+        muxed.update(video=video, audio=audio, sample_rate=sample_rate, num_channels=num_channels)
+        return b"muxed"
+
+    monkeypatch.setattr(media_io, "mux_mp4_with_pcm16", fake_mux)
+    body = client.post(
+        "/v1/videos/generations",
+        json={"model": "ltx2_5", "prompt": "a dog barking", "size": "960x544", "num_frames": 121,
+              "seed": 3, "negative_prompt": "blurry"},
+    ).json()
+    assert base64.b64decode(body["data"][0]["b64_json"]) == b"muxed"
+    assert muxed == {"video": mp4, "audio": pcm, "sample_rate": 48000, "num_channels": 2}
+    assert stub.last_submit["output_modalities"] == ["video", "audio"]
+    mk = stub.last_submit["model_kwargs"]
+    assert (mk["width"], mk["height"], mk["num_frames"], mk["seed"]) == (960, 544, 121, 3)
+    assert mk["negative_prompt"] == "blurry" and "audio" not in mk  # extra_body passthrough
+
+
+def test_videos_generations_ltx2_5_video_only_and_rejects_conditioning(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "ltx2_5"
+    stub.next_chunks = [_Chunk("video", b"mp4")]
+    client.post("/v1/videos/generations", json={"model": "ltx2_5", "prompt": "x", "audio": False})
+    assert stub.last_submit["output_modalities"] == ["video"]
+    r = client.post(
+        "/v1/videos/generations",
+        json={"model": "ltx2_5", "prompt": "x", "image": "data:image/png;base64,AAAA"},
+    )
+    assert r.status_code == 400 and "text-to-video" in r.json()["error"]["message"]
+
+
 def test_chat_stream(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
