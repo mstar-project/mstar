@@ -18,7 +18,18 @@ def rid(prefix: str) -> str:
 
 
 def sse(obj: dict) -> str:
-    return f"data: {json.dumps(obj)}\n\n"
+    return f"data: {_dumps(obj)}\n\n"
+
+
+try:
+    import orjson
+
+    def _dumps(obj: dict) -> str:
+        # ~5x json.dumps; one event per token at tens of thousands a second
+        return orjson.dumps(obj).decode()
+except ImportError:  # pragma: no cover
+    def _dumps(obj: dict) -> str:
+        return json.dumps(obj)
 
 
 def error_type(status: int) -> str:
