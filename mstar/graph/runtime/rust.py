@@ -440,10 +440,12 @@ class RustGraphRuntime(GraphRuntime):
 
     def cleanup_consumed_inputs(
         self, node_name: str, rids: list[int], wg_ids: list[int],
+        completes_node: list[bool] | None = None,
+        completes_walk: list[bool] | None = None,
     ) -> FreedTensors:
-        return FreedTensors(
-            *self._rust.cleanup_consumed_inputs(node_name, rids, wg_ids)
-        )
+        return FreedTensors(*self._rust.cleanup_consumed_inputs(
+            node_name, rids, wg_ids, completes_node, completes_walk,
+        ))
 
     # --------- Scheduling ----------
 
@@ -599,6 +601,8 @@ class RustGraphRuntime(GraphRuntime):
             "inline_values": list(input.inline_values),
             "walks": input.walks,
             "rid_walk_idx": input.rid_walk_idx,
+            "completes_node": input.completes_node,
+            "completes_walk": input.completes_walk,
         })
         return RouteOutput(
             completion_id=out.completion_id,

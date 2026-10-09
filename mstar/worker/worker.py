@@ -681,6 +681,13 @@ class Worker:
                 self._my_consumer_connections, model.get_graph_walk_graphs(),
             )
 
+        # Streamed outputs a chunked prefill emits on every chunk rather than
+        # only the last, because their consumer opted into partial input.
+        self._partial_stream_edges: frozenset[str] = frozenset(
+            conn.edge_name for conn in self.partition_topology.connections
+            if conn.chunk_policy_factory().allow_partial_input()
+        ) if self.partition_topology else frozenset()
+
         # edge_name -> partition the stream feeds
         self._stream_partition: dict[str, str] = {
             conn.edge_name: conn.to_partition for conn in self._my_consumer_connections
@@ -2654,7 +2661,10 @@ class Worker:
         # assumes that.
         # a row mid-prefill loops back on nothing of N's; it joins the merge below as `mid_prefill`
         held = batch_N.incomplete_node_rids
-        candidates = [r for r in walk_rids if not self._is_tearing_down(r)]
+        candidates = [
+            r for r in walk_rids
+            if not self._is_tearing_down(r) and pending.node_batch.completes_walk(r)
+        ]
         if held:
             candidates = [r for r in candidates if r not in held]
         # Polling the StreamBuffers stays on this side: they hold real tensors.
@@ -3200,11 +3210,10 @@ class Worker:
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
 
-        # a row mid-prefill keeps its inputs: its next chunk reads them again
-        held = batch_N.batch.incomplete_node_rids
-        rids = [
-            r for r in batch_N.batch.request_to_worker_graph if r not in held
-        ] if held else list(batch_N.batch.request_to_worker_graph)
+        # a row mid-prefill keeps its inputs, since its next chunk reads them
+        # again; one whose walk is not done keeps all but its streamed inputs
+        rids = list(batch_N.batch.request_to_worker_graph)
+        completes_node, completes_walk = self._completion_flags(batch_N, rids)
         # What the runtime dereferenced to zero and cannot reclaim itself: a
         # runtime behind the contract has the bookkeeper, not the shm files or
         # the registered memory.
@@ -3212,6 +3221,7 @@ class Worker:
             *self._graph_runtime.cleanup_consumed_inputs(
                 batch_N.batch.node_name, rids,
                 [batch_N.batch.request_to_worker_graph[r] for r in rids],
+                completes_node, completes_walk,
             )
         )
         _pp_stage("cleanup_inputs")
@@ -3295,20 +3305,26 @@ class Worker:
         # so this can carry a device transfer as well as the stop logic.
         _t_stop = _time.perf_counter() if self._phase_period else 0.0
         engine = self.engine_manager.get_engine(batch_N.node_name)
-        cpu_outputs, host_rows = self._prematerialize_for_check_stop(
-            outputs, batch_N.node_batch.completion_event,
-            request_ids=batch_N.node_batch.request_ids,
-        )
-        _pp_stage("prematerialize")
-        stops = engine.check_stop_for_batch(
-            batch_N.node_batch, cpu_outputs, host_rows=host_rows,
-        )
-        if self._phase_period:
-            self._phase_record(
-                "worker.postprocess.check_stop", _time.perf_counter() - _t_stop,
+        if batch_N.node_batch.request_ids:
+            cpu_outputs, host_rows = self._prematerialize_for_check_stop(
+                outputs, batch_N.node_batch.completion_event,
+                request_ids=batch_N.node_batch.request_ids,
             )
-        # the same host copy, before stops, so a request ending here still indexes its pages
-        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
+            _pp_stage("prematerialize")
+            stops = engine.check_stop_for_batch(
+                batch_N.node_batch, cpu_outputs, host_rows=host_rows,
+            )
+            if self._phase_period:
+                self._phase_record(
+                    "worker.postprocess.check_stop", _time.perf_counter() - _t_stop,
+                )
+            # the same host copy, before stops, so a request ending here still indexes its pages
+            engine.extend_prefix_chains(
+                batch_N.node_batch, cpu_outputs, host_rows=host_rows,
+            )
+        else:
+            # only rows mid-prefill streaming partial outputs, which never stop
+            cpu_outputs, host_rows, stops = None, None, {}
 
         # Stream-terminated loop: a stream-consuming node inside a loop has no
         # internal stop signal (unlike a self-EOS loop), so when it consumes the
@@ -3457,15 +3473,31 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
+    @staticmethod
+    def _completion_flags(
+        batch_N: PendingBatch, rids: list[int],
+    ) -> tuple[list[bool] | None, list[bool] | None]:
+        """Per row of ``rids``: whether its step finished its node, and its
+        walk. None for either when every row did, the common case."""
+        mid_node = batch_N.batch.incomplete_node_rids
+        mid_walk = batch_N.node_batch.incomplete_walk_rids
+        return (
+            [r not in mid_node for r in rids] if mid_node else None,
+            [r not in mid_walk for r in rids] if mid_walk else None,
+        )
+
     def _settle_chunks(
         self, batch_N: PendingBatch, step_outputs: BatchedModelOutput,
     ) -> bool:
         """Hold back a row whose node needs more chunks: its outputs wait in
-        the accumulator and its node goes back to the ready queue, unrouted. A
-        final chunk takes the held outputs back. False when nothing is left to
-        route: no row that ran, and no row the prefix cache served whole."""
+        the accumulator and its node goes back to the ready queue. The streamed
+        outputs a consumer opted to take partially stay to be routed now; a row
+        with none is dropped from the batch. A final chunk takes the held
+        outputs back. False when nothing is left to route: no row that ran or
+        streams a partial output, and no row the prefix cache served whole."""
         batch, node = batch_N.batch, batch_N.node_name
         outputs = step_outputs.per_rid_outputs
+        partial_rids: set[int] = set()
         join_stream = None
         joined: list[torch.Tensor] = []
         for rid, (_, end, _) in batch.chunk_ranges.items():
@@ -3476,9 +3508,19 @@ class Worker:
                 policies = self.engine_manager.get_engine(node).chunked_prefill_output_policies(
                     node, batch.walk_of(rid),
                 )
-                self.scheduler.chunk_outputs.hold(rid, node, outputs.pop(rid, {}), policies)
+                row = outputs.pop(rid, {})
+                partial = {
+                    name: t for name, t in row.items() if name in self._partial_stream_edges
+                }
+                self.scheduler.chunk_outputs.hold(rid, node, {
+                    name: t for name, t in row.items() if name not in partial
+                }, policies)
                 wg_id = batch.request_to_worker_graph[rid]
-                batch.discard_rid(rid)
+                if partial:
+                    outputs[rid] = partial
+                    partial_rids.add(rid)
+                else:
+                    batch.discard_rid(rid)
                 if rid not in batch_N.next_chunk_launched:
                     self._graph_runtime.push_back_node(node, [rid], [wg_id])
             else:
@@ -3498,14 +3540,15 @@ class Worker:
                     outputs[rid] = merged
         if joined:
             self._publish_joined_chunks(batch_N, join_stream, joined)
+        # held rows never reach the stop check; a partial one keeps its info for the send
         held = batch.incomplete_node_rids
         batch_N.node_batch.request_ids = [
             rid for rid in batch_N.node_batch.request_ids if rid not in held
         ]
-        for rid in held:
+        for rid in held - partial_rids:
             batch_N.node_batch.per_request_info.pop(rid, None)
         # a served row's walk completes only when it is routed (#768)
-        return bool(batch_N.node_batch.request_ids or batch_N.node_batch.cached_rids)
+        return bool(batch_N.node_batch.request_ids or partial_rids or batch_N.node_batch.cached_rids)
 
     def _chunk_join_stream(self, batch_N: PendingBatch) -> torch.Stream | None:
         """The side stream a final chunk's outputs are joined on, ordered after
@@ -3641,6 +3684,7 @@ class Worker:
 
         # The graph runtime's own share of postprocess: the routing call.
         _t_route = _time.perf_counter() if self._phase_period else 0.0
+        completes_node, completes_walk = self._completion_flags(batch_N, rids)
         route_output = self._graph_runtime.complete_and_route_batch(
             RouteInput(
                 partition=batch_N.partition,
@@ -3657,6 +3701,8 @@ class Worker:
                 inline_values=inline_values,
                 walks=walks if rid_walk_idx is not None else None,
                 rid_walk_idx=rid_walk_idx,
+                completes_node=completes_node,
+                completes_walk=completes_walk,
             ),
         )
         if self._phase_period:
@@ -3690,7 +3736,8 @@ class Worker:
             for rid, uuid in per_signal:
                 req_info = self.request_state.per_request_info[rid]
                 stream_buf = req_info.stream_buffers[signal]
-                stream_buf.pre_read_register(uuid)
+                stream_buf.pre_read_register(uuid, batch_N.node_batch.completes_walk(rid)
+                                             and rid not in batch_N.batch.incomplete_node_rids)
                 tensor = self.tensor_manager.get_tensor(uuid)
                 stream_buf.put(uuid, tensor.clone())
                 streamed.append(uuid)

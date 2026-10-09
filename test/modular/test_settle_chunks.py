@@ -53,6 +53,7 @@ def _worker():
     w.engine_manager = SimpleNamespace(get_engine=lambda name: w._engine)
     w._engine = _Engine()
     w._graph_runtime = _Runtime()
+    w._partial_stream_edges = frozenset()  # no consumer streams a chunk's outputs
     return w
 
 
