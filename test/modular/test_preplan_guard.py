@@ -14,7 +14,7 @@ import logging
 import torch
 
 from mstar.communication.tensors import LocalTransferEngine
-from mstar.engine.resources.kv.config import KVConfig, KVStep
+from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import Segment, StepContext
@@ -23,7 +23,7 @@ PS = 8
 
 
 def _manager() -> KVManager:
-    cfg = KVConfig(num_layers=1, num_kv_heads=1, head_dim=4, max_seq_len=64 * PS, max_num_pages=64, page_size=PS)
+    cfg = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=4, max_seq_len=64 * PS, max_num_pages=64, page_size=PS)
     return KVManager(
         cfg=cfg, name="kv", joint_comm_group=None,
         transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")),

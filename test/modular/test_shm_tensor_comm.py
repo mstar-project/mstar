@@ -1,7 +1,11 @@
 """Unit tests for SharedMemoryCommunicationManager and tensor serialization."""
 
+import errno
+import logging
 import os
+import shutil
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -286,6 +290,76 @@ def test_cleanup_unlinks_file():
         assert not os.path.isfile(path)
 
 
+class _StubFullDir:
+    """Opens files that take half of a write and then fail it, as a tmpfs out of space does."""
+
+    def __init__(self):
+        self.partial: dict[str, int] = {}
+
+    def __call__(self, path: str):
+        return _StubFullFile(self, path)
+
+
+class _StubFullFile:
+    """One file of a ``_StubFullDir``; records the bytes it kept before failing."""
+
+    def __init__(self, full_dir: _StubFullDir, path: str):
+        self._dir, self._path, self._f = full_dir, path, open(path, "wb")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._f.close()
+
+    def write(self, data: bytes):
+        self._f.write(data[: len(data) // 2])
+        self._f.flush()
+        self._dir.partial[self._path] = os.path.getsize(self._path)
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+
+def _send_into(monkeypatch, mgr, full_dir: _StubFullDir) -> tuple[TensorPointerInfo, OSError]:
+    info = mgr.store_and_return_tensor_info("req1", {"out": [torch.zeros(4096)]})["out"][0]
+    monkeypatch.setattr(mgr, "_create_shm_file", full_dir)
+    with pytest.raises(OSError) as err:
+        mgr.register_for_send("req1", [info])
+    return info, err.value
+
+
+def test_a_full_shm_dir_fails_the_send_with_what_ran_out(monkeypatch):
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=1024))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        info, err = _send_into(monkeypatch, _make_manager(tmpdir, request_id="req1"), _StubFullDir())
+    ran_out = f"{tmpdir} has 1024 bytes free, too few for a {info.nbytes}-byte tensor"
+    assert ran_out in str(err) and "--shm-size" in str(err), "the error hides what ran out"
+
+
+def test_a_full_shm_dir_with_room_left_is_not_called_too_small(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _, err = _send_into(monkeypatch, _make_manager(tmpdir, request_id="req1"), _StubFullDir())
+    assert "after the failed write" in str(err) and "too few" not in str(err), (
+        "the error would blame the dir's size for inodes or another writer"
+    )
+
+
+def test_a_failed_send_leaves_nothing_in_the_shm_dir(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, full_dir = _make_manager(tmpdir, request_id="req1"), _StubFullDir()
+        info, _ = _send_into(monkeypatch, mgr, full_dir)
+        path = mgr._shm_path(mgr.my_entity_id, info.uuid)
+        assert full_dir.partial[path] > 0, "the write must fail part way, as a filling tmpfs does"
+        assert not os.path.lexists(path), "a partial file no cleanup tracks would hold the space for good"
+
+
+def test_a_small_shm_dir_warns_at_boot(monkeypatch, caplog):
+    # 64 MiB, Docker's default
+    monkeypatch.setattr(os, "statvfs", lambda path: SimpleNamespace(f_frsize=4096, f_blocks=16384))
+    with tempfile.TemporaryDirectory() as tmpdir, caplog.at_level(logging.WARNING):
+        _make_manager(tmpdir)
+    assert "--shm-size" in caplog.text, "a small /dev/shm would show only as the first large send failing"
+
+
 def test_cleanup_collectable_reclaims_what_a_runtime_already_freed():
     """A graph runtime behind the contract dereferences inside the bookkeeper
     it shares, so nothing here ever sees the count hit zero. It hands the
@@ -500,6 +574,50 @@ def test_has_inflight_reads_tracks_pending_futures():
         )
         assert mgr.has_inflight_reads("req1")
         assert not mgr.has_inflight_reads("other-req")
+
+
+def test_a_read_that_finishes_early_waits_for_the_ones_started_before_it():
+    """The async reader runs reads on a thread pool, so a request's second read
+    can finish before its first. Its edges still have to come out in order."""
+    from mstar.communication.tensors import FutureAndPointers
+
+    class _Fut:
+        def __init__(self, done: bool):
+            self.finished = done
+
+        def done(self):
+            return self.finished
+
+        def result(self):
+            return None
+
+    def _read(future, rid: str, name: str) -> FutureAndPointers:
+        return FutureAndPointers(
+            future=future, graph_edges=[GraphEdge(next_node="LLM", name=name)],
+            request_id=rid,
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir, request_id="req1")
+        mgr.register_request("req2", _empty_sharding_config())
+        first = _Fut(done=False)
+        mgr.pending = [
+            _read(first, "req1", "token_0"),
+            _read(_Fut(done=True), "req1", "token_1"),
+            _read(_Fut(done=True), "req2", "token_0"),
+        ]
+
+        ready = mgr.get_ready_tensors()
+        assert "req1" not in ready, "a token went out ahead of the one before it"
+        assert [e.name for e in ready["req2"]] == ["token_0"], (
+            "another request's read waited on this one"
+        )
+
+        first.finished = True
+        ready = mgr.get_ready_tensors()
+        assert [e.name for e in ready["req1"]] == ["token_0", "token_1"], (
+            "the request's reads came out out of order"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -722,3 +840,70 @@ def test_register_for_send_uuids_writes_every_request_not_just_the_first():
             for info in infos:
                 assert info.uuid in mgr._shm_files, f"{rid} never written"
                 assert os.path.exists(mgr._shm_files[info.uuid])
+
+
+# ---------------------------------------------------------------------------
+# Host copies: a transport that sends from host memory reuses the producer's
+# ---------------------------------------------------------------------------
+
+def _send_and_read(sender, receiver, rid, edges):
+    sender.register_for_send(rid, edges[0].tensor_info)
+    receiver.start_read_tensors(rid, edges, graph_walk="decode")
+    receiver.get_ready_tensors(graph_walk="decode")
+    return receiver.get_tensor(edges[0].tensor_info[0].uuid)
+
+
+def test_shm_sends_the_stored_host_copy():
+    """The send reads the host copy when there is one. The copy differs from
+    the stored tensor here only so the test can tell which one was sent."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sender = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        receiver = _make_manager(tmpdir, entity_id="worker_1", request_id="req1")
+        assert sender.needs_cpu_tensor
+
+        tensor, host = torch.zeros(1, 4), torch.arange(4.0).reshape(1, 4)
+        infos = sender.store_and_return_tensor_info(
+            "req1", {"tok": [tensor]}, cpu_tensors={"tok": [host]},
+        )
+        assert sender.tensor_store.get_cpu_tensor(infos["tok"][0].uuid) is host
+        edges = [GraphEdge(next_node="LLM", name="tok", tensor_info=infos["tok"])]
+        assert torch.equal(_send_and_read(sender, receiver, "req1", edges), host)
+
+
+def test_host_copy_follows_a_renamed_output():
+    """A submodule that rebinds an output under its signal name (Qwen3.5's
+    ``new_token`` -> ``text_inputs``) aliases the tensor; the stop check's
+    copy, keyed by the original name, still reaches the stored signal."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir)
+        token = [torch.zeros(1, dtype=torch.int64)]
+        outputs = {7: {"new_token": token, "text_inputs": token}}
+        host = torch.ones(1, dtype=torch.int64)
+        stored = mgr.store_and_return_tensor_info_batch(
+            [7], outputs, ["text_inputs"],
+            cpu_tensors={7: {"new_token": [host]}},
+        )
+        assert mgr.tensor_store.get_cpu_tensor(stored.flat_uuids[0]) is host
+
+
+def test_host_copies_not_kept_for_device_transports():
+    """TCP / RDMA read device memory, so a host copy would only be held."""
+    assert not MooncakeCommunicationManager.needs_cpu_tensor.fget(object())
+
+    class _DeviceTransport(SharedMemoryCommunicationManager):
+        needs_cpu_tensor = False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _DeviceTransport(
+            my_entity_id="worker_0", hostname="localhost", device="cpu",
+            communicator=MockCommunicator(), shm_dir=tmpdir,
+        )
+        infos = mgr.store_and_return_tensor_info(
+            "req1", {"tok": [torch.zeros(1)]}, cpu_tensors={"tok": [torch.ones(1)]},
+        )
+        stored = mgr.store_and_return_tensor_info_batch(
+            [1], {1: {"tok": [torch.zeros(1)]}}, ["tok"],
+            cpu_tensors={1: {"tok": [torch.ones(1)]}},
+        )
+        for uuid in [infos["tok"][0].uuid, *stored.flat_uuids]:
+            assert mgr.tensor_store.get_cpu_tensor(uuid) is None

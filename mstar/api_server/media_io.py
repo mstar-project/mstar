@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import base64
 import io
-import logging
 import os
 import wave
 from pathlib import Path
@@ -28,8 +27,6 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 # MIME (top-level type or full type) -> file extension used when persisting.
 _MIME_TO_EXT: dict[str, str] = {
@@ -63,8 +60,49 @@ AUDIO_FORMAT_MIME: dict[str, str] = {
     "mp3": "audio/mpeg",
     "flac": "audio/flac",
     "opus": "audio/ogg",
-    "aac": "audio/aac",
 }
+
+# response_format -> soundfile (format, subtype); wav and pcm need no encoder
+_SOUNDFILE_AUDIO: dict[str, tuple[str, str | None]] = {
+    "mp3": ("MP3", None),
+    "flac": ("FLAC", None),
+    "opus": ("OGG", "OPUS"),
+}
+
+
+# libsndfile's Opus encoder takes only these rates (44.1 kHz fails)
+_OPUS_RATES = (8000, 12000, 16000, 24000, 48000)
+
+
+def audio_formats(stream: bool = False, sample_rate: int | None = None) -> tuple[str, ...]:
+    """The ``response_format`` values this frontend can produce.
+
+    A stream carries an open-ended WAV or bare PCM, so only those two; the
+    compressed containers need the optional ``soundfile`` (the ``audio`` extra),
+    and Opus also needs one of its native sample rates when ``sample_rate`` is given.
+    """
+    if stream:
+        return ("wav", "pcm")
+    try:
+        import soundfile  # type: ignore  # noqa: F401
+    except ImportError:
+        return ("wav", "pcm")
+    return ("wav", "pcm", *(
+        f for f in _SOUNDFILE_AUDIO
+        if f != "opus" or sample_rate is None or int(sample_rate) in _OPUS_RATES
+    ))
+
+
+def check_audio_format(fmt: str | None, stream: bool = False, sample_rate: int | None = None) -> str:
+    """``fmt`` lower-cased (``wav`` when unset); ValueError when it cannot be produced."""
+    fmt = (fmt or "wav").lower()
+    allowed = audio_formats(stream, sample_rate)
+    if fmt not in allowed:
+        how = "streamed" if stream else "produced"
+        raise ValueError(
+            f"response_format {fmt!r} cannot be {how} by this server; use one of: {', '.join(allowed)}"
+        )
+    return fmt
 
 
 def modality_from_mime(mime: str) -> str:
@@ -173,6 +211,72 @@ def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False)
 # Outbound: wrap raw model output for client surfaces
 # ---------------------------------------------------------------------------
 
+def decode_audio(path: str, sample_rate: int = 16000):
+    """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``.
+
+    libsndfile (``soundfile``) first — no FFmpeg needed for wav/flac/ogg/mp3 —
+    then torchcodec for the rest (m4a, webm, ...).
+    """
+    try:
+        import soundfile as sf
+
+        audio, sr = sf.read(path, dtype="float32", always_2d=True)
+        audio = audio.mean(axis=1)
+    except Exception:  # noqa: BLE001 — not a libsndfile container
+        from torchcodec.decoders import AudioDecoder
+
+        frames = AudioDecoder(path, sample_rate=sample_rate, num_channels=1).get_all_samples()
+        return frames.data[0].numpy().astype(np.float32)
+    if sr != sample_rate:
+        try:
+            import torch
+            import torchaudio
+
+            audio = torchaudio.functional.resample(torch.from_numpy(audio), sr, sample_rate).numpy()
+        except ImportError:
+            idx = np.linspace(0, len(audio) - 1, int(round(len(audio) * sample_rate / sr)))
+            audio = np.interp(idx, np.arange(len(audio)), audio).astype(np.float32)
+    return audio
+
+
+def split_windows(
+    audio, window_seconds: float, sample_rate: int = 16000,
+    search_seconds: float = 0.0, frame_seconds: float = 0.02,
+) -> list:
+    """Cut a waveform into consecutive windows of at most ``window_seconds``;
+    concatenating them gives the input back sample for sample.
+
+    With ``search_seconds`` a cut is moved back from its nominal boundary to
+    the end of the quietest ``frame_seconds`` frame within that span (the
+    last such frame on a tie, so silence cuts at the boundary): the cut lands
+    in a pause rather than on a word when there is one to find.
+    """
+    audio = np.asarray(audio)
+    step = int(round(window_seconds * sample_rate))
+    search = int(round(search_seconds * sample_rate))
+    frame = max(1, int(round(frame_seconds * sample_rate)))
+    pieces, start = [], 0
+    while start < len(audio):
+        stop = min(len(audio), start + step)
+        if stop < len(audio) and search > 0:
+            num_frames = (min(search, stop - start - frame)) // frame
+            if num_frames > 0:
+                span = audio[stop - num_frames * frame:stop].astype(np.float32)
+                energy = np.square(span.reshape(num_frames, frame)).mean(axis=1)
+                quietest = num_frames - 1 - int(np.argmin(energy[::-1]))
+                stop = stop - num_frames * frame + (quietest + 1) * frame
+        pieces.append(audio[start:stop])
+        start = stop
+    return pieces
+
+
+def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
+    """Float waveform -> 16-bit PCM WAV file at ``path``."""
+    pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0) * 32767).astype("<i2").tobytes()
+    Path(path).write_bytes(pcm16_to_wav_bytes(pcm, sample_rate))
+    return path
+
+
 def pcm16_to_wav_bytes(pcm: bytes, sample_rate: int, num_channels: int = 1) -> bytes:
     """Wrap raw little-endian 16-bit PCM (the model's audio output) into a WAV blob."""
     buf = io.BytesIO()
@@ -187,26 +291,24 @@ def pcm16_to_wav_bytes(pcm: bytes, sample_rate: int, num_channels: int = 1) -> b
 def pcm16_to_container(pcm: bytes, sample_rate: int, fmt: str = "wav") -> tuple[bytes, str]:
     """Encode raw 16-bit PCM into ``fmt``. Returns ``(bytes, mime_type)``.
 
-    ``wav`` and ``pcm`` use the stdlib (the bytes are already PCM_16). Compressed
-    formats need the optional ``soundfile`` backend; if it is missing we fall back
-    to WAV and log once.
+    ``wav`` and ``pcm`` use the stdlib (the bytes are already PCM_16); the
+    compressed formats use the optional ``soundfile``. A format this server
+    cannot produce raises ValueError (see :func:`check_audio_format`) rather
+    than coming back as WAV under another name.
     """
-    fmt = (fmt or "wav").lower()
+    fmt = check_audio_format(fmt, sample_rate=sample_rate)
     if fmt == "wav":
         return pcm16_to_wav_bytes(pcm, sample_rate), AUDIO_FORMAT_MIME["wav"]
     if fmt == "pcm":
         return pcm, AUDIO_FORMAT_MIME["pcm"]
 
-    try:
-        import soundfile as sf  # type: ignore
+    import soundfile as sf  # type: ignore
 
-        audio = np.frombuffer(pcm, dtype="<i2")
-        buf = io.BytesIO()
-        sf.write(buf, audio, int(sample_rate), format=fmt.upper())
-        return buf.getvalue(), AUDIO_FORMAT_MIME.get(fmt, "application/octet-stream")
-    except Exception:  # noqa: BLE001 — any backend failure degrades to WAV
-        logger.warning("Audio format %r unavailable (need soundfile); returning WAV", fmt)
-        return pcm16_to_wav_bytes(pcm, sample_rate), AUDIO_FORMAT_MIME["wav"]
+    sf_format, subtype = _SOUNDFILE_AUDIO[fmt]
+    audio = np.frombuffer(pcm, dtype="<i2")
+    buf = io.BytesIO()
+    sf.write(buf, audio, int(sample_rate), format=sf_format, subtype=subtype)
+    return buf.getvalue(), AUDIO_FORMAT_MIME[fmt]
 
 
 def mux_mp4_with_pcm16(

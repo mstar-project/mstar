@@ -27,11 +27,22 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "bagel_cfg_parallel": "bagel_cfg_parallel.yaml",
     "cosmos3": "cosmos3_nano.yaml",
     "cosmos3_droid": "cosmos3_droid.yaml",
+    "cosmos3_edge": "cosmos3_edge.yaml",
+    "cosmos3_edge_droid": "cosmos3_edge_droid.yaml",
     "cosmos3_super": "cosmos3_super_tp2.yaml",
+    "cosmos3_super_i2v_4step": "cosmos3_super_i2v_4step_tp2.yaml",
+    "cosmos3_super_t2i_4step": "cosmos3_super_t2i_4step_tp2.yaml",
+    "kokoro": "kokoro.yaml",
+    "chatterbox": "chatterbox.yaml",
+    "chatterbox_multilingual": "chatterbox_multilingual.yaml",
+    "chatterbox_turbo": "chatterbox_turbo.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
     "omnivoice": "omnivoice.yaml",
+    "qwen3_tts_1p7b": "qwen3tts_1p7b.yaml",
+    "qwen3_tts_voicedesign": "qwen3tts_voicedesign.yaml",
+    "qwen3_tts_base": "qwen3tts_base.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
@@ -39,7 +50,17 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
     "wan22": "wan22.yaml",
+    "waypoint": "waypoint.yaml",
 }
+
+# qwen 3.5 series (dense)
+qwen_3_5_dense_sizes = ("0.8", "2", "4", "9", "27")
+DEFAULT_CONFIGS.update({
+    f"qwen3_5_{size}b": f"qwen3_5_{size}b.yaml" \
+        for size in qwen_3_5_dense_sizes
+})
+# 27B has no single-GPU form
+DEFAULT_CONFIGS["qwen3_5_27b"] = "qwen3_5_27b_tp4.yaml"
 
 
 def _repo_root() -> Path:
@@ -111,14 +132,27 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
     if model == "omnivoice":
         lines.append("    client.tts(\"Xin chào\", language=\"Vietnamese\").to_wav(\"out.wav\")")
-        lines.append("    # clone a voice: ref_audio=\"ref.wav\", ref_text=\"<its transcript>\"")
-    if model in ("orpheus", "qwen3_omni", "qwen3_tts"):
+        lines.append("    # clone a voice: reference_audio=\"ref.wav\", ref_text=\"<its transcript>\"")
+    if model in ("kokoro", "orpheus", "qwen3_omni", "qwen3_tts", "qwen3_tts_1p7b"):
         voice = {
+            "kokoro": "af_heart",
             "orpheus": "tara",
             "qwen3_omni": "Ethan",
             "qwen3_tts": "Vivian",
+            "qwen3_tts_1p7b": "Vivian",
         }[model]
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
+    if model in ("chatterbox", "chatterbox_multilingual", "chatterbox_turbo"):
+        lines.append("    client.tts(\"Hello there\", voice=\"default\", cfg_weight=0.5).to_wav(\"out.wav\")")
+        if model == "chatterbox_multilingual":
+            lines.append("    client.tts(\"Bonjour\", voice=\"default\", language_id=\"fr\").to_wav(\"fr.wav\")")
+        lines.append("    # clone a voice: client.generate(text=\"Hello\", audio=\"ref.wav\",")
+        lines.append("    #     input_modalities=(\"text\",\"audio\"), output_modalities=(\"audio\",))")
+    if model == "qwen3_tts_voicedesign":
+        lines.append("    client.tts(\"Hello there\", instruct=\"A calm, warm female voice\").to_wav(\"out.wav\")")
+    if model == "qwen3_tts_base":
+        lines.append("    client.tts(\"Hello there\", reference_audio=\"ref.wav\", "
+                     "ref_text=\"...\").to_wav(\"out.wav\")")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
@@ -128,15 +162,15 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    print(res.text)  # transcript")
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
-    if model in ("bagel", "qwen3_omni", "orpheus", "cosmos3", "cosmos3_super"):
+    if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")"]
         if model in ("bagel", "qwen3_omni"):
             lines.append(f"    oai.chat.completions.create(model=\"{model}\", "
                          "messages=[{\"role\":\"user\",\"content\":\"hi\"}])")
-        if model in ("orpheus", "qwen3_omni"):
-            voice = "tara" if model == "orpheus" else "Ethan"
+        if model in ("orpheus", "qwen3_omni", "kokoro"):
+            voice = {"orpheus": "tara", "qwen3_omni": "Ethan", "kokoro": "af_heart"}[model]
             lines.append(f"    oai.audio.speech.create(model=\"{model}\", input=\"hi\", voice=\"{voice}\")")
         if model == "bagel":
             lines.append("    oai.images.generate(model=\"bagel\", prompt=\"a cat\")")

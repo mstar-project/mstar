@@ -1,0 +1,30 @@
+model: "cosmos3_super_i2v_4step"
+# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
+max_seq_len: 8192
+# Per-rank KV pool, as for Super at TP=2 (see cosmos3_super_tp2.yaml).
+resources:
+  kv:
+    max_num_pages: 384
+model_kwargs:
+  cuda_graph: true
+  graph_max_latent_area: 2000
+  # Distilled image-to-video: 4 fixed sigmas, guidance baked in; the
+  # checkpoint is trained at 16 fps (transformer base_fps).
+  num_inference_steps_video: 4
+  guidance_scale: 1.0
+  fps: 16.0
+  # The distilled checkpoints ship the diffusers modular pipeline, whose image
+  # conditioning is cover-scaled, antialiased and center-cropped (Edge recipe).
+  conditioning_resize: aspect_crop
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1]
+    tp_size: 2
+  # No audio_decoder: the i2v checkpoint has no sound pathway. The decoder
+  # sits on rank 1: decoding a 121-frame 480p clip peaks well above the
+  # headroom rank 0 keeps beside its DiT shard, the encoder and the KV pool
+  # (measured: CUDA OOM in the Wan VAE decode with everything on rank 0).
+  - node_names: ["vae_encoder"]
+    ranks: [0]
+  - node_names: ["vae_decoder"]
+    ranks: [1]

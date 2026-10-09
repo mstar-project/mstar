@@ -35,6 +35,8 @@ dependencies = [
     "torchvision>=0.24.1",
     "torchaudio>=2.9.1",
     "uvicorn",
+    # uvicorn serves WebSockets (/v1/realtime) only with a ws library installed
+    "websockets",
     "gdown",
     "datasets",
 ]
@@ -81,7 +83,7 @@ dynamo = [
 
 bagel = [
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",
@@ -104,7 +106,7 @@ bagel_xpu = [
     "torchaudio",
     "torchcodec",
     "transformers",
-    "vllm-xpu-kernels==0.1.13.2",
+    "vllm-xpu-kernels==0.1.15.4",
 ]
 
 cosmos3 = [
@@ -118,7 +120,7 @@ cosmos3 = [
     # build; on a mismatch the engine logs a warning and falls back to the
     # paged flashinfer backend. See docs/models.rst.
     "fa3-fwd",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",
@@ -133,7 +135,7 @@ qwen3_omni = [
     # prebuilt wheels aren't on PyPI, so a plain install compiles from source
     # (and fails on CUDA 13). Install it separately; see docs/installation.rst.
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",
@@ -150,17 +152,50 @@ qwen3_omni = [
 
 qwen3_tts = [
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "qwen-tts==0.1.1",
     "safetensors",
+    "soundfile",  # reference-audio decoding for Base voice cloning
     "transformers>=4.57.3",
+]
+
+kokoro = [
+    # misaki is the G2P (lexicon + spaCy tagger); `misaki[en]` additionally
+    # bundles espeak-ng (GPL) for out-of-dictionary words and is optional.
+    # The spaCy model is fetched on first use: `python -m spacy download en_core_web_sm`.
+    "misaki>=0.9.4",
+    "spacy>=3.8",
+    "num2words",
+    "huggingface-hub",
+    "transformers",
+]
+
+# Chatterbox / Chatterbox-Turbo: resemble-perth (MIT) carries the PerTh
+# watermark network applied to every output; pyloudnorm normalises Turbo's
+# reference clip like the reference package. Both are imported lazily.
+chatterbox = [
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "librosa",
+    "mooncake-transfer-engine",
+    "pyloudnorm",
+    "resemble-perth",
+    "safetensors",
+    "tokenizers",
+    "torchcodec",
+    "transformers",
+]
+chatterbox_multilingual = [
+    # Chatterbox Multilingual's Japanese kana reading and Chinese word segmentation
+    "pykakasi==2.3.0",
+    "spacy-pkuseg",
 ]
 
 orpheus = [
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -168,7 +203,7 @@ orpheus = [
 ]
 
 pi05 = [
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -198,8 +233,23 @@ wan22 = [
     "av",
 ]
 
+waypoint = [
+    # mp4 encode for benchmark_streaming.py --save-videos.
+    "av",
+    "huggingface-hub",
+    "safetensors",
+    # TAEHV is installed separately at a pinned revision. PyPI rejects project
+    # metadata containing direct-URL dependencies; see docs/installation.rst.
+    # Only the reference needs this: world_engine passes pos_ids as a TensorDict,
+    # so the parity tests import it. Serving does not — components/dit.py uses a
+    # NamedTuple to keep tensordict out of the serving path.
+    "tensordict==0.10.0",
+    # flash-attn-4 (flash_attn.cute, the default flex attention backend) is not
+    # on PyPI; install it separately, see docs/installation.rst.
+]
+
 vjepa2_ac = [
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -209,7 +259,7 @@ vjepa2_ac = [
 # ASR models: Whisper-large-v3, Higgs Audio
 asr = [
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -227,7 +277,7 @@ all = [
     "diffusers>=0.39",
     "fa3-fwd",
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",
@@ -245,7 +295,12 @@ all = [
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
     # wan22 (see the [wan22] extra for the rationale; av / diffusers already above)
     "accelerate",
+    # waypoint. TAEHV is intentionally installed separately because PyPI rejects
+    # direct-URL dependencies in project metadata; see docs/installation.rst.
+    "tensordict==0.10.0",
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
+    # separately, see docs/installation.rst.
+    # flash-attn-4 (waypoint's default flex attention backend) is also installed
     # separately, see docs/installation.rst.
     "jiwer",
     # omnivoice is intentionally omitted for the same reason as flash-attn: it
@@ -303,6 +358,8 @@ ignore = [
 "test/modular/test_phase1.py" = ["E402"]
 # Imports are deliberately placed after module-level pytest.importorskip().
 "test/rust/*.py" = ["E402"]
+# Vendored from vLLM and kept diffable against upstream; see its docstring.
+"mstar/utils/causal_conv1d/kernels.py" = ["B007", "F841", "PLR5501"]
 
 [tool.ruff.format]
 quote-style = "double"

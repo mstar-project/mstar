@@ -59,6 +59,10 @@ class MessageSource(IntEnum):
 class RemoveRequest(MessageBody):
     request_id: str
     source: int = MessageSource.CONDUCTOR
+    # Rank 0 forwarding a removal to its followers stamps the last step it had
+    # broadcast, so they tear the request down at the same point in the step
+    # sequence it did, maintaining KV cache state symmetry.
+    after_tp_seq: int = -1
 
 
 @dataclass
@@ -102,6 +106,76 @@ class StopLoops(MessageBody):
 
 
 @dataclass
+class OffloadDelta:
+    """A rank's offloads and reloads, in the order it made them.
+
+    Ordered so the follower replays the leader's decisions in the same order: a
+    sequence that worked for the leader works for the followers too.
+
+    Holds WIRE request ids, not worker-local handles: a handle is minted per
+    worker, so rank 0's would name different requests on the follower.
+
+    A dataclass of lists rather than a NamedTuple of deques so that the wire codec
+    can automatically encode it. ``pop_left`` is O(n) on a list, which costs nothing
+    at the handful of entries a delta ever holds.
+
+    ``__len__`` is the queue depth, so an empty delta is falsy -- several callers
+    lean on that.
+    """
+
+    # parallel lists: rids[i] was offloaded if is_offload[i], else reloaded
+    rids: list[str] = field(default_factory=list)
+    is_offload: list[bool] = field(default_factory=list)
+
+    @classmethod
+    def new(cls) -> "OffloadDelta":
+        return cls()
+
+    def add_offloaded(self, rid: str):
+        self.rids.append(rid)
+        self.is_offload.append(True)
+
+    def add_reloaded(self, rid: str):
+        self.rids.append(rid)
+        self.is_offload.append(False)
+
+    def __len__(self):
+        return len(self.rids)
+
+    def peek_left(self) -> tuple[str, bool] | None:
+        if not len(self):
+            return
+        return (self.rids[0], self.is_offload[0])
+
+    def pop_left(self) -> tuple[str, bool] | None:
+        if not len(self):
+            return None
+        return (self.rids.pop(0), self.is_offload.pop(0))
+
+    def copy(self) -> "OffloadDelta":
+        """An independent queue holding the same moves.
+
+        One per follower: each replays at its own pace, popping as it goes.
+        """
+        return OffloadDelta(list(self.rids), list(self.is_offload))
+
+    def take(self) -> "OffloadDelta":
+        """Hand the queue over and leave this one empty.
+
+        Copies and clears rather than rebinding, so a holder of this delta (the
+        engine keeps its journal in a dict) sees it emptied.
+        """
+        taken = self.copy()
+        self.rids.clear()
+        self.is_offload.clear()
+        return taken
+
+    def extend(self, other: "OffloadDelta") -> None:
+        self.rids.extend(other.rids)
+        self.is_offload.extend(other.is_offload)
+
+
+@dataclass
 class ScheduleTPNode(MessageBody):
     node_name: str
     graph_walk: str
@@ -109,6 +183,7 @@ class ScheduleTPNode(MessageBody):
     speculative: bool = False
     spec_seq: int = -1
     spec_from_seq: int = -1
+    resident_delta: OffloadDelta = field(default_factory=OffloadDelta.new)
 
 
 @dataclass

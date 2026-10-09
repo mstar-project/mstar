@@ -126,6 +126,7 @@ def _taking(gpu: SimpleNamespace, cost: int):
         if gpu.free < cost:
             raise torch.OutOfMemoryError("CUDA out of memory")
         gpu.free -= cost
+        return {}
 
     return run
 
@@ -192,6 +193,7 @@ class _StubCaptureRegion:
         self._device = torch.device("cuda", 0)
         self._autocast_dtype = None
         self._label = "vit"
+        self._memory_pool = None
         self._comm_group = None
         self._num_slots = 1
         self._graphs = {}
@@ -212,6 +214,7 @@ class _StubCaptureRegion:
         self.tried.append((shape.bs, shape.total_tokens))
         yield WarmedRegion(
             run=_taking(self._gpu, self._eager_steps[self._bucket(shape)].reserved), static_inputs={}, dummy_rids=[],
+            warm_outputs={},
         )
 
 
@@ -226,7 +229,7 @@ def gpu(monkeypatch):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (gpu.free, 80 * _GIB))
     monkeypatch.setattr(
-        cuda_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (run(), None),
+        cuda_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, run()),
     )
     return gpu
 

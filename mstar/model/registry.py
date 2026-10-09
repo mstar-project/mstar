@@ -4,23 +4,44 @@ from mstar.model.base import Model
 
 MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
+    "chatterbox": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
+    "chatterbox_multilingual": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
+    "chatterbox_turbo": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_edge": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_edge_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_super_i2v_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
+    "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "qwen3_tts_1p7b": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "qwen3_tts_voicedesign": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "qwen3_tts_base": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
+    "waypoint": ("mstar.model.waypoint.waypoint_model", "WaypointModel"),
     "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
 }
 
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
+    # Resemble AI Chatterbox: Llama-520M T3 speech-token LM + S3Gen flow
+    # matching decoder + HiFT vocoder, zero-shot voice cloning with CFG and
+    # exaggeration control. The Turbo checkpoint is a GPT-2-medium T3 with a
+    # distilled two-step decoder; same class, variant picked from the repo id.
+    # The 23-language checkpoint lives in the same repo as the English one
+    # (a T3 with a 2454-token grapheme vocabulary), so its variant is named.
+    "chatterbox": {"model_path_hf": "ResembleAI/chatterbox"},
+    "chatterbox_multilingual": {"model_path_hf": "ResembleAI/chatterbox", "variant": "multilingual"},
+    "chatterbox_turbo": {"model_path_hf": "ResembleAI/chatterbox-turbo"},
     # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
     "cosmos3": {"model_path_hf": "nvidia/Cosmos3-Nano"},
     # Cosmos3-Nano-Policy-DROID — Nano-sized action-policy fine-tune for the
@@ -28,10 +49,23 @@ HF_MODELS: dict[str, dict] = {
     # class; the checkpoint's config disables the sound pathway (sound_gen
     # false, no sound_tokenizer/), so the model self-serves without audio.
     "cosmos3_droid": {"model_path_hf": "nvidia/Cosmos3-Nano-Policy-DROID"},
+    # Cosmos3-Edge (4B) — same class; the dense Nemotron backbone family
+    # (relu2 MLPs, Nemotron norms, no text QK-norm, k_norm_und_for_gen),
+    # 480p-native generation and the reasoner (understanding tower + SigLIP2
+    # vision encoder served as a VLM) all load from the checkpoint's configs.
+    "cosmos3_edge": {"model_path_hf": "nvidia/Cosmos3-Edge"},
+    # Edge action-policy fine-tune for DROID (domain droid_lerobot); Edge
+    # backbone, no reasoner weights beyond the shared text tower.
+    "cosmos3_edge_droid": {"model_path_hf": "nvidia/Cosmos3-Edge-Policy-DROID"},
     # Cosmos3-Super (64B) — same architecture + class; dims (64 layers / 5120
     # hidden / 25600 intermediate) load from the checkpoint's config.json, so it
     # needs tensor parallelism (it does not fit on one GPU).
     "cosmos3_super": {"model_path_hf": "nvidia/Cosmos3-Super"},
+    # 4-step distilled Super task checkpoints (guidance baked in; a fixed
+    # 4-sigma stochastic Euler sampler instead of UniPC). Same class + TP
+    # deployment as Super.
+    "cosmos3_super_i2v_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Image2Video-4Step"},
+    "cosmos3_super_t2i_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Text2Image-4Step"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
@@ -39,13 +73,22 @@ HF_MODELS: dict[str, dict] = {
     # bidirectionally over an 8-codebook canvas, plus the Higgs-Audio-v2 codec
     # shipped in the checkpoint's audio_tokenizer/ subfolder (~3.3 GB total).
     "omnivoice": {"model_path_hf": "k2-fsa/OmniVoice"},
+    # Kokoro-82M TTS: misaki G2P + PL-BERT prosody + iSTFTNet decoder, 54 bundled voices.
+    "kokoro": {"model_path_hf": "hexgrad/Kokoro-82M"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
+    # Qwen3-TTS 12 Hz family: one class, the variant is read from config.json.
+    # CustomVoice = built-in speakers (1.7B also takes style instructions),
+    # VoiceDesign = voice described by an instruction, Base = voice cloned
+    # from reference audio.
     "qwen3_tts": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"},
+    "qwen3_tts_1p7b": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"},
+    "qwen3_tts_voicedesign": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"},
+    "qwen3_tts_base": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"},
     # V-JEPA 2 standard (encoder + masked predictor).  Default is ViT-L @ 256
     # (~300M); the same class loads vitl/h/g at 256 or 384 by reading
     # config.json.
@@ -59,10 +102,32 @@ HF_MODELS: dict[str, dict] = {
     # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
     # only; the A14B MoE variants are a separate follow-up.
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
+    # Waypoint owns a variant -> Hub repository mapping. None is intentional:
+    # it lets WaypointModel distinguish the registry default from an explicit
+    # local path or Hub ID, then select the 720P or 360P repository named by the
+    # YAML `variant`. TAEHV is resolved independently from config.ae_uri.
+    "waypoint": {"model_path_hf": None},
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
 }
+
+# qwen 3.5 family: dense (MoE TODO)
+qwen_3_5_dense_sizes = ("0.8", "2", "4", "9", "27")
+MODEL_REGISTRY.update({
+    f"qwen3_5_{size}b": ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel") \
+        for size in qwen_3_5_dense_sizes
+})
+HF_MODELS.update({
+    f"qwen3_5_{size}b": {"model_path_hf": f"Qwen/Qwen3.5-{size}B"} \
+        for size in qwen_3_5_dense_sizes
+})
+
+
+def model_init_kwargs(name: str) -> dict:
+    """Constructor kwargs the registry pins for ``name``: the checkpoint repo
+    and, where one repo serves several models, the variant."""
+    return {"model_path_hf": "", **HF_MODELS.get(name, {})}
 
 
 def get_model_class(name: str) -> type[Model]:

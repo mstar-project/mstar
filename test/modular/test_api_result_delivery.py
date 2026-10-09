@@ -35,6 +35,9 @@ class _RecordingTensorManager:
     def cleanup_request(self, request_id):
         pass
 
+    def force_cleanup_request(self, request_id):
+        pass
+
     def store_and_return_tensor_info(self, request_id, tensors):
         return {}
 
@@ -165,6 +168,7 @@ def _api_server_stub(preprocess_worker):
     server.log_stats = False
     server.request_lock = threading.Lock()
     server.timeout_seconds = 5.0
+    server.enable_nvtx = False
     return server
 
 
