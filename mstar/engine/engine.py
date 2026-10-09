@@ -1853,12 +1853,15 @@ class Engine:
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
         )
+        t0 = perf_counter() if PHASE_PERIOD else 0.0
         step = submodule_mgmt.submodule.declare_step(
             graph_walk=batch.step_context.graph_walk,
             request_ids=batch.step_context.padded_request_ids,
             inputs=inputs,
             slot_lease=lease,
         )
+        if PHASE_PERIOD:
+            phase_record("engine.pre_declare", perf_counter() - t0)
         if step is None:
             return False
         if batch.inputs is not None or (
@@ -1867,14 +1870,17 @@ class Engine:
                 batch.step_context.graph_walk,
             )
         ):
-            # exec drives this step as declared here (its admit ran as
-            # pre_admit), instead of declaring and admitting again
+            # exec drives this step as declared here, and its admit skips
+            # the resources pre_admit covered
             batch.step = step
 
         batch.step_context.is_preplan = True
         step.set_ctx(batch.step_context)
         try:
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             admit_outcome = self._runner.pre_admit(step)
+            if PHASE_PERIOD:
+                phase_record("engine.pre_admit", perf_counter() - t0)
             if not admit_outcome.ok:
                 # exec re-drives the step and reports the failure from there
                 self.reset_pre_plan_for_batch(batch)
