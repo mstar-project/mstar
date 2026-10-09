@@ -367,6 +367,16 @@ Worker scheduling
        cleanup per step). Only nodes that opt in (Qwen3.5 decode) and only
        when the sampler has graph buffers; ``0`` keeps every node on the
        per-request tensor path.
+   * - ``MSTAR_INGRAPH_DECODE_TOKENS``
+     - ``0``
+     - A captured decode step gathers its input ids off the sampler's slot
+       master inside the graph instead of staging them before the replay.
+       Experiment knob, measured and gated on its own.
+   * - ``MSTAR_INGRAPH_DECODE_ROPE``
+     - ``0``
+     - A captured decode step builds its rotary tables inside the graph from
+       the position resource's planned positions instead of staging them.
+       Experiment knob, measured and gated on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - ``0``
      - The captured sampler gathers its RNG offsets from the slot masters
