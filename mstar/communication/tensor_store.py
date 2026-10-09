@@ -579,6 +579,11 @@ class TensorStore:
         """The host copy stored alongside ``uuid``, if the producer gave one."""
         return self._tensors_cpu.get(uuid)
 
+    def drop_cpu_tensors(self, uuids: list[int]):
+        if self._tensors_cpu:
+            for uuid in uuids:
+                self._tensors_cpu.pop(uuid, None)
+
     def put_tensor(
         self, request_id: Rid, uuid: int,
         tensor: torch.Tensor,

@@ -392,18 +392,14 @@ class TensorCommunicationManager(ABC):
     ) -> torch.Tensor | None:
         """The producer's host copy of ``tensor``, if it gave a usable one: a
         host tensor of the same shape and dtype, else None (the send then
-        copies from the device tensor).
-
-        Cloned: the worker's copies are views of pinned buffers the next step
-        reuses, and a persisted output can be sent steps later (a loop's
-        accumulated tokens go out when the loop ends)."""
+        copies from the device tensor)."""
         cpu = by_tensor.get(id(tensor))
         if not torch.is_tensor(cpu) or cpu.device.type != "cpu":
             return None
         cpu = self._ensure_leading_shard_dim(shard_dim, cpu)
         if cpu.shape != canonical.shape or cpu.dtype != canonical.dtype:
             return None
-        return cpu.clone()
+        return cpu
 
     def _ensure_leading_shard_dim(self, shard_dim: int | None, tensor: torch.Tensor):
         """Move ``shard_dim`` to dim 0, preserving the relative order of the
@@ -1129,6 +1125,12 @@ class TensorCommunicationManager(ABC):
 
     def increment_ref(self, uuid: int, n: int = 1):
         self.tensor_store.increment_ref(uuid, n=n)
+
+    def drop_host_copies(self, uuids: list[int]):
+        """Forget the host copies stored with ``uuids``. The producer reuses
+        their memory next step, so only this step's sends may read them; a
+        later send copies from the device tensor."""
+        self.tensor_store.drop_cpu_tensors(uuids)
 
     def increment_ref_batch_uniform(self, uuids: list[int], n: int = 1):
         """``increment_ref_batch`` for a uniform count, which is what the

@@ -2884,14 +2884,15 @@ class Worker:
         # mints, so nothing is keyed by request and signal only to be taken
         # apart again here.
         _t_store = _time.perf_counter() if self._phase_period else 0.0
-        # No host copies: the stop check's are views of pinned buffers the
-        # next step reuses, and a loop's accumulated outputs are sent steps
-        # later. A host-memory transport copies the rows itself.
+        # Pass the stop check's host copies so a host-memory transport needn't
+        # copy the rows again. They are views of pinned buffers the next step
+        # reuses, so they are dropped once this step's sends are written.
         stored = self.tensor_manager.store_and_return_tensor_info_batch(
             rids, outputs, signals,
             node_name=batch_N.node_name,
             graph_walk=batch_N.graph_walk,
             skip_cuda_sync=True,
+            cpu_tensors=cpu_outputs,
         )
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
@@ -2947,6 +2948,8 @@ class Worker:
             range_push("worker.postprocess.register_outputs", synchronize=False)
         with self._span("worker.postprocess.register_outputs"):
             self._register_outputs(route_output)
+        # Anything sent later (a loop's accumulated tokens) copies from the device.
+        self.tensor_manager.drop_host_copies(flat_uuids)
         _pp_stage("register_outputs")
 
         # send outputs
