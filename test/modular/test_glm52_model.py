@@ -618,3 +618,34 @@ def test_load_refuses_a_checkpoint_missing_a_layer(tmp_path):
         load("missing")
     assert all(n in str(exc.value) for n in layer1)
     assert "model.layers.0." not in str(exc.value)
+
+
+def test_fallback_tokenizer_keeps_turn_tokens_special(tmp_path):
+    """Built from tokenizer.json alone, a tokenizer has no special tokens even where the file
+    marks them special: the fallback registers tokenizer_config's, or every reply ends in
+    ``<|user|>``. ``</think>`` stays printable, and no id is added."""
+    import json
+
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+
+    from mstar.model.utils import ByteLevelDetokenizer
+
+    alphabet = pre_tokenizers.ByteLevel.alphabet()
+    raw = Tokenizer(models.BPE(vocab={c: i for i, c in enumerate(sorted(alphabet))}, merges=[]))
+    raw.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    raw.decoder = decoders.ByteLevel()
+    turns = ["<|endoftext|>", "<|user|>", "<|observation|>"]
+    raw.add_special_tokens(turns)
+    raw.add_tokens(["</think>"])
+    raw.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>",
+        "extra_special_tokens": turns, "tokenizer_class": "TokenizersBackend"}))
+
+    tok = Glm52Model._fast_tokenizer_fallback(str(tmp_path))
+    assert len(tok) == raw.get_vocab_size()
+    assert set(tok.convert_tokens_to_ids(turns)) <= set(tok.all_special_ids)
+    think, user = tok.convert_tokens_to_ids(["</think>", "<|user|>"])
+    assert think not in tok.all_special_ids
+    ids = tok.encode("hi", add_special_tokens=False) + [think, user]
+    assert ByteLevelDetokenizer(tok).to_bytes(ids) == b"hi</think>"

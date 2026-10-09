@@ -149,6 +149,14 @@ class Glm52Model(Model):
         template = snap / "chat_template.jinja"
         if template.is_file():
             tokenizer.chat_template = template.read_text()
+        # built from tokenizer.json alone, the tokenizer has no special tokens, so the
+        # detokenizer would print <|user|> and the other turn markers into replies
+        config = snap / "tokenizer_config.json"
+        if config.is_file():
+            cfg = json.loads(config.read_text())
+            special = {k: cfg[k] for k in ("eos_token", "pad_token") if cfg.get(k)}
+            tokenizer.add_special_tokens(
+                {**special, "additional_special_tokens": list(cfg.get("extra_special_tokens") or [])})
         return tokenizer
 
     # -------------------------------------------------------------------
