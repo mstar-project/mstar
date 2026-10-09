@@ -36,6 +36,7 @@ test/modular/test_parallel_groups.py
 test/modular/test_preplan_error_paths.py
 test/modular/test_diffusion_denoise_loop.py
 test/modular/test_diffusion_noise_stager.py
+test/modular/test_batched_rows.py
 test/modular/test_flux2_klein_model.py
 test/modular/test_z_image_model.py
 test/modular/test_flux2_klein_compile_exact.py
@@ -85,3 +86,4 @@ test/modular/test_kv_pinned_index_ring.py
 test/modular/test_kv_plan_host_lens.py
 test/modular/test_sampler_trash_row.py
 test/modular/test_launch_script_socket_prefix.py
+test/modular/test_ltx2_5_model.py
