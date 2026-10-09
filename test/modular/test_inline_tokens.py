@@ -190,3 +190,42 @@ def test_inline_values_fall_back_when_a_rid_has_no_row_or_nothing_applies():
     assert _worker(_NoInline())._inline_emit_values(
         eng, _Batch(), rows, [7, 8], ["text_inputs"],
     ) == none
+
+
+def test_a_model_that_decodes_ids_gets_the_inline_value_as_a_list():
+    """The per-token tensor build is skipped for a model that opts in; the
+    default model still receives a tensor."""
+    from mstar.api_server.data_worker import InlineToken, PreprocessWorkerThread
+
+    class _Ids(_Model):
+        inline_postprocess_takes_ids = True
+
+        def postprocess(self, output, modality, request_kwargs=None):
+            assert isinstance(output, list) and output == [5]
+            return b"<5>"
+
+    def _worker(model):
+        w = object.__new__(PreprocessWorkerThread)
+        w.model = model
+        w.request_output_state = {}
+        w.request_model_kwargs = {}
+        w.queued = []
+        w._queue_completed_output = lambda rid, seq, chunk: w.queued.append((rid, seq, chunk.data))
+        w._fail_request = lambda *a, **kw: w.queued.append(("fail", a))
+        return w
+
+    item = InlineToken(request_id="r1", value=5, loop_indices=None, modality="text")
+    w = _worker(_Ids())
+    w._emit_inline_token(item)
+    assert w.queued == [("r1", 0, b"<5>")]
+
+    seen = {}
+
+    class _Tensor(_Model):
+        def postprocess(self, output, modality, request_kwargs=None):
+            seen["type"] = type(output).__name__
+            return b"x"
+
+    w = _worker(_Tensor())
+    w._emit_inline_token(item)
+    assert seen["type"] == "Tensor" and w.queued == [("r1", 0, b"x")]
