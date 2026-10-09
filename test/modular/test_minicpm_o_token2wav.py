@@ -18,14 +18,23 @@ import torch
 from mstar.model.minicpm_o.components.token2wav import (
     HIFT_TAIL,
     KEEP_RECENT,
+    PHASE_FIRST,
+    PHASE_SECOND,
+    PHASE_STEADY,
     CacheCapacity,
     SineGen2Source,
     Token2Wav,
     Token2WavState,
     fade_in_out,
+    lengths_after,
     num_windows,
+    state_block_shapes,
+    state_from_slot,
+    state_lengths,
     stream_windows,
+    window_batch_key,
     window_frames,
+    window_phase,
     window_samples,
 )
 from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt, _module_path
@@ -188,6 +197,108 @@ def test_stream_shapes_and_capacity_independence(random_token2wav):
             assert state.dit_len <= 2 * p + KEEP_RECENT or last
         outs.append(torch.cat(wavs, dim=1))
     assert torch.equal(outs[0], outs[1])
+
+
+def test_window_phase_and_lengths():
+    p2 = 302
+    fresh = {"prompt_frames": p2, "enc_len1": 151, "enc_len2": 302, "dit_len": 302, "calls": 0}
+    phases, lengths = [], fresh
+    for _ in range(5):
+        phases.append(window_phase(lengths, 28, False))
+        lengths = lengths_after(lengths, 28, False)
+    assert phases == [PHASE_FIRST, PHASE_SECOND, PHASE_STEADY, PHASE_STEADY, PHASE_STEADY]
+    assert lengths == {"prompt_frames": p2, "enc_len1": 201, "enc_len2": 402, "dit_len": 402, "calls": 5}
+    assert window_phase(lengths, 28, True) is None and window_phase(lengths, 20, False) is None
+    small = {"prompt_frames": 60, "enc_len1": 30, "enc_len2": 60, "dit_len": 60, "calls": 0}
+    assert window_phase(small, 28, False) is None
+
+
+def test_steady_windows_share_a_batch_key():
+    p2 = 302
+    lengths = {"prompt_frames": p2, "enc_len1": 151, "enc_len2": 302, "dit_len": 302, "calls": 0}
+    keys = []
+    for _ in range(6):
+        keys.append(window_batch_key(lengths, 28, False))
+        lengths = lengths_after(lengths, 28, False)
+    assert len({keys[0], keys[1], keys[2]}) == 3
+    assert keys[2] == keys[3] == keys[4] == keys[5]
+    assert window_batch_key(lengths, 9, True) != window_batch_key(lengths, 10, True)
+
+
+def test_lengths_after_matches_state(random_token2wav):
+    """The host bookkeeping agrees with what ``flow_chunk`` leaves in a state."""
+    model = random_token2wav
+    p = 50
+    voice = model.prepare_voice(VoicePrompt(
+        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32), spk_emb=torch.randn(1, 192),
+        mel=torch.randn(1, 2 * p, 80),
+    ))
+    st = model.new_state(voice)
+    for win, last in list(stream_windows(list(range(80))))[:3]:
+        want = lengths_after(state_lengths(st), len(win), last)
+        model.stream(st, voice, win, last)
+        assert state_lengths(st) == want
+
+
+def test_batched_windows_on_pool(random_token2wav):
+    """Every window of an utterance batched on pool slots: one row is bit-identical to
+    ``stream`` (samples, and the slot against the state after every window: first window
+    read from the voice, truncation, last window), and two rows agree with it to the
+    batch-size dependence of the GEMMs."""
+    from mstar.model.chatterbox.components.s3gen_hift import HiFTNoise
+
+    model = random_token2wav
+    p = 50
+    torch.manual_seed(1)
+    voice = model.prepare_voice(VoicePrompt(
+        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32), spk_emb=torch.randn(1, 192),
+        mel=torch.randn(1, 2 * p, 80),
+    ))
+    shapes = state_block_shapes(CacheCapacity(p))
+    blocks = {name: torch.zeros((3, *shape)) for name, shape in shapes.items()}
+    codes = [torch.randint(0, 6561, (90,)).tolist() for _ in range(2)]
+    wins = [list(stream_windows(c)) for c in codes]  # 4 windows each, the last of 18 tokens
+    gen = torch.Generator().manual_seed(9)
+
+    def noise(rows, calls, win, last):
+        frames = window_frames(len(win), last) + (0 if calls == 0 else 8)
+        return model.hift.m_source.draw_noise(rows, frames * 480, torch.float32, "cpu", gen)
+
+    def check_slot(slot, st):
+        view = state_from_slot({n: t[slot] for n, t in blocks.items()}, state_lengths(st))
+        for name in shapes:
+            a, b = getattr(view, name), getattr(st, name)
+            n = {"enc_kv1": st.enc_len1, "enc_kv2": st.enc_len2, "dit_kv": st.dit_len}.get(name)
+            if n is not None:
+                a, b = a[..., :n, :], b[..., :n, :]
+            assert torch.equal(a, b), name
+
+    ref = model.new_state(voice)
+    lengths = state_lengths(voice.initial)
+    mels, noises = [], []
+    for win, last in wins[0]:
+        nz = noise(2, lengths["calls"], win, last)
+        row0 = HiFTNoise(phase=nz.phase[:1], harmonic=nz.harmonic[:1])
+        mel = model.flow_chunk(ref, voice, torch.tensor([win], dtype=torch.int32), last)
+        want = model.vocode_chunk(ref, mel, last, noise=row0)
+        tokens = torch.tensor([win], dtype=torch.int32)
+        out = model.window_spectrum(blocks, torch.tensor([1]), voice, lengths, tokens, last, row0)
+        got = model.window_finish(blocks, torch.tensor([1]), out["magnitude"], out["phase"], lengths, last)
+        assert torch.equal(got, want) and torch.equal(out["mel"], mel)
+        if not last:
+            check_slot(1, ref)
+        lengths = lengths_after(lengths, len(win), last)
+        mels.append(mel)
+        noises.append(nz)
+
+    for t in blocks.values():
+        t.zero_()
+    lengths = state_lengths(voice.initial)
+    for k, ((w0, last), (w1, _)) in enumerate(zip(wins[0], wins[1], strict=True)):
+        tokens = torch.tensor([w0, w1], dtype=torch.int32)
+        out = model.window_spectrum(blocks, torch.tensor([1, 2]), voice, lengths, tokens, last, noises[k])
+        torch.testing.assert_close(out["mel"][:1], mels[k], rtol=1e-4, atol=1e-4)
+        lengths = lengths_after(lengths, len(w0), last)
 
 
 def test_onnx_scope_paths():

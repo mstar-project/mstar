@@ -5,15 +5,20 @@ Ported from Step-Audio2's ``CausalMaskedDiffWithXvec`` (``cosyvoice2/flow/flow.p
 (``flow_matching.py``) and ``DiT`` (``decoder_dit.py``), shipped in ``minicpmo-utils``
 (Apache-2.0); only the streaming ``*_chunk`` paths exist here.
 
-The reference keeps its streaming caches in buffers shared by every caller. Here each call
-takes the request's cache tensors and a valid length, reads ``[:length]`` and writes the new
-entries in place, so a request's whole state can live in one fixed-size slot. Ops, operand
-layouts and concatenation orders follow the reference so the result is bit-identical: the
-conformer appends new keys after its cache, the DiT puts them in front of it.
+The reference keeps its streaming caches in buffers shared by every caller. Here every
+attention layer is handed a ``KVCache`` saying where its keys|values live: ``DenseKV`` over a
+request's own cache tensor (any window, one request), or ``PoolKV`` straight over the rows of a
+slot pool (a batch of steady-state windows, gathered and scattered by slot index, so it can be
+captured). Ops, operand layouts and concatenation orders follow the reference so the result is
+bit-identical: the conformer appends new keys after its cache, the DiT puts them in front of it.
+
+Classifier-free guidance runs the conditional and unconditional rows of a request side by side
+(rows ``2b`` and ``2b + 1``), which is also how the DiT caches store them.
 """
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -36,6 +41,81 @@ DIT_HIDDEN = 512
 CFG_RATE = 0.7
 N_TIMESTEPS = 10
 NOISE_FRAMES = 50 * 600
+
+
+class KVCache:
+    """One attention layer's keys|values (``[..., 2 * head_dim]``) between windows."""
+
+    length: int  # valid entries before this window
+
+    def read(self) -> torch.Tensor | None:
+        """The valid entries ``[N, H, length, 2d]``, or None when there are none."""
+        raise NotImplementedError
+
+    def write(self, k: torch.Tensor, v: torch.Tensor, new_first: bool) -> None:
+        """Persist after attention; ``k``/``v`` ``[N, H, length + T, d]`` are what the layer
+        attended to, this window's entries first (``new_first``) or last."""
+        raise NotImplementedError
+
+
+class DenseKV(KVCache):
+    """A request's own cache tensor ``[N, H, capacity, 2d]`` holding ``length`` entries;
+    afterwards it holds ``length + T`` in attention order (the caller truncates)."""
+
+    def __init__(self, buf: torch.Tensor, length: int):
+        self.buf = buf
+        self.length = length
+
+    def read(self) -> torch.Tensor | None:
+        return self.buf[:, :, : self.length] if self.length > 0 else None
+
+    def write(self, k: torch.Tensor, v: torch.Tensor, new_first: bool) -> None:
+        if new_first:
+            self.buf[:, :, : k.shape[2]] = torch.cat([k, v], dim=3)
+        else:
+            n = self.length
+            self.buf[:, :, n:k.shape[2]] = torch.cat((k[:, :, n:], v[:, :, n:]), dim=-1)
+
+
+class PoolKV(KVCache):
+    """Rows of slot-major pool views ``[slots, *rows, H, capacity, 2d]``. Reads gather
+    ``[:length]`` of ``src`` at ``src_slots`` (a voice's initial state as a one-slot pool, say),
+    flattening ``rows`` per slot into the batch (``[B * prod(rows), H, length, 2d]``). After
+    attention each ``(keep, dst)`` in ``writes`` scatters the attended entries ``keep`` to
+    ``[dst, dst + len(keep))`` of ``view`` at ``slots``: that is how a fixed-length window
+    lands its cache, truncation included, without a separate pass."""
+
+    def __init__(
+        self,
+        view: torch.Tensor,
+        slots: torch.Tensor,
+        length: int,
+        writes: list[tuple[slice, int]],
+        src: torch.Tensor | None = None,
+        src_slots: torch.Tensor | None = None,
+    ):
+        self.view = view
+        self.slots = slots
+        self.length = length
+        self.writes = writes
+        self.src = view if src is None else src
+        self.src_slots = slots if src_slots is None else src_slots
+
+    def read(self) -> torch.Tensor | None:
+        if self.length == 0:
+            return None
+        rows = self.src[..., : self.length, :].index_select(0, self.src_slots)
+        return rows.flatten(0, rows.dim() - 4)
+
+    def write(self, k: torch.Tensor, v: torch.Tensor, new_first: bool) -> None:
+        del new_first
+        rows = (self.slots.shape[0], *self.view.shape[1:-3])
+        d = k.shape[-1]
+        for keep, dst in self.writes:
+            # keys and values straight into their halves of the slot, without a joined copy
+            for half, part in ((slice(0, d), k), (slice(d, 2 * d), v)):
+                part = part[:, :, keep].unflatten(0, rows)
+                self.view[..., dst:dst + part.shape[-2], half].index_copy_(0, self.slots, part)
 
 
 def rel_position_table(d_model: int, max_len: int = 5000) -> torch.Tensor:
@@ -91,20 +171,18 @@ class RelPositionAttention(nn.Module):
         x_padded = torch.cat([zero_pad, x], dim=-1).view(x.size(0), x.size(1), x.size(3) + 1, x.size(2))
         return x_padded[:, :, 1:].view_as(x)[:, :, :, : x.size(-1) // 2 + 1]
 
-    def forward(
-        self, x: torch.Tensor, pos_emb: torch.Tensor, kv_cache: torch.Tensor, n_cached: int,
-    ) -> torch.Tensor:
-        """``x [B, T, D]``; ``kv_cache [B, H, cap, 2 * d_k]`` holds ``n_cached`` entries and
-        receives this chunk's keys/values at ``[n_cached, n_cached + T)``."""
+    def forward(self, x: torch.Tensor, pos_emb: torch.Tensor, kv: KVCache) -> torch.Tensor:
+        """``x [B, T, D]``; this chunk's keys/values go after the cached ones."""
         b, t, _ = x.shape
         q = self.linear_q(x).view(b, -1, self.h, self.d_k)
         k = self.linear_k(x).view(b, -1, self.h, self.d_k).transpose(1, 2)
         v = self.linear_v(x).view(b, -1, self.h, self.d_k).transpose(1, 2)
-        kv_cache[:, :, n_cached:n_cached + t] = torch.cat((k, v), dim=-1)
-        if n_cached > 0:
-            key_cache, value_cache = torch.split(kv_cache[:, :, :n_cached], self.d_k, dim=-1)
+        cached = kv.read()
+        if cached is not None:
+            key_cache, value_cache = torch.split(cached, self.d_k, dim=-1)
             k = torch.cat([key_cache, k], dim=2)
             v = torch.cat([value_cache, v], dim=2)
+        kv.write(k, v, new_first=False)
 
         p = self.linear_pos(pos_emb).view(pos_emb.size(0), -1, self.h, self.d_k).transpose(1, 2)
         q_with_bias_u = (q + self.pos_bias_u).transpose(1, 2)
@@ -140,8 +218,8 @@ class ConformerLayer(nn.Module):
         self.norm_ff = nn.LayerNorm(size, eps=1e-12)
         self.norm_mha = nn.LayerNorm(size, eps=1e-12)
 
-    def forward(self, x: torch.Tensor, pos_emb: torch.Tensor, kv_cache: torch.Tensor, n_cached: int) -> torch.Tensor:
-        x = x + self.self_attn(self.norm_mha(x), pos_emb, kv_cache, n_cached)
+    def forward(self, x: torch.Tensor, pos_emb: torch.Tensor, kv: KVCache) -> torch.Tensor:
+        x = x + self.self_attn(self.norm_mha(x), pos_emb, kv)
         return x + self.feed_forward(self.norm_ff(x))
 
 
@@ -205,16 +283,14 @@ class StreamingTokenEncoder(nn.Module):
         xs: torch.Tensor,
         last_chunk: bool,
         cnn_cache: torch.Tensor,
-        kv1: torch.Tensor,
-        len1: int,
-        kv2: torch.Tensor,
-        len2: int,
+        kv1: list[KVCache],
+        kv2: list[KVCache],
     ) -> torch.Tensor:
         """Token embeddings ``[B, T, 512]`` -> ``[B, 2 (T - 3), 512]`` (``2T`` on the last
-        chunk, whose lookahead is zero padding). ``cnn_cache [B, 512, 6]``; ``kv1 [6, B, H,
-        cap1, 128]`` / ``kv2 [4, B, H, cap2, 128]`` hold ``len1`` / ``len2`` entries and
-        receive this chunk's after them. The reference positions the 25 Hz stage at
-        ``len2 // 2``, which equals ``len1`` because ``len2 == 2 * len1`` on entry."""
+        chunk, whose lookahead is zero padding). ``cnn_cache [B, 512, 6]`` (updated in place);
+        ``kv1`` / ``kv2``: one cache per 25 Hz / 50 Hz layer. The reference positions the 25 Hz
+        stage at ``len2 // 2``, which equals ``len1`` because ``len2 == 2 * len1`` on entry."""
+        len1, len2 = kv1[0].length, kv2[0].length
         assert len2 == UP_RATE * len1, (len1, len2)
         xs = self.embed(xs)
         if last_chunk:
@@ -222,13 +298,13 @@ class StreamingTokenEncoder(nn.Module):
         xs = self.pre_lookahead_layer(xs, cnn_cache[:, :, :2])
         pos_emb = self.position_encoding(len1 + xs.shape[1])
         for idx, layer in enumerate(self.encoders):
-            xs = layer(xs, pos_emb, kv1[idx], len1)
+            xs = layer(xs, pos_emb, kv1[idx])
 
         xs = self.up_layer(xs.transpose(1, 2).contiguous(), cnn_cache[:, :, 2:]).transpose(1, 2).contiguous()
         xs = self.up_embed(xs)
         pos_emb = self.position_encoding(len1 * UP_RATE + xs.shape[1])
         for idx, layer in enumerate(self.up_encoders):
-            xs = layer(xs, pos_emb, kv2[idx], len2)
+            xs = layer(xs, pos_emb, kv2[idx])
         return self.after_norm(xs)
 
 
@@ -237,8 +313,9 @@ class StreamingTokenEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return x * (1 + scale) + shift
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale_plus_1: torch.Tensor) -> torch.Tensor:
+    """adaLN's ``x * (1 + scale) + shift``, with ``1 + scale`` precomputed (same arithmetic)."""
+    return x * scale_plus_1 + shift
 
 
 class TimestepEmbedder(nn.Module):
@@ -276,18 +353,18 @@ class DiTAttention(nn.Module):
         b, t, c = x.shape
         return x.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
 
-    def forward(self, x: torch.Tensor, kv_cache: torch.Tensor, n_cached: int) -> torch.Tensor:
-        """``kv_cache [B, H, cap, 2 * head_dim]`` holds ``n_cached`` entries; afterwards it
-        holds ``[this chunk, old entries]`` (``n_cached + T``)."""
+    def forward(self, x: torch.Tensor, kv: KVCache) -> torch.Tensor:
+        """This chunk's keys/values go in front of the cached ones."""
         b, t, _ = x.shape
         q = self.q_norm(self._heads(self.to_q(x)))
         k = self.k_norm(self._heads(self.to_k(x)))
         v = self._heads(self.to_v(x))
-        if n_cached > 0:
-            k_cache, v_cache = kv_cache[:, :, :n_cached].chunk(2, dim=3)
+        cached = kv.read()
+        if cached is not None:
+            k_cache, v_cache = cached.chunk(2, dim=3)
             k = torch.cat([k, k_cache], dim=2)
             v = torch.cat([v, v_cache], dim=2)
-        kv_cache[:, :, : n_cached + t] = torch.cat([k, v], dim=3)
+        kv.write(k, v, new_first=True)
         x = F.scaled_dot_product_attention(q, k, v)
         return self.proj(x.transpose(1, 2).reshape(b, t, -1))
 
@@ -345,12 +422,18 @@ class DiTBlock(nn.Module):
         self.conv = CausalConvBlock(hidden)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden, 9 * hidden))
 
-    def forward(
-        self, x: torch.Tensor, c: torch.Tensor, cnn_cache: torch.Tensor, kv_cache: torch.Tensor, n_cached: int,
-    ) -> torch.Tensor:
+    def modulation(self, c: torch.Tensor) -> torch.Tensor:
+        """The time condition's 9 modulation vectors ``[9, *c.shape]``, scales as ``1 + scale``."""
+        mod = list(self.adaLN_modulation(c).chunk(9, dim=-1))
+        for i in (1, 4, 7):
+            mod[i] = 1 + mod[i]
+        return torch.stack(mod)
+
+    def forward(self, x: torch.Tensor, mod: torch.Tensor, cnn_cache: torch.Tensor, kv: KVCache) -> torch.Tensor:
+        """``mod`` is ``modulation``'s output for this Euler step (rows broadcast over ``x``)."""
         (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp,
-         shift_conv, scale_conv, gate_conv) = self.adaLN_modulation(c).chunk(9, dim=-1)
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), kv_cache, n_cached)
+         shift_conv, scale_conv, gate_conv) = mod
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), kv)
         x = x + gate_conv * self.conv(modulate(self.norm3(x), shift_conv, scale_conv), cnn_cache)
         return x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
 
@@ -362,8 +445,12 @@ class FinalLayer(nn.Module):
         self.norm_final = nn.LayerNorm(hidden, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden, out_channels)
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def modulation(self, c: torch.Tensor) -> torch.Tensor:
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+        return torch.stack([shift, 1 + scale])
+
+    def forward(self, x: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
+        shift, scale = mod
         return self.linear(modulate(self.norm_final(x), shift, scale))
 
 
@@ -381,21 +468,28 @@ class DiT(nn.Module):
         self,
         x: torch.Tensor,
         mu: torch.Tensor,
-        t: torch.Tensor,
+        mods: torch.Tensor,
+        final_mod: torch.Tensor,
         spks: torch.Tensor,
         cond: torch.Tensor,
         cnn_cache: torch.Tensor,
-        kv_cache: torch.Tensor,
-        n_cached: int,
+        kv: list[KVCache],
     ) -> torch.Tensor:
-        """``x, mu, cond [B, 80, T]``, ``t [B]``, ``spks [B, 80]``; ``cnn_cache [depth, B,
-        1024, 2]`` and ``kv_cache [depth, B, H, cap, 128]`` are this Euler step's."""
-        c = self.t_embedder(t).unsqueeze(1)
+        """``x, mu, cond [N, 80, T]``, ``spks [N, 80]``; ``mods [depth, 9, r, 1, 512]`` /
+        ``final_mod [2, r, 1, 512]`` the step's time modulations (``ChunkCFM.constants``),
+        ``cnn_cache [depth, N, 1024, 2]`` and ``kv`` (one per block) its caches."""
         x = torch.cat([x, mu, spks.unsqueeze(-1).expand(-1, -1, x.shape[-1]), cond], dim=1)
         x = self.in_proj(x.transpose(1, 2))
         for i, block in enumerate(self.blocks):
-            x = block(x, c, cnn_cache[i], kv_cache[i], n_cached)
-        return self.final_layer(x, c).transpose(1, 2)
+            x = block(x, mods[i], cnn_cache[i], kv[i])
+        return self.final_layer(x, final_mod).transpose(1, 2)
+
+
+@dataclass(frozen=True)
+class SolverConstants:
+    mods: torch.Tensor  # [steps, depth, 9, r, 1, 512], r = 1 (rows equal) or 2
+    finals: torch.Tensor  # [steps, 2, r, 1, 512]
+    dts: torch.Tensor  # [steps]
 
 
 class ChunkCFM(nn.Module):
@@ -408,10 +502,44 @@ class ChunkCFM(nn.Module):
         super().__init__()
         self.estimator = DiT()
         self.register_buffer("rand_noise", torch.zeros(1, MEL_BINS, NOISE_FRAMES), persistent=False)
+        self._constants: SolverConstants | None = None
 
     def t_span(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         t = torch.linspace(0, 1, N_TIMESTEPS + 1, device=device, dtype=dtype)
         return 1 - torch.cos(t * 0.5 * torch.pi)
+
+    def reset_constants(self) -> None:
+        """Drop the cached ``constants``; call after changing weights, device or precision."""
+        self._constants = None
+
+    @torch.inference_mode()
+    def constants(self, device: torch.device, dtype: torch.dtype) -> SolverConstants:
+        """Everything the solver computes from the time schedule alone, built once with the
+        reference's own ops (the time embedding on the guidance pair, each block's adaLN
+        projection, the step sizes as it accumulates them), so using them is bit-identical
+        to recomputing them every window. The pair's two rows are equal, so one is kept and
+        broadcast over any batch."""
+        if self._constants is not None and self._constants.dts.device == device:
+            return self._constants
+        dit = self.estimator
+        t_span = self.t_span(device, dtype)
+        t, dt = t_span[0].unsqueeze(0), t_span[1] - t_span[0]
+        mods, finals, dts = [], [], []
+        for step in range(1, len(t_span)):
+            c = dit.t_embedder(t.repeat(2)).unsqueeze(1)
+            mods.append(torch.stack([block.modulation(c) for block in dit.blocks]))
+            finals.append(dit.final_layer.modulation(c))
+            dts.append(dt.reshape(()))
+            t = t + dt
+            if step < len(t_span) - 1:
+                dt = t_span[step + 1] - t
+        mods, finals = torch.stack(mods), torch.stack(finals)
+        first = (..., slice(0, 1), slice(None), slice(None))
+        second = (..., slice(1, 2), slice(None), slice(None))
+        if torch.equal(mods[first], mods[second]) and torch.equal(finals[first], finals[second]):
+            mods, finals = mods[first].contiguous(), finals[first].contiguous()
+        self._constants = SolverConstants(mods=mods, finals=finals, dts=torch.stack(dts))
+        return self._constants
 
     def forward(
         self,
@@ -419,28 +547,30 @@ class ChunkCFM(nn.Module):
         spks: torch.Tensor,
         cond: torch.Tensor,
         cnn_cache: torch.Tensor,
-        kv_cache: torch.Tensor,
-        n_cached: int,
+        kv: list[list[KVCache]],
     ) -> torch.Tensor:
-        """``mu, cond [1, 80, T]``, ``spks [1, 80]``; ``cnn_cache [steps, depth, 2, 1024, 2]``
-        and ``kv_cache [steps, depth, 2, H, cap, 128]`` (batch 2 = conditional, unconditional)."""
-        x = self.rand_noise[:, :, n_cached:n_cached + mu.size(2)] * 1.0
-        t_span = self.t_span(mu.device, mu.dtype)
-        t, dt = t_span[0].unsqueeze(0), t_span[1] - t_span[0]
-        mu_in = torch.cat([mu, torch.zeros_like(mu)], dim=0)
-        spks_in = torch.cat([spks, torch.zeros_like(spks)], dim=0)
-        cond_in = torch.cat([cond, torch.zeros_like(cond)], dim=0)
-        for step in range(1, len(t_span)):
+        """``mu, cond [B, 80, T]``, ``spks [B, 80]``; ``cnn_cache [steps, depth, 2B, 1024, 2]``
+        and ``kv`` (per step, per block) over the ``2B`` guidance rows. Every row has the same
+        cache length, which is also the noise offset."""
+        b, n_cached = mu.shape[0], kv[0][0].length
+        x = self.rand_noise[:, :, n_cached:n_cached + mu.size(2)].expand(b, -1, -1) * 1.0
+        consts = self.constants(mu.device, mu.dtype)
+        mods, finals = consts.mods, consts.finals
+        if mods.shape[-3] != 1 and b != 1:
+            # guidance rows are interleaved per request
+            mods = mods.repeat(*([1] * (mods.dim() - 3)), b, 1, 1)
+            finals = finals.repeat(*([1] * (finals.dim() - 3)), b, 1, 1)
+        mu_in = torch.stack([mu, torch.zeros_like(mu)], dim=1).flatten(0, 1)
+        spks_in = torch.stack([spks, torch.zeros_like(spks)], dim=1).flatten(0, 1)
+        cond_in = torch.stack([cond, torch.zeros_like(cond)], dim=1).flatten(0, 1)
+        for step in range(N_TIMESTEPS):
             dphi_dt = self.estimator(
-                x.repeat(2, 1, 1), mu_in, t.repeat(2), spks_in, cond_in,
-                cnn_cache[step - 1], kv_cache[step - 1], n_cached,
-            )
-            dphi_dt, cfg_dphi_dt = dphi_dt.chunk(2, dim=0)
+                x.repeat_interleave(2, dim=0), mu_in, mods[step], finals[step], spks_in, cond_in,
+                cnn_cache[step], kv[step],
+            ).unflatten(0, (b, 2))
+            dphi_dt, cfg_dphi_dt = dphi_dt[:, 0], dphi_dt[:, 1]
             dphi_dt = (1.0 + CFG_RATE) * dphi_dt - CFG_RATE * cfg_dphi_dt
-            x = x + dt * dphi_dt
-            t = t + dt
-            if step < len(t_span) - 1:
-                dt = t_span[step + 1] - t
+            x = x + consts.dts[step] * dphi_dt
         return x
 
 
@@ -466,20 +596,18 @@ class Token2WavFlow(nn.Module):
         cond: torch.Tensor | None,
         last_chunk: bool,
         enc_cnn: torch.Tensor,
-        enc_kv1: torch.Tensor,
-        enc_len1: int,
-        enc_kv2: torch.Tensor,
-        enc_len2: int,
+        enc_kv1: list[KVCache],
+        enc_kv2: list[KVCache],
         dit_cnn: torch.Tensor,
-        dit_kv: torch.Tensor,
-        dit_len: int,
+        dit_kv: list[list[KVCache]],
     ) -> torch.Tensor:
-        """``tokens [1, T]`` (int) -> mel ``[1, 80, 2 (T - 3)]`` (``2T`` when ``last_chunk``);
-        ``spk`` is ``project_speaker``'s output, ``cond`` the prompt mel ``[1, 80, frames]``
-        when building a voice's cache, else zeros. Writes every cache in place; the caller
-        advances the lengths."""
-        h = self.encoder(self.input_embedding(tokens), last_chunk, enc_cnn, enc_kv1, enc_len1, enc_kv2, enc_len2)
+        """``tokens [B, T]`` (int) -> mel ``[B, 80, 2 (T - 3)]`` (``2T`` when ``last_chunk``);
+        ``spk [B, 80]`` is ``project_speaker``'s output, ``cond`` the prompt mel ``[B, 80,
+        frames]`` when building a voice's cache, else zeros. ``enc_cnn [B, 512, 6]`` and
+        ``dit_cnn [steps, depth, 2B, 1024, 2]`` are updated in place, the attention caches
+        through their ``KVCache``; the caller advances the lengths."""
+        h = self.encoder(self.input_embedding(tokens), last_chunk, enc_cnn, enc_kv1, enc_kv2)
         h = self.encoder_proj(h)
         if cond is None:
             cond = torch.zeros_like(h).transpose(1, 2).contiguous()
-        return self.decoder(h.transpose(1, 2).contiguous(), spk, cond, dit_cnn, dit_kv, dit_len)
+        return self.decoder(h.transpose(1, 2).contiguous(), spk, cond, dit_cnn, dit_kv)
