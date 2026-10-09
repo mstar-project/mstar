@@ -329,14 +329,15 @@ class KVPlanState:
 
 
 class _LabelRows:
-    """One plan label's rows of the last decode plan, as the plan cache keeps
-    them: the real rows first (their streams, lengths, page lists), then the
-    padding rows, which never change."""
+    """One plan label's real rows of a cached decode plan, derived from the
+    full plan's views at the first hit: streams, lengths, page lists and the
+    numpy index arrays FlashInfer takes. Padding rows are not here; they are
+    rebuilt per step from the step's own padding segments (same layout, other
+    dummy ids)."""
 
     __slots__ = (
-        "rids", "labels", "streams", "lens", "npages", "row_pages", "last_page",
-        "qo_indptr", "kv_indptr", "indices", "pad_views", "pad_npages",
-        "pad_last", "pad_last_page", "pad_indices",
+        "rows", "streams", "lens", "npages", "row_pages", "last_page",
+        "indices", "n_pad", "pad_span", "pad_pages",
     )
 
     def __init__(self, **kw):
@@ -345,18 +346,35 @@ class _LabelRows:
 
 
 class _DecodePlanCache:
-    __slots__ = ("segments", "rows", "rids", "epoch", "labels", "pending")
+    """The last leased decode plan, as `_fast_decode_plan` continues it."""
 
-    def __init__(self, segments, rows, epoch, labels):
-        self.segments = segments
-        # the (request, label) pairs of the real rows: a commit of any of them
-        # in another batch invalidates, a commit of other rows is ignored
-        self.rows = rows
-        self.rids = frozenset(rid for rid, _ in rows)
+    __slots__ = (
+        "step_segments", "real_segments", "n_real", "pad_layout", "views", "epoch", "pending", "derived", "_rows",
+    )
+
+    def __init__(self, step_segments, real_segments, n_real, pad_layout, views, epoch):
+        # the planned step's own segments tuple: a commit of that object is the
+        # one commit the next plan may assume
+        self.step_segments = step_segments
+        # the real rows' segments, the key the next step must match
+        self.real_segments = real_segments
+        self.n_real = n_real
+        # (count, span) of the padding rows, which change dummy ids per slot
+        self.pad_layout = pad_layout
+        # the full plan's views per label, the source of `derived`
+        self.views = views
         self.epoch = epoch
-        self.labels = labels
-        # commits of these same segments since the plan the cache describes
         self.pending = 0
+        self.derived: dict | None = None
+        self._rows = None
+
+    @property
+    def rows(self) -> frozenset:
+        """The real (request, label) pairs, for the commit check of a step
+        that is not the cached batch."""
+        if self._rows is None:
+            self._rows = frozenset(seg[:2] for seg in self.real_segments)
+        return self._rows
 
 
 class KVManager(AttentionResource):
@@ -1430,83 +1448,100 @@ class KVManager(AttentionResource):
         commit: the plan cache no longer describes the streams if it holds
         that request."""
         cache = self._decode_plan_cache
-        if cache is not None and (rid is None or rid in cache.rids):
+        if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
+
+    def _split_padding(self, step: KVStep, ctx: StepContext):
+        """``(n_real, (n_pad, span))`` of a step whose real segments come
+        first and whose padding segments (a replay's dummy rows) all share
+        one span; None when the layout is anything else."""
+        segs = step.segments
+        n_real = 0
+        for seg in segs:
+            if not ctx.is_real_row(seg.request_id):
+                break
+            n_real += 1
+        pad = segs[n_real:]
+        if not pad:
+            return n_real, (0, 0)
+        span = pad[0].span
+        for seg in pad:
+            if seg.span != span or ctx.is_real_row(seg.request_id):
+                return None
+        return n_real, (len(pad), span)
 
     def _remember_decode_plan(
         self, step: KVStep, ctx: StepContext, res: "KVPlanOutputs",
     ) -> None:
-        """Keep a leased decode step's plan so the next step of the same
-        batch can be planned off it (`_fast_decode_plan`). Any other plan
-        leaves the cache alone: the epoch and the commit bookkeeping say
-        whether it still describes the streams."""
+        """Keep a leased decode step's plan so the next step of the same rows
+        can be planned off it (`_fast_decode_plan`). O(1): the full plan's
+        views are kept as they are and the per-row arrays are derived at the
+        first hit. Any other plan leaves the cache alone; the epoch and the
+        commit bookkeeping say whether it still describes the streams."""
         lease = ctx.slot_lease
         if lease is None or ctx.capture or step.pre_forks or step.post_forks:
             return
-        page_size = self.kv_cache.page_size
-        labels: dict[str, _LabelRows] = {}
-        for label, out in res.items():
-            views = out.views
-            if not views:
+        split = self._split_padding(step, ctx)
+        if split is None:
+            return
+        n_real, pad_layout = split
+        for seg in step.segments:
+            if seg.span != 1:
                 return
+        self._decode_plan_cache = _DecodePlanCache(
+            step_segments=step.segments, real_segments=step.segments[:n_real],
+            n_real=n_real, pad_layout=pad_layout,
+            views={label: out.views for label, out in res.items()},
+            epoch=self._plan_epoch,
+        )
+
+    def _derive_rows(self, cache: _DecodePlanCache, ctx: StepContext) -> dict | None:
+        """The per-label row arrays of a cached plan, from its views (once,
+        at the first hit)."""
+        page_size = self.kv_cache.page_size
+        derived: dict[str, _LabelRows] = {}
+        for label, views in cache.views.items():
             n_real = 0
             for v in views:
-                if ctx.is_padding_row(v.request_id):
+                if not ctx.is_real_row(v.request_id) and v.request_id not in self._streams:
+                    break
+                if not any(v.request_id == seg[0] and v.label == seg[1] for seg in cache.real_segments):
                     break
                 n_real += 1
             real, pad = views[:n_real], views[n_real:]
-            if any(v.to_compute != 1 for v in views) or any(
-                not ctx.is_padding_row(v.request_id) for v in pad
-            ):
-                return
+            if pad and (len(pad), pad[0].to_compute) != cache.pad_layout:
+                return None
             streams = []
             for v in real:
                 stream = self._streams.get(v.request_id, {}).get(v.label)
                 if stream is None or len(v.page_idxs) != -(-v.length // page_size):
-                    return
+                    return None
                 streams.append(stream)
             row_pages = [v.page_idxs for v in real]
-            indptrs = out.cpu_indptrs
-            labels[label] = _LabelRows(
-                rids=[v.request_id for v in real],
-                labels=[v.label for v in real],
+            derived[label] = _LabelRows(
+                rows=tuple((v.request_id, v.label, 1) for v in real),
                 streams=streams,
                 lens=np.fromiter((v.length for v in real), np.int64, n_real),
                 npages=np.fromiter((len(p) for p in row_pages), np.int64, n_real),
                 row_pages=row_pages,
                 last_page=np.fromiter((p[-1] for p in row_pages), np.int64, n_real),
-                qo_indptr=indptrs.qo_indptr.numpy().copy(),
-                kv_indptr=indptrs.paged_kv_indptr.numpy().copy(),
-                indices=indptrs.paged_kv_indices.numpy().copy(),
-                pad_views=pad,
-                pad_npages=np.fromiter((len(v.page_idxs) for v in pad), np.int64, len(pad)),
-                pad_last=np.fromiter(
-                    (v.last_page_len(page_size) or page_size for v in pad), np.int64, len(pad),
+                indices=np.fromiter(
+                    itertools.chain.from_iterable(row_pages), np.int32, sum(len(p) for p in row_pages),
                 ),
-                pad_last_page=np.fromiter((v.page_idxs[-1] for v in pad), np.int64, len(pad)),
-                pad_indices=np.fromiter(
-                    itertools.chain.from_iterable(v.page_idxs for v in pad), np.int32,
-                    sum(len(v.page_idxs) for v in pad),
-                ),
+                n_pad=len(pad), pad_span=pad[0].to_compute if pad else 0,
+                pad_pages=len(pad[0].page_idxs) if pad else 0,
             )
-        self._decode_plan_cache = _DecodePlanCache(
-            segments=step.segments,
-            rows=frozenset(
-                (rid, lab) for rows in labels.values()
-                for rid, lab in zip(rows.rids, rows.labels, strict=True)
-            ),
-            epoch=self._plan_epoch, labels=labels,
-        )
+        return derived
 
     def _fast_decode_plan(
         self, step: KVStep, ctx: StepContext,
     ) -> "KVPlanOutputs | None":
         """The plan of a leased decode step off the previous step's, when the
-        batch is the same rows in the same order and only that step's commit
-        touched the streams (`_plan_epoch`, `pending`): every length
-        is one more, a page is new only where a row crossed a page boundary,
-        and the index arrays come from numpy. None means plan from the
-        streams."""
+        real rows are the same in the same order and only that step's commit
+        touched the streams (`_plan_epoch`, `pending`): every length is one
+        more, a page is new only where a row crossed a page boundary, the
+        index arrays come from numpy and the views are built only if a
+        consumer asks. None means plan from the streams."""
         cache = self._decode_plan_cache
         stats = self.plan_cache_stats
         if (
@@ -1517,16 +1552,29 @@ class KVManager(AttentionResource):
             or step.post_forks
         ):
             return None
+        if cache.epoch != self._plan_epoch or cache.pending != 1:
+            stats["miss"] += 1
+            return None
+        n_real = cache.n_real
+        segs = step.segments
         if (
-            cache.epoch != self._plan_epoch
-            or cache.pending != 1
-            or step.segments != cache.segments
+            len(segs) != n_real + cache.pad_layout[0]
+            or segs[:n_real] != cache.real_segments
+            or any(seg.span != cache.pad_layout[1] or ctx.is_real_row(seg.request_id) for seg in segs[n_real:])
         ):
             stats["miss"] += 1
             return None
+        if cache.derived is None:
+            cache.derived = self._derive_rows(cache, ctx)
+            if cache.derived is None:
+                self._decode_plan_cache = None
+                stats["miss"] += 1
+                return None
         page_size = self.kv_cache.page_size
+        pad_segs = segs[n_real:]
+        make = self._indptr_ring.take if self._indptr_ring is not None else torch.from_numpy
         out: dict[str, KVPlanOutput] = {}
-        for label, rows in cache.labels.items():
+        for label, rows in cache.derived.items():
             lens = rows.lens + 1
             last = (lens - 1) % page_size + 1
             npages = (lens + page_size - 1) // page_size
@@ -1541,51 +1589,55 @@ class KVManager(AttentionResource):
                     pages = held[:want]
                     rows.row_pages[i] = pages
                     rows.last_page[i] = pages[-1]
-                n_real = int(npages.sum())
-                real_indices = np.fromiter(
-                    itertools.chain.from_iterable(rows.row_pages), np.int32, n_real,
+                rows.indices = np.fromiter(
+                    itertools.chain.from_iterable(rows.row_pages), np.int32, int(npages.sum()),
                 )
-                rows.indices = (
-                    np.concatenate((real_indices, rows.pad_indices))
-                    if rows.pad_indices.size else real_indices
-                )
-                counts = (
-                    np.concatenate((npages, rows.pad_npages))
-                    if rows.pad_npages.size else npages
-                )
-                rows.kv_indptr = np.concatenate(
-                    (np.zeros(1, np.int64), np.cumsum(counts)),
-                ).astype(np.int32)
             rows.lens = lens
             rows.npages = npages
-            if rows.pad_npages.size:
-                last_all = np.concatenate((last, rows.pad_last))
-                npages_all = np.concatenate((npages, rows.pad_npages))
-                pages_all = np.concatenate((rows.last_page, rows.pad_last_page))
+            n_pad, pad_span, pad_pages = rows.n_pad, rows.pad_span, rows.pad_pages
+            if n_pad:
+                pad_last = (pad_span - 1) % page_size + 1
+                last_all = np.concatenate((last, np.full(n_pad, pad_last, np.int64)))
+                npages_all = np.concatenate((npages, np.full(n_pad, pad_pages, np.int64)))
+                indices = np.concatenate((rows.indices, np.full(n_pad * pad_pages, SINK_PAGE, np.int32)))
+                pages_all = np.concatenate((rows.last_page, np.full(n_pad, SINK_PAGE, np.int64)))
             else:
-                last_all, npages_all, pages_all = last, npages, rows.last_page.copy()
+                last_all, npages_all, indices, pages_all = last, npages, rows.indices, rows.last_page.copy()
+            kv_indptr = np.concatenate((np.zeros(1, np.int64), np.cumsum(npages_all))).astype(np.int32)
+            n_rows = n_real + n_pad
+            qo_indptr = np.arange(n_rows + 1, dtype=np.int32)
             kv_lens = (npages_all - 1) * page_size + last_all
-            views = [
-                SequenceView(rid, lab, pages, length, 1, 0, stream.generation)
-                for rid, lab, pages, length, stream in zip(
-                    rows.rids, rows.labels, rows.row_pages, lens.tolist(), rows.streams,
-                    strict=True,
+            row_pages_now, lens_now, streams = rows.row_pages, lens.tolist(), rows.streams
+            pad_now = [(seg.request_id, seg.label, seg.span) for seg in pad_segs]
+
+            def build_views(
+                row_pages_now=row_pages_now, lens_now=lens_now, streams=streams, pad_now=pad_now, rows=rows,
+            ):
+                views = [
+                    SequenceView(rid, lab, pages, length, 1, 0, stream.generation)
+                    for (rid, lab, _), pages, length, stream in zip(
+                        rows.rows, row_pages_now, lens_now, streams, strict=True,
+                    )
+                ]
+                views.extend(
+                    SequenceView(rid, lab, [SINK_PAGE] * rows.pad_pages, span, span) for rid, lab, span in pad_now
                 )
-            ]
-            views.extend(rows.pad_views)
-            make = self._indptr_ring.take if self._indptr_ring is not None else torch.from_numpy
+                return views
+
             out[label] = KVPlanOutput(
                 cpu_indptrs=PagedIndptrs(
-                    qo_indptr=make(rows.qo_indptr),
-                    paged_kv_indptr=make(rows.kv_indptr),
-                    paged_kv_indices=make(rows.indices),
+                    qo_indptr=make(qo_indptr),
+                    paged_kv_indptr=make(kv_indptr),
+                    paged_kv_indices=make(indices),
                     paged_kv_last_page_len=make(last_all.astype(np.int32)),
                     kv_lens=torch.from_numpy(kv_lens.astype(np.int32)).as_subclass(HostLens),
                 ),
-                views=views,
                 decode_pages=pages_all,
                 decode_offsets=last_all - 1,
+                rows=rows.rows + tuple(pad_now),
+                view_builder=build_views,
             )
+        cache.step_segments = step.segments
         cache.pending = 0
         stats["hit"] += 1
         return KVPlanOutputs(out, pre_forks=step.pre_forks, post_forks=step.post_forks)
@@ -1759,11 +1811,13 @@ class KVManager(AttentionResource):
         # landed, nothing else (a step that keeps no tokens is "something else")
         cache = self._decode_plan_cache
         if cache is not None:
-            if step.segments == cache.segments:
+            if step.segments is cache.step_segments:
                 cache.pending += 1
-            elif any(
+            elif len(step.segments) >= len(cache.step_segments) or any(
                 (seg.request_id, seg.label) in cache.rows for seg in step.segments
             ):
+                # another batch that is as big (surely sharing rows) or that
+                # names a cached row: the cache no longer describes the streams
                 self._plan_epoch += 1
         if not step.commit:
             self._plan_epoch += 1
