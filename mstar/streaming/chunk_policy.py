@@ -150,12 +150,18 @@ class FixedChunkPolicy(ChunkPolicy):
         chunk_size: number of items per chunk.
         continue_after_done: if True, keep producing empty chunks after
             the producer finishes and all buffered items are consumed.
+        allow_partial: if True, take a chunked prefill's non-final chunks as
+            they arrive (``ChunkPolicy.allow_partial_input``).
     """
 
-    def __init__(self, chunk_size: int, continue_after_done: bool = False):
+    def __init__(
+        self, chunk_size: int, continue_after_done: bool = False,
+        allow_partial: bool = False,
+    ):
         super().__init__()
         self._chunk_size = chunk_size
         self._continue_after_done = continue_after_done
+        self._allow_partial = allow_partial
 
     def is_ready(self, buffer_len) -> bool:
         return buffer_len >= self._chunk_size
@@ -168,6 +174,9 @@ class FixedChunkPolicy(ChunkPolicy):
 
     def continue_after_producer_done(self) -> bool:
         return self._continue_after_done
+
+    def allow_partial_input(self) -> bool:
+        return self._allow_partial
 
 
 class RampChunkPolicy(ChunkPolicy):
