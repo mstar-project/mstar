@@ -708,10 +708,14 @@ def sample_cuda_graphable_gpu(
     so the CUDA-graph path can apply the same vLLM-style repetition penalty as
     the regular ``Sampler``, then samples with
     ``flashinfer.sampling.top_k_top_p_sampling_from_probs`` (``deterministic=True``
-    — the graph-safe variant that avoids CPU-seeded RNG paths). Greedy requests
-    are encoded as ``(temperature=1.0, top_k=1)`` so ``from_probs`` returns the
-    argmax and this function never branches on CPU values (``include_greedy`` is
-    therefore left off).
+    — the graph-safe variant that avoids CPU-seeded RNG paths).
+
+    ``include_greedy`` is always on here, so a row at ``temperature == 0`` gets a
+    one-hot at its argmax and ``from_probs`` returns that token whatever the RNG
+    offset is. The decision is per row and read from the temperature buffer on
+    device, so the constexpr baked at capture stays correct for any later mix of
+    greedy and sampled requests, and this function still never branches on CPU
+    values.
 
     The autotune sync inside ``fused_temperature_softmax`` only fires the first
     time a kernel key is seen, which happens during eager warmup — by capture
@@ -738,7 +742,7 @@ def sample_cuda_graphable_gpu(
             logits, temperature,
             penalty=rep_penalty if apply_penalty else None,
             seen_mask=seen_tokens if apply_penalty else None,
-            include_greedy=False,
+            include_greedy=True,
         )
         top_k = torch.where(top_k > 0, top_k, logits.shape[1])
         # NOTE: this is NOT batch-invariant — flashinfer's deterministic RNG
@@ -1086,13 +1090,14 @@ class SamplerBuffers:
         mask is NOT written here (it changes every step — see
         ``update_request_config``).
         """
-        if cfg.temperature > 0:
-            t = float(cfg.temperature)
-            k = int(cfg.top_k)
-            p = float(cfg.top_p) if cfg.top_p else 1.0
-        else:
-            # Greedy: encoded as (temp=1, top_k=1) so from_probs returns argmax.
-            t, k, p = 1.0, 1, 1.0
+        # Greedy rows keep their real temperature of 0. The prep kernel reads it
+        # per row and emits a one-hot at the argmax, which is what the eager
+        # sampler does; re-encoding greedy as (temp=1, top_k=1) instead left the
+        # choice to FlashInfer's RNG, and a top-1 tie — common, since the head
+        # emits bf16 — then resolved differently at every RNG offset.
+        t = float(cfg.temperature)
+        k = int(cfg.top_k)
+        p = float(cfg.top_p) if cfg.top_p else 1.0
         self.temperature.write_master_row(slot, t)
         self.top_k.write_master_row(slot, k)
         self.top_p.write_master_row(slot, p)
