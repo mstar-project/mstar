@@ -61,6 +61,18 @@ def split_at(text: str, cuts: list[int]) -> list[str]:
     return parts
 
 
+def _parallelism_on() -> None:
+    """The Rust backend encodes a batch on its thread pool only while
+    ``TOKENIZERS_PARALLELISM`` reads true; serving environments often export
+    it false (to silence the fork warning), which makes the chunked encode
+    no faster than one encode (18 vs 19 ms for 8.8k tokens on H200 hosts).
+    ``MSTAR_TOKENIZE_PARALLEL=0`` leaves the variable alone."""
+    if os.environ.get("MSTAR_TOKENIZE_PARALLEL", "1") != "1":
+        return
+    if os.environ.get("TOKENIZERS_PARALLELISM", "").lower() not in ("true", "1"):
+        os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+
 def encode_ids(
     tokenizer, text: str, chunk_chars: int = DEFAULT_CHUNK_CHARS,
     max_chunks: int = DEFAULT_MAX_CHUNKS,
@@ -73,6 +85,7 @@ def encode_ids(
     cuts = cut_points(text, chunk_chars, max_chunks) if backend is not None else []
     if not cuts:
         return list(tokenizer(text).input_ids)
+    _parallelism_on()
     encodings = backend.encode_batch(split_at(text, cuts), add_special_tokens=False)
     ids: list[int] = []
     for enc in encodings:
