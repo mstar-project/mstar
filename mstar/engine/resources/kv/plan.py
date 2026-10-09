@@ -7,7 +7,6 @@ consumer depends on the contract rather than on the cache.
 """
 
 import itertools
-from dataclasses import dataclass
 from typing import NamedTuple
 
 import numpy as np
@@ -221,21 +220,44 @@ def _host_lens(values: list[int]) -> torch.Tensor:
     return _int32_tensor(values).as_subclass(HostLens)
 
 
-@dataclass
 class KVPlanOutput:
     """
     Output of KVManager.plan for a single label
     """
-    cpu_indptrs: PagedIndptrs
-    # packing in plan order w/h 1 view per segment covered by plan
-    views: list[SequenceView]
-    # only the packed write addressing needs these on device, and only the
-    # resource that builds them reads them; see KVManager._setup_plan_states
-    cuda_indptrs: PagedIndptrs | None = None
-    # a decode step planned off the previous one (KVManager's plan cache):
-    # each row's write page and offset in it, so staging need not walk the views
-    decode_pages: np.ndarray | None = None
-    decode_offsets: np.ndarray | None = None
+
+    __slots__ = ("cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets", "rows")
+
+    def __init__(
+        self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
+        cuda_indptrs: "PagedIndptrs | None" = None, decode_pages=None, decode_offsets=None,
+        rows=None, view_builder=None,
+    ):
+        self.cpu_indptrs = cpu_indptrs
+        # packing in plan order w/h 1 view per segment covered by plan; a plan
+        # off the KV manager's cache hands a builder instead and the views are
+        # made on first use (the FlashInfer path never asks for them)
+        self._views = views
+        self._view_builder = view_builder
+        # only the packed write addressing needs these on device, and only the
+        # resource that builds them reads them; see KVManager._setup_plan_states
+        self.cuda_indptrs = cuda_indptrs
+        # a decode step planned off the previous one (KVManager's plan cache):
+        # each row's write page and offset in it, so staging need not walk the views
+        self.decode_pages = decode_pages
+        self.decode_offsets = decode_offsets
+        # (request_id, label, to_compute) per view, for consumers that need no
+        # pages or lengths (the position resource); None means read the views
+        self.rows = rows
+
+    @property
+    def views(self) -> "list[SequenceView]":
+        if self._views is None:
+            self._views = self._view_builder()
+        return self._views
+
+    @views.setter
+    def views(self, value):
+        self._views = value
 
     def get_total_len(self):
         return int(self.cpu_indptrs.qo_indptr[-1])
