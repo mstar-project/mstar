@@ -139,7 +139,13 @@ class StreamBuffer:
         self._update_buffer()
         return self._walk_runs[0][0] if self._walk_runs else None
 
-    def has_chunk_ready(self) -> bool:
+    def has_pending_items(self) -> bool:
+        """Items announced, buffered, or popped but refused by the graph."""
+        return bool(
+            self._buffer or self._tensor_ids_in_order or self._waiting_graph_edges
+        )
+
+    def has_chunk_ready(self, consumer_walk: str | None = None) -> bool:
         self._update_buffer()
         buf_len = len(self._buffer)
 
@@ -158,11 +164,9 @@ class StreamBuffer:
         # were consumed in earlier chunks. Emit exactly one final
         # (empty) chunk so ``is_final`` propagates and the stream closes.
 
-        return (
-            buf_len > 0
-            or self.policy.continue_after_producer_done()
-            or not self._final_chunk_emitted
-        )
+        if self.policy.continue_after_producer_done():
+            return buf_len > 0 or self.policy.continues_in(consumer_walk)
+        return buf_len > 0 or not self._final_chunk_emitted
 
     def pop_chunk(self) -> StreamChunk:
         """Pop the next chunk. Only call when has_chunk_ready() is True.

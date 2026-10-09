@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
 from time import sleep
@@ -76,7 +76,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.node_manager_utils import AssignedWalk, RequestStateManager
+from mstar.worker.node_manager_utils import AssignedWalk, PerRequestInfo, RequestStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -498,7 +498,15 @@ class Worker:
             for conn in self._my_consumer_connections
             if conn.to_partition in self._walk_drivers
         }
-        # producer side: (node, walk) -> the walk drivers it emits for
+        # producer side: streamed signal -> its consumer partition, and
+        # (node, walk) -> the walk drivers it emits for
+        self._signal_consumer = {
+            conn.edge_name: conn.to_partition
+            for conn in (
+                self.partition_topology.connections
+                if self.partition_topology else []
+            )
+        }
         self._emitted_walk_drivers: dict[tuple[str, str], list[Connection]] = {}
 
         # Set of edge names that arrive via streaming (used to distinguish
@@ -1069,11 +1077,8 @@ class Worker:
         """Move a producer-triggered partition into ``walk``, then replay the
         conductor inputs that were waiting for it."""
         self._graph_runtime.set_walk(request_id, partition, walk)
-        fwd_info = self.request_state.get_fwd_info(request_id, partition)
-        self.request_state.update_request_info(
-            request_id, partition,
-            current_fwd_info=replace(fwd_info, graph_walk=walk),
-        )
+        # Nothing of the partition is in flight to still read the old walk
+        self.request_state.get_fwd_info(request_id, partition).graph_walk = walk
         req_info = self.request_state.per_request_info[request_id]
         replay, keep = [], []
         for body in req_info.parked_inputs:
@@ -1095,14 +1100,14 @@ class Worker:
         key = (batch_N.node_name, batch_N.graph_walk)
         drivers = self._emitted_walk_drivers.get(key)
         if drivers is None:
-            signals = set(self._graph_runtime.get_output_signals(*key))
-            emitted = {
-                conn.to_partition for conn in self.partition_topology.connections
-                if conn.edge_name in signals
-            } if self.partition_topology else set()
+            consumers = {
+                self._signal_consumer[signal]
+                for signal in self._graph_runtime.get_output_signals(*key)
+                if signal in self._signal_consumer
+            }
             drivers = [
-                conn for partition, conn in self._walk_drivers.items()
-                if partition in emitted
+                self._walk_drivers[partition] for partition in consumers
+                if partition in self._walk_drivers
             ]
             self._emitted_walk_drivers[key] = drivers
         if not drivers:
@@ -1128,6 +1133,30 @@ class Worker:
             fwd_info.stream_consumer_walks = walks
             assigned[rid] = walks
         return assigned
+
+    def _release_parked_inputs(
+        self, request_id: int, req_info: PerRequestInfo,
+    ) -> None:
+        """Apply a parked conductor input once its partition is idle and its
+        stream has nothing queued. The producer decides the walks of what it
+        streams; a walk the consumer enters on its own (Qwen3-Omni's Talker
+        going to decode after its last prefill) comes from the conductor,
+        and no later item may be coming to assign it (a one-token reply)."""
+        for body in list(req_info.parked_inputs):
+            partition = body.partition_name
+            if not any(b is body for b in req_info.parked_inputs):
+                continue  # replayed by an earlier switch in this loop
+            queued = any(
+                sbuf.has_pending_items()
+                for edge, sbuf in req_info.stream_buffers.items()
+                if self._walk_driven_edges.get(edge) == partition
+            )
+            if not queued and self._graph_runtime.is_partition_idle(
+                request_id, partition,
+            ):
+                self._switch_partition_walk(
+                    request_id, partition, body.request_info.graph_walk,
+                )
 
     def _enter_chunk_walk(
         self, sbuf: StreamBuffer, edge_name: str, request_id: int,
@@ -1157,7 +1186,11 @@ class Worker:
         waiting = sbuf.pop_waiting_edge()
         if waiting is not None:
             return waiting
-        if sbuf.has_chunk_ready() and self._enter_chunk_walk(
+        partition = self._walk_driven_edges.get(edge_name)
+        consumer_walk = (
+            self._partition_walk(request_id, partition) if partition else None
+        )
+        if sbuf.has_chunk_ready(consumer_walk) and self._enter_chunk_walk(
             sbuf, edge_name, request_id, allow_walk_change,
         ):
             chunk = sbuf.pop_chunk()
@@ -1266,6 +1299,8 @@ class Worker:
         # Python <> Rust roundtrip)
         polled: list[tuple[int, StreamingEdge]] = []
         for request_id, req_info in list(self.request_state.per_request_info.items()):
+            if req_info.parked_inputs:
+                self._release_parked_inputs(request_id, req_info)
             for edge_name, sbuf in req_info.stream_buffers.items():
                 streaming_edge = self._pop_streaming_edge(sbuf, edge_name, request_id)
                 if streaming_edge is not None:

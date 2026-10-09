@@ -90,6 +90,14 @@ from mstar.streaming.topology import (
 logger = logging.getLogger(__name__)
 
 
+def _thinker_to_talker_policy() -> FixedChunkPolicy:
+    # Past the Thinker's end only the decode loop keeps running; an empty
+    # chunk in a prefill walk would run a prefill pass with nothing in it
+    return FixedChunkPolicy(
+        chunk_size=1, continue_after_done=frozenset({"talker_decode"}),
+    )
+
+
 def _talker_walk(ctx: ProducerWalkCtx) -> str:
     """The Talker walk a Thinker pass's streamed states run under."""
     if ctx.producer_walk != "thinker_decode":
@@ -559,14 +567,14 @@ class Qwen3OmniModel(Model):
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_states",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    chunk_policy_factory=_thinker_to_talker_policy,
                     consumer_walk=_talker_walk,
                 ),
                 Connection(
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_mask",
-                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    chunk_policy_factory=_thinker_to_talker_policy,
                     consumer_walk=_talker_walk,
                 ),
                 Connection(

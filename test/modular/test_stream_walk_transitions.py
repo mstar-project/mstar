@@ -72,6 +72,19 @@ def test_an_incomplete_run_waits_for_more_items():
     assert sbuf.peek_walk() == "talker_decode"
 
 
+def test_empty_chunks_after_the_producer_ends_come_only_in_the_listed_walks():
+    sbuf = StreamBuffer(
+        request_id=0, edge_name="thinker_states", from_partition="Thinker",
+        policy=FixedChunkPolicy(1, continue_after_done=frozenset({"talker_decode"})),
+        walk_tagged=True,
+    )
+    sbuf.signal_done()
+    # A prefill pass on an empty chunk would have nothing to run on
+    assert not sbuf.has_chunk_ready("talker_last_prefill")
+    assert sbuf.has_chunk_ready("talker_decode")
+    assert not sbuf.pop_chunk().is_final
+
+
 def test_an_untagged_buffer_is_unchanged():
     sbuf = _buffer(chunk_size=3, tagged=False)
     _feed(sbuf, ["a", "a", "b", "b"])
@@ -179,6 +192,33 @@ def test_a_conductor_input_for_a_later_walk_waits_for_the_stream():
     assert w.walks == ["talker_last_prefill", "talker_decode"]
 
 
+@pytest.mark.parametrize("queued, idle, released", [
+    (False, True, True),
+    (True, True, False),    # the stream decides first
+    (False, False, False),  # mid-pass
+])
+def test_a_parked_input_applies_once_the_stream_has_nothing_queued(queued, idle, released):
+    """A one-token reply: the Thinker's only decode pass ran talker_last_prefill
+    and nothing will assign talker_decode, so the conductor's input moves it."""
+    w = _worker(idle=idle)
+    w._switch_partition_walk(0, "Talker", "talker_last_prefill")
+    req_info = w.request_state.per_request_info[0]
+    sbuf = _buffer()
+    req_info.stream_buffers["thinker_states"] = sbuf
+    if queued:
+        _feed(sbuf, ["talker_decode"])
+    body = _conductor_input("talker_decode")
+    w._process_new_inputs(body)
+    assert req_info.parked_inputs == [body]
+
+    replayed = []
+    w._process_new_inputs = replayed.append
+    w._release_parked_inputs(0, req_info)
+    assert (replayed == [body]) is released
+    walk = w.request_state.get_fwd_info(0, "Talker").graph_walk
+    assert walk == ("talker_decode" if released else "talker_last_prefill")
+
+
 @pytest.mark.parametrize("idle, allow, switched", [
     (True, True, True),
     (False, True, False),   # mid-pass: the chunk waits
@@ -218,6 +258,7 @@ def _producer():
     w = Worker.__new__(Worker)
     w.partition_topology = topology
     w._walk_drivers = topology.walk_drivers()
+    w._signal_consumer = {c.edge_name: c.to_partition for c in topology.connections}
     w._emitted_walk_drivers = {}
     w._graph_runtime = SimpleNamespace(
         get_output_signals=lambda node, walk: (
