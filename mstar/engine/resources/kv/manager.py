@@ -1708,6 +1708,11 @@ class KVManager(AttentionResource):
         """Device pages the request is holding — the most reclaimable first."""
         return float(self.reclaimable(rid))
 
+    def stored_len(self, rid: str, label: str = "main") -> int:
+        """Tokens the stream holds, i.e. the position the next one lands at."""
+        with self._lock:
+            return self._streams[rid][label].stored_len
+
     def _own_transfer_info(
         self,
         request_id: str,

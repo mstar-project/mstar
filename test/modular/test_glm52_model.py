@@ -1,0 +1,620 @@
+"""Glm52Model contract on the resource-pools engine: registry, graph walks, the prefill ->
+decode transition, the node's resource declaration, the per-request sampling config, and
+the submodule's stop / preprocess guards.
+"""
+import sys
+import types
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
+def _cpu_rmsnorm(x, weight, eps=1e-6):
+    x32 = x.float()
+    normed = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
+    return (normed * weight.float()).to(x.dtype)
+
+
+def _cpu_flashinfer() -> types.ModuleType:
+    fi = types.ModuleType("flashinfer")
+    fi.norm = types.SimpleNamespace(rmsnorm=_cpu_rmsnorm)
+    return fi
+
+
+try:
+    import flashinfer  # noqa: F401  (the real one stays for later test files)
+except ImportError:
+    sys.modules["flashinfer"] = _cpu_flashinfer()
+
+
+@pytest.fixture(autouse=True)
+def _force_cpu_flashinfer(monkeypatch):
+    monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+
+
+from mstar.conductor.request_info import (  # noqa: E402
+    CurrentForwardConductorMetadata,
+    CurrentForwardPassInfo,
+)
+from mstar.engine.resources import (  # noqa: E402
+    AttentionSpec,
+    AttnBackend,
+    KVLayout,
+    KVSpec,
+    SamplerSpec,
+    SamplingReqConfig,
+)
+from mstar.graph.base import Loop  # noqa: E402
+from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
+from mstar.model.glm52.config import (  # noqa: E402
+    ATTN_RESOURCE,
+    KV_RESOURCE,
+    SAMPLER_RESOURCE,
+    Glm52ModelConfig,
+)
+from mstar.model.glm52.dsa import Glm52DsaKStore  # noqa: E402
+from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
+from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
+
+
+def _make_model(config: Glm52ModelConfig | None = None) -> Glm52Model:
+    # Skip __init__ (tokenizer download); the contract under test only
+    # needs the config.
+    model = object.__new__(Glm52Model)
+    model.config = config or Glm52ModelConfig()
+    return model
+
+
+def test_glm52_registered():
+    # The registry is lazy (module path, class name) so importing it pulls
+    # no model code; resolve the entry and check it is the class.
+    from mstar.model import registry
+
+    assert registry.MODEL_REGISTRY["glm52"] == (
+        "mstar.model.glm52.glm52_model", "Glm52Model")
+    assert registry.get_model_class("glm52") is Glm52Model
+    assert registry.HF_MODELS["glm52"]["model_path_hf"] == "zai-org/GLM-5.2-FP8"
+
+
+def test_glm52_graph_walks_are_one_node():
+    model = _make_model()
+    walks = model.get_graph_walk_graphs()
+    assert set(walks) == {"prefill", "decode"}
+    assert isinstance(walks["decode"], Loop)
+    # every walk runs the one fat LLM node, and every resource is declared
+    # for exactly that node
+    assert {n for g in walks.values() for n in g.get_nodes()} == {"LLM"}
+    assert all(spec.nodes == {"LLM"} for spec in model.get_node_resources())
+
+
+# ── resource declaration ──
+
+
+def _specs(config):
+    kv, attn, sampler = _make_model(config).get_node_resources()
+    assert isinstance(kv, KVSpec) and kv.resource_key == KV_RESOURCE
+    assert isinstance(sampler, SamplerSpec) and sampler.resource_key == SAMPLER_RESOURCE
+    assert attn.resource_key == ATTN_RESOURCE
+    return kv, attn, sampler
+
+
+def test_glm52_resources_absorbed_is_mla_latent_layout():
+    cfg = Glm52ModelConfig()  # full model, mla_absorb default True
+    kv, attn, sampler = _specs(cfg)
+    # MLA: one shared latent "head" of width kv_lora_rank + qk_rope_head_dim,
+    # not num_kv_heads x head_dim.
+    assert kv.config.layout == KVLayout.MLA
+    assert kv.config.num_layers == 78
+    assert kv.config.num_kv_heads == 1
+    assert kv.config.head_dim == 512 + 64
+    assert kv.config.num_qo_heads == 64
+    assert kv.config.max_seq_len == cfg.max_seq_len == 2048
+    assert kv.config.kv_lora_rank == cfg.kv_lora_rank == 512
+    assert kv.config.qk_rope_head_dim == cfg.qk_rope_head_dim == 64
+    assert isinstance(attn, AttentionSpec)
+    assert attn.config.backend is AttnBackend.FLASHINFER_MLA
+    assert attn.config.kv_cache == KV_RESOURCE
+    assert attn.config.sm_scale == cfg.qk_head_dim ** -0.5  # 256**-0.5, no mscale
+    assert attn.depends_on() == {KV_RESOURCE}
+    assert sampler.vocab_size == cfg.vocab_size
+
+
+def test_glm52_resources_flag_off_is_naive():
+    cfg = Glm52ModelConfig.reduced()  # mla_absorb False
+    kv, attn, _ = _specs(cfg)
+    assert kv.config.layout == KVLayout.NHD
+    assert kv.config.num_kv_heads == cfg.num_attention_heads == 4
+    assert kv.config.head_dim == cfg.padded_head_dim == 64  # qk 24 -> FlashInfer 64
+    assert kv.config.num_qo_heads == 4
+    assert isinstance(attn, AttentionSpec)
+    assert attn.config.backend is AttnBackend.FLASHINFER
+    assert attn.config.kv_cache == KV_RESOURCE
+
+
+# ── conductor state machine ──
+
+
+def test_glm52_initial_forward_pass_args_seed_prefill_from_the_prompt():
+    signals = {"text_inputs": ["PROMPT"]}
+    args = _make_model().get_initial_forward_pass_args(
+        "default", ["text"], ["text"], signals)
+    assert args.full_metadata.graph_walk == "prefill"
+    assert args.full_metadata.is_prefill is True
+    assert args.step_metadata == {"is_prefill": True}
+    (edge,) = args.inputs
+    assert (edge.next_node, edge.name) == ("LLM", "text_inputs")
+    assert edge.tensor_info == ["PROMPT"]
+    assert args.unpersist_tensors == ["PROMPT"]
+
+
+def test_glm52_prefill_transitions_to_decode():
+    model = _make_model()
+    metadata = CurrentForwardConductorMetadata(
+        input_modalities=["text"],
+        output_modalities=["text"],
+        graph_walk="prefill",
+        is_prefill=True,
+    )
+
+    result = model.get_partition_forward_pass_args(
+        partition_name="default",
+        partition_metadata=metadata,
+        persist_signals={"new_token": []},
+    )
+
+    assert result.full_metadata.graph_walk == "decode"
+    assert result.step_metadata["is_prefill"] is False
+    assert result.request_done is False
+
+
+def test_glm52_prefill_emits_only_the_new_token():
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+
+    prefill = _make_model().get_graph_walk_graphs()["prefill"]
+    (edge,) = prefill.outputs
+    assert edge.name == "new_token" and edge.next_node == EMIT_TO_CLIENT
+    assert edge.persist is True
+
+
+def test_glm52_decode_seeds_from_the_new_token_not_the_prompt():
+    """Decode must be seeded from the emitted token, never from the prompt
+    signal, and must unpersist it so no per-request tensor outlives the
+    transition."""
+    metadata = CurrentForwardConductorMetadata(
+        input_modalities=["text"], output_modalities=["text"],
+        graph_walk="prefill", is_prefill=True,
+    )
+    res = _make_model().get_partition_forward_pass_args(
+        partition_name="default", partition_metadata=metadata,
+        persist_signals={"text_inputs": ["PROMPT"], "new_token": ["tok"]},
+    )
+    assert res.inputs[0].name == "text_inputs"
+    assert res.inputs[0].tensor_info == ["tok"]
+    assert res.unpersist_tensors == ["tok"]
+
+
+def test_glm52_decode_loop_cap_stays_below_the_context_guard():
+    """The decode loop cap must NOT be raised to max_seq_len."""
+    model = _make_model()
+    cfg = model.config
+    decode = model.get_graph_walk_graphs()["decode"]
+    # The guard's bound is whichever limit preprocess actually compares
+    # against — index_topk with DSA off, max_seq_len with it on.
+    guard = cfg.max_seq_len if cfg.dsa_long_context else cfg.index_topk
+    assert decode.max_iters < guard, (
+        f"loop cap {decode.max_iters} can reach the batch-killing context "
+        f"guard at {guard}")
+    # check_stop is the only thing enforcing the real per-request budget,
+    # because the decode edge carries no conductor_new_token.
+    assert not any(e.conductor_new_token for e in decode.section.outputs)
+
+
+def test_glm52_decode_completion_marks_done():
+    model = _make_model()
+    metadata = CurrentForwardConductorMetadata(
+        input_modalities=["text"],
+        output_modalities=["text"],
+        graph_walk="decode",
+        is_prefill=False,
+    )
+
+    result = model.get_partition_forward_pass_args(
+        partition_name="default",
+        partition_metadata=metadata,
+        persist_signals={},
+    )
+
+    assert result.request_done is True
+    assert result.full_metadata.kwargs["decode_finished"] is True
+
+
+# ── per-request sampling config ──
+
+
+def test_glm52_request_config_is_the_sampler_config():
+    model = _make_model()
+    cfg = model.config
+    configs = model.get_request_resource_configs({})
+    assert set(configs) == {SAMPLER_RESOURCE}
+    sampling = configs[SAMPLER_RESOURCE]
+    assert isinstance(sampling, SamplingReqConfig)
+    # the config's generation defaults, unless the request overrides them
+    assert sampling.temperature == cfg.temperature
+    assert sampling.top_p == cfg.top_p
+    assert sampling.repetition_penalty == cfg.repetition_penalty
+    assert sampling.ignore_eos is cfg.ignore_eos
+    over = model.get_request_resource_configs(
+        {}, {"top_p": 0.5, "ignore_eos": True, "repetition_penalty": 1.1})[SAMPLER_RESOURCE]
+    assert (over.top_p, over.ignore_eos, over.repetition_penalty) == (0.5, True, 1.1)
+    assert over.temperature == cfg.temperature
+
+
+def test_glm52_mtp_is_refused_until_it_lands():
+    with pytest.raises(ValueError, match="mtp_num_draft_tokens"):
+        Glm52Model(model_path_hf="", tokenizer_mode="byte", mtp_num_draft_tokens=2)
+    Glm52Model(model_path_hf="", tokenizer_mode="byte", mtp_num_draft_tokens=0)
+
+
+# ── config ──
+
+
+def test_glm52_config_sanity():
+    cfg = Glm52ModelConfig()
+    assert cfg.cache_latent_dim == 576  # 512 latent + 64 decoupled rope
+    assert cfg.qk_head_dim == cfg.padded_head_dim == 256
+    assert cfg.num_dense_layers == 3
+
+    from mstar.model.glm52.components.language_model import is_moe_layer
+
+    assert [is_moe_layer(cfg, i) for i in (0, 1, 2)] == [False, False, False]
+    assert is_moe_layer(cfg, 3) and is_moe_layer(cfg, 77)
+
+    reduced = Glm52ModelConfig.reduced()
+    assert not is_moe_layer(reduced, 0) and is_moe_layer(reduced, 1)
+    assert reduced.qk_head_dim == 24 and reduced.padded_head_dim == 64
+
+
+# ── submodule: check_stop ──
+
+
+def _make_submodule(config) -> Glm52LLMSubmodule:
+    # check_stop / preprocess only read self.config; skip nn.Module init.
+    sub = object.__new__(Glm52LLMSubmodule)
+    sub.config = config
+    sub._dsa_k_store = Glm52DsaKStore()
+    sub._token_budget = {}  # no prefill ran: check_stop falls back to the request's max_tokens
+    return sub
+
+
+def _fwd_info(max_tokens=100, ignore_eos=False, iters=0) -> CurrentForwardPassInfo:
+    return CurrentForwardPassInfo(
+        request_id="r0",
+        graph_walk="decode",
+        fwd_index=0,
+        random_seed=0,
+        max_tokens=max_tokens,
+        resource_configs={SAMPLER_RESOURCE: SamplingReqConfig(ignore_eos=ignore_eos)},
+        dynamic_loop_iter_counts={"decode_loop": iters},
+    )
+
+
+@pytest.mark.parametrize("eos", [154820, 154827, 154829])
+def test_glm52_check_stop_on_each_eos_id(eos):
+    sub = _make_submodule(Glm52ModelConfig())
+    outputs = {"new_token": [torch.tensor([eos])]}
+    assert sub.check_stop("r0", _fwd_info(), outputs) == {"decode_loop"}
+
+
+def test_glm52_check_stop_continues_on_normal_token():
+    sub = _make_submodule(Glm52ModelConfig())
+    outputs = {"new_token": [torch.tensor([42])]}
+    assert sub.check_stop("r0", _fwd_info(), outputs) == set()
+
+
+def test_glm52_check_stop_ignore_eos_runs_to_max_tokens():
+    sub = _make_submodule(Glm52ModelConfig())
+    outputs = {"new_token": [torch.tensor([154820])]}
+    assert sub.check_stop("r0", _fwd_info(ignore_eos=True), outputs) == set()
+    # max_tokens counts every generated token, the prefill's included: 1 +
+    # iters+1. For max 8 the stop fires at decode iter 6 (8 total), not 7.
+    assert sub.check_stop(
+        "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=5), outputs,
+    ) == set()
+    assert sub.check_stop(
+        "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=6), outputs,
+    ) == {"decode_loop"}
+
+
+# ── submodule: graph configs ──
+
+
+def test_glm52_no_cuda_graphs_under_reference_dispatch():
+    # The reference MoE dispatch (.nonzero()/host loop) cannot be stream-
+    # captured; registering graph configs would fail every capture and then
+    # break eager prefill. Reference modes must register none.
+    fp8 = _make_submodule(Glm52ModelConfig.reduced_fp8())
+    assert fp8.get_cuda_graph_configs(torch.device("cpu")) == []
+    bf16_tp = _make_submodule(Glm52ModelConfig.reduced())
+    assert bf16_tp.get_cuda_graph_configs(torch.device("cpu"), tp_world_size=8) == []
+    # bf16 TP=1 uses the capture-safe fused kernel on GPU: graphs stay.
+    bf16 = _make_submodule(Glm52ModelConfig.reduced())
+    assert len(bf16.get_cuda_graph_configs(torch.device("cpu"))) == 2
+
+
+def test_glm52_graph_compile_env_escape_hatch(monkeypatch):
+    # MSTAR_GLM52_GRAPH_COMPILE=0 captures the eager forward (both walks) —
+    # the escape hatch for an Inductor-subprocess Triton crash that fails
+    # every capture. Default stays compile-on, in the cuBLAS ("default") mode.
+    sub = _make_submodule(Glm52ModelConfig.reduced())
+    configs = sub.get_cuda_graph_configs(torch.device("cpu"))
+    assert all(c.compile for c in configs)
+    assert all(c.compile_mode == "default" for c in configs)
+    monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
+    assert not any(
+        c.compile for c in sub.get_cuda_graph_configs(torch.device("cpu"))
+    )
+
+
+# ── submodule: preprocess ──
+
+
+class _FakeKV:
+    """Only what preprocess reads off the KV resource: the stored length."""
+
+    def __init__(self, starts):
+        self._starts = starts
+
+    def stored_len(self, rid, label="main"):
+        return self._starts[rid]
+
+
+def _preprocess(sub, starts, seq_len):
+    from mstar.model.submodule_base import ARNodeInputs
+
+    sub.get_device = lambda: torch.device("cpu")
+    inputs = [
+        ARNodeInputs(
+            input_ids=torch.zeros(seq_len, dtype=torch.long),
+            input_seq_len=seq_len,
+        )
+        for _ in starts
+    ]
+    engine_inputs = SimpleNamespace(
+        request_ids=list(starts), resources={KV_RESOURCE: _FakeKV(starts)},
+    )
+    return sub.preprocess("prefill", engine_inputs, inputs)
+
+
+def test_glm52_preprocess_supplies_eager_last_token_indices():
+    sub = _make_submodule(Glm52ModelConfig())
+    out = _preprocess(sub, {"r0": 0, "r1": 0}, seq_len=16)
+    assert torch.equal(out["last_token_indices"], torch.tensor([15, 31]))
+    assert out["dsa_ctx"] is None
+
+
+def test_glm52_preprocess_positions_continue_from_the_stored_length():
+    sub = _make_submodule(Glm52ModelConfig())
+    out = _preprocess(sub, {"r0": 5, "r1": 0}, seq_len=3)
+    assert out["position_ids"].tolist() == [5, 6, 7, 0, 1, 2]
+
+
+def test_glm52_preprocess_refuses_context_beyond_dsa_window():
+    # Dense MLA == DSA only within the top-2048 window; beyond it needs the
+    # DSA engine path (dsa_long_context).
+    sub = _make_submodule(Glm52ModelConfig())
+    _preprocess(sub, {"r0": 2032}, seq_len=16)  # exactly 2048: allowed
+    with pytest.raises(RuntimeError, match="dsa_long_context"):
+        _preprocess(sub, {"r0": 2040}, seq_len=16)
+
+
+# ── prompt / output processing ──
+
+
+def test_glm52_process_prompt_byte_mode_never_touches_tokenizer():
+    m = object.__new__(Glm52Model)
+    m.config = Glm52ModelConfig.reduced()  # vocab 256
+    m._tokenizer_mode = "byte"
+    m._tokenizer = None
+    out = m.process_prompt("Hi", ["text"], ["text"])
+    assert set(out) == {"text_inputs"}
+    (ids,) = out["text_inputs"]
+    assert ids.dtype == torch.long and ids.tolist() == [72, 105]
+    # bytes past the vocabulary clip to the last id; an empty prompt is one
+    # pad-ish token, not an empty prefill
+    m.config.vocab_size = 100
+    assert m.process_prompt("z", ["text"], ["text"])["text_inputs"][0].tolist() == [99]
+    assert m.process_prompt("", ["text"], ["text"])["text_inputs"][0].tolist() == [0]
+    assert m.process_prompt(None, ["text"], ["text"]) == {}
+    assert m._tokenizer is None  # no lazy HF download triggered
+
+
+def test_glm52_postprocess_byte_mode_never_touches_tokenizer():
+    m = object.__new__(Glm52Model)
+    m._tokenizer_mode = "byte"
+    m._tokenizer = None
+    out = m.postprocess(torch.tensor([72, 105]), "text")
+    assert out == b"Hi"
+    assert m._tokenizer is None  # no lazy HF download triggered
+    with pytest.raises(ValueError, match="Unsupported modality"):
+        m.postprocess(torch.tensor([1]), "audio")
+
+
+
+# ---------------------------------------------------------------------------
+# DSA indexer residency follows dsa_long_context
+# ---------------------------------------------------------------------------
+
+def _indexer_params(model):
+    return {n for n, _ in model.named_parameters() if ".self_attn.indexer." in n}
+
+
+def test_indexer_exists_only_on_the_dsa_path():
+    """Flag-off no forward ever hands a layer a dsa_ctx, so a FULL layer's
+    indexer would be replicated (not TP-sharded) dead weight — ~370 MB per
+    rank on the full model. Flag-on FULL layers carry it, SHARED ones never."""
+    off = Glm52ForCausalLM(Glm52ModelConfig.reduced())
+    assert _indexer_params(off) == set()
+    assert all(layer.self_attn.indexer is None for layer in off.model.layers)
+
+    cfg = Glm52ModelConfig.reduced()
+    cfg.dsa_long_context = True
+    on = Glm52ForCausalLM(cfg)
+    assert on.model.layers[0].self_attn.indexer is not None  # FULL
+    assert on.model.layers[1].self_attn.indexer is None      # SHARED
+    assert all(n.startswith("model.layers.0.") for n in _indexer_params(on))
+
+
+def test_flag_off_layer_refuses_a_dsa_ctx():
+    from mstar.model.glm52.components.attention import Glm52MLAAttention
+    from mstar.model.glm52.dsa import Glm52DsaForwardContext
+
+    cfg = Glm52ModelConfig.reduced()
+    cfg.mla_absorb = True
+    attn = Glm52MLAAttention(cfg, layer_idx=0)  # FULL slot, built flag-off
+    ctx = Glm52DsaForwardContext(spans=[], k_store=Glm52DsaKStore(), needs_selection=True)
+    with pytest.raises(RuntimeError, match="dsa_long_context"):
+        attn(torch.randn(1, cfg.hidden_size), torch.tensor([0]), dsa_ctx=ctx)
+
+
+def test_load_weights_skips_indexer_keys_flag_off_and_demands_them_flag_on():
+    from test_glm52_moe import BLOCK, _fabricate_checkpoint
+
+    torch.manual_seed(3)
+    cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+    state, _ = _fabricate_checkpoint(cfg)  # carries layer 0's indexer keys
+    assert any(".self_attn.indexer." in name for name, _ in state)
+
+    # flag-off: the keys are dropped before the dequant stream, the load is
+    # complete both ways without them
+    off = Glm52ForCausalLM(cfg)
+    loaded = off.load_weights(iter(state))
+    assert loaded == set(dict(off.named_parameters()))
+    assert not any(".indexer." in n for n in loaded)
+
+    # flag-on: the FULL layer's indexer loads, and a stream without those
+    # keys is refused rather than served from uninitialized memory
+    cfg.dsa_long_context = True
+    on = Glm52ForCausalLM(cfg)
+    loaded = on.load_weights(iter(state))
+    assert loaded == set(dict(on.named_parameters()))
+    assert _indexer_params(on) <= loaded and _indexer_params(on)
+
+    stripped = [(n, t) for n, t in state if ".self_attn.indexer." not in n]
+    with pytest.raises(RuntimeError, match="indexer parameters received no checkpoint"):
+        Glm52ForCausalLM(cfg).load_weights(iter(stripped))
+
+
+def _hf_config(cfg: Glm52ModelConfig) -> dict:
+    """``cfg`` written out as a checkpoint's config.json."""
+    from dataclasses import fields
+
+    from mstar.model.glm52.components.indexer import is_full_indexer_layer
+
+    hf = {f.name: getattr(cfg, f.name) for f in fields(cfg) if f.init}
+    del hf["quantization_config"], hf["rope_theta"], hf["eos_token_ids"]
+    n = cfg.num_hidden_layers
+    hf.update(
+        model_type="glm_moe_dsa", n_group=1, topk_group=1,
+        rope_parameters={"rope_theta": int(cfg.rope_theta), "rope_type": "default"},
+        eos_token_id=list(cfg.eos_token_ids),
+        indexer_types=[
+            "full" if is_full_indexer_layer(cfg, i) else "shared" for i in range(n)],
+        mlp_layer_types=[
+            "dense" if i < cfg.first_k_dense_replace else "sparse" for i in range(n)],
+    )
+    return hf
+
+
+def test_from_hf_config_reads_the_checkpoint_geometry():
+    official = Glm52ModelConfig()
+    assert Glm52ModelConfig.from_hf_config(_hf_config(official)) == official
+
+    other = Glm52ModelConfig(
+        num_hidden_layers=42, hidden_size=4096, n_routed_experts=128,
+        num_nextn_predict_layers=0)
+    assert Glm52ModelConfig.from_hf_config(_hf_config(other)) == other
+
+    hf = _hf_config(other)
+    hf["indexer_types"][3] = "full"
+    with pytest.raises(ValueError, match="indexer_types"):
+        Glm52ModelConfig.from_hf_config(hf)
+    del hf["num_hidden_layers"]
+    with pytest.raises(ValueError, match="num_hidden_layers"):
+        Glm52ModelConfig.from_hf_config(hf)
+
+
+@pytest.mark.parametrize("rope", [
+    {"rope_parameters": {"rope_theta": 8e6, "rope_type": "yarn", "factor": 4.0}},
+    {"rope_scaling": {"type": "dynamic", "factor": 2.0}},
+])
+def test_a_scaled_rope_is_refused(rope):
+    # it ran as plain RoPE: wrong frequencies and softmax scale, no error
+    hf = {**_hf_config(Glm52ModelConfig()), **rope}
+    with pytest.raises(ValueError, match="plain RoPE"):
+        Glm52ModelConfig.from_hf_config(hf)
+
+
+def test_model_takes_its_geometry_from_config_json(tmp_path):
+    import json
+
+    truncated = Glm52ModelConfig(num_hidden_layers=42, num_nextn_predict_layers=0)
+    (tmp_path / "config.json").write_text(json.dumps(_hf_config(truncated)))
+
+    m = Glm52Model(model_path_hf="", checkpoint_path=str(tmp_path))
+    assert m.config.num_hidden_layers == 42
+    kv, _, _ = _specs(m.config)
+    assert kv.config.num_layers == 42
+    # the override serves a shallower trunk than the checkpoint holds
+    m = Glm52Model(model_path_hf="", checkpoint_path=str(tmp_path), num_hidden_layers=10)
+    assert m.config.num_hidden_layers == 10
+    # no config.json: the official geometry
+    assert Glm52Model(model_path_hf="").config.num_hidden_layers == 78
+
+
+def _write_checkpoint(path, cfg, state):
+    import json
+
+    from safetensors.torch import save_file
+
+    hf = _hf_config(cfg)
+    hf["quantization_config"] = {
+        "quant_method": "fp8",
+        "weight_block_size": list(cfg.quantization_config.weight_block_size),
+    }
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(hf))
+    save_file({n: t.contiguous() for n, t in state}, str(path / "model.safetensors"))
+
+
+def test_load_refuses_a_checkpoint_missing_a_layer(tmp_path):
+    """Parameters come from to_empty, so a checkpoint without one layer must
+    fail the load and name every parameter it left unfilled."""
+    from test_glm52_moe import BLOCK, _fabricate_checkpoint
+
+    torch.manual_seed(4)
+    cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+    state, _ = _fabricate_checkpoint(cfg)
+    _write_checkpoint(tmp_path / "complete", cfg, state)
+    _write_checkpoint(
+        tmp_path / "missing", cfg,
+        [(n, t) for n, t in state if not n.startswith("model.layers.1.")],
+    )
+
+    def load(name):
+        model = Glm52Model(
+            model_path_hf="", checkpoint_path=str(tmp_path / name),
+            tokenizer_mode="byte",
+        )
+        return model.get_submodule("LLM", device="cpu")
+
+    lm = load("complete").language_model
+    layer1 = [n for n, _ in lm.named_parameters() if n.startswith("model.layers.1.")]
+    assert layer1
+    with pytest.raises(RuntimeError) as exc:
+        load("missing")
+    assert all(n in str(exc.value) for n in layer1)
+    assert "model.layers.0." not in str(exc.value)
