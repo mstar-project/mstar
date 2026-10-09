@@ -172,7 +172,7 @@ class Runtime:
         engine = ModelInputsFromEngine(rids, {}, self.resources)
         ids = self.node.preprocess(walk, engine, inputs)["text_inputs"]
         lm = self.node.language_model
-        hidden = lm(lm.model.embed_tokens(ids), label="main")
+        hidden = lm(lm.model.embed(ids), label="main")
         if iteration == 0:
             hidden = self.resources[LOCAL_ATTN].select_last_hidden(hidden, label="main")
         logits = lm.compute_logits(hidden)

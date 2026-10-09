@@ -1,6 +1,7 @@
 """Single-node text generation with pinned metadata and explicitly supplied weights."""
 
 import json
+import os
 
 import torch
 
@@ -54,7 +55,9 @@ class CommandAPlusModel(Model):
                 ],
             ),
             "decode": Loop(
-                name="decode_loop", max_iters=self.get_max_output_tokens(), outputs=[],
+                # Per-request max_output_tokens ends the loop earlier; this is
+                # only the hard bound, so it must not cap the request's choice.
+                name="decode_loop", max_iters=self.max_seq_len, outputs=[],
                 section=GraphNode(name="LLM", input_names=["text_inputs"], outputs=[
                     GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token",
                               output_modality="text", conductor_new_token=True),
@@ -165,6 +168,8 @@ class CommandAPlusModel(Model):
             self.local_dir, device="cpu", prefix="model.language_model.",
         ))
         language_model.eval()
+        if torch.device(device).type == "cuda" and not os.environ.get("COMMAND_A_PLUS_UNFUSED"):
+            language_model.model.fuse_for_inference()
         return CommandAPlusLLMSubmodule(language_model, self.config).eval()
 
     def _get_tokenizer(self):
@@ -189,14 +194,29 @@ class CommandAPlusModel(Model):
                 raise ValueError("Expected one prompt token tensor")
             ids = ids[0]
         else:
-            if not isinstance(prompt, str):
-                raise ValueError("Expected a text prompt")
+            messages = kwargs.get("messages")
+            if messages is None:
+                if not isinstance(prompt, str):
+                    raise ValueError("Expected a text prompt")
+                messages = [{"role": "user", "content": prompt}]
+            elif not (
+                isinstance(messages, list) and messages
+                and all(isinstance(m, dict) and set(m) == {"role", "content"}
+                        and m["role"] in ("system", "user", "assistant")
+                        and isinstance(m["content"], str) for m in messages)
+            ):
+                raise ValueError("messages must be a non-empty list of {role, content} chat turns")
             ids = torch.tensor(self._get_tokenizer().apply_chat_template(
-                [{"role": "user", "content": prompt}], tokenize=True,
-                add_generation_prompt=True, return_dict=False,
+                messages, tokenize=True, add_generation_prompt=True, return_dict=False,
             ), dtype=torch.long)
         if ids.ndim != 1 or ids.numel() == 0 or ids.numel() > self.max_seq_len:
             raise ValueError("Prompt must contain 1..max_seq_len token IDs")
+        max_output_tokens = kwargs.get("max_output_tokens")
+        if max_output_tokens is not None and ids.numel() + max_output_tokens > self.max_seq_len:
+            raise ValueError(
+                f"prompt ({ids.numel()} tokens) + max_output_tokens ({max_output_tokens}) "
+                f"exceeds max_seq_len ({self.max_seq_len})"
+            )
         if ids.dtype not in (torch.int32, torch.int64) or bool(((ids < 0) | (ids >= self.config.vocab_size)).any()):
             raise ValueError("Prompt token IDs must be integers within the vocabulary")
         return {"text_inputs": [ids.to(dtype=torch.long)]}
