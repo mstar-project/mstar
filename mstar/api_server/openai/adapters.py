@@ -1095,6 +1095,9 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "qwen3_asr": Qwen3ASRAdapter(),
     "qwen3_asr_realtime": Qwen3ASRAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
+    "flux2_klein": DiffusionImageAdapter(),
+    "flux2_klein_9b": DiffusionImageAdapter(),
+    "z_image_turbo": DiffusionImageAdapter(),
 }
 
 # One key per size; every size takes the same adapter.

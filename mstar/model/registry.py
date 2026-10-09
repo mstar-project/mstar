@@ -14,6 +14,8 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_i2v_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
+    "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
@@ -32,6 +34,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "waypoint": ("mstar.model.waypoint.waypoint_model", "WaypointModel"),
     "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
     "whisper_large_v3_turbo": ("mstar.model.whisper.whisper_model", "WhisperModel"),
+    "z_image_turbo": ("mstar.model.z_image.z_image_model", "ZImageModel"),
 }
 
 HF_MODELS: dict[str, dict] = {
@@ -69,6 +72,11 @@ HF_MODELS: dict[str, dict] = {
     # deployment as Super.
     "cosmos3_super_i2v_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Image2Video-4Step"},
     "cosmos3_super_t2i_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Text2Image-4Step"},
+    # FLUX.2 [klein]: step-distilled rectified-flow text-to-image + multi-reference
+    # editing (Qwen3 hidden-state text encoder, FLUX.2 VAE). 4B is Apache-2.0; 9B is
+    # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.
+    "flux2_klein": {"model_path_hf": "black-forest-labs/FLUX.2-klein-4B"},
+    "flux2_klein_9b": {"model_path_hf": "black-forest-labs/FLUX.2-klein-9B"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
@@ -121,6 +129,9 @@ HF_MODELS: dict[str, dict] = {
     # layer distillation that serves the same encoder several times faster.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
     "whisper_large_v3_turbo": {"model_path_hf": "openai/whisper-large-v3-turbo"},
+    # Z-Image-Turbo: 8-step distilled single-stream flow DiT (Qwen3-4B caption encoder,
+    # FLUX.1 VAE), text-to-image only. Apache-2.0.
+    "z_image_turbo": {"model_path_hf": "Tongyi-MAI/Z-Image-Turbo"},
 }
 
 # qwen 3.5 family: dense (MoE TODO)

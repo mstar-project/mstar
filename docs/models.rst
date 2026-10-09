@@ -110,6 +110,18 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
+   * - ``flux2_klein``
+     - ``black-forest-labs/FLUX.2-klein-4B``
+     - FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
+       image editing; Qwen3-4B hidden-state text encoder + FLUX.2 VAE. Apache-2.0.
+   * - ``flux2_klein_9b``
+     - ``black-forest-labs/FLUX.2-klein-9B``
+     - FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
+       the FLUX Non-Commercial License; check it before deploying.
+   * - ``z_image_turbo``
+     - ``Tongyi-MAI/Z-Image-Turbo``
+     - Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
+       encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.
 
 Notes
 -----
@@ -679,3 +691,116 @@ Requests are therefore independent and the loop is resumable across ranks.
 ``torch.compile``, no CUDA-graph capture, no continuous batching, no component
 offload, and the VAE decode is always tiled (which bounds its workspace so the
 untiled conv3d cannot OOM a 32 GiB card).
+
+FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
+-----------------------------------------------------
+
+Text-to-image and reference-image editing on the step-distilled **FLUX.2 [klein]**
+checkpoints. Four stateless nodes: a native Qwen3 encoder that runs only the 27 layers
+whose hidden states the DiT consumes (taps 9/18/27 concatenated), the rectified-flow
+transformer as the body of a ``denoise_loop`` (one Euler step per iteration, 4 by
+default, no classifier-free guidance), the FLUX.2 VAE encode of reference images and
+the VAE decode. All of them are exact ports; the CPU suite pins them bit-for-bit against
+the diffusers modules on tiny random configs and the GPU suite compares real-weight
+trajectories and PSNR against a recorded pipeline run
+(``test/flux2_klein/record_oracle.py``).
+
+Serve on one GPU and generate::
+
+   mstar serve flux2_klein --gpus 0
+   python - <<'PY'
+   from mstar import MStarClient
+   client = MStarClient("http://localhost:8000")
+   png = client.generate_image("a cat holding a sign that says hello world", width=1024, height=1024, seed=0)
+   open("cat.png", "wb").write(png)
+   open("edit.png", "wb").write(client.edit_image("make it a watercolor painting", "cat.png", seed=1))
+   PY
+
+The OpenAI routes are ``POST /v1/images/generations`` (``size`` as ``WxH``, ``seed``,
+``n``; ``num_inference_steps`` through ``extra_body``) and ``POST /v1/images/edits``
+(multipart ``image`` + ``prompt``; up to four reference images are concatenated as
+conditioning tokens, in order).
+
+Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
+
+``attention_backend``
+   ``sdpa`` (default) is the reference kernel, cuDNN on an H100 and measured as fast as
+   FlashInfer in the served path. ``flashinfer`` runs the DiT's joint attention on the
+   engine's ragged FlashInfer resource; both are CUDA-graph replayable.
+
+``compile``
+   ``torch.compile`` of the transformer, one trace per shape.
+
+``compile_eager_rounding``
+   Inductor rounds intermediates where eager PyTorch does, and fuses no FMAs.
+
+``compile_exact_ops``
+   ``true``, or a list of op classes among ``norms`` and ``activations``: those modules
+   stay on the eager kernels inside the compiled forward, so inductor only fuses the
+   chains around the GEMMs and attention. Each excluded module is a graph break, so this
+   is a latency-for-exactness trade:
+
+   * The norms alone make the transformer bit-exact with eager (measured on klein-4B and
+     9B). The shipped ``[norms]`` costs klein-4B 4% of its B=1 latency (0.371 vs
+     0.356 s); excluding the activations too adds cost and nothing else.
+   * Z-Image's 180 norms per step cost 45% (1.25 vs 0.86 s at B=1), so it ships ``false``
+     and lands at a median 34 dB. ``[norms]`` turns it reference-faithful (at least
+     55.9 dB on every prompt).
+   * Without it, the plain compile — even with eager rounding — lands at a median 35 to
+     38 dB PSNR from eager over the 100 protocol prompts, because a 4- or 8-step
+     distilled sampler amplifies the last bit of inductor's own reductions and activation
+     decompositions.
+
+``cuda_graph``, ``capture_sizes``, ``capture_batch_sizes``
+   The denoise step, Euler update included, is captured per listed ``[height, width]``
+   and batch size. Other shapes run the eager batched path.
+
+``capture_edit_sizes``
+   klein only: edit buckets with one reference image of the output size, the shape of an
+   edit that keeps its reference's size. Defaults to ``capture_sizes``; ``[]`` captures
+   none. The eight edit buckets of the 1024² default cost about 8 GiB of peak VRAM on
+   klein-4B and 6 GiB on 9B, and every extra capture size adds roughly 7 minutes of
+   startup.
+
+``async_scheduling``
+   The engine's speculative scheduling of the image nodes: the worker assembles a batch's
+   next denoise step while the current one runs and merges requests that became ready
+   meanwhile, so requests at different steps share a forward. On by default; a step a
+   request speculates past its schedule is vetoed before any forward, and ``false``
+   restores lockstep. Measured on one H100 back to back against lockstep: klein-4B 0.365
+   to 0.372 s vs 0.377 to 0.390 s at B=1 and about 3% more images per second at 4 and 16
+   concurrent requests, klein-9B 2%, Z-Image neutral, served images unchanged — the
+   denoise phase is compute-bound either way.
+
+``max_batch_size``
+   Rows batched per denoise step.
+
+``vae_compile``
+   ``torch.compile`` of the VAE decode with inductor autotuning: 89 to 29 ms at 1024² on
+   an H100. Its fused reductions move the image by about 55 dB PSNR from the eager decode
+   on every prompt, and the autotuner may pick different conv kernels in another server
+   process, so set it to ``false`` for bit-exact, repeatable output — which is how the
+   parity suite runs. The compiled decode is warmed at load for the ``capture_sizes``
+   grids and the decode batch sizes; any other latent shape decodes eagerly rather than
+   paying a 40 to 100 s autotune inside a request. Memory cuts the other way: the eager
+   decode of an 8-image batch at 1024² allocates about 40 GiB of activations, for served
+   peaks of 75 GiB on klein-4B and 77 GiB on Z-Image at 16 concurrent requests against
+   36 to 44 GiB compiled.
+
+``max_image_area``
+   Pixels, default 2048². Bounds the output size a request may ask for; larger requests
+   are rejected with a 400 before scheduling instead of occupying the worker for minutes
+   (an 8192² request means 262k tokens of quadratic attention).
+
+With the klein defaults every served image is within 53 dB of the eager path on all 100
+protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
+images of the other engines are 10 to 16 dB from the diffusers reference for the same
+seeds.
+Requests at the same output size batch across users in every node, including the
+text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the
+transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or
+BFL-layout safetensors), so a styled deployment runs at the base model's speed. The adapter's
+own scaling follows PEFT: an ``alpha`` key in the weights, else the ``lora_alpha`` (and
+``use_rslora``) of an ``adapter_config.json`` / ``config.json`` next to them, else ``alpha = r``;
+``scale`` multiplies that (a public rank-64 rsLoRA adapter lands within 53 dB of diffusers'
+fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).
