@@ -805,6 +805,9 @@ class KVManager(AttentionResource):
         runs once per batch of steps instead of every step. A key can thus
         appear a few steps late and is indexed by a later commit, as the
         single-request path allows. Removals and resets flush first."""
+        if self._chain_lazy_steps <= 1:
+            self._extend_chains_eager(request_ids, node_name, graph_walk, host_rows)
+            return
         step = (
             tuple(host_rows.request_ids), node_name, graph_walk, tuple(request_ids),
             {
@@ -813,10 +816,6 @@ class KVManager(AttentionResource):
                 if torch.is_tensor(buf) and buf.dim() != 0
             },
         )
-        if self._chain_lazy_steps <= 1:
-            with self._lock:
-                self._extend_chains_from([step])
-            return
         width = max((a.shape[1] for a in step[4].values()), default=0)
         with self._lock:
             self._chain_backlog.append(step)
@@ -824,6 +823,56 @@ class KVManager(AttentionResource):
             self._chain_backlog_width = max(self._chain_backlog_width, width)
             if len(self._chain_backlog) >= self._chain_lazy_steps:
                 self.flush_chain_backlog()
+
+    def _extend_chains_eager(
+        self, request_ids: list[str], node_name: str, graph_walk: str,
+        host_rows,
+    ) -> None:
+        """The per-step extension (MSTAR_KV_CHAIN_LAZY_STEPS=1): one lock,
+        one ``tolist`` per buffer instead of one per request. The round-2
+        body, kept as it was: at c32 the step is GIL-bound and even the
+        few extra numpy calls of the lazy path's bookkeeping showed."""
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        buffers = host_rows.buffers
+        rows_of: dict[str, list] = {}
+        page_size = self.config.page_size
+        key = (node_name, graph_walk)
+        lookup = self._chain_lookup
+        with self._lock:
+            for rid in request_ids:
+                # the label and buffer name do not change over a request's
+                # life (its overrides are set at ingest), so each is looked up
+                # once instead of on every decode step
+                per_rid = lookup.get(rid)
+                if per_rid is None:
+                    per_rid = lookup[rid] = {}
+                entry = per_rid.get(key)
+                if entry is None:
+                    label = self._keyed_label(rid, node_name, graph_walk)
+                    tensor = (
+                        (self._overrides[rid].prefix_decode or {}).get(label)
+                        if label is not None else None
+                    )
+                    entry = per_rid[key] = (label, tensor)
+                label, tensor = entry
+                if label is None or not tensor:
+                    continue
+                rows = rows_of.get(tensor)
+                if rows is None:
+                    buf = buffers.get(tensor)
+                    if not torch.is_tensor(buf) or buf.dim() == 0:
+                        continue
+                    rows = rows_of[tensor] = buf.reshape(buf.shape[0], -1).tolist()
+                i = row_of.get(rid)
+                if i is None or i >= len(rows):
+                    continue
+                stream = self._streams.get(rid, {}).get(label)
+                if stream is None or stream.chain is None or stream.chain.unkeyed is None:
+                    continue
+                if stream.released:
+                    stream.chain = None
+                    continue
+                stream.chain.extend(rows[i], page_size)
 
     def flush_chain_backlog(self) -> None:
         """Extend the chains with every step waiting in the backlog."""
