@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from mstar.model.minicpm_o.components.tts import next_history, windowed_frequency_penalty
 from mstar.model.minicpm_o.components.vision import Resampler, navit_position_ids, slice_layout
 from mstar.model.minicpm_o.config import ResamplerConfig, VisionConfig
 
@@ -60,6 +61,20 @@ def test_sincos_keys_match_upstream_table(hw):
 @pytest.mark.parametrize("hw", [(26, 40), (32, 32), (7, 69), (70, 70), (100, 3)])
 def test_navit_position_buckets_match_upstream(hw):
     assert torch.equal(navit_position_ids(*hw, 70), upstream_navit_ids(*hw, 70))
+
+
+def test_tts_history_counts_codes_and_keeps_the_window():
+    window = 4
+    history = torch.tensor([[-1] * window + [0]] * 2)
+    codes = [torch.tensor([10, 20]), torch.tensor([11, 21]), torch.tensor([12, 22]),
+             torch.tensor([13, 23]), torch.tensor([14, 24])]
+    for c in codes:
+        history = next_history(history, c)
+    assert history.tolist() == [[11, 12, 13, 14, 5], [21, 22, 23, 24, 5]]
+    # empty slots count for nothing in the penalty; a repeated code twice
+    logits = torch.ones(1, 30)
+    out = windowed_frequency_penalty(logits, torch.tensor([[-1, -1, 7, 7]]), 2.0)
+    assert out[0, 7] == 0.25 and (out[0, :7] == 1).all() and out[0, 0] == 1
 
 
 def test_slice_layout_concatenates_slices_in_order():
@@ -124,6 +139,29 @@ def test_audio_placeholders_line_up_with_pooled_tokens(model):
 
 
 @needs_ckpt
+def test_spoken_reply_system_prompt_with_and_without_the_voice_clip(model):
+    """By default a spoken reply's system message carries the voice clip (upstream's
+    audio_assistant prompt); with ``voice_prompt=False`` it is the request's text system
+    prompt. Both use the speech template, which ends the prompt on <|tts_bos|>."""
+    from mstar.model.multimodal import PromptPart
+
+    tts_bos = model.tokenizer.convert_tokens_to_ids("<|tts_bos|>")
+    parts = [PromptPart("text", "Say hello.")]
+    voiced = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts)
+    assert voiced["audio_positions"][0].numel() > 0
+    assert voiced["text_inputs"][0][-1].item() == tts_bos
+    plain = model.process_prompt(
+        None, ["text"], ["text", "audio"], prompt_parts=parts,
+        voice_prompt=False, system_prompt="You are a helpful assistant.",
+    )
+    assert "audio_positions" not in plain
+    assert plain["text_inputs"][0][-1].item() == tts_bos
+    assert "You are a helpful assistant." in model.tokenizer.decode(plain["text_inputs"][0])
+    with pytest.raises(ValueError, match="unknown MiniCPM-o voice"):
+        model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, voice_prompt=False, voice="nope")
+
+
+@needs_ckpt
 @pytest.mark.parametrize(
     "tensors, walk",
     [
@@ -162,4 +200,6 @@ def test_every_node_gets_only_its_resources(model):
         "LLM": {"llm_kv", "llm_attn", "llm_pos", "llm_sampler"},
         "vision_encoder": {"vision_attn", "resampler_attn"},
         "audio_encoder": {"audio_attn"},
+        "TTS": {"tts_kv", "tts_attn", "tts_pos", "tts_sampler"},
+        "Token2Wav": {"t2w_state"},
     }
