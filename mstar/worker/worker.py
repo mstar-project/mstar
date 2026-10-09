@@ -2924,7 +2924,9 @@ class Worker:
                     range_pop(synchronize=False)
                 return None
 
-        _pp_stage("check_stop")
+        # the stop check itself is the direct window above; this stage is its
+        # tail (prefix chains, stream-terminated loops, failed rids)
+        _pp_stage("check_stop_tail")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.stop_loops", synchronize=False)
@@ -3073,8 +3075,7 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
-        with self._span("worker.postprocess.register_outputs"):
-            self._register_outputs(route_output)
+        self._register_outputs(route_output)
         _pp_stage("register_outputs")
 
         return _PostprocessState(
