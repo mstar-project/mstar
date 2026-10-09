@@ -2174,7 +2174,10 @@ def partial_stream(request):
     non-streaming ``trigger``: the Qwen3-Omni shape."""
     talker = GraphNode(
         name="talker", input_names={"trigger", "states"},
-        outputs=[GraphEdge(name="codes", next_node=EMIT_TO_CLIENT)],
+        outputs=[
+            GraphEdge(name="codes", next_node=EMIT_TO_CLIENT),
+            GraphEdge(name="embeds", next_node="sink"),
+        ],
     )
     talker._register_streaming({"states"})
     thinker = WorkerGraph(
@@ -2187,15 +2190,17 @@ def partial_stream(request):
         ),
         graph_walks={WALK}, ranks=[0], worker_graph_id=0,
     )
+    sink = GraphNode(name="sink", input_names={"embeds"}, outputs=[])
     talker_wg = WorkerGraph(
-        section=talker, graph_walks={"talk"}, ranks=[0], worker_graph_id=1,
+        section=Sequential(sections=[talker, sink]), graph_walks={"talk"},
+        ranks=[0], worker_graph_id=1,
     )
     common = dict(
         my_worker_id=WORKER, my_worker_graphs=[thinker, talker_wg],
         all_wg_ids_to_graph_walks={0: {WALK}, 1: {"talk"}},
         all_wg_ids_to_dyn_loops={0: set(), 1: set()},
-        all_wg_ids_to_nodes={0: {"thinker"}, 1: {"talker"}},
-        node_to_partition={"thinker": "default", "talker": "TALKER"},
+        all_wg_ids_to_nodes={0: {"thinker"}, 1: {"talker", "sink"}},
+        node_to_partition={"thinker": "default", "talker": "TALKER", "sink": "TALKER"},
         sharding_config=_sharding(),
     )
     if request.param == "python":
@@ -2258,18 +2263,21 @@ def test_a_consumer_whose_walk_is_not_done_runs_again_on_the_next_chunk(
     rt.cleanup_consumed_inputs("talker", [rid], [1], completes_walk=flags)
     out = rt.complete_and_route_batch(RouteInput(
         partition="TALKER", graph_walk="talk", node_name="talker",
-        output_signals=["codes"], wg_ids=ParallelList([rid], [1]),
-        tensors=[3], num_tensors=[1], completes_walk=flags,
+        output_signals=["codes", "embeds"], wg_ids=ParallelList([rid], [1]),
+        tensors=[3], num_tensors=[1, 0], completes_walk=flags,
     ))
     assert 3 in out.register_uuids, "its outputs are routed either way"
     assert _released(book, 2), "the consumed chunk is released either way"
     assert _released(book, 1) == walk_done, "the trigger stays for the next chunk"
 
+    # a normal completion routes every output edge; an unfinished one only what it produced
+    assert (("sink", "talk", [rid]) in _ready(rt)) == walk_done
+
     rt.ingest_inputs_batch(
         _ingest_block([rid], [_spec("states", "talker", [4])]), is_streaming=True,
     )
-    # finished, the worker graph was reset and waits for a new trigger
-    assert _ready(rt) == ([] if walk_done else [("talker", "talk", [rid])])
+    # finished, the talker waits for a new trigger
+    assert (("talker", "talk", [rid]) in _ready(rt)) != walk_done
 
 
 def test_a_loop_member_must_finish_its_walk(pair):

@@ -452,7 +452,8 @@ class RouteInput(NamedTuple):
     # Per row; None, every row finished. A row whose step did not finish its
     # node (a chunked prefill's non-final chunk) routes only its streaming
     # outputs; one that finished its node but not its walk (a consumer of
-    # such a chunk) routes all of them. Neither completes the node, so no
+    # such a chunk) routes all of them. Either routes only outputs that carry
+    # tensors. Neither completes the node, so no
     # worker graph is reported done, and their streaming edges carry
     # finished_graph_walk=False.
     completes_node: list[bool] | None = None

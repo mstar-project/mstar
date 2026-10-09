@@ -1396,10 +1396,11 @@ class PythonGraphRuntime(GraphRuntime):
                     self._mark_node_complete(rid, wg_id, input.node_name).output_edges
                 ]
             else:
-                # routed as they are, the node left live for its next step
+                # what it produced, the node left live for its next step; an
+                # empty edge would satisfy its consumer, or persist nothing
                 out_edges = [
                     edge.clone() for edge in node.outputs
-                    if node_done[i] or (edge.is_streaming and edge.tensor_info)
+                    if edge.tensor_info and (node_done[i] or edge.is_streaming)
                 ]
                 for edge in out_edges:
                     edge.finished_graph_walk = False

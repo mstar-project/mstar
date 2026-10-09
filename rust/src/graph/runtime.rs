@@ -1166,7 +1166,8 @@ pub struct RouteArg {
     #[pyo3(item)] rid_walk_idx: Option<Vec<u32>>,
     /// Per row; None, every row finished. A row whose step did not finish its
     /// node routes only its streaming outputs; one that finished its node but
-    /// not its walk routes all of them. Neither completes the node.
+    /// not its walk routes all of them. Either routes only outputs that carry
+    /// tensors, and neither completes the node.
     #[pyo3(item)] completes_node: Option<Vec<bool>>,
     #[pyo3(item)] completes_walk: Option<Vec<bool>>,
 }
