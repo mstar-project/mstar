@@ -669,6 +669,26 @@ mod tests {
     }
 
     #[test]
+    fn a_developer_message_is_a_system_message() {
+        let (_, _, _, parts) = flatten(
+            r#"[{"role":"developer","content":"Be brief."},{"role":"user","content":"Hi."}]"#,
+            Path::new("/unused"),
+        )
+        .unwrap();
+        assert_eq!(
+            described(&parts),
+            [("text", "system", Some("Be brief."), 0), ("text", "user", Some("Hi."), 0)],
+            "a developer message reached the templates under a role they do not render"
+        );
+    }
+
+    #[test]
+    fn a_role_a_chat_cannot_render_is_refused() {
+        let err = flatten(r#"[{"role":"tool","content":"42"}]"#, Path::new("/unused")).unwrap_err();
+        assert_eq!(err, "a message's role must be system, developer, user or assistant, not 'tool'");
+    }
+
+    #[test]
     fn an_attachment_keeps_its_place_between_text() {
         let (text, file_paths, in_mods, parts) = flatten(
             r#"[{"role":"user","content":[

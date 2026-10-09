@@ -111,6 +111,25 @@ def test_messages_of_one_role_stay_one_turn(tmp_path):
     )
 
 
+def test_a_developer_message_is_a_system_message(tmp_path):
+    """OpenAI's newer name for it, which Qwen3-Omni's template drops, text and all."""
+    messages = [
+        {"role": "developer", "content": "Be brief."},
+        {"role": "user", "content": "hi"},
+    ]
+    _, _, _, parts = flatten_messages(messages, tmp_path)
+    assert _roles(parts) == [("text", "system", "Be brief."), ("text", "user", "hi")], (
+        "a developer message reached the templates under a role they do not render"
+    )
+
+
+@pytest.mark.parametrize("role", ["tool", "function", "usr"])
+def test_a_role_a_chat_cannot_render_is_refused(tmp_path, role):
+    refused = f"^a message's role must be system, developer, user or assistant, not '{role}'$"
+    with pytest.raises(ValueError, match=refused):
+        flatten_messages([{"role": role, "content": "hi"}], tmp_path)
+
+
 @pytest.mark.parametrize(("role", "message"), [
     ("system", "a system message cannot carry an image attachment"),
     ("assistant", "an assistant message cannot carry an image attachment"),
