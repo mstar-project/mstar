@@ -83,9 +83,10 @@ def kv_plan_cache() -> int:
     rows in the same order and nothing but that step's commit touched the
     streams: lengths advance by one, pages change only where a row crossed
     a page boundary, and the five index arrays come from numpy instead of a
-    per-row Python pass. ``0`` plans every step from the streams; ``2`` does
-    both and logs any difference (a correctness check for runs)."""
-    return int(os.environ.get("MSTAR_KV_PLAN_CACHE", "1"))
+    per-row Python pass. ``0`` (the default until the reworked path is
+    measured) plans every step from the streams; ``2`` does both and logs any
+    difference (a correctness check for runs)."""
+    return int(os.environ.get("MSTAR_KV_PLAN_CACHE", "0"))
 
 
 def kv_pinned_indptrs() -> bool:
