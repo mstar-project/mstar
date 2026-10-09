@@ -214,6 +214,12 @@ def test_model_kwarg_dsa_long_context():
     assert mtp.config.dsa_long_context and mtp.config.mtp_num_draft_tokens == 2
 
 
+def test_model_kwarg_dsa_long_context_refuses_old_flashinfer(monkeypatch):
+    monkeypatch.setitem(sys.modules, "flashinfer", types.SimpleNamespace(__version__="0.6.17"))
+    with pytest.raises(ValueError, match="FlashInfer >= 0.6.18"):
+        Glm52Model(model_path_hf="", dsa_long_context=True)
+
+
 def test_reduced_variant_grows_trunk_for_mtp():
     # reduced() sizes 2 trunk layers, landing the MTP position on a SHARED
     # indexer slot; a reduced-variant serve yaml with MTP on must still

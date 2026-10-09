@@ -20,6 +20,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.attn.sparse_mla import check_flashinfer
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
@@ -91,6 +92,7 @@ class Glm52Model(Model):
                     "dsa_long_context requires mla_absorb: the sparse path "
                     "gathers selected latents from the paged MLA cache"
                 )
+            check_flashinfer()
             self.config.dsa_long_context = True
             if "prefill_chunk_tokens" in kwargs:
                 self.config.prefill_chunk_tokens = int(kwargs["prefill_chunk_tokens"])
