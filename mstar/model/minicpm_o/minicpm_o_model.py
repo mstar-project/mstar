@@ -302,7 +302,9 @@ class MiniCPMOModel(Model):
             AttentionSpec(resource_key=TTS_ATTN, nodes={TTS}, config=AttentionConfig(kv_cache=TTS_KV)),
             PositionSpec(
                 resource_key=TTS_POS, nodes={TTS},
-                config=PositionConfig(kv_cache=TTS_KV, rope_theta=tts.rope_theta),
+                # a TTS step is a few small kernels a layer: fused RoPE saves 5-10% of
+                # its GPU time (on the LLM it measured slower at batch 32)
+                config=PositionConfig(kv_cache=TTS_KV, rope_theta=tts.rope_theta, fused=True),
             ),
             # the window frequency penalty runs in the TTS forward, before this
             SamplerSpec(
