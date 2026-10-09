@@ -303,3 +303,50 @@ def test_notify_many_wakes_every_handler_with_one_loop_call():
     assert len(loop.calls) == 1
     assert all(req.wake.is_set() for req in reqs[:3])
     assert not reqs[3].wake.is_set()
+
+
+def test_chunks_waiting_together_come_as_one_batch():
+    """Everything the message thread appended since the last wake is drained
+    as one list, so a streaming handler can send it as one body frame; a
+    chunk that lands later comes on its own, and the finish ends the stream
+    without an empty batch."""
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    req = _pending_request()
+    for i in range(3):
+        req.chunks.append(ResultChunk(request_id="r5", modality="text", data=f"t{i}".encode()))
+    server.pending_requests["r5"] = req
+
+    async def _collect():
+        batches = server.iter_result_chunk_batches("r5")
+        got = [await batches.__anext__()]
+        with server.request_lock:
+            req.chunks.append(ResultChunk(request_id="r5", modality="text", data=b"t3"))
+            req.notify()
+        got.append(await batches.__anext__())
+        with server.request_lock:
+            req.event.set()
+            req.notify()
+        async for batch in batches:
+            got.append(batch)
+        return got
+
+    got = asyncio.run(_collect())
+    assert [[c.data for c in b] for b in got] == [[b"t0", b"t1", b"t2"], [b"t3"]]
+    assert "r5" not in server.pending_requests
+
+
+def test_error_tail_is_its_own_last_batch():
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    req = _pending_request()
+    req.chunks.append(ResultChunk(request_id="r6", modality="text", data=b"partial"))
+    req.error = "result delivery timed out; response is incomplete"
+    req.error_status = 500
+    req.event.set()
+    server.pending_requests["r6"] = req
+
+    async def _collect():
+        return [[c.modality for c in b] async for b in server.iter_result_chunk_batches("r6")]
+
+    assert asyncio.run(_collect()) == [["text"], ["error"]]
