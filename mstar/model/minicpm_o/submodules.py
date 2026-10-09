@@ -15,6 +15,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -69,10 +70,35 @@ _MM_FILLS = {"vision_embeds": "image_positions", "audio_embeds": "audio_position
 
 
 class LLMSubmodule(ARNodeSubmodule):
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+
     def __init__(self, model: Qwen3DenseLM, config: MiniCPMOConfig):
         super().__init__()
         self.model = model
         self.config = config
+
+    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
+        """Decode, and one prefill capture every prefill walk replays: ids are
+        embedded in `preprocess`, so the forward always takes embeddings."""
+        def dummy(n: int) -> ARNodeInputs:
+            return ARNodeInputs(input_ids=torch.zeros(n, dtype=torch.long, device=device), input_seq_len=n)
+
+        return [
+            BatchedCudaGraphConfig(
+                capture_graph_walk=DECODE,
+                single_request_inputs=dummy(1),
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+            ),
+            PackedCudaGraphConfig(
+                capture_graph_walk="prefill_text",
+                replay_graph_walks=["prefill_image", "prefill_audio", "prefill_omni"],
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                make_node_input=dummy,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+            ),
+        ]
 
     # ------------------------------------------------------------------
     # Inputs
@@ -116,10 +142,15 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, Any]:
         device = self.get_device()
-        if inputs[0].input_ids is not None:
+        if all(inp.input_ids is not None for inp in inputs):
             ids = torch.cat([inp.input_ids for inp in inputs]).to(device)
             return {"input_embeds": self.model.embed(ids)}
-        return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs])}
+        # the prefill walks share one capture, so a batch can mix text rows
+        # (ids) with multimodal ones (embeddings)
+        return {"input_embeds": torch.cat([
+            inp.input_embeds if inp.input_embeds is not None else self.model.embed(inp.input_ids.to(device))
+            for inp in inputs
+        ])}
 
     def declare_step(
         self,
@@ -421,6 +452,11 @@ TTS_DECODE_LOOP = "tts_decode_loop"
 
 
 class TTSSubmodule(ARNodeSubmodule):
+    # A reply's text plus two: at most a few hundred rows, once per request
+    PREFILL_TOKEN_BUCKETS = [64, 128, 256, 512]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+
     """The speech-token LM. ``tts_prefill`` reads the whole reply (upstream's
     ``chat`` speaks only once the text is done) and samples the first code;
     ``tts_decode`` feeds each code back until the EOS code.
@@ -439,7 +475,37 @@ class TTSSubmodule(ARNodeSubmodule):
         super().__init__()
         self.model = model
         self.config = config
+        self.config_tts = model.config
         self.sampling = sampling
+
+    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
+        hidden = self.config_tts.hidden_size
+
+        def extras() -> dict[str, torch.Tensor]:
+            return {"history": self._empty_history(device)}
+
+        def prefill_dummy(n: int) -> ARNodeInputs:
+            return ARNodeInputs(
+                input_embeds=torch.zeros(n, hidden, device=device, dtype=self.model.emb_code.weight.dtype),
+                input_seq_len=n, tensor_inputs=extras(),
+            )
+
+        return [
+            BatchedCudaGraphConfig(
+                capture_graph_walk=TTS_DECODE,
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                    input_seq_len=1, tensor_inputs=extras(),
+                ),
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+            ),
+            PackedCudaGraphConfig(
+                capture_graph_walk=TTS_PREFILL,
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                make_node_input=prefill_dummy,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+            ),
+        ]
 
     # ------------------------------------------------------------------
     # Inputs
