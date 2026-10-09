@@ -1,3 +1,4 @@
+import logging
 import os
 from collections.abc import Iterable
 
@@ -17,6 +18,8 @@ from mstar.model.components.distributed.attention import ParallelAttention
 from mstar.model.components.distributed.embedding import VocabParallelEmbedding
 from mstar.model.components.distributed.mlp import ParallelGatedMLP
 from mstar.model.components.moe import ParallelSparseMoeBlock
+
+logger = logging.getLogger(__name__)
 
 
 class CommandAPlusLayerNorm(nn.Module):
@@ -326,15 +329,39 @@ class CommandAPlusLanguageModel(nn.Module):
                 self._replicated_embedding, shard.contiguous(), group=group.device_group,
             )
         if group.world_size > 1 and not os.environ.get("COMMAND_A_PLUS_NCCL_ALLREDUCE"):
+            self._allreduce_workspace = self._create_allreduce_workspace(max_allreduce_tokens)
+            if self._allreduce_workspace is not None:
+                self._allreduce_max_tokens = max_allreduce_tokens
+
+    def _create_allreduce_workspace(self, max_tokens: int):
+        """FlashInfer's one-shot all-reduce workspace, or None to use NCCL.
+
+        It needs direct peer access between all ranks (NVLink). Ranks agree on
+        the outcome, so if any rank fails they all fall back to NCCL.
+        """
+        group, weight = self.comm_group, self.embed_tokens.weight
+        workspace, error = None, None
+        try:
             from flashinfer.comm import create_allreduce_fusion_workspace
 
-            weight = self.embed_tokens.weight
-            self._allreduce_workspace = create_allreduce_fusion_workspace(
+            workspace = create_allreduce_fusion_workspace(
                 backend="trtllm", world_size=group.world_size, rank=group.rank,
-                max_token_num=max_allreduce_tokens, hidden_dim=weight.shape[1],
+                max_token_num=max_tokens, hidden_dim=weight.shape[1],
                 dtype=weight.dtype, group=group.device_group,
             )
-            self._allreduce_max_tokens = max_allreduce_tokens
+        except Exception as exc:
+            error = exc
+        ok = torch.tensor([workspace is not None], dtype=torch.int32, device=weight.device)
+        torch.distributed.all_reduce(ok, op=torch.distributed.ReduceOp.MIN, group=group.device_group)
+        if ok.item():
+            return workspace
+        if workspace is not None:
+            workspace.destroy()
+        logger.warning(
+            "FlashInfer one-shot all-reduce unavailable (%s); Command A+ uses NCCL",
+            error if error is not None else "failed on another rank",
+        )
+        return None
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self._replicated_embedding is None:
