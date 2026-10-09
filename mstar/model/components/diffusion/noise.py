@@ -79,9 +79,14 @@ class NoiseStager:
 
         A plain CPU tensor: identical to drawing it inline, so a model is free to
         post-process it (pack, reshape) before handing it to :meth:`to_device`.
+
+        The generator is shared, so seeding and drawing are one critical section:
+        split them and a concurrent caller's seed lands between, and both draws
+        come out of the wrong stream.
         """
-        generator = self._generator.manual_seed(int(seed))
-        return torch.randn(shape, generator=generator, dtype=self.dtype)
+        with self._lock:
+            generator = self._generator.manual_seed(int(seed))
+            return torch.randn(shape, generator=generator, dtype=self.dtype)
 
     def randn_to_device(
         self, shape: tuple[int, ...], seed: int, device: torch.device,
@@ -104,7 +109,6 @@ class NoiseStager:
         if device.type != "cuda" or not self._pinned:
             return self.randn(shape, seed).to(device)
 
-        generator = self._generator.manual_seed(int(seed))
         out = torch.empty(shape, dtype=self.dtype, device=device)
         if numel == 0:
             return out
@@ -112,6 +116,9 @@ class NoiseStager:
             if numel > self._numel:
                 self._grow(numel)
             index, event, staging = self._take(numel, device)
+            # Seed inside the lock, with the draw: the generator is shared, so a
+            # concurrent caller seeding between the two would reseed this draw.
+            generator = self._generator.manual_seed(int(seed))
             # Fill the pinned buffer in place: no intermediate host tensor, so the
             # draw is the only host-side pass over the values.
             torch.randn(shape, generator=generator, dtype=self.dtype, out=staging.view(shape))

@@ -167,3 +167,35 @@ def test_stage_all_covers_a_seed_set():
     assert set(out) == set(seeds)
     for name, tensor in seeds.items():
         assert torch.equal(out[name].cpu(), tensor)
+
+
+def test_concurrent_draws_do_not_cross_seeds():
+    """Seeding and drawing must be one critical section.
+
+    The generator is shared, so if a second thread seeds between this thread's
+    manual_seed and its draw, both get the wrong stream. Review of PR 287 measured
+    293 wrong draws in 12800 with the seed outside the lock.
+    """
+    import threading
+
+    stager = NoiseStager(torch.float32)
+    seeds = list(range(16))
+    want = {s: torch.randn((32,), generator=torch.Generator(device="cpu").manual_seed(s))
+            for s in seeds}
+    wrong: list[tuple[int, int]] = []
+    lock = threading.Lock()
+
+    def worker(worker_id: int) -> None:
+        for _ in range(100):
+            for s in seeds:
+                got = stager.randn((32,), seed=s)
+                if not torch.equal(got, want[s]):
+                    with lock:
+                        wrong.append((worker_id, s))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not wrong, f"{len(wrong)} draws out of {8 * 100 * len(seeds)} used another thread's seed"

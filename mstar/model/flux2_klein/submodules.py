@@ -329,6 +329,12 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
         # latent shapes (batch, H, W) the compiled decode was warmed with; any other shape decodes eager:
         # a fresh max-autotune compile inside a request cost 40-100 s (measured on 1024x768 / 512^2 edits)
         self._warmed: set[tuple[int, int, int]] = set()
+        # Before the warm-up, not after: the loader leaves requires_grad=True and
+        # Engine.load_model only clears it later. Dynamo guards on requires_grad, so
+        # a graph warmed with it set fails its guard on the first served decode and
+        # recompiles under max-autotune *inside* the request -- the warm-up is thrown
+        # away exactly when it matters.
+        vae.requires_grad_(False)
         self.warmup(warmup_grids)
 
     def _decode_chunk(self, latent: torch.Tensor) -> torch.Tensor:

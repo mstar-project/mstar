@@ -292,8 +292,10 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         if k >= num_steps:
             # Async scheduling dispatched an iteration past this request's stop; None
             # makes the engine skip the forward (the cosmos3 / wan22 veto).
-            logger.info("%s: skipping overshoot iteration %d (request %s runs %d steps)",
-                        type(self).__name__, k, fwd_info.request_id, num_steps)
+            # debug, not info: one line per vetoed step per request (1.9k lines in a
+            # 36-minute served run), and it is the expected outcome of speculation.
+            logger.debug("%s: skipping overshoot iteration %d (request %s runs %d steps)",
+                         type(self).__name__, k, fwd_info.request_id, num_steps)
             return None
         tensors = {
             **self._carried_inputs(fwd_info, inputs, bucket_key, k, device),
@@ -416,8 +418,11 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # iteration k is being postprocessed while the counter reads k, so N steps stop at k == N - 1
         k, num_steps = self.step_index(request_info), int(state["num_steps"])
         stop = k + 1 >= num_steps
-        logger.info("%s: check_stop request %s k=%d/%d -> %s", type(self).__name__,
-                    request_id, k, num_steps, "STOP" if stop else "continue")
+        # debug, not info: one line per request per step on the GPU thread -- 19.8k of
+        # the 49.7k lines in a 36-minute served run. Invaluable when debugging the loop
+        # counter, far too loud for a served default.
+        logger.debug("%s: check_stop request %s k=%d/%d -> %s", type(self).__name__,
+                     request_id, k, num_steps, "STOP" if stop else "continue")
         return {self.loop_name} if stop else set()
 
     # ------------------------------------------------------------ resources

@@ -278,6 +278,9 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
         self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
         self._decode_batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
         self._warmed: set[tuple[int, int, int]] = set()  # shapes the compiled decode was warmed with
+        # see KleinVaeDecoderSubmodule: clear requires_grad before warming, or dynamo
+        # guards on it and the first served decode recompiles inside the request
+        vae.requires_grad_(False)
         self.warmup(warmup_grids)
 
     def _decode_chunk(self, latent: torch.Tensor) -> torch.Tensor:
