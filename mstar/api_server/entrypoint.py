@@ -743,14 +743,31 @@ class APIServer:
     # ----------------------------------------------------------
 
     async def iter_result_chunks(self, request_id: str):
-        """Yield raw :class:`ResultChunk` objects as they arrive.
+        """Yield raw :class:`ResultChunk` objects as they arrive, one at a time.
 
         Shared source for both output surfaces: ``/generate`` formats each
         chunk as NDJSON (via :meth:`async_stream_results`), while the
-        OpenAI-compatible endpoints translate the same chunks into SSE. The
-        per-request timeout, incremental drain, and final flush behave exactly
-        as before — only the yielded type changed (``ResultChunk`` instead of a
-        pre-serialized line).
+        OpenAI-compatible endpoints translate the same chunks into SSE. This
+        is a flattening wrapper over :meth:`iter_result_chunk_batches`, which
+        hands out the chunks the way they arrive (several per wake under load)
+        and owns the timeout, the drain and the abort on an early exit.
+        """
+        batches = self.iter_result_chunk_batches(request_id)
+        try:
+            async for batch in batches:
+                for chunk in batch:
+                    yield chunk
+        finally:
+            await batches.aclose()
+
+    async def iter_result_chunk_batches(self, request_id: str):
+        """Yield the :class:`ResultChunk` objects as they arrive, as one list
+        per drain: everything the message thread appended since the last
+        wake. Under load several tokens of a request are often waiting when
+        the handler runs, and sending them as one body frame costs one write
+        instead of one per token; when the loop keeps up the lists are of
+        length one and nothing is delayed. The final flush and an in-band
+        error come as the last list.
         """
         start = time.time()
         finished = False
@@ -783,10 +800,11 @@ class APIServer:
                     else:
                         done = True
 
-                for chunk in new_chunks:
+                if new_chunks:
                     if self.enable_nvtx:
-                        profiler.mark("apiserver.chunk_available")
-                    yield chunk
+                        for _ in new_chunks:
+                            profiler.mark("apiserver.chunk_available")
+                    yield new_chunks
 
                 if done:
                     logger.info("Async stream results received finish for %s", request_id)
@@ -802,19 +820,20 @@ class APIServer:
                     # lock; the popped request is no longer shared with other threads.
                     if finished_req is not None:
                         self._finalize_profile(finished_req)
-                    for chunk in remaining:
-                        yield chunk
+                    tail = list(remaining)
                     # A request can fail after the stream is already open
                     # (preprocess error, result-delivery timeout); the HTTP
                     # status is committed by then, so the error must travel
                     # in-band as the final chunk.
                     if finished_req is not None and finished_req.error is not None:
-                        yield ResultChunk(
+                        tail.append(ResultChunk(
                             request_id=request_id,
                             modality="error",
                             data=str(finished_req.error).encode("utf-8"),
                             metadata={"status": finished_req.error_status},
-                        )
+                        ))
+                    if tail:
+                        yield tail
                     finished = True
                     break
 
