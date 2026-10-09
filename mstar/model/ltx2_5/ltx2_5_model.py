@@ -11,14 +11,21 @@ Graph walks:
     generate_av     Loop("denoise_loop", dit) -> Parallel(vae_decoder -> video, audio_decoder -> audio)
     generate_video  the same loop -> vae_decoder only     (output_modalities == ["video"])
     generate_audio  the same loop -> audio_decoder only   (output_modalities == ["audio"])
+    stage1          Loop("denoise_loop", dit) at half resolution -> latent_upsampler;
+                    persists refine_latents, refine_audio                (recipe "two_stage")
+    refine_av|video|audio
+                    Loop("denoise_loop", dit) from the upsampled latents (3 sigmas) -> decoders
 
-Every request runs ``encode_text`` then one generate walk, stepped through
-``metadata.kwargs["walk_step"]``. The model always denoises video and audio jointly;
-the walk only decides which decoders run.
+A request runs ``encode_text`` then one generate walk (recipe "single", the default),
+or ``encode_text`` -> ``stage1`` -> one refine walk ("two_stage", the card's
+better-quality recipe; ``height`` / ``width`` are the final size). Walks are stepped
+through ``metadata.kwargs["walk_step"]``. The model always denoises video and audio
+jointly; the walk only decides which decoders run.
 
 Per-request knobs (``model_kwargs``): ``height``, ``width`` (multiples of 32),
 ``num_frames`` (8k + 1), ``fps`` (enters the video RoPE and the container),
-``seed``. The distilled checkpoint runs a fixed 8-sigma schedule with no guidance;
+``seed``, ``recipe`` ("single" | "two_stage"; two-stage sizes are multiples of 64).
+The distilled checkpoint runs a fixed 8-sigma schedule with no guidance;
 ``num_inference_steps`` and the guidance scales are not honoured.
 """
 
@@ -32,6 +39,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
+from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     NodeResourceSpec,
     RaggedAttentionConfig,
@@ -48,7 +56,9 @@ from mstar.model.ltx2_5.config import (
     DIT_NODE,
     LTX25_REPO,
     SNAPSHOT_PATTERNS,
+    STAGE_2_DISTILLED_SIGMA_VALUES,
     TEXT_ENCODER_NODE,
+    UPSAMPLER_NODE,
     VAE_DECODER_NODE,
     LTX25Config,
 )
@@ -58,6 +68,8 @@ from mstar.model.ltx2_5.submodules import (
     AUDIO_OUTPUT,
     AUDIO_XATTN,
     LATENTS,
+    REFINE_AUDIO,
+    REFINE_LATENTS,
     TEXT_AUDIO,
     TEXT_INPUTS,
     TEXT_VIDEO,
@@ -66,6 +78,7 @@ from mstar.model.ltx2_5.submodules import (
     VIDEO_XATTN,
     LTXAudioDecoderSubmodule,
     LTXDenoiseSubmodule,
+    LTXLatentUpsamplerSubmodule,
     LTXShape,
     LTXTextEncoderSubmodule,
     LTXVideoDecoderSubmodule,
@@ -85,6 +98,18 @@ GENERATE_WALKS = {
     frozenset({"video"}): GENERATE_VIDEO_WALK,
     frozenset({"audio"}): GENERATE_AUDIO_WALK,
 }
+# The two-stage recipe: stage 1 at half resolution, the latent upsampler, then a
+# refine walk at full resolution that decodes.
+STAGE1_WALK = "stage1"
+REFINE_AV_WALK = "refine_av"
+REFINE_VIDEO_WALK = "refine_video"
+REFINE_AUDIO_WALK = "refine_audio"
+REFINE_WALKS = {
+    frozenset({"video", "audio"}): REFINE_AV_WALK,
+    frozenset({"video"}): REFINE_VIDEO_WALK,
+    frozenset({"audio"}): REFINE_AUDIO_WALK,
+}
+RECIPES = ("single", "two_stage")
 ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 
 
@@ -101,6 +126,7 @@ class LTX25Model(Model):
         compile_eager_rounding: bool = True,
         cuda_graph: bool = True,
         capture_shapes: list[list[float]] | None = None,
+        capture_refine_shapes: list[list[float]] | None = None,
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 4,
         vae_tile_min_pixels: int = 1280 * 720,
@@ -122,6 +148,11 @@ class LTX25Model(Model):
         # other shapes run the compiled eager path.
         self.capture_shapes = [
             (int(h), int(w), int(f), float(fps)) for h, w, f, fps in (capture_shapes or [[544, 960, 121, 24.0]])
+        ]
+        # the two-stage recipe's stage 2, by final (height, width, num_frames, fps); its stage 1
+        # replays the single-stage capture of the half size
+        self.capture_refine_shapes = [
+            (int(h), int(w), int(f), float(fps)) for h, w, f, fps in (capture_refine_shapes or [])
         ]
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2])]
         self.max_batch_size = int(max_batch_size)
@@ -200,9 +231,43 @@ class LTX25Model(Model):
             GENERATE_AV_WALK: self._generate_walk(video=True, audio=True),
             GENERATE_VIDEO_WALK: self._generate_walk(video=True, audio=False),
             GENERATE_AUDIO_WALK: self._generate_walk(video=False, audio=True),
+            STAGE1_WALK: self._stage1_walk(),
+            REFINE_AV_WALK: self._generate_walk(video=True, audio=True, refine=True),
+            REFINE_VIDEO_WALK: self._generate_walk(video=True, audio=False, refine=True),
+            REFINE_AUDIO_WALK: self._generate_walk(video=False, audio=True, refine=True),
         }
 
-    def _generate_walk(self, video: bool, audio: bool) -> GraphSection:
+    def _denoise_loop(self, outputs: list[GraphEdge], refine: bool) -> Loop:
+        inputs = [TEXT_VIDEO, TEXT_AUDIO, LATENTS, AUDIO_LATENTS] + ([REFINE_LATENTS, REFINE_AUDIO] if refine else [])
+        return Loop(
+            name=DENOISE_LOOP,
+            section=GraphNode(
+                name=DIT_NODE,
+                input_names=inputs,
+                outputs=[
+                    GraphEdge(next_node=DIT_NODE, name=LATENTS),
+                    GraphEdge(next_node=DIT_NODE, name=AUDIO_LATENTS),
+                ],
+                enable_async_scheduling=self.async_scheduling,
+            ),
+            max_iters=len(STAGE_2_DISTILLED_SIGMA_VALUES if refine else DISTILLED_SIGMA_VALUES),
+            outputs=outputs,
+        )
+
+    def _stage1_walk(self) -> GraphSection:
+        to_upsampler = [GraphEdge(next_node=UPSAMPLER_NODE, name=name) for name in (LATENTS, AUDIO_LATENTS)]
+        loop = self._denoise_loop(to_upsampler, refine=False)
+        upsampler = GraphNode(
+            name=UPSAMPLER_NODE, enable_async_scheduling=self.async_scheduling,
+            input_names=[LATENTS, AUDIO_LATENTS],
+            outputs=[
+                GraphEdge(next_node=EMPTY_DESTINATION, name=REFINE_LATENTS, persist=True),
+                GraphEdge(next_node=EMPTY_DESTINATION, name=REFINE_AUDIO, persist=True),
+            ],
+        )
+        return Sequential([loop, upsampler])
+
+    def _generate_walk(self, video: bool, audio: bool, refine: bool = False) -> GraphSection:
         decoders: list[GraphSection] = []
         loop_outputs: list[GraphEdge] = []
         if video:
@@ -219,20 +284,7 @@ class LTX25Model(Model):
                 input_names=[AUDIO_LATENTS],
                 outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=AUDIO_OUTPUT, output_modality="audio")],
             ))
-        loop = Loop(
-            name=DENOISE_LOOP,
-            section=GraphNode(
-                name=DIT_NODE,
-                input_names=[TEXT_VIDEO, TEXT_AUDIO, LATENTS, AUDIO_LATENTS],
-                outputs=[
-                    GraphEdge(next_node=DIT_NODE, name=LATENTS),
-                    GraphEdge(next_node=DIT_NODE, name=AUDIO_LATENTS),
-                ],
-                enable_async_scheduling=self.async_scheduling,
-            ),
-            max_iters=len(DISTILLED_SIGMA_VALUES),
-            outputs=loop_outputs,
-        )
+        loop = self._denoise_loop(loop_outputs, refine)
         return Sequential([loop, decoders[0] if len(decoders) == 1 else Parallel(decoders)])
 
     # ---------------------------------------------------------------- inputs
@@ -268,11 +320,22 @@ class LTX25Model(Model):
                 raise ValueError(f"LTX-2.5 {name} must be positive; got {value}")
             return value
 
-        height, width = integer("height", cfg.default_height), integer("width", cfg.default_width)
+        recipe = model_kwargs.get("recipe") or "single"
+        if recipe not in RECIPES:
+            raise ValueError(f"LTX-2.5 recipe must be one of {RECIPES}; got {recipe!r}")
+        two_stage = recipe == "two_stage"
+        default_h, default_w = cfg.default_height, cfg.default_width
+        if two_stage:
+            # the card's two-stage example runs stage 1 at the single-stage default size
+            default_h, default_w = 2 * default_h, 2 * default_w
+        height, width = integer("height", default_h), integer("width", default_w)
+        # stage 1 runs at half the size, which must itself be on the VAE's grid
+        align = geo.spatial_compression * (2 if two_stage else 1)
         for name, value in (("height", height), ("width", width)):
-            if value % geo.spatial_compression:
+            if value % align:
                 raise ValueError(
-                    f"LTX-2.5 {name}={value} must be a multiple of {geo.spatial_compression} (the VAE's spatial stride)"
+                    f"LTX-2.5 {name}={value} must be a multiple of {align} "
+                    f"(the VAE's spatial stride{', at half size for stage 1' if two_stage else ''})"
                 )
         num_frames = integer("num_frames", cfg.default_num_frames)
         if (num_frames - 1) % geo.temporal_compression:
@@ -296,12 +359,12 @@ class LTX25Model(Model):
                 f"LTX-2.5 {width}x{height}x{num_frames} is {tokens} latent tokens, above this server's "
                 f"max_video_tokens of {self.max_video_tokens}"
             )
-        return {"height": height, "width": width, "num_frames": num_frames, "fps": fps}
+        return {"height": height, "width": width, "num_frames": num_frames, "fps": fps, "recipe": recipe}
 
     @staticmethod
-    def _generate_walk_for(output_modalities: list[str] | None) -> str:
+    def _generate_walk_for(output_modalities: list[str] | None, recipe: str = "single") -> str:
         wanted = frozenset(output_modalities or ["video", "audio"])
-        walk = GENERATE_WALKS.get(wanted)
+        walk = (REFINE_WALKS if recipe == "two_stage" else GENERATE_WALKS).get(wanted)
         if walk is None:
             raise ValueError(
                 f"LTX-2.5 generates video and/or audio; got output modalities {sorted(wanted)}"
@@ -326,10 +389,15 @@ class LTX25Model(Model):
 
     # --------------------------------------------------------- state machine
     def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        kw = metadata.kwargs
+        # The request's geometry lives under its own key: the conductor merges each
+        # pass's step metadata into ``metadata.kwargs``, so stage 1's half-size
+        # "height" would otherwise overwrite the request's for every later walk.
+        kw = metadata.kwargs["request"]
+        scale = 2 if metadata.graph_walk == STAGE1_WALK else 1
         return {
             "is_prefill": metadata.is_prefill,
-            "height": kw["height"], "width": kw["width"], "num_frames": kw["num_frames"], "fps": kw["fps"],
+            "height": kw["height"] // scale, "width": kw["width"] // scale,
+            "num_frames": kw["num_frames"], "fps": kw["fps"],
         }
 
     def get_initial_forward_pass_args(
@@ -341,14 +409,14 @@ class LTX25Model(Model):
         if not input_signals.get(TEXT_INPUTS):
             raise ValueError("LTX-2.5 requires a text prompt (text_inputs)")
         model_kwargs = model_kwargs or {}
-        kwargs = {
-            "walk_schedule": [ENCODE_TEXT_WALK, self._generate_walk_for(output_modalities)],
-            "walk_step": 0,
-            **self.resolve_request(model_kwargs),
-        }
+        request = self.resolve_request(model_kwargs)
+        final_walk = self._generate_walk_for(output_modalities, request["recipe"])
+        middle = [STAGE1_WALK] if request["recipe"] == "two_stage" else []
+        kwargs = {"walk_schedule": [ENCODE_TEXT_WALK, *middle, final_walk], "walk_step": 0, "request": request}
         logger.info(
-            "LTX-2.5 request: %dx%d frames=%d fps=%s outputs=%s seed=%s", kwargs["width"], kwargs["height"],
-            kwargs["num_frames"], kwargs["fps"], output_modalities, model_kwargs.get("seed", "auto"),
+            "LTX-2.5 request: %dx%d frames=%d fps=%s recipe=%s outputs=%s seed=%s", request["width"],
+            request["height"], request["num_frames"], request["fps"], request["recipe"], output_modalities,
+            model_kwargs.get("seed", "auto"),
         )
         metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities, output_modalities=output_modalities,
@@ -371,19 +439,25 @@ class LTX25Model(Model):
         step = metadata.kwargs["walk_step"] + 1
         inputs: list[GraphEdge] = []
         request_done = step >= len(schedule)
+        unpersist: list[TensorPointerInfo] = []
         if not request_done:
             metadata.kwargs["walk_step"] = step
-            metadata.graph_walk = schedule[step]
+            walk = metadata.graph_walk = schedule[step]
             metadata.is_prefill = False
-            for name in (TEXT_VIDEO, TEXT_AUDIO):
+            persisted = [TEXT_VIDEO, TEXT_AUDIO]
+            if walk in REFINE_WALKS.values():
+                persisted += [REFINE_LATENTS, REFINE_AUDIO]
+            for name in persisted:
                 edge = GraphEdge(next_node=DIT_NODE, name=name)
                 edge.tensor_info = persist_signals.get(name, [])
                 inputs.append(edge)
+                # the text embeddings outlive stage 1: the refine walk reads them too
+                if walk != STAGE1_WALK:
+                    unpersist += edge.tensor_info
             # the loop-back edges arrive empty; the dit seeds them at iteration 0
             inputs += [GraphEdge(next_node=DIT_NODE, name=LATENTS), GraphEdge(next_node=DIT_NODE, name=AUDIO_LATENTS)]
         return ForwardPassArgs(
-            full_metadata=metadata, inputs=inputs,
-            unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
+            full_metadata=metadata, inputs=inputs, unpersist_tensors=unpersist,
             step_metadata=self._step_metadata(metadata), request_done=request_done,
         )
 
@@ -433,23 +507,28 @@ class LTX25Model(Model):
     def capture_buckets(self) -> list[tuple[str, LTXShape]]:
         if not self.cuda_graph:
             return []
-        return [
-            (GENERATE_AV_WALK, shape_from_metadata(
-                self.config, {"height": h, "width": w, "num_frames": f, "fps": fps},
-            ))
-            for h, w, f, fps in self.capture_shapes
+        def shape(h, w, f, fps):
+            return shape_from_metadata(self.config, {"height": h, "width": w, "num_frames": f, "fps": fps})
+
+        return [(GENERATE_AV_WALK, shape(*s)) for s in self.capture_shapes] + [
+            (REFINE_AV_WALK, shape(*s)) for s in self.capture_refine_shapes
         ]
+
+    def get_default_sharding_config(self) -> ShardingConfig:
+        # The dit's linears and qk-norms shard by head (tensor parallelism); what crosses
+        # node edges stays replicated, so nothing needs a shard_dim.
+        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={})
 
     def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, tp_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("loaded LTX-2.5 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device) -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device, tp_group=None) -> NodeSubmodule | None:
         if self.skip_weight_loading:
             return None
         from mstar.model.ltx2_5 import weight_loader
@@ -463,13 +542,17 @@ class LTX25Model(Model):
             )
         if node_name == DIT_NODE:
             return LTXDenoiseSubmodule(
-                weight_loader.build_transformer(self.config, snapshot, device), self.config,
+                weight_loader.build_transformer(self.config, snapshot, device, comm_group=tp_group), self.config,
                 loop_name=DENOISE_LOOP, use_ragged_attention=self.attention_backend == "flashinfer",
+                refine_walks=frozenset(REFINE_WALKS.values()),
                 compile_transformer=self.compile_transformer, compile_eager_rounding=self.compile_eager_rounding,
                 max_batch_size=self.max_batch_size, capture_buckets=self.capture_buckets(),
                 capture_batch_sizes=self.capture_batch_sizes,
                 # one capture serves every generate walk: the dit's step is the same in each
-                replay_walks={GENERATE_AV_WALK: [GENERATE_VIDEO_WALK, GENERATE_AUDIO_WALK]},
+                replay_walks={
+                    GENERATE_AV_WALK: [GENERATE_VIDEO_WALK, GENERATE_AUDIO_WALK, STAGE1_WALK],
+                    REFINE_AV_WALK: [REFINE_VIDEO_WALK, REFINE_AUDIO_WALK],
+                },
             )
         if node_name == VAE_DECODER_NODE:
             from diffusers import AutoencoderKLLTX2Video
@@ -478,6 +561,25 @@ class LTX25Model(Model):
             return LTXVideoDecoderSubmodule(
                 vae.to(device).eval(), self.config, tile_min_pixels=self.vae_tile_min_pixels,
             )
+        if node_name == UPSAMPLER_NODE:
+            from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video
+            from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+
+            upsampler = LTX2LatentUpsamplerModel.from_pretrained(
+                str(snapshot / "latent_upsampler"), torch_dtype=torch.bfloat16,
+            )
+            # the latent statistics only; the VAEs themselves live on the decoder nodes
+            vae_cfg = AutoencoderKLLTX2Video.load_config(str(snapshot / "vae"))
+            vae = AutoencoderKLLTX2Video.from_pretrained(str(snapshot / "vae"), torch_dtype=torch.float32)
+            audio_vae = AutoencoderKLLTX2Audio.from_pretrained(str(snapshot / "audio_vae"), torch_dtype=torch.float32)
+            submodule = LTXLatentUpsamplerSubmodule(
+                upsampler.eval(),
+                (vae.latents_mean, vae.latents_std, float(vae_cfg["scaling_factor"])),
+                (audio_vae.latents_mean, audio_vae.latents_std),
+                self.config,
+            )
+            del vae, audio_vae
+            return submodule.to(device)
         if node_name == AUDIO_DECODER_NODE:
             from diffusers import AutoencoderKLLTX2Audio
             from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE

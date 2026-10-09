@@ -39,6 +39,10 @@ from mstar.model.ltx2_5.ltx2_5_model import (
     GENERATE_AUDIO_WALK,
     GENERATE_AV_WALK,
     GENERATE_VIDEO_WALK,
+    REFINE_AUDIO_WALK,
+    REFINE_AV_WALK,
+    REFINE_VIDEO_WALK,
+    STAGE1_WALK,
     LTX25Model,
 )
 from mstar.model.ltx2_5.submodules import (
@@ -58,6 +62,8 @@ from mstar.model.ltx2_5.submodules import (
 )
 from mstar.model.submodule_base import NodeInputs
 
+ALL_WALKS = {ENCODE_TEXT_WALK, GENERATE_AV_WALK, GENERATE_VIDEO_WALK, GENERATE_AUDIO_WALK, STAGE1_WALK,
+             REFINE_AV_WALK, REFINE_VIDEO_WALK, REFINE_AUDIO_WALK}
 CONFIG_PATH = "configs/ltx2_5.yaml"
 
 
@@ -133,8 +139,8 @@ def test_defaults_match_the_checkpoint_when_cached():
 def test_graph_walks_and_nodes():
     model = _make_model()
     walks = model.get_graph_walk_graphs()
-    assert set(walks) == {ENCODE_TEXT_WALK, GENERATE_AV_WALK, GENERATE_VIDEO_WALK, GENERATE_AUDIO_WALK}
-    assert model.nodes == ["audio_decoder", "dit", "text_encoder", "vae_decoder"]
+    assert set(walks) == ALL_WALKS
+    assert model.nodes == ["audio_decoder", "dit", "latent_upsampler", "text_encoder", "vae_decoder"]
     text = walks[ENCODE_TEXT_WALK]
     assert isinstance(text, GraphNode) and text.input_names == {"text_inputs"}
     assert {(e.name, e.persist, e.next_node) for e in text.outputs} == {
@@ -182,7 +188,7 @@ def test_worker_graphs_from_yaml():
     walks = set()
     for wg in _make_model().get_worker_graphs(CONFIG_PATH):
         walks |= wg.graph_walks
-    assert walks == {ENCODE_TEXT_WALK, GENERATE_AV_WALK, GENERATE_VIDEO_WALK, GENERATE_AUDIO_WALK}
+    assert walks == ALL_WALKS
 
 
 def test_dummy_mode_returns_no_submodules():
@@ -237,6 +243,7 @@ def test_schedule_encode_text_then_generate_then_done(outputs, walk):
     md = args.full_metadata
     assert md.graph_walk == ENCODE_TEXT_WALK and md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, walk]
     assert args.step_metadata == {"is_prefill": True, "height": 544, "width": 960, "num_frames": 121, "fps": 24.0}
+    assert md.kwargs["request"]["recipe"] == "single"
     persist = {"text_video": [_info("v", [1024, 4096])], "text_audio": [_info("a", [1024, 2048])]}
     nxt = model.get_partition_forward_pass_args("default", md, persist)
     assert nxt.full_metadata.graph_walk == walk and not nxt.request_done
@@ -245,6 +252,61 @@ def test_schedule_encode_text_then_generate_then_done(outputs, walk):
     assert by_name["latents"].tensor_info == [] and by_name["audio_latents"].tensor_info == []
     done = model.get_partition_forward_pass_args("default", nxt.full_metadata, {})
     assert done.request_done and done.inputs == []
+
+
+def test_stage1_walk_upsamples_and_persists_the_refine_inputs():
+    section = _make_model().get_graph_walk_graphs()[STAGE1_WALK]
+    loop, upsampler = section.sections
+    assert loop.max_iters == 8
+    assert {(e.name, e.next_node) for e in loop.outputs} == {
+        ("latents", "latent_upsampler"), ("audio_latents", "latent_upsampler"),
+    }
+    assert upsampler.name == "latent_upsampler" and upsampler.input_names == {"latents", "audio_latents"}
+    assert {(e.name, e.persist, e.next_node) for e in upsampler.outputs} == {
+        ("refine_latents", True, EMPTY_DESTINATION), ("refine_audio", True, EMPTY_DESTINATION),
+    }
+
+
+def test_refine_walk_reads_the_upsampled_latents_for_three_steps():
+    loop, _ = _make_model().get_graph_walk_graphs()[REFINE_AV_WALK].sections
+    assert loop.max_iters == 3
+    assert loop.section.input_names == {
+        "text_video", "text_audio", "latents", "audio_latents", "refine_latents", "refine_audio",
+    }
+
+
+def test_two_stage_schedule_keeps_text_until_the_refine_walk():
+    model = _make_model()
+    args = model.get_initial_forward_pass_args(
+        "default", ["text"], ["video", "audio"], {"text_inputs": [_info("t", [36])]},
+        model_kwargs={"recipe": "two_stage", "height": 1088, "width": 1920, "num_frames": 121},
+    )
+    md = args.full_metadata
+    assert md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, STAGE1_WALK, REFINE_AV_WALK]
+    text = {"text_video": [_info("v", [1024, 4096])], "text_audio": [_info("a", [1024, 2048])]}
+    md.kwargs.update(args.step_metadata)  # what the conductor does after every pass
+    s1 = model.get_partition_forward_pass_args("default", md, text)
+    assert s1.full_metadata.graph_walk == STAGE1_WALK
+    s1.full_metadata.kwargs.update(s1.step_metadata)
+    # stage 1 runs at half the size, and the text embeddings stay persisted for stage 2
+    assert (s1.step_metadata["height"], s1.step_metadata["width"]) == (544, 960)
+    assert s1.unpersist_tensors == []
+    refine_inputs = {**text, "refine_latents": [_info("rl", [32640, 128])], "refine_audio": [_info("ra", [126, 128])]}
+    s2 = model.get_partition_forward_pass_args("default", s1.full_metadata, refine_inputs)
+    assert s2.full_metadata.graph_walk == REFINE_AV_WALK
+    assert (s2.step_metadata["height"], s2.step_metadata["width"]) == (1088, 1920)
+    assert {e.name for e in s2.inputs} == {
+        "text_video", "text_audio", "refine_latents", "refine_audio", "latents", "audio_latents",
+    }
+    assert {i.uuid for i in s2.unpersist_tensors} == {"uuid-v", "uuid-a", "uuid-rl", "uuid-ra"}
+    assert model.get_partition_forward_pass_args("default", s2.full_metadata, {}).request_done
+
+
+def test_two_stage_sizes_must_halve_onto_the_vae_grid():
+    with pytest.raises(ValueError, match="multiple of 64"):
+        _make_model().process_prompt("a dog", ["text"], ["video"], recipe="two_stage", height=544, width=1920)
+    with pytest.raises(ValueError, match="recipe"):
+        _make_model().process_prompt("a dog", ["text"], ["video"], recipe="three_stage")
 
 
 def test_postprocess_audio_is_interleaved_pcm16():

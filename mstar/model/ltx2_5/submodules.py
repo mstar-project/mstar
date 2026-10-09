@@ -13,6 +13,7 @@ None. Each forward mirrors ``LTX2Pipeline``'s op order; see
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import logging
 from dataclasses import dataclass
@@ -38,7 +39,7 @@ from mstar.model.components.diffusion.compile_utils import compile_transformer_f
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.ltx2_5.components.transformer import LTX2Attends, build_rope
-from mstar.model.ltx2_5.config import DISTILLED_SIGMA_VALUES, LTX25Config
+from mstar.model.ltx2_5.config import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES, LTX25Config
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ logger = logging.getLogger(__name__)
 TEXT_INPUTS = "text_inputs"
 TEXT_VIDEO, TEXT_AUDIO = "text_video", "text_audio"
 LATENTS, AUDIO_LATENTS = "latents", "audio_latents"
+# the two-stage recipe's stage-2 starting point, made by the latent upsampler
+REFINE_LATENTS, REFINE_AUDIO = "refine_latents", "refine_audio"
 VIDEO_OUTPUT, AUDIO_OUTPUT = "video_output", "audio_output"
 
 # The dit's ragged attention resources, one per (kind, head geometry): the video
@@ -217,6 +220,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         *,
         loop_name: str,
         use_ragged_attention: bool,
+        refine_walks: frozenset[str] = frozenset(),
         compile_transformer: bool = False,
         compile_eager_rounding: bool = True,
         max_batch_size: int = 4,
@@ -231,6 +235,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         self.transformer = transformer
         self.config = config
         self.use_ragged_attention = use_ragged_attention
+        # walks that run the two-stage recipe's stage 2 (the refine loop)
+        self.refine_walks = frozenset(refine_walks)
         self._attends: LTX2Attends | None = None
         if compile_transformer and transformer is not None:
             # Fuses the AdaLN modulation, norms, RoPE and gating chains (44% of an eager
@@ -243,7 +249,31 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
     def schedule_for(self, fwd_info, bucket_key: LTXShape) -> FlowMatchSchedule:
+        if fwd_info.graph_walk in self.refine_walks:
+            return distilled_schedule(STAGE_2_DISTILLED_SIGMA_VALUES)
         return distilled_schedule()
+
+    def initial_loop_back(self, fwd_info, inputs, bucket_key: LTXShape, generator: torch.Generator):
+        """Stage 2 of the two-stage recipe starts from the upsampled stage-1 latents,
+        blended with noise at its first sigma (``LTX2Pipeline._create_noised_state``).
+
+        The reference threads one generator through both stages, so stage 2's noise
+        continues the stream stage 1 drew from: the stage-1 draws are replayed (and
+        dropped) first. Stage 2 draws its video noise in bf16 in the packed layout (it
+        takes the dtype of the upsampled latents) and its audio noise in fp32."""
+        if fwd_info.graph_walk not in self.refine_walks:
+            return self.seed_loop_back(fwd_info, bucket_key, generator)
+        stage1 = dataclasses.replace(bucket_key, height=bucket_key.height // 2, width=bucket_key.width // 2)
+        self.seed_loop_back(fwd_info, stage1, generator)
+        device = self.get_device()
+        refine_video = inputs[REFINE_LATENTS][0].to(device)
+        refine_audio = inputs[REFINE_AUDIO][0].to(device)
+        video_noise = torch.randn((1, *refine_video.shape), generator=generator, dtype=refine_video.dtype)[0]
+        audio_noise = torch.randn((1, *refine_audio.shape), generator=generator, dtype=refine_audio.dtype)[0]
+        scale = STAGE_2_DISTILLED_SIGMA_VALUES[0]
+        video = scale * video_noise.to(device) + (1 - scale) * refine_video
+        audio = scale * audio_noise.to(device) + (1 - scale) * refine_audio
+        return {LATENTS: video.to(torch.float32), AUDIO_LATENTS: audio.to(torch.float32)}
 
     def seed_loop_back(self, fwd_info, bucket_key: LTXShape, generator: torch.Generator) -> dict[str, torch.Tensor]:
         # LTX2Pipeline draws the video noise, then the audio noise, from one generator,
@@ -350,11 +380,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         )
 
 
-# ---------------------------------------------------------------------------
-# decoders
-# ---------------------------------------------------------------------------
-
-class _ShapeBatched:
+class _ShapeBatchedBase:
     """Requests batch when their latent shape matches."""
 
     _max_batch_size: int
@@ -366,7 +392,66 @@ class _ShapeBatched:
         return self._max_batch_size
 
 
-class LTXVideoDecoderSubmodule(_ShapeBatched, BatchedRows, NodeSubmodule):
+# ---------------------------------------------------------------------------
+# latent_upsampler (two-stage recipe)
+# ---------------------------------------------------------------------------
+
+class LTXLatentUpsamplerSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
+    """Stage 1's final latents -> stage 2's starting latents, before the noise blend.
+
+    Mirrors the card's recipe through the pipelines' latent space round trips: stage 1
+    returns denormalized latents (fp32), ``LTX2LatentUpsamplePipeline`` runs the x2
+    spatial upsampler in bf16, and stage 2's ``prepare_latents`` re-normalizes (in bf16)
+    and packs. The audio passes through the same denormalize / re-normalize round trip
+    in fp32. Emits ``refine_latents`` ``[L2, 128]`` bf16 and ``refine_audio`` ``[La, 128]``.
+    """
+
+    disable_torch_compile = True
+    output_keys = (REFINE_LATENTS, REFINE_AUDIO)
+
+    def __init__(self, upsampler: nn.Module, vae_stats: tuple[torch.Tensor, torch.Tensor, float],
+                 audio_stats: tuple[torch.Tensor, torch.Tensor], config: LTX25Config, max_batch_size: int = 2):
+        super().__init__()
+        self.upsampler = upsampler
+        mean, std, scaling = vae_stats
+        self.register_buffer("vae_mean", mean.view(1, -1, 1, 1, 1).clone(), persistent=False)
+        self.register_buffer("vae_std", std.view(1, -1, 1, 1, 1).clone(), persistent=False)
+        self.scaling = float(scaling)
+        self.register_buffer("audio_mean", audio_stats[0].clone(), persistent=False)
+        self.register_buffer("audio_std", audio_stats[1].clone(), persistent=False)
+        self.config = config
+        self._max_batch_size = max_batch_size
+
+    def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
+        return NodeInputs(
+            tensor_inputs={LATENTS: inputs[LATENTS][0], AUDIO_LATENTS: inputs[AUDIO_LATENTS][0]},
+            resource_step_info=shape_from_metadata(self.config, fwd_info.step_metadata),
+        )
+
+    def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
+        return {
+            LATENTS: torch.stack([inp.tensor_inputs[LATENTS] for inp in inputs]),
+            AUDIO_LATENTS: torch.stack([inp.tensor_inputs[AUDIO_LATENTS] for inp in inputs]),
+            "shape": inputs[0].resource_step_info,
+        }
+
+    def run_batch(self, latents: torch.Tensor, audio_latents: torch.Tensor, shape: LTXShape, **kwargs):
+        device = self.vae_mean.device
+        x = unpack_video(latents.to(device=device, dtype=torch.float32), shape)
+        x = x * self.vae_std.float() / self.scaling + self.vae_mean.float()
+        x = self.upsampler(x.to(self.upsampler.dtype))
+        dtype = x.dtype
+        x = (x - self.vae_mean.to(dtype)) * self.scaling / self.vae_std.to(dtype)
+        a = audio_latents.to(device=device, dtype=torch.float32)
+        a = (a * self.audio_std + self.audio_mean - self.audio_mean) / self.audio_std
+        return {REFINE_LATENTS: pack_video(x), REFINE_AUDIO: a}
+
+
+# ---------------------------------------------------------------------------
+# decoders
+# ---------------------------------------------------------------------------
+
+class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
     """Packed fp32 video latents ``[Lv, 128]`` -> uint8 frames ``[3, F, H, W]``, through the
     convolutional VAE. The reference casts the final latents to bf16 before
     denormalizing; quantizing at the worker boundary keeps the edge one byte per channel."""
@@ -380,9 +465,9 @@ class LTXVideoDecoderSubmodule(_ShapeBatched, BatchedRows, NodeSubmodule):
         self.vae = vae
         self.config = config
         self._max_batch_size = max_batch_size
-        # Frames larger than this decode in spatial tiles, bounding the decode's peak
-        # memory (the reference tiles its 1080p decodes); smaller ones decode whole, as
-        # the single-stage pipeline does. Tiling changes the output near tile seams.
+        # Frames larger than this decode in spatial tiles (the card's recipe tiles its
+        # 1088x1920 stage-2 decode); smaller ones decode whole, as the single-stage
+        # pipeline does. Tiling changes the output near tile seams.
         self.tile_min_pixels = int(tile_min_pixels)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
@@ -408,7 +493,7 @@ class LTXVideoDecoderSubmodule(_ShapeBatched, BatchedRows, NodeSubmodule):
         return {VIDEO_OUTPUT: frames}
 
 
-class LTXAudioDecoderSubmodule(_ShapeBatched, BatchedRows, NodeSubmodule):
+class LTXAudioDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
     """Packed fp32 audio latents ``[La, 128]`` -> a ``[2, samples]`` fp32 waveform at the
     vocoder's 48 kHz: denormalize over the packed features, unpack to
     ``[8, La, 16]``, audio VAE -> mel, vocoder (with bandwidth extension)."""
