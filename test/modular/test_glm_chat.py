@@ -292,3 +292,40 @@ def test_a_malformed_property_schema_does_not_break_the_parse(schema):
         "name": "f", "parameters": {"properties": {"a": schema}}}}])
     call = "<tool_call>f<arg_key>a</arg_key><arg_value>3</arg_value></tool_call>"
     assert _parser(tools=tools).message("x</think>" + call)["tool_calls"][0]["function"]["arguments"] == '{"a": 3}'
+
+
+def test_text_chunks_carry_their_usage():
+    torch = pytest.importorskip("torch")
+    from mstar.api_server.data_worker import _text_usage
+
+    assert _text_usage(torch.tensor([5, 6, 9]), frozenset({9}), 12) == {
+        "tokens": 3, "prompt_tokens": 12, "stop_token": True}
+    assert _text_usage(torch.tensor([5, 6]), frozenset({9}), 12)["stop_token"] is False
+    # a model that names no stop tokens leaves the reason alone
+    assert _text_usage(torch.tensor([5]), None, None) == {"tokens": 1}
+
+
+def test_the_data_worker_tags_text_chunks_with_usage():
+    torch = pytest.importorskip("torch")
+    import queue
+    from types import SimpleNamespace
+
+    from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState
+
+    class _Model:
+        def postprocess(self, tensor, modality, request_kwargs=None):
+            return b"hi"
+
+        def stop_token_ids(self):
+            return frozenset({9})
+
+    wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    wt.out_queue, wt.model, wt.request_model_kwargs = queue.Queue(), _Model(), {}
+    wt.tensor_uuid_to_metadata_per_request = {"r1": {"u1": {}}}
+    wt.enable_prof = wt.enable_nvtx = False
+    wt.request_output_state = {"r1": RequestOutputState(order={"u1": (0, None)}, next_sequence=1, prompt_tokens=7)}
+    edge = SimpleNamespace(name="text_output", tensor_info=[SimpleNamespace(uuid="u1")])
+    wt.tensor_manager = SimpleNamespace(get_ready_tensors=lambda: {"r1": [edge]},
+                                        get_tensor=lambda uuid: torch.tensor([4, 9]), dereference=lambda uuid: None)
+    assert wt._process_read_tensors() is True
+    assert wt.out_queue.get_nowait().metadata == {"tokens": 2, "prompt_tokens": 7, "stop_token": True}
