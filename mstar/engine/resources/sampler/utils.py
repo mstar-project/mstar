@@ -50,136 +50,123 @@ def _xpu_generator_seed_offset(
     return seed, offset
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 4096},  num_warps=4,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 8192},  num_warps=4,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 8192},  num_warps=8,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 16384}, num_warps=8,  num_stages=2),
-        triton.Config({"BLOCK_SIZE": 16384}, num_warps=16, num_stages=2),
-        triton.Config({"BLOCK_SIZE": 32768}, num_warps=16, num_stages=2),
-        triton.Config({"BLOCK_SIZE": 32768}, num_warps=32, num_stages=2),
-    ],
-    key=["V", "APPLY_PENALTY", "INCLUDE_GREEDY"],
-)
+_PREP_CHUNK = 2048
+
+
 @triton.jit
-def _fused_sampling_prep_kernel(
+def _prep_row_params(temperature_ptr, penalty_ptr, row, APPLY_PENALTY: tl.constexpr):
+    temp = tl.load(temperature_ptr + row)
+    # Greedy rows (temp == 0) get a finite inv_temp; their output is a one-hot.
+    inv_temp = tl.where(temp == 0, 1.0, 1.0 / tl.maximum(temp, 1e-30))
+    if APPLY_PENALTY:
+        penalty = tl.load(penalty_ptr + row)
+    else:
+        penalty = 1.0
+    return temp, inv_temp, penalty
+
+
+@triton.jit
+def _load_penalized_chunk(
+    logits_ptr, seen_mask_ptr, penalty, row, offs, mask,
+    stride_b, stride_v, mask_stride_b, mask_stride_v,
+    APPLY_PENALTY: tl.constexpr,
+):
+    vals = tl.load(
+        logits_ptr + row * stride_b + offs * stride_v,
+        mask=mask, other=-float("inf"),
+    ).to(tl.float32)
+    if APPLY_PENALTY:
+        seen = tl.load(
+            seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+            mask=mask, other=0,
+        ).to(tl.int1)
+        penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
+        vals = tl.where(seen, penalized, vals)
+    return vals
+
+
+@triton.jit
+def _sampling_prep_partials_kernel(
     logits_ptr,        # [B, V] input
     temperature_ptr,   # [B]
     penalty_ptr,       # [B] (only read when APPLY_PENALTY=True)
     seen_mask_ptr,     # [B, V] bool (only read when APPLY_PENALTY=True)
+    part_max_ptr,      # [B, NUM_CHUNKS] float32
+    part_idx_ptr,      # [B, NUM_CHUNKS] int32
+    part_sum_ptr,      # [B, NUM_CHUNKS] float32
+    V, NUM_CHUNKS,
+    stride_b, stride_v,
+    mask_stride_b, mask_stride_v,
+    CHUNK: tl.constexpr,
+    APPLY_PENALTY: tl.constexpr,
+):
+    """Per-chunk max, lowest-index argmax and sum(exp((x - max) / temp))."""
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    _, inv_temp, penalty = _prep_row_params(temperature_ptr, penalty_ptr, row, APPLY_PENALTY)
+    offs = chunk * CHUNK + tl.arange(0, CHUNK)
+    mask = offs < V
+    vals = _load_penalized_chunk(
+        logits_ptr, seen_mask_ptr, penalty, row, offs, mask,
+        stride_b, stride_v, mask_stride_b, mask_stride_v, APPLY_PENALTY,
+    )
+    chunk_max = tl.max(vals)
+    chunk_idx = chunk * CHUNK + tl.argmax(vals, axis=0, tie_break_left=True)
+    safe_max = tl.where(chunk_max == -float("inf"), 0.0, chunk_max)
+    chunk_sum = tl.sum(tl.exp(vals * inv_temp - safe_max * inv_temp))
+    out = row * NUM_CHUNKS + chunk
+    tl.store(part_max_ptr + out, chunk_max)
+    tl.store(part_idx_ptr + out, chunk_idx.to(tl.int32))
+    tl.store(part_sum_ptr + out, chunk_sum)
+
+
+@triton.jit
+def _sampling_prep_write_kernel(
+    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr,
+    part_max_ptr, part_idx_ptr, part_sum_ptr,
     probs_ptr,         # [B, V] float32 output
-    V,
+    V, NUM_CHUNKS,
     stride_b, stride_v,
     out_stride_b, out_stride_v,
     mask_stride_b, mask_stride_v,
-    BLOCK_SIZE: tl.constexpr,
+    CHUNK: tl.constexpr,
+    CHUNKS_POW2: tl.constexpr,
     APPLY_PENALTY: tl.constexpr,
     INCLUDE_GREEDY: tl.constexpr,
 ):
-    """Fused (optional rep penalty) + (logits/temperature) + softmax.
+    """Combine the row's partials and write one chunk of probabilities.
 
     When INCLUDE_GREEDY is True and a row's temperature == 0, the kernel
     emits a one-hot distribution at the argmax instead of a temperature-scaled
     softmax — so a downstream multinomial sampler deterministically returns
     the argmax token (replaces the separate torch.argmax + torch.where pair).
-
-    Both constexprs specialize at compile time; the unused branches compile out.
     """
     row = tl.program_id(0)
-    temp = tl.load(temperature_ptr + row)
+    chunk = tl.program_id(1)
+    temp, inv_temp, penalty = _prep_row_params(temperature_ptr, penalty_ptr, row, APPLY_PENALTY)
+
+    parts = tl.arange(0, CHUNKS_POW2)
+    part_mask = parts < NUM_CHUNKS
+    part_offs = row * NUM_CHUNKS + parts
+    part_max = tl.load(part_max_ptr + part_offs, mask=part_mask, other=-float("inf"))
+    part_sum = tl.load(part_sum_ptr + part_offs, mask=part_mask, other=0.0)
+    row_max = tl.max(part_max)
+    safe_max = tl.where(row_max == -float("inf"), 0.0, row_max)
+    total = tl.sum(part_sum * tl.exp(part_max * inv_temp - safe_max * inv_temp))
+    inv_sum = 1.0 / tl.maximum(total, 1e-30)
+
+    offs = chunk * CHUNK + tl.arange(0, CHUNK)
+    mask = offs < V
+    vals = _load_penalized_chunk(
+        logits_ptr, seen_mask_ptr, penalty, row, offs, mask,
+        stride_b, stride_v, mask_stride_b, mask_stride_v, APPLY_PENALTY,
+    )
+    probs = tl.exp(vals * inv_temp - safe_max * inv_temp) * inv_sum
     if INCLUDE_GREEDY:
-        is_greedy = temp == 0
-        # Safe inv_temp so the softmax branch doesn't produce NaN for greedy
-        # rows (their output is overwritten by the one-hot anyway).
-        inv_temp = tl.where(is_greedy, 1.0, 1.0 / tl.maximum(temp, 1e-30))
-    else:
-        inv_temp = 1.0 / temp
-
-    if APPLY_PENALTY:
-        penalty = tl.load(penalty_ptr + row)
-
-    # Pass 1: scan over V, compute max of raw vals (post-penalty) + argmax.
-    # argmax is only used by the greedy one-hot path; still tracked when
-    # INCLUDE_GREEDY is True regardless of per-row temp.
-    max_raw = -float("inf")
-    max_idx = tl.zeros([], dtype=tl.int32)
-    for v_start in range(0, V, BLOCK_SIZE):
-        offs = v_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < V
-        vals = tl.load(
-            logits_ptr + row * stride_b + offs * stride_v,
-            mask=mask, other=-float("inf"),
-        )
-        if APPLY_PENALTY:
-            seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
-                mask=mask, other=0,
-            ).to(tl.int1)
-            penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
-            vals = tl.where(seen, penalized, vals)
-        masked_vals = tl.where(mask, vals, -float("inf"))
-        block_max = tl.max(masked_vals)
-        if INCLUDE_GREEDY:
-            block_argmax = tl.argmax(masked_vals, axis=0)
-            is_new = block_max > max_raw
-            max_idx = tl.where(is_new, v_start + block_argmax.to(tl.int32), max_idx)
-        max_raw = tl.maximum(max_raw, block_max)
-
-    max_scaled = max_raw * inv_temp
-
-    # Pass 2: exp(scaled - max_scaled), accumulate sum
-    sum_exp = tl.zeros([], dtype=tl.float32)
-    for v_start in range(0, V, BLOCK_SIZE):
-        offs = v_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < V
-        vals = tl.load(
-            logits_ptr + row * stride_b + offs * stride_v,
-            mask=mask, other=0.0,
-        )
-        if APPLY_PENALTY:
-            seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
-                mask=mask, other=0,
-            ).to(tl.int1)
-            penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
-            vals = tl.where(seen, penalized, vals)
-        scaled = vals * inv_temp
-        exp_val = tl.exp(scaled - max_scaled)
-        exp_val = tl.where(mask, exp_val, 0.0)
-        sum_exp += tl.sum(exp_val)
-
-    # Avoid div-by-zero in the greedy rows (their output is overwritten).
-    inv_sum = 1.0 / tl.maximum(sum_exp, 1e-30)
-
-    # Pass 3: write the output — softmax probs for non-greedy rows,
-    # one-hot at argmax for greedy rows.
-    for v_start in range(0, V, BLOCK_SIZE):
-        offs = v_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < V
-        vals = tl.load(
-            logits_ptr + row * stride_b + offs * stride_v,
-            mask=mask, other=0.0,
-        )
-        if APPLY_PENALTY:
-            seen = tl.load(
-                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
-                mask=mask, other=0,
-            ).to(tl.int1)
-            penalized = tl.where(vals > 0, vals / penalty, vals * penalty)
-            vals = tl.where(seen, penalized, vals)
-        scaled = vals * inv_temp
-        softmax_val = tl.exp(scaled - max_scaled) * inv_sum
-        if INCLUDE_GREEDY:
-            is_max = offs == max_idx
-            one_hot = tl.where(is_max, 1.0, 0.0)
-            probs = tl.where(is_greedy, one_hot, softmax_val)
-        else:
-            probs = softmax_val
-        tl.store(
-            probs_ptr + row * out_stride_b + offs * out_stride_v,
-            probs, mask=mask,
-        )
+        part_idx = tl.load(part_idx_ptr + part_offs, mask=part_mask, other=V)
+        argmax = tl.min(tl.where(part_max == row_max, part_idx, V))
+        probs = tl.where(temp == 0, tl.where(offs == argmax, 1.0, 0.0), probs)
+    tl.store(probs_ptr + row * out_stride_b + offs * out_stride_v, probs, mask=mask)
 
 
 def fused_temperature_softmax(
@@ -201,28 +188,36 @@ def fused_temperature_softmax(
     mask_ptr = seen_mask if apply_penalty else logits
     mask_stride_b = seen_mask.stride(0) if apply_penalty else 0
     mask_stride_v = seen_mask.stride(1) if apply_penalty else 0
-    grid = (B,)
+    # Split V across programs so a small batch still uses the whole GPU.
+    num_chunks = triton.cdiv(V, _PREP_CHUNK)
+    part_max = torch.empty(B, num_chunks, dtype=torch.float32, device=logits.device)
+    part_sum = torch.empty_like(part_max)
+    part_idx = torch.empty(B, num_chunks, dtype=torch.int32, device=logits.device)
+    grid = (B, num_chunks)
     with torch.cuda.device(logits.device):
-        # BLOCK_SIZE is picked by @triton.autotune (not passed here). The first
-        # launch for a given key benchmarks every config (do_bench), which can
-        # leave probs in a state not ordered on the current stream relative to
-        # the downstream FlashInfer read -> garbage. We can't gate the sync on
-        # autotune alone (that wasn't enough on its own); pairing it with the
-        # device context above is what fixes it. Detect the autotune call by the
-        # config cache growing, and sync only then -- steady state stays sync-free.
-        cache = getattr(_fused_sampling_prep_kernel, "cache", None)
-        cache_size_before = len(cache) if cache is not None else 0
-        _fused_sampling_prep_kernel[grid](
-            logits, temperature, pen_ptr, mask_ptr, probs,
-            V,
+        _sampling_prep_partials_kernel[grid](
+            logits, temperature, pen_ptr, mask_ptr,
+            part_max, part_idx, part_sum,
+            V, num_chunks,
+            logits.stride(0), logits.stride(1),
+            mask_stride_b, mask_stride_v,
+            CHUNK=_PREP_CHUNK,
+            APPLY_PENALTY=apply_penalty,
+            num_warps=4,
+        )
+        _sampling_prep_write_kernel[grid](
+            logits, temperature, pen_ptr, mask_ptr,
+            part_max, part_idx, part_sum, probs,
+            V, num_chunks,
             logits.stride(0), logits.stride(1),
             probs.stride(0), probs.stride(1),
             mask_stride_b, mask_stride_v,
+            CHUNK=_PREP_CHUNK,
+            CHUNKS_POW2=triton.next_power_of_2(num_chunks),
             APPLY_PENALTY=apply_penalty,
             INCLUDE_GREEDY=include_greedy,
+            num_warps=4,
         )
-        if cache is not None and len(cache) > cache_size_before:
-            torch.cuda.current_stream().synchronize()
     return probs
 
 
@@ -716,10 +711,6 @@ def sample_cuda_graphable_gpu(
     device, so the constexpr baked at capture stays correct for any later mix of
     greedy and sampled requests, and this function still never branches on CPU
     values.
-
-    The autotune sync inside ``fused_temperature_softmax`` only fires the first
-    time a kernel key is seen, which happens during eager warmup — by capture
-    time the config is cached, so the captured launch is sync-free.
 
     Args:
         logits: ``[batch_size, vocab_size]`` raw logits from the codebook head.
