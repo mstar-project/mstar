@@ -314,8 +314,8 @@ def test_verify_shape_mismatch_raises():
 
 def test_verify_emission_invariant():
     # Every step emits num_accepted + 1 tokens and they are exactly the
-    # target's greedy stream: the property that makes MTP-on bit-identical
-    # to MTP-off at temp 0.
+    # target's greedy stream: at temp 0, MTP-on matches MTP-off up to
+    # rounding (kernels that tile by row count can round differently).
     draft = [3, 1, 4, 1]
     target = [3, 1, 5, 9, 2]
     n, tok = _verify(draft, target)
