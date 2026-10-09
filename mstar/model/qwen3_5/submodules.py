@@ -313,6 +313,32 @@ class LLMSubmodule(ARNodeSubmodule):
             return frozenset({"text_inputs"})
         return frozenset()
 
+    @staticmethod
+    def _captured_decode(engine_inputs: ModelInputsFromEngine) -> bool:
+        """A decode step replayed on a leased slot (or being captured for one)."""
+        step = getattr(engine_inputs, "step", None)
+        ctx = getattr(step, "ctx", None) if step is not None else None
+        return (
+            ctx is not None
+            and getattr(ctx, "slot_lease", None) is not None
+            and getattr(ctx, "graph_walk", None) == "decode"
+        )
+
+    def _decode_cos_sin(
+        self, engine_inputs: ModelInputsFromEngine, num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The rotary tables of a decode step from the position resource's
+        planned positions: one token per row, no custom grids."""
+        pos_ids = self.node_resources[ROPE].pos_ids("main")
+        assert pos_ids is not None, (
+            "position resource has no plan for this step; `plan` must run "
+            "before the forward"
+        )
+        pos = pos_ids[:num_tokens].unsqueeze(0).expand(3, -1)
+        return self.model.model.build_cos_sin(
+            pos, dtype=self.model.model.embed_tokens.weight.dtype,
+        )
+
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """``[3, total_tokens]`` for the step, in packed request order.
 
@@ -352,6 +378,12 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
         if inputs[0].input_ids is None and inputs[0].input_embeds is None:
+            if self._captured_decode(engine_inputs):
+                # A captured decode step: the token gather and the rotary
+                # tables run inside the graph (``_forward``), off the static
+                # buffers the plan and the previous step's commit wrote, so
+                # the replay stages no input at all.
+                return out
             # device loop-back: every row of a decode step is its request's
             # last sampled token, read by slot (padding rows read slot 0)
             sampler: SamplerResource = engine_inputs.resources[SAMPLER]
@@ -432,13 +464,20 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        cos_3d: torch.Tensor,
-        sin_3d: torch.Tensor,
+        cos_3d: torch.Tensor | None = None,
+        sin_3d: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+        if input_ids is None and input_embeds is None:
+            # a captured decode step (see ``preprocess``): the gather off the
+            # sampler's slot master is recorded in the graph, so a replay reads
+            # the tokens the previous step's commit scattered there
+            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+        if cos_3d is None or sin_3d is None:
+            cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, input_ids.shape[0])
 
         embeds = (
             self.model.model.embed_tokens(input_ids)
@@ -457,8 +496,8 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        cos_3d: torch.Tensor,
-        sin_3d: torch.Tensor,
+        cos_3d: torch.Tensor | None = None,
+        sin_3d: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         **kwargs,
@@ -484,8 +523,8 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        cos_3d: torch.Tensor,
-        sin_3d: torch.Tensor,
+        cos_3d: torch.Tensor | None = None,
+        sin_3d: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         **kwargs,
