@@ -55,6 +55,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
+from mstar.model.components.diffusion.noise import NoiseStager
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # Per-key derived tensors (rotary tables, ...) built on first use and never
         # evicted: a captured graph reads them at fixed addresses.
         self._layouts: dict[Hashable, Any] = {}
+        # Pinned staging rings for the seeded noise, one per dtype, built on first
+        # use (a stager allocates nothing until it stages something).
+        self._noise_stagers: dict[torch.dtype, NoiseStager] = {}
         # One callable per attention label for the life of a binding; see
         # :meth:`ragged_for`.
         self._ragged_fns: dict[str, RaggedAttentionCallable] = {}
@@ -150,6 +154,41 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     ) -> torch.Tensor:
         """Initial noise for one request, ``[L, C]`` on the CPU generator's device."""
         raise NotImplementedError
+
+    def seed_to_device(self, graph_walk: str) -> bool:
+        """Whether :meth:`seed_loop_back` returns tensors already on the device.
+
+        False by default: the base stages the CPU draw itself, which costs one host
+        memcpy and asks nothing of the model. A model whose seeding is layout-only
+        after the draw -- a reshape, a permute -- can override this to draw straight
+        into the stager's pinned buffer (:meth:`noise_stager`) and skip that memcpy.
+        A model doing real host work on the noise must not.
+        """
+        del graph_walk
+        return False
+
+    def noise_stager(self, dtype: torch.dtype) -> NoiseStager:
+        """This node's pinned staging ring for ``dtype``, built on first use.
+
+        A benign race between the plan and GPU threads can build two and keep one;
+        a stager holds no buffers until it stages something, so that costs nothing.
+        """
+        stager = self._noise_stagers.get(dtype)
+        if stager is None:
+            stager = self._noise_stagers[dtype] = NoiseStager(dtype)
+        return stager
+
+    def stage_seed(self, tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Seed tensor on ``device``, copied from pinned memory without stalling.
+
+        ``tensor.to(device)`` would copy from pageable host memory, which blocks the
+        calling thread until it retires -- and this runs on the GPU thread, where
+        that stalls the pre-plan and the overlap with the previous step's
+        postprocess. See :mod:`mstar.model.components.diffusion.noise`.
+        """
+        if tensor.device == device:
+            return tensor
+        return self.noise_stager(tensor.dtype).to_device(tensor, device)
 
     def seed_loop_back(
         self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, generator: torch.Generator,
@@ -237,7 +276,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def prepare_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs,
     ) -> NodeInputs | None:
-        state = self.request_state(fwd_info.request_id)
+        # Keyed by the integer rid_handle, NOT by request_id. The handle is what
+        # the engine keys batches by and what it hands check_stop
+        state = self.request_state(fwd_info.rid_handle)
         k = self.step_index(fwd_info)
         device = self.get_device()
         if "schedule" not in state:
@@ -251,8 +292,10 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         if k >= num_steps:
             # Async scheduling dispatched an iteration past this request's stop; None
             # makes the engine skip the forward (the cosmos3 / wan22 veto).
-            logger.info("%s: skipping overshoot iteration %d (request %s runs %d steps)",
-                        type(self).__name__, k, fwd_info.request_id, num_steps)
+            # debug, not info: one line per vetoed step per request (1.9k lines in a
+            # 36-minute served run), and it is the expected outcome of speculation.
+            logger.debug("%s: skipping overshoot iteration %d (request %s runs %d steps)",
+                         type(self).__name__, k, fwd_info.request_id, num_steps)
             return None
         tensors = {
             **self._carried_inputs(fwd_info, inputs, bucket_key, k, device),
@@ -308,10 +351,12 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         Past iteration 0 a missing edge is a routing bug: raise rather than reseed."""
         if k == 0:
             generator = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
-            return {
-                name: tensor.to(device)
-                for name, tensor in self.seed_loop_back(fwd_info, bucket_key, generator).items()
-            }
+            seeds = self.seed_loop_back(fwd_info, bucket_key, generator)
+            if self.seed_to_device(fwd_info.graph_walk):
+                # The model drew straight onto the device through a stager; staging
+                # again would copy a device tensor out to the host and back.
+                return dict(seeds)
+            return {name: self.stage_seed(tensor, device) for name, tensor in seeds.items()}
         missing = [name for name in self.loop_back_names if not inputs.get(name)]
         if missing:
             raise RuntimeError(
@@ -359,21 +404,39 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             for i, rid in enumerate(engine_inputs.request_ids)
         }
 
-    def check_stop(self, request_id: str, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
+    def check_stop(self, request_id: int, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
+        # ``request_id`` is the engine's integer rid handle, the same key
+        # prepare_inputs stored under.
         state = self.request_states.get(request_id)
         if state is None or "num_steps" not in state:
+            logger.warning(
+                "%s: check_stop found no schedule for request %r (state=%s); the loop "
+                "will not be stopped by this pass",
+                type(self).__name__, request_id, "absent" if state is None else "no num_steps",
+            )
             return set()
         # iteration k is being postprocessed while the counter reads k, so N steps stop at k == N - 1
-        if self.step_index(request_info) + 1 >= int(state["num_steps"]):
-            return {self.loop_name}
-        return set()
+        k, num_steps = self.step_index(request_info), int(state["num_steps"])
+        stop = k + 1 >= num_steps
+        # debug, not info: one line per request per step on the GPU thread -- 19.8k of
+        # the 49.7k lines in a 36-minute served run. Invaluable when debugging the loop
+        # counter, far too loud for a served default.
+        logger.debug("%s: check_stop request %s k=%d/%d -> %s", type(self).__name__,
+                     request_id, k, num_steps, "STOP" if stop else "continue")
+        return {self.loop_name} if stop else set()
 
     # ------------------------------------------------------------ resources
     def _uniform_key(self, keys) -> Hashable | None:
         keys = set(keys)
         return keys.pop() if len(keys) == 1 else None
 
-    def cg_key_info(self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo]):
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs,
+    ):
+        del per_request_input_metadata, kwargs
         # Padding rows (a captured bucket's dummy requests) carry no step metadata; the
         # real rows decide the bucket.
         keys = [self.bucket_key_for(info) for info in per_request_info.values() if info.step_metadata]

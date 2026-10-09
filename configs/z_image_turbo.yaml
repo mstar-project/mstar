@@ -1,0 +1,52 @@
+model: "z_image_turbo"
+
+# Z-Image-Turbo (6B single-stream flow DiT, Qwen3-4B captions, FLUX.1 VAE), single GPU.
+# max_seq_len only satisfies the conductor's config check (prompts are truncated to 512).
+max_seq_len: 512
+
+model_kwargs:
+  # sdpa (cuDNN on H100) served as fast as FlashInfer FA3 (0.349 vs 0.355 s at B=1) and is the
+  # reference kernel; flashinfer stays available
+  attention_backend: sdpa
+  compile: true
+  # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
+  # transformer still lands at a median 34.4 dB from the eager path over the 100 protocol prompts (78 of 100 below 40 dB)
+  compile_eager_rounding: true
+  # compile_exact_ops keeps op classes on the eager kernels inside the compiled forward. On Z-Image the cost is the
+  # 180 norm graph breaks per step: [norms] (or true) is >= 55.9 dB from the eager path on all 100 protocol prompts but
+  # runs 1.25 s / 0.80 images/s at B=1 / concurrency 8 against 0.86 s / 1.17 for the plain compile (SGLang 0.86 s), and
+  # [activations] buys nothing (median 34.9 dB). Default: the fast plain compile; set [norms] for reference-faithful output.
+  compile_exact_ops: false
+  accelerator_graph: true
+  capture_sizes: [[1024, 1024]]
+  # Captions pad to multiples of 32 up to max_seq_len, so cap_len has 16 possible
+  # values -- and it is an INPUT, not a shape: the DiT substitutes a learned
+  # cap_pad_token at every padded position and attends over it, so a prompt cannot
+  # be padded up into a wider bucket without changing the image. A cap_len with no
+  # captured graph falls back to the eager batched path.
+  #
+  # The capture budget is len(capture_caption_lengths) x len(capture_batch_sizes),
+  # so all 16 lengths would be 128 graphs. Spend the budget on caption lengths
+  # instead of batch sizes: a captured bucket already serves SHORTER batches by
+  # padding them with dummy rows (AcceleratorGraphRunner.DummyRowPool), so 1/2/4/8 covers
+  # every batch up to 8, where extra cap_lens cover nothing but themselves.
+  # 4 x 4 = 16 graphs, the same count as the [32, 64] x [1..8] this replaced, with
+  # twice the caption coverage. Widen if the measured startup and VRAM allow.
+  capture_caption_lengths: [32, 64, 96, 128]
+  # The scaffold default; 3/5/6/7 replay the next captured size with dummy rows.
+  # Costs some padded compute at those sizes, buys half the graphs.
+  capture_batch_sizes: [1, 2, 4, 8]
+  max_batch_size: 8
+  # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
+  # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
+  vae_compile: true
+  # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
+  # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
+
+node_groups:
+  - node_names: [text_encoder]
+    ranks: [0]
+  - node_names: [vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0]

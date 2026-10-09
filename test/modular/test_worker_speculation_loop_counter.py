@@ -70,8 +70,10 @@ def test_a_continuing_rid_runs_one_iteration_past_the_in_flight_one():
 
     view = spec.node_batch.per_request_info_wrapped[1]
     assert view.dynamic_loop_iter_counts == {LOOP: 3}
+    assert spec.node_batch.per_request_input_metadata[1].dynamic_loop_iter_counts == {LOOP: 3}
     # Building the successor leaves the shared info at the current iteration.
     assert shared[1].dynamic_loop_iter_counts == {LOOP: 2}
+    assert spec.node_batch.per_request_info[1] is shared[1]
     assert view is not shared[1]
     # what an engine records on the view is seen by later steps
     assert view.step_metadata is shared[1].step_metadata
