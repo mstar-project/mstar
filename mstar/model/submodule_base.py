@@ -691,6 +691,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
         a fixed key set for graph compat, so the filtering happens here."""
         return outputs
 
+    def uniform_row_inputs(self, graph_walk: str) -> "NodeInputs | None":
+        """The inputs every row of this walk gets, when ``prepare_inputs``
+        would return an equal object for each regardless of the request, its
+        routed signals and its metadata (a decode walk that reads its token
+        off the device). The engine then prepares the batch with one call and
+        shares the object across the step's rows, so it must not be mutated
+        per row. None (the default) prepares row by row."""
+        del graph_walk
+        return None
+
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs
         but their spans, and every real row has the span of the template row.
