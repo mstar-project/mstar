@@ -291,6 +291,11 @@ class Worker:
     computation via engines.
     """
 
+    # Rids that own a stream buffer (a streaming model's chunked inputs).
+    # Empty for a text model, which lets a speculation build skip its three
+    # per-row stream polls; None (a bare instance) means unknown, so poll.
+    _stream_buffer_rids: set[int] | None = None
+
     def __init__(
         self,
         worker_id: str,
@@ -318,6 +323,7 @@ class Worker:
         # (node, walk) -> the loop-back signals the node keeps on the device
         self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
         self._host_rows_slot = 0
+        self._stream_buffer_rids = set()
 
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads
@@ -725,6 +731,8 @@ class Worker:
                 req_info.stream_buffers[conn.edge_name] = sbuf
                 consumer = self._consumer_node_cache.get(conn.edge_name, "")
                 req_info.stream_buffers_by_consumer.setdefault(consumer, {})[conn.edge_name] = sbuf
+                if self._stream_buffer_rids is not None:
+                    self._stream_buffer_rids.add(request_id)
             if conn.to_partition == body.request_info.partition_name:
                 lead = body.request_info.stream_lead_items.get(conn.edge_name)
                 if lead:
@@ -820,6 +828,8 @@ class Worker:
         self._pending_drains.discard(body.request_id)
         self._reads_done_sent.discard(body.request_id)
         self.engine_manager.remove_request(request_id)
+        if self._stream_buffer_rids:
+            self._stream_buffer_rids.discard(request_id)
         self.request_state.remove_request(request_id)
         self.tensor_manager.force_cleanup_request(request_id)
         self.profile_info.pop_request(request_id)
@@ -1198,6 +1208,12 @@ class Worker:
         if sbuf is not None:
             sbuf.ingested_chunk = streaming_edge.chunk
 
+    def _streams_possible(self) -> bool:
+        """False when no live request owns a stream buffer: the per-row stream
+        polls of a speculation build then have nothing to find."""
+        rids = getattr(self, "_stream_buffer_rids", None)
+        return rids is None or bool(rids)
+
     def _stream_chunks_for(
         self, request_id: int, node_name: str, inputs: NameToTensorList
     ) -> dict[str, StreamChunkInfo] | None:
@@ -1365,11 +1381,12 @@ class Worker:
     ) -> tuple[dict[str, InputMetadata], dict[str, CurrentForwardPassInfo]]:
         meta = {}
         fwd_info = {}
+        streams = self._streams_possible()
         for rid, inputs in per_request_inputs.items():
             req_info = self.request_state.get_fwd_info(rid, batch_partition)
             fwd_info[rid] = req_info
             stream_chunks = {}
-            if chunks := self._stream_chunks_for(rid, node_name, inputs):
+            if streams and (chunks := self._stream_chunks_for(rid, node_name, inputs)):
                 stream_chunks = chunks
             meta[rid] = InputMetadata(
                 stream_chunks=stream_chunks,
@@ -2186,7 +2203,7 @@ class Worker:
         per_request_input_metadata = {
             rid: InputMetadata(stream_chunks=chunks) for rid in request_ids
             if (chunks := self._stream_chunks_for(rid, spec_node, per_request_inputs[rid]))
-        }
+        } if self._streams_possible() else {}
         spec_batch = ScheduledBatch(
             node_name=spec_node,
             graph_walk=pending.graph_walk,
@@ -2361,10 +2378,13 @@ class Worker:
         # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, StreamingEdge]] = []
         per_rid_counts: list[int] = []
-        for r in candidates:
-            edges = self._poll_stream_buffers_for_speculation(r, spec_node_name)
-            polled.extend((r, e) for e in edges)
-            per_rid_counts.append(len(edges))
+        if self._streams_possible():
+            for r in candidates:
+                edges = self._poll_stream_buffers_for_speculation(r, spec_node_name)
+                polled.extend((r, e) for e in edges)
+                per_rid_counts.append(len(edges))
+        else:
+            per_rid_counts = [0] * len(candidates)
 
         prep = self._graph_runtime.prep_spec_rids(SpeculationPrepInput(
             spec_node_name=spec_node_name,
