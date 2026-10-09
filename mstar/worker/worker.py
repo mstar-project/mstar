@@ -1843,6 +1843,12 @@ class Worker:
         from mstar.utils.profiler import range_pop, range_push
 
         engine = self.engine_manager.get_engine(batch.node_name)
+        # Every output of this step stays on the device: the engine keeps the
+        # rows and skips the per-request dicts and tail (cached per node and
+        # walk, a dict read here).
+        node_batch.rows_only = self._all_on_device(
+            engine, batch.node_name, batch.graph_walk, batch.output_signals,
+        )
         if logger.isEnabledFor(logging.DEBUG):
             # test/waypoint/serve_rollout.py parses this line (wire ids, logged
             # before prepare_inputs runs) to recover the DiT schedule.
@@ -2462,9 +2468,23 @@ class Worker:
         """
         threaded_continuing: set[int] = set()
         dropped: set[int] = set()
+        # A rows-only step kept every output on the device: a rid that ran is
+        # present, and its loop-back signal arrives empty, the way every
+        # fallback batch of such a walk does (``device_loopback_signals``).
+        rows_only = getattr(outputs_N, "rows_only", False)
+        ran = frozenset(outputs_N.row_request_ids or ()) if rows_only else None
         for rid in list(speculation.node_batch.request_ids):
             if rid not in speculation.continuing_rids:
                 continue  # fresh rid — inputs already gathered.
+            if ran is not None:
+                if rid in ran:
+                    inputs = speculation.node_batch.per_request_input_tensors[rid]
+                    for input_name, _ in speculation.consumed_edges:
+                        inputs[input_name] = []
+                    threaded_continuing.add(rid)
+                else:
+                    dropped.add(rid)
+                continue
             rid_outputs = outputs_N.get(rid, {})
             ok = True
             for input_name, _ in speculation.consumed_edges:
