@@ -414,6 +414,19 @@ def test_long_context_refuses_pools_per_page_off_a_power_of_two():
         cfg.check_long_context(page_size=cfg.index_kpool * 3)
 
 
+@pytest.mark.parametrize("version, refused", [("0.6.17", True), ("0.6.18", False), (None, False)])
+def test_long_context_refuses_a_flashinfer_without_page_size(monkeypatch, version, refused):
+    # None: a stub module with no version, as the CPU tests install
+    fake = types.SimpleNamespace() if version is None else types.SimpleNamespace(__version__=version)
+    monkeypatch.setitem(sys.modules, "flashinfer", fake)
+    cfg = Glm5NextModelConfig.reduced_long_context()
+    if refused:
+        with pytest.raises(ValueError, match="FlashInfer >= 0.6.18"):
+            cfg.check_long_context()
+    else:
+        cfg.check_long_context()
+
+
 def test_bind_refuses_sharded_prefill_beside_eviction():
     cfg = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), dsa_shard_prefill=True)
     sub = object.__new__(Glm5NextLLMSubmodule)
