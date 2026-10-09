@@ -60,6 +60,7 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5VisionConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
 
@@ -421,8 +422,8 @@ class Qwen3_5DenseModel(Model):
             add_generation_prompt=True,
             enable_thinking=kwargs.get("enable_thinking", True),
         )
-        input_ids = self.tokenizer(text, return_tensors="pt").input_ids[0]
-
+        # a long prompt is encoded as parallel chunks, identical ids
+        input_ids = torch.tensor(encode_ids(self.tokenizer, text), dtype=torch.long)
         spans = find_media_spans(input_ids, self._placeholder_specs())
         segments = split_around_spans(input_ids, spans)
         check_plan(prefill_plan(parts), spans, len(segments))
