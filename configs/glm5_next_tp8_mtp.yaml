@@ -13,6 +13,7 @@ max_concurrent_requests: 64
 tp_allreduce: "symm_multimem"
 # Prefill's all-reduces too: a 4096-token bucket moves 32 MiB per call.
 tp_allreduce_max_kb: 32768
+tp_async_sched: true
 model_kwargs:
   # "auto" takes the fused fp8 MoE kernel when one is available, which is
   # what lets decode capture; "reference" is an eager, uncapturable fallback.
