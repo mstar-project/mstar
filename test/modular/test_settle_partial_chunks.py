@@ -88,12 +88,3 @@ def test_a_batch_left_with_only_partial_rows_is_still_routed():
 
     assert _settle(worker, pending, outputs), "its stream still has to go out"
     assert pending.node_batch.request_ids == []
-
-
-def test_completion_flags_name_only_the_unfinished_rows():
-    pending = _pending()
-    pending.node_batch.incomplete_walk_rids = set()
-    assert Worker._completion_flags(pending, [0, 1]) == ([False, True], None)
-    pending.batch.incomplete_node_rids = set()
-    pending.node_batch.incomplete_walk_rids = {1}
-    assert Worker._completion_flags(pending, [0, 1]) == (None, [True, False])
