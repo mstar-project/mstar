@@ -510,7 +510,8 @@ def piecewise_runner(mgr, capture_fn):
         num_slots=1,
         node_name="encoder",
     )
-    runner.warmup_and_capture()
+    runner.size_captures()
+    runner.warmup_and_capture({runner._bucket(shape) for shape in runner.prepare_for_capture()})
     assert runner.any_graphs, "capture produced no graphs"
     return runner
 

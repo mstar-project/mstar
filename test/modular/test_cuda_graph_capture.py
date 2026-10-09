@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from mstar.engine.cuda_graph_runner import (
+    CaptureCost,
     CudaGraphRunner,
     capture_into_graph,
     fail_if_graphs_required,
@@ -68,9 +69,8 @@ class _Group:
 
 
 class _FakeRunner:
-    """`warmup_and_capture` and `_register_slot` bound onto stubs."""
+    """`warmup_and_capture`, with every bucket planned, and `_register_slot` bound onto stubs."""
 
-    warmup_and_capture = CudaGraphRunner.warmup_and_capture
     _register_slot = CudaGraphRunner._register_slot
     _buckets_captured_everywhere = CudaGraphRunner._buckets_captured_everywhere
     _report_dropped = CudaGraphRunner._report_dropped
@@ -85,6 +85,8 @@ class _FakeRunner:
         self._num_slots = num_slots
         self._specs = specs
         self._fail = fail
+        # every bucket alike, so capture keeps the specs' order
+        self._capture_costs = {spec.bucket: CaptureCost(0, 0, 0, num_slots) for spec in specs}
         self._buckets = {}
         self._memory_pool = None
         self.barrier = _Group(peer_flags)
@@ -99,6 +101,9 @@ class _FakeRunner:
 
     def prepare_for_capture(self):
         return self._specs
+
+    def warmup_and_capture(self):
+        CudaGraphRunner.warmup_and_capture(self, {spec.bucket for spec in self._specs})
 
     def _capture_one(self, spec):
         if (spec.bucket.graph_walk, spec.slot) in self._fail:

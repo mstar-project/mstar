@@ -4,10 +4,11 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 import torch
 
@@ -15,11 +16,12 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
 from mstar.engine.cuda_graph_runner import (
-    CaptureBudget,
+    CapturePlan,
     CudaGraphRunner,
     PiecewiseCudaGraphRunner,
     autocast_scope,
     fail_if_graphs_required,
+    plan_captures,
 )
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -563,26 +565,32 @@ class Engine:
             for runner in piecewise[node_name].values():
                 runner.prepare_for_capture()
 
-        # before the first capture, while every eager step still fits
-        budget = CaptureBudget.measure(self._device, [
-            runner for node_name in self._submodules
-            for runner in (cg_runners[node_name], *piecewise[node_name].values())
-        ])
+        # every bucket sized before any is captured, so one plan weighs them all
+        # against the largest eager step on the device
+        plan = self._plan_captures(cg_runners, piecewise)
 
         for node_name, submodule_mgmt in self._submodules.items():
             runner = cg_runners[node_name]
-            runner.warmup_and_capture(budget)
-            if budget is not None:
+            with self._capture_into(plan, node_name) as planned:
+                runner.warmup_and_capture(planned)
+            if plan is not None:
                 submodule_mgmt.capture_runner = runner
             if runner.any_graphs:
                 submodule_mgmt.cuda_graph_runner = runner
 
             captured: dict[str, PiecewiseCudaGraphRunner] = {}
-            for label, pw_runner in piecewise[node_name].items():
-                pw_runner.warmup_and_capture(budget)
-                if pw_runner.any_graphs:
-                    captured[label] = pw_runner
+            with self._capture_into(plan, f"{node_name} piecewise") as planned:
+                for label, pw_runner in piecewise[node_name].items():
+                    pw_runner.warmup_and_capture({bucket for region, bucket in planned if region == label})
+                    if pw_runner.any_graphs:
+                        captured[label] = pw_runner
             submodule_mgmt.piecewise_runners = captured
+        if plan is not None:
+            torch.cuda.empty_cache()
+            logger.info(
+                "CapturePlan[%s]: %.0f MiB free after capture, %.0f for the largest eager step",
+                self._device, torch.cuda.mem_get_info(self._device)[0] / 2**20, plan.floor / 2**20,
+            )
 
         fail_if_graphs_required([
             f"{node_name} {key}"
@@ -601,6 +609,56 @@ class Engine:
 
         for resource in self._resources.values():
             resource.post_warmup_validate()
+
+    def _plan_captures(
+        self, cg_runners: dict[str, CudaGraphRunner],
+        piecewise: dict[str, dict[str, PiecewiseCudaGraphRunner]],
+    ) -> CapturePlan | None:
+        """Size every bucket on the device, then plan which to capture.
+
+        None off CUDA: nothing captures there, and asking the driver for memory
+        would fail an XPU or CPU worker at start.
+        """
+        if self._device is None or self._device.type != "cuda":
+            return None
+        pools: dict[str, dict] = {}
+        for node_name in self._submodules:
+            pools[node_name] = cg_runners[node_name].size_captures()
+            # one pool for all of a node's regions (see `_build_piecewise_runners`)
+            pools[f"{node_name} piecewise"] = {
+                (label, bucket): cost
+                for label, runner in piecewise[node_name].items()
+                for bucket, cost in runner.size_captures().items()
+            }
+        torch.cuda.empty_cache()
+        free = torch.cuda.mem_get_info(self._device)[0]
+        plan = plan_captures(pools, free)
+        logger.info(
+            "CapturePlan[%s]: %.0f MiB free, %.0f for the largest eager step",
+            self._device, free / 2**20, plan.floor / 2**20,
+        )
+        for pool, costs in pools.items():
+            if costs:
+                logger.info(
+                    "CapturePlan[%s] %s: %d of %d buckets, %.0f MiB predicted", self._device, pool,
+                    len(plan.buckets[pool]), len(costs), plan.predicted[pool] / 2**20,
+                )
+        return plan
+
+    @contextmanager
+    def _capture_into(self, plan: CapturePlan | None, pool: str) -> Iterator[set]:
+        """Yield what ``plan`` captures into ``pool``, then log what capturing it took."""
+        if plan is None:
+            yield set()
+            return
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_reserved(self._device)
+        yield plan.buckets[pool]
+        torch.cuda.empty_cache()
+        logger.info(
+            "CapturePlan[%s] %s: capture took %.0f MiB, %.0f predicted", self._device, pool,
+            (torch.cuda.memory_reserved(self._device) - before) / 2**20, plan.predicted[pool] / 2**20,
+        )
 
     def _build_piecewise_runners(
         self, node_name: str, submodule_mgmt: SubmoduleManagement,
