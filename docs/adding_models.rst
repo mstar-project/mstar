@@ -372,6 +372,10 @@ The spec types are:
      - The cross-attention counterpart: one span of each request attends another
        (``RaggedCrossAttentionStep(pairs=...)``). Same config. See `Cross-attention
        between spans`_.
+   * - ``RaggedBlockCausalAttentionSpec(config=RaggedAttentionConfig(...), block_size=...)``
+     - Block-causal self-attention within each span (``AttentionStep(causal=False)``): causal
+       between ``block_size``-token blocks, bidirectional within one. Same config. See
+       `Block-causal attention within spans`_.
    * - ``PositionSpec(config=PositionConfig(kv_cache=...))``
      - Position tracking and RoPE. ``scheme`` is ``PosScheme.SEQUENTIAL`` or
        ``PosScheme.BLOCK``. The RoPE parameters are set here: ``rope_theta``,
@@ -601,6 +605,21 @@ request's ``kv_label`` span; cross-attention is never causal. A layer attends th
 span's tokens as ``k`` and ``v``. One resource has one head geometry, so a model whose
 attentions differ in head count or head dim declares one spec per (kind, geometry).
 LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
+
+Block-causal attention within spans
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A Whisper-style encoder trained for streaming masks attention by chunk: a frame in chunk
+``b`` sees every frame of chunks ``0..b`` and nothing later. Declare it as a
+``RaggedBlockCausalAttentionSpec`` with the chunk length as ``block_size``, and step it like
+any ragged self-attention, one segment per independently attending span, with
+``AttentionStep(causal=False)``. Blocks are counted from each span's start, so a span need
+not be a multiple of ``block_size``.
+
+The prefixes overlap, which a ragged layout cannot express, so this kind runs FlashInfer's
+paged prefill over the packed keys viewed as one-token pages, each query block listing its
+prefix; nothing is copied. Under a captured graph the block count and page list are sized
+for the worst layout the bucket's token count allows.
 
 .. note::
 

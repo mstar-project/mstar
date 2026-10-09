@@ -1,7 +1,11 @@
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.ragged.base import RaggedAttnManager, RaggedCrossAttnManager
+from mstar.engine.resources.attn.ragged.base import (
+    RaggedAttnManager,
+    RaggedBlockCausalAttnManager,
+    RaggedCrossAttnManager,
+)
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
@@ -137,7 +141,8 @@ class RaggedAttentionCallable:
     says to thread explicitly. A cross-attention pair of a
     ``RaggedCrossAttentionSpec`` resource is bound the same way, under
     ``cross_label(q_label, kv_label)``; its ``k`` / ``v`` are then the key span's
-    tokens, packed in the same request order as ``q``.
+    tokens, packed in the same request order as ``q``. A
+    ``RaggedBlockCausalAttentionSpec`` resource binds like a self-attention one.
 
     One instance per label, held for the life of the resource binding: a
     compiled transformer region guards on the identity of the callables it is
@@ -145,7 +150,11 @@ class RaggedAttentionCallable:
     until Dynamo gives up.
     """
 
-    def __init__(self, attn: RaggedAttnManager | RaggedCrossAttnManager, label: str):
+    def __init__(
+        self,
+        attn: RaggedAttnManager | RaggedCrossAttnManager | RaggedBlockCausalAttnManager,
+        label: str,
+    ):
         self.attn = attn
         self.label = label
 
