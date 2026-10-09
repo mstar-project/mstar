@@ -330,6 +330,16 @@ def test_a_reply_comes_back_without_its_end_token(model):
     assert reply == b"Blue.", "the reply ends with a literal end token, which the next turn writes twice"
 
 
+def test_ignore_eos_keeps_every_end_token(model):
+    """Generation runs past them, and the benchmark counts one token per non-empty chunk."""
+    model.config = SimpleNamespace(im_end_token_id=SPECIAL_IDS["<|im_end|>"])
+    ids = model.tokenizer("Blue.<|im_end|><|im_end|>")["input_ids"][0].tolist()
+    chunks = [model.postprocess(torch.tensor([i]), "text", request_kwargs={"ignore_eos": True}) for i in ids]
+    assert all(chunks) and b"".join(chunks) == b"Blue.<|im_end|><|im_end|>", (
+        "an end token decoded to an empty chunk, which the benchmark does not count"
+    )
+
+
 def test_schedule_matches_the_spans(model):
     """As many text walks as spans, one media walk per attachment, in order."""
     mods = ["image", "text", "image"]

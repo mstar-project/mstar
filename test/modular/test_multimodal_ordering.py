@@ -413,6 +413,16 @@ def test_a_reply_comes_back_without_its_end_token(bagel):
     assert reply == b"Blue.", "the reply ends with a literal end token, which the next turn writes twice"
 
 
+def test_ignore_eos_keeps_every_end_token(bagel):
+    """Generation runs past them, and the benchmark counts one token per non-empty chunk."""
+    bagel.eos_token_id = _StubTokenizer.SPECIALS["<|im_end|>"]
+    ids = bagel.tokenizer.encode("Blue.<|im_end|><|im_end|>")
+    chunks = [bagel.postprocess(torch.tensor([i]), "text", request_kwargs={"ignore_eos": True}) for i in ids]
+    assert all(chunks) and b"".join(chunks) == b"Blue.<|im_end|><|im_end|>", (
+        "an end token decoded to an empty chunk, which the benchmark does not count"
+    )
+
+
 def test_an_image_chat_puts_each_turn_in_its_own_role_block(bagel, tmp_path):
     """A message's attachment sits inside its own turn."""
     messages = [
