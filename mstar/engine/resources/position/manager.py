@@ -302,12 +302,10 @@ class RopeManager(PositionManager):
         for plan_label, kv_out in plan_outputs.items():
             pos_ids = self._explicit_pos_ids(step, plan_label, len(plan_outputs))
             if pos_ids is None:
-                pos_ids = self._build_pos_ids(
-                    kv_out.rows if kv_out.rows is not None else (
-                        (v.request_id, v.label, v.to_compute) for v in kv_out.views
-                    ),
-                    plan_label, lease,
-                )
+                rows = kv_out.rows
+                if rows is None:
+                    rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
+                pos_ids = self._build_pos_ids(rows, plan_label, lease)
             pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
         self._preplanned = ctx.is_preplan
         return pos_ids_out
