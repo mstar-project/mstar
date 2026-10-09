@@ -88,3 +88,30 @@ def test_engine_falls_back_and_attributes_failures():
     )
     assert stops == {"a": {"decode_loop"}}
     assert list(failures) == ["x"]
+
+
+def test_rows_out_of_batch_order_still_map_by_request():
+    """A batch listed in another order than the forward ran it reads each
+    request's own row, and a request without a row is skipped."""
+    from types import SimpleNamespace
+
+    from mstar.model.qwen3_5.config import SAMPLER
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+    from mstar.model.submodule_base import HostRows
+
+    sub = LLMSubmodule.__new__(LLMSubmodule)
+    sub.config = SimpleNamespace(stop_token_ids={7})
+    rows = HostRows(("a", "b", "c"), {"new_token": torch.tensor([1, 7, 1])})
+
+    def info(max_tokens, iters=0):
+        return SimpleNamespace(
+            resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)},
+            dynamic_loop_iter_counts={"decode_loop": iters}, max_tokens=max_tokens,
+        )
+
+    infos = {"a": info(100), "b": info(100), "c": info(5, iters=4), "d": info(100)}
+    stops = LLMSubmodule.check_stop_batched(sub, ["c", "d", "b", "a"], infos, rows)
+    assert stops == {"c": {"decode_loop"}, "b": {"decode_loop"}}
+    # forward order: the same answer without the row map
+    stops = LLMSubmodule.check_stop_batched(sub, ["a", "b", "c"], infos, rows)
+    assert stops == {"b": {"decode_loop"}, "c": {"decode_loop"}}
