@@ -364,6 +364,33 @@ def test_a_legacy_prompt_with_no_text_slot_still_renders(bagel):
     ), "a prompt with no text slot in its layout was dropped"
 
 
+@pytest.mark.parametrize(("messages", "blocks"), [
+    (SECOND_TURN[1:], [("system", None), ("user", "Name a color."), ("assistant", "Blue."), ("user", "Another.")]),
+    (SECOND_TURN, [("system", "Be brief."), ("user", "Name a color."), ("assistant", "Blue."), ("user", "Another.")]),
+    (FIRST_TURN[:1], [("system", None), ("system", "Be brief.")]),
+    (
+        [FIRST_TURN[1], FIRST_TURN[0], SECOND_TURN[3]],
+        [("system", None), ("user", "Name a color."), ("system", "Be brief."), ("user", "Another.")],
+    ),
+], ids=["default-system", "client-system", "lone-system", "later-system"])
+def test_a_text_chat_renders_one_role_block_per_turn(bagel, tmp_path, messages, blocks):
+    """Without a role label the model cannot tell its own turn from the client's."""
+    rendered = bagel.tokenizer.decode(_chat_ids(bagel, messages, tmp_path))
+    assert rendered == "".join(
+        f"<|im_start|>{role}\n{text or bagel.BAGEL_DEFAULT_SYSTEM_PROMPT}<|im_end|>\n" for role, text in blocks
+    ) + "<|im_start|>assistant\n", "a text turn rendered without its role label"
+
+
+def test_think_mode_still_instructs_a_client_system_prompt(bagel, tmp_path):
+    from mstar.model.bagel.bagel_model import VLM_THINK_SYSTEM_PROMPT
+
+    bagel.config.think_mode = True
+    rendered = bagel.tokenizer.decode(_chat_ids(bagel, FIRST_TURN, tmp_path))
+    assert rendered.startswith(f"<|im_start|>system\nBe brief. {VLM_THINK_SYSTEM_PROMPT}<|im_end|>\n"), (
+        "a client's system prompt dropped the think-mode instruction"
+    )
+
+
 def test_the_next_turn_extends_the_last_prompt_and_its_reply(bagel, tmp_path):
     """Turn 2 re-sends turn 1 and its reply, which the cache keyed as generated.
 
