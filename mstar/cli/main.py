@@ -52,6 +52,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "wan22": "wan22.yaml",
     "waypoint": "waypoint.yaml",
     "flux2_klein": "flux2_klein.yaml",
+    "ltx2_5": "ltx2_5.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
 }
@@ -129,6 +130,10 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat holding a sign\"))")
         lines.append("    open(\"edit.png\",\"wb\").write(client.edit_image(\"make it a watercolor\", \"out.png\"))")
         lines.append("    res = client.generate(text=\"a robot arm cleaning a plate\", output_modalities=(\"video\",))")
+    if model == "ltx2_5":
+        lines.append("    res = client.generate(text=\"a dog barking on a beach at sunset\",")
+        lines.append("                          output_modalities=(\"video\", \"audio\"),")
+        lines.append("                          height=544, width=960, num_frames=121)")
     if model == "cosmos3_droid":
         lines.append("    res = client.generate(text=\"pick up the banana and place it in the bowl\",")
         lines.append("                           images=[\"frame.jpg\"], output_modalities=(\"action\",),")
@@ -169,7 +174,7 @@ def _next_steps(model: str, host: str, port: int) -> str:
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
-                 "flux2_klein", "flux2_klein_9b", "z_image_turbo"):
+                 "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")"]
@@ -185,6 +190,9 @@ def _next_steps(model: str, host: str, port: int) -> str:
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a red cube\", size=\"320x192\")")
         if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a cat in a hat\", size=\"1024x1024\")")
+        if model == "ltx2_5":
+            lines.append("    oai.post(\"/videos/generations\", cast_to=dict, body={\"model\": \"ltx2_5\",")
+            lines.append("             \"prompt\": \"a dog barking on a beach\", \"size\": \"960x544\"})")
     lines.append("")
     return "\n".join(lines)
 

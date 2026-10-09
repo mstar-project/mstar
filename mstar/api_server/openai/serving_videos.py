@@ -21,7 +21,8 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
         text=args.text,
         file_paths=args.file_paths,
         input_modalities=args.input_modalities,
-        output_modalities=["video"],
+        # the adapter decides: video alone, or video with its generated audio
+        output_modalities=args.output_modalities,
         model_kwargs=args.model_kwargs,
         streaming=stream,
         request_id=request_id,

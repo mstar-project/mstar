@@ -27,7 +27,8 @@ RaggedAttentionFn = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.T
 
 
 def sdpa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Bidirectional attention over ``[B, S, H, D]`` tensors via SDPA; returns ``[B, S, H, D]``."""
+    """Bidirectional attention over ``[B, S, H, D]`` tensors via SDPA (``k`` / ``v`` may
+    have their own length); returns ``[B, S, H, D]``."""
     out = F.scaled_dot_product_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False,
     )
@@ -37,17 +38,21 @@ def sdpa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.T
 def joint_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, ragged: RaggedAttentionFn | None = None,
 ) -> torch.Tensor:
-    """Attention over ``[B, S, H, D]`` q/k/v (all requests in the batch share
-    ``S``) through the ragged resource when one is bound, else SDPA.
+    """Attention of ``[B, S, H, D]`` queries over ``[B, S_kv, H_kv, D]`` keys / values
+    (all requests in the batch share ``S`` and ``S_kv``; ``S_kv == S`` for
+    self-attention) through the ragged resource when one is bound, else SDPA.
 
-    The ragged kernel wants the batch packed to ``[B * S, H, D]`` with one
-    segment of ``S`` tokens per request — exactly what the owning submodule
-    declared in its step — and hands back the same packing.
+    The ragged kernel wants the batch packed to ``[B * S, H, D]`` / ``[B * S_kv, ...]``
+    with one segment per request — exactly what the owning submodule declared in its
+    step (a cross-attention pair for ``S_kv != S``) — and hands back the query packing.
     """
     if ragged is None:
         return sdpa_attention(q, k, v)
     bsz, seq, heads, dim = q.shape
+    kv_seq, kv_heads = k.shape[1], k.shape[2]
     out = ragged(
-        q.reshape(bsz * seq, heads, dim), k.reshape(bsz * seq, heads, dim), v.reshape(bsz * seq, heads, dim),
+        q.reshape(bsz * seq, heads, dim),
+        k.reshape(bsz * kv_seq, kv_heads, dim),
+        v.reshape(bsz * kv_seq, kv_heads, dim),
     )
     return out.view(bsz, seq, heads, dim).to(q.dtype)
