@@ -69,10 +69,10 @@ class StreamBuffer:
 
     _buffer: list = field(default_factory=list)
     # parallel to _buffer: whether each item finished the producer's walk
-    _finished: list = field(default_factory=list)
+    _finished_walk: list = field(default_factory=list)
     _tensor_ids_in_order: deque = field(default_factory=deque)
     # parallel to _tensor_ids_in_order
-    _finished_in_order: deque = field(default_factory=deque)
+    _finished_walk_in_order: deque = field(default_factory=deque)
     _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
     _chunks_popped: int = 0
@@ -98,7 +98,7 @@ class StreamBuffer:
     def pre_read_register(self, tensor_id: str, finished_graph_walk: bool = True):
         self._num_tensors_registered += 1
         self._tensor_ids_in_order.append(tensor_id)
-        self._finished_in_order.append(finished_graph_walk)
+        self._finished_walk_in_order.append(finished_graph_walk)
 
     def put(self, tensor_id: str, item: torch.Tensor) -> None:
         """Called when a tensor arrives via normal RDMA routing."""
@@ -111,7 +111,7 @@ class StreamBuffer:
                 return
             self._tensor_ids_in_order.popleft()
             self._buffer.append(self._id_to_tensor[tensor_id])
-            self._finished.append(self._finished_in_order.popleft())
+            self._finished_walk.append(self._finished_walk_in_order.popleft())
             self._num_buffer_writes += 1
             del self._id_to_tensor[tensor_id]
 
@@ -126,19 +126,9 @@ class StreamBuffer:
         if len(self._waiting_graph_edges) > 0:
             return self._waiting_graph_edges.popleft()
 
-    def _available(self) -> int:
-        """Items a chunk may take: all of them under ``allow_partial_input``,
-        otherwise those up to the last one that finished a walk."""
-        if self.policy.allow_partial_input():
-            return len(self._buffer)
-        for i in range(len(self._finished) - 1, -1, -1):
-            if self._finished[i]:
-                return i + 1
-        return 0
-
     def has_chunk_ready(self) -> bool:
         self._update_buffer()
-        buf_len = self._available()
+        buf_len = len(self._buffer)
 
         if not self._producer_done_and_all_read():
             return self.policy.is_ready(buf_len)
@@ -165,27 +155,26 @@ class StreamBuffer:
         start_offset is the global position of the first item in the chunk.
         """
         self._update_buffer()
-        buf_len = self._available()
+        buf_len = len(self._buffer)
         window = self.policy.window_size()
         offset = self._consumed  # global position of buffer[0]
 
         if self._producer_done_and_all_read() and not self.policy.is_ready(buf_len):
             # Flush remainder — return whatever is left (may be empty)
             items = list(self._buffer)
-            finished = list(self._finished)
+            finished = list(self._finished_walk)
             self._buffer.clear()
-            self._finished.clear()
+            self._finished_walk.clear()
             self._consumed += len(items)
             stride = len(items)
         else:
             stride = self.policy.next_chunk_size(buf_len)
-            # Return the first `window` items (overlapping sliding window),
-            # never past what is available
-            items = self._buffer[:min(window, buf_len)]
-            finished = self._finished[:len(items)]
+            # Return the first `window` items (overlapping sliding window)
+            items = self._buffer[:window]
+            finished = self._finished_walk[:len(items)]
             # Advance by stride — discard items that fell out of the window
             self._buffer = self._buffer[stride:]
-            self._finished = self._finished[stride:]
+            self._finished_walk = self._finished_walk[stride:]
             self._consumed += stride
         self.policy.register_chunk(stride)
 
