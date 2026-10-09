@@ -96,14 +96,14 @@ class _Mesh:
             [1] * len(wgs),
         )
 
-    def run(self, rid, uuids, completes_node=None, **send_kwargs):
+    def run(self, rid, uuids, completes_node=None, completes_walk=None, **send_kwargs):
         """Ingest, pop, complete and send. Returns the frames each peer got."""
         self.rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
         self.rt.pop_rids("only", WALK, [rid])
         signals = self.rt.get_output_signals("only", WALK)
         out = self.rt.complete_and_route_batch({
             "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
-            "completes_node": completes_node, "completes_walk": None,
+            "completes_node": completes_node, "completes_walk": completes_walk,
             "output_signals": signals, "rids": [rid], "wg_ids": [WG_ID],
             "tensors": list(uuids),
             "num_tensors": [
@@ -263,10 +263,11 @@ def test_a_remote_destination_gets_input_signals(tmp_path):
     assert got[PEER][0].body.request_info.fwd_index == 2
 
 
-@pytest.mark.parametrize("node_done", [True, False])
-def test_a_streamed_edge_says_whether_its_walk_finished(tmp_path, node_done):
-    """A non-final chunk's streamed output goes out marked, so the consumer's
-    buffer can hold it back; and its step reports no worker graph done."""
+@pytest.mark.parametrize("node_done, walk_done", [(True, True), (False, False), (True, False)])
+def test_only_a_non_final_chunks_stream_is_marked_partial(tmp_path, node_done, walk_done):
+    """A non-final chunk's streamed output goes out marked; a step that
+    finished its node but not its walk streams whole items. Neither reports
+    a worker graph done."""
     mesh = _Mesh(
         tmp_path, outs=[("states", "remote", False, True)],
         remote=[{"wg_id": 1, "graph_walks": [WALK],
@@ -274,13 +275,16 @@ def test_a_streamed_edge_says_whether_its_walk_finished(tmp_path, node_done):
     )
     rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
     info = _put(mesh, 1)
-    got = mesh.run(rid, uuids=[1], completes_node=None if node_done else [False])
+    got = mesh.run(
+        rid, uuids=[1], completes_node=None if node_done else [False],
+        completes_walk=None if walk_done else [False],
+    )
 
     [frame] = got[PEER]
     [edge] = frame.body.inputs
     assert (edge.name, edge.tensor_info) == ("states", [info])
     assert edge.finished_graph_walk == node_done
-    assert bool(got["conductor"]) == node_done
+    assert bool(got["conductor"]) == walk_done
 
 
 def test_a_persist_signal_rides_the_worker_graphs_done(tmp_path):

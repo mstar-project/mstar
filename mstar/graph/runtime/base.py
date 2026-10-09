@@ -454,8 +454,8 @@ class RouteInput(NamedTuple):
     # outputs; one that finished its node but not its walk (a consumer of
     # such a chunk) routes all of them. Either routes only outputs that carry
     # tensors. Neither completes the node, so no
-    # worker graph is reported done, and their streaming edges carry
-    # finished_graph_walk=False.
+    # worker graph is reported done. The streamed edges of a row mid-node
+    # carry finished_graph_walk=False.
     completes_node: list[bool] | None = None
     completes_walk: list[bool] | None = None
 

@@ -1402,8 +1402,9 @@ class PythonGraphRuntime(GraphRuntime):
                     edge.clone() for edge in node.outputs
                     if edge.tensor_info and (node_done[i] or edge.is_streaming)
                 ]
+                # only a non-final chunk's outputs are partial, and only opted-in edges carry them
                 for edge in out_edges:
-                    edge.finished_graph_walk = False
+                    edge.finished_graph_walk = node_done[i]
             walk = input.graph_walk
             if input.walks is not None:
                 walk = rid_walk[rid] = input.walks[input.rid_walk_idx[i]]

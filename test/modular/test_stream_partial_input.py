@@ -1,7 +1,6 @@
 """A chunked prefill can stream its non-final chunks early, flagged as not
-finishing the producer's walk. A consumer sees them only if its ChunkPolicy
-opts into partial input; otherwise its buffer waits for an item that finishes
-a walk, as if the producer had not been chunked."""
+finishing the producer's walk, to a consumer whose ChunkPolicy opted into
+partial input. A chunk of only such items does not finish the consumer's walk."""
 import torch
 
 from mstar.streaming.chunk_policy import FixedChunkPolicy
@@ -19,17 +18,6 @@ def _buffer(policy, flags):
         buf.pre_read_register(f"t{i}", finished)
         buf.put(f"t{i}", torch.tensor([float(i)]))
     return buf
-
-
-def test_by_default_partial_items_wait_for_the_walk_to_finish():
-    buf = _buffer(FixedChunkPolicy(2), [False, False])
-    assert not buf.has_chunk_ready()
-
-    buf.pre_read_register("t2", True)
-    buf.put("t2", torch.tensor([2.0]))
-    assert buf.has_chunk_ready()
-    chunk = buf.pop_chunk()
-    assert chunk.num_items == 2 and not chunk.finished_graph_walk
 
 
 def test_a_partial_consumer_takes_items_as_they_arrive():

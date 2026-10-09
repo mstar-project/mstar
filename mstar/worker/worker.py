@@ -3178,8 +3178,7 @@ class Worker:
             for rid, uuid in per_signal:
                 req_info = self.request_state.per_request_info[rid]
                 stream_buf = req_info.stream_buffers[signal]
-                stream_buf.pre_read_register(uuid, batch_N.node_batch.completes_walk(rid)
-                                             and rid not in batch_N.batch.incomplete_node_rids)
+                stream_buf.pre_read_register(uuid, rid not in batch_N.batch.incomplete_node_rids)
                 tensor = self.tensor_manager.get_tensor(uuid)
                 stream_buf.put(uuid, tensor.clone())
                 streamed.append(uuid)

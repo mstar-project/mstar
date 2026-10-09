@@ -163,7 +163,8 @@ pub fn routed_without_completing(
         .zip(out_tensors)
         // an edge with nothing on it would satisfy its consumer, or persist nothing
         .filter(|(e, t)| !t.is_empty() && (all_outputs || e.streaming))
-        .map(|(e, t)| RoutedEdge { finished_graph_walk: false, ..routed(e, t.clone()) })
+        // only a non-final chunk's outputs are partial, and only opted-in edges carry them
+        .map(|(e, t)| RoutedEdge { finished_graph_walk: all_outputs, ..routed(e, t.clone()) })
         .collect()
 }
 
