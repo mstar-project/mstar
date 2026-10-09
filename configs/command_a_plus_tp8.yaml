@@ -1,0 +1,12 @@
+model: command_a_plus
+max_seq_len: 8192
+model_kwargs:
+  max_seq_len: 8192
+  # Optional: checkpoint_dir: /path/to/an/already-downloaded/checkpoint
+
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    sp_size: 1
+    graph_walks: [prefill, decode]

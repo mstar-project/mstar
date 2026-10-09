@@ -25,6 +25,7 @@ import mstar
 DEFAULT_CONFIGS: dict[str, str] = {
     "bagel": "bagel_single_gpu.yaml",
     "bagel_cfg_parallel": "bagel_cfg_parallel.yaml",
+    "command_a_plus": "command_a_plus_tp4.yaml",
     "cosmos3": "cosmos3_nano.yaml",
     "cosmos3_droid": "cosmos3_droid.yaml",
     "cosmos3_edge": "cosmos3_edge.yaml",
@@ -119,7 +120,7 @@ def _next_steps(model: str, host: str, port: int) -> str:
         "    from mstar import MStarClient",
         f"    client = MStarClient(\"{base}\")",
     ]
-    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni"):
+    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus"):
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model in ("bagel", "bagel_cfg_parallel"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")

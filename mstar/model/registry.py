@@ -7,6 +7,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "chatterbox": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "chatterbox_multilingual": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "chatterbox_turbo": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
+    "command_a_plus": ("mstar.model.command_a_plus.command_a_plus_model", "CommandAPlusModel"),
     "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_edge": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
@@ -46,6 +47,7 @@ HF_MODELS: dict[str, dict] = {
     "chatterbox_multilingual": {"model_path_hf": "ResembleAI/chatterbox", "variant": "multilingual"},
     "chatterbox_turbo": {"model_path_hf": "ResembleAI/chatterbox-turbo"},
     # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
+    "command_a_plus": {"model_path_hf": "CohereLabs/command-a-plus-05-2026-bf16"},
     "cosmos3": {"model_path_hf": "nvidia/Cosmos3-Nano"},
     # Cosmos3-Nano-Policy-DROID — Nano-sized action-policy fine-tune for the
     # DROID robot platform (domain droid_lerobot, 10-dim raw actions). Same

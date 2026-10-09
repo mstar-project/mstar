@@ -61,6 +61,14 @@ mstar-serve = "mstar.api_server.entrypoint:main"
 # PyPI reject the mstar upload, so it is an install step instead — see
 # docs/installation.rst, same as flash-attn.
 omnivoice = []
+command_a_plus = [
+    "flashinfer-python>=0.6.18,<0.7",
+    "huggingface-hub>=1.5",
+    "mooncake-transfer-engine",
+    "ninja",
+    "safetensors",
+    "transformers>=5.17",
+]
 
 dev = [
     "ruff<=0.16",
