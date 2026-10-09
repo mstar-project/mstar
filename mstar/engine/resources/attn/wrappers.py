@@ -298,6 +298,15 @@ class FlashInferDecodeWrapper:
         Inputs may be on CPU; see prefill wrapper's plan docstring.
         """
         n_req = paged_kv_indptr.shape[0] - 1
+        if self.use_cuda_graph and paged_kv_indices.device.type != "cuda":
+            # FlashInfer copies host indices with a blocking copy; from here
+            # it is one non-blocking copy into its own buffer (really
+            # asynchronous when the source is page-locked, see
+            # PinnedIndexRing), and its copy_ of that buffer onto itself is
+            # a no-op
+            n = paged_kv_indices.shape[0]
+            self._paged_kv_indices_buf[:n].copy_(paged_kv_indices, non_blocking=True)
+            paged_kv_indices = self._paged_kv_indices_buf[:n]
 
         if self.enable_nvtx:
             from mstar.utils.profiler import range_pop, range_push
