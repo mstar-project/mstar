@@ -24,6 +24,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import pytest
+
 from mstar.api_server.entrypoint import APIServer, PendingRequest
 from mstar.api_server.request_types import (
     APIServerMessage,
@@ -276,13 +278,15 @@ def _preprocess_thread(model):
     return wt
 
 
-def test_output_postprocess_failure_becomes_an_error_chunk():
+# A ValueError past intake is a server bug too, not a 400
+@pytest.mark.parametrize("error", [RuntimeError, ValueError])
+def test_output_postprocess_failure_becomes_an_error_chunk(error):
     """A model that blows up postprocessing a result tensor must fail that
     request, not silently drop the chunk and leave the client hanging."""
 
     class _BadModel:
         def postprocess(self, tensor, modality, request_kwargs=None):
-            raise RuntimeError("decode failed")
+            raise error("decode failed")
 
     wt = _preprocess_thread(_BadModel())
     dereferenced = []

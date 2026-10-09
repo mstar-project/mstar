@@ -6,6 +6,7 @@ import os
 import queue
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 
 import torch
@@ -46,6 +47,29 @@ from mstar.utils.ipc_format import (
 )
 
 logger = logging.getLogger(__name__)
+
+# What decoders raise on a file they can't read (torchvision and torchcodec
+# RuntimeError, PIL OSError); anything else from a loader is a server bug
+_DECODE_ERRORS = (RuntimeError, OSError, EOFError)
+
+
+def _raised_on_import(exc: BaseException) -> bool:
+    """True when ``exc`` came out of a module being imported, e.g. torchcodec
+    on a host without FFmpeg: the install is broken, not the file."""
+    return any(f.f_code.co_name == "<module>" for f, _ in traceback.walk_tb(exc.__traceback__))
+
+
+def _decode_input(load, filepath: str, device: str, modality: str):
+    """Run a model's ``load_<modality>`` on one upload. A file that won't decode
+    becomes a ValueError, so the client gets a 400 instead of a 500."""
+    try:
+        return load(filepath, device)
+    except _DECODE_ERRORS as exc:
+        # a missing upload was removed by our own cleanup
+        if not os.path.exists(filepath) or _raised_on_import(exc):
+            raise
+        detail = str(exc).replace(filepath, "the upload")  # PIL names the server path
+        raise ValueError(f"could not decode the {modality} input: {detail}") from exc
 
 
 def _video_frame_metadata(
@@ -450,19 +474,19 @@ class PreprocessWorkerThread:
                 for filepath in input.file_paths[modality]:
                     # ---- Image ----
                     if modality == "image":
-                        out = self.model.load_image(filepath, self.device)
+                        out = _decode_input(self.model.load_image, filepath, self.device, "image")
                         tensors[key].append(out.data)
                         input_metadata[key].append(out.metadata)
 
                     # ---- Audio ----
                     elif modality == "audio":
-                        out = self.model.load_audio(filepath, self.device)
+                        out = _decode_input(self.model.load_audio, filepath, self.device, "audio")
                         tensors[key].append(out.data)
                         input_metadata[key].append(out.metadata)
 
                     # ---- Video ----
                     elif modality == "video":
-                        out = self.model.load_video(filepath, self.device)
+                        out = _decode_input(self.model.load_video, filepath, self.device, "video")
                         tensors[key].append(out.data)
                         input_metadata[key].append(out.metadata)
 
@@ -608,7 +632,7 @@ class PreprocessWorkerThread:
 
     def _fail_request(
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
-        sequence: int | None = None,
+        sequence: int | None = None, status: int = 500,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -620,9 +644,11 @@ class PreprocessWorkerThread:
         ``sequence`` is the output slot the failed tensor held. Its error chunk
         takes that slot in the reorder buffer; put straight on ``out_queue`` it
         would leave every later sequence held in ``pending`` until the TTL.
+
+        ``status`` is 500 unless the caller knows the request itself was bad:
+        past intake, a ValueError is a server bug, not invalid input.
         """
         logger.exception("%s failed for request %s", stage, request_id)
-        status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
         chunks = [
             ResultChunk(
                 request_id=request_id,
@@ -944,6 +970,8 @@ class PreprocessWorkerThread:
                         # server timeout.
                         self._fail_request(
                             pre_input.request_id, exc, "preprocessing",
+                            # intake rejects a request with ValueError/TypeError
+                            status=400 if isinstance(exc, (ValueError, TypeError)) else 500,
                         )
                         # Never reached the conductor, so there are no remote
                         # readers to race: hard-drop the (possibly persisted)
