@@ -23,9 +23,9 @@ import mstar
 
 # Model name -> default config (relative to the repo's configs/).
 DEFAULT_CONFIGS: dict[str, str] = {
-    "command_a_plus": "command_a_plus_tp8.yaml",
     "bagel": "bagel_single_gpu.yaml",
     "bagel_cfg_parallel": "bagel_cfg_parallel.yaml",
+    "command_a_plus": "command_a_plus_tp4.yaml",
     "cosmos3": "cosmos3_nano.yaml",
     "cosmos3_droid": "cosmos3_droid.yaml",
     "cosmos3_edge": "cosmos3_edge.yaml",

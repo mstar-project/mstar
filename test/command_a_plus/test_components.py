@@ -1,14 +1,19 @@
-"""Small CPU checks for Command A+ normalization and routing contracts."""
+"""Small CPU checks for Command A+ normalization, routing and all-reduce selection."""
 
 import math
+import sys
+import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.command_a_plus.components.language_model import (
+    CommandAPlusLanguageModel,
     CommandAPlusLayerNorm,
     CommandAPlusMoeBlock,
     CommandAPlusRouter,
@@ -208,6 +213,47 @@ class MoeBlockTests(unittest.TestCase):
                     self.assertEqual(parameter.device.type, "cpu")
                     if name != "gate.weight":
                         self.assertTrue(callable(parameter.weight_loader))
+
+
+class AllReduceWorkspaceTests(unittest.TestCase):
+    """Every rank must take the same all-reduce path, falling back to NCCL."""
+
+    def create(self, factory, peers_ok=True):
+        model = SimpleNamespace(
+            comm_group=SimpleNamespace(world_size=4, rank=0, device_group=None),
+            embed_tokens=SimpleNamespace(weight=torch.zeros(8, 16, dtype=torch.bfloat16)),
+        )
+        comm = types.ModuleType("flashinfer.comm")
+        comm.create_allreduce_fusion_workspace = factory
+
+        def all_reduce(flag, op, group):
+            if not peers_ok:
+                flag.zero_()
+
+        with (
+            patch.dict(sys.modules, {"flashinfer": types.ModuleType("flashinfer"), "flashinfer.comm": comm}),
+            patch("torch.distributed.all_reduce", side_effect=all_reduce),
+        ):
+            return CommandAPlusLanguageModel._create_allreduce_workspace(model, 2048)
+
+    def test_uses_the_workspace_when_every_rank_has_one(self):
+        workspace = MagicMock()
+        self.assertIs(self.create(lambda **kwargs: workspace), workspace)
+        workspace.destroy.assert_not_called()
+
+    def test_falls_back_to_nccl_when_creation_fails(self):
+        def unsupported(**kwargs):
+            raise RuntimeError("no peer access")
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertIsNone(self.create(unsupported))
+        self.assertIn("no peer access", logs.output[0])
+
+    def test_falls_back_to_nccl_when_another_rank_fails(self):
+        workspace = MagicMock()
+        with self.assertLogs(level="WARNING"):
+            self.assertIsNone(self.create(lambda **kwargs: workspace, peers_ok=False))
+        workspace.destroy.assert_called_once()
 
 
 if __name__ == "__main__":

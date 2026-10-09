@@ -63,11 +63,11 @@ mstar-serve = "mstar.api_server.entrypoint:main"
 omnivoice = []
 command_a_plus = [
     "flashinfer-python>=0.6.18,<0.7",
-    "huggingface-hub>=1.5,<2",
+    "huggingface-hub>=1.5",
     "mooncake-transfer-engine",
     "ninja",
     "safetensors",
-    "transformers>=5.17,<5.18",
+    "transformers>=5.17",
 ]
 
 dev = [

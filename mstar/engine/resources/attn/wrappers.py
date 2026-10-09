@@ -154,10 +154,10 @@ class FlashInferPrefillWrapper:
         window_left: int = -1,
         **kwargs
     ):
-        """Plan attention over the KV resource's page mappings.
+        """Plan attention and compute KV write indices.
 
-        ``window_left`` counts preceding positions inclusively; -1 is unbounded.
-        KV writes are performed separately by the KV resource.
+        ``window_left`` is the number of preceding positions each query sees;
+        -1 is unbounded.
 
         In CUDA graph mode, updates static buffers via .copy_() so that
         the same GPU addresses are used during graph replay.
@@ -295,11 +295,12 @@ class FlashInferDecodeWrapper:
         window_left: int = -1,
         **kwargs
     ):
-        """Plan attention for one new query per request.
+        """Plan decode attention and compute KV write locations.
 
-        The page mappings include the new token's reserved cache position;
-        KV writes are performed separately by the KV resource.
-        ``window_left`` counts preceding positions inclusively; -1 is unbounded.
+        For decode, each request appends exactly 1 token. The write
+        location is the last page at position = last_page_len (before
+        the append; after append it becomes last_page_len).
+        ``window_left`` is as in the prefill wrapper's ``plan``.
 
         Inputs may be on CPU; see prefill wrapper's plan docstring.
         """

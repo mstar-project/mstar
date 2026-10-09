@@ -15,7 +15,7 @@ from test.command_a_plus.test_integration import FIXTURE
 
 
 class RegistrationTests(unittest.TestCase):
-    def test_registry_cli_and_tp8_deployment_agree(self):
+    def test_registry_cli_and_default_deployment_agree(self):
         self.assertIs(get_model_class("command_a_plus"), CommandAPlusModel)
         self.assertEqual(HF_MODELS["command_a_plus"]["model_path_hf"], MODEL_ID)
         config = yaml.safe_load(Path(_resolve_config("command_a_plus", None)).read_text())
@@ -25,7 +25,7 @@ class RegistrationTests(unittest.TestCase):
         model = CommandAPlusModel(MODEL_ID, checkpoint_dir=directory)
         graphs = model.get_worker_graphs(_resolve_config("command_a_plus", None))
         self.assertEqual(len(graphs), 2)
-        self.assertTrue(all(g.tp_size == 8 and g.sp_size == 1 for g in graphs))
+        self.assertTrue(all(g.tp_size == 4 and g.sp_size == 1 for g in graphs))
         # Fail before the parameter constructor allocates any storage.
         with patch("mstar.model.command_a_plus.components.language_model.CommandAPlusForCausalLM") as constructor:
             with self.assertRaisesRegex(FileNotFoundError, "obtain the checkpoint explicitly"):

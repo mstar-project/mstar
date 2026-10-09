@@ -14,11 +14,6 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - Registry key
      - Example Hugging Face model ID
      - Description
-   * - ``command_a_plus`` *(Experimental)*
-     - ``CohereLabs/command-a-plus-05-2026-bf16``
-     - Text-only MoE integration with real-checkpoint generation tested. TP8
-       numerical acceptance and full-checkpoint HTTP validation remain open.
-       See :doc:`command_a_plus`.
    * - ``bagel``
      - ``ByteDance-Seed/BAGEL-7B-MoT``
      - Unified multimodal model (text + image understanding and generation).
@@ -27,6 +22,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Zero-shot voice-cloning TTS: T3 speech-token LM (Llama-520M, or GPT-2-medium
        for Turbo) with CFG and exaggeration control, S3Gen flow-matching decoder,
        HiFT vocoder, PerTh watermark. 24 kHz.
+   * - ``command_a_plus`` *(Experimental)*
+     - ``CohereLabs/command-a-plus-05-2026-bf16``
+     - Command A+ text chat: a 218B-parameter MoE (25B active) with sliding-window
+       attention. Tested on 4x GB200 at TP4; see the notes below.
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
@@ -164,6 +163,56 @@ needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
 via ``extra_body``.
+
+Command A+ (``command_a_plus``)
+-------------------------------
+
+Text chat on Command A+: 32 layers, 128 routed experts (top-8) plus an
+always-on shared expert, and three sliding-window (4096) layers for every
+global one. Only the text backbone is loaded; the vision tower is skipped.
+Served on ``POST /generate`` (there is no OpenAI adapter yet)::
+
+    mstar serve command_a_plus --gpus 0,1,2,3
+
+The ~437 GB of BF16 weights are never downloaded automatically. Download the
+checkpoint, set ``model_kwargs.checkpoint_dir`` in
+``configs/command_a_plus_tp4.yaml``, and launch; without it, workers stop
+with a missing-weights error before allocating parameters. Tokenizer and
+config metadata are pinned to one checkpoint revision. The default config is
+TP4 with a 65536-token ``max_seq_len``. ``configs/command_a_plus_tp8.yaml``
+targets 8x 80 GB GPUs and has not been run with the fused decode path below.
+
+Install the ``command_a_plus`` extra (FlashInfer >= 0.6.18). The fused-MoE
+alignment op JIT-builds against the local CUDA toolkit, so point ``CUDA_HOME``
+at a toolkit matching PyTorch's CUDA version; otherwise it falls back to a
+slower torch implementation.
+
+``model_kwargs={"messages": [{"role": ..., "content": ...}, ...]}`` with
+``system`` / ``user`` / ``assistant`` turns goes through the chat template; a
+plain ``text`` prompt is one user turn. Sampling defaults to temperature 0.9,
+top-p 0.95 and repetition penalty 1.04. The model reasons before answering
+(``<|START_THINKING|>...<|END_THINKING|><|START_TEXT|>...<|END_TEXT|>``), so
+give it a generous ``max_output_tokens``. A prompt plus ``max_output_tokens``
+longer than ``max_seq_len`` is rejected.
+
+Decode runs in CUDA graphs over a fused path that concatenates each layer's
+projections into two GEMMs, all-reduces once per layer, and uses Triton
+kernels for the norms, routing, SwiGLU and output projection. The all-reduce
+is FlashInfer's one-shot kernel up to 2048 tokens when every GPU has peer
+access, and NCCL otherwise. On 4x GB200 at TP4 with ``MSTAR_TP_ASYNC_SCHED=1``
+it decodes 277 tok/s for one request and 1650 tok/s across eight, with a
+37 ms time to first token. Above ~32 concurrent requests the TP leader's CPU,
+not the GPUs, is the limit. See :doc:`environment_variables` for the
+``COMMAND_A_PLUS_*`` switches that turn the fused path, the one-shot
+all-reduce or decode graphs off.
+
+Against the Hugging Face reference (``test/command_a_plus/validate_checkpoint.py``,
+three prompts x 32 steps), the argmax matches at 96/96 steps and greedy output
+matches on all three prompts. ``bench_http.py``, ``parity_http.py`` and
+``profile_decode.py`` in the same directory benchmark, diff greedy outputs and
+profile a running deployment. Not supported yet: image input, FP8 weights,
+prefill CUDA graphs, and reclaiming the KV pages that fall outside the sliding
+window.
 
 Kokoro notes
 ------------

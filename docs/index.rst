@@ -46,4 +46,3 @@ vision-language-action policies, and world models — through a **Python SDK**, 
    :caption: Contributing
 
    adding_models
-   command_a_plus
