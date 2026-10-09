@@ -106,18 +106,10 @@ class Glm5NextModel(Model):
             self.config = Glm5NextModelConfig.reduced()
         elif self._config_variant == "reduced_fp8":
             self.config = Glm5NextModelConfig.reduced_fp8()
+        elif self._config_variant == "reduced_long_context":
+            self.config = Glm5NextModelConfig.reduced_long_context()
         else:
             self.config = Glm5NextModelConfig()
-        if kwargs.get("dsa_long_context", False):
-            # The config carries the opt-in long-context flag for shape
-            # parity, but the k-pool engine path (pooled scoring + sparse
-            # gather) is not built yet — refuse loudly instead of serving a
-            # silently-dense long context.
-            raise NotImplementedError(
-                "glm5_next dsa_long_context is a post-M1 follow-up: the "
-                "k-pool indexer engine path is not implemented; serve "
-                "within index_topk (2048) where dense MLA is exact DSA"
-            )
         if "moe_quant_kernel" in kwargs:
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
         if "mtp_num_draft_tokens" in kwargs:
@@ -132,6 +124,16 @@ class Glm5NextModel(Model):
         if kwargs.get("prefill_max_step_tokens") is not None:
             cap = kwargs["prefill_max_step_tokens"]
             self.config.prefill_max_step_tokens = cap if cap == "auto" else int(cap)
+        if kwargs.get("dsa_long_context", False):
+            # Contexts past index_topk through the k-pool indexer and sparse MLA (dsa.py).
+            # Captured prefill buckets take whole short prompts; a longer prompt runs eager, in
+            # token windows.
+            self.config.dsa_long_context = True
+            self.config.max_seq_len = int(kwargs.get("max_seq_len", self.config.max_seq_len))
+            self.config.prefill_window_tokens = int(
+                kwargs.get("prefill_window_tokens", self.config.prefill_window_tokens))
+            self.config.dsa_shard_prefill = bool(kwargs.get("dsa_shard_prefill", False))
+        self.config.check_long_context()
         # Requests that may hold KDA state at once (the decode batch cap). The
         # pool holds one more slot, its sink; a serve YAML sets the pool's
         # size, sink included, under ``resources: kda_state: {max_slots: N}``.
@@ -186,9 +188,7 @@ class Glm5NextModel(Model):
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """The LLM node's five resources."""
-        num_kv_layers = len(self.config.full_attn_layer_indices) + (
-            1 if self.config.mtp_num_draft_tokens > 0 else 0
-        )
+        num_kv_layers = self.config.num_kv_planes
         kda_blocks = DeltaNetGeometry(
             num_k_heads=self.config.linear_num_heads,
             num_v_heads=self.config.linear_num_heads,
@@ -443,10 +443,10 @@ class Glm5NextModel(Model):
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
 
         # Decode runs at least one step, and one more may already be scheduled
-        # when it stops, so the prompt leaves two steps' tokens of index_topk
-        # free (an MTP step keeps k + 1). A ValueError here reaches the client
-        # as a 400.
-        limit = self.config.index_topk - 2 * (self.config.mtp_num_draft_tokens + 1)
+        # when it stops, so the prompt leaves two steps' tokens of the context
+        # limit free (an MTP step keeps k + 1). A ValueError here reaches the
+        # client as a 400.
+        limit = self.config.context_limit - 2 * (self.config.mtp_num_draft_tokens + 1)
         if input_ids.numel() > limit:
             raise ValueError(
                 f"prompt is {input_ids.numel()} tokens; GLM-5.3-Flash is served "
@@ -456,15 +456,15 @@ class Glm5NextModel(Model):
 
     def max_decode_steps(self) -> int:
         """Decode iterations a one-token prompt can run before its context
-        reaches index_topk or its cache rows reach kv_rows (an MTP step stores
-        k + 1); check_stop stops every request before either."""
+        reaches the context limit or its cache rows reach kv_rows (an MTP step
+        stores k + 1); check_stop stops every request before either."""
         cfg = self.config
-        return min(cfg.index_topk - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
+        return min(cfg.context_limit - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
 
     def get_max_output_tokens(self, **model_kwargs):
-        # held to the window: a one-token prompt emits at most index_topk tokens
+        # held to the window: a one-token prompt emits at most context_limit tokens
         budget = model_kwargs.get("max_output_tokens", self.config.max_output_tokens)
-        return min(budget, self.config.index_topk)
+        return min(budget, self.config.context_limit)
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

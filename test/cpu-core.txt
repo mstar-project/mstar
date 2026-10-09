@@ -121,3 +121,5 @@ test/modular/test_glm5next_output_budget.py
 test/modular/test_glm5next_postprocess.py
 test/modular/test_glm5next_mtp_admission.py
 test/modular/test_glm5next_loading_guards.py
+test/modular/test_glm5next_dsa.py
+test/modular/test_sparse_mla.py

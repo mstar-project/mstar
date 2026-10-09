@@ -1,7 +1,9 @@
 import logging
 import os
 import threading
+from collections.abc import Iterator
 from concurrent.futures import Future, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -2194,6 +2196,23 @@ class KVManager(AttentionResource):
         plan_state = self._current_plan_states[label]
         n = plan_state.total_tokens
         return plan_state.token_to_page[:n], plan_state.token_to_cache[:n]
+
+    @contextmanager
+    def token_window(self, start: int, end: int, label: str | None = None) -> Iterator[None]:
+        """Narrow this step's write addressing to its tokens ``[start, end)``, for a forward
+        that runs a long step's tokens in windows: each window writes at its own slots."""
+        if label is None:
+            label = self._default_label
+        full = self._current_plan_states[label]
+        self._current_plan_states[label] = KVPlanState(
+            token_to_page=full.token_to_page[start:end],
+            token_to_cache=full.token_to_cache[start:end],
+            total_tokens=end - start,
+        )
+        try:
+            yield
+        finally:
+            self._current_plan_states[label] = full
 
     @torch.compiler.disable
     def write_kv(
