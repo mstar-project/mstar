@@ -48,6 +48,7 @@ class ToyLM(nn.Module):
         super().__init__()
         self.model = nn.Module()
         self.model.embed_tokens = nn.Embedding.from_pretrained(torch.eye(vocab))
+        self.model.embed = self.model.embed_tokens
 
     def forward(self, x, *, label):
         assert label == "main"
@@ -252,6 +253,19 @@ class ModelIntegrationTests(unittest.TestCase):
         )
         chunks = [self.model.postprocess(torch.tensor([i]), "text") for i in (10, 11, 12, 13, 3)]
         self.assertEqual(b"".join(chunks).decode("utf-8"), "é hi<|START_THINKING|>")
+        turns = [{"role": "system", "content": "Be terse."}, {"role": "user", "content": "hi"},
+                 {"role": "assistant", "content": "Hello."}, {"role": "user", "content": "again"}]
+        tokenizer.apply_chat_template.reset_mock()
+        self.model.process_prompt("again", ["text"], ["text"], messages=turns)
+        tokenizer.apply_chat_template.assert_called_once_with(
+            turns, tokenize=True, add_generation_prompt=True, return_dict=False,
+        )
+        self.model.process_prompt("hi", ["text"], ["text"], max_output_tokens=self.model.max_seq_len - 3)
+        with self.assertRaisesRegex(ValueError, "exceeds max_seq_len"):
+            self.model.process_prompt("hi", ["text"], ["text"], max_output_tokens=self.model.max_seq_len - 2)
+        for bad in ([], [{"role": "tool", "content": "x"}], [{"role": "user"}], "hi"):
+            with self.assertRaisesRegex(ValueError, "messages"):
+                self.model.process_prompt("hi", ["text"], ["text"], messages=bad)
         with self.assertRaisesRegex(ValueError, "text input"):
             self.model.process_prompt("hi", ["image"], ["text"])
         for ids in (torch.tensor([]), torch.tensor([128]), torch.tensor([-1]), torch.tensor([2.0])):
