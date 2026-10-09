@@ -558,6 +558,36 @@ def test_edge_prompt_rendering_matches_reference_layout() -> None:
     assert render_chat(tok, parts, cfg.reasoner).endswith("<think>\n")
 
 
+CHAT = [
+    {"role": "system", "content": "Be brief."},
+    {"role": "user", "content": "What is ahead?"},
+    {"role": "assistant", "content": "A truck."},
+    {"role": "user", "content": "And behind?"},
+]
+
+
+@needs_edge
+@pytest.mark.parametrize(("messages", "rendered_from"), [
+    (CHAT[1:2], [{"role": "system", "content": "Drive carefully."}, CHAT[1]]),
+    (CHAT, CHAT),
+], ids=["one-turn", "chat"])
+def test_edge_chat_renders_as_its_template_renders_its_messages(messages, rendered_from, tmp_path) -> None:
+    """Each message reaches the template as its own turn, and the request's
+    ``system_prompt`` leads only a chat that sent no system message."""
+    from transformers import AutoTokenizer
+
+    from mstar.api_server.openai.adapters import flatten_messages
+    from mstar.model.cosmos3.components.reasoner import render_chat
+
+    cfg = Cosmos3Config.from_pretrained(EDGE_DIR)
+    tok = AutoTokenizer.from_pretrained(str(EDGE_DIR))
+    *_, parts = flatten_messages(messages, tmp_path)
+    rendered = render_chat(tok, parts, cfg.reasoner, enable_thinking=False, system_prompt="Drive carefully.")
+    assert rendered == tok.apply_chat_template(
+        rendered_from, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+    ), "the chat reached the template as one user message, its turns glued together"
+
+
 @needs_edge
 def test_edge_reasoner_video_prompt() -> None:
     """A video attachment renders one timestamped span per sampled frame, the
