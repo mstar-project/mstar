@@ -130,19 +130,6 @@ def test_a_role_a_chat_cannot_render_is_refused(tmp_path, role):
         flatten_messages([{"role": role, "content": "hi"}], tmp_path)
 
 
-@pytest.mark.parametrize(("role", "message"), [
-    ("system", "a system message cannot carry an image attachment"),
-    ("assistant", "an assistant message cannot carry an image attachment"),
-])
-def test_an_attachment_outside_a_user_message_is_refused(tmp_path, role, message):
-    """The template writes a turn break where the layout has no text slot for it."""
-    messages = [{"role": role, "content": [
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
-    ]}]
-    with pytest.raises(ValueError, match=f"^{message}$"):
-        flatten_messages(messages, tmp_path)
-
-
 def test_plan_orders_attachments_as_written():
     parts = parts_from_modalities(["audio", "image", "audio"])
     plan = prefill_plan(parts)

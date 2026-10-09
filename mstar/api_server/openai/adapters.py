@@ -75,10 +75,6 @@ class Transcript:
     unfinished: bool = False
 
 
-def _with_article(word: str) -> str:
-    return f"{'an' if word[:1] in 'aeiou' else 'a'} {word}"
-
-
 def flatten_messages(
     messages: list, upload_dir: Path, allow_remote: bool = True
 ) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
@@ -88,20 +84,17 @@ def flatten_messages(
     it — text newline-joined, attachments persisted under ``upload_dir`` and
     grouped by modality, ``input_modalities`` the per-part modality sequence.
     So an attachment's position and a repeated modality both survive. Each
-    part carries its message's role, so a reply stays its own turn.
+    text part carries its message's role, so a reply stays its own turn.
     """
     parts: list[PromptPart] = []
     file_paths: dict[str, list[str]] = {}
 
-    def add_file(modality: str, path: str, role: str) -> None:
-        # the layout has no text slot for the turn break the template writes
-        # between two attachments, so an attachment stays in a user turn
-        if role != "user":
-            raise ValueError(
-                f"{_with_article(role)} message cannot carry {_with_article(modality)} attachment"
-            )
+    def add_file(modality: str, path: str) -> None:
+        # shortcut: always a user turn, so the model can't tell an image it made from one it was
+        # sent, and a reply that is only an image leaves no assistant turn; a feature like
+        # multi-turn editing would give the turn break between two attachments a text slot
         paths = file_paths.setdefault(modality, [])
-        parts.append(PromptPart(modality=modality, index=len(paths), role=role))
+        parts.append(PromptPart(modality=modality, index=len(paths), role="user"))
         paths.append(path)
 
     def add_text(text: str, role: str) -> None:
@@ -142,23 +135,23 @@ def flatten_messages(
                 url = (part.get("image_url") or {}).get("url", "")
                 if url:
                     mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "image", path, role)
+                    add_file(mod or "image", path)
             elif ptype == "video_url":  # extension for video-capable models
                 url = (part.get("video_url") or {}).get("url", "")
                 if url:
                     mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "video", path, role)
+                    add_file(mod or "video", path)
             elif ptype == "audio_url":  # data:/http audio input (vllm-omni content style)
                 url = (part.get("audio_url") or {}).get("url", "")
                 if url:
                     mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "audio", path, role)
+                    add_file(mod or "audio", path)
             elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
                 ia = part.get("input_audio") or {}
                 data, fmt = ia.get("data"), ia.get("format", "wav")
                 if data:
                     mod, path = media_io.save_base64(data, fmt, "audio", upload_dir)
-                    add_file(mod, path, role)
+                    add_file(mod, path)
 
     text_parts = [p.text for p in parts if p.modality == "text"]
     text = "\n".join(text_parts) if text_parts else None

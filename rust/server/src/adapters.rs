@@ -78,7 +78,7 @@ impl Default for SubmitArgs {
 /// it: text newline-joined, attachments persisted under `upload_dir` and
 /// grouped by modality, `input_modalities` the per-part modality sequence.
 /// So an attachment's position and a repeated modality both survive. Each
-/// part carries its message's role, so a reply stays its own turn. The rules
+/// text part carries its message's role, so a reply stays its own turn. The rules
 /// are `flatten_messages` in `api_server/openai/adapters.py`, line for line.
 pub fn flatten_messages(
     messages: &[crate::protocol::ChatMessage],
@@ -126,10 +126,9 @@ pub fn flatten_messages(
                     let url = nested_url(obj, ptype);
                     if !url.is_empty() {
                         let fallback = ptype.trim_end_matches("_url");
-                        refuse_outside_user(role, fallback)?;
                         let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
                         let m = if m == "unknown" { fallback.to_string() } else { m };
-                        add_file(&mut parts, &mut file_paths, m, p, role);
+                        add_file(&mut parts, &mut file_paths, m, p);
                     }
                 }
                 "input_audio" => {
@@ -139,9 +138,8 @@ pub fn flatten_messages(
                         let data = ia.get("data").and_then(Value::as_str).unwrap_or("");
                         let fmt = ia.get("format").and_then(Value::as_str).unwrap_or("wav");
                         if !data.is_empty() {
-                            refuse_outside_user(role, "audio")?;
                             let (m, p) = media::save_base64(data, fmt, "audio", upload_dir)?;
-                            add_file(&mut parts, &mut file_paths, m, p, role);
+                            add_file(&mut parts, &mut file_paths, m, p);
                         }
                     }
                 }
@@ -156,38 +154,21 @@ pub fn flatten_messages(
     Ok((text, file_paths, input_modalities, parts))
 }
 
-/// The layout has no text slot for the turn break a template writes between
-/// two attachments, so an attachment stays in a user turn. Checked before the
-/// attachment is persisted: a refused request never reaches the upload cleanup.
-fn refuse_outside_user(role: &str, modality: &str) -> Result<(), String> {
-    if role == "user" {
-        return Ok(());
-    }
-    Err(format!(
-        "{} message cannot carry {} attachment",
-        with_article(role),
-        with_article(modality)
-    ))
-}
-
-fn with_article(word: &str) -> String {
-    let article = if word.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
-    format!("{article} {word}")
-}
-
 fn add_file(
     parts: &mut Vec<Part>,
     file_paths: &mut BTreeMap<String, Vec<String>>,
     modality: String,
     path: String,
-    role: &str,
 ) {
+    // shortcut: always a user turn, so the model can't tell an image it made from one it was
+    // sent, and a reply that is only an image leaves no assistant turn; a feature like
+    // multi-turn editing would give the turn break between two attachments a text slot
     let paths = file_paths.entry(modality.clone()).or_default();
     parts.push(Part {
         modality,
         text: None,
         index: paths.len(),
-        role: role.to_string(),
+        role: "user".to_string(),
     });
     paths.push(path);
 }
@@ -729,21 +710,5 @@ mod tests {
             [0, 1, 0],
             "the second image does not address the second upload"
         );
-    }
-
-    #[test]
-    fn an_attachment_outside_a_user_message_is_refused_before_it_is_saved() {
-        let dir = std::env::temp_dir().join(format!("mstar_adapters_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let err = flatten(
-            r#"[{"role":"assistant","content":[
-                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}}]}]"#,
-            &dir,
-        )
-        .unwrap_err();
-        let saved = std::fs::read_dir(&dir).unwrap().count();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(err, "an assistant message cannot carry an image attachment");
-        assert_eq!(saved, 0, "a refused attachment was saved, and nothing cleans it up");
     }
 }
