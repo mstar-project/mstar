@@ -182,6 +182,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``max_concurrent_requests``
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue.
+   * - ``gpu_memory_fraction``
+     - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
+       done, for workers that share a GPU (see below). Unset, capture plans against
+       whatever is free.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
    * - ``warmup_requests``
@@ -256,6 +260,13 @@ never waits for a light node's steps on its worker loop (a TTS talker and its co
      - {node_names: [Talker], ranks: [0]}
      - {node_names: [Codec], ranks: [1]}
    rank_devices: {1: 0}
+
+At start-up a worker sizes every CUDA-graph bucket of its nodes with a capture it throws
+away, then captures the cheapest buckets across all of them while its largest eager step
+still fits beside them; a bucket left out runs eagerly. Workers sharing a GPU see each
+other's memory only as used, so the first to capture can take the other's room. Set
+``gpu_memory_fraction`` (``0.45`` for two workers, say) to bound what each plans for. It
+counts PyTorch allocations, not the CUDA context or NCCL buffers, so leave room for those.
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
