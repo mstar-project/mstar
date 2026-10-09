@@ -37,3 +37,13 @@ def sampler_slots() -> int:
     """``MSTAR_SAMPLER_SLOTS`` (default 4096): master rows allocated up front
     when the in-graph scatter is on (see ``sampler_ingraph_scatter``)."""
     return int(os.environ.get("MSTAR_SAMPLER_SLOTS", "4096"))
+
+
+def tp_early_spec() -> bool:
+    """``MSTAR_TP_EARLY_SPEC`` (default 0): let a tensor-parallel leader build
+    its next speculation early (during the current step's postprocess,
+    committing only once it holds a head). Off by default: with the device
+    loop-back on a 4-way group this stalled every request for ~1.2 s once
+    (27B TP4 c8 674 vs 1009 tok/s with it off), and the TP cells are GPU-bound
+    anyway. TP1 nodes build early regardless (``MSTAR_EARLY_SPEC``)."""
+    return os.environ.get("MSTAR_TP_EARLY_SPEC", "0") == "1"
