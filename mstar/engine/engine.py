@@ -1047,6 +1047,7 @@ class Engine:
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
                     slot_lease=ctx.slot_lease,
                     piecewise_leases=ctx.piecewise_leases,
+                    per_request_info=batch.per_request_info,
                 )
             finally:
                 if PHASE_PERIOD:
@@ -1706,6 +1707,7 @@ class Engine:
             request_ids=batch.step_context.padded_request_ids,
             inputs=inputs,
             slot_lease=lease,
+            per_request_info=batch.per_request_info,
         )
         if step is None:
             return False

@@ -68,3 +68,6 @@ class SamplerStep(ResourceStep):
     apply_penalty: bool = True
     # rid -> prefill tokens for the repetition penalty
     prefill_tracked_tokens: dict[str, torch.Tensor] = field(default_factory=dict)
+    # Rows whose sampled token is kept; None keeps every row. A dropped row
+    # still draws, but its RNG offset and seen-token mask are not committed.
+    kept_rids: frozenset[int] | None = None

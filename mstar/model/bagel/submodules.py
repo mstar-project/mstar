@@ -897,6 +897,7 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
         slot_lease: SlotLease | None = None,
         piecewise_leases: Mapping[str, SlotLease] | None = None,
+        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
         **kwargs,
     ) -> SubmoduleStep | None:
         """This batch's step: which cache streams it touches, by how much,
@@ -982,6 +983,12 @@ class LLMSubmodule(ARNodeSubmodule):
         # `cg_key_info` picks among the walk's capture buckets; it must match
         # the `additional_key_info` on the configs in get_cuda_graph_configs.
         steps: dict = {}
+        # the prefill rows whose token `postprocess` keeps
+        info = per_request_info or {}
+        kept_rids = frozenset(
+            rid for rid in request_ids
+            if rid in info and info[rid].step_metadata.get("sample_prefill_token", False)
+        )
         if graph_walk == "prefill_text":
             # The prompt's tokens enter the repetition-penalty mask here; the
             # sampler resource adds them at plan time. Only prefill carries
@@ -992,10 +999,13 @@ class LLMSubmodule(ARNodeSubmodule):
                     for rid, inp in zip(request_ids, inputs, strict=True)
                     if inp.input_ids is not None
                 },
+                kept_rids=kept_rids,
             )
-        elif graph_walk in ("decode", "prefill_vit"):
+        elif graph_walk == "prefill_vit":
             # prefill_vit is the last walk before decode for an image prompt,
             # so it samples the first token too (prefill_vae never does).
+            steps["sampler"] = SamplerStep(kept_rids=kept_rids)
+        elif graph_walk == "decode":
             steps["sampler"] = SamplerStep()
 
         steps.update({

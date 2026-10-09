@@ -594,6 +594,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         inputs: list[NodeInputs],
         slot_lease: SlotLease | None = None,
         piecewise_leases: Mapping[str, SlotLease] | None = None,
+        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
         **kwargs,
     ) -> SubmoduleStep | None:
         """Declare this batch's step for the runner to drive: which cache
@@ -616,7 +617,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
         ``piecewise_leases`` names the regions of this node that hold a slot
         for this step. Such a region declares, plans and commits its own work,
-        so a resource it owns must be left out of this declaration."""
+        so a resource it owns must be left out of this declaration.
+
+        ``per_request_info`` holds the real rows' forward-pass info (capture
+        passes dummy metadata); padding rows are absent, so read it with
+        ``.get``."""
         return None
 
     @abstractmethod

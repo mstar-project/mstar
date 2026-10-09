@@ -553,7 +553,7 @@ class CudaGraphRunner:
         lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
         step = self._submodule.declare_step(
             graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
-            slot_lease=lease,
+            slot_lease=lease, per_request_info=engine_inputs.per_request_info,
         )
         if step is not None:
             step = replace(step, _ctx=StepContext(
