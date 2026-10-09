@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
@@ -43,6 +44,7 @@ from mstar.model.multimodal import (
     check_attachments,
     check_plan,
     find_media_spans,
+    messages_from_parts,
     parts_from_modalities,
     prefill_plan,
     split_around_spans,
@@ -394,6 +396,7 @@ class Qwen3_5DenseModel(Model):
             input_modalities,
             [p.text or "" for p in prompt_parts if p.modality == TEXT]
             if prompt_parts is not None else prompt,
+            [p.role for p in prompt_parts or ()],
         )
         unsupported = {p.modality for p in parts} - {TEXT, "image"}
         if unsupported:
@@ -410,17 +413,17 @@ class Qwen3_5DenseModel(Model):
         # The released checkpoints are chat models (base ones say `-Base`), so
         # always use the chat template. `enable_thinking=False` emits an empty,
         # pre-closed `<think>` block, which is how Qwen turns reasoning off.
-        content = [
-            {"type": TEXT, "text": part.text or ""} if part.modality == TEXT
-            else {"type": part.modality, part.modality: ""}
-            for part in parts
-        ]
-        text = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": content}],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=kwargs.get("enable_thinking", True),
-        )
+        try:
+            text = self.tokenizer.apply_chat_template(
+                messages_from_parts(parts),
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=kwargs.get("enable_thinking", True),
+            )
+        except TemplateError as exc:
+            # a chat the template refuses (a system message after the first turn,
+            # no user turn) is the client's to fix: a 400, not a 500
+            raise ValueError(f"Qwen3.5's chat template refused the chat: {exc}") from exc
         input_ids = self.tokenizer(text, return_tensors="pt").input_ids[0]
 
         spans = find_media_spans(input_ids, self._placeholder_specs())

@@ -895,6 +895,7 @@ class Cosmos3Model(Model):
         parts = parts_from_modalities(
             input_modalities,
             [p.text or "" for p in prompt_parts if p.modality == TEXT] if prompt_parts is not None else prompt,
+            [p.role for p in prompt_parts or ()],
         )
         unsupported = {p.modality for p in parts} - {TEXT, IMAGE, VIDEO}
         if unsupported:
