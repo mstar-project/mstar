@@ -6,8 +6,22 @@ segments of one packed forward. There is nothing to page, nothing to advance,
 and nothing to carry between steps: the resource holds only planned wrappers.
 """
 
-from mstar.engine.resources.attn.ragged.config import RaggedAttentionSpec
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionSpec, RaggedCrossAttentionSpec
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
+
+
+def _build_ragged(spec, info: EngineResourceInfo, manager_cls):
+    config = spec.config
+    if info.joint_comm_group is not None:
+        config.shard(info.joint_comm_group.world_size)
+    dtype = config.dtype if config.dtype is not None else info.kv_dtype
+    if dtype is None:
+        raise ValueError(
+            f"ragged attention {spec.resource_key!r}: no activation dtype. Set "
+            "RaggedAttentionConfig.dtype on a node without a KV-backed attention "
+            "(the engine has no KV dtype to fall back on)."
+        )
+    return manager_cls(device=info.device, dtype=dtype, config=config)
 
 
 class RaggedAttnManager(AttentionResource):
@@ -25,18 +39,19 @@ class RaggedAttnManager(AttentionResource):
             FlashInferRaggedManager,
         )
 
-        config = spec.config
-        if info.joint_comm_group is not None:
-            config.shard(info.joint_comm_group.world_size)
-        dtype = config.dtype if config.dtype is not None else info.kv_dtype
-        if dtype is None:
-            raise ValueError(
-                f"ragged attention {spec.resource_key!r}: no activation dtype. Set "
-                "RaggedAttentionConfig.dtype on a node without a KV-backed attention "
-                "(the engine has no KV dtype to fall back on)."
-            )
-        return FlashInferRaggedManager(
-            device=info.device,
-            dtype=dtype,
-            config=config,
+        return _build_ragged(spec, info, FlashInferRaggedManager)
+
+
+class RaggedCrossAttnManager(AttentionResource):
+    """Cacheless cross-attention between two spans of each request; see
+    ``RaggedCrossAttentionSpec``."""
+
+    prefix_skip_safe = True
+
+    @classmethod
+    def build(cls, spec: RaggedCrossAttentionSpec, info: EngineResourceInfo):
+        from mstar.engine.resources.attn.ragged.flashinfer import (
+            FlashInferRaggedCrossManager,
         )
+
+        return _build_ragged(spec, info, FlashInferRaggedCrossManager)
