@@ -41,6 +41,12 @@ class PositionConfig:
     rope_scale: float = 1.0
     rope_theta: float = 10000.0
     rope_dtype: torch.dtype | None = None
+    # Apply RoPE as torch ops over a precomputed float32 cos/sin table instead of
+    # FlashInfer's kernel (which computes sin/cos per call and is opaque to
+    # torch.compile), so a compiled forward fuses it into its neighbouring
+    # kernels. Worth it for small models whose decode step is a few kernels per
+    # layer; standard (non-interleaved, non-Llama-3.1) RoPE on CUDA only.
+    fused: bool = False
 
     low_freq_factor: float | None = None
     high_freq_factor: float | None = None

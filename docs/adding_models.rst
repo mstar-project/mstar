@@ -391,7 +391,10 @@ The spec types are:
      - Position tracking and RoPE. ``scheme`` is ``PosScheme.SEQUENTIAL`` or
        ``PosScheme.BLOCK``. The RoPE parameters are set here: ``rope_theta``,
        ``rope_scale``, and the Llama-3.1 parameters ``low_freq_factor``,
-       ``high_freq_factor`` and ``old_context_len``. A model with learned position
+       ``high_freq_factor`` and ``old_context_len``. ``fused=True`` applies standard RoPE
+       as torch ops over a cached cos/sin table instead of FlashInfer's kernel, so a
+       compiled forward fuses it into neighbouring kernels; it pays off where a decode
+       step is a handful of small kernels per layer. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
