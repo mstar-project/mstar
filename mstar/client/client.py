@@ -424,7 +424,7 @@ class MStarClient:
         text_parts: list[str] = []
         images: list[bytes] = []
         audio_pcm: list[bytes] = []
-        sample_rate = 24000
+        sample_rate, num_channels = 24000, 1
         raw: list[dict] = []
         for modality, entries in outputs.items():
             for e in entries:
@@ -438,7 +438,8 @@ class MStarClient:
                 elif modality == "audio":
                     audio_pcm.append(b)
                     sample_rate = int(meta.get("sample_rate", sample_rate))
-        audio = AudioBuffer(b"".join(audio_pcm), sample_rate) if audio_pcm else None
+                    num_channels = int(meta.get("num_channels", num_channels))
+        audio = AudioBuffer(b"".join(audio_pcm), sample_rate, num_channels) if audio_pcm else None
         return GenerateResult(
             request_id=payload.get("request_id"),
             text="".join(text_parts) if text_parts else None,

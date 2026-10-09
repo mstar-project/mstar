@@ -132,6 +132,25 @@ def test_audiobuffer_wav_bytes():
     assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE" and wav[44:] == pcm
 
 
+def test_stereo_audio_keeps_its_channels():
+    """The server's num_channels metadata reaches the WAV header and the numpy view;
+    interleaved stereo read as mono plays at half speed for twice as long."""
+    import base64
+    import io
+    import wave
+
+    from mstar.client.client import MStarClient
+
+    pcm = np.array([1, -1, 2, -2, 3, -3], dtype="<i2").tobytes()
+    payload = {"outputs": {"audio": [{
+        "data": base64.b64encode(pcm).decode(), "metadata": {"sample_rate": 48000, "num_channels": 2},
+    }]}}
+    audio = MStarClient._parse_result(payload).audio
+    assert audio.num_channels == 2 and audio.to_numpy().tolist() == [[1, -1], [2, -2], [3, -3]]
+    with wave.open(io.BytesIO(audio.wav_bytes())) as w:
+        assert (w.getnchannels(), w.getframerate(), w.getnframes()) == (2, 48000, 3)
+
+
 def test_build_files_accepts_one_filename_bytes_pair():
     """A bare ``(filename, bytes)`` pair is one upload, not two items (the SDK docstring's contract)."""
     from mstar.client.client import MStarClient
