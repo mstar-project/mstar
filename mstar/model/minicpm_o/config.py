@@ -159,6 +159,8 @@ class TTSSampling:
     temperature: float = 0.8
     top_p: float = 0.85
     top_k: int = 25
+    # HF's TopPLogitsWarper min_tokens_to_keep in upstream's sampler
+    top_p_min_keep: int = 3
     repetition_penalty: float = 1.05
     # the frequency penalty counts the last this-many codes
     penalty_window: int = 16

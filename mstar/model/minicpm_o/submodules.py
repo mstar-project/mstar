@@ -42,7 +42,6 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
-from mstar.model.minicpm_o.components.tts import next_history, windowed_frequency_penalty
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
@@ -536,24 +535,21 @@ TTS_DECODE_LOOP = "tts_decode_loop"
 
 
 class TTSSubmodule(ARNodeSubmodule):
-    # A reply's text plus two: at most a few hundred rows, once per request
-    PREFILL_TOKEN_BUCKETS = [64, 128, 256, 512]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
-
     """The speech-token LM. ``tts_prefill`` reads the whole reply (upstream's
     ``chat`` speaks only once the text is done) and samples the first code;
     ``tts_decode`` feeds each code back until the EOS code.
 
-    Upstream's per-step logits processing, in its order:
-      * the window-16 frequency penalty (skipped for the first code), applied
-        here as a pure tensor op over the last codes;
-      * EOS masked until ``min_new_tokens`` codes exist.
-    Both read ``tts_history``, which rides the loop edge instead of living in
-    host state: the last ``penalty_window`` codes (-1 for none yet), then the
-    number of codes generated so far. Nothing per row crosses from the host.
-    then the sampler resource: temperature, top-k/top-p, draw.
+    Sampling is the sampler resource's, set up as upstream's TTS sampler
+    (``get_request_resource_configs``): temperature, a frequency penalty over
+    the last 16 codes, top-p then top-k, and EOS barred until 50 codes exist.
+    Upstream samples the first code with temperature and the EOS floor only, so
+    the prefill walk declares its sampler step without filters.
     """
+
+    # A reply's text plus two: at most a few hundred rows, once per request
+    PREFILL_TOKEN_BUCKETS = [64, 128, 256, 512]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
     def __init__(self, model, config: MiniCPMOConfig, sampling):
         super().__init__()
@@ -565,21 +561,17 @@ class TTSSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
         hidden = self.config_tts.hidden_size
 
-        def extras() -> dict[str, torch.Tensor]:
-            return {"history": self._empty_history(device)}
-
         def prefill_dummy(n: int) -> ARNodeInputs:
             return ARNodeInputs(
                 input_embeds=torch.zeros(n, hidden, device=device, dtype=self.model.emb_code.weight.dtype),
-                input_seq_len=n, tensor_inputs=extras(),
+                input_seq_len=n,
             )
 
         return [
             BatchedCudaGraphConfig(
                 capture_graph_walk=TTS_DECODE,
                 single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
-                    input_seq_len=1, tensor_inputs=extras(),
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=1,
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             ),
@@ -607,26 +599,8 @@ class TTSSubmodule(ARNodeSubmodule):
             ids = torch.cat([t.reshape(-1) for t in inputs["tts_ids"]]).to(device)
             hidden = torch.cat([t.reshape(-1, t.shape[-1]) for t in inputs["tts_hidden"]]).to(device)
             embeds = self.model.condition(ids, hidden)
-            history = self._empty_history(device)
-        else:
-            embeds = None
-            history = inputs["tts_history"][0].reshape(-1).to(device)
-        return ARNodeInputs(
-            input_seq_len=1 if embeds is None else embeds.shape[0],
-            input_ids=None if embeds is not None else inputs["tts_code"][0].reshape(1).to(device),
-            input_embeds=embeds,
-            tensor_inputs={"history": history},
-        )
-
-    def _empty_history(self, device: torch.device) -> torch.Tensor:
-        """No codes yet: ``penalty_window`` empty slots and a count of 0. Cloned
-        from a cached template, so a prefill launches one copy and no H2D."""
-        template = getattr(self, "_history_template", None)
-        if template is None or template.device != device:
-            template = torch.full((self.sampling.penalty_window + 1,), -1, dtype=torch.long)
-            template[-1] = 0
-            self._history_template = template = template.to(device)
-        return template.clone()
+            return ARNodeInputs(input_seq_len=embeds.shape[0], input_embeds=embeds)
+        return ARNodeInputs(input_seq_len=1, input_ids=inputs["tts_code"][0].reshape(1).to(device))
 
     def preprocess(
         self,
@@ -635,13 +609,8 @@ class TTSSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, Any]:
         if inputs[0].input_ids is not None:
-            embeds = self.model.emb_code(torch.cat([inp.input_ids for inp in inputs]))
-        else:
-            embeds = torch.cat([inp.input_embeds for inp in inputs])
-        return {
-            "input_embeds": embeds,
-            "history": torch.stack([inp.tensor_inputs["history"] for inp in inputs]),
-        }
+            return {"input_embeds": self.model.emb_code(torch.cat([inp.input_ids for inp in inputs]))}
+        return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs])}
 
     def declare_step(
         self,
@@ -659,8 +628,9 @@ class TTSSubmodule(ARNodeSubmodule):
                 TTS_KV: KVStep(),
                 TTS_ATTN: AttentionStep(causal=True),
                 TTS_POS: PositionStep(),
-                # the window penalty is applied before sampling, here
-                TTS_SAMPLER: SamplerStep(apply_penalty=False),
+                # the windowed penalty is the sampler's own history, not the
+                # presence mask `apply_penalty` drives
+                TTS_SAMPLER: SamplerStep(apply_penalty=False, apply_filters=graph_walk != TTS_PREFILL),
             },
         )
 
@@ -669,29 +639,14 @@ class TTSSubmodule(ARNodeSubmodule):
     # ------------------------------------------------------------------
 
     def _forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        input_embeds: torch.Tensor,
-        history: torch.Tensor,
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         attn: AttentionManager = engine_inputs.resources[TTS_ATTN]
         sampler: SamplerResource = engine_inputs.resources[TTS_SAMPLER]
         hidden = self.model.model(input_embeds, label="main")
         if graph_walk != TTS_DECODE:
             hidden = attn.select_last_hidden(hidden)
-        logits = self.model.logits(hidden)
-        recent, generated = history[:, :-1], history[:, -1:]
-        if graph_walk == TTS_DECODE:
-            logits = windowed_frequency_penalty(logits, recent, self.sampling.repetition_penalty)
-        eos = self.model.config.eos_code
-        suppress_eos = generated[:, 0] < self.sampling.min_new_tokens
-        logits[:, eos] = torch.where(suppress_eos, float("-inf"), logits[:, eos])
-        code = sampler.sample(engine_inputs.request_ids, logits=logits)
-        return {
-            "tts_code": code,
-            "tts_history": next_history(history, code),
-        }
+        return {"tts_code": sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))}
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
         return {k: [v] for k, v in self._forward(graph_walk, engine_inputs, **kwargs).items()}

@@ -177,24 +177,3 @@ class MiniCPMTTS(nn.Module):
             raise RuntimeError(
                 f"MiniCPM-o checkpoint left {len(missing)} TTS parameter(s) unloaded, e.g. {missing[:5]}"
             )
-
-
-def next_history(history: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
-    """``history [B, W + 1]`` (the last ``W`` codes, -1 for none yet, then the number
-    generated so far) after sampling ``codes [B]``."""
-    recent, generated = history[:, :-1], history[:, -1:]
-    return torch.cat([recent[:, 1:], codes.reshape(-1, 1).to(history.dtype), generated + 1], dim=1)
-
-
-def windowed_frequency_penalty(
-    logits: torch.Tensor, recent: torch.Tensor, penalty: float,
-) -> torch.Tensor:
-    """Upstream's ``CustomRepetitionPenaltyLogitsProcessorRepeat``: each code's
-    logit is divided (positive) or multiplied (negative) by ``penalty ** n``,
-    ``n`` its count among the ``recent`` codes (``[B, W]``, -1 for empty).
-    Pure tensor ops, so it runs inside a captured graph."""
-    counts = torch.zeros_like(logits)
-    valid = recent >= 0
-    counts.scatter_add_(1, recent.clamp(min=0), valid.to(logits.dtype))
-    alpha = torch.pow(torch.full_like(counts, penalty), counts)
-    return torch.where(logits > 0, logits / alpha, logits * alpha)

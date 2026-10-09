@@ -14,7 +14,6 @@ import numpy as np
 import pytest
 import torch
 
-from mstar.model.minicpm_o.components.tts import next_history, windowed_frequency_penalty
 from mstar.model.minicpm_o.components.vision import Resampler, navit_position_ids, slice_layout
 from mstar.model.minicpm_o.config import ResamplerConfig, VisionConfig
 
@@ -61,20 +60,6 @@ def test_sincos_keys_match_upstream_table(hw):
 @pytest.mark.parametrize("hw", [(26, 40), (32, 32), (7, 69), (70, 70), (100, 3)])
 def test_navit_position_buckets_match_upstream(hw):
     assert torch.equal(navit_position_ids(*hw, 70), upstream_navit_ids(*hw, 70))
-
-
-def test_tts_history_counts_codes_and_keeps_the_window():
-    window = 4
-    history = torch.tensor([[-1] * window + [0]] * 2)
-    codes = [torch.tensor([10, 20]), torch.tensor([11, 21]), torch.tensor([12, 22]),
-             torch.tensor([13, 23]), torch.tensor([14, 24])]
-    for c in codes:
-        history = next_history(history, c)
-    assert history.tolist() == [[11, 12, 13, 14, 5], [21, 22, 23, 24, 5]]
-    # empty slots count for nothing in the penalty; a repeated code twice
-    logits = torch.ones(1, 30)
-    out = windowed_frequency_penalty(logits, torch.tensor([[-1, -1, 7, 7]]), 2.0)
-    assert out[0, 7] == 0.25 and (out[0, :7] == 1).all() and out[0, 0] == 1
 
 
 def test_slice_layout_concatenates_slices_in_order():

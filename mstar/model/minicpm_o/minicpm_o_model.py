@@ -306,10 +306,13 @@ class MiniCPMOModel(Model):
                 # its GPU time (on the LLM it measured slower at batch 32)
                 config=PositionConfig(kv_cache=TTS_KV, rope_theta=tts.rope_theta, fused=True),
             ),
-            # the window frequency penalty runs in the TTS forward, before this
+            # upstream's TTS sampling (see TTSSubmodule)
             SamplerSpec(
                 resource_key=TTS_SAMPLER, nodes={TTS},
                 vocab_size=tts.num_audio_tokens, enable_repetion_penalty=False,
+                max_repetition_window=TTS_SAMPLING.penalty_window,
+                min_tokens_stop_ids=(tts.eos_code,),
+                enable_top_p_first=True,
             ),
         ]
 
@@ -324,7 +327,11 @@ class MiniCPMOModel(Model):
         tts = TTS_SAMPLING
         return {
             LLM_SAMPLER: SamplingReqConfig(**knobs),
-            TTS_SAMPLER: SamplingReqConfig(temperature=tts.temperature, top_p=tts.top_p, top_k=tts.top_k),
+            TTS_SAMPLER: SamplingReqConfig(
+                temperature=tts.temperature, top_p=tts.top_p, top_k=tts.top_k,
+                repetition_penalty=tts.repetition_penalty, repetition_window=tts.penalty_window,
+                min_tokens=tts.min_new_tokens, top_p_first=True, top_p_min_keep=tts.top_p_min_keep,
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -379,17 +386,15 @@ class MiniCPMOModel(Model):
             name=TTS, input_names=["tts_ids", "tts_hidden"],
             outputs=tts_outputs + [
                 GraphEdge(next_node=EMPTY_DESTINATION, name="tts_code", persist=True),
-                GraphEdge(next_node=EMPTY_DESTINATION, name="tts_history", persist=True),
             ],
         )
         tts_decode = Loop(
             name=TTS_DECODE_LOOP,
             section=GraphNode(
                 name=TTS,
-                input_names=["tts_code", "tts_history"],
+                input_names=["tts_code"],
                 outputs=tts_outputs + [
                     GraphEdge(next_node=TTS, name="tts_code"),
-                    GraphEdge(next_node=TTS, name="tts_history"),
                 ],
             ),
             max_iters=TTS_SAMPLING.max_new_tokens,
@@ -714,7 +719,7 @@ class MiniCPMOModel(Model):
             inputs = self._carry(TTS, ("tts_ids", "tts_hidden"), persist_signals)
         elif walk == TTS_PREFILL:
             metadata.graph_walk = TTS_DECODE
-            inputs = self._carry(TTS, ("tts_code", "tts_history"), persist_signals)
+            inputs = self._carry(TTS, ("tts_code",), persist_signals)
         else:
             return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True)
         return ForwardPassArgs(
