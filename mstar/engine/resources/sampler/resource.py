@@ -233,13 +233,15 @@ class SamplerResource(Resource):
     def plan(self, step: SamplerStep, ctx: StepContext):
         self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan and self._penalty_live:
+            configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
-                self._sampler.get_token_mask(rid).add_tokens(tokens)
+                if configs[rid].penalize_prompt:
+                    self._sampler.get_token_mask(rid).add_tokens(tokens)
             # dropped as they are used: `plan` runs on every step of a resident
             # request, and these belong to the one prefill that was cut
             for rid in ctx.request_ids:
                 skipped = self._cached_prefix.pop(rid, None)
-                if skipped is not None:
+                if skipped is not None and configs[rid].penalize_prompt:
                     self._sampler.get_token_mask(rid).add_tokens(skipped)
 
         # A step planned ahead promotes here. Its static config was gathered in
@@ -341,4 +343,6 @@ class SamplerResource(Resource):
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step
             )
-        return self._sampler.sample(request_ids, logits)
+        return self._sampler.sample(
+            request_ids, logits, apply_penalty=self._apply_penalty_this_step,
+        )

@@ -473,6 +473,25 @@ def apply_min_p(probs: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
     return kept / kept.sum(dim=-1, keepdim=True)
 
 
+# Temperatures below this are greedy: past it 1/T overflows fp32 and the paths disagree.
+GREEDY_TEMPERATURE = 1e-5
+
+
+def canonical_sampling_values(
+    temperature, top_k, top_p, min_p,
+) -> tuple[float, int, float, float]:
+    """The one meaning of each knob, applied before either sampler reads it.
+
+    ``temperature`` below ``GREEDY_TEMPERATURE`` is greedy (0). A greedy row
+    ignores top-k / top-p / min-p, so they are written as off.
+    """
+    if temperature < GREEDY_TEMPERATURE:
+        return 0.0, 0, 1.0, 0.0
+    # any top_k past the vocab is off; past int32 it would not even fit the buffers
+    top_k = int(top_k) if int(top_k) < 2**31 else 0
+    return float(temperature), top_k, float(top_p), float(min_p)
+
+
 @dataclass
 class SamplingConfig:
     # Sizes the per-request seen-token mask for the repetition penalty. When set,
@@ -486,6 +505,8 @@ class SamplingConfig:
     ignore_eos: bool = False # used for benchmark parity
     repetition_penalty: float = 1
     min_p: float = 0.0  # 0 = disabled; see ``SamplingReqConfig.min_p``
+    # whether the penalty also counts the prompt's tokens; see ``SamplingReqConfig``
+    penalize_prompt: bool = True
     _seed: int = 0 # set by the conductor
 
     def set_seed(self, seed: int):
@@ -582,10 +603,17 @@ class Sampler(BaseSampler):
     def set_config(self, request_id: str, **kwargs):
         old_vocab_size = self._sampling_config[request_id].vocab_size
         curr_config = asdict(self._sampling_config[request_id])
-        kwargs = {k: arg for k, arg in kwargs.items() if k in curr_config.keys()}
-        self._sampling_config[request_id] = SamplingConfig(**{
-            **curr_config, **kwargs
-        })
+        # None is "not set": it keeps the current value rather than replacing it
+        kwargs = {
+            k: arg for k, arg in kwargs.items()
+            if k in curr_config.keys() and arg is not None
+        }
+        merged = {**curr_config, **kwargs}
+        (merged["temperature"], merged["top_k"], merged["top_p"],
+         merged["min_p"]) = canonical_sampling_values(
+            merged["temperature"], merged["top_k"], merged["top_p"], merged["min_p"],
+        )
+        self._sampling_config[request_id] = SamplingConfig(**merged)
 
         new_vocab_size = self._sampling_config[request_id].vocab_size
         if old_vocab_size != new_vocab_size:
@@ -598,7 +626,8 @@ class Sampler(BaseSampler):
     # sampling runs inside the forward; nothing here is worth tracing
     @torch.compiler.disable
     def sample(
-        self, request_ids: list[str], logits: torch.Tensor, **kwargs
+        self, request_ids: list[str], logits: torch.Tensor,
+        apply_penalty: bool = True, **kwargs
     ) -> torch.Tensor:
         """Return the sampled tokens as a single [B] int tensor.
 
@@ -606,6 +635,9 @@ class Sampler(BaseSampler):
         the rid order in `request_ids`. We return the raw tensor (instead of
         a dict of views) because constructing the dict adds Python overhead
         the hot path doesn't need.
+
+        ``apply_penalty`` False skips the repetition penalty, as the captured
+        sampler does for a node or step without it.
         """
         configs = [self._sampling_config[rid] for rid in request_ids]
         temperature = torch.tensor([c.temperature for c in configs], device=logits.device)
@@ -622,7 +654,7 @@ class Sampler(BaseSampler):
             device=logits.device, dtype=torch.long,
         )
 
-        any_rep_pen = any(c.repetition_penalty != 1.0 for c in configs)
+        any_rep_pen = apply_penalty and any(c.repetition_penalty != 1.0 for c in configs)
         any_greedy = any(c.temperature == 0 for c in configs)
         top_k_zero_count = sum(c.top_k == 0 for c in configs)
 
@@ -734,6 +766,8 @@ def _sample_cuda(
         )
         if min_p is not None:
             probs = apply_min_p(probs, min_p)
+        # top_k 0 is off: FlashInfer reads it as k=0, so a mixed batch's 0 rows drew token 0
+        top_k = torch.where(top_k > 0, top_k, logits.shape[1])
         result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
             probs, top_k, top_p,
             deterministic=True,
@@ -999,10 +1033,10 @@ def sample_cuda_graphable_gpu(
         if min_p is not None:
             probs = apply_min_p(probs, min_p)
         top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-        # NOTE: this is NOT batch-invariant — flashinfer's deterministic RNG
-        # folds the batch row index into philox, so identical (probs, seed,
-        # offset) yield different tokens at different batch positions. Sampling
-        # is thus reproducible only within a fixed batch layout; under
+        # NOTE: this is NOT batch-invariant. FlashInfer reads only row 0's seed
+        # and offset and folds the row index into philox, so identical (probs,
+        # seed, offset) yield different tokens at different batch positions.
+        # Sampling is thus reproducible only within a fixed batch layout; under
         # continuous batching (shifting positions) a request's stream is not.
         # Measured in test/sampling_test/flashinfer_batch_test.py.
         samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
@@ -1351,9 +1385,9 @@ class SamplerBuffers:
         """Allocate sampling buffers for ``max_batch_size``.
 
         ``vocab_size`` (when not None) enables the seen-token mask buffer for the
-        repetition penalty. The master rows default to a ``SamplingConfig()`` row
-        (temp=1, top_k=0, top_p=1, rep_penalty=1) — what an unregistered slot
-        would surface if accidentally indexed. ``cg_slots`` double-buffers the
+        repetition penalty. The master rows default to temp=1, top_k=0, top_p=1,
+        rep_penalty=1; padding rows read slot 0, whose row may be a live
+        request's. ``cg_slots`` double-buffers the
         per-step tensors so the sampler can pre-plan.
         """
         pinned = torch.cuda.is_available() and device.type == "cuda"
@@ -1418,22 +1452,18 @@ class SamplerBuffers:
         mask is NOT written here (it changes every step — see
         ``update_request_config``).
         """
-        if cfg.temperature > 0:
-            t = float(cfg.temperature)
-            k = int(cfg.top_k)
-            p = float(cfg.top_p) if cfg.top_p else 1.0
-        else:
-            # Greedy: temperature 0 -> the fused prep kernel emits a one-hot at
-            # argmax (first index on ties), which from_probs returns for any
-            # seed. See ``sample_cuda_graphable_gpu``.
-            t, k, p = 0.0, 0, 1.0
+        # the eager sampler's canonical values (greedy: the prep kernel's
+        # one-hot at argmax, filters off), so both paths read one meaning
+        t, k, p, m = canonical_sampling_values(
+            cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p,
+        )
         self.temperature.write_master_row(slot, t)
         self.top_k.write_master_row(slot, k)
         self.top_p.write_master_row(slot, p)
         self.seed.write_master_row(slot, cfg.seed)
         self.rep_penalty.write_master_row(slot, float(cfg.repetition_penalty))
         if self.min_p is not None:
-            self.min_p.write_master_row(slot, float(cfg.min_p) if cfg.temperature > 0 else 0.0)
+            self.min_p.write_master_row(slot, m)
         self._config_version += 1
 
     def _grow_master(self, new_capacity: int) -> None:
