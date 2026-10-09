@@ -295,6 +295,12 @@ class ExecutingBatch:
     # the resource that ran out, so an eviction can be scoped to it
     failed_resource: str | None = None
 
+    # Every output signal of this step stays on the device (the node's
+    # ``device_loopback_signals``): collect builds no per-request output
+    # dicts and the per-request ``postprocess`` is skipped; the stop check,
+    # the inline emit and the speculation splice read the rows instead.
+    rows_only: bool = False
+
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
     outputs: BatchedModelOutput = field(default_factory=BatchedModelOutput)
@@ -973,6 +979,7 @@ class Engine:
                     submodule_mgmt, lease, raw, inputs, req_info,
                     request_ids=batch.request_ids,
                     step_request_ids=batch.step_context.padded_request_ids,
+                    rows_only=batch.rows_only,
                 )
             finally:
                 if PHASE_PERIOD:
@@ -1391,7 +1398,8 @@ class Engine:
         outputs = self.exec(batch)
         # A failed admit means no forward ran and every rid's outputs are empty,
         # so the tail has nothing to consume; the worker re-drives the step.
-        if batch.admit_error is None:
+        # A rows-only step has no per-request outputs for a tail to work on.
+        if batch.admit_error is None and not batch.rows_only:
             self.postprocess_batch(batch, outputs)
         return outputs
 
@@ -1536,9 +1544,15 @@ class Engine:
         req_info: Mapping[str, CurrentForwardPassInfo],
         request_ids: list[str],
         step_request_ids: tuple[str, ...],
+        rows_only: bool = False,
     ) -> BatchedModelOutput:
         """Per-rid outputs for the real requests: drop the padding rows and map
         a captured graph's keys back to real ids.
+
+        ``rows_only`` (see ``ExecutingBatch.rows_only``) keeps the row views
+        and the stop buffers but builds no per-rid dicts: nothing downstream
+        reads them on such a step, and at 128 rows they were a few hundred
+        allocations on the gpu thread.
 
         A captured forward emits its per-rid entries under the slot's padding
         ids (those were the batch at capture time), so entry ``i`` belongs to
@@ -1553,6 +1567,7 @@ class Engine:
 
         row_clones, row_views = self._merge_per_rid(
             outputs, raw_outputs, request_ids, out_ids, submodule, req_info,
+            rows_only=rows_only,
         )
         self._merge_unpacked(
             outputs, raw_outputs, request_ids, submodule,
@@ -1560,6 +1575,7 @@ class Engine:
         )
         return BatchedModelOutput(
             per_rid_outputs=outputs,
+            rows_only=rows_only and not outputs,
             # the stop buffer that is a row output shares its clone: one copy
             # of the sampled tokens per step, not two
             check_stop_buffers=raw_outputs.clone_check_stop_buffers(
@@ -1579,6 +1595,7 @@ class Engine:
         out_ids: list[str],
         submodule: NodeSubmodule,
         req_info: Mapping[str, CurrentForwardPassInfo],
+        rows_only: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[torch.Tensor, ...]] | None]:
         """Fold the forward's per-rid entries into ``outputs``.
 
@@ -1605,7 +1622,7 @@ class Engine:
                 for name, tensor in row_clones.items()
                 if isinstance(tensor, torch.Tensor) and tensor.dim()
             }
-            if row_views:
+            if row_views and not rows_only:
                 for i, rid in enumerate(request_ids):
                     merged = outputs.setdefault(rid, {})
                     for name, views in row_views.items():
