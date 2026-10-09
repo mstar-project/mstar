@@ -201,6 +201,17 @@ There are two ``ResourceReqConfig`` subclasses:
   per-request seed. ``min_p`` follows the HF processor order (after the penalty and
   temperature, before top-k/top-p) and needs ``enable_min_p=True`` on the node's
   ``SamplerSpec``, which adds the filter to that node's captured sampler only.
+  Further knobs, each needing a ``SamplerSpec`` capability (CUDA only):
+
+  - ``repetition_window`` (``max_repetition_window``): the penalty counts a token's
+    occurrences in the last N generated tokens, ``repetition_penalty ** n``.
+  - ``min_tokens`` (``min_tokens_stop_ids``): those ids are barred until
+    ``min_tokens`` tokens exist; applied after top-k/top-p.
+  - ``top_p_first``, ``top_p_min_keep`` (``enable_top_p_first``): HF's order (top-p,
+    then top-k) instead of FlashInfer's, and HF's ``min_tokens_to_keep``.
+
+  ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
+  TTS's first code); declare it the same way on every step of a walk.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
@@ -389,6 +400,9 @@ The spec types are:
        intention. It selects which kernel variant is recorded into the captured graph.
        Whether the penalty runs on a given step is decided from the
        ``repetition_penalty`` values of the resident requests.
+       ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
+       ``enable_top_p_first`` are capabilities of the same kind. See
+       ``SamplingReqConfig`` above.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
