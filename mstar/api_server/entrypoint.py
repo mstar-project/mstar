@@ -20,6 +20,8 @@ from typing import Any, Optional
 import msgpack
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
@@ -34,6 +36,7 @@ from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
 from mstar.utils.exitcode import describe_exitcode
+from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 
@@ -383,6 +386,17 @@ class APIServer:
     # Submitting a request
     # ----------------------------------------------------------
 
+    def _report_ignored_params(self, model_kwargs: dict) -> None:
+        """Log the keys the model does not read; the request is served regardless."""
+        model = getattr(self, "model", None)
+        declared = model.request_kwargs() if model is not None else None
+        if declared is None:
+            return
+        ignored = sorted(set(model_kwargs) - declared - SERVER_KWARGS)
+        if not ignored:
+            return
+        logger.warning("Ignoring model_kwargs this model does not read: %s", ignored)
+
     def submit_request(
         self,
         *,
@@ -417,6 +431,10 @@ class APIServer:
                 f"Output modality {names} requires streaming=True; raw frame "
                 "chunks cannot be returned as an aggregated response."
             )
+        # here, before anything is queued: null is unset, types and ranges are
+        # checked once for every endpoint, and an over-wide seed cannot be packed
+        model_kwargs = normalize_generation_kwargs(model_kwargs)
+        self._report_ignored_params(model_kwargs)
 
         # Register pending request
         with self.request_lock:
@@ -734,7 +752,7 @@ class APIServer:
             if not finished:
                 self.abort_request(request_id)
 
-    def async_stream_results(self, request_id: str, binary: bool = False):
+    def async_stream_results(self, request_id: str, binary: bool = False, chunks=None):
         """Yield the serialized body of ``/generate`` one piece at a time.
 
         ``binary`` selects the length-framed form negotiated through ``Accept``.
@@ -744,13 +762,42 @@ class APIServer:
         Deliberately a plain ``def`` returning the chosen async generator rather
         than an ``async def`` delegating to it: the branch is per-request, not
         per-chunk, and this keeps both bodies flat.
-        """
-        if binary:
-            return self._stream_binary(request_id)
-        return self._stream_ndjson(request_id)
 
-    async def _stream_ndjson(self, request_id: str):
-        async for chunk in self.iter_result_chunks(request_id):
+        ``chunks`` is the request's ``ResultChunk`` iterator when the caller has
+        already read from it (``open_result_stream``); None opens a fresh one.
+        """
+        chunks = chunks if chunks is not None else self.iter_result_chunks(request_id)
+        if binary:
+            return self._stream_binary(chunks)
+        return self._stream_ndjson(chunks)
+
+    async def open_result_stream(self, request_id: str):
+        """The request's chunk iterator, after its first chunk has arrived.
+
+        A request the engine refuses (a 400 from admission, a failed worker)
+        raises ``HTTPException`` with its status here, before the caller commits
+        a 200. Otherwise the returned iterator yields the first chunk again.
+        """
+        chunks = self.iter_result_chunks(request_id)
+        first = await anext(chunks, None)
+        if first is not None and first.modality == "error":
+            # read to the end, so the finished request is not aborted
+            async for _ in chunks:
+                pass
+            raise HTTPException(
+                status_code=int((first.metadata or {}).get("status", 500)),
+                detail=bytes(first.data).decode("utf-8", "replace"),
+            )
+
+        async def replay():
+            if first is not None:
+                yield first
+            async for chunk in chunks:
+                yield chunk
+        return replay()
+
+    async def _stream_ndjson(self, chunks):
+        async for chunk in chunks:
             line = self._chunk_to_ndjson(chunk)
             if not self.enable_nvtx:
                 yield line
@@ -766,8 +813,8 @@ class APIServer:
             finally:
                 profiler.range_pop()
 
-    async def _stream_binary(self, request_id: str):
-        async for chunk in self.iter_result_chunks(request_id):
+    async def _stream_binary(self, chunks):
+        async for chunk in chunks:
             header, payload = _chunk_to_binary_frame(chunk)
             # Two yields rather than one concatenation: joining them would copy
             # the whole payload to prepend ~100 bytes, which is the class of
@@ -1050,6 +1097,22 @@ app = FastAPI(
     description="Multimodal Inference API",
     root_path=os.environ.get("MSTAR_ROOT_PATH", ""),
 )
+# keys the server itself reads for every model
+SERVER_KWARGS = frozenset({"seed", "max_output_tokens", "prefix_cache"})
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error(request: Request, exc: RequestValidationError):
+    """A body that fails its schema is a 400 like every other refused input,
+    in the envelope of the route family it was sent to."""
+    if request.url.path.startswith("/v1/"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {
+                "message": str(exc.errors()), "type": "invalid_request_error", "code": 400,
+            }},
+        )
+    return JSONResponse(status_code=400, content={"detail": jsonable_encoder(exc.errors())})
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1247,8 +1310,13 @@ async def generate_ws(websocket: WebSocket):
             raise
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
             logger.exception("generate/ws request failed")
+            # the status /generate would have answered with
+            status = getattr(exc, "status_code", 400 if isinstance(exc, (ValueError, TypeError)) else 500)
             try:
-                await send({"request_id": request_id, "error": str(exc)}, binary)
+                await send({
+                    "request_id": request_id, "error": str(getattr(exc, "detail", exc)),
+                    "status": status,
+                }, binary)
             except Exception:  # noqa: BLE001
                 pass
         finally:
@@ -1388,24 +1456,31 @@ async def generate(
         )
 
     try:
-        request_id = api_server.submit_request(
-            text=text,
-            file_paths=file_paths or None,
-            input_modalities=in_mods,
-            output_modalities=out_mods,
-            model_kwargs=parsed_kwargs,
-            prompt_parts=parts or None,
-            streaming=streaming,
-            request_id=request_id,
-        )
+        try:
+            request_id = api_server.submit_request(
+                text=text,
+                file_paths=file_paths or None,
+                input_modalities=in_mods,
+                output_modalities=out_mods,
+                model_kwargs=parsed_kwargs,
+                prompt_parts=parts or None,
+                streaming=streaming,
+                request_id=request_id,
+            )
+        except json.JSONDecodeError:
+            raise   # a downstream parse failure, not a bad request (a 500 below)
+        except ValueError as e:   # submit_request's refusals are the client's fault
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
         if streaming:
             # Substring match, not RFC 7231 q-value parsing: the value is a
             # private vendor type that appears in no other media range, and a
             # client that does not ask for it keeps the historical NDJSON body.
             binary = BINARY_STREAM_MEDIA_TYPE in request.headers.get("accept", "")
+            # wait for the first chunk: a refused request gets its real status, not a 200
+            chunks = await api_server.open_result_stream(request_id)
             return StreamingResponse(
-                api_server.async_stream_results(request_id, binary=binary),
+                api_server.async_stream_results(request_id, binary=binary, chunks=chunks),
                 media_type=BINARY_STREAM_MEDIA_TYPE if binary else NDJSON_STREAM_MEDIA_TYPE,
                 headers={"Cache-Control": "no-cache", "Vary": "Accept"},
             )

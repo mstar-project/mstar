@@ -126,7 +126,8 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
         },
     )
     assert r.status_code == 400
-    assert r.json()["error"]["type"] == "server_error"
+    # a refused input is the client's error, on every route
+    assert r.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_chat_audio_output(client_and_stub):
@@ -400,7 +401,9 @@ def test_images_edits_forwards_size(client_and_stub):
         data={"prompt": "make it neon", "size": "768x1024"},
     )
     assert resp.status_code == 200
-    assert stub.last_submit["model_kwargs"].get("size") == "768x1024"
+    # BAGEL reads width / height, so the adapter maps "WxH" onto them
+    mk = stub.last_submit["model_kwargs"]
+    assert (mk.get("width"), mk.get("height"), "size" in mk) == (768, 1024, False)
 
 
 def test_image_routes_report_validation_errors_as_400(client_and_stub):

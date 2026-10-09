@@ -167,8 +167,8 @@ def _apply_sampling(
     """Map the OpenAI-standard sampling fields onto a model's ``model_kwargs``.
 
     Behavior is common across models, but the target key names differ (e.g.
-    Qwen3-Omni's Thinker uses ``thinker_temperature`` and its Talker
-    ``talker_temperature``), so callers pass them in. ``setdefault`` lets an
+    Qwen3-Omni's speech route targets its Talker with ``talker_temperature``;
+    a plain key sets a model's primary stage), so callers pass them in. ``setdefault`` lets an
     explicit ``extra_body`` value win over the standard field.
 
     Handled (the OpenAI-standard scalars): ``temperature``, ``top_p``, ``seed``,
@@ -188,7 +188,10 @@ def _apply_sampling(
     if seed is not None:
         mk.setdefault("seed", seed)
     if max_tokens_key:
-        max_tokens = getattr(req, "max_completion_tokens", None) or getattr(req, "max_tokens", None)
+        # is-not-None, not ``or``: an explicit 0 must reach validation (a 400), not fall through
+        max_tokens = getattr(req, "max_completion_tokens", None)
+        if max_tokens is None:
+            max_tokens = getattr(req, "max_tokens", None)
         if max_tokens is not None:
             mk.setdefault(max_tokens_key, max_tokens)
     return mk
@@ -282,12 +285,25 @@ class OpenAIAdapter:
         raise NotImplementedError("realtime transcription is not supported by this model")
 
 
+def _size_kwargs(size: str | None, mk: dict) -> None:
+    """OpenAI ``size`` (``WxH``) onto the model's ``width`` / ``height``."""
+    if not size:
+        return
+    try:
+        width, height = (int(v) for v in size.lower().split("x"))
+    except ValueError:
+        raise ValueError(f"size must be 'WxH' (e.g. '1024x1024'); got {size!r}") from None
+    mk.setdefault("width", width)
+    mk.setdefault("height", height)
+
+
 class BagelAdapter(OpenAIAdapter):
     """BAGEL: text chat (text out) + text-to-image / image editing.
 
-    BAGEL's ``get_sampling_config`` reads the model config, so per-request
-    ``temperature`` / ``top_p`` are not honored; ``max_output_tokens`` and
-    ``seed`` are.
+    Chat honors ``temperature`` / ``top_p`` / ``max_tokens`` / ``seed``, and
+    ``top_k`` / ``repetition_penalty`` / ``penalize_prompt`` via ``extra_body``
+    (``min_p`` is refused). Images map ``size`` (``WxH``) onto ``width`` /
+    ``height``; on an edit they bound the output, keeping the input's aspect.
     """
 
     supports_chat = True
@@ -308,6 +324,7 @@ class BagelAdapter(OpenAIAdapter):
 
     def image_to_request(self, req: ImageGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         mk = _passthrough(req)
+        _size_kwargs(getattr(req, "size", None), mk)
         if getattr(req, "seed", None) is not None:
             mk.setdefault("seed", req.seed)
         return SubmitArgs(
@@ -320,21 +337,24 @@ class BagelAdapter(OpenAIAdapter):
     def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:
         # Image editing: the input image + prompt produce an edited image
         # (BAGEL's I2I path). Extra kwargs (e.g. cfg_*_scale, seed) pass through.
+        mk = dict(extra_kwargs or {})
+        _size_kwargs(mk.pop("size", None), mk)
         return SubmitArgs(
             text=prompt,
             file_paths={"image": [image_path]},
             input_modalities=["image", "text"],
             output_modalities=["image"],
-            model_kwargs=dict(extra_kwargs or {}),
+            model_kwargs=mk,
         )
 
 
 class Qwen3OmniAdapter(OpenAIAdapter):
     """Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.
 
-    Sampling is split across three stages: the Thinker (text) takes
+    Sampling is split across three stages: the Thinker (text) takes plain or
     ``thinker_*`` keys, the Talker (speech) ``talker_*``, and the Talker's
-    CodePredictor (residual codec groups) ``code_predictor_*``. Everything
+    CodePredictor (residual codec groups) ``code_predictor_*``; a stage key wins
+    over a plain one. Everything
     except temperature/top_p is not an OpenAI field (``talker_top_k``,
     ``talker_repetition_penalty``, ``code_predictor_top_k``, …) — pass those
     via ``extra_body``.
@@ -346,7 +366,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
 
     def _voice(self, req) -> str | None:
         audio_cfg = getattr(req, "audio", None) or {}
-        if isinstance(audio_cfg, dict) and audio_cfg.get("voice"):
+        if isinstance(audio_cfg, dict) and audio_cfg.get("voice") is not None:
             return audio_cfg["voice"]
         return getattr(req, "voice", None)
 
@@ -358,7 +378,8 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         out_mods = ["text", "audio"] if want_audio else ["text"]
         _apply_sampling(req, mk, temperature_key="thinker_temperature", top_p_key="thinker_top_p")
         voice = self._voice(req)
-        if voice:
+        # is-not-None: an empty voice reaches the model, which refuses it
+        if voice is not None:
             mk["voice"] = voice
         return SubmitArgs(
             text=text,
@@ -373,7 +394,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         # Qwen3-Omni is a chat model; /v1/audio/speech returns the audio of its
         # spoken response to ``input`` (the handler keeps only the audio).
         mk = _passthrough(req)
-        if getattr(req, "voice", None):
+        if getattr(req, "voice", None) is not None:
             mk["voice"] = req.voice
         # Talker (speech) sampling; max_tokens is not an OpenAI speech field.
         _apply_sampling(req, mk, temperature_key="talker_temperature", top_p_key="talker_top_p", max_tokens_key=None)
@@ -389,11 +410,12 @@ class Qwen3_5Adapter(OpenAIAdapter):
     """Qwen3.5: text-and-image chat, text out.
 
     Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
-    ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus two
+    ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus
     non-OpenAI fields via ``extra_body``:
 
-    * ``repetition_penalty`` — the sampler applies it over the prompt's tokens
-      as well as the generated ones.
+    * ``top_k``; ``min_p`` is refused (the sampler has no min-p filter).
+    * ``repetition_penalty`` — counts the prompt's tokens as well as the
+      generated ones unless ``penalize_prompt`` is false.
     * ``enable_thinking`` (default true) — the chat template opens a
       ``<think>`` block. Set it false for short answers.
     """
@@ -415,14 +437,15 @@ class Qwen3_5Adapter(OpenAIAdapter):
 
 
 class OrpheusAdapter(OpenAIAdapter):
-    """Orpheus: text-to-speech (audio out only). Honors temperature/top_p/seed
-    (its ``get_sampling_config`` reads model_kwargs)."""
+    """Orpheus: text-to-speech (audio out only). ``temperature`` / ``top_p`` /
+    ``seed`` map directly; ``top_k``, ``repetition_penalty`` and
+    ``penalize_prompt`` travel through ``extra_body``."""
 
     supports_speech = True
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         mk = _passthrough(req)
-        if getattr(req, "voice", None):
+        if getattr(req, "voice", None) is not None:
             mk["voice"] = req.voice
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
         return SubmitArgs(
@@ -459,7 +482,8 @@ class OmniVoiceAdapter(OpenAIAdapter):
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
-        if getattr(req, "voice", None) and not mk.get("instruct"):
+        # is-not-None, so an empty voice reaches the model and is refused there
+        if getattr(req, "voice", None) is not None and mk.get("instruct") is None:
             mk["instruct"] = req.voice
         mk.pop("voice", None)
         if getattr(req, "speed", None) is not None:
@@ -472,7 +496,7 @@ class OmniVoiceAdapter(OpenAIAdapter):
         input_modalities = ["text"]
         if ref_audio:
             # A data URL, a base64 blob, a local path or (when allowed) a URL.
-            path, _mime = media_io.resolve_media_ref(
+            _modality, path = media_io.resolve_media_ref(
                 ref_audio, upload_dir, allow_remote=True
             )
             # Keyed by modality: the data worker iterates the dict and
@@ -496,7 +520,7 @@ class Qwen3TTSAdapter(OpenAIAdapter):
     OpenAI field; ``instruct`` also accepted) carries the style or voice
     description. Non-standard knobs travel through ``extra_body``:
     ``language``, ``non_streaming_mode``, ``top_k``, ``repetition_penalty``,
-    the residual-group ``subtalker_*`` sampling, ``max_new_tokens``.
+    the residual-group ``code_predictor_*`` sampling, ``max_output_tokens``.
     ``temperature`` / ``top_p`` / ``seed`` map onto the Talker sampler.
 
     Inputs of 600+ characters are synthesized as ordered sentence chunks
@@ -511,7 +535,7 @@ class Qwen3TTSAdapter(OpenAIAdapter):
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
-        if getattr(req, "voice", None):
+        if getattr(req, "voice", None) is not None:
             mk["voice"] = req.voice
         # OpenAI's field is ``instructions``; the model reads ``instruct``.
         instructions = mk.pop("instructions", None)
@@ -559,7 +583,7 @@ class KokoroAdapter(OpenAIAdapter):
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         mk = _passthrough(req)
-        if getattr(req, "voice", None):
+        if getattr(req, "voice", None) is not None:
             mk.setdefault("voice", req.voice)
         if getattr(req, "speed", None) is not None:
             mk.setdefault("speed", req.speed)
@@ -594,19 +618,20 @@ class ChatterboxAdapter(OpenAIAdapter):
     reference clip for cloning comes through ``ref_audio`` in ``extra_body``
     (a data URL or, when the server allows it, an http(s) URL; paths on the
     server are refused) and is loaded by the worker like an uploaded file.
-    The model's own knobs --
-    ``exaggeration``, ``cfg_weight``, ``min_p``, ``repetition_penalty``,
-    ``top_k``, ``n_cfm_timesteps``, ``watermark``, ``max_new_tokens`` and, for
-    the multilingual checkpoint, ``language_id`` -- pass through ``extra_body``
-    verbatim; ``temperature``/``top_p``/``seed`` are the standard fields.
-    ``speed`` is not a Chatterbox control and is dropped.
+    The model's own knobs (``exaggeration``, ``cfg_weight``, ``min_p``,
+    ``repetition_penalty``, ``top_k``, ``n_cfm_timesteps``, ``watermark``,
+    ``max_output_tokens`` and, for the multilingual checkpoint,
+    ``language_id``) pass through ``extra_body`` verbatim;
+    ``temperature``/``top_p``/``seed`` are the standard fields. Turbo refuses a
+    non-zero ``cfg_weight`` / ``exaggeration`` / ``min_p``. ``speed`` is not a
+    Chatterbox control and is reported as ignored.
     """
 
     supports_speech = True
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
-        if getattr(req, "voice", None):
+        if getattr(req, "voice", None) is not None:
             mk.setdefault("voice", req.voice)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
         file_paths = None
@@ -704,9 +729,10 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
 
     Chat requests take the OpenAI ``messages`` layout with image / video
     attachments in order; ``temperature`` / ``top_p`` / ``max_tokens`` map to
-    the reasoner's sampler, and ``extra_body`` knobs (``enable_thinking``,
-    ``top_k``, ``repetition_penalty``, ``video_fps`` / ``video_num_frames``)
-    pass through.
+    the reasoner's sampler (``max_tokens`` at most 2048), and ``extra_body``
+    knobs (``enable_thinking``, ``top_k``, ``repetition_penalty``,
+    ``penalize_prompt``, ``video_fps`` / ``video_num_frames``) pass through;
+    ``min_p`` is refused.
     """
 
     supports_chat = True
@@ -719,7 +745,8 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
         # accept it alongside a flat ``enable_thinking``.
         template_kwargs = mk.pop("chat_template_kwargs", None) or {}
         if "enable_thinking" in template_kwargs:
-            mk.setdefault("enable_thinking", bool(template_kwargs["enable_thinking"]))
+            # raw, not bool(): the model refuses a non-boolean rather than reading "false" as true
+            mk.setdefault("enable_thinking", template_kwargs["enable_thinking"])
         return SubmitArgs(
             text=text,
             file_paths=file_paths or None,
@@ -796,20 +823,9 @@ class DiffusionImageAdapter(OpenAIAdapter):
 
     supports_images = True
 
-    @staticmethod
-    def _size_kwargs(size: str | None, mk: dict) -> None:
-        if not size:
-            return
-        try:
-            width, height = (int(v) for v in size.lower().split("x"))
-        except ValueError:
-            raise ValueError(f"size must be 'WxH' (e.g. '1024x1024'); got {size!r}") from None
-        mk.setdefault("width", width)
-        mk.setdefault("height", height)
-
     def image_to_request(self, req: ImageGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         mk = _passthrough(req)
-        self._size_kwargs(getattr(req, "size", None), mk)
+        _size_kwargs(getattr(req, "size", None), mk)
         if getattr(req, "seed", None) is not None:
             mk.setdefault("seed", req.seed)
         return SubmitArgs(
@@ -821,7 +837,7 @@ class DiffusionImageAdapter(OpenAIAdapter):
 
     def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:
         mk = dict(extra_kwargs or {})
-        self._size_kwargs(mk.pop("size", None), mk)
+        _size_kwargs(mk.pop("size", None), mk)
         return SubmitArgs(
             text=prompt,
             file_paths={"image": [image_path]},
@@ -874,7 +890,9 @@ def _transcription_kwargs(req: TranscriptionRequest) -> dict:
     under their own names; ``prompt`` becomes ``initial_prompt`` (the
     conditioning text, named as faster-whisper does — ``prompt`` itself is
     the request's text argument); a timestamped ``response_format`` or an
-    explicit granularity asks the model for timestamps."""
+    explicit granularity asks the model for timestamps. Neither served ASR
+    model reads ``initial_prompt`` or ``timestamps`` yet (and Higgs-Audio not
+    ``language``), so those are logged as ignored."""
     mk = _passthrough(req)
     if req.language:
         mk.setdefault("language", req.language)
@@ -895,11 +913,12 @@ def _transcription_kwargs(req: TranscriptionRequest) -> dict:
 class WhisperAdapter(OpenAIAdapter):
     """Whisper (large-v3, large-v3-turbo): speech-to-text.
 
-    The transcript stream is Whisper's own token stream rendered as text:
-    a leading ``<|xx|>`` language token when the language was detected or
-    forced, and ``<|s.ss|>`` timestamp tokens around each segment when
-    timestamps were requested. ``parse_transcript`` lifts those into
-    :class:`Transcript`; ``stream_text`` hides them from streaming clients.
+    The transcript stream is Whisper's own token stream rendered as text.
+    ``parse_transcript`` lifts ``<|xx|>`` language and ``<|s.ss|>`` timestamp
+    tokens into :class:`Transcript` and ``stream_text`` hides them, but the model
+    today forces ``language`` (default ``en``, no detection) and
+    ``<|notimestamps|>``, so neither appears and long uploads are cut at fixed
+    window boundaries.
     """
 
     supports_transcriptions = True

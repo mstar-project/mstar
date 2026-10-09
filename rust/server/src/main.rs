@@ -250,21 +250,17 @@ fn detail_error(status: u16, message: &str) -> Response {
     (code, Json(json!({"detail": message}))).into_response()
 }
 
-/// Turn a `Json` extractor rejection into FastAPI + pydantic's `422` +
-/// `{"detail": [{"loc", "msg", "type"}]}` shape, instead of axum's default
-/// `400` + `text/plain`, so a malformed/invalid body looks the same as the
-/// Python frontend's validation error. Handlers take
+/// Turn a `Json` extractor rejection into the Python frontend's answer to a
+/// schema-invalid body: `400` in the OpenAI envelope, like every other refused
+/// input (axum's default is `400` + `text/plain`). Handlers take
 /// `Result<Json<T>, JsonRejection>` and route the error through here.
-fn json_422(rej: JsonRejection) -> Response {
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        Json(json!({"detail": [{
-            "loc": ["body"],
-            "msg": rej.body_text(),
-            "type": "value_error",
-        }]})),
-    )
-        .into_response()
+fn json_400(rej: JsonRejection) -> Response {
+    error(400, &rej.body_text(), "invalid_request_error")
+}
+
+/// The OpenAI error `type` for a status: a 4xx is the client's, the rest ours.
+fn error_type(status: u16) -> &'static str {
+    if (400..500).contains(&status) { "invalid_request_error" } else { "server_error" }
 }
 
 /// Parse a form-field boolean the way FastAPI's `bool = Form(...)` does (pydantic
@@ -334,7 +330,7 @@ fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
 /// An SSE data event carrying an OpenAI error envelope (terminal mid-stream).
 fn sse_error_event(status: u16, msg: &str) -> Event {
     Event::default().data(
-        json!({"error": {"message": msg, "type": "server_error", "code": status}}).to_string(),
+        json!({"error": {"message": msg, "type": error_type(status), "code": status}}).to_string(),
     )
 }
 
@@ -369,7 +365,7 @@ async fn chat_completions(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Chat) {
         Ok(a) => a,
@@ -397,7 +393,7 @@ async fn chat_completions(
             &st.model_name, &request_id, chunks, st.sample_rate,
         ))
         .into_response(),
-        Err((status, msg)) => error(status, &msg, "server_error"),
+        Err((status, msg)) => error(status, &msg, error_type(status)),
     }
 }
 
@@ -537,7 +533,7 @@ async fn audio_speech(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Speech) {
         Ok(a) => a,
@@ -590,7 +586,7 @@ async fn audio_speech(
 
     let chunks = match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => chunks,
-        Err((status, msg)) => return error(status, &msg, "server_error"),
+        Err((status, msg)) => return error(status, &msg, error_type(status)),
     };
     let mut pcm: Vec<u8> = Vec::new();
     for c in &chunks {
@@ -613,7 +609,7 @@ async fn images_generations(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Images) {
         Ok(a) => a,
@@ -644,7 +640,7 @@ async fn images_generations(
     for r in futures::future::join_all(futs).await {
         match r {
             Ok(chunks) => all.extend(chunks),
-            Err((status, msg)) => return error(status, &msg, "server_error"),
+            Err((status, msg)) => return error(status, &msg, error_type(status)),
         }
     }
     Json(images_response(all)).into_response()
@@ -658,7 +654,7 @@ async fn videos_generations(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Videos) {
         Ok(a) => a,
@@ -672,7 +668,7 @@ async fn videos_generations(
     let request_id = rid("vid");
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(videos_response(chunks)).into_response(),
-        Err((status, msg)) => error(status, &msg, "server_error"),
+        Err((status, msg)) => error(status, &msg, error_type(status)),
     }
 }
 
@@ -752,7 +748,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     let request_id = rid("img");
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(images_response(chunks)).into_response(),
-        Err((status, msg)) => error(status, &msg, "server_error"),
+        Err((status, msg)) => error(status, &msg, error_type(status)),
     }
 }
 

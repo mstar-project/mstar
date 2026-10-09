@@ -124,6 +124,14 @@ class RustFrontendBridge:
                 streaming=bool(msg.get("streaming", True)),
                 request_id=rid,
             )
+        except (ValueError, TypeError) as e:
+            # a refused input: an in-band error chunk carries its 400 to the client
+            logger.info("submit %s refused: %s", rid, e)
+            self._send({
+                "t": "chunk", "rid": rid, "modality": "error",
+                "data": str(e).encode("utf-8"), "metadata": {"status": 400},
+            })
+            return
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the loop
             logger.warning("submit %s failed: %r", rid, e)
             self._err(rid, repr(e))
