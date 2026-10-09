@@ -1559,6 +1559,24 @@ class Engine:
         ``request_ids[i]`` on either path.
         """
         submodule = submodule_mgmt.submodule
+        if (
+            rows_only
+            and raw_outputs.check_stop_buffers is not None
+            and not raw_outputs.per_rid_outputs
+            and not raw_outputs.packed_outputs
+            and type(submodule).filter_batched_output
+            is NodeSubmodule.filter_batched_output
+        ):
+            # No clone either: the worker takes the host copy on this thread,
+            # on this stream, right behind the step (``_stage_host_rows``), so
+            # a later replay cannot overwrite the rows first, and nothing else
+            # reads them on the device. Padded rows past the real ones ride
+            # along and are never read.
+            return BatchedModelOutput(
+                check_stop_buffers=raw_outputs.check_stop_buffers,
+                row_request_ids=tuple(request_ids),
+                rows_only=True,
+            )
         out_ids = (
             step_request_ids if lease is None
             else submodule_mgmt.cuda_graph_runner.slot_for(lease).dummy_rids
