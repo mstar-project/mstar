@@ -615,6 +615,25 @@ class Model(ABC):
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
 
+    def get_max_output_tokens_limit(self) -> int | None:
+        """The largest ``max_output_tokens`` a request may ask for; above it the
+        conductor refuses the request (a 400) rather than stopping short. None
+        is no published limit.
+
+        A model whose decode Loop is built with ``max_iters`` from the
+        kwarg-less ``get_max_output_tokens()`` must return that value: the loop
+        ends there whatever the request asked.
+        """
+        return None
+
+    def request_kwargs(self) -> frozenset[str] | None:
+        """Every ``model_kwargs`` key this model reads, including the ones an
+        OpenAI adapter maps onto it. A request carrying any other key is served,
+        and the key named in the ``X-MStar-Ignored-Params`` response header.
+        None (the default) declares nothing, so nothing is reported.
+        """
+        return None
+
     def get_autocast_dtype(self):
         return torch.bfloat16
 
