@@ -91,3 +91,37 @@ def test_the_loop_back_decode_row_is_uniform(monkeypatch):
     assert LLMSubmodule.uniform_row_inputs(_sub(_Sampler(masters=False)), "decode") is None
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
     assert LLMSubmodule.uniform_row_inputs(sub, "decode") is None
+
+
+def test_in_graph_decode_inputs_are_two_separate_knobs(monkeypatch):
+    sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]))
+    sub = _sub(sampler)
+    rows = [_prepare(sub, "decode", {}) for _ in range(2)]
+    leased = SimpleNamespace(
+        resources={SAMPLER: sampler}, request_ids=["r1", "r2"],
+        step=SimpleNamespace(ctx=SimpleNamespace(slot_lease=object(), graph_walk="decode")),
+    )
+    sub.model = SimpleNamespace(model=SimpleNamespace(
+        build_cos_sin=lambda pos, dtype: (pos, pos),
+        embed_tokens=SimpleNamespace(weight=torch.zeros(1)),
+    ))
+    sub._position_ids_3d = lambda inputs: torch.zeros(3, len(inputs))
+    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_TOKENS", raising=False)
+    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_ROPE", raising=False)
+    out = LLMSubmodule.preprocess(sub, "decode", leased, rows)
+    assert out["input_ids"].tolist() == [3, 4] and "cos_3d" in out
+    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_TOKENS", "1")
+    out = LLMSubmodule.preprocess(sub, "decode", leased, rows)
+    assert "input_ids" not in out and "cos_3d" in out
+    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_ROPE", "1")
+    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_TOKENS", raising=False)
+    out = LLMSubmodule.preprocess(sub, "decode", leased, rows)
+    assert out["input_ids"].tolist() == [3, 4] and "cos_3d" not in out
+    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_TOKENS", "1")
+    assert LLMSubmodule.preprocess(sub, "decode", leased, rows) == {}
+    eager = SimpleNamespace(
+        resources={SAMPLER: sampler}, request_ids=["r1", "r2"],
+        step=SimpleNamespace(ctx=SimpleNamespace(slot_lease=None, graph_walk="decode")),
+    )
+    out = LLMSubmodule.preprocess(sub, "decode", eager, rows)
+    assert out["input_ids"].tolist() == [3, 4] and "cos_3d" in out
