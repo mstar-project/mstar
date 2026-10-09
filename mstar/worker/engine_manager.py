@@ -170,6 +170,7 @@ class EngineManager:
             autocast_dtype=autocast_dtype,
             enable_nvtx=enable_nvtx,
             enable_profile=enable_prof,
+            gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
         )
         engine.load_model(
             submodules,

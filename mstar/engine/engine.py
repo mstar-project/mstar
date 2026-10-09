@@ -381,9 +381,16 @@ class Engine:
         autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
         enable_profile: bool=False,
+        gpu_memory_fraction: float | None = None,
     ):
+        assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
+            f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
+        )
         self._device = None
         self._autocast_dtype = autocast_dtype
+        # the share of the device this worker's allocations may hold once
+        # capture is done, None for whatever is free
+        self._gpu_memory_fraction = gpu_memory_fraction
         self._resources: dict[str, Resource] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
@@ -631,12 +638,21 @@ class Engine:
                 for bucket, cost in runner.size_captures().items()
             }
         torch.cuda.empty_cache()
-        free = torch.cuda.mem_get_info(self._device)[0]
+        free, total = torch.cuda.mem_get_info(self._device)
+        if self._gpu_memory_fraction is not None:
+            # shortcut: counts this worker's PyTorch allocations, not its CUDA
+            # context or NCCL buffers; add those if a capped worker still crowds another
+            free = min(free, int(self._gpu_memory_fraction * total) - torch.cuda.memory_reserved(self._device))
         plan = plan_captures(pools, free)
         logger.info(
             "CapturePlan[%s]: %.0f MiB free, %.0f for the largest eager step",
             self._device, free / 2**20, plan.floor / 2**20,
         )
+        if free < plan.floor:
+            logger.warning(
+                "CapturePlan[%s]: no room for graphs beside the largest eager step "
+                "(gpu_memory_fraction %s)", self._device, self._gpu_memory_fraction,
+            )
         for pool, costs in pools.items():
             if costs:
                 logger.info(
