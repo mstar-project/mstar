@@ -394,6 +394,7 @@ class ParallelSparseMoeBlock(nn.Module):
         norm_topk_prob: bool = True,
         router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         if comm_group is None:
@@ -406,6 +407,10 @@ class ParallelSparseMoeBlock(nn.Module):
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
+        # ``False`` returns this rank's partial from ``_dispatch_tp`` instead of
+        # the reduced routed output, for a caller that batches the all-reduce
+        # with the other branches of its block.
+        self.reduce_results = reduce_results
 
         self.gate = router if router is not None else TopKRouter(
             hidden_size=hidden_size,
@@ -478,7 +483,8 @@ class ParallelSparseMoeBlock(nn.Module):
         )
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
-        self.comm_group.all_reduce(output)
+        if self.reduce_results:
+            self.comm_group.all_reduce(output)
         return output
 
 
