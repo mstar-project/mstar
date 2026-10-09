@@ -83,7 +83,16 @@ Every build from the fused one onward was checked three ways before it shipped.
 
 ## Changes
 
-Changes 1-5 are from the overnight bring-up; 6-16 are later.
+Changes 1-5 are from the overnight bring-up; 6-16 are later. The bring-up was done
+on a branch cut before several engine changes landed on `main`, so the shared
+changes below are not all in this PR:
+
+- 1 (worker) is not needed: `main` reads new-token counts before releasing the
+  tensors since #324.
+- 3 (greedy sampling) landed independently as #255, and 12 (split-vocab sampler
+  prep) is superseded by `main`'s own split-V kernel.
+- 7, 13 and the `fused_experts` alignment hook from 15 are the fused-MoE PR this
+  one is stacked on; 10 (KV write) is a separate PR.
 
 ### 1. Every decode step returned HTTP 500 (`mstar/worker/worker.py`)
 
@@ -233,8 +242,6 @@ Tested against the two-step path, including ties.
 ### Smaller changes
 
 - `compute_logits` skips the multiply when `logit_scale == 1.0`.
-- `test/command_a_plus/graph_parity.py` was deleted: it deadlocked capturing NCCL
-  collectives, and `sampler_determinism.py` covers what it was written for.
 
 ## Running it
 
@@ -303,9 +310,8 @@ All under `test/command_a_plus/`, run from the repo root.
 | `validate_checkpoint.py` | `reference` mode writes HF logits and greedy outputs (run alone, needs `accelerate`); `mstar` mode (under `torchrun --nproc-per-node 4`) compares against them. The validation runs above used `--tokens 32 --max-rmse 1 --max-abs 10 --min-cosine 0.9` and were compared by RMSE, cosine and argmax |
 | `parity_http.py` | Greedy outputs and speed for 6 prompts from a live server; `--compare` diffs against an earlier run |
 | `bench_http.py` | The benchmark above. `--concurrency 1 8 32 64 --max-tokens 128` |
-| `../sampling_test/sampler_determinism.py` | Regression test for change 3; no model load, ~8 s |
 | `profile_decode.py` | Per-step latency by batch size plus a `torch.profiler` breakdown |
-| `test_fused_kernels.py` | Unit tests for every kernel in `kernels.py` and the KV scatter, plus fused-vs-unfused backbone checks |
+| `test_fused_kernels.py` | Unit tests for every kernel in `kernels.py`, plus fused-vs-unfused backbone checks |
 
 The HF reference files used above are not checked in; regenerate them with
 `reference` mode before validating further changes.
@@ -360,30 +366,21 @@ config) so a new pod is serving again in about 10 minutes.
 
 | Suite | Result |
 |---|---|
-| `test/command_a_plus/`, `test/sampling_test/`, `test/modular/test_qwen3_omni_fused_moe.py`, `test/modular/test_worker_thread_device.py` | 84 passed, 5 skipped, 134 subtests |
-| `test_ragged_attention.py` | 4 failed — **pre-existing**, reproduced on a pristine worktree of HEAD; unrelated to these changes |
+| `test/command_a_plus/`, `test/sampling_test/`, `test/modular/test_qwen3_omni_fused_moe.py`, `test/modular/test_fused_moe_config.py`, `test/modular/test_worker_thread_device.py` | 88 passed, 15 skipped (HF reference and Intel XPU), 134 subtests |
+| `test_ragged_attention.py` | 3 failed — **pre-existing**, same 3 fail on `main`; unrelated to these changes |
 
-## Files touched
+## Files touched by the performance work
 
 ```
-mstar/worker/worker.py                                   change 1
 mstar/model/command_a_plus/submodules.py                 changes 2, 9
-mstar/engine/resources/sampler/utils.py                  changes 3, 12
 mstar/model/command_a_plus/components/language_model.py  changes 4, 6, 8, 9, 11, 14, 15
 mstar/model/command_a_plus/kernels.py                    new: changes 6, 11, 14, 15
 mstar/model/command_a_plus/command_a_plus_model.py       changes 6, 16
-mstar/engine/resources/kv/cache.py                       change 10
-mstar/utils/fused_moe/kernels.py                         changes 7, 13
-mstar/utils/fused_moe/runner.py                          changes 7, 15
-mstar/utils/fused_moe/__init__.py                        change 15 (exports moe_block_m)
-mstar/utils/fused_moe/tune.py                            new: change 7
-mstar/utils/fused_moe/configs/E=128,N=2048,K=4096,device_name=NVIDIA_GB200.json   new: change 7 (gitignored; add -f)
 test/command_a_plus/test_fused_kernels.py                new
 test/command_a_plus/test_integration.py                  changes 9, 16
 test/command_a_plus/validate_checkpoint.py               change 9 (embed())
-test/sampling_test/sampler_determinism.py                new
 test/command_a_plus/bench_http.py                        new
 test/command_a_plus/parity_http.py                       new
 test/command_a_plus/profile_decode.py                    new
-test/sampling_test/test_fused_prep.py                    new: change 12
+pyproject.toml                                           flashinfer >= 0.6.18 (one-shot all-reduce)
 ```
