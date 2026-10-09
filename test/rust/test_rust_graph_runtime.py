@@ -211,9 +211,9 @@ def test_node_metadata_is_accepted(runtime):
 
 def test_speculative_flag_rejects_an_unknown_node(runtime):
     rid = _admit(runtime)
-    runtime.set_speculatively_scheduled("prefill", WG_ID, [rid], True)
+    runtime.set_in_flight("prefill", WG_ID, [rid], True)
     with pytest.raises((RuntimeError, ValueError)):
-        runtime.set_speculatively_scheduled("nope", WG_ID, [rid], True)
+        runtime.set_in_flight("nope", WG_ID, [rid], True)
 
 
 # --- coverage of the ABC -----------------------------------------------------
@@ -637,10 +637,11 @@ def test_prep_respects_room_for_continuing(runtime):
 def _two_node_runtime():
     """a -> b, where b ALSO needs an input a does not produce.
 
-    A same-node loop-back is a poor subject for not-ready: it checks the
-    next-iter slot, which a loop's external input never occupies, so such a
-    loop simply cannot be speculated. A cross-node target checks the current
-    slot, which is the case the prep filters actually see.
+    A same-node loop-back is a poor subject for not-ready: its held external
+    inputs are carried over from the current slot and the loop-back itself is
+    supplied by the speculative ingest, so nothing is ever missing. A
+    cross-node target checks the current slot, which is the case the prep
+    filters actually see.
     """
     wg = WorkerGraph(
         section=Sequential(sections=[
@@ -809,10 +810,11 @@ def test_routing_settles_the_safety_hold(runtime):
 def test_a_stop_records_a_pending_stop(runtime):
     rid = _admit(runtime)
     assert not runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
-    runtime.stop_loops_batched(
+    stopped_rids = runtime.stop_loops_batched(
         partition="default", graph_walk=WALK, last_node_run="ar_decode",
         loop_names=ParallelList([rid], [["ar_loop"]]),
     )
+    assert stopped_rids == [rid]
     assert runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
     assert runtime.pending_loop_stop_rids(WALK, "ar_loop") == {rid}
     runtime.clear_pending_loop_stops()
@@ -822,10 +824,11 @@ def test_a_stop_records_a_pending_stop(runtime):
 def test_a_stop_for_a_loop_not_in_the_walk_is_dropped(runtime):
     # A model bug rather than a protocol one: logged and dropped, not raised.
     rid = _admit(runtime)
-    runtime.stop_loops_batched(
+    stopped_rids = runtime.stop_loops_batched(
         partition="default", graph_walk=WALK, last_node_run="ar_decode",
         loop_names=ParallelList([rid], [["not_a_loop"]]),
     )
+    assert stopped_rids == []
     assert runtime.pending_loop_stop_rids(WALK, "not_a_loop") == set()
 
 

@@ -26,7 +26,13 @@ class CommGroup:
         self.group_members = group_members
         self.world_size = len(group_members)
         self.device_group = None
+        # gloo twin of ``device_group``, for object collectives (workspace
+        # rendezvous) that should not go through NCCL
+        self.cpu_group = None
         self.initialized = False
+        # see ``init_allreduce_fusion``
+        self._ar_fusion_ws: int | None = None
+        self._ar_fusion_max_tokens = 0
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -69,6 +75,42 @@ class CommGroup:
             return input_
         dist.all_reduce(input_, group=self.device_group)
         return input_
+
+    def init_allreduce_fusion(
+        self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
+    ) -> bool:
+        """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
+        hidden]`` inputs; larger inputs keep the NCCL path. Collective: every
+        member calls it at the same point. Returns whether it is available."""
+        if self.world_size == 1 or self._ar_fusion_ws is not None:
+            return self._ar_fusion_ws is not None
+        from mstar.distributed.ar_fusion import create_workspace
+
+        self._ar_fusion_ws = create_workspace(
+            self.rank, self.world_size, self.cpu_group, max_tokens, hidden, dtype,
+        )
+        self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
+        return self._ar_fusion_ws is not None
+
+    def allreduce_add_rmsnorm(
+        self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+        eps: float, weight_bias: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``r = all_reduce(x) + residual``; returns ``(rms_norm(r), r)``,
+        scaling by ``weight + weight_bias``. ``x`` is a row-parallel
+        projection's partial sum (its linear skipped ``reduce_results``)."""
+        if (self._ar_fusion_ws is not None
+                and x.shape[0] <= self._ar_fusion_max_tokens
+                and x.is_contiguous() and residual.is_contiguous()):
+            from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
+
+            return allreduce_add_rmsnorm(
+                x, residual, weight, eps, weight_bias, self._ar_fusion_ws,
+            )
+        r = self.all_reduce(x) + residual
+        v = r.float()
+        v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
+        return (v * (weight.float() + weight_bias)).to(r.dtype), r
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
@@ -229,6 +271,14 @@ class WorkerParallelGroups:
     # projections).
     node_to_tp_group: dict[str, CommGroup] = field(default_factory=dict)
     node_to_sp_group: dict[str, CommGroup] = field(default_factory=dict)
+    # Global topology metadata. Unlike the comm-group maps above, these maps
+    # describe every replica, including ones this worker does not host.
+    node_to_parallel_shapes: dict[
+        str, frozenset[tuple[int, int]]
+    ] = field(default_factory=dict)
+    node_to_instance_groups: dict[
+        str, frozenset[tuple[int, ...]]
+    ] = field(default_factory=dict)
     _device: torch.device | None = field(default=None, init=False, repr=False)
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
@@ -292,8 +342,16 @@ class WorkerParallelGroups:
         # tag-ordered (see the field comment). A tuple shared by a TP and
         # an SP group (degenerate meshes) maps to one subgroup.
         rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
+        rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
             rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
+            # Members only: with the default group bound to a device, a
+            # non-member's subgroup creation joins an ncclCommSplit that
+            # members never call for a gloo group, and blocks forever.
+            rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
+                ranks=list(rank_tuple), backend="gloo",
+                use_local_synchronization=True,
+            )
 
         seen: set[int] = set()
         for comm_group in (
@@ -306,6 +364,7 @@ class WorkerParallelGroups:
                 comm_group.initialized = True
                 continue
             comm_group.device_group = rank_tuple_to_pg[tuple(comm_group.group_members)]
+            comm_group.cpu_group = rank_tuple_to_cpu_pg[tuple(comm_group.group_members)]
             comm_group.initialized = True
 
     def get_tp_config_for_node(self, node: str) -> CommGroup:
@@ -351,6 +410,40 @@ class WorkerParallelGroups:
                 return False
         return True
 
+    def all_have_compatible_parallel_shape(self, nodes: set[str]) -> bool:
+        """Whether every replica uses the same tensor/sequence parallel size."""
+        shapes: set[tuple[int, int]] = set()
+        for node in nodes:
+            global_shapes = self.node_to_parallel_shapes.get(node)
+            if global_shapes:
+                shapes.update(global_shapes)
+                continue
+            tp = self.node_to_tp_group.get(node)
+            sp = self.node_to_sp_group.get(node)
+            shapes.add((
+                tp.world_size if tp is not None else 1,
+                sp.world_size if sp is not None else 1,
+            ))
+        return len(shapes) <= 1
+
+    def resource_needs_remote_transfer(
+        self, nodes: set[str], local_nodes: set[str],
+    ) -> bool:
+        """Whether a logical resource spans more than one worker instance."""
+        instance_groups: set[tuple[int, ...]] = set()
+        topology_known = True
+        for node in nodes:
+            groups = self.node_to_instance_groups.get(node)
+            if not groups:
+                topology_known = False
+                break
+            instance_groups.update(groups)
+        if topology_known:
+            return len(instance_groups) > 1
+        # Preserve sensible behavior for hand-built/test configs that lack the
+        # global maps: another named consumer necessarily needs a transfer.
+        return bool(nodes - local_nodes)
+
     def barrier_all(self) -> None:
         """Global barrier across every worker process in the run.
 
@@ -378,6 +471,26 @@ class GlobalParallelConfig:
         any_parallelism = any(
             wg.tp_size > 1 or wg.sp_size > 1 for wg in worker_graphs.values()
         )
+        node_to_parallel_shapes: dict[str, set[tuple[int, int]]] = {}
+        node_to_instance_groups: dict[str, set[tuple[int, ...]]] = {}
+        for wg in worker_graphs.values():
+            shape = (wg._tp_comm_size, wg.sp_size)
+            instance_groups = wg._instance_ranks or [
+                [rank] for rank in wg.ranks
+            ]
+            for node in wg.section.get_nodes():
+                node_to_parallel_shapes.setdefault(node, set()).add(shape)
+                node_to_instance_groups.setdefault(node, set()).update(
+                    tuple(group) for group in instance_groups
+                )
+        frozen_parallel_shapes = {
+            node: frozenset(shapes)
+            for node, shapes in node_to_parallel_shapes.items()
+        }
+        frozen_instance_groups = {
+            node: frozenset(groups)
+            for node, groups in node_to_instance_groups.items()
+        }
         world_tp_groups: list[tuple[int, ...]] = sorted({
             tuple(rank_group)
             for wg in worker_graphs.values()
@@ -400,6 +513,8 @@ class GlobalParallelConfig:
                 global_rank=i, num_workers=self.num_workers,
                 any_parallelism=any_parallelism,
                 world_parallel_groups=world_parallel_groups,
+                node_to_parallel_shapes=frozen_parallel_shapes,
+                node_to_instance_groups=frozen_instance_groups,
             ) for i, wid in enumerate(worker_ids)
         }
 

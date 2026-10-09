@@ -55,6 +55,33 @@ class SpeechRequest(BaseModel):
     stream: bool | None = False
     temperature: float | None = None
     top_p: float | None = None
+    seed: int | None = Field(None, ge=-2**63, le=2**63 - 1)  # the conductor's seed is an int64
+
+
+class TranscriptionRequest(BaseModel):
+    """OpenAI ``/v1/audio/transcriptions`` (speech-to-text), minus the file.
+
+    The endpoint is multipart; the router reads the audio upload itself and
+    validates the remaining form fields through this model. Unknown fields
+    (``extra_body`` from the OpenAI client, or extra multipart fields) pass
+    through as ``model_kwargs``.
+    """
+
+    model_config = _CFG
+
+    model: str | None = None
+    # ISO-639-1 code (``"en"``). ``None`` lets a model that can detect the
+    # language do so.
+    language: str | None = None
+    # Text the model conditions on before transcribing (Whisper's ``<|prev|>``
+    # prompt, an LLM decoder's context).
+    prompt: str | None = None
+    # ``json`` | ``text`` | ``verbose_json`` | ``srt`` | ``vtt``
+    response_format: str = "json"
+    temperature: float | None = 0.0
+    # ``["segment"]`` and/or ``["word"]``, only read for ``verbose_json``.
+    timestamp_granularities: list[str] | None = None
+    stream: bool | None = False
     seed: int | None = None
 
 
@@ -93,6 +120,20 @@ class VideoGenerationRequest(BaseModel):
     fps: float | None = None
     image: str | None = None  # URL or data URI for image-to-video conditioning
     video: str | None = None  # URL or data URI for video-to-video conditioning
+
+
+class VoiceCard(BaseModel):
+    """One entry of ``GET /v1/audio/voices``. ``id`` is what ``voice`` accepts;
+    ``name`` duplicates it for clients that render a voice picker."""
+
+    id: str
+    name: str
+
+
+class VoiceList(BaseModel):
+    object: str = "list"
+    voices: list[VoiceCard] = Field(default_factory=list)
+    default_voice: str | None = None
 
 
 class ModelCard(BaseModel):

@@ -255,7 +255,14 @@ class Benchmark:
                 "jct_ms": (m.e2e_latency or 0.0) * 1000.0,
                 "type": m.type.value if hasattr(m.type, "value") else str(m.type),
                 "output_bytes": dict(m.output_bytes),
+                # per-modality time to first chunk, seconds (TTFT / time to first audio)
+                "ttft_s": dict(m.ttft),
             })
+
+        def _stats(stats):
+            if stats is None:
+                return None
+            return {"mean": stats.mean, "p50": stats.p50, "p95": stats.p95, "p99": stats.p99}
 
         payload = {
             "system": "ours",
@@ -273,6 +280,16 @@ class Benchmark:
             "jct_p95_ms": _pct(jcts_ms, 95),
             "jct_p99_ms": _pct(jcts_ms, 99),
             "request_throughput": (agg.request_throughput or 0.0),
+            # the streaming/audio aggregates the protocol tables are built from
+            "aggregate": {
+                "max_concurrency": agg.max_concurrency,
+                "ttft_s": {modality: _stats(stats) for modality, stats in agg.ttft.items()},
+                "e2e_latency_s": _stats(agg.e2e_latency),
+                "rtf": _stats(agg.rtf),
+                "audio_seconds_throughput": agg.audio_seconds_throughput,
+                "audio_duration_mean_s": agg.audio_duration_mean_s,
+                "total_output_bytes": dict(agg.total_output_bytes),
+            },
             "per_request": per_request,
         }
 
@@ -522,6 +539,8 @@ def parse_args() -> BenchmarkConfig:
     # "default" uses the BAGEL-codebase transforms.
     parser.add_argument("--bagel-image-preprocess", choices=["default", "vllm"], default="vllm")
 
+    parser.add_argument("--model-id", type=str, default=None)
+
     # VBench args
     vbench = parser.add_argument_group("vbench")
     vbench.add_argument(
@@ -651,10 +670,18 @@ def parse_args() -> BenchmarkConfig:
     # disable_cfg is Bagel-specific; only pass it when the target model accepts
     # it so robotics models (Pi05, VJepa2AC) don't see a stray kwarg.
     model_type = ModelType(args.model)
+    # `--model-id` is what the request names, so a size other than the family's
+    # default (e.g. Qwen3.5-9B) reaches the server. Only Qwen3.5 is a family of
+    # sizes today; the rest pin one checkpoint and their constructors take no
+    # such argument, so passing it would be a TypeError rather than a no-op.
+    extra = (
+        {"model_id": args.model_id}
+        if args.model_id and model_type == ModelType.QWEN3_5 else {}
+    )
     if model_type == ModelType.BAGEL:
         model = model_type.inst(disable_cfg=args.disable_cfg, image_preprocess=args.bagel_image_preprocess)
     else:
-        model = model_type.inst()
+        model = model_type.inst(**extra)
 
     return BenchmarkConfig(
         url=args.url,

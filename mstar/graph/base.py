@@ -71,7 +71,7 @@ class GraphEdge:
     conductor_new_token: bool = field(default=False)  # counted by the conductor toward the output-token total
     is_streaming: bool = field(default=False)  # streaming edge: tokens accumulate at destination buffer
     # only for EMIT_TO_CLIENT
-    output_modality: str = field(default="")  # text | image | video | audio
+    output_modality: str = field(default="")  # text | image | video | video_frame | audio
     _persist_for_loop: bool = field(default=False)
     # set on a synthetic streaming-input edge carrying the final chunk, so the
     # consuming pass (not the earlier ingest) reports the partition done
@@ -242,7 +242,9 @@ class GraphNode(GraphSection):
     # Whether this node is currently speculatively being executed: if so, we
     # don't want to queue it in a "ready" queue because it's already being
     # executed, but we do want to update everything else as normal.
-    _speculatively_scheduled: bool = False
+    # Set while a batch carrying this node is in flight (speculative or not):
+    # gates ready-queue adds so the node is not double-queued underneath it.
+    _in_flight: bool = False
 
     _streaming_inputs: set[str] = field(default_factory=set)
 
@@ -324,6 +326,16 @@ class GraphNode(GraphSection):
             loop_back=loop_back
         )
 
+    def persisted_input_names(self) -> set[str]:
+        """Inputs the enclosing loop re-injects unchanged into ``ready_signals``
+        every iteration (``Loop.ingest_external_input`` / ``complete_iter``): a
+        denoise step's text conditioning, say. They never land in
+        ``ready_next_iter``, but they are as good as ready for the next one."""
+        return {
+            name for name, edge in self.ready_signals.ready_inputs.items()
+            if edge._persist_for_loop
+        }
+
     def is_ready_for_speculation(
         self, check_next_iter: bool=False,
         allow_streaming: bool=True
@@ -332,8 +344,12 @@ class GraphNode(GraphSection):
         if allow_streaming:
             needed_inputs = needed_inputs - self._streaming_inputs
         if check_next_iter:
+            # Count the persisted inputs here so a same-node next-iteration
+            # speculation isn't blocked on inputs guaranteed to reappear.
             return needed_inputs.issubset(
-                self.ready_next_iter.ready_names | self.speculative_signals.ready_names
+                self.ready_next_iter.ready_names
+                | self.speculative_signals.ready_names
+                | self.persisted_input_names()
             )
         return needed_inputs.issubset(
             self.ready_signals.ready_names | self.speculative_signals.ready_names
@@ -782,25 +798,25 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
 
     def register_ingested_input(self, graph_edge: GraphEdge):
         node = self.nodes[graph_edge.next_node]
-        # If node._speculatively_scheduled, the node is already executing as
-        # a spec batch. We don't want to double-queue it (either for the
+        # If node._in_flight, the node is already executing as part of a
+        # batch. We don't want to double-queue it (either for the
         # current iter via ``ready_names`` or for the next iter via
         # ``ready_next_iter`` — both eventually feed the scheduler) so we
         # gate every queue add on the flag.
         if node.ready_signals.is_ready:
-            if not node._speculatively_scheduled:
+            if not node._in_flight:
                 self.ready_names.add(node.name)
             self.ready_for_streaming.discard(node.name)
         elif node.ready_signals.is_ready_for_streaming:
-            if not node._speculatively_scheduled:
+            if not node._in_flight:
                 self.ready_for_streaming.add(node.name)
 
         if node.ready_next_iter.is_ready:
-            if not node._speculatively_scheduled:
+            if not node._in_flight:
                 self.ready_next_iter.add(node.name)
             self.ready_streaming_next_iter.discard(node.name)
         elif node.ready_next_iter.is_ready_for_streaming:
-            if not node._speculatively_scheduled:
+            if not node._in_flight:
                 self.ready_streaming_next_iter.add(node.name)
 
     def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:

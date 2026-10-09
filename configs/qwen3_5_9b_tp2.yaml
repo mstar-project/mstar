@@ -1,0 +1,26 @@
+model: "qwen3_5_9b"
+max_seq_len: 32768
+node_groups:
+  # Text and images; video is refused (see `process_prompt`). Colocated: the
+  # encoder runs once per request, then idles.
+  - node_names: [vision_encoder]
+    ranks: [0]
+  - node_names: [LLM]
+    ranks: [0, 1]
+    tp_size: 2
+
+resources:
+  gdn_state:
+    max_slots: 129
+    # state_dtype: bfloat16  # default: the checkpoint's mamba_ssm_dtype (float32)
+
+# The vision encoder compiles on its first image shape and recompiles dynamic
+# on the second (~1.5 s each); these two sizes (64 and 608 image tokens) take
+# both compiles before the server binds.
+warmup_requests:
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_action_fd_umi_first_frame.png]
+    model_kwargs: {max_output_tokens: 4}
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/edge_action_id_av_0_output.png]
+    model_kwargs: {max_output_tokens: 4}

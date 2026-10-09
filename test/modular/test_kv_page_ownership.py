@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVStep
+from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.step import Segment, StepContext
@@ -35,11 +35,18 @@ SEED = 20260920
 class _StubTransfer:
     """No engine, no bytes moved: retrieves complete immediately."""
 
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
-    def get_kv_transfer_info(self):
-        return None
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del kwargs
+        return transfer_info == self.get_kv_transfer_info()
+
+    def remove_request(self, request_id):
+        del request_id
 
     def start_async_retrieve(self, **kwargs):
         del kwargs
@@ -58,7 +65,7 @@ def _manager(max_num_pages: int = 16, cpu_offload_pages: int = 0) -> KVManager:
     is marked `requires_cuda`: the host pool pins its memory as it is built,
     and pinning needs a GPU even though this manager does not."""
     return KVManager(
-        cfg=KVConfig(
+        cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
             max_num_pages=max_num_pages, page_size=PAGE_SIZE,
             cpu_offload_pages=cpu_offload_pages,
@@ -302,3 +309,23 @@ def test_the_flag_puts_the_check_on_the_lifecycle(monkeypatch):
 
     with pytest.raises(AssertionError, match="owner counts disagree"):
         _grow(kv, "r0", PAGE_SIZE)
+
+
+@pytest.mark.parametrize("page_size", [1, 16])
+def test_kv_lens_match_flashinfer_seq_lens(page_size):
+    """The host lengths handed to FlashInfer's decode plan are exactly what it
+    would have rebuilt from the indptrs itself."""
+    from flashinfer.page import get_seq_lens
+
+    from mstar.engine.resources.kv.plan import SequenceView, build_paged_indptrs
+
+    views = [
+        SequenceView("a", "main", page_idxs=[3], length=1, to_compute=1),
+        SequenceView("b", "main", page_idxs=[4, 5], length=page_size + 1, to_compute=1),
+        SequenceView("c", "main", page_idxs=[6, 7], length=2 * page_size, to_compute=1),
+        SequenceView("d", "main", page_idxs=[], length=0, to_compute=0),
+    ]
+    ind = build_paged_indptrs(views, page_size)
+    expected = get_seq_lens(ind.paged_kv_indptr, ind.paged_kv_last_page_len, page_size)
+    assert ind.kv_lens.dtype == expected.dtype
+    assert torch.equal(ind.kv_lens, expected)

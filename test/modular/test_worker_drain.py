@@ -7,6 +7,9 @@ conductor's REMOVE_REQUEST. No read may start for a draining request.
 
 from types import SimpleNamespace
 
+import pytest
+
+from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -25,6 +28,7 @@ def _worker(
 ):
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
+    w._phase_period = 0
     w.is_tp_follower = is_follower
     w.sent = []
     w.cleared = []
@@ -54,6 +58,7 @@ def _worker(
         clear_rid=lambda rid, rid_str: w.cleared.append(rid),
         clear_wire_rid=w.cleared.append,
         fail_rids=lambda rids: w.failed.update(rids),  # noqa: PLW0108
+        failed_rids=w.failed,
         pending_tp_follow_count=dict.fromkeys(tp_follow, 1),
     )
     w.request_state = SimpleNamespace(
@@ -79,6 +84,65 @@ def _reads_done(w):
         m for e, m in w.sent
         if e == "conductor" and m.message_type == ConductorMessageType.READS_DONE
     ]
+
+
+@pytest.mark.parametrize("enable_nvtx", [False, True])
+def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
+    monkeypatch, enable_nvtx,
+):
+    """A speculative step may finish after its request's decode loop stopped."""
+    w = _worker()
+    w.enable_nvtx = enable_nvtx
+    collected = []
+    w.tensor_manager.cleanup_collectable = lambda *args: collected.append(args)
+    w._graph_runtime.cleanup_consumed_inputs = lambda *args: ({}, {})
+    w._graph_runtime.pending_loop_stop_rids = lambda *args: {7}
+    pending = SimpleNamespace(
+        batch=SimpleNamespace(node_name="LLM", request_to_worker_graph={7: 0}),
+        node_batch=SimpleNamespace(request_ids=[7], per_request_info={7: object()}),
+        speculative_new_iter=True, graph_walk="decode", loop_name="decode",
+    )
+    outputs = BatchedModelOutput(per_rid_outputs={7: {}})
+    ranges, markers = [], []
+
+    def push(name, **kwargs):
+        assert enable_nvtx, "NVTX must not run while profiling is disabled"
+        ranges.append(name)
+        markers.append("push")
+
+    def pop(**kwargs):
+        assert enable_nvtx, "NVTX must not run while profiling is disabled"
+        ranges.pop()
+        markers.append("pop")
+
+    monkeypatch.setattr("mstar.worker.worker.range_push", push)
+    monkeypatch.setattr("mstar.worker.worker.range_pop", pop)
+
+    Worker._postprocess_batch(w, pending, outputs)
+
+    assert collected == [({}, {})]
+    assert outputs.per_rid_outputs == {}
+    assert pending.node_batch.request_ids == []
+    assert pending.node_batch.per_request_info == {}
+    assert pending.batch.request_to_worker_graph == {}
+    assert ranges == []
+    assert markers == (["push", "pop", "push", "pop"] if enable_nvtx else [])
+
+
+def test_draining_and_pending_removal_rids_are_not_published():
+    w = _worker(known_rids=("healthy", "draining", "pending", "failed"))
+    w._draining_rids.add("draining")
+    w._pending_removes.add("pending")
+    w.scheduler.failed_rids.add("failed")
+    batch = SimpleNamespace(
+        request_ids=["healthy", "draining", "pending", "failed"],
+        per_request_info={
+            rid: SimpleNamespace(request_id=rid)
+            for rid in ("healthy", "draining", "pending", "failed")
+        },
+    )
+
+    assert w._publishable_request_ids(batch) == ["healthy"]
 
 
 def test_drain_acks_reads_done_when_no_inflight_reads():
@@ -157,6 +221,27 @@ def test_drain_deferred_behind_inflight_gpu_step():
 
     Worker._apply_pending_drains(w, set())  # step finished
     assert "X" in w._draining_rids and len(_reads_done(w)) == 1
+
+
+def test_speculation_stops_for_a_rid_being_torn_down():
+    """A same-node speculation chain keeps its rids in flight every step, so a
+    drain deferred behind it only fires once the chain lets the rid go."""
+    w = _worker(known_rids=("X", "Y"), in_flight=("X", "Y"))
+    assert not w._is_tearing_down("X")
+
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert "X" in w._pending_drains
+    assert w._is_tearing_down("X")
+    assert not w._is_tearing_down("Y")
+
+    w._pending_drains.clear()
+    w._in_flight_rids.clear()
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert "X" in w._draining_rids and "X" in w.scheduler.failed_rids
+    assert w._is_tearing_down("X")
+
+    w._pending_removes.add("Y")
+    assert w._is_tearing_down("Y")
 
 
 def test_follower_ignores_conductor_drain():
@@ -270,6 +355,7 @@ def _preprocess(inflight_reads=False):
     wt.tensor_uuid_to_metadata_per_request = {}
     wt.request_model_kwargs = {}
     wt.in_flight_requests = set()
+    wt.request_output_state = {}
     return wt
 
 
@@ -329,12 +415,19 @@ def test_preprocess_finished_reading_gates_ack_when_not_drained():
 
 
 def test_preprocess_hard_cleanup_force_drops_and_clears():
+    from mstar.api_server.data_worker import RequestOutputState
+
     wt = _preprocess()
     wt._draining_rids.add("X")
     wt._reads_done_sent.add("X")
     wt.tensor_uuid_to_metadata_per_request["X"] = {"u": {}}
     wt.request_model_kwargs["X"] = {}
     wt.in_flight_requests.add("X")
+    # the completed-request path ends here, so the output-order state must go too
+    wt.request_output_state["X"] = RequestOutputState(
+        order={"u": (0, None)}, next_sequence=2, next_emit=1,
+        pending={1: object()}, frame_index=8,
+    )
 
     wt._hard_cleanup("X")
     assert wt.forced == ["X"]
@@ -343,3 +436,4 @@ def test_preprocess_hard_cleanup_force_drops_and_clears():
     assert "X" not in wt.tensor_uuid_to_metadata_per_request
     assert "X" not in wt.request_model_kwargs
     assert "X" not in wt.in_flight_requests
+    assert "X" not in wt.request_output_state

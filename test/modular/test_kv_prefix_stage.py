@@ -308,7 +308,7 @@ class _RaisingFor(_Answering):
 class _Preparing(_Submodule):
     """Prepares the same prompt for every request, and never batches."""
 
-    def prepare_inputs(self, graph_walk, fwd_info, inputs, resources):
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, resources, **kwargs):
         return _inputs()
 
     def can_batch(self, batch, model_inputs):

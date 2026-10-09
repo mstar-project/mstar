@@ -9,6 +9,7 @@ import sys
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 
 from mstar.communication.tensor_store import TensorStore
@@ -50,7 +51,46 @@ def test_to_input_tensors_groups_per_rid_and_names_the_final_chunks():
         1: {"token": ["t10"], "kv": ["t11", "t12"]},
         2: {"token": ["t20"]},
     }
-    assert out.final_stream_rids == {1}
+    assert out.final_stream_edges == {1: {"kv"}}
+
+
+def test_a_missing_uuid_raises_by_default():
+    """The speculative preps roll back and retry serially, so for them a freed
+    uuid should raise rather than quietly shrink the batch."""
+    block = _block((1, "token", [10], False), (2, "token", [99], False))
+
+    def get_tensor(u):
+        if u == 99:
+            raise KeyError(u)
+        return f"t{u}"
+
+    with pytest.raises(KeyError):
+        block.to_input_tensors(get_tensor)
+
+
+def test_skip_missing_takes_out_only_the_affected_rid():
+    """One rid holding a freed uuid must not fail the whole step with it."""
+    block = _block(
+        (1, "token", [10], False),
+        (2, "token", [99], False),
+        (2, "kv", [21], True),
+        (3, "token", [30], True),
+    )
+
+    def get_tensor(u):
+        if u == 99:
+            raise KeyError(u)
+        return f"t{u}"
+
+    out = block.to_input_tensors(get_tensor, [1, 2, 3], skip_missing=True)
+    assert out.unresolved_rids == frozenset({2})
+    # rid 1 and 3 resolved normally; the bad signal is absent rather than
+    # half-filled, and the walk stayed aligned past the skipped edge.
+    assert out.by_rid[1] == {"token": ["t10"]}
+    assert out.by_rid[3] == {"token": ["t30"]}
+    assert "token" not in out.by_rid[2] and out.by_rid[2] == {"kv": ["t21"]}
+    # rid 3's final-chunk mark survives the skip earlier in the walk.
+    assert out.final_stream_edges == {2: {"kv"}, 3: {"token"}}
 
 
 def test_a_rid_with_nothing_ready_still_gets_an_entry_when_seeded():

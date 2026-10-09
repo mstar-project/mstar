@@ -19,6 +19,7 @@ from mstar.conductor.request_info import (
     CurrentForwardPassInfo,
 )
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources.kv.manager import KVSequenceInfo, PublishedKVInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import (
@@ -180,6 +181,30 @@ def _make_manager(wg_id=0, graph_walk="decode", worker_id="worker0"):
 
 
 # --- tests -------------------------------------------------------------------
+
+def test_publication_buffer_keeps_only_local_metadata():
+    mgr, _, _, _, rid = _make_manager()
+    inherited = PublishedKVInfo.build_for_rank(
+        rank=0, world_size=2,
+        seq_info={"main": KVSequenceInfo(10, "peer", [0])},
+    )
+    mgr.update_request_info(
+        rid, "default", resource_publish_info={"kv": inherited},
+    )
+    produced = PublishedKVInfo.build_for_rank(
+        rank=1, world_size=2,
+        seq_info={"main": KVSequenceInfo(9, "local", [1])},
+    )
+    mgr.buffer_publish_info(rid, "default", {"kv": produced})
+    produced.update(inherited)
+    produced.get(1)["main"].page_indices.append(2)
+
+    pending = mgr.get_pending_publish_info(rid, "default")["kv"]
+    assert set(pending.info) == {1}
+    assert pending.get(1)["main"].page_indices == [1]
+    assert set(mgr.get_fwd_info(rid, "default").resource_publish_info["kv"].info) == {0}
+    assert set(mgr.flush_publish_info(rid, "default")["kv"].info) == {1}
+    assert mgr.get_pending_publish_info(rid, "default") == {}
 
 def test_inverted_index_populated_at_init():
     mgr, wg_id, walk, runtime, rid = _make_manager()
@@ -397,10 +422,11 @@ def test_pending_loop_stops_are_recorded_and_live_one_iteration():
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
     runtime._mark_node_complete(rid, wg_id, "prefill")
 
-    runtime.stop_loops_batched(
+    stopped_rids = runtime.stop_loops_batched(
         partition="default", graph_walk=walk, last_node_run="ar_decode",
         loop_names=ParallelList([rid], [["ar_loop"]]),
     )
+    assert stopped_rids == [rid]
     assert runtime.has_pending_loop_stop(rid, walk, "ar_loop")
     assert runtime.pending_loop_stop_rids(walk, "ar_loop") == {rid}
     # A different walk must not match.
@@ -414,10 +440,11 @@ def test_stop_for_a_loop_not_in_the_walk_is_dropped():
     """check_dyn_loop filtering: a stop naming a loop this walk does not have
     is a model bug, logged and dropped rather than raised."""
     _mgr, _wg_id, walk, runtime, rid = _make_manager()
-    runtime.stop_loops_batched(
+    stopped_rids = runtime.stop_loops_batched(
         partition="default", graph_walk=walk, last_node_run="ar_decode",
         loop_names=ParallelList([rid], [["not_a_real_loop"]]),
     )
+    assert stopped_rids == []
     assert runtime.pending_loop_stop_rids(walk, "not_a_real_loop") == set()
 
 
@@ -659,6 +686,77 @@ def test_persist_signals_are_buffered_until_a_worker_graph_finishes():
     assert wgd[0].body.persist_signals["token"][0].uuid == uuids[0]
     # Flushed, so a second pass does not resend them.
     assert runtime._request_info[rid].pending_persist_signals == []
+
+
+def test_worker_graphs_done_carries_every_persisted_tensor_of_a_name():
+    """A loop persists a name once per iteration before its worker graph
+    finishes, so the conductor needs all of them, oldest first."""
+    single = GraphNode(
+        name="prefill", input_names={"prompt"},
+        outputs=[GraphEdge(name="token", next_node=EMPTY_DESTINATION,
+                           persist=True)],
+    )
+    mgr, runtime, rid = _build(single, 0, "decode", nodes={"prefill"})
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+    comm = _RecordingCommunicator()
+    runtime._communicator = comm
+    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
+
+    # An earlier iteration's tensor, persisted twice (one output, two edges).
+    earlier = GraphEdge(name="token", next_node=EMPTY_DESTINATION, persist=True)
+    earlier.tensor_info = [SimpleNamespace(uuid=-1)]
+    runtime._request_info[rid].pending_persist_signals.extend([earlier, earlier])
+
+    out, uuids = _route_one(runtime, mgr, rid, store, minter)
+    runtime.send_outputs(_send_input(runtime, rid, out.completion_id, _fwd_info("decode")))
+
+    [wgd] = [
+        m for e, m in comm.sent
+        if e == "conductor"
+        and m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE
+    ]
+    assert [i.uuid for i in wgd.body.persist_signals["token"]] == [-1, uuids[0]]
+
+
+def test_an_unread_loop_back_is_not_routed():
+    """The token loops back only to feed the loop's accumulated output. The
+    node never reads it, so routing it would send this worker an edge it
+    refuses, every iteration."""
+    section = Sequential(sections=[
+        GraphNode(
+            name="prefill", input_names={"prompt"},
+            outputs=[GraphEdge(name="text_inputs", next_node="decode")],
+        ),
+        Loop(
+            name="decode_loop",
+            section=GraphNode(
+                name="decode", input_names={"text_inputs"},
+                outputs=[
+                    GraphEdge(name="new_token", next_node="decode", persist=True),
+                    GraphEdge(name="text_inputs", next_node="decode"),
+                ],
+            ),
+            outputs=[],
+            accumulated_outputs=[
+                GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT,
+                          output_modality="text"),
+            ],
+            max_iters=8,
+        ),
+    ])
+    mgr, runtime, rid = _build(
+        section, 0, "decode", nodes={"prefill", "decode"}, loops={"decode_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+    completion = runtime._mark_node_complete(rid, 0, "prefill")
+    runtime._process_node_outputs(rid, "prefill", completion.output_edges, "decode")
+
+    completion = runtime._mark_node_complete(rid, 0, "decode")
+    routing = runtime._process_node_outputs(
+        rid, "decode", completion.output_edges, "decode",
+    )
+    assert routing.to_workers == {}
+    assert [e.name for e in routing.persist] == ["new_token"]
 
 
 # --- speculate_node -----------------------------------------------------------

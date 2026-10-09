@@ -44,7 +44,8 @@ class _FakeEngine:
     def __init__(self, not_ready=()):
         self.not_ready = set(not_ready)
 
-    def check_ready(self, node_name, rid, fwd_info):
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        del allow_reload
         # Retryable not-ready only; a terminal AdmitRuntimeError is the
         # scheduler's ``_check_ready`` business, pinned in test_micro_scheduler.
         return FULL_ADMIT_NOT_READY if rid in self.not_ready else FULL_ADMIT_OK
@@ -90,6 +91,11 @@ class _FakeRuntime:
 
     def __init__(self, queue=None):
         self._queue = queue
+
+    def get_rid_string(self, handle):
+        # Only ``_check_resident_set_matches`` needs this, to compare page state
+        # in wire ids; these tests drive the scheduling path, not that check.
+        return f"wire-{handle}"
 
     def get_worker_graph_id_for_node(self, node_name, graph_walk):
         return "wg0"

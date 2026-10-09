@@ -640,7 +640,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         """
         if self.tensor_store.is_registered(uuid):
             return False
-        tensor = self.tensor_store.get_tensor(uuid)
+        tensor = self._send_source(uuid)
         t0 = time.perf_counter()
         t = tensor.detach().contiguous()
         nbytes = t.numel() * t.element_size()
@@ -657,8 +657,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             # file read for exactly those).
             data = _serialize_tensor(t)
             path = self._shm_path(self.my_entity_id, uuid)
-            with self._create_shm_file(path) as f:
-                f.write(data)
+            self._write_shm_file(path, data)
             self._shm_files[uuid] = path
             self._arena_ts[uuid] = time.monotonic()
             self.tensor_store.set_metadata(uuid, mem_registered=True)
@@ -678,8 +677,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 # Async D2H into the pinned segment when a copy stream exists
                 # (the caller's single sync covers the batch); blocking
                 # otherwise, so the descriptor can never ship ahead of the bytes.
-                host.copy_(t, non_blocking=self._d2h_stream is not None)
-                queued = True
+                if t.is_cuda:
+                    host.copy_(t, non_blocking=self._d2h_stream is not None)
+                    queued = True
+                else:
+                    # a stored host copy: a memcpy, nothing for the stream
+                    # sync to wait on
+                    host.copy_(t)
             self._arena_locs[uuid] = (seg, off)
             self._arena_ts[uuid] = time.monotonic()
         except BaseException:
@@ -734,7 +738,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self, request_id: Rid, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         queued = False
         placements = _Placements.empty()
@@ -758,7 +762,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         uuid, and placement goes back as two columns rather than a whole
         descriptor. The whole batch stages inside one stream context and syncs
         once at the end, rather than one host-blocking sync per request."""
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         queued = False
         placements = _Placements.empty()

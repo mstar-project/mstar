@@ -22,9 +22,9 @@ from mstar.engine.resources import (
     AttentionSpec,
     AttentionStep,
     AttnBackend,
-    KVConfig,
     KVSpec,
     KVStep,
+    PagedKVConfig,
     Segment,
     SlotLease,
     StepContext,
@@ -44,8 +44,8 @@ HEAD_DIM = 3
 MAX_PAGES = 8
 
 
-def _kv_config() -> KVConfig:
-    return KVConfig(
+def _kv_config() -> PagedKVConfig:
+    return PagedKVConfig(
         num_layers=1,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
@@ -279,7 +279,9 @@ def kv_manager(monkeypatch):
     from mstar.engine.resources.kv import manager as kv_manager_module
 
     monkeypatch.setattr(
-        kv_manager_module, "KVTransferManager", lambda info, kv_cache: None
+        kv_manager_module,
+        "KVTransferManager",
+        lambda info, kv_cache, **kwargs: None,
     )
     return kv_manager_module.KVManager(
         cfg=_kv_config(),

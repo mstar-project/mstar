@@ -17,6 +17,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``bagel``
      - ``ByteDance-Seed/BAGEL-7B-MoT``
      - Unified multimodal model (text + image understanding and generation).
+   * - ``chatterbox`` / ``chatterbox_turbo``
+     - ``ResembleAI/chatterbox``, ``ResembleAI/chatterbox-turbo``
+     - Zero-shot voice-cloning TTS: T3 speech-token LM (Llama-520M, or GPT-2-medium
+       for Turbo) with CFG and exaggeration control, S3Gen flow-matching decoder,
+       HiFT vocoder, PerTh watermark. 24 kHz.
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
@@ -25,15 +30,38 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Cosmos3 action-policy fine-tune for the DROID platform (``domain_name``
        ``droid_lerobot``, 10-dim raw actions); no sound pathway. The config
        serves the released policy sampling defaults (4 steps, guidance 3.0).
+   * - ``cosmos3_edge``
+     - ``nvidia/Cosmos3-Edge``
+     - Cosmos3-Edge (4B): dense Nemotron backbone, 480p-native t2i/t2v/i2v and
+       robot-action modes, plus the reasoner (image/video chat through
+       ``/v1/chat/completions``) on the shared understanding tower.
+   * - ``cosmos3_edge_droid``
+     - ``nvidia/Cosmos3-Edge-Policy-DROID``
+     - Edge action-policy fine-tune for DROID (``domain_name``
+       ``droid_lerobot``); serves the released 4-step, guidance-3.0 policy
+       defaults.
    * - ``cosmos3_super``
      - ``nvidia/Cosmos3-Super``
      - Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.
+   * - ``cosmos3_super_t2i_4step`` / ``cosmos3_super_i2v_4step``
+     - ``nvidia/Cosmos3-Super-Text2Image-4Step`` / ``…-Image2Video-4Step``
+     - 4-step distilled Super task checkpoints (guidance baked in, fixed-sigma
+       stochastic sampler); TP=2 deployments.
+   * - ``kokoro``
+     - ``hexgrad/Kokoro-82M``
+     - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
+       decoder, 54 bundled voices and voice blends, sentence-chunked streaming,
+       batched across requests.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
    * - ``pi05``
      - ``lerobot/pi05_base``
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
+   * - ``qwen3_5_{0.8,2,4,9,27}b``
+     - ``Qwen/Qwen3.5-4B``
+     - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
+       attention interleaved with full attention, plus a ViT tower.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -44,6 +72,15 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_tts``
      - ``Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice``
      - Streaming text-to-speech with built-in speakers: Talker + 12 Hz speech codec.
+   * - ``qwen3_tts_1p7b``
+     - ``Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice``
+     - 1.7B CustomVoice: built-in speakers plus style/emotion ``instruct`` control.
+   * - ``qwen3_tts_voicedesign``
+     - ``Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign``
+     - 1.7B VoiceDesign: the voice is described by the request's ``instruct`` text.
+   * - ``qwen3_tts_base``
+     - ``Qwen/Qwen3-TTS-12Hz-1.7B-Base``
+     - 1.7B Base: zero-shot voice clone from one reference clip (x-vector, optional in-context transcript).
    * - ``vjepa2``
      - ``facebook/vjepa2-vitl-fpc64-256``
      - V-JEPA 2 video encoder + masked predictor.
@@ -73,9 +110,9 @@ Notes
 OmniVoice notes
 ~~~~~~~~~~~~~~~
 
-- Zero-shot only: there are no built-in speakers. Pass ``ref_audio`` with its
+- Zero-shot only: there are no built-in speakers. Pass ``reference_audio`` with its
   transcript in ``ref_text`` to clone a voice, or describe one in ``voice``.
-  ``ref_text`` is required alongside ``ref_audio``.
+  ``ref_text`` is required alongside ``reference_audio``.
 - ``language`` takes either the name (``Vietnamese``) or the id (``vi``): a
   name is resolved to the id the model was trained on before the prompt is
   built, and an unrecognised value warns and falls back to language-agnostic
@@ -86,29 +123,141 @@ OmniVoice notes
   rows over a few unmasking steps, so there is no KV cache and no per-token
   sampling loop. Serve it with ``mstar serve omnivoice --gpus 0``.
 
+Qwen3.5 (``qwen3_5_*``)
+-----------------------
+
+Text-and-image chat on the Qwen3.5 dense family (five sizes; MoE variants are
+not supported yet; video is refused). Served on both ``POST /generate`` and
+``/v1/chat/completions`` (image parts included). Images may be interleaved with
+text anywhere in the prompt, and prefill follows the order they were written::
+
+    mstar serve qwen3_5_4b --gpus 0
+
+Most layers are gated DeltaNet, so a request holds a recurrent-state slot as
+well as a KV allocation. Set ``gdn_state.max_slots`` in
+``configs/qwen3_5_*.yaml`` to the concurrency you want plus one for the sink;
+CUDA-graph capture and padded replays use the sink, not slots. A slot is
+~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half that in bf16), hence
+not the 256-slot default. The state defaults to the checkpoint's
+``mamba_ssm_dtype`` (fp32 for the released checkpoints, as in vLLM);
+``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
+needs FlashInfer's fused bf16 decode kernel (K = V = 128).
+
+``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
+``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
+a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
+via ``extra_body``.
+
+Kokoro notes
+------------
+
+- Install the G2P dependencies with ``pip install -e '.[kokoro]'`` and fetch the
+  spaCy tagger once with ``python -m spacy download en_core_web_sm`` (misaki does
+  this itself on first use when it has network access). ``pip install 'misaki[en]'``
+  additionally bundles espeak-ng (GPL), which Kokoro uses only as the fallback for
+  out-of-dictionary English words and as the G2P for Spanish, French, Hindi,
+  Italian and Portuguese voices; without it those words are skipped and those
+  languages are unavailable. Japanese and Mandarin voices need ``misaki[ja]`` /
+  ``misaki[zh]``.
+- Serve with ``mstar serve kokoro``. Request knobs: ``voice`` (a bundled voice such
+  as ``af_heart``, or a blend ``af_bella+af_sky`` / ``af_bella(2)+af_sky(1)``),
+  ``speed`` (0.25-4.0), ``lang_code`` (defaults to the voice prefix: ``a`` American
+  English, ``b`` British, ``e`` Spanish, ``f`` French, ``h`` Hindi, ``i`` Italian,
+  ``p`` Portuguese, ``j`` Japanese, ``z`` Mandarin) and ``phonemes`` (skip G2P and
+  synthesize a phoneme string directly).
+- Deployment-wide options go in the YAML's ``model_kwargs`` (see ``configs/kokoro.yaml``):
+  ``lang_code`` fixes the G2P language, ``espeak_fallback: false`` disables the espeak-ng
+  fallback even when it is installed, ``chunk_target_phonemes`` and
+  ``first_chunk_target_phonemes`` set the sentence packing, ``text_buckets``,
+  ``frame_buckets``, ``capture_batch_sizes`` and ``max_batch_frames`` shape the CUDA
+  graphs captured at start-up (fewer buckets on a smaller GPU), ``compile_decoder: false``
+  skips the ``torch.compile`` of the vocoder (start-up in seconds instead of minutes, about
+  half the throughput on an H100) and ``decoder_dtype: bfloat16`` runs the vocoder trunk
+  in bf16 (about 13% more throughput at concurrency 32 in our runs, with the harmonic
+  source and the iSTFT kept in fp32; the parity test covers fp32 only).
+- Text is cut at sentence boundaries into chunks of at most 510 phonemes (the
+  PL-BERT window); each chunk is emitted to the client as soon as it is
+  synthesized, so ``stream=True`` on ``/v1/audio/speech`` returns audio sentence by
+  sentence. The first chunk is kept short so time to first audio is one short
+  synthesis.
+- Output is 24 kHz mono PCM16. The model runs in fp32 by default: its vocoder is
+  phase-sensitive, so reduced precision is opt-in. On CUDA the text half and the
+  frame half of the forward are captured as CUDA graphs per length bucket and the
+  frame half is compiled with dynamic shapes, so the first start-up on a GPU takes
+  about two minutes; rows of one step are grouped by frame bucket
+  (``frame_grouping: single`` pads them into one group instead, kept for comparison).
+- ``examples/livekit_kokoro.py`` and ``examples/pipecat_kokoro.py`` plug the server
+  into LiveKit Agents and Pipecat through their OpenAI TTS plugins (``base_url``
+  pointed at M*, ``response_format="pcm"``); ``GET /v1/audio/voices`` lists the
+  voices for a picker: the bundled voices whose G2P extra is installed on the server
+  (a request for one of the others gets a 400 with the ``pip install`` hint).
+
 Qwen3-TTS notes
 ---------------
 
 - Install the model-specific dependencies with ``pip install -e '.[qwen3_tts]'``
-  and launch the default single-GPU deployment with
-  ``mstar serve qwen3_tts --gpus 0``.
-- The first integration supports the CustomVoice checkpoint and text-to-audio
-  requests. ``voice`` selects one of the checkpoint's built-in speakers and
-  ``language`` defaults to automatic detection.
-- Codec CUDA graphs are captured through batch size 8. The upstream decoder's
-  batch-16 capture can exhaust an H100 after Talker weights and CodePredictor
-  graphs are resident; larger Codec batches therefore use the scheduler's safe
-  ceiling.
-- Talker prefill remains eager because it runs once with variable sequence
-  lengths. Decode always uses the whole-walk CUDA Graph, with the 15-step
+  and launch a single-GPU deployment with ``mstar serve <key> --gpus 0`` where
+  ``<key>`` is one of ``qwen3_tts`` (0.6B CustomVoice), ``qwen3_tts_1p7b``,
+  ``qwen3_tts_voicedesign`` or ``qwen3_tts_base``. One model class serves every
+  12 Hz checkpoint; the variant (speakers, instruction support, reference
+  audio) is read from the checkpoint's ``config.json``.
+- Requests: ``voice`` selects a built-in speaker (CustomVoice), ``language``
+  defaults to automatic detection, ``instruct`` (OpenAI: ``instructions``)
+  carries a style instruction (1.7B CustomVoice) or the voice description
+  (VoiceDesign, required). Base clones a voice from one reference clip: on
+  ``/v1/audio/speech`` pass ``ref_audio`` (data URL, URL, path or base64) plus
+  ``ref_text`` (its transcript) or ``x_vector_only_mode: true``; with the SDK,
+  ``client.tts(text, reference_audio="ref.wav", ref_text="...")``. The clip's
+  conditioning (x-vector and codec frames) is memoised by content, so a voice
+  reused across requests, or by the sentence chunks of one long request, is
+  encoded once; named, persisted voices arrive with the shared voice registry.
+- Text layout follows the reference defaults: CustomVoice and VoiceDesign put
+  the whole text in the prefill; Base feeds it one token per frame. Override
+  per request with ``non_streaming_mode``.
+- ``/v1/audio/speech`` inputs of 600 or more characters are synthesized as
+  ordered sentence chunks of about 400 characters (one Talker request each,
+  two kept in flight while the current one streams); set
+  ``sentence_chunking: false`` (or ``true`` for shorter texts) per request.
+- Audio streams in a ramp of codec chunks: the first frame is decoded on its
+  own (first audio one Talker step after prefill), the next windows add 3, 8
+  and 16 frames, then 25 new frames behind up to 72 frames of already decoded
+  left context, the decoder transformer's sliding window (as vLLM-Omni). The
+  transformer stacks 8 such layers, so a window still differs slightly from a
+  whole-utterance decode once an utterance outgrows the context; 25 frames of
+  context differed far more. Each window size is a CUDA-graph bucket captured
+  for batch sizes 1 to 32; the stream buffer reports how many leading frames of
+  a window are repeated context, and the codec trims their audio. A voice
+  clone's reference tail (its last 72 frames) is the first window's context.
+- The codec runs its transformer over the whole window but its conv stack (all
+  but a few percent of the codec's time) only over the new frames plus the
+  stack's causal receptive field, derived from the decoder's modules at load
+  (10 frames for the 12 Hz decoder; the new frames' audio equals the
+  whole-window decode). It also fuses the SnakeBeta activations into one kernel.
+- Talker prefill replays a packed CUDA Graph for the smallest token bucket
+  (32 to 1024 tokens) that holds the batch; only the clone prefill, which also
+  pushes the reference clip's frames into the codec stream, runs eager. Decode
+  always uses the whole-walk CUDA Graph, with the 15-step
   CodePredictor loop captured inside it; request-local EOS suppression is
   carried as a graph tensor input so replay does not consult capture-slot dummy
   request state. Residual ``subtalker_*`` sampling is per-request through the
   ``code_predictor`` aux sampler, so custom values neither block batching nor
-  fall off the graph.
-- The 12 Hz decoder does not require the system SoX executable. M* imports only
-  the exact upstream decoder modules, avoiding qwen-tts's unrelated 25 Hz SoX
-  probe during worker startup.
+  fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
+  Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
+- ``configs/qwen3tts_1p7b_split.yaml`` runs the Codec on a second worker that
+  shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.
+  On its own it lowers first-audio latency at high concurrency; with a
+  user-level CUDA MPS daemon (``nvidia-cuda-mps-control -d`` before
+  ``mstar serve``) the two workers' kernels also overlap, which raised c=32
+  throughput by about a fifth on an H100.
+- The codec decoder runs in float32 by default, reproducing the reference
+  decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
+  deployment YAML halves its GPU time when throughput matters more than
+  bit-exactness (the Talker is bf16 either way).
+- Weight loading checks coverage in both directions: a parameter the checkpoint
+  does not fill, or a checkpoint tensor the port does not load, fails startup.
+- The 12 Hz codec does not require the system SoX executable. M* imports only
+  the exact upstream speech-tokenizer modules, avoiding qwen-tts's unrelated
+  25 Hz SoX probe during worker startup.
 
 For throughput/latency validation, run the native serving benchmark with the
 Qwen3-TTS model metadata rather than the Orpheus compatibility entry::
@@ -130,6 +279,135 @@ The benchmark stops on the model's natural codec EOS by default. Use
 fixed-length decode throughput rather than end-user latency.
 The first process-local request can include eager FlashInfer kernel JIT, so
 keep the warmup requests enabled when reporting steady-state latency.
+
+For cross-engine comparisons (M*, vLLM-Omni, SGLang-Omni) use the shared
+streaming ``/v1/audio/speech`` client, which measures time-to-first-audio, RTF
+and audio-seconds per second with the same request for every engine, and score
+the saved WAVs with ``benchmark/tts_speech_wer.py``::
+
+   python -m benchmark.tts_speech_bench --engine mstar --url http://127.0.0.1:8000 \
+       --model qwen3_tts_1p7b --sentences sentences_200.txt --voice vivian \
+       --language English --concurrency 8 --repeats 3 --out results/mstar_c8.json
+
+Chatterbox notes
+----------------
+
+- ``pip install -e '.[chatterbox]'`` then ``mstar serve chatterbox --gpus 0``
+  (``chatterbox_turbo`` for the distilled Turbo checkpoint,
+  ``chatterbox_multilingual`` for the 23-language one). All variants are one
+  model class; the variant follows the registry key or ``model_kwargs:
+  variant``.
+- Multilingual: the same graph, S3Gen and voice encoder as the English model
+  with the ``t3_mtl23ls_v2`` T3 weights (a 2454-token grapheme vocabulary)
+  and a language token in front of the text. Requests pass ``language_id``
+  in ``extra_body`` (``ar da de el en es fi fr he hi it ja ko ms nl no pl pt
+  ru sv sw tr zh``; the deployment's ``model_kwargs: default_language``, ``en``
+  by default, applies when a request gives none). The text is lower-cased and
+  NFKD-normalised, Korean is decomposed into jamo and Chinese spelled as
+  Cangjie codes from the checkpoint's table; Japanese kana reading, Hebrew
+  diacritics and Russian stress marks use the same optional packages as the
+  reference (``pip install -e '.[chatterbox_multilingual]'`` brings
+  ``pykakasi`` and the Chinese word segmenter; ``dicta_onnx`` and
+  ``russian_text_stresser`` are installed separately) and are skipped with a
+  warning when a package is missing, as the reference does.
+- Requests: ``/v1/audio/speech`` with ``input``, ``voice`` (``default`` = the
+  voice shipped in the checkpoint, or a preset name resolved under the
+  deployment's ``model_kwargs: voices_dir``), and in ``extra_body``
+  ``ref_audio`` (data URL of a reference clip, 5-30 s, cloning; an http(s)
+  URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``; paths on the
+  server are refused), ``exaggeration`` (0-2, emotion intensity, default 0.5),
+  ``cfg_weight`` (0-1, default 0.5; 0 disables guidance and halves the T3 work),
+  ``temperature`` (up to 5; under 1e-5 is greedy)/``top_p``/``top_k`` (the
+  whole vocab or more is no filter)/``min_p``/``repetition_penalty`` (up to 2;
+  the upper bounds are the reference demo's), ``seed``, ``n_cfm_timesteps``
+  (S3Gen Euler steps, 10; Turbo 2), ``max_new_tokens`` (up to the deployment's
+  ``model_kwargs: max_new_tokens_limit``, 1000 in the shipped configs; with
+  ``max_concurrent_requests`` set, the server refuses to start unless that
+  many requests of that length fit the KV cache, so raise it together with
+  ``max_num_pages`` or a lower cap),
+  ``ignore_eos`` (T3 decodes all ``max_new_tokens``
+  past the stop token, for fixed-length benchmarks; the speech tokens among
+  them are vocoded, but T3 keeps emitting stop and control tokens after the
+  end of speech and those are dropped, so the audio is shorter than
+  ``max_new_tokens`` / 25 s: 4096 tokens gave 117 s on base and 141 s on
+  Turbo, not 164 s) and ``watermark`` (default on). Turbo ignores
+  ``cfg_weight``, ``exaggeration`` and ``min_p`` like the reference package.
+  The native ``/generate`` route and ``client.tts(...)`` take the same knobs;
+  a clip uploaded as ``audio`` input is the reference voice.
+- Graph: ``voice_encoder`` (speaker LSTM + S3 tokenizer over the reference,
+  cached per clip hash) -> ``T3`` (paged KV, continuous batching; guidance runs
+  the conditional and unconditional streams through one attention plan and one
+  captured decode graph per batch size) -> ``s3gen`` (own streaming partition).
+- Outputs are watermarked with Resemble's PerTh network when ``resemble-perth``
+  is installed; ``watermark: false`` per request or in ``model_kwargs`` turns it
+  off, and a deployment without the package logs that outputs are unmarked.
+  The mark is embedded on the worker's device end to end (the package's own
+  routine resamples on the CPU); it decodes with the package's detector like
+  the package's output, from which it differs by the resampler only.
+- Streaming (``stream: true``) emits WAV chunks as the speech tokens arrive:
+  the first after 15 tokens (about 0.12 s on an H100), then 50, 100 and 200
+  tokens (``model_kwargs: stream_first_chunk_tokens`` / ``stream_chunk_tokens``
+  / ``stream_chunk_growth`` / ``stream_max_chunk_tokens``): each chunk buys
+  the playback time to produce a bigger one, so a stream costs three or four
+  flow solves instead of one per 25 tokens. Each chunk re-runs
+  the flow decoder over all tokens so far with a fixed noise field, holds back
+  the three look-ahead tokens and crossfades the vocoder tail, so the stream
+  is continuous but not sample-identical to the whole-utterance decode;
+  ``stream_chunk_tokens: 0`` synthesises whole utterances (the reference
+  path, bit-exact with the package at a fixed seed). ``stream_context_tokens``
+  (default 25; 0 = whole history) bounds how many settled tokens a chunk's
+  flow solve keeps as left context, making the per-chunk cost constant; the
+  window stays as close to the whole-utterance decode as the full history
+  does (log-mel correlation 0.988 vs 0.985 on CPU). Requests whose chunks
+  are ready together share one padded flow solve (up to 8 per step).
+- S3Gen runs from CUDA graphs by default (``s3gen_graphs``): the flow solve
+  (one graph per rows x frames x steps; the estimator's hundreds of tiny
+  kernels per Euler step make the eager solve launch-bound, 170 ms vs 45 ms
+  for one row on an H100), the token encoder (per rows x token bucket) and
+  the HiFT vocoder up to its output spectrum (per exact chunk length, its
+  excitation noise drawn outside the graph in the reference's order; the
+  inverse STFT runs eagerly since ``torch.istft`` synchronises). Rows are
+  padded to the powers
+  of two up to ``s3gen_max_batch_size`` (8) and frames to
+  ``s3gen_frame_bucket`` (64); the built-in voice's chunk shapes are captured
+  at startup, other shapes on first use; ``s3gen_graph_stages`` (default
+  ``solve,encoder,vocoder``) picks the stages. The flow estimator runs in
+  ``s3gen_estimator_dtype`` float16 by default with the Euler state in
+  float32 (within 0.02-0.15 of the float32 log-mel; ``bfloat16`` is as fast
+  and further off; ``float32`` is the reference path, bit-exact with the
+  package at a fixed seed). ``t3_prefill_graphs`` (default on) captures T3
+  prefill as packed CUDA graphs by token bucket for batches of up to four
+  requests; decode graphs are always captured. ``s3gen_graphs: false`` gives
+  the eager path; ``s3gen_compile: true`` is the older alternative and turns
+  the graphs off.
+- Sampling follows the reference order inside the sampler resource:
+  repetition penalty -> temperature -> ``min_p`` -> ``top_p``; the T3 node
+  declares ``enable_min_p`` on its ``SamplerSpec`` (see
+  :doc:`adding_models`). T3 runs in bf16 (``model_kwargs: t3_dtype:
+  float16`` is the alternative; float32 is refused because the paged
+  attention has no float32 kernels, and fp32 token parity is checked by the
+  CPU tests in ``test/chatterbox``).
+- Reference clips are decoded with ``soundfile`` (WAV/FLAC/OGG/MP3 through
+  the bundled libsndfile); other codecs fall back to ``torchcodec``, which
+  needs FFmpeg's shared libraries on the node.
+- Keep each request short, a sentence or two. Text longer than 512 tokens is
+  rejected, but quality drops well before that, as it does in the reference
+  package: on three-sentence inputs (600-720 characters) Turbo often drops or
+  babbles the last sentence (median WER 0.10, reference 0.12; base 0.02), and
+  1,500-2,000 characters come back from Turbo as a second or so of unrelated
+  speech, with a 200. For long text send ``sentence_chunking: true`` in
+  ``extra_body``: the server splits it into sentence groups of up to 400
+  characters (at most 32) and synthesises them in order, or split it
+  client-side.
+- Benchmarks and parity scripts live in ``benchmark/chatterbox/``
+  (``bench_all.sh`` drives M*, Chatterbox-TTS-Server and chatterbox-vllm on
+  one GPU; ``reference_greedy.py`` + ``serve_parity.py`` compare a served
+  greedy synthesis with the reference package; ``wer_eval.py`` is the Whisper
+  intelligibility guard; ``node_breakdown.py`` turns a served run's
+  ``--log-stats`` profiles into a per-node time table; ``profile_s3gen.py``
+  micro-benchmarks the flow estimator, solve, encoder, vocoder and watermark
+  by precision, eager vs. CUDA graph; ``gpu_util.py`` summarises
+  ``nvidia-smi dmon`` samples taken during runs).
 
 Cosmos3 environment requirements
 --------------------------------
@@ -158,6 +436,135 @@ Cosmos3 environment requirements
 - The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
+
+Cosmos3-Edge reasoner and action loop
+-------------------------------------
+
+``cosmos3_edge`` serves the understanding tower as a vision-language model on the
+same transformer instance and KV pool as the generator. ``/v1/chat/completions``
+takes image and video content parts (URLs or data URIs) and streams tokens; the
+chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
+``enable_thinking`` (or ``chat_template_kwargs.enable_thinking``), ``top_k``,
+``repetition_penalty``, and for video attachments ``video_fps`` / ``video_num_frames``
+(frames are sampled at 2 fps by default, each frame a timestamped span).
+
+.. code-block:: bash
+
+   curl -sN http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+     "model": "cosmos3_edge", "stream": true, "max_tokens": 256,
+     "messages": [{"role": "user", "content": [
+       {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+       {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
+     "enable_thinking": false}'
+
+The decode step is captured into CUDA graphs per batch bucket and, by default,
+compiled first (``compile_reasoner_decode: true``; ``COSMOS3_REASONER_COMPILE=0``
+turns it off): the eager step is over a thousand tiny kernels, and the fused
+step runs at the weight-streaming floor (about twice the uncompiled rate at
+batch size 1 on an H100). Concurrent chat requests share decode steps
+(continuous batching over the captured decode graphs, padded to the next batch
+bucket). Requests never see each other's data, but the batch bucket changes the
+bf16 arithmetic of the step, so a long greedy answer can part from its solo run
+where two candidate tokens tie: in every measured divergence the two tokens'
+logits were equal or one bf16 ulp apart, the first differing token came after
+tens to hundreds of identical ones, and identical prompts in one batch agreed
+with each other. Short answers (128 tokens) came out identical in 8 of 8 runs;
+256-token answers with thinking on in 2 of 8. Generation requests batch
+into one denoise pass too, which is the same maths but not the same bf16
+arithmetic — under classifier-free guidance the branch rounding is amplified,
+so an image or clip produced alongside other requests differs from its solo
+result at the kernel-drift level (~30 dB PSNR at guidance 6). Serve with one
+request at a time when outputs must be bitwise repeatable.
+
+The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
+``domain_name``) predicts a chunk of robot actions from the current observation:
+``output_modalities=action`` with ``model_kwargs``
+``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 10,
+"action_chunk_size": 32}``; the reply's ``action`` payload is float32
+``[chunk, action_dim_padded]`` and the first ``raw_action_dim`` columns are the
+embodiment's actions. For a control loop use ``/generate/ws`` (one connection,
+pipelined observations): ``examples/cosmos3_action_ws_client.py`` runs it and
+reports chunks/s, actions/s and latency percentiles.
+
+Cosmos3 streaming rollout (windowed video)
+------------------------------------------
+
+Long clips can be generated window by window instead of in one denoise loop,
+with each finished window streamed to the client while the next one is being
+denoised. The deployment opts in with ``enable_windowed_video: true`` in the
+config YAML (``configs/cosmos3_edge.yaml`` and ``configs/cosmos3_nano_ar.yaml``
+do), which adds the ``video_gen_ar`` walk and a ``vae_decoder_ar`` node in its
+own ``window_decoder`` partition; a request opts in per call:
+
+.. list-table:: Windowed request knobs (``model_kwargs`` or the video request body)
+   :header-rows: 1
+   :widths: 22 14 64
+
+   * - Knob
+     - Default
+     - Meaning
+   * - ``window_mode``
+     - —
+     - ``chained``: every window is a full bidirectional denoise conditioned on
+       the previous window's tail (``overlap_frames`` pinned clean). ``kv``: the
+       finished window's clean K/V is committed to the cache and later windows
+       attend to it block-causally; no overlap, and frames older than
+       ``context_frames`` behind the frontier are released from the cache
+       (the persistent world state of a long rollout stays bounded).
+   * - ``window_frames``
+     - 29
+     - Pixel frames per window (quantized to latent frames).
+   * - ``overlap_frames``
+     - 8
+     - ``chained`` only: frames re-pinned from the previous window (at least two
+       latent frames).
+   * - ``context_frames``
+     - 61
+     - ``kv`` only: committed context kept behind the frontier; ``0`` keeps all.
+   * - ``stream_video``
+     - ``false``
+     - Emit each window as its own video chunk as it is decoded instead of one
+       assembled clip. ``/generate`` streams the chunks as NDJSON lines,
+       ``/generate/ws`` as frames, ``/v1/videos/generations`` switches to an
+       NDJSON body (``video`` lines with a running ``index``, closed by ``done``).
+   * - ``session_id``
+     - —
+     - Names a world-state session: the DiT node keeps the rollout's last window
+       and the decoder its context. The most recent ``session_store_size`` idle
+       sessions are kept; a session with a request in flight is never evicted, and
+       a second request on it is refused until the first finishes.
+   * - ``resume_session``
+     - ``false``
+     - Continue the named session: window 0 is conditioned on the stored last
+       frames (pinned clean, like a chained overlap) and only the ``num_frames``
+       new frames are delivered — a new prompt steers the same world.
+   * - ``session_timeout_s``
+     - 600
+     - Seconds an idle session is kept after its request finishes, capped at the
+       deployment's ``session_timeout_max_s`` (3600). An expired session resumes
+       like an unknown one: the request is rejected.
+   * - ``end_session``
+     - ``false``
+     - Drop the named session once this request is done (with or without
+       ``resume_session``) instead of keeping its state.
+
+.. code-block:: bash
+
+   curl -sN http://localhost:8000/generate \
+     -F 'text=a drone flies over a coastal town at dawn' \
+     -F 'output_modalities=video' \
+     -F 'model_kwargs={"num_frames":241,"window_mode":"kv","window_frames":29,"context_frames":61,"stream_video":true}'
+
+The schedule is padded up to whole windows and the video trimmed back to
+``num_frames``; a seeded request is deterministic end to end (later windows draw
+their noise from the same generator). Windowed requests batch with each other
+and with plain requests at the same walk. ``gen_capture_video`` lists (height,
+width, frames) tiers whose denoise steps replay a per-step CUDA graph (one graph per
+latent shape, the clean/noisy frame layout carried as a mask input; plain t2v/i2v and
+``chained`` windows, never ``kv`` windows). It is empty by default: at 832x480 the
+graph, which captures the paged attention, measured 3-6% slower than the eager dense
+FA3 step for both the 121-frame clip and the 29-frame window, so it only pays for
+small, launch-bound tiers.
 
 Wan2.2 (``wan22``)
 ------------------

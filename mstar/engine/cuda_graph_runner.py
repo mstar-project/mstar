@@ -17,7 +17,8 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseCudaGraphConfig,
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.utils import profiler
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,38 @@ def capture_into_graph(run, pool, device, autocast_dtype):
     return graph, output
 
 
+def capture_with_static_outputs(run, warm_outputs, pool, device, autocast_dtype):
+    """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
+
+    ``warm_outputs`` is what ``run`` returned on a warm-up call (``{name:
+    Tensor}``); it fixes the shapes and dtypes. The captured graph ends with a
+    device-to-device copy of each output into a buffer allocated here, before
+    the capture, from the ordinary allocator.
+
+    Why not hand out the graph's own output tensors: blocks a graph frees
+    while it is being captured go back to the pool and are handed to the
+    graphs captured after it, so an output that lived in the pool could sit
+    exactly where an earlier-captured graph keeps its scratch and be
+    overwritten by that graph's next replay. That is harmless while a pool
+    belongs to one region whose graphs replay one at a time and whose
+    outputs are consumed before the next replay, but not once a node's
+    regions share one pool and replay in data-dependent order. Buffers outside
+    the pool stay valid until this graph's own next replay, whatever else the
+    node runs in between.
+    """
+    static_outputs = {
+        name: torch.empty_like(value) for name, value in warm_outputs.items()
+    }
+
+    def captured():
+        for name, value in run().items():
+            static_outputs[name].copy_(value)
+        return static_outputs
+
+    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype)
+    return graph, static_outputs
+
+
 def fail_if_graphs_required(missing: list[str]) -> None:
     """MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
     failure, for deployments that would rather not come up than serve the
@@ -219,7 +252,7 @@ class CudaGraphSlot:
     # preprocess output as captured; tensor entries are the static buffers
     static_inputs: dict[str, Any]
     static_input_keys: tuple[str, ...]
-    static_outputs: dict
+    static_outputs: BatchedModelOutput
     # padding rows address these; their streams stay resident between steps
     dummy_rids: list[int]
     dummy_metadata: dict[int, CurrentForwardPassInfo]
@@ -553,8 +586,12 @@ class CudaGraphRunner:
             # same GPU addresses; replay writes real values into them.
             for key, value in list(static_inputs.items()):
                 if isinstance(value, torch.Tensor):
+                    seq_dim_override = (
+                        config.input_seq_dims.get(key) if config.input_seq_dims else None
+                    )
                     static_inputs[key] = self._intern_static_buffer(
-                        spec.config_idx, key, value, seq_len=spec.num_tokens,
+                        spec.config_idx, key, value,
+                        seq_len=spec.num_tokens, seq_dim_override=seq_dim_override,
                     )
             static_input_keys = tuple(
                 key for key, value in static_inputs.items()
@@ -584,6 +621,7 @@ class CudaGraphRunner:
             graph, output = capture_into_graph(
                 run_forward, self._memory_pool, self._device, self._autocast_dtype,
             )
+            output = BatchedModelOutput.coerce(output)
 
             return self._build_slot_from_capture(
                 output=output,
@@ -595,9 +633,9 @@ class CudaGraphRunner:
                 config_idx=spec.config_idx,
             )
         finally:
-            # pages stay with the dummy streams: replay's padding rows address
-            # the same ids, so their plan finds the storage already resident
-            self._dummy_rows.reset(dummy_rids)
+            # Capture ran the dummy rows as real requests; free their storage
+            # now, since replay's padding rows address the sink page and slot.
+            self._dummy_rows.reset(dummy_rids, free=True)
 
     def _forward_for(self, spec: CGSlotSpec):
         """The callable this bucket captures, compiled once per config.
@@ -643,7 +681,7 @@ class CudaGraphRunner:
 
     def _intern_static_buffer(
         self, config_idx: int, key: str, value: torch.Tensor,
-        seq_len: int | None = None,
+        seq_len: int | None = None, seq_dim_override: int | None = None,
     ) -> torch.Tensor:
         """Return a slice view into the shared buffer for (config_idx, key).
 
@@ -651,6 +689,10 @@ class CudaGraphRunner:
         largest-first) bucket's shape; smaller buckets reslice its leading dim.
         If ``seq_len`` is given, the seq dim is moved to the front for storage and
         back on return, so the captured forward sees the original layout.
+        ``seq_dim_override``, from the config's ``input_seq_dims``, is used
+        instead of `_seq_dim`'s size-based guess when a caller already knows
+        which dim varies with the bucket (`_seq_dim` can pick the wrong dim
+        when an unrelated axis happens to match ``seq_len``).
         """
         buf_key = (config_idx, key)
         if seq_len is None:
@@ -661,7 +703,10 @@ class CudaGraphRunner:
             # — and the buffer is shared, so its layout cannot vary anyway
             seq_dim = self._static_buffer_seq_dims[buf_key]
         else:
-            seq_dim = self._seq_dim(value, seq_len)
+            seq_dim = (
+                seq_dim_override if seq_dim_override is not None
+                else self._seq_dim(value, seq_len)
+            )
             self._static_buffer_seq_dims[buf_key] = seq_dim
         stored = value.movedim(seq_dim, 0) if seq_dim != 0 else value
         shared = self._shared_static_buffers.get(buf_key)
@@ -705,13 +750,16 @@ class CudaGraphRunner:
 
         A walk may have several captures (e.g. one per image resolution, each a
         fixed shape with its own token count), so every matching bucket is
-        considered rather than the first config declared.
+        considered rather than the first config declared. ``num_tokens`` counts
+        the batch's input tokens; a bucket is keyed by the tokens its plan
+        carries, so the request is scaled by that config's multiplier.
         """
         best: BucketKey | None = None
         for key, bucket in self._buckets.items():
             if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info:
                 continue
-            if key.bs < bs or key.num_tokens < num_tokens or not bucket.slots:
+            needed = num_tokens * bucket.config.total_tokens_multiplier
+            if key.bs < bs or key.num_tokens < needed or not bucket.slots:
                 continue
             if best is None or (key.num_tokens, key.bs) < (best.num_tokens, best.bs):
                 best = key
@@ -747,6 +795,13 @@ class CudaGraphRunner:
             if best is None or (key.bs, key.num_tokens) < (best.bs, best.num_tokens):
                 best = key
         return best
+
+    def captures_walk(self, graph_walk: str) -> bool:
+        """Whether any capture replays this walk."""
+        return any(
+            graph_walk in config.replay_graph_walks
+            for config in self._capture_configs
+        )
 
     def max_batch_size_for(self, graph_walk: str) -> int | None:
         """Largest batch this walk was captured for, or None for no cap.
@@ -881,7 +936,13 @@ class CudaGraphRunner:
 
     def _replay(self, lease: SlotLease) -> dict:
         slot = self.slot_for(lease)
+        # The launch, not the GPU work: replay is async, so this range measures
+        # enqueue cost only. GPU-side duration comes from --cuda-graph-trace.
+        if self._enable_nvtx:
+            profiler.range_push(f"cg.replay.slot[{lease.slot}]")
         slot.graph.replay()
+        if self._enable_nvtx:
+            profiler.range_pop()
         return slot.static_outputs
 
     def run_forward(
@@ -911,11 +972,12 @@ class CudaGraphRunner:
     def release(self, lease: SlotLease, real_bs: int) -> None:
         """Return the padding rows to their at-rest state after a step.
 
-        Their pages stay resident (``free=False``), so the next step's plan for
-        this slot allocates nothing for the tail.
+        Padding rows (`is_padding_row`) run against SINK_PAGE and the recurrent
+        pool's sink slot, so nothing stays resident: padding must never compete
+        with real requests for storage.
         """
         dummy_rids = self.slot_for(lease).dummy_rids
-        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs])
+        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs], free=True)
 
     def plan_stream(self) -> torch.cuda.Stream | None:
         """Dedicated stream for pre-planning.
@@ -984,8 +1046,10 @@ class PiecewiseOutput:
         """The leading ``real_len`` slice WITHOUT copying.
 
         The result aliases the runner-owned static output buffer and is
-        OVERWRITTEN by the next ``run``. Read it within the same step; use
-        ``get`` when you need something that outlives the step.
+        OVERWRITTEN by the next ``run`` of this runner. Nothing else writes
+        there: the buffers live outside the graph memory pool, so replays of
+        other regions sharing the node's pool leave them alone. Read it within
+        the same step; use ``get`` when you need something that outlives it.
         """
         value = self._outputs.get(key)
         if value is None:
@@ -1026,6 +1090,7 @@ class PiecewiseCudaGraphRunner:
         num_slots: int,
         joint_comm_group: JointGroups | None = None,
         node_name: str | None = None,
+        memory_pool=None,
     ):
         self._label = label
         self._config = config
@@ -1043,7 +1108,7 @@ class PiecewiseCudaGraphRunner:
         )
 
         self._graphs: dict[PiecewiseGraphKey, PiecewiseGraphData] = {}
-        self._memory_pool = None
+        self._memory_pool = memory_pool
         # (bs, total_tokens) shapes that failed to capture and run eagerly
         self.dropped_shapes: list[tuple[int, int]] = []
         self._dummy_rows = DummyRowPool(
@@ -1128,7 +1193,8 @@ class PiecewiseCudaGraphRunner:
             return
 
         torch.cuda.set_device(self._device)
-        self._memory_pool = torch.cuda.graphs.graph_pool_handle()
+        if self._memory_pool is None:
+            self._memory_pool = torch.cuda.graphs.graph_pool_handle()
 
         shapes = self.prepare_for_capture()
         if not shapes:
@@ -1214,24 +1280,25 @@ class PiecewiseCudaGraphRunner:
             )
 
         def run_fn():
-            return fn(call)
+            return self._normalize_output(fn(call))
 
         try:
             self._plan(step, shape)
             torch.cuda.synchronize()
+            warm_outputs = None
             for _ in range(self.NUM_WARMUP):
                 with autocast_scope(self._autocast_dtype):
-                    run_fn()
+                    warm_outputs = run_fn()
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the shapes the first plan did
                 self._dummy_rows.reset(dummy_rids)
                 self._plan(step, shape)
             torch.cuda.synchronize()
 
-            graph, raw_outputs = capture_into_graph(
-                run_fn, self._memory_pool, self._device, self._autocast_dtype,
+            graph, static_outputs = capture_with_static_outputs(
+                run_fn, warm_outputs, self._memory_pool, self._device,
+                self._autocast_dtype,
             )
-            static_outputs = self._normalize_output(raw_outputs)
         finally:
             # pages stay with the dummy streams: replay's padding rows address
             # the same ids, so their plan finds the storage already resident

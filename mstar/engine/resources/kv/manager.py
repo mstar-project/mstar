@@ -15,7 +15,13 @@ from mstar.engine.resources.base import (
     PublishedInfo,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVSpec,
+    KVStep,
+    PagedKVConfig,
+    RetentionPolicy,
+)
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import fingerprint, page_key
 from mstar.engine.resources.kv.plan import (
@@ -39,6 +45,7 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -101,14 +108,6 @@ class PageArena:
         return self.allocator.num_free
 
 
-@dataclass(frozen=True)
-class RetentionPolicy:
-    """fifo retention of `context_budget`"""
-    context_budget: int
-    # front tokens the window never releases; only pages within them are indexed
-    protected_prefix: int = 0
-
-
 @dataclass
 class PrefixChain:
     """The keys that name a stream's pages, and how far the index holds them."""
@@ -161,7 +160,15 @@ class CacheStream:
     page_indices: list[int] = field(default_factory=list)
     stored_len: int = 0
     position: int = 0
+    # tokens compacted out of the front by `release_oldest` so far; the
+    # stream's committed content is then `[0, protected_prefix) + the newest
+    # (stored_len - protected_prefix)` tokens of what was written
     released: int = 0
+    # the first `protected_prefix` committed tokens (a text prefix, say) are
+    # never released; set once, after they commit (`protect_prefix`)
+    protected_prefix: int = 0
+    # the policy the last committing step declared for this stream
+    # (`KVStep.retention`): the index caps at its prefix, `reset` clears it
     retention: RetentionPolicy | None = None
     read_pending: bool = False
     read_future: Future | None = None
@@ -176,18 +183,30 @@ class CacheStream:
     # set at conversion, cleared at `commit`, so a refused admit's re-probe answers the same
     converted: bool = False
     offloaded: bool = False
+    # General mutation epoch used by plans and offload claims. Appends move it.
     generation: int = 0
+    # Logical-content epoch exported to remote readers. Unlike generation, an
+    # append does not move it; rewinds and whole-stream replacements do.
+    reset_generation: int = 0
+    # Last remote logical-content epoch this cache observed. None keeps
+    # transfer descriptors from before reset_generation compatible.
+    remote_reset_generation: int | None = None
 
     # set from a successful admit until commit: an admitted step already holds
     # addressing into these pages, so an offload in that window must not claim
     # them. read by `_claim_for_offload`
     step_in_flight: bool = False
 
-    def reset(self, freed: bool=False):
+    def reset(self, freed: bool=False, *, content_reset: bool=True):
         self.stored_len = 0
         self.position = 0
         self.released = 0
+        self.protected_prefix = 0
+        self.retention = None
         self.generation += 1
+        if content_reset:
+            self.reset_generation += 1
+            self.remote_reset_generation = None
         self.step_in_flight = False
 
         if freed:
@@ -212,6 +231,7 @@ class ClaimedStream:
     stored_len: int
     position: int
     released: int
+    protected_prefix: int
 
 
 LabelToStream = dict[str, CacheStream]
@@ -222,6 +242,7 @@ class KVSequenceInfo:
     # for tracking KV cache
     latest_kv_transfer_info: Any
     page_indices: list[int] = field(default_factory=list)
+    reset_generation: int | None = None
 
 
 @dataclass
@@ -250,6 +271,23 @@ class PublishedKVInfo(PublishedInfo):
                 **val
             }
 
+    def clone(self) -> "PublishedKVInfo":
+        return PublishedKVInfo(
+            info={
+                rank: {
+                    label: KVSequenceInfo(
+                        seq_len=seq.seq_len,
+                        latest_kv_transfer_info=seq.latest_kv_transfer_info,
+                        page_indices=list(seq.page_indices),
+                        reset_generation=seq.reset_generation,
+                    )
+                    for label, seq in labels.items()
+                }
+                for rank, labels in self.info.items()
+            },
+            world_size=self.world_size,
+        )
+
     def get(self, rank: int) -> dict[str, KVSequenceInfo]:
         return self.info.get(rank, {})
 
@@ -258,6 +296,7 @@ class PublishedKVInfo(PublishedInfo):
 class AllocResult:
     success: bool = True
     error: AdmitFailedReason | None = None
+    new_pages: list[int] | None = None
 
 
 @dataclass
@@ -288,12 +327,13 @@ class KVManager(AttentionResource):
 
     def __init__(
         self,
-        cfg: KVConfig,
+        cfg: PagedKVConfig,
         name: str,
         joint_comm_group: JointGroups | None,
         transfer_engine_info: TransferEngineInfo,
         device: torch.device,
         dtype=torch.bfloat16,
+        needs_remote_transfer: bool = False,
     ):
         self.config = cfg
         if joint_comm_group is not None:
@@ -312,7 +352,10 @@ class KVManager(AttentionResource):
         sink = self._arena.acquire(1)
         assert sink == [SINK_PAGE], f"expected page {SINK_PAGE} first, got {sink}"
         self._transfer = KVTransferManager(
-            transfer_engine_info, self.kv_cache
+            transfer_engine_info,
+            self.kv_cache,
+            resource_key=name,
+            needs_remote_transfer=needs_remote_transfer,
         )
         self._cpu_pool: CPUPagePool | None = None
         if cfg.cpu_offload_pages > 0:
@@ -341,6 +384,8 @@ class KVManager(AttentionResource):
 
         # (slot, label) -> KVPlanState, sized for the largest capture bucket
         self._static_plan_states: dict[tuple[int, str], KVPlanState] = {}
+        # copy-only H2D into those, see `_stage_decode_plan_state`
+        self._plan_stager = PinnedStager(torch.long)
         self._cg_max_seq_len = 0
         self._current_plan_states: dict[str, KVPlanState] = {}
         self.reset_default_cursors()
@@ -350,15 +395,23 @@ class KVManager(AttentionResource):
         self._preplan_key = None
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
 
-        # (rid, to_label, stored_len, generation) for pre-forks appliedb by
-        # a staged step; facilitates clear_preplan function
-        self._preplan_fork_undo: list[tuple[str, str, int, int]] = []
-        # (rid, to_label) for intialized reservations by staged step; cleared_preplan removes
-        # recorded in admit not plan, so separate from above.
+        # (rid, to_label) reservations a staged step made; clear_preplan
+        # releases them. recorded in admit, not plan: forks are not staged.
         self._preplan_new_labels: list[tuple[str, str]] = []
         # (rid, label) marked step_in_flight by a staged step, so an abandoned
         # one does not leave its streams unevictable
         self._preplan_marked: list[tuple[str, str]] = []
+
+        # (rid, label) -> pages the live reservation freshly acquired, for
+        # ``rollback_admit``. One record, not one per pass: only the plan thread
+        # or the GPU thread holds a reservation at a time, and the unwind has to
+        # find it whichever it was.
+        #
+        # Handle-keyed, so it MUST be purged when the handle is released: handles
+        # are recycled, and a stale entry would resolve against whichever request
+        # gets that handle next. ``admit`` clears the record, but a pre-planned
+        # step's admit returns first -- see ``remove_request`` / ``reset_request``.
+        self._admit_reserved_pages: dict[tuple[int, str], list[int]] = {}
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
@@ -369,6 +422,7 @@ class KVManager(AttentionResource):
             joint_comm_group=info.joint_comm_group,
             transfer_engine_info=info.transfer_engine_info,
             dtype=info.kv_dtype,
+            needs_remote_transfer=info.needs_remote_transfer,
         )
 
     def build_cuda_graph_buffers(
@@ -723,7 +777,30 @@ class KVManager(AttentionResource):
                     return AdmitOutcome(ok=True, ready=False)
 
                 stream = self._ensure_label(rid, label)
-                own = seq_info.latest_kv_transfer_info == self._own_transfer_info()
+                own = self._transfer.owns_transfer_info(
+                    transfer_info=seq_info.latest_kv_transfer_info,
+                    request_id=rid,
+                    label=label,
+                )
+                remote_reset_generation = seq_info.reset_generation
+                if (
+                    not own
+                    and remote_reset_generation is not None
+                    and stream.remote_reset_generation is not None
+                    and remote_reset_generation
+                    != stream.remote_reset_generation
+                ):
+                    # The producer rewound/replaced this logical stream. Its
+                    # seq_len may be unchanged, so length alone cannot prove
+                    # the receiver still holds the published contents.
+                    self._release_lease(stream)
+                    drop = self._arena.any_sealed(stream.page_indices)
+                    if drop:
+                        self._arena.release(stream.page_indices)
+                    stream.reset(freed=drop)
+                    stream.forget_chain()
+                if not own and remote_reset_generation is not None:
+                    stream.remote_reset_generation = remote_reset_generation
                 if not own and stream.chain is not None:
                     # another rank sampled the token after this record, so the pending tail is one behind
                     stream.chain.unkeyed = None
@@ -770,12 +847,19 @@ class KVManager(AttentionResource):
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned and not ctx.is_preplan:
             if self._preplan_key == self._plan_key(step, ctx):
-                # pages were already reserved by the preplan pass
+                # pages were already reserved by the preplan pass — and the record
+                # of them has to survive this call, because it is what a refusal
+                # further down the resource order unwinds. Falling through to the
+                # clear below would leak them.
                 return ADMIT_OK
             # a different step arrived first (see `plan`): drop the staged
             # plan and reserve for this step normally. The staged step's own
             # span pages stay with its stream, where its re-admit finds them.
+            # Its reservation went with ``clear_preplan``, so the record of it is
+            # stale and the clear below is right for this path.
             self.clear_preplan()
+        with self._lock:
+            self._admit_reserved_pages.clear()
         # forks reserve here and copy later (plan for pre-, commit for post-),
         # so a step that never runs leaves pages resident but no page contents
         # moved — re-admitting it allocates nothing and re-copies nothing.
@@ -821,6 +905,8 @@ class KVManager(AttentionResource):
                 self._preplan_marked = []
             for (from_label, to_label), extra in forks:
                 for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
                     # checked before the reservation, which is what creates it
                     if (
                         ctx.is_preplan
@@ -833,9 +919,15 @@ class KVManager(AttentionResource):
                     )
                     if not alloc_res.success:
                         return AdmitOutcome(ok=False, reason=alloc_res.error)
+                    if alloc_res.new_pages:
+                        self._admit_reserved_pages.setdefault(
+                            (rid, to_label), []).extend(alloc_res.new_pages)
 
             for segment in step.segments:
-                if segment.span == 0:
+                # A replay's padding rows reserve nothing: they run against
+                # SINK_PAGE (see `_sequence_views`). Pages for them would fail
+                # to allocate on a near-full arena and hold the batch.
+                if segment.span == 0 or ctx.is_padding_row(segment.request_id):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 alloc_res = self._alloc(
@@ -845,6 +937,10 @@ class KVManager(AttentionResource):
                 )
                 if not alloc_res.success:
                     return AdmitOutcome(ok=False, reason=alloc_res.error)
+                if alloc_res.new_pages:
+                    self._admit_reserved_pages.setdefault(
+                        (segment.request_id, segment.label), []
+                    ).extend(alloc_res.new_pages)
 
             # marked here rather than in plan so the mark also covers
             # admit -> plan, where an offload would otherwise release pages
@@ -853,6 +949,8 @@ class KVManager(AttentionResource):
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
+                if ctx.is_padding_row(segment.request_id):
+                    continue
                 stream = self._streams.get(
                     segment.request_id, {}
                 ).get(segment.label)
@@ -865,27 +963,85 @@ class KVManager(AttentionResource):
                     )
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
-        # TODO: apply retention policy
+        # retention is applied at commit (see `_apply_retention`)
 
         return ADMIT_OK
 
-    def _sequence_views(self, segments: list[Segment]) -> list[SequenceView]:
+    def rollback_admit(self, step: KVStep, ctx: StepContext) -> None:
+        """Give back the pages this admit freshly acquired. Does not touch pages
+        retained by a shared prefix or a lease converted onto the stream.
+
+        ``page_indices`` maps token position to page, so the reserved pages can
+        only be dropped off the tail. If something else has extended the stream
+        since, the tail can no longer be safely removed.
+        """
+        del step, ctx
+        with self._lock:
+            reserved, self._admit_reserved_pages = self._admit_reserved_pages, {}
+            for (rid, label), pages in reserved.items():
+                if not pages:
+                    continue  # `page_indices[:-0]` would empty the whole stream
+                stream = self._streams.get(rid, {}).get(label)
+                if stream is None:
+                    continue  # reset or removed under us; its pages went with it
+                if stream.page_indices[-len(pages):] != pages:
+                    logger.error(
+                        "KV %s: cannot unwind %s/%s's admit — its pages are no "
+                        "longer the tail of the stream (%d reserved, stream has "
+                        "%d). Leaving them; the free pool is short by that much.",
+                        self.name, rid, label, len(pages),
+                        len(stream.page_indices),
+                    )
+                    continue
+                self._arena.release(pages)
+                del stream.page_indices[-len(pages):]
+                # so an offload that claimed this stream mid-admit notices its
+                # host copy no longer describes it and aborts
+                stream.generation += 1
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
+
+    def _forget_reservations(self, rid: int) -> None:
+        """Drop ``rid``'s unwind record. Caller holds the lock."""
+        for key in [k for k in self._admit_reserved_pages if k[0] == rid]:
+            del self._admit_reserved_pages[key]
+
+    def _sequence_views(
+        self,
+        segments: list[Segment],
+        pending_forks: dict[tuple[str, str], tuple[int, int]] | None = None,
+        ctx: StepContext | None = None,
+    ) -> list[SequenceView]:
         views = []
         page_size = self.kv_cache.page_size
+        pending_forks = pending_forks or {}
         for s in segments:
+            if ctx is not None and ctx.is_padding_row(s.request_id):
+                # A padding row reads and writes SINK_PAGE; the engine
+                # discards its output.
+                views.append(SequenceView(
+                    request_id=s.request_id, label=s.label,
+                    # a sink page per page of span, not one: fewer and its writes spill into the previous row's pages
+                    page_idxs=[SINK_PAGE] * -(-s.span // page_size),
+                    length=s.span, to_compute=s.span,
+                ))
+                continue
             stream = self._streams[s.request_id][s.label]
+            stored_len, generation = pending_forks.get(
+                (s.request_id, s.label), (stream.stored_len, stream.generation)
+            )
             # `page_indices` is a high-water mark, so a stream can hold more
             # pages than its tokens need (a refused admit, a reset that kept
             # its pages). slice to the length or the view addresses token 0
             # into the wrong page and reports the padding as resident context
-            length = s.span + stream.stored_len
+            length = s.span + stored_len
             num_pages = -(-length // page_size)
             views.append(SequenceView(
                 request_id=s.request_id,
                 label=s.label, page_idxs=stream.page_indices[:num_pages],
                 length=length,
                 to_compute=s.span,
-                generation=stream.generation,
+                generation=generation,
             ))
         return views
 
@@ -946,15 +1102,7 @@ class KVManager(AttentionResource):
         stream, so build it in the same CPU pass the views came from and send
         it over as one H2D.
         """
-        page_size = self.kv_cache.page_size
-        pages: list[int] = []
-        offsets: list[int] = []
-        for view in views:
-            # off the stream's page count, not its logical length: that is what
-            # `build_paged_indptrs` hands attention, so a stream holding more
-            # pages than its length needs stays self-consistent
-            pages.append(view.page_idxs[-1])
-            offsets.append((view.last_page_len(page_size) or page_size) - 1)
+        pages, offsets = self._decode_locations(views)
         locations = torch.tensor(
             [pages, offsets], dtype=torch.long
         ).to(self._device, non_blocking=True)
@@ -964,11 +1112,53 @@ class KVManager(AttentionResource):
             total_tokens=len(views),
         )
 
+    def _decode_locations(
+        self, views: list[SequenceView],
+    ) -> tuple[list[int], list[int]]:
+        """Each decode row's (page, offset-in-page) for the token it writes.
+
+        Off the stream's page count, not its logical length: that is what
+        `build_paged_indptrs` hands attention, so a stream holding more pages
+        than its length needs stays self-consistent."""
+        page_size = self.kv_cache.page_size
+        pages = [view.page_idxs[-1] for view in views]
+        offsets = [(view.last_page_len(page_size) or page_size) - 1 for view in views]
+        return pages, offsets
+
+    def _stage_decode_plan_state(
+        self, views: list[SequenceView], static_state: KVPlanState,
+        capture_len: int,
+    ) -> KVPlanState:
+        """``_decode_plan_state`` + ``KVPlanState.copy_`` with no device staging
+        tensor; rows past the real tokens get SINK_PAGE / 0."""
+        pages, offsets = self._decode_locations(views)
+        self._plan_stager.copy_(
+            static_state.token_to_page[:capture_len], pages, pad_value=SINK_PAGE,
+        )
+        self._plan_stager.copy_(
+            static_state.token_to_cache[:capture_len], offsets, pad_value=0,
+        )
+        static_state.total_tokens = len(views)
+        return static_state
+
     def _setup_plan_states(
         self, plan_output: dict[str, KVPlanOutput],
         ctx: StepContext, lease,
     ):
         for label, indptrs in plan_output.items():
+            if indptrs.is_decode and lease is not None:
+                # Straight into the captured buffers in one H2D per buffer:
+                # this runs in the pre-plan beside a live graph, where a
+                # device-side copy + fill would slow it (see mstar.utils.h2d).
+                plan_state = self._stage_decode_plan_state(
+                    indptrs.views, self._static_plan_state(lease.slot, label),
+                    lease.bucket.num_tokens,
+                )
+                if ctx.is_preplan:
+                    self._preplan_states[label] = plan_state
+                else:
+                    self._current_plan_states[label] = plan_state
+                continue
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(indptrs.views)
             else:
@@ -993,6 +1183,38 @@ class KVManager(AttentionResource):
             views=views,
         )
 
+    def _maybe_apply_forks(self, step: KVStep, ctx: StepContext):
+        for (from_label, to_label) in step.pre_forks:
+            for rid in ctx.padded_request_ids:
+                if ctx.is_padding_row(rid):
+                    continue
+                self._apply_fork(rid, from_label, to_label)
+
+    def _pending_fork_state(
+        self, step: KVStep, ctx: StepContext
+    ) -> dict[tuple[str, str], tuple[int, int]]:
+        """``(stored_len, generation)`` each pre-fork will hand its target.
+
+        Staging cannot run the fork (`copy_pages` would race the default
+        stream), so the target's length and bumped generation are read ahead
+        and the copy happens at promotion.
+        """
+        pending: dict[tuple[str, str], tuple[int, int]] = {}
+        with self._lock:
+            for (from_label, to_label) in step.pre_forks:
+                for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
+                    labels = self._streams.get(rid, {})
+                    src = labels.get(from_label)
+                    dst = labels.get(to_label)
+                    if src is None or dst is None:
+                        continue
+                    pending[(rid, to_label)] = (
+                        src.stored_len, dst.generation + 1,
+                    )
+        return pending
+
     def plan(self, step: KVStep, ctx: StepContext) -> dict[str, KVPlanOutput]:
         """
         Returns list of sequence views per plan label
@@ -1006,7 +1228,11 @@ class KVManager(AttentionResource):
             if self._preplan_key == self._plan_key(step, ctx):
                 self._current_plan_states = self._preplan_states
                 res = self._cached_plan_output
-                self._preplan_fork_undo = []
+
+                # Promotion: apply the fork copies staging left undone; see
+                # `_pending_fork_state`.
+                self._maybe_apply_forks(step, ctx)
+
                 self._preplan_new_labels = []
                 self._preplan_marked = []
                 self.clear_preplan()
@@ -1016,13 +1242,20 @@ class KVManager(AttentionResource):
             # pre-planned): it must not be served the staged plan's pages.
             # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
-        undo = self._preplan_fork_undo if ctx.is_preplan else None
-        for (from_label, to_label) in step.pre_forks:
-            for rid in ctx.padded_request_ids:
-                self._apply_fork(rid, from_label, to_label, undo=undo)
+
+        # Forks run ahead of the views, which record length and generation;
+        # staging only reads what the fork will land.
+        if ctx.is_preplan:
+            pending = self._pending_fork_state(step, ctx)
+        else:
+            pending = {}
+            self._maybe_apply_forks(step, ctx)
+
         res = KVPlanOutputs(
             {
-                plan_label: self._plan_output(self._sequence_views(segments))
+                plan_label: self._plan_output(
+                    self._sequence_views(segments, pending, ctx)
+                )
                 for plan_label, segments in group_by_plan_label(
                     step.segments, step.combined_labels
                 ).items()
@@ -1050,17 +1283,9 @@ class KVManager(AttentionResource):
 
     def clear_preplan(self):
         # the staged step is not going to run, so undo what it did to live
-        # state: dropping the cached plan is not enough, the pre-forks already
-        # copied pages and moved lengths
+        # state. the pre-forks need no rewinding — staging only read them —
+        # but admit's reservations are real pages and real streams
         with self._lock:
-            for rid, label, stored_len, generation in reversed(
-                self._preplan_fork_undo
-            ):
-                stream = self._streams.get(rid, {}).get(label)
-                if stream is not None:
-                    stream.stored_len = stored_len
-                    stream.generation = generation
-            self._preplan_fork_undo = []
             # labels the staged step invented are removed, not rewound to 0:
             # a stream at 0 that nothing asked for is still a stream, and it
             # holds the pages the reservation took
@@ -1083,7 +1308,11 @@ class KVManager(AttentionResource):
     def commit(self, step: KVStep, ctx: StepContext):
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
+            # committed, so there is nothing left to unwind
+            self._admit_reserved_pages.clear()
             for segment in step.segments:
+                if ctx.is_padding_row(segment.request_id):
+                    continue  # ran against SINK_PAGE, holds nothing
                 stream = self._streams[segment.request_id][segment.label]
                 # cleared before the `step.commit` test: a step that keeps no
                 # tokens (image_gen, action_gen) still read these pages, and
@@ -1104,18 +1333,153 @@ class KVManager(AttentionResource):
                     stream.stored_len += segment.span
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
+                    policy = step.retention.get((segment.request_id, segment.label))
+                    if policy is not None:
+                        self._adopt_retention(stream, policy, segment)
                     self._index_filled_pages(segment, stream, ctx)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
+                    # The step's retention, if it declared one: drop what aged
+                    # past the context budget now that this step's tokens
+                    # count. Here, under the lock and before `commit_done`
+                    # lets the next step pre-plan, so no admitted plan
+                    # addresses the pages this frees (this step's own kernels
+                    # may still be reading them, but every later user of the
+                    # pages queues behind them on the node's stream, the host
+                    # pool's copies included)
+                    if policy is not None:
+                        self._apply_retention(stream, policy)
             # post-forks copy what this step just wrote, so they land after the
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
                 for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
                     self._apply_fork(rid, from_label, to_label)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
-        # TODO: handle retention policy, free pages if not commit
+
+    # Partial release behind a protected prefix (windowed generation): a
+    # request that generates in windows commits each window's K/V and, once
+    # its context horizon fills, drops the oldest generated pages while the
+    # prompt prefix stays. Two routes to the same page-floored front release:
+    # a `RetentionPolicy` the committing step declares (`KVStep.retention`),
+    # applied inside that commit — the served route, safe under pre-planning —
+    # and the explicit `protect_prefix` / `release_oldest` pair for a driver
+    # that runs between steps. Ported from #198's PagedAllocationManager
+    # (merceod) onto the pool's streams.
+
+    @torch.compiler.disable
+    def protect_prefix(
+        self, request_id: str, num_tokens: int, label: str | None = None,
+    ) -> None:
+        """Mark the first ``num_tokens`` committed tokens of the stream as never
+        releasable. Set once, after the prefix commits and before any release;
+        idempotent at the same value."""
+        if label is None:
+            label = self._default_label
+        with self._lock:
+            stream = self._streams[request_id][label]
+            if num_tokens < 0 or num_tokens > stream.stored_len:
+                raise ValueError(
+                    f"protect_prefix({num_tokens}) outside the committed {stream.stored_len} "
+                    f"tokens of request {request_id!r} label {label!r}"
+                )
+            if stream.released:
+                raise ValueError(
+                    f"protect_prefix must precede any release_oldest for request "
+                    f"{request_id!r} label {label!r}"
+                )
+            if stream.protected_prefix not in (0, num_tokens):
+                raise ValueError(
+                    f"protected prefix already {stream.protected_prefix} tokens for "
+                    f"request {request_id!r} label {label!r}, got {num_tokens}"
+                )
+            stream.protected_prefix = num_tokens
+
+    def _adopt_retention(
+        self, stream: CacheStream, policy: RetentionPolicy, segment: Segment,
+    ) -> None:
+        """Take the policy a committing step declares for its stream: the
+        protected prefix must be committed and agree with any earlier one
+        (`protect_prefix`, or the previous window's). The budget may change
+        between windows. Under the lock."""
+        if policy.protected_prefix > stream.stored_len:
+            raise ValueError(
+                f"retention for request {segment.request_id!r} label {segment.label!r} "
+                f"protects {policy.protected_prefix} tokens but only "
+                f"{stream.stored_len} are committed"
+            )
+        if stream.protected_prefix not in (0, policy.protected_prefix):
+            raise ValueError(
+                f"protected prefix already {stream.protected_prefix} tokens for "
+                f"request {segment.request_id!r} label {segment.label!r}, got "
+                f"{policy.protected_prefix}"
+            )
+        stream.protected_prefix = policy.protected_prefix
+        stream.retention = policy
+
+    def _apply_retention(self, stream: CacheStream, policy: RetentionPolicy) -> int:
+        """Release what the step's policy no longer keeps. Under the lock."""
+        excess = stream.stored_len - policy.protected_prefix - policy.context_budget
+        if excess <= 0:
+            return 0
+        return self._release_oldest_locked(stream, excess)
+
+    def _release_oldest_locked(self, stream: CacheStream, num_tokens: int) -> int:
+        """The page-floored front release shared by ``release_oldest`` and the
+        commit-time retention. Under the lock."""
+        page_size = self.config.page_size
+        first = (stream.protected_prefix + page_size - 1) // page_size
+        releasable = stream.stored_len // page_size - first
+        k = min(num_tokens // page_size, releasable)
+        if k <= 0:
+            return 0
+        freed = stream.page_indices[first:first + k]
+        del stream.page_indices[first:first + k]
+        stream.stored_len -= k * page_size
+        stream.released += k * page_size
+        stream.generation += 1
+        self._arena.release(freed)
+        return k * page_size
+
+    @torch.compiler.disable
+    def release_oldest(
+        self, request_id: str, num_tokens: int, label: str | None = None,
+    ) -> int:
+        """Free the oldest unprotected committed tokens of a live stream, whole
+        pages only, compacting the page list so the remaining stream stays
+        contiguous in page-list order. Returns the tokens actually freed.
+
+        The freed span starts at the first page fully past the protected
+        prefix; a page straddling the protection boundary and a partially
+        filled tail page are never freed, so the realized release can fall
+        short of ``num_tokens`` by up to a page — callers re-offer the
+        shortfall next time (see ``WindowedKVSession``). ``stored_len`` drops
+        by exactly the freed count and ``generation`` moves, so a prefix a
+        backend gathered out of these pages is re-read (the dense backend keys
+        its gathered prefix on it). Positions are not touched: the tokens that
+        remain keep the absolute positions their K/V was written with.
+
+        Refused under an admitted step (its plan addresses these pages) and
+        while the stream is offloaded or being retrieved.
+        """
+        if label is None:
+            label = self._default_label
+        with self._lock:
+            stream = self._streams[request_id][label]
+            if stream.step_in_flight:
+                raise RuntimeError(
+                    f"release_oldest on request {request_id!r} label {label!r} under an "
+                    "admitted step; release between steps"
+                )
+            if stream.offloaded or stream.read_pending:
+                raise RuntimeError(
+                    f"release_oldest on request {request_id!r} label {label!r} while its "
+                    "pages are offloaded or in transfer"
+                )
+            return self._release_oldest_locked(stream, num_tokens)
 
     # Eviction
 
@@ -1172,6 +1536,7 @@ class KVManager(AttentionResource):
                     gpu_page_indices=claim.pages,
                     stored_len=claim.stored_len, position=claim.position,
                     released=claim.released,
+                    protected_prefix=claim.protected_prefix,
                 )
             ]
             if not moved:
@@ -1214,6 +1579,7 @@ class KVManager(AttentionResource):
                     stored_len=stream.stored_len,
                     position=stream.position,
                     released=stream.released,
+                    protected_prefix=stream.protected_prefix,
                 ))
                 if stream.read_future is not None:
                     read_futures.append(stream.read_future)
@@ -1243,7 +1609,8 @@ class KVManager(AttentionResource):
                 freed += len(claim.pages)
                 self._arena.release(claim.pages)
                 stream.page_indices = []
-                stream.reset()
+                # Offload changes residency, not logical stream contents.
+                stream.reset(content_reset=False)
             return freed, {claim.label for claim in moved}
 
     def _abandon_claims(self, rid: str, labels: list[str]) -> None:
@@ -1272,6 +1639,21 @@ class KVManager(AttentionResource):
             request_id=rid,
         )
 
+    def _reload_pages_needed(self, rid: str) -> int:
+        return sum(
+            self._cpu_pool.num_pages(rid, label)
+            for label in self._cpu_pool.labels(rid)
+        )
+
+    def can_reload(self, rid: str) -> bool:
+        """Whether the free pages plus what the prefix index could evict cover
+        ``rid``'s offloaded streams. An upper bound: ``reload`` can still refuse."""
+        if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
+            return False
+        with self._lock:
+            evictable = 0 if self._index is None else self._index.num_sole_owned()
+            return self._reload_pages_needed(rid) <= self._arena.num_free + evictable
+
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
 
@@ -1282,7 +1664,7 @@ class KVManager(AttentionResource):
             return False
         with self._lock:
             labels = self._cpu_pool.labels(rid)
-            needed = sum(self._cpu_pool.num_pages(rid, label) for label in labels)
+            needed = self._reload_pages_needed(rid)
             if needed > self._arena.num_free and self._index is not None:
                 # as `_alloc` does: once the pool is all cached pages, nothing
                 # else would ever free one for this request to come back to
@@ -1306,6 +1688,7 @@ class KVManager(AttentionResource):
                 stream.stored_len = state.stored_len
                 stream.position = state.position
                 stream.released = state.released
+                stream.protected_prefix = state.protected_prefix
                 stream.offloaded = False
         # sync outside the lock: orders the reload H2D copies before attention
         # reads them, but the pages are already assigned so it touches no
@@ -1325,28 +1708,81 @@ class KVManager(AttentionResource):
         """Device pages the request is holding — the most reclaimable first."""
         return float(self.reclaimable(rid))
 
-    def _own_transfer_info(self):
+    def _own_transfer_info(
+        self,
+        request_id: str,
+        label: str,
+        stream: CacheStream,
+    ):
         """This cache's transfer descriptor, as `publish` stamps it."""
-        return self._transfer.get_kv_transfer_info()
+        return self._transfer.get_kv_transfer_info(
+            request_id=request_id,
+            label=label,
+            page_indices=stream.page_indices,
+            seq_len=stream.stored_len,
+            reset_generation=stream.reset_generation,
+        )
 
-    def publish(self, request_id: str):
-        # `remove_request` can pop the streams from another thread between the
-        # forward and finalize; nothing to publish then
-        streams = self._streams.get(request_id)
-        if streams is None:
-            return None
-
-        transfer_info = self._own_transfer_info()
+    def publish(
+        self,
+        request_id: str,
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+        *,
+        final: bool = False,
+    ):
         with self._lock:
+            # remove_request can race finalize on another thread. Resolve the
+            # request and build its descriptor in this one critical section.
+            streams = self._streams.get(request_id)
+            overrides = self._overrides.get(request_id)
+            if streams is None or overrides is None:
+                return None
+            labels = overrides.get_publish_labels(
+                node_name, graph_walk, list(streams), final=final,
+            )
+            if not labels:
+                return None
             seq_info = {
                 label: KVSequenceInfo(
                     seq_len=stream.stored_len,
-                    latest_kv_transfer_info=transfer_info,
+                    latest_kv_transfer_info=self._own_transfer_info(
+                        request_id=request_id,
+                        label=label,
+                        stream=stream,
+                    ),
                     page_indices=list(stream.page_indices),
-                ) for label, stream in streams.items()
+                    reset_generation=stream.reset_generation,
+                ) for label in labels
+                if (stream := streams.get(label)) is not None
             }
+            if not seq_info:
+                return None
         return PublishedKVInfo.build_for_rank(
             rank=self._rank, world_size=self._world_size, seq_info=seq_info,
+        )
+
+    def publish_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        return self.publish(
+            request_id, node_name=node_name, graph_walk=graph_walk,
+        )
+
+    def publish_after_stop(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        return self.publish(
+            request_id,
+            node_name=node_name,
+            graph_walk=graph_walk,
+            final=True,
         )
 
     def reset_request(self, rid: str, free: bool=False):
@@ -1373,6 +1809,8 @@ class KVManager(AttentionResource):
                 stream.reset(freed=drop)
                 # a stale cursor or generated key would misfile what the rerun writes
                 stream.forget_chain()
+            # the pages above were released, so any record of them is stale
+            self._forget_reservations(rid)
             for label, stream in self._streams.get(rid, {}).items():
                 self._seed_keys(rid, label, stream)
             if _DEBUG_ASSERTS:
@@ -1392,8 +1830,12 @@ class KVManager(AttentionResource):
                     self._arena.release(stream.page_indices)
             if self._cpu_pool is not None:
                 self._cpu_pool.remove_request(rid)
+            # handle-keyed, and this releases the handle: a survivor would be
+            # unwound against whichever request is given this handle next
+            self._forget_reservations(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
+            self._transfer.remove_request(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -1563,25 +2005,18 @@ class KVManager(AttentionResource):
         )
 
     def _apply_fork(
-        self, rid: str, from_label: str, to_label: str, undo: list | None = None,
+        self, rid: str, from_label: str, to_label: str,
     ) -> None:
         """Copy a stream onto its fork target, over pages `_reserve_fork` took.
 
         Locked (reentrant): called from plan (pre-forks, else unguarded) and
         from the already-locked commit (post-forks).
-
-        ``undo`` collects each target's prior ``(stored_len, generation)`` so a
-        preplan that is abandoned can be reversed; see `clear_preplan`.
         """
         with self._lock:
             if from_label not in self._streams[rid]:
                 return
             from_stream = self._streams[rid][from_label]
             to_stream = self._ensure_label(rid, to_label)
-            if undo is not None:
-                undo.append(
-                    (rid, to_label, to_stream.stored_len, to_stream.generation)
-                )
             # sized off the source's length, not either side's page count:
             # both can hold more pages than the fork needs, and a target left
             # over-reserved by a refused admit used to make the copy lopsided
@@ -1605,6 +2040,7 @@ class KVManager(AttentionResource):
             )
             to_stream.stored_len = from_stream.stored_len
             to_stream.generation += 1
+            to_stream.reset_generation += 1
 
     def _alloc(
         self, request_id: str, label: str, seq_len: int
@@ -1620,6 +2056,9 @@ class KVManager(AttentionResource):
                 )
             num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
             num_new_pages = num_pages_needed - len(stream.page_indices)
+            # a stream that already holds enough pages acquires none, and has
+            # nothing for ``rollback_admit`` to give back
+            new_pages: list[int] = []
             if num_new_pages > 0:
                 new_pages = self._arena.acquire(num_new_pages)
                 if new_pages is None and self._index is not None:
@@ -1644,7 +2083,7 @@ class KVManager(AttentionResource):
                     )
                 stream.page_indices.extend(new_pages)
                 stream.generation += 1
-        return AllocResult()
+        return AllocResult(new_pages=new_pages)
 
     ### Submodule-level functionality
     # Label / layer cursors come from `AttentionResource`; the readers resolve
