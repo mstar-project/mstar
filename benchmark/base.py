@@ -446,6 +446,9 @@ class MiniCPMO45(Model):
             # vllm-omni only: the template thinks unless told not to, and
             # speaks only with the TTS template
             "chat_template_kwargs": {"enable_thinking": False, "use_tts_template": speech},
+            # vllm-omni slices images by config.json (one slice); upstream's
+            # chat() and M* default to the processor's nine
+            "max_slice_nums": 1,
         }
         if speech:
             # raw 24 kHz int16 chunks, which RequestMetrics' duration maths assumes
