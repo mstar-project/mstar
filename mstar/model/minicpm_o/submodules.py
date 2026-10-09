@@ -9,13 +9,21 @@ advances by the token count with no special casing.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.cuda_graph_config import (
+    BatchedCudaGraphConfig,
+    CudaGraphConfig,
+    PackedCudaGraphConfig,
+    PiecewiseCaptureShape,
+    PiecewiseCudaGraphConfig,
+    PiecewisePackedConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -24,6 +32,7 @@ from mstar.engine.resources import (
     RaggedCrossAttentionStep,
     SamplerStep,
     Segment,
+    SlotLease,
     SubmoduleStep,
 )
 from mstar.engine.resources.attn.base import AttentionManager
@@ -280,6 +289,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
     navit SigLIP attends within each slice, then the resampler turns each slice
     into 64 tokens. Requests pack too; their slices stay apart by segment."""
 
+    # Every request brings its own slice count and patch grid, which a compiled
+    # forward would recompile for; it runs once a request.
+    disable_torch_compile = True
+
     def __init__(self, model: MiniCPMOVision, config: MiniCPMOConfig):
         super().__init__()
         self.model = model
@@ -368,9 +381,26 @@ class VisionEncoderSubmodule(NodeSubmodule):
         }
 
 
+# The Whisper block loop, as a piecewise capture region
+AUDIO_BLOCK_LOOP = "audio_block_loop"
+
+
 class AudioEncoderSubmodule(NodeSubmodule):
-    """A request's audio pieces (30 s each at most), packed with any other
-    request's; each piece is its own block-causal segment."""
+    """A request's audio pieces (30 s each at most); each piece is its own
+    block-causal segment.
+
+    The conv front end and the pooling run eagerly around a captured block
+    loop (24 layers and the projector), one request per replay, bucketed by
+    frame count: eager, the encoder is launch-bound (~10 ms whatever the
+    clip's length). A request past the largest bucket runs eagerly.
+    """
+
+    # 50 frames a second: 5 s up to two full 30 s pieces
+    BLOCK_LOOP_FRAME_BUCKETS = [256, 512, 1024, 1536, 3072]
+
+    # Every clip has its own length, which a compiled forward would recompile
+    # for; the captured block loop is what makes it fast.
+    disable_torch_compile = True
 
     def __init__(self, model: MiniCPMOAudio, config: MiniCPMOConfig):
         super().__init__()
@@ -398,8 +428,12 @@ class AudioEncoderSubmodule(NodeSubmodule):
         graph_walk: str,
         request_ids: list[str],
         inputs: list[NodeInputs],
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
-    ) -> SubmoduleStep:
+    ) -> SubmoduleStep | None:
+        # leased, the captured block loop plans its own attention per replay
+        if (piecewise_leases or {}).get(AUDIO_BLOCK_LOOP):
+            return None
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label="main", span=n)
@@ -411,6 +445,50 @@ class AudioEncoderSubmodule(NodeSubmodule):
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
+
+    def max_batch_size(self, graph_walk: str) -> int:
+        # one request a step, so it can take the captured block loop
+        return 1
+
+    def get_piecewise_cuda_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs,
+    ) -> dict[str, PiecewiseCudaGraphConfig]:
+        d_model = self.config.audio.d_model
+
+        def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
+            return {"hidden": torch.zeros(shape.total_tokens, d_model, dtype=autocast_dtype, device=device)}
+
+        def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
+            (rid,) = request_ids
+            return SubmoduleStep(
+                segments=[Segment(request_id=rid, label="main", span=n) for n in seq_lens],
+                steps={AUDIO_ATTN: AttentionStep(causal=False)},
+            )
+
+        return {
+            AUDIO_BLOCK_LOOP: PiecewisePackedConfig(
+                capture_fn=lambda inp: {"hidden": self.model.encode(inp.static_inputs["hidden"])},
+                make_static_inputs=make_static_inputs,
+                declare_step=declare_step,
+                lease_before_step=True,
+                total_tokens=self.BLOCK_LOOP_FRAME_BUCKETS,
+                capture_batch_sizes=[1],
+            )
+        }
+
+    @torch.compiler.disable
+    def _replay_block_loop(
+        self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, frames: list[int],
+    ) -> torch.Tensor | None:
+        runner = engine_inputs.piecewise_runners.get(AUDIO_BLOCK_LOOP)
+        if runner is None or not runner.can_run(len(engine_inputs.request_ids), int(hidden.shape[0])):
+            return None
+        return runner.run(
+            static_inputs={"hidden": hidden},
+            request_ids=[engine_inputs.request_ids[0]],
+            seq_lens=list(frames),
+            real_bs=1,
+        ).get_view("hidden")
 
     def preprocess(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs],
@@ -439,7 +517,11 @@ class AudioEncoderSubmodule(NodeSubmodule):
         tokens_per_request: list[int],
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        embeds = self.model(pieces, frames)
+        hidden = self.model.apm.frontend(pieces)
+        encoded = self._replay_block_loop(engine_inputs, hidden, frames)
+        if encoded is None:
+            encoded = self.model.encode(hidden)
+        embeds = self.model.pool(encoded, frames)
         return {
             rid: {"audio_embeds": [out]}
             for rid, out in zip(engine_inputs.request_ids, embeds.split(tokens_per_request), strict=True)

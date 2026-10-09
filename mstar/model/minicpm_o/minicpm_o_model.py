@@ -254,6 +254,8 @@ class MiniCPMOModel(Model):
                     num_qo_heads=audio.encoder_attention_heads,
                     num_kv_heads=audio.encoder_attention_heads,
                     head_dim=audio.head_dim,
+                    # 30 s pieces: the largest captured bucket holds two
+                    max_segments_per_request=2,
                 ),
             ),
             *self._tts_resources(),
