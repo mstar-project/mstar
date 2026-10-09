@@ -1,5 +1,6 @@
 """Glm5NextModel: Model implementation for GLM-5.3-Flash (text generation)."""
 
+import json
 import logging
 from pathlib import Path
 
@@ -180,6 +181,14 @@ class Glm5NextModel(Model):
         template = snap / "chat_template.jinja"
         if template.is_file():
             tokenizer.chat_template = template.read_text()
+        # the turn markers (<|user|>, <|observation|>) are listed only here; not
+        # registered as special, the detokenizer prints them into the reply
+        config = snap / "tokenizer_config.json"
+        if config.is_file():
+            cfg = json.loads(config.read_text())
+            special = {k: cfg[k] for k in ("eos_token", "pad_token") if cfg.get(k)}
+            tokenizer.add_special_tokens(
+                {**special, "additional_special_tokens": list(cfg.get("extra_special_tokens") or [])})
         return tokenizer
 
     # -------------------------------------------------------------------
