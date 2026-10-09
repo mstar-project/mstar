@@ -208,6 +208,25 @@ class ReadySignals:
         self.is_ready = False
         self.is_ready_for_streaming = False
 
+    def clear_streaming(self):
+        """``clear`` for the streaming inputs only: the rest stay for the
+        node's next step, which the next streamed chunk triggers."""
+        names = self.streaming_inputs & self.ready_names
+        if self._tensor_manager is not None:
+            self._tensor_manager.dereference_batch_uniform([
+                info.uuid
+                for name in names
+                if not self.ready_inputs[name]._persist_for_loop
+                for info in self.ready_inputs[name].tensor_info
+            ])
+        for name in names:
+            del self.ready_inputs[name]
+        self.ready_names -= names
+        self.is_ready = self.input_names.issubset(self.ready_names)
+        self.is_ready_for_streaming = self.is_ready or self.input_names.issubset(
+            self.ready_names | self.streaming_inputs
+        )
+
     def remove(self, edge_name: str) -> "GraphEdge | None":
         """Reverse ``update(edge)`` without dereferencing tensor_info.
 
