@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 from contextlib import contextmanager
+from functools import partial
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -33,6 +34,8 @@ from mstar.engine.engine import Engine
 from mstar.engine.resources import BucketKey, CGSlotSpec
 
 _GIB = 2**30
+
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a throwaway capture needs a GPU")
 
 
 def _bucket(walk: str, bs: int, tokens: int) -> BucketKey:
@@ -56,12 +59,17 @@ class _StubMeasuredRunner:
         self._capture_costs = {}
         group = SimpleNamespace(world_size=1, barrier=lambda: None)
         self._comm_group = SimpleNamespace(tp_group=group, sp_group=group)
+        self.warmed: list[tuple[BucketKey, int]] = []
+        self.failing: set[tuple[BucketKey, int]] = set()
 
     def prepare_for_capture(self):
         return [CGSlotSpec(bucket=b, slot=s, config=SimpleNamespace()) for b in self._steps for s in (0, 1)]
 
     @contextmanager
     def _warmed(self, spec):
+        self.warmed.append((spec.bucket, spec.slot))
+        if (spec.bucket, spec.slot) in self.failing:
+            raise RuntimeError(f"capture admit failed for {spec.bucket}")
         step = self._steps[spec.bucket]
         yield WarmedSpec(
             run=lambda: step, static_inputs={}, static_input_keys=(), dummy_rids=[], dummy_metadata={},
@@ -110,6 +118,30 @@ def test_every_bucket_is_measured_once_before_any_capture(measured):
     assert kept == steps, "every bucket's step must be kept to size its capture"
 
 
+def test_every_slot_is_warmed_before_any_capture(measured):
+    """A slot's first plan builds state of its own: FlashInfer's graph wrappers,
+    and a 512 MiB workspace for the Talker's second slot. Warmed at slot 0 only,
+    that came after free memory was read, and the Talker's capture took 844 MiB
+    against 98 predicted."""
+    runner = _StubMeasuredRunner(torch.device("cuda", 0), {_DECODE: CaptureCost(_GIB, 2 * _GIB, 0)})
+
+    runner.size_captures()
+
+    assert runner.warmed == [(_DECODE, 0), (_DECODE, 1)], "every slot must be warmed before the plan reads free memory"
+
+
+def test_a_bucket_whose_second_slot_cannot_run_is_never_planned(measured):
+    """A bucket registers all of its slots or none, so one whose second slot
+    fails its warm-up would be captured at slot 0 for nothing."""
+    runner = _StubMeasuredRunner(torch.device("cuda", 0), {_DECODE: CaptureCost(_GIB, 2 * _GIB, 0)})
+    runner.failing = {(_DECODE, 1)}
+
+    costs = runner.size_captures()
+
+    assert costs[_DECODE].graph is None, "a bucket that can't run every slot must not be planned"
+    assert costs[_DECODE].peak == _GIB, "its eager peak still counts toward the floor"
+
+
 def test_a_cpu_device_never_asks_the_driver(monkeypatch):
     """Asking the CUDA driver for memory fails an XPU or CPU worker at start. A
     CPU device skips the budget even on a host where CUDA exists."""
@@ -123,6 +155,49 @@ def test_a_cpu_device_never_asks_the_driver(monkeypatch):
 
     assert budget is None
     assert driver_calls == [], "a CPU worker must not ask the CUDA driver for memory"
+
+
+def _succeeds(x: torch.Tensor) -> torch.Tensor:
+    return x @ x
+
+
+def _runs_out_of_memory(x: torch.Tensor) -> torch.Tensor:
+    x @ x
+    return torch.empty(2 * torch.cuda.mem_get_info(x.device)[0], dtype=torch.uint8, device=x.device)
+
+
+def _fails_in_capture_end(x: torch.Tensor) -> torch.Tensor:
+    """A side stream never joined back: the capture runs, and capture_end refuses it."""
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        return x @ x
+
+
+@requires_cuda
+@pytest.mark.parametrize("forward", [_succeeds, _runs_out_of_memory, _fails_in_capture_end])
+def test_a_throwaway_capture_frees_its_memory_pass_or_fail(forward, monkeypatch):
+    """torch releases a graph's pool only for a capture that ended. One that
+    failed in capture_end kept its pool, and the cuBLAS workspace the capture
+    stream took in it, for good: memory every later bucket was sized without."""
+    # a captured log record would keep the failed capture's frames, and its memory, alive
+    monkeypatch.setattr(cuda_graph_runner.logger, "disabled", True)
+    device = torch.device("cuda")
+    x = torch.randn(2048, 2048, device=device)
+    # warmed up, as before any capture: cuBLAS can't make its handle inside one
+    _succeeds(x)
+    # a failed capture drops every stream's workspace, so start with none
+    torch._C._cuda_clearCublasWorkspaces()
+    torch.cuda.empty_cache()
+    reserved = torch.cuda.memory_reserved(device)
+
+    taken, _ = cuda_graph_runner._capture_thrown_away(
+        partial(cuda_graph_runner.capture_into_graph, lambda: forward(x), device=device, autocast_dtype=None),
+        forward.__name__,
+    )
+
+    assert (taken is None) == (forward is not _succeeds)
+    assert torch.cuda.memory_reserved(device) == reserved, "a throwaway capture must hand back all it took"
 
 
 def _taking(gpu: SimpleNamespace, cost: int):
