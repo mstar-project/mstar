@@ -34,6 +34,11 @@ KV pages and recurrent (GDN/Mamba) state slots are two forms of the same per-req
 - **FlashAttention's causal mask is bottom-right aligned** (the new queries are the last positions); `F.scaled_dot_product_attention(is_causal=True)` is top-left aligned. They disagree whenever `q_len != kv_len`, so build the mask explicitly in a reference or you will "find" an FA bug that isn't there.
 - **Check that an FA build has paged KV at all.** It is a compile-time flag (`FLASH_ATTENTION_DISABLE_PAGEDKV`): a build without it imports fine and raises on the first `page_table=` call. Upstream FA2 also requires `page_block_size % 256 == 0`; a paged FA3 build accepts 16–512.
 
+## Ragged (cacheless) attention
+
+- **A ragged resource plans one layout per label.** A step declares, per request, the spans its layers attend over as `(label, length)` segments; the manager plans each label across the batch and a layer asks for its label's callable. Spans with different head geometries need separate resources, since a resource has one head layout.
+- **Cross-attention between spans of a request is its own kind** (`RaggedCrossAttentionSpec`, #372): its step names `(q_label, kv_label)` pairs and plans each pair under `cross_label(q, kv)`. It keeps the self-attention resource's API unchanged; extending a resource that almost fits this way beats a model calling SDPA (see AGENTS.md invariant 1).
+
 ## Scope
 
 KV layout is engine-side Python only; a cache-layout change needs no `rust/` change (invariant 5 covers the graph runtime, wire format and edges). New resource kinds should still land as their own PR under the model that needs them; see "Splitting work across PRs" in [AGENTS.md](../../../AGENTS.md). Document the resource in `docs/adding_models.rst` (invariant 9).

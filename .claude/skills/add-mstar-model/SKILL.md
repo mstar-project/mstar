@@ -23,6 +23,12 @@ Check your own work against both before anything else, because both produce code
 
 Read `Model` in `mstar/model/base.py` and list its current abstract hooks; read `NodeSubmodule` and `ARNodeSubmodule` in `mstar/model/submodule_base.py`; read the declarations and implementations under `mstar/engine/resources/` with their focused tests. `docs/adding_models.rst` is the narrative guide and worth reading, but the checkout is authoritative — the docs were wrong about the registry's own type signature for a long time. If a direction you need requires an API that does not exist, record that and stop rather than reviving an older one.
 
+Then check you can actually run the reference, before any design work:
+
+- **Access.** Gated repos need a token and an accepted licence; ask for it now rather than mid-recon.
+- **Every format the weights ship in.** A model card may point at a single-file (e.g. ComfyUI) checkpoint while the diffusers- or transformers-format weights the oracle loads live in a separate repo under the same author.
+- **The oracle's library versions against the venv.** A newer model often needs a newer `transformers` or `diffusers` than the serving venv pins. Every other model imports those too, so a bump is an invariant-4 change and its own PR; for the oracle, use a separate venv with the same torch build.
+
 ## Phase 1 — Reconnaissance on the reference
 
 Before designing anything, understand what the reference actually does, and write it down with `path:line` citations rather than from memory. Mark anything you inferred as an inference and anything you could not determine as an explicit unknown with the file to look in — a guess recorded as a fact is worse than a gap.
@@ -32,6 +38,7 @@ What to extract:
 - **File map**: model class, config class, weight loader and key mapping, preprocessing, inference entry point, streaming/output path, any existing vLLM or SGLang port.
 - **Runtime trace** of one request through the entry point: for each operation, whether it runs once per request or per iteration; what is carried between iterations; how termination is decided; how output leaves. Flag every request-time operation touching shapes or the host — resizes, RNG draws, `.item()`/`.cpu()` syncs, dtype casts, padding.
 - **State and shape ledger**: one row per persistent tensor or buffer — lifetime (global / per request / per iteration), shape, which dims vary at request time and over what range, who allocates, who frees. This table is what Phase 5 consumes; it is the single most useful artifact of this phase.
+- **Size per component**: weight bytes per component (from the safetensors index) and a rough peak-activation estimate. It answers "is this hardware enough?" and is the starting point for placement in Phase 2.
 
 If a vLLM or SGLang port exists, record what it did — registration, cache config, attention backend, multimodal processor, batching hooks, special-cased code — and what it explicitly did not support.
 
@@ -42,6 +49,8 @@ Diff your `state_dict()` against the checkpoint's safetensors index by **name an
 **Split by when things run.** Once-per-request work is one walk; repeated work is another; nodes fall out of what each walk emits to the client. Then:
 
 - Anything you want independently schedulable or independently placeable is its own node — that is what buys disaggregation via `node_groups`.
+- Where to draw the line between two adjacent stages is a judgement call. Start from precedent in the repo, then reason about performance: what crosses the edge and how large it is, whether either side is worth placing, scaling, or scheduling independently, and how it affects capture. LTX-2.5 keeps its text encoder and text connectors in one node because Gemma's stacked hidden states are ~30× the connectors' output; splitting there would ship the large tensor between nodes to gain nothing.
+- Decide now which nodes need tensor or sequence parallelism. TP/SP has to be designed into the attention and linear layers from the start (`tp_enabled_nodes` / `sp_enabled_nodes` in the sharding config; cosmos3 and its `*_tp2_sp2.yaml` are the precedent), and retrofitting it is a rewrite of the layers.
 - A finished artifact and an ordered stream of partial results are **different modalities** even when the bytes look alike. Add a modality only when the lifecycle differs.
 - Streaming partitions are for parts of the graph that should run asynchronously, passing data as it is produced rather than at walk boundaries. Read invariant 12 first; the coordination and finish-condition hazards are real.
 
@@ -52,6 +61,8 @@ Diff your `state_dict()` against the checkpoint's safetensors index by **name an
 A **resource** is state the engine must admit, plan, commit and clean up per request, and that must survive graph capture: persistent cross-step state, and anything planned over it. Everything else is a submodule.
 
 Reuse KV, attention, cross-attention, ragged (cacheless) attention, position and sampler resources wherever their contracts fit. A genuinely new kind is a normal outcome and gets a package under `mstar/engine/resources/<kind>/` with declaration types, a manager, exports and focused tests, built on the existing spec, request-config, step and `Resource` interfaces. Several current model PRs add recurrent-state and linear-attention resources this way, modelled on the KV resource. Read the [engine-resources skill](../engine-resources/SKILL.md) before writing one.
+
+Don't drop to calling a kernel from the model because no resource quite fits. When the closest resource almost expresses what you need, extend it (in its own package, alongside the existing kind); when nothing is close but a new resource is a reasonable amount of work, build one. Qwen3.5's recurrent state and GDN resources resembled nothing that existed and were still the right call. Attention in particular is typically (though not always) resource-driven, cross-attention and attention with fixed shapes inside a capture bucket included: "capture still works with SDPA" is true and is not by itself a reason, since the model then misses the engine's kernels and a backend change becomes a sweep through model code. Exceptions need a stated reason (performance, or implementation complexity out of proportion to the gain), e.g. a text encoder whose head dim no FlashInfer kernel supports and whose attention is a negligible share of its node's time.
 
 Do not modify `engine.py`, `resources/base.py`, `resources/runner.py` or `resources/step.py` to make your model fit, and do not fall back to model-owned pooling, allocation, capacity, dependency scheduling or cleanup. If the engine genuinely cannot express something, document the missing extension interface — effort is not a blocker, and neither is losing a preferred optimization.
 
@@ -67,7 +78,9 @@ Grep for callers before overriding any base-model or submodule hook — the hook
 
 The engine calls `submodule.to(device, dtype)` *after* `get_submodule` (`mstar/worker/engine_manager.py:82`), so per-parameter dtype fixes applied at construction do not survive. If a module has dtype-sensitive parameters — FlashInfer's GDN kernels assert fp32 on the decay terms — enforce it in the module's own `_apply`, so it holds against any caller rather than one loader.
 
-Reuse from `mstar/model/components/`, and put anything reusable across models there rather than in your package. For MoE models, CUDA-graph compatibility comes from the vLLM kernels shipped in `mstar/model/components/moe.py`.
+Reuse from `mstar/model/components/`, and put anything reusable across models there rather than in your package. For MoE models, CUDA-graph compatibility comes from the vLLM kernels shipped in `mstar/model/components/moe.py`. For image and video flow models, build the `dit` node on the DiT scaffold in `mstar/model/components/diffusion/`; read the [diffusion-scaffold skill](../diffusion-scaffold/SKILL.md) first.
+
+**Port natively by default; reusing an upstream leaf module is accepted but second best.** A native port can be optimized (TP, capture, fused kernels) and doesn't break when `transformers` or `diffusers` moves. The hot path — the backbone or DiT — should always be native. Importing a cold leaf module such as a VAE or vocoder from the upstream library, lazily as wan22 and cosmos3 do, is accepted precedent when porting it would be high effort for little gain; say which parts are reused and why in the PR.
 
 Validate in this order:
 
@@ -79,9 +92,15 @@ Validate in this order:
 
 When a parity check fails, diff per-layer hidden states against the oracle, then split the first bad layer into its parts — each norm, the mixer, the MLP. A mixer compared in isolation can pass while its enclosing layer is wrong, because the isolated comparison feeds both sides the same input; the norms and the residual are where convention mismatches live.
 
+**When parity is close but not exact, find the configuration where it is exact before accepting a tolerance.** Served paths legitimately differ from the reference in shapes and kernel routes (running only the real prompt tokens instead of a padded batch, a different SDPA backend), and those differences alone produce ~0.3–1% per layer. Reproduce the reference's shapes and kernel route in a test-only mode; bit-exact output there proves the port and attributes the residue to the shape and kernel choices, and that mode becomes a regression test. Test each attribution by making it vanish rather than accepting it because it sounds right; on LTX-2.5's Gemma, one of two plausible causes was false.
+
+**For a sampler that amplifies small differences** (a few-step distilled diffusion sampler, any sampled AR stage), the oracle's bytes are not the bar. Measure the reference against itself under a different, equally valid kernel (flash vs memory-efficient SDPA) and hold the served output to that spread, for per-step tensors and for the final media (PSNR for video, a log-spectrum distance for audio).
+
 Make the weight loader raise if any parameter goes unfilled. A silently half-loaded model produces plausible output instead of an error.
 
 Record the oracle once and keep the parity suite; rerun it after every performance commit, and add a parity test per performance commit. Do not add CUDA-graph configs while chasing parity — capture makes every discrepancy harder to localize and the two kinds of debugging do not mix.
+
+The oracle and the server are two sides of an A/B, so they must never share a GPU at the same time: run them on different GPUs when nothing is being timed, and back to back when something is. Record every oracle input you expect to need in one session up front, so you don't stop the server to re-record later.
 
 ## Small details to double-check
 
@@ -92,6 +111,7 @@ Each of these is a one-line convention that a reference implementation states so
 - **Whether a norm is Gemma-style.** `(1 + weight)` versus `weight`, and a model can use both — Qwen3.5's plain `RMSNorm` scales by `(1 + weight)` while its gated norm does not. The tell is in the checkpoint: a weight tensor whose mean is ~0 rather than ~1 is storing `weight - 1`. Reading `mean()` off one norm tensor is faster than any amount of parity debugging.
 - **Stop tokens: trust the tokenizer over `config.json`.** Qwen3.5's `config.json` names `<|endoftext|>` while `tokenizer.eos_token` is `<|im_end|>`, which is what a chat turn actually ends on. Stopping on the config's alone means every reply runs to `max_tokens`, which reads as a sampler or scheduler bug. Union the two.
 - **Base versus instruct.** Variants may differ only by a suffix — Qwen tags base checkpoints `-Base`, so the unsuffixed repo is the instruct one and needs the chat template. Applying no template to an instruct model gives fluent, wrong continuations.
+- **The conductor merges each pass's `step_metadata` into the request's `metadata.kwargs`.** A model whose walks send *different* step metadata (multi-stage, multi-resolution) and also keeps request-level facts in kwargs under the same names has those facts overwritten by the previous walk's values: a stage-1 half-resolution `height` becomes the request's height for stage 2. Keep request-level facts under keys step metadata never uses (LTX-2.5 nests them under `kwargs["request"]`).
 
 ## Phase 5 — Batching and CUDA graphs
 
@@ -109,11 +129,15 @@ Consider making capture a separate PR stacked on the eager MVP, and any **system
 
 **Media output must be verified by a human, here and again before the PR goes up.** An agent is fine for sanity checks and for reading text, but audio, images and video need a person to listen to or look at them. Numerical parity passing is not evidence that generated audio sounds right.
 
+Hand the person files they can play: audio as WAV alongside any mp4, since AAC-in-MP4 does not decode in every player. Put the reference's output next to yours, and the reference-vs-reference numbers from Phase 4 next to the served-vs-reference ones.
+
 ## Phase 7 — Benchmark against the competition
 
 Against vLLM, vllm-omni, TensorRT-LLM, SGLang, sglang-omni — whichever serve this model. The goal is genuinely to be better than or on par with them; this is a target, not an observation.
 
 Across a **comprehensive** set, though, not one configuration. A single winning benchmark usually means it got tuned for, and the workloads you didn't measure are where the regression hides: don't buy `image_to_text` throughput with `text_to_text` or mixed-workload throughput. Report which workloads you checked, including the ones that didn't improve.
+
+**The deployment is an axis too.** For a multi-node model, especially a large DiT, the first-order lever is often the config: which nodes are colocated, which GPU each sits on, and TP vs SP vs both on the heavy node. A full sweep is combinatorial and mostly wasted, so reason first: which configs fit in memory, what the per-node time split from the profile says is worth parallelizing, which edges are large enough that colocating their ends matters. Then benchmark the handful of candidates that survive, and ship the winner as the default config.
 
 Use the [benchmarking skill](../benchmarking/SKILL.md) for methodology — warmup, concurrency sweeps, and the traps that make a cross-process A/B move on their own. Millisecond-scale effects are measured server-side (NVTX, nsys), and startup is never compared across days or nodes. For streaming models, realtime is a per-stream verdict (TTFF, gap p50/p95, on-time fraction, stalls), with budget-edge rows labelled borderline. Ship one config per variant with capacity fields at the measured recommendation.
 

@@ -42,9 +42,11 @@ If another server still holds the port, uvicorn logs startup-complete and only *
 
 ## Stop a server
 
+**Never `pkill -f`.** List with `ps` / `pgrep -a`, pick the PID, and signal it (`kill -INT <pid>`, or `kill -INT -- -<pgid>` for its process group).
+
 `SIGINT` (Ctrl-C) on the `mstar` process shuts the whole deployment down gracefully. Give it up to a minute. You normally do not need to clean up processes individually.
 
-Signal it by PID. `pkill -f` / `pgrep -f` with a pattern that also appears in your own command line match your own shell: the kill takes the shell down, and a watcher loop polling `pgrep -f` never exits. Likewise a bare `wait` in a script that started the server with `&` waits on the server forever.
+`pkill -f` / `pgrep -f` with a pattern that also appears in your own command line match your own shell: the kill takes the shell down, and a watcher loop polling `pgrep -f` never exits. Likewise a bare `wait` in a script that started the server with `&` waits on the server forever.
 
 **But killing it non-gracefully does not kill its workers.** The conductor and workers are `multiprocessing` spawns; orphaned, they hold both their GPU memory and their IPC handles, and the next server fails to start. After any hard kill, reap the tree:
 
@@ -55,6 +57,8 @@ pgrep -a -u "$USER" -f 'torch/_inductor/compile_worker'
 ```
 
 Then confirm with `nvidia-smi` that the memory actually came back. Tens of GB in use with no server of yours running means orphans. Leftover IPC socket files under `/tmp/mstar_$USER/` (or `--socket-path-prefix`) are harmless and persist between runs — what breaks a new server is a *live* process still holding one.
+
+**`benchmark.worker_phases.server` starts the server in its own process group**, separate from the wrapper's. Signalling the wrapper's group leaves the server running; the next arm's wrapper then refuses to start, and a client that doesn't check keeps benchmarking the previous arm's server. In a scripted A/B, stop both groups, check the port is free before each arm, and log which checkout each arm imported (`python -c 'import mstar; print(mstar.__file__)'` with the arm's environment) so you can verify every number came from the build you think it did.
 
 ## Run a benchmark
 
@@ -123,6 +127,10 @@ The editable install maps the `mstar` package to this checkout's absolute path v
 find mstar -name __pycache__ -type d -prune -exec rm -rf {} +
 python -c "import mstar, mstar.conductor.conductor, mstar.worker.worker"
 ```
+
+**Two arms never share a GPU at the same time.** That covers a reference/oracle run against the server as much as two builds: when nothing is being timed, run them in parallel on different GPUs; when something is, run them back to back.
+
+**A sweep pins the code it measures.** A background sweep that starts a server per cell imports whatever is in the tree at that moment, so editing the tree mid-sweep makes later cells run new code against configs meant for the old (or fail to start). Run long sweeps from a separate worktree, and don't touch that worktree until the sweep finishes.
 
 Never run two things that touch the repo at once — a `git checkout` racing a server start produces exactly this failure.
 
