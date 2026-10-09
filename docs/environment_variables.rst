@@ -360,6 +360,16 @@ Worker scheduling
        cleanup per step). Only nodes that opt in (Qwen3.5 decode) and only
        when the sampler has graph buffers; ``0`` keeps every node on the
        per-request tensor path.
+   * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
+     - ``0``
+     - The captured sampler gathers its RNG offsets from the slot masters
+       and scatters the advanced offsets and the sampled tokens back inside
+       the graph, so a replayed decode step issues none of those launches on
+       the gpu thread afterwards (each one is a GIL release the main thread's
+       postprocess wins). Padding rows then address a trash master row and
+       the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` concurrent
+       requests (default 4096, a hard cap with this on). Only with the device
+       loop-back on. An experiment knob; measure before turning it on.
    * - ``MSTAR_LAUNCH_SIGNAL_AFTER_COMMIT``
      - ``0``
      - Release the thread that submitted a step only once the gpu thread
