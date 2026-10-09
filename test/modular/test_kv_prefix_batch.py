@@ -133,16 +133,46 @@ def test_lazy_extension_flushes_at_the_threshold_and_on_removal(eager):
     assert kv._chain_backlog == []
     assert _chain_state(kv, "r0")[2] == [9000, 9001, 9002, 9003]
     assert _chain_state(kv, "r1")[2] == [9100, 9101, 9102, 9103]
-    # a removal flushes what waits before the request goes
+    # a removal drains the request's own waiting tokens, the others stay
     step(4, rids)
     step(5, rids)
+    kv._drain_chain_backlog("r1")
+    assert _chain_state(kv, "r1")[2] == [9100, 9101, 9102, 9103, 9104, 9105]
+    assert _chain_state(kv, "r0")[2] == [9000, 9001, 9002, 9003]
     kv.remove_request("r1")
-    assert kv._chain_backlog == []
-    assert _chain_state(kv, "r0")[2] == [9000, 9001, 9002, 9003, 9004, 9005]
     assert "r1" not in kv._streams
+    assert len(kv._chain_backlog) == 2 and kv._chain_drained == {"r1"}
+    assert kv._chain_pending == {"r0": 2}
+    # the flush skips the drained request and clears the backlog
+    kv.flush_chain_backlog()
+    assert kv._chain_backlog == [] and kv._chain_drained == set()
+    assert _chain_state(kv, "r0")[2] == [9000, 9001, 9002, 9003, 9004, 9005]
     # a flush with nothing waiting is a no-op
     kv.flush_chain_backlog()
     assert _chain_state(kv, "r0")[2] == [9000, 9001, 9002, 9003, 9004, 9005]
+
+
+def test_lazy_extension_flushes_when_a_drained_handle_comes_back(eager):
+    kv = H._manager()
+    kv._chain_lazy_steps = 8
+    prompt = list(range(H.PAGE_SIZE))
+    for rid in ("r0", "r1"):
+        H._ingest(kv, rid, prompt)
+        H._step(kv, rid, len(prompt))
+    for t in range(3):
+        rows = HostRows(request_ids=("r0", "r1"), buffers={
+            H.TENSOR: torch.tensor([[9000 + t], [9100 + t]]),
+        })
+        kv.extend_prefix_chains_batch(["r0", "r1"], H.NODE, H.WALK, rows)
+    kv.remove_request("r1")
+    assert kv._chain_drained == {"r1"} and len(kv._chain_backlog) == 3
+    # the handle is ingested again: the old steps go out first, under r1's
+    # old name they find no stream, and r0 is caught up
+    H._ingest(kv, "r1", prompt)
+    assert kv._chain_backlog == [] and kv._chain_drained == set()
+    assert _chain_state(kv, "r0")[2] == [9000, 9001, 9002]
+    H._step(kv, "r1", len(prompt))
+    assert _chain_state(kv, "r1")[2] == []
 
 
 def test_batched_extension_skips_rows_it_does_not_have(eager):
