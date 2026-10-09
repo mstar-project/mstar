@@ -18,6 +18,7 @@ dist_timeout_s: 7200
 # warning, where NVLink multicast is unavailable.
 tp_allreduce: "symm_multimem"
 tp_allreduce_max_kb: 32768
+tp_async_sched: true
 model_kwargs:
   dsa_long_context: true
   # the guard bound and the KV sizing input; keep it <= the pages below x page_size
