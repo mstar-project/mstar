@@ -763,14 +763,15 @@ class BagelModel(Model):
         )
 
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
-        """The text walk's prompt is its token ids.
+        """The text walk's prompt is its token ids, and so is every step it takes.
 
         The image walks write into this stream too, and an edit's picture lands
         at the positions its keyed text would have; only the text walk is named.
-        Generated pages are not keyed: the chat API sends a reply back inside
-        the next user turn, so their keys never match.
+        A chat sends a reply back as its own assistant turn, so its pages match.
         """
-        return {"kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text")}}
+        return {"kv": {"main": PrefixStream(
+            "text_inputs", "ids", "prefill_text", "decode",
+        )}}
 
     def checkpoint_path(self) -> str:
         return snapshot_download(
