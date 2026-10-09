@@ -368,6 +368,10 @@ The spec types are:
        defaults to ``head_dim ** -0.5``, ``flashinfer_backend``, and the two
        CUDA-graph ceilings ``max_segments_per_request`` and
        ``max_tokens_per_request``. See `Cacheless attention (encoder towers)`_.
+   * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
+     - The cross-attention counterpart: one span of each request attends another
+       (``RaggedCrossAttentionStep(pairs=...)``). Same config. See `Cross-attention
+       between spans`_.
    * - ``PositionSpec(config=PositionConfig(kv_cache=...))``
      - Position tracking and RoPE. ``scheme`` is ``PosScheme.SEQUENTIAL`` or
        ``PosScheme.BLOCK``. The RoPE parameters are set here: ``rope_theta``,
@@ -574,6 +578,29 @@ previous step's plan. Because the tower is normally captured as a piecewise regi
 declaration lives in the region's ``declare_step``, and names no ``KVStep``. See
 ``mstar/model/bagel/submodules.py``, region ``"vit_block_loop"``, and `Piecewise CUDA
 graphs (capturing an inner loop)`_.
+
+Cross-attention between spans
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A diffusion transformer whose streams attend each other (video queries over text keys, or
+audio over video) has several spans per request and no cache either. Declare each span as
+its own label, and the cross-attentions as a ``RaggedCrossAttentionSpec`` beside the
+``RaggedAttentionSpec`` for the self-attention: a resource is one kind of attention. Its
+step names the ``(q_label, kv_label)`` pairs:
+
+.. code-block:: python
+
+   RaggedCrossAttentionStep(
+       segments=segments,              # one Segment per (request, label) the pairs use
+       pairs=(("video", "text"), ("audio", "video")),
+   )
+
+Each pair is planned as its own layout, pairing each request's ``q_label`` span with that
+request's ``kv_label`` span; cross-attention is never causal. A layer attends through
+``RaggedAttentionCallable(resource, cross_label(q_label, kv_label))``, passing the key
+span's tokens as ``k`` and ``v``. One resource has one head geometry, so a model whose
+attentions differ in head count or head dim declares one spec per (kind, geometry).
+LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
 
 .. note::
 

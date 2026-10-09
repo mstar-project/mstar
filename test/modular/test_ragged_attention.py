@@ -31,14 +31,20 @@ from mstar.engine.resources import (
     BucketKey,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
+    RaggedCrossAttentionSpec,
+    RaggedCrossAttentionStep,
     Segment,
     SlotLease,
     StepContext,
     StepRunner,
     SubmoduleStep,
+    cross_label,
 )
-from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedManager
-from mstar.engine.resources.attn.ragged.wrappers import RaggedPrefillWrapper
+from mstar.engine.resources.attn.ragged.flashinfer import (
+    FlashInferRaggedCrossManager,
+    FlashInferRaggedManager,
+)
+from mstar.engine.resources.attn.ragged.wrappers import RaggedCrossPrefillWrapper, RaggedPrefillWrapper
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
 pytestmark = pytest.mark.skipif(
@@ -597,3 +603,151 @@ def test_capture_shape_partition_fits_the_bucket():
     assert isinstance(shape, PiecewiseCaptureShape)
     assert sum(shape.seq_lens) == PW_TOKENS == shape.total_tokens
     assert len(shape.seq_lens) == PW_BS
+
+
+# --- cross-attention between spans -------------------------------------------
+
+def cross_ref(q, k, v, q_cu, kv_cu):
+    """Per-segment SDPA of query segment i over key segment i, in fp32."""
+    out = torch.zeros_like(q)
+    q_off, kv_off = q_cu.tolist(), kv_cu.tolist()
+    for qs, qe, ks, ke in zip(q_off[:-1], q_off[1:], kv_off[:-1], kv_off[1:], strict=True):
+        if qe <= qs:
+            continue
+        qq, kk, vv = (t.transpose(0, 1).unsqueeze(0).float() for t in (q[qs:qe], k[ks:ke], v[ks:ke]))
+        o = F.scaled_dot_product_attention(qq, kk, vv, scale=HEAD_DIM ** -0.5)
+        out[qs:qe] = o.squeeze(0).transpose(0, 1).to(out.dtype)
+    return out
+
+
+def cross_wrapper(**overrides) -> RaggedCrossPrefillWrapper:
+    kwargs = dict(
+        workspace_buffer=workspace(), num_qo_heads=HEADS, num_kv_heads=HEADS,
+        head_dim=HEAD_DIM, device=DEVICE, q_data_type=DTYPE,
+    )
+    kwargs.update(overrides)
+    return RaggedCrossPrefillWrapper(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "q_lens,kv_lens",
+    [([128, 96], [32, 300]), ([7, 200], [64, 64]), ([50], [1])],
+    ids=["longer_keys", "shorter_keys", "single_key"],
+)
+def test_eager_cross_matches_reference(q_lens, kv_lens):
+    w = cross_wrapper()
+    q = qkv(sum(q_lens), seed=1)[0]
+    _, k, v = qkv(sum(kv_lens), seed=2)
+    w.plan(cu(q_lens), cu(kv_lens))
+    close(w.run(q, k, v), cross_ref(q, k, v, cu(q_lens), cu(kv_lens)))
+
+
+def test_cross_plan_rejects_unpaired_segments():
+    with pytest.raises(ValueError, match="pairs them one to one"):
+        cross_wrapper().plan(cu([8, 8]), cu([8]))
+
+
+def test_graph_cross_rejects_too_many_key_tokens():
+    w = cross_wrapper(max_num_segments=2, max_total_tokens=64, max_total_kv_tokens=128, use_cuda_graph=True)
+    w.plan(cu([32, 32]), cu([64, 64]))
+    with pytest.raises(ValueError, match="key tokens exceeds"):
+        w.plan(cu([32, 32]), cu([64, 65]))
+
+
+@pytest.mark.parametrize(
+    "q_lens,kv_lens",
+    [([128, 128, 128, 128], [64, 64, 64, 64]), ([100, 60, 30, 0], [200, 10, 30, 0]), ([7, 0, 0, 0], [300, 0, 0, 0])],
+    ids=["as_captured", "ragged", "mostly_pad"],
+)
+def test_graph_cross_replay_matches_reference(q_lens, kv_lens):
+    """A cross plan re-planned before each replay of one captured graph, with
+    query and key layouts changing independently."""
+    w = cross_wrapper(max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, use_cuda_graph=True)
+    sq, sk, sv = (torch.zeros(MAX_TOKENS, HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) for _ in range(3))
+    w.plan(cu([MAX_TOKENS // MAX_SEGMENTS] * MAX_SEGMENTS), cu([64] * MAX_SEGMENTS))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            w.run(sq, sk, sv)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = w.run(sq, sk, sv)
+    torch.cuda.synchronize()
+
+    q = qkv(sum(q_lens), seed=3)[0]
+    _, k, v = qkv(sum(kv_lens), seed=4)
+    w.plan(cu(q_lens), cu(kv_lens))
+    for buf, real in ((sq, q), (sk, k), (sv, v)):
+        buf.zero_()
+        buf[: real.shape[0]].copy_(real)
+    graph.replay()
+    torch.cuda.synchronize()
+    total = sum(q_lens)
+    close(out[:total], cross_ref(q, k, v, cu(q_lens), cu(kv_lens)))
+
+
+def cross_manager() -> FlashInferRaggedCrossManager:
+    spec = RaggedCrossAttentionSpec(
+        resource_key="cross", nodes={"dit"},
+        config=RaggedAttentionConfig(num_qo_heads=HEADS, num_kv_heads=HEADS, head_dim=HEAD_DIM),
+    )
+    return build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
+
+
+def av_segments(video, text, audio):
+    """Two requests, three spans each: what a joint audio-video DiT declares."""
+    segs = []
+    for label, spans in (("video", video), ("text", text), ("audio", audio)):
+        segs += [Segment(f"r{i}", label, span) for i, span in enumerate(spans)]
+    return tuple(segs)
+
+
+def test_cross_spec_builds_the_cross_manager():
+    mgr = cross_manager()
+    assert isinstance(mgr, FlashInferRaggedCrossManager)
+    assert mgr.depends_on() == set()
+
+
+def test_cross_step_plans_each_pair_and_nothing_else():
+    mgr = cross_manager()
+    step_ = RaggedCrossAttentionStep(
+        segments=av_segments([96, 64], [32, 32], [16, 8]), pairs=(("video", "text"), ("audio", "video")),
+    )
+    mgr.plan(step_, ctx(["r0", "r1"]))
+    assert sorted(mgr._current_plan_states) == sorted([cross_label("video", "text"), cross_label("audio", "video")])
+    # a cross resource does no self-attention, even over the labels it was given
+    with pytest.raises(KeyError, match="no plan for label 'video'"):
+        mgr.run(*qkv(160), label="video")
+
+    v, t, a = qkv(160, seed=5), qkv(64, seed=6), qkv(24, seed=7)
+    close(
+        mgr.run(v[0], t[1], t[2], label=cross_label("video", "text")),
+        cross_ref(v[0], t[1], t[2], cu([96, 64]), cu([32, 32])),
+    )
+    close(
+        mgr.run(a[0], v[1], v[2], label=cross_label("audio", "video")),
+        cross_ref(a[0], v[1], v[2], cu([16, 8]), cu([96, 64])),
+    )
+
+
+def test_cross_pair_needs_the_same_requests_in_order():
+    segs = (
+        Segment("r0", "video", 8), Segment("r1", "video", 8),
+        Segment("r1", "text", 4), Segment("r0", "text", 4),
+    )
+    with pytest.raises(ValueError, match="same requests in the same order"):
+        cross_manager().plan(RaggedCrossAttentionStep(segments=segs, pairs=(("video", "text"),)), ctx(["r0", "r1"]))
+
+
+def test_cross_pair_under_a_lease_gets_a_graph_wrapper_sized_for_its_keys():
+    mgr = cross_manager()
+    lease = SlotLease(slot=0, bucket=bucket(bs=2, num_tokens=MAX_TOKENS))
+    mgr.plan(
+        RaggedCrossAttentionStep(segments=av_segments([96, 64], [32, 32], [16, 8]), pairs=(("video", "text"),)),
+        ctx(["r0", "r1"], lease=lease),
+    )
+    w = mgr._current_plan_states[cross_label("video", "text")]
+    assert isinstance(w, RaggedCrossPrefillWrapper) and w.use_cuda_graph
+    assert w.max_total_kv_tokens == MAX_TOKENS
