@@ -737,15 +737,9 @@ class PreprocessWorkerThread:
         sequence = state.next_sequence
         state.next_sequence += 1
         try:
-            # A model that detokenizes from ids takes the plain list: one
-            # tensor build and one tensor-to-list per token saved, at tens of
-            # thousands of tokens a second through this thread.
-            if getattr(self.model, "inline_postprocess_takes_ids", False):
-                output = [item.value]
-            else:
-                output = torch.tensor([item.value], dtype=torch.int64)
+            tensor = torch.tensor([item.value], dtype=torch.int64)
             postprocessed = self.model.postprocess(
-                output, item.modality,
+                tensor, item.modality,
                 request_kwargs=self.request_model_kwargs.get(request_id),
             )
             self._queue_completed_output(
