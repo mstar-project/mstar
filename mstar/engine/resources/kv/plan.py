@@ -75,6 +75,9 @@ class PagedIndptrs(NamedTuple):
     paged_kv_indptr: torch.Tensor
     paged_kv_indices: torch.Tensor
     paged_kv_last_page_len: torch.Tensor
+    # Each row's KV length, host-only, so FlashInfer's decode plan need not
+    # rebuild it with torch ops.
+    kv_lens: torch.Tensor | None = None
 
     def to_device(self, device: torch.device):
         return PagedIndptrs(
@@ -82,6 +85,7 @@ class PagedIndptrs(NamedTuple):
             paged_kv_indptr=self.paged_kv_indptr.to(device, non_blocking=True),
             paged_kv_indices=self.paged_kv_indices.to(device, non_blocking=True),
             paged_kv_last_page_len=self.paged_kv_last_page_len.to(device, non_blocking=True),
+            kv_lens=self.kv_lens,
         )
 
     def to_kwargs_dict(self):
@@ -89,7 +93,8 @@ class PagedIndptrs(NamedTuple):
             qo_indptr=self.qo_indptr,
             paged_kv_indptr=self.paged_kv_indptr,
             paged_kv_indices=self.paged_kv_indices,
-            paged_kv_last_page_len=self.paged_kv_last_page_len
+            paged_kv_last_page_len=self.paged_kv_last_page_len,
+            kv_lens=self.kv_lens,
         )
 
 
@@ -106,16 +111,22 @@ def build_paged_indptrs(
     kv_indptr = [0]
     all_pages: list[int] = []
     last_page_lens: list[int] = []
+    kv_lens: list[int] = []
     for s in segments:
         qo_indptr.append(qo_indptr[-1] + s.to_compute)
         all_pages.extend(s.page_idxs)
-        kv_indptr.append(kv_indptr[-1] + len(s.page_idxs))
-        last_page_lens.append(s.last_page_len(page_size) or page_size)
+        num_pages = len(s.page_idxs)
+        kv_indptr.append(kv_indptr[-1] + num_pages)
+        last = s.last_page_len(page_size) or page_size
+        last_page_lens.append(last)
+        # FlashInfer's `get_seq_lens`, on the ints already here
+        kv_lens.append(max(num_pages - 1, 0) * page_size + last)
     return PagedIndptrs(
         qo_indptr=torch.tensor(qo_indptr, dtype=torch.int32),
         paged_kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32),
         paged_kv_indices=torch.tensor(all_pages, dtype=torch.int32),
         paged_kv_last_page_len=torch.tensor(last_page_lens, dtype=torch.int32),
+        kv_lens=torch.tensor(kv_lens, dtype=torch.int32),
     )
 
 
