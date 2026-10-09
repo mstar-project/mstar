@@ -234,6 +234,10 @@ class _PostprocessState:
     signal_idxs: object = None
 
 
+# pinned host-row buffers in flight at once (see Worker._stage_host_rows)
+_HOST_ROWS_RING = 4
+
+
 class _LazyPerRid:
     """``Worker._rows_to_per_rid`` on demand: the per-rid host dicts are built
     the first time a consumer reads them. The batched stop check, the row store
@@ -313,6 +317,7 @@ class Worker:
         self.enable_nvtx = nvtx_enabled(enable_nvtx, device)
         # (node, walk) -> the loop-back signals the node keeps on the device
         self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
+        self._host_rows_slot = 0
 
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads
@@ -1892,6 +1897,7 @@ class Worker:
             with self._span("worker.gpu_thread.exec"):
                 outputs = engine.exec_and_postprocess(node_batch)
             if execution_stream is not None:
+                self._stage_host_rows(outputs)
                 event = torch.Event()
                 event.record(execution_stream)
                 node_batch.completion_event = event
@@ -3270,6 +3276,34 @@ class Worker:
                 return None, []
         return None, []
 
+    def _stage_host_rows(self, outputs: "BatchedModelOutput") -> None:
+        """Start the device-to-host copy of the step's row-addressed stop
+        buffers here on the gpu thread, on the execution stream right behind
+        the clone that made them, so the completion event recorded next
+        covers it. The main thread's stop check then finds the rows landed
+        once it has waited on that event: no side stream, no second sync, and
+        one fewer GIL release on its critical path.
+
+        A small ring of pinned buffers: step N's rows are read by the main
+        thread while this thread already stages N+1's (the pipeline is one
+        step deep, the ring leaves room for the early speculation too).
+        """
+        buffers = outputs.check_stop_buffers
+        if not buffers or outputs.row_request_ids is None:
+            return
+        slot = self._host_rows_slot = (self._host_rows_slot + 1) % _HOST_ROWS_RING
+        host: dict[str, torch.Tensor] = {}
+        for index, (name, tensor) in enumerate(buffers.items()):
+            if not (torch.is_tensor(tensor) and tensor.is_cuda):
+                host[name] = tensor
+                continue
+            buf = self._get_pinned_d2h_buffer(
+                f"host_rows{slot}", tensor.shape, tensor.dtype, index,
+            )
+            buf.copy_(tensor, non_blocking=True)
+            host[name] = buf
+        outputs.host_rows = HostRows(tuple(outputs.row_request_ids), host)
+
     def _get_pinned_d2h_buffer(
         self,
         purpose: str,
@@ -3369,6 +3403,11 @@ class Worker:
             list(outputs.row_request_ids)
             if outputs.row_request_ids is not None else request_ids
         )
+        landed = outputs.host_rows
+        if landed is not None and completion_event is not None:
+            # staged by the gpu thread behind the step; the caller has waited
+            # on the completion event, so the rows are here
+            return _LazyPerRid(landed.buffers, list(landed.request_ids)), landed
         if not torch.cuda.is_available() or completion_event is None:
             if outputs.check_stop_buffers is not None and row_rids is not None:
                 # host tensors already (a CPU device): only the re-keying
