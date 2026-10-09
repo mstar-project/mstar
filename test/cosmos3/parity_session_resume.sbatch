@@ -6,8 +6,11 @@
 # this branch (where they are request fields) -- and diffs the decoded frames.
 # Sequential on purpose: cosmos3 is deterministic only at concurrency 1.
 #
+# Submit from the repo root; everything is resolved relative to it. Override
+# REPO or LOG_ROOT only to point somewhere else on purpose.
+#
 #   sbatch test/cosmos3/parity_session_resume.sbatch
-#   cat $LOG_ROOT/<jobid>/job.log
+#   cat .parity-logs/parity-<jobid>/*.log
 #
 # One venv serves both sides: this branch's rust/ and mstar/graph/runtime/ are
 # byte-identical to main's, so the installed mstar_rust extension matches both.
@@ -20,13 +23,14 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=240G
 #SBATCH --time=01:30:00
-#SBATCH --output=/m-coriander/coriander/naomi/mstar_session_tests/slurm-%j.out
+#SBATCH --output=slurm-%j.out
 #SBATCH --requeue
 
 set -uo pipefail  # not -e: a difference is a result, not a crash
 
-REPO=${REPO:-/m-coriander/coriander/naomi/mstar}
-LOG_ROOT=${LOG_ROOT:-/m-coriander/coriander/naomi/mstar_session_tests}
+# the submission directory under sbatch, the shell's cwd when run by hand
+REPO=${REPO:-${SLURM_SUBMIT_DIR:-$PWD}}
+LOG_ROOT=${LOG_ROOT:-$REPO/.parity-logs}
 JOB=${SLURM_JOB_ID:-local}
 OUT=$LOG_ROOT/parity-$JOB
 mkdir -p "$OUT"
