@@ -341,6 +341,35 @@ def test_routing_agrees(pair):
     assert not book.can_gc(2)
 
 
+def test_partition_idle_agrees(pair):
+    """A producer-triggered partition changes walk only when idle, so both
+    runtimes must agree on what idle is."""
+    rt, book, _store = pair
+    rid = _admit(rt)
+    assert rt.is_partition_idle(rid, "default")
+    assert not rt.is_partition_idle(rid, "no_such_partition")
+    assert not rt.is_partition_idle(9999, "default")
+
+    # A held input is a pass under way.
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
+    assert not rt.is_partition_idle(rid, "default")
+
+    rt.pop_rids("prefill", WALK, [rid])
+    for u in (1, 2):
+        book.put_tensor(u, _info(u))
+        book.increment_ref(u, 1)
+    rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="prefill",
+            output_signals=["kv_cache", "token"],
+            wg_ids=ParallelList([rid], [WG_ID]),
+            tensors=[1, 2], num_tensors=[1, 1],
+        ),
+    )
+    # prefill is done but the worker graph is not: ar_decode holds its inputs.
+    assert not rt.is_partition_idle(rid, "default")
+
+
 def test_prep_agrees(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
@@ -511,6 +540,9 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
         lambda rt, r: rt.ingest_inputs_batch(
             _ingest_block([r], [_spec("prompt", "prefill")])),
         id="ingest_inputs_batch"),
+    pytest.param(
+        lambda rt, r: rt.is_partition_idle(r, "default"),
+        id="is_partition_idle"),
 ])
 def test_a_stale_handle_never_panics(pair, call):
     """A handle can outlive its request: a message for a rid this rank already

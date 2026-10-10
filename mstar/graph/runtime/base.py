@@ -561,6 +561,15 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
+    def is_partition_idle(self, rid: int, partition: str) -> bool:
+        """Whether nothing of this partition's current walk is under way for
+        the request: no input held, no node in flight, no loop mid-run. Only
+        then can the walk change without stranding state in the old walk's
+        graphs. False for an unknown request or partition.
+        """
+        pass
+
+    @abstractmethod
     def set_in_flight(
         self, node: str, wg_id: int, rids: list[int],
         in_flight: bool,

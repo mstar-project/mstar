@@ -326,6 +326,9 @@ class RustGraphRuntime(GraphRuntime):
     def set_walk(self, rid: int, partition: str, walk: str):
         self._rust.set_walk(rid, partition, walk)
 
+    def is_partition_idle(self, rid: int, partition: str) -> bool:
+        return self._rust.is_partition_idle(rid, partition)
+
     def set_in_flight(
         self, node: str, wg_id: int, rids: list[int],
         in_flight: bool,

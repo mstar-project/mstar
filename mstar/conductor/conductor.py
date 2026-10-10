@@ -367,6 +367,13 @@ class Conductor:
                 if node.consumes_stream:
                     self.streaming_consumers.add(name)
 
+        topology = model.get_partition_topology()
+        self.producer_triggered_partitions: set[str] = (
+            topology.producer_triggered_partitions() if topology else set()
+        )
+        if topology:
+            topology.check_walk_driving_connections()
+
         # v1: one sharding group per worker graph. Track which group "owns"
         # each wg so we can assert single-group-per-wg.
         wg_to_owning_group: dict[int, str] = {}
@@ -1336,6 +1343,19 @@ class Conductor:
 
             pstate.curr_forward_outputs += body.output_signal_names
 
+        # The stream moves a producer-triggered partition's walk on the
+        # worker; follow it so the completion check and the model's state
+        # machine see the walk this pass actually ran.
+        if (
+            partition_name in self.producer_triggered_partitions
+            and body.graph_walk
+            and body.graph_walk != pstate.metadata.graph_walk
+        ):
+            pstate.metadata.graph_walk = body.graph_walk
+            self._set_partition_worker_graph_ids(
+                body.request_id, partition_name, body.graph_walk,
+            )
+
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
             count = pstate.wg_rank_completions.get(wg_id, 0) + 1
@@ -1417,6 +1437,11 @@ class Conductor:
             for conn in request_data.streaming_connections.values():
                 if conn.from_partition == partition_name:
                     conn.producer_done = True
+                    # A finished consumer takes no more input; told its
+                    # producer is done, a continue_after_done stream would
+                    # keep feeding it empty chunks
+                    if request_data.partition_states[conn.to_partition].is_done:
+                        continue
                     self._send_producer_done(request_id, conn.from_partition, conn.to_partition)
         elif fwd_args.inputs:
             # Partition has inputs to send — conductor-driven
