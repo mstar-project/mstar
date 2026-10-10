@@ -197,8 +197,9 @@ request, and the engine passes each config to its resource when the request is i
 There are two ``ResourceReqConfig`` subclasses:
 
 - ``SamplingReqConfig`` holds ``temperature``, ``top_k``, ``top_p``,
-  ``repetition_penalty``, ``min_p`` and ``ignore_eos``. The conductor fills in the
-  per-request seed. ``min_p`` follows the HF processor order (after the penalty and
+  ``repetition_penalty``, ``min_p``, ``penalize_prompt`` and ``ignore_eos``. The
+  conductor fills in the per-request seed, derived per resource key so each sampler of a
+  request draws its own stream. ``min_p`` follows the HF processor order (after the penalty and
   temperature, before top-k/top-p) and needs ``enable_min_p=True`` on the node's
   ``SamplerSpec``, which adds the filter to that node's captured sampler only.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
@@ -213,7 +214,8 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 
    def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
        model_kwargs = model_kwargs or {}
-       keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
+       keys = ("temperature", "top_p", "top_k", "min_p",
+               "repetition_penalty", "penalize_prompt", "ignore_eos")
        return {
            SAMPLER: SamplingReqConfig(
                **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys}
@@ -223,6 +225,24 @@ Orpheus shows the simple case. It has one sampler, and reads the parameters from
 BAGEL (``bagel_model.py``) returns both config types. A BAGEL request uses
 classifier-free guidance or does not, and that choice determines which cache labels the
 request reads.
+
+Sampling knobs mean the same thing on every model (:ref:`generation-parameters`), and
+the server range-checks them before your model sees them. A model's part of that
+contract:
+
+- Default each knob the request leaves unset from the checkpoint's own
+  ``generation_config.json`` (``mstar.model.utils.load_generation_defaults``),
+  falling back to your config only when the checkpoint ships none.
+- Raise ``ValueError`` (a 400) for an input you cannot serve; never clamp, coerce, or
+  fall back silently. A ``SamplerSpec`` without ``enable_repetion_penalty`` or
+  ``enable_min_p`` refuses those knobs at admission, so do not default a penalty onto it.
+- Declare every ``model_kwargs`` key you read in ``request_kwargs()``; any other key a
+  client sends is logged as ignored by the server.
+- If a decode ``Loop`` takes ``max_iters`` from the kwarg-less ``get_max_output_tokens()``,
+  return that value from ``get_max_output_tokens_limit()``, so a request above it is
+  refused instead of cut short.
+- Draw any model-local randomness from the request's seed (``random_seed`` on the
+  forward-pass info), never the global RNG.
 
 ``get_sampling_config(node_name, model_kwargs)`` still exists as a helper for assembling
 sampling parameters. The engine no longer reads it directly. Pass its result into a

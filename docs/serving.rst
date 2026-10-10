@@ -304,7 +304,8 @@ Pi0.5 DROID variant fixes the action horizon:
      - {node_names: [LLM], ranks: [0]}
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`.
+client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each
+sampling knob means.
 
 .. _tensor-transport:
 

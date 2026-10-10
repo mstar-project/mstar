@@ -88,9 +88,9 @@ Each message is one request with the ``/generate`` fields — ``text``, ``files`
 as a msgpack binary frame (``data`` raw bytes). Replies use the same encoding as the
 message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
 then ``{"request_id", "finish": true}``. A rejected message answers
-``{"request_id", "error": ...}`` and the socket stays open; a request that fails after it
-was accepted ends the same way, with the HTTP ``status`` it would have had, and no
-``finish`` follows. Messages may be pipelined —
+``{"request_id", "error": ..., "status": ...}`` with the HTTP status ``/generate`` would
+have returned, and the socket stays open; a request that fails after it was accepted ends
+the same way, and no ``finish`` follows. Messages may be pipelined —
 send the next observation before the current action chunk has returned — and the
 ``request_id`` tells the replies apart. Closing the socket aborts whatever is still in
 flight.
@@ -117,6 +117,71 @@ flight.
 
 ``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
 loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
+
+.. _generation-parameters:
+
+Generation parameters
+---------------------
+
+``model_kwargs`` knobs mean the same thing on every model, every endpoint, and every
+execution path (eager or CUDA graph). The server checks them once, before the request is
+queued; a value outside these rules is a ``400`` that names the knob and its range, and a
+streaming request gets that status instead of a ``200`` followed by an in-band error.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 30 48
+
+   * - Knob
+     - Allowed
+     - Meaning
+   * - ``temperature``
+     - number ``>= 0``
+     - ``0`` is greedy (the most likely token; ties go to the lower id). Values below
+       ``1e-5`` are greedy too. A greedy request ignores ``top_k``, ``top_p`` and ``min_p``.
+   * - ``top_k``
+     - integer ``>= 0``
+     - ``0`` is off; so is any value at or above the vocabulary size.
+   * - ``top_p``
+     - number in ``(0, 1]``
+     - ``1`` is off. ``0`` is refused: ask for greedy with ``temperature: 0``.
+   * - ``min_p``
+     - number in ``[0, 1]``
+     - ``0`` is off. A model whose sampler has no min-p filter refuses ``min_p > 0``.
+   * - ``repetition_penalty``
+     - number ``> 0``
+     - ``1`` is off. Counts the prompt's tokens as well as generated ones unless
+       ``penalize_prompt`` is ``false``. A model whose sampler has no penalty refuses
+       any value other than ``1``.
+   * - ``penalize_prompt``
+     - ``true`` / ``false``
+     - Whether ``repetition_penalty`` also counts the prompt (default ``true``).
+   * - ``seed``
+     - signed 64-bit integer
+     - Seeds FlashInfer's sampler. A seeded request repeats only when its batch
+       repeats: the draw also depends on its batch position and on the batch's
+       first request, so under continuous batching the same seed can give different
+       tokens. Absent, the server derives a seed from the request id.
+       Each sampler of a multi-stage model draws its own stream from it.
+   * - ``max_output_tokens``
+     - integer ``>= 1``
+     - In the model's output unit (text tokens, codec frames). ``max_tokens``,
+       ``max_completion_tokens`` and ``max_new_tokens`` are accepted as aliases, in
+       that order of increasing precedence below ``max_output_tokens`` itself. A value
+       above the model's limit is refused rather than cut short.
+   * - ``ignore_eos``
+     - ``true`` / ``false``
+     -
+
+Types are strict: ``"0.7"`` is not a number and ``"false"`` is not a boolean. ``null``
+is the same as leaving the knob out: the model's default applies, which is the
+checkpoint's own ``generation_config.json`` value where it ships one. Multi-stage models
+take a stage prefix (``talker_temperature``, ``code_predictor_top_k``) with the same
+rules; an unprefixed knob sets the primary stage (the thinker of Qwen3-Omni, the talker
+of Qwen3-TTS), and a prefixed one wins over it for its stage.
+
+A knob the model does not read is not an error: the request is served, and the server
+logs its name as ignored (check the server log for typos such as ``temprature``).
 
 Python SDK
 ----------
@@ -268,30 +333,27 @@ Per-model notes:
 
 - **BAGEL** — chat returns text only; use ``/v1/images/generations`` and
   ``/v1/images/edits`` for image output.
-- **Qwen3-Omni** — text sampling uses ``thinker_*`` keys, speech uses ``talker_*``, and the
-  residual codec groups use ``code_predictor_*``; set the speaker with ``voice`` (default
-  ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
+- **Qwen3-Omni** — text sampling uses plain or ``thinker_*`` keys (a ``thinker_*`` key wins),
+  speech uses ``talker_*``, and the residual codec groups use ``code_predictor_*``; set the
+  speaker with ``voice`` (``Ethan`` default, ``Chelsie``, ``Aiden``; any other is a 400) and
+  request audio output by including ``"audio"`` in ``modalities``. ``max_output_tokens``
+  is at most 2048 and ``talker_max_output_tokens`` at most 4096 (its default, from the checkpoint).
   Non-OpenAI knobs (e.g. ``talker_top_k``, ``code_predictor_top_p``) go through
   ``extra_body``.
-- **Whisper / Higgs-Audio** — ``language`` (ISO-639-1) skips language detection,
-  ``prompt`` conditions the decoder on prior text (it reaches the model as
-  ``initial_prompt``), and ``response_format``
-  ``verbose_json`` / ``srt`` / ``vtt`` (or ``timestamp_granularities[]``) asks the
-  model for timestamps. Whisper's language and timestamp tokens travel in the
-  text stream and are lifted into ``language`` / ``segments`` by the server; a
-  streaming client receives only the spoken words. Uploads longer than the
-  model's clip (30 s for Whisper) are served as consecutive windows. By default
-  they run in order, openai-whisper style: each window gets the transcript so
-  far as ``initial_prompt`` and the first window's detected language, is decoded
-  with timestamps so the next window can start where its last closed segment
-  ended (no word is split by a boundary), and is decoded again when its text is
-  a repetition loop (gzip compression ratio above 2.4): first without the
-  conditioning text, then at rising temperatures — after which the transcript
-  so far stops conditioning later windows.
-  Leave ``temperature`` at 0 to get that fallback; a pinned temperature is used
-  as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
-  once, each cut at the quietest moment before its boundary. Segment timestamps
-  are offset to the whole file.
+- **Whisper / Higgs-Audio** — Whisper decodes in ``language`` (ISO-639-1, default
+  ``en``); it does not detect the language, emit timestamps, or read ``prompt``.
+  Higgs-Audio takes ``prompt`` as its transcription instruction (the model has a
+  default) and ignores ``language``. A key the model does not read is logged as ignored.
+  ``max_output_tokens`` is at most 444 (Whisper) and 1024 (Higgs-Audio). With no
+  timestamps, ``verbose_json`` has no segments and ``srt`` / ``vtt`` return one cue
+  spanning the file. Higgs-Audio hears the whole upload. Whisper hears 30 s, so a
+  longer upload is served as consecutive windows whose texts are joined. By default
+  (``long_form="sequential"``) they run one at a time, each cut at a fixed 30 s
+  boundary, so a word can be split between two windows; a window whose text is a
+  repetition loop (gzip compression ratio above 2.4) is decoded again at rising
+  temperatures. Leave ``temperature`` at 0 to get that fallback; a pinned temperature
+  is used as is. ``long_form="parallel"`` in ``extra_body`` submits up to 8 windows at
+  once, each cut at the quietest moment in the 2 s before its boundary.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``
@@ -304,4 +366,5 @@ Per-model notes:
   ``temperature`` / ``top_p`` are ignored: Kokoro does not sample.
 - **Orpheus** — set the speaker with ``voice`` — one of ``tara`` (default), ``zoe``,
   ``zac``, ``jess``, ``leo``, ``mia``, ``julia``, ``leah`` (the ``available_voices`` list
-  in the Orpheus config).
+  in the Orpheus config); an empty or unknown voice is a 400. ``max_output_tokens`` is at
+  most 2048.

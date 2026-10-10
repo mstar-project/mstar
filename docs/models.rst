@@ -110,9 +110,10 @@ Notes
 OmniVoice notes
 ~~~~~~~~~~~~~~~
 
-- Zero-shot only: there are no built-in speakers. Pass ``reference_audio`` with its
-  transcript in ``ref_text`` to clone a voice, or describe one in ``voice``.
-  ``ref_text`` is required alongside ``reference_audio``.
+- Zero-shot only: there are no built-in speakers. Pass ``ref_audio`` (an uploaded
+  ``audio`` input on ``/generate``) with its transcript in ``ref_text`` to clone a voice,
+  or describe one in ``instruct`` (``voice`` on ``/v1/audio/speech``).
+  ``ref_text`` is required alongside the reference clip.
 - ``language`` takes either the name (``Vietnamese``) or the id (``vi``): a
   name is resolved to the id the model was trained on before the prompt is
   built, and an unrecognised value warns and falls back to language-agnostic
@@ -144,9 +145,11 @@ not the 256-slot default. The state defaults to the checkpoint's
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
-``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
-a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
-via ``extra_body``.
+``top_k``, ``repetition_penalty``, ``penalize_prompt`` and ``enable_thinking``
+(default true; the template opens a ``<think>`` block) are read by the model but are
+not OpenAI fields — pass them via ``extra_body``; ``min_p`` is refused. Unset knobs take
+the checkpoint's ``generation_config.json`` (only the 27B ships one: ``top_k`` 20,
+``top_p`` 0.95), and ``max_output_tokens`` may not exceed ``max_position_embeddings``.
 
 Kokoro notes
 ------------
@@ -164,7 +167,9 @@ Kokoro notes
   ``speed`` (0.25-4.0), ``lang_code`` (defaults to the voice prefix: ``a`` American
   English, ``b`` British, ``e`` Spanish, ``f`` French, ``h`` Hindi, ``i`` Italian,
   ``p`` Portuguese, ``j`` Japanese, ``z`` Mandarin) and ``phonemes`` (skip G2P and
-  synthesize a phoneme string directly).
+  synthesize a phoneme string directly). An empty ``voice`` / ``lang_code`` or a
+  ``speed`` outside 0.25-4.0 is a 400. ``seed`` fixes the vocoder's noise, so a seeded
+  request repeats; batched with others it matches up to rounding.
 - Deployment-wide options go in the YAML's ``model_kwargs`` (see ``configs/kokoro.yaml``):
   ``lang_code`` fixes the G2P language, ``espeak_fallback: false`` disables the espeak-ng
   fallback even when it is installed, ``chunk_target_phonemes`` and
@@ -239,7 +244,7 @@ Qwen3-TTS notes
   always uses the whole-walk CUDA Graph, with the 15-step
   CodePredictor loop captured inside it; request-local EOS suppression is
   carried as a graph tensor input so replay does not consult capture-slot dummy
-  request state. Residual ``subtalker_*`` sampling is per-request through the
+  request state. Residual ``code_predictor_*`` sampling (``subtalker_*`` is a deprecated alias) is per-request through the
   ``code_predictor`` aux sampler, so custom values neither block batching nor
   fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
   Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
@@ -320,18 +325,19 @@ Chatterbox notes
   ``temperature`` (up to 5; under 1e-5 is greedy)/``top_p``/``top_k`` (the
   whole vocab or more is no filter)/``min_p``/``repetition_penalty`` (up to 2;
   the upper bounds are the reference demo's), ``seed``, ``n_cfm_timesteps``
-  (S3Gen Euler steps, 10; Turbo 2), ``max_new_tokens`` (up to the deployment's
+  (S3Gen Euler steps, 10; Turbo 2), ``max_output_tokens`` (up to the deployment's
   ``model_kwargs: max_new_tokens_limit``, 1000 in the shipped configs; with
   ``max_concurrent_requests`` set, the server refuses to start unless that
   many requests of that length fit the KV cache, so raise it together with
   ``max_num_pages`` or a lower cap),
-  ``ignore_eos`` (T3 decodes all ``max_new_tokens``
+  ``ignore_eos`` (T3 decodes all ``max_output_tokens``
   past the stop token, for fixed-length benchmarks; the speech tokens among
   them are vocoded, but T3 keeps emitting stop and control tokens after the
   end of speech and those are dropped, so the audio is shorter than
-  ``max_new_tokens`` / 25 s: 4096 tokens gave 117 s on base and 141 s on
-  Turbo, not 164 s) and ``watermark`` (default on). Turbo ignores
-  ``cfg_weight``, ``exaggeration`` and ``min_p`` like the reference package.
+  ``max_output_tokens`` / 25 s: 4096 tokens gave 117 s on base and 141 s on
+  Turbo, not 164 s) and ``watermark`` (default on). Turbo has no
+  ``cfg_weight``, ``exaggeration`` or ``min_p``: a non-zero value is a 400.
+  ``language_id`` on a non-multilingual checkpoint is reported as ignored.
   The native ``/generate`` route and ``client.tts(...)`` take the same knobs;
   a clip uploaded as ``audio`` input is the reference voice.
 - Graph: ``voice_encoder`` (speaker LSTM + S3 tokenizer over the reference,
@@ -445,7 +451,8 @@ same transformer instance and KV pool as the generator. ``/v1/chat/completions``
 takes image and video content parts (URLs or data URIs) and streams tokens; the
 chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
 ``enable_thinking`` (or ``chat_template_kwargs.enable_thinking``), ``top_k``,
-``repetition_penalty``, and for video attachments ``video_fps`` / ``video_num_frames``
+``repetition_penalty``, ``penalize_prompt`` (``min_p`` is refused; ``max_tokens`` is
+at most 2048), and for video attachments ``video_fps`` / ``video_num_frames``
 (frames are sampled at 2 fps by default, each frame a timestamped span).
 
 .. code-block:: bash
@@ -628,7 +635,8 @@ Generation knobs (per request, via ``model_kwargs`` or the request body):
        frames = ``(num_frames - 1) // 4 + 1``.
    * - ``num_inference_steps``
      - 50
-     - Clamped to ``max_denoise_steps`` (100), the denoise loop's ceiling.
+     - An integer in 1-100 (``max_denoise_steps``, the denoise loop's ceiling); a 400
+       outside it.
    * - ``guidance_scale``
      - 5.0
      - Classifier-free guidance; run as a single batched forward.
