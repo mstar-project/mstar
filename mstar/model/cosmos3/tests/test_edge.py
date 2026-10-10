@@ -559,6 +559,25 @@ def test_edge_prompt_rendering_matches_reference_layout() -> None:
 
 
 @needs_edge
+def test_edge_system_prompt_leads_a_chat_with_no_system_message(tmp_path) -> None:
+    """The request's ``system_prompt`` leads a chat whose client sent no system message of its own."""
+    from transformers import AutoTokenizer
+
+    from mstar.api_server.openai.adapters import flatten_messages
+    from mstar.model.cosmos3.components.reasoner import render_chat
+
+    cfg = Cosmos3Config.from_pretrained(EDGE_DIR)
+    tok = AutoTokenizer.from_pretrained(str(EDGE_DIR))
+    question = {"role": "user", "content": "What is ahead?"}
+    *_, parts = flatten_messages([question], tmp_path)
+    rendered = render_chat(tok, parts, cfg.reasoner, enable_thinking=False, system_prompt="Drive carefully.")
+    assert rendered == tok.apply_chat_template(
+        [{"role": "system", "content": "Drive carefully."}, question],
+        tokenize=False, add_generation_prompt=True, enable_thinking=False,
+    ), "the request's system_prompt did not lead a chat that sent none"
+
+
+@needs_edge
 def test_edge_reasoner_video_prompt() -> None:
     """A video attachment renders one timestamped span per sampled frame, the
     packed patches cover every frame, and the positions advance per frame."""

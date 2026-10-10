@@ -895,6 +895,7 @@ class Cosmos3Model(Model):
         parts = parts_from_modalities(
             input_modalities,
             [p.text or "" for p in prompt_parts if p.modality == TEXT] if prompt_parts is not None else prompt,
+            [p.role for p in prompt_parts or ()],
         )
         unsupported = {p.modality for p in parts} - {TEXT, IMAGE, VIDEO}
         if unsupported:
@@ -1000,7 +1001,15 @@ class Cosmos3Model(Model):
 
             if self._detokenizer is None or self._detokenizer.tokenizer is not self.tokenizer:
                 self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-            return self._detokenizer.to_bytes(output.reshape(-1).tolist())
+            ids = output.reshape(-1).tolist()
+            if not (request_kwargs or {}).get("ignore_eos"):
+                return self._detokenizer.to_bytes(ids)
+            # under ignore_eos the end token ended nothing and stays, one chunk per token
+            eos = self.config.reasoner.eos_token_id
+            return b"".join(
+                self.tokenizer.decode([i]).encode("utf-8") if i == eos else self._detokenizer.to_bytes([i])
+                for i in ids
+            )
         if modality == "image":
             import io
             import os

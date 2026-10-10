@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -83,37 +83,46 @@ def flatten_messages(
     ``parts`` is the ordered sequence as written; the other three derive from
     it — text newline-joined, attachments persisted under ``upload_dir`` and
     grouped by modality, ``input_modalities`` the per-part modality sequence.
-    So an attachment's position and a repeated modality both survive.
-    (Multi-turn role structure is flattened — a v1 simplification; the models
-    apply their own prompt formatting in ``process_prompt``.)
+    So an attachment's position and a repeated modality both survive. Each
+    text part carries its message's role, so a reply stays its own turn.
     """
     parts: list[PromptPart] = []
     file_paths: dict[str, list[str]] = {}
 
     def add_file(modality: str, path: str) -> None:
+        # shortcut: always a user turn, so the model can't tell an image it made from one it was
+        # sent, and a reply that is only an image leaves no assistant turn; a feature like
+        # multi-turn editing would give the turn break between two attachments a text slot
         paths = file_paths.setdefault(modality, [])
-        parts.append(PromptPart(modality=modality, index=len(paths)))
+        parts.append(PromptPart(modality=modality, index=len(paths), role="user"))
         paths.append(path)
 
-    def add_text(text: str) -> None:
+    def add_text(text: str, role: str) -> None:
         # Adjacent text parts were newline-joined before ordering was kept;
-        # merge them here so only text an attachment separates gets its own
-        # part, and the rendered prompt keeps the separator it used to have.
-        if parts and parts[-1].modality == "text":
-            parts[-1] = PromptPart(
-                modality="text", text=f"{parts[-1].text}\n{text}"
-            )
+        # merge them here, across messages of one role too (the layout has no
+        # slot for the boundary between them), so only text an attachment or a
+        # role change separates gets its own part, and the rendered prompt
+        # keeps the separator it used to have.
+        if parts and parts[-1].modality == "text" and parts[-1].role == role:
+            parts[-1] = replace(parts[-1], text=f"{parts[-1].text}\n{text}")
             return
-        parts.append(PromptPart(modality="text", text=text))
+        parts.append(PromptPart(modality="text", text=text, role=role))
 
     for msg in messages or []:
         # Messages may be pydantic ChatMessage objects or plain dicts.
-        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        if isinstance(msg, dict):
+            role, content = msg.get("role"), msg.get("content")
+        else:
+            role, content = getattr(msg, "role", None), getattr(msg, "content", None)
+        if role == "developer":  # OpenAI's newer name for system
+            role = "system"
+        elif role not in ("system", "user", "assistant"):
+            raise ValueError(f"a message's role must be system, developer, user or assistant, not {role!r}")
         if content is None:
             continue
         if isinstance(content, str):
             if content:
-                add_text(content)
+                add_text(content, role)
             continue
         for part in content:
             if not isinstance(part, dict):
@@ -121,7 +130,7 @@ def flatten_messages(
             ptype = part.get("type")
             if ptype == "text":
                 if part.get("text"):
-                    add_text(part["text"])
+                    add_text(part["text"], role)
             elif ptype == "image_url":
                 url = (part.get("image_url") or {}).get("url", "")
                 if url:
@@ -154,6 +163,27 @@ def _passthrough(req) -> dict:
     flow through verbatim as model_kwargs."""
     extra = getattr(req, "model_extra", None) or {}
     return dict(extra)
+
+
+def _refuse_tool_calls(req) -> None:
+    """Refuse a chat that asks the model to call a tool.
+
+    No adapter here parses a tool call out of a reply, so a client sent plain
+    text takes it for the model declining every tool. An empty ``tools`` and a
+    ``tool_choice`` of ``none`` or ``auto`` ask for no call; clients send them
+    by default. Their older names, ``functions`` and ``function_call``, follow
+    the same rules.
+    """
+    extra = req.model_extra or {}
+    choice = extra.get("tool_choice")
+    if (
+        extra.get("tools") not in (None, [])
+        or extra.get("functions") not in (None, [])
+        or choice == "required"
+        or isinstance(choice, dict)
+        or extra.get("function_call") not in (None, "none", "auto")
+    ):
+        raise ValueError("tool calling is not supported for this model")
 
 
 def _apply_sampling(
@@ -294,6 +324,7 @@ class BagelAdapter(OpenAIAdapter):
     supports_images = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -351,6 +382,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         return getattr(req, "voice", None)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         # Speech output also emits text, so request both modalities when audio is asked for.
@@ -401,6 +433,7 @@ class Qwen3_5Adapter(OpenAIAdapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -712,6 +745,7 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)

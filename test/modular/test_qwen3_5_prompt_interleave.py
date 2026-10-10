@@ -16,6 +16,7 @@ import os
 import pytest
 import torch
 
+from mstar.api_server.openai.adapters import flatten_messages
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -224,3 +225,19 @@ def test_attachment_count_mismatch_is_caught(model):
             "Describe these.", ["image", "image", "text"], ["text"],
             tensors={"image_inputs": [an_image()]},
         )
+
+
+CHAT = [
+    {"role": "system", "content": "Be brief."},
+    {"role": "user", "content": "My name is Ada."},
+    {"role": "assistant", "content": "Hello Ada."},
+    {"role": "user", "content": "What is my name?"},
+]
+
+
+def test_a_chat_the_template_refuses_is_a_bad_request(model, tmp_path):
+    """The template's own error is a 500 at the data worker; the ValueError it becomes is what makes it a 400."""
+    messages = [CHAT[1], CHAT[0], CHAT[3]]
+    text, _, in_mods, parts = flatten_messages(messages, tmp_path)
+    with pytest.raises(ValueError, match="System message must be at the beginning"):
+        model.process_prompt(text, in_mods, ["text"], prompt_parts=parts)

@@ -2,6 +2,7 @@
 import json
 import logging
 import re
+from collections.abc import Container
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -364,3 +365,18 @@ class ByteLevelDetokenizer:
         for token in tokens:
             raw.extend(self.byte_decoder[c] for c in token)
         return bytes(raw)
+
+
+def drop_stop_tokens(
+    output: torch.Tensor, stop_token_ids: Container[int], request_kwargs: dict | None,
+) -> list[int]:
+    """Drop the stop tokens that ended a text reply, unless the request sets ``ignore_eos``.
+
+    A stop token ends the turn, not the reply: a client sends the reply back as
+    an assistant message, whose template closes it. Under ``ignore_eos`` it ends
+    nothing and stays, one chunk per token.
+    """
+    ids = output.reshape(-1).tolist()
+    if (request_kwargs or {}).get("ignore_eos"):
+        return ids
+    return [i for i in ids if i not in stop_token_ids]

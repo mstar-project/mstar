@@ -288,16 +288,19 @@ def test_transcription_stream_events(client_and_stub):
     assert stub.last_submit["streaming"] is True
 
 
-def test_transcription_stream_reports_in_band_error(client_and_stub):
+@pytest.mark.parametrize("status,error_type", [(500, "server_error"), (400, "invalid_request_error")])
+def test_transcription_stream_reports_in_band_error(client_and_stub, status, error_type):
     client, stub = client_and_stub
-    stub.next_chunks = [_Chunk("error", b"boom", {"status": 500})]
+    stub.next_chunks = [_Chunk("error", b"boom", {"status": status})]
     with client.stream(
         "POST", "/v1/audio/transcriptions",
         data={"model": "whisper_large", "stream": "true"},
         files={"file": ("a.wav", b"RIFF", "audio/wav")},
     ) as r:
         lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
-    assert json.loads(lines[0][len("data: "):])["type"] == "error"
+    event = json.loads(lines[0][len("data: "):])
+    assert event["type"] == "error"
+    assert event["error"] == {"message": "boom", "type": error_type, "code": status}, "the type ignores the status"
     assert lines[-1] == "data: [DONE]"
 
 

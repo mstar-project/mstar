@@ -268,5 +268,5 @@ def test_bagel_declares_the_tensor_its_text_walk_prefills_from():
     declared = BagelModel.prefix_key_streams(object())
 
     assert declared == {
-        "kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text")}
+        "kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}
     }, "the text walk's prompt does not arrive under the name it keys"
