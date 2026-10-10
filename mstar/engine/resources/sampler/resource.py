@@ -12,7 +12,12 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
-from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
+from mstar.engine.resources.sampler.utils import (
+    CudaGraphableSampler,
+    Sampler,
+    SamplerBuffers,
+    fused_temperature_softmax,
+)
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
@@ -367,6 +372,83 @@ class SamplerResource(Resource):
 
     ### Submodule-level functionality
 
+    def speculative_sample(
+        self, request_ids: list[str], logits: torch.Tensor, drafts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Speculative sampling of one verify block per row, the drafts taken as certain.
+
+        ``logits`` ``[n, k + 1, V]`` are the target's after the last token and after each
+        draft, ``drafts`` ``[n, k]``. Draft i stays with probability p_i(draft); the first one
+        refused is replaced by a draw from p_i without it, and with every draft kept one more
+        comes from p_k, so the tokens are distributed as sampling the target one at a time. A
+        greedy row (temperature 0) keeps its argmax's prefix, as greedy verification does.
+        Returns the tokens ``[n, k + 1]`` (a row's first refused draft replaced; later entries
+        unspecified) and the drafts kept per row. Neither a repetition penalty nor min_p
+        applies here: callers refuse requests that set them.
+        """
+        n, block, vocab = logits.shape
+        # A row draws up to block + 1 numbers from its Philox stream at `offset` (each draft,
+        # the refused one again, then the replacement); the next step starts past them all
+        stride = block + 1
+        temperature, top_k, top_p, seed, offset = self._spec_params(
+            request_ids, n, logits.device, stride)
+        rows = logits.reshape(n * block, vocab)
+        expand = lambda t: t.repeat_interleave(block)  # noqa: E731
+        top_k = torch.where(top_k > 0, top_k, vocab)
+        if logits.is_cuda:
+            import flashinfer
+
+            with torch.cuda.device(logits.device):
+                probs = fused_temperature_softmax(rows, expand(temperature), include_greedy=True)
+                probs = flashinfer.sampling.top_k_renorm_probs(probs, expand(top_k))
+                probs = flashinfer.sampling.top_p_renorm_probs(probs, expand(top_p))
+                draft_probs = probs.new_zeros(n, block - 1, vocab)
+                draft_probs.scatter_(2, drafts[..., None].long(), 1.0)
+                accepted = torch.zeros(n, dtype=torch.int32, device=logits.device)
+                kept = torch.zeros(n, dtype=torch.int32, device=logits.device)
+                # (tokens, accepted per position, drafts kept); the counts are added in place
+                tokens, _, kept = flashinfer.sampling.chain_speculative_sampling(
+                    draft_probs, drafts.int(), probs.view(n, block, vocab), accepted, kept,
+                    deterministic=True, seed=seed, offset=offset,
+                )
+                # A draft refused at u == 1 under a target one-hot at it leaves nothing to
+                # draw from, and the kernel emits an id it never set: the draft stands there
+                at = kept.long()[:, None]
+                q = probs.view(n, block, vocab).gather(
+                    1, at[..., None].expand(n, 1, vocab)).squeeze(1)
+                emitted = tokens.long().gather(1, at)
+                drawn = (emitted >= 0) & (emitted < vocab) & (
+                    q.gather(1, emitted.clamp(0, vocab - 1)) > 0)
+                tokens = tokens.long().scatter(
+                    1, at, torch.where(drawn, emitted, q.argmax(-1, keepdim=True)))
+        else:
+            tokens, kept = _speculative_sample_torch(
+                rows.float(), expand(temperature), expand(top_k), expand(top_p), drafts, block)
+        if self._cg_sampler is not None:
+            self._cg_sampler.offset_buf += stride
+        return tokens.long().clamp_min(0), kept.long()
+
+    def _spec_params(self, request_ids, n, device, stride):
+        """Per-row temperature, top_k, top_p, seed and RNG offset: the slot's gathered buffers
+        under a graph, else the requests' configs and the eager sampler's offsets, which
+        this step moves ``stride`` on."""
+        cg = self._cg_sampler
+        if cg is not None:
+            return (cg.temperature_buf[:n], cg.top_k_buf[:n], cg.top_p_buf[:n],
+                    cg.seed_buf[:n], cg.offset_buf[:n])
+        configs = [self._sampler._sampling_config[rid] for rid in request_ids]
+        steps = self._sampler._step_offset
+        offsets = []
+        for rid in request_ids:
+            offsets.append(steps.get(rid, 0))
+            steps[rid] = offsets[-1] + stride
+        as_tensor = lambda values, dtype: torch.tensor(values, dtype=dtype, device=device)  # noqa: E731
+        return (as_tensor([c.temperature for c in configs], torch.float32),
+                as_tensor([c.top_k for c in configs], torch.int32),
+                as_tensor([c.top_p for c in configs], torch.float32),
+                as_tensor([c._seed for c in configs], torch.int64),
+                as_tensor(offsets, torch.int64))
+
     def sample(
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ):
@@ -428,3 +510,36 @@ class SamplerResource(Resource):
             cg_slot, padded_bs = self._step_slot
             return bufs.gather_last_tokens(cg_slot, padded_bs)
         return bufs.last_tokens_for(request_ids)
+
+
+def _speculative_sample_torch(probs_logits, temperature, top_k, top_p, drafts, block):
+    """``SamplerResource.speculative_sample`` without a GPU: the same rule, torch's RNG."""
+    rows, vocab = probs_logits.shape
+    n, k = rows // block, block - 1
+    greedy = temperature <= 0
+    probs = torch.softmax(probs_logits / torch.where(greedy, 1.0, temperature)[:, None], -1)
+    probs = torch.where(greedy[:, None], torch.nn.functional.one_hot(
+        probs_logits.argmax(-1), vocab).float(), probs)
+    order = probs.argsort(-1, descending=True)
+    sorted_probs = probs.gather(-1, order)
+    rank = torch.arange(vocab, device=probs.device)[None, :]
+    keep = (rank < top_k[:, None]) & (sorted_probs.cumsum(-1) - sorted_probs < top_p[:, None])
+    keep[:, 0] = True
+    probs = torch.zeros_like(probs).scatter(-1, order, sorted_probs * keep)
+    probs = (probs / probs.sum(-1, keepdim=True)).view(n, block, vocab)
+    tokens = torch.zeros(n, block, dtype=torch.long, device=probs.device)
+    kept = torch.zeros(n, dtype=torch.long, device=probs.device)
+    for r in range(n):
+        for i in range(block):
+            p = probs[r, i]
+            if i < k:
+                d = int(drafts[r, i])
+                if torch.rand(()) < p[d]:
+                    tokens[r, i] = d
+                    kept[r] += 1
+                    continue
+                p = p.clone()
+                p[d] = 0.0
+            tokens[r, i] = torch.multinomial(p / p.sum(), 1)[0]
+            break
+    return tokens, kept
