@@ -360,6 +360,16 @@ The spec types are:
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
        Ring storage is currently paired with FlexAttention.
+   * - ``BoundedKVSpec(config=BoundedKVConfig(...))``
+     - Fixed-size per-request KV with sink + window retention, and its attention. A
+       request's stream is an optional read-only source (e.g. a voice prompt's keys,
+       shared by the requests that use it) followed by what it writes; ``retention`` maps
+       the source length to the ``SinkWindow`` kept (the first ``sink`` entries and the
+       last ``window``). Each step declares its rows' ``StreamPosition`` and writes
+       (``BoundedKVStep``), so rows at different positions batch, and nothing is
+       reserved or released per step. ``attend`` takes an optional per-distance score
+       term (``rel_bias``) for relative-position attention. Float32 by default (Triton
+       kernels). See `Bounded (sink + window) caches`_.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
        ``AttnBackend.FLASHINFER`` (the default), ``AttnBackend.DENSE`` or
@@ -644,6 +654,31 @@ for the worst layout the bucket's token count allows.
    72, which the FlashInfer kernel — it supports only a few fixed head dimensions — forces
    us to zero-pad to 128. So that tower attends through the resource only when it is
    replaying a captured graph, and runs flash-attn varlen otherwise.
+
+Bounded (sink + window) caches
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A streaming decoder that keeps a fixed amount of context per request (a prompt or voice
+prefix plus the last N steps, as StreamingLLM-style sinks or a streaming vocoder's chunk
+caches do) declares a ``BoundedKVSpec``. A request takes a slot when it first runs and
+keeps it; the window is a ring overwritten in place, so a step reserves and releases
+nothing. A step's layout is at most five key ranges and three write ranges per row,
+computed on the host from the position the step declares, which is also what lets rows at
+different positions share a batch and a captured graph.
+
+The model calls ``attend(layer_idx, q, k, v, source, plan)``: each row attends its
+retained keys in stream order and its own, unmasked, and its writes land after. Pass
+``source`` (``[rows, H, L, 2 * head_dim]``, keys then values) when requests start from a
+shared prefix that the slots should not copy. ``rel_bias`` adds a term that depends only on
+the query-key distance, for Transformer-XL-style relative positions. MiniCPM-o's token2wav
+(``CACHE_FAMILIES`` in ``mstar/model/minicpm_o/components/token2wav.py``) declares three:
+its two conformer caches and its DiT's.
+
+Two flags cover retention rules that are not quite a token FIFO.
+``SinkWindow(window_includes_step=True)`` counts the step's own tokens toward the window.
+``BoundedKVConfig(reverse_step_order=True)`` appends each step's tokens last-first, which
+only makes sense for attention that ignores key order; it decides which of the oldest
+step's tokens leave first.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -1365,6 +1400,8 @@ that a misspelled setting is never silently ignored:
        ``prefix_cache``, ``prefix_cache_salt``
    * - ``KVSpec`` with ``RingKVConfig``
      - ``num_sessions``
+   * - ``BoundedKVSpec``
+     - ``max_slots``
    * - ``AttentionSpec``
      - ``backend`` (``flashinfer`` / ``dense`` / ``flex``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)

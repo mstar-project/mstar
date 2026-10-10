@@ -183,16 +183,19 @@ the same text. Interleaved text/speech generation (upstream's
 ``configs/minicpm_o.yaml`` runs everything on one GPU in three workers
 (``rank_devices``): the LLM with the image and audio encoders, the TTS, and the
 vocoder, so a vocoder step never holds up the TTS's or the LLM's. Each spoken
-reply holds a vocoder slot (``t2w_state``, ~0.4 GiB) from its first audio to its
-last; size ``t2w_state.max_slots`` to the concurrent spoken replies you want plus
-one, since a reply waits for a slot before its first audio. Run it under CUDA MPS
+reply holds a vocoder slot from its first audio to its last: one in ``t2w_state``
+(conv and HiFT tails, plus a sink slot) and one in each of ``t2w_enc1_kv``,
+``t2w_enc2_kv`` and ``t2w_dit_kv`` (its attention caches, ~0.4 GiB in all). Size
+them to the concurrent spoken replies you want (``t2w_state`` one more), since a
+reply waits for a slot before its first audio. Run it under CUDA MPS
 when the GPU is busy (see *Several workers on one GPU* in :doc:`serving`): on an
 H100 at 32 concurrent spoken replies it raised throughput from 50 to 71 audio
 seconds per second.
 
-The vocoder's batched path keeps each request's DiT caches as a ring in its slot
-and runs the DiT on fused Triton kernels (TF32), matching the per-request
-reference path to summation order; the per-request path reproduces upstream bit
+The vocoder's batched path keeps its attention caches on bounded (sink + window)
+KV resources, so windows at any point of their reply share a batch, and runs the
+DiT on fused Triton kernels (TF32), matching the per-request reference path to
+summation order; the per-request path reproduces upstream bit
 for bit at full fp32. The ``minicpm_o`` extra installs ``onnx``, used only to read
 the voice-prompt tokenizer's and speaker encoder's weights out of the checkpoint.
 

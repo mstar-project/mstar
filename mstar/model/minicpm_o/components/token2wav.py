@@ -304,13 +304,19 @@ class CacheFamily(NamedTuple):
     source: Callable[[Token2WavVoice], torch.Tensor]
     reverse_step_order: bool = False
 
-    def position(self, voice_tokens: int, calls: int) -> tuple[int, int]:
-        """``(source_len, written)`` before a request's next window, after ``calls`` full ones."""
-        return self.rate * voice_tokens, self.rate * (WINDOW - PRE_LOOKAHEAD) * calls
+    def position(self, voice_tokens: int, written_tokens: int) -> tuple[int, int]:
+        """``(source_len, written)`` once a request's windows have added ``written_tokens``
+        (``window_tokens`` each)."""
+        return self.rate * voice_tokens, self.rate * written_tokens
 
     def span(self, num_tokens: int, last: bool) -> int:
-        """Stream entries a window adds: none for a last window, which writes no caches."""
-        return 0 if last else self.rate * (num_tokens - PRE_LOOKAHEAD)
+        return self.rate * window_tokens(num_tokens, last)
+
+
+def window_tokens(num_tokens: int, last: bool) -> int:
+    """25 Hz tokens a window adds to its caches: its own, without the lookahead (a window
+    is 28 codes, or fewer when it carried the TTS's stop code); none for a last window."""
+    return 0 if last else num_tokens - PRE_LOOKAHEAD
 
 
 CACHE_FAMILIES = {

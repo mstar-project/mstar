@@ -20,10 +20,14 @@ resources:
   # The TTS's ~60 KiB/token: a spoken reply's condition plus up to 2047 codes.
   tts_kv:
     max_num_pages: 256
-  # One slot per request whose reply is being vocoded (~0.4 GiB each), plus
-  # the sink. A request waits for a slot before its first audio, so this caps
-  # concurrent spoken replies.
+  # The vocoder holds a slot in each of these per spoken reply, ~0.4 GiB in all
+  # (t2w_state has one more, its sink). A reply waits for slots before its first
+  # audio, so they cap concurrent spoken replies.
   t2w_state:
     max_slots: 33
+  t2w_enc1_kv:
+    max_slots: 32
+  t2w_enc2_kv:
+    max_slots: 32
   t2w_dit_kv:
     max_slots: 32

@@ -757,30 +757,28 @@ class Token2WavSubmodule(NodeSubmodule):
         self, request_ids: list[str], voices: list[str], num_tokens: list[int], lasts: list[bool],
     ) -> dict[str, BoundedKVStep]:
         """Each cache resource's step: every row's stream position and what its window adds."""
-        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES, state_lengths
+        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES
 
-        lengths = []
+        positions = []
         for rid, voice in zip(request_ids, voices, strict=True):
             req = self.request_states.get(rid)
-            if req is not None and "lengths" in req:
-                lengths.append(req["lengths"])
-            elif voice in self.voices:
-                lengths.append(state_lengths(self.voices[voice].initial))
-            else:
+            if voice not in self.voices:
                 # a capture's dummy row: the resource plans it as padding
-                lengths.append(None)
+                positions.append(None)
+            else:
+                written = 0 if req is None else req.get("written", 0)
+                positions.append((self.voices[voice].initial.prompt_frames // UP_RATE_T2W, written))
         steps = {}
         for name, family in CACHE_FAMILIES.items():
-            positions = {
-                rid: StreamPosition(*family.position(ln["prompt_frames"] // UP_RATE_T2W, ln["calls"]))
-                for rid, ln in zip(request_ids, lengths, strict=True) if ln is not None
-            }
             steps[T2W_KV[name]] = BoundedKVStep(
                 segments=[
                     Segment(request_id=rid, label="main", span=family.span(n, last))
                     for rid, n, last in zip(request_ids, num_tokens, lasts, strict=True)
                 ],
-                positions=positions,
+                positions={
+                    rid: StreamPosition(*family.position(*pos))
+                    for rid, pos in zip(request_ids, positions, strict=True) if pos is not None
+                },
             )
         return steps
 
@@ -950,7 +948,7 @@ class Token2WavSubmodule(NodeSubmodule):
         """Each window in two stages: the flow, batched over every row of one voice and
         window length whatever its position, then HiFT, batched over rows that are all
         or none their request's first window."""
-        from mstar.model.minicpm_o.components.token2wav import lengths_after, state_lengths
+        from mstar.model.minicpm_o.components.token2wav import lengths_after, state_lengths, window_tokens
 
         pool = engine_inputs.resources[T2W_STATE]
         blocks = {name: pool.block(name, 0) for name in pool.config.blocks}
@@ -997,6 +995,8 @@ class Token2WavSubmodule(NodeSubmodule):
                 for i, rid in enumerate(chunk):
                     req = self.request_state(rid)
                     req.add("lengths", lengths_after(lengths[rid], num_tokens[rid], last))
+                    # the attention caches' stream position (``_cache_steps``)
+                    req.add("written", req.get("written", 0) + window_tokens(num_tokens[rid], last))
                     req.add("started", True)
                     out[rid] = {"audio_chunk": [wav[i]]}
         return out

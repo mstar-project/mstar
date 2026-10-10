@@ -55,19 +55,19 @@ class _CacheSteps:
             ), device)
             for name, f in CACHE_FAMILIES.items()
         }
-        self.calls: dict[str, int] = {}
+        self.written: dict[str, int] = {}
 
     def window(self, rids, num_tokens: int, last: bool):
         from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
         from mstar.engine.resources.step import Segment, StepContext
-        from mstar.model.minicpm_o.components.token2wav import AttentionCache, WindowCaches
+        from mstar.model.minicpm_o.components.token2wav import AttentionCache, WindowCaches, window_tokens
 
         ctx = StepContext(request_ids=list(rids), graph_walk="t2w", slot=0, capture=False)
         caches, steps = {}, {}
         for name, family in self.families.items():
             step = steps[name] = BoundedKVStep(
                 segments=[Segment(request_id=r, label="main", span=family.span(num_tokens, last)) for r in rids],
-                positions={r: StreamPosition(*family.position(self.p, self.calls.get(r, 0))) for r in rids},
+                positions={r: StreamPosition(*family.position(self.p, self.written.get(r, 0))) for r in rids},
             )
             resource = self.resources[name]
             assert resource.admit(step, ctx).ok
@@ -76,9 +76,8 @@ class _CacheSteps:
         def commit():
             for name, step in steps.items():
                 self.resources[name].commit(step, ctx)
-            if not last:
-                for r in rids:
-                    self.calls[r] = self.calls.get(r, 0) + 1
+            for r in rids:
+                self.written[r] = self.written.get(r, 0) + window_tokens(num_tokens, last)
         return WindowCaches(**caches), commit
 
     def retained(self, name: str, rid) -> torch.Tensor:
@@ -86,7 +85,7 @@ class _CacheSteps:
         from mstar.engine.resources.kv.bounded.layout import READ_FROM_SOURCE, row_layout
 
         family, resource = self.families[name], self.resources[name]
-        source_len, written = family.position(self.p, self.calls.get(rid, 0))
+        source_len, written = family.position(self.p, self.written.get(rid, 0))
         layout = row_layout(source_len, written, 0, family.retention(source_len),
                             resource.config.sink_capacity, family.reverse_step_order)
         slot = resource._requests[rid].slot
@@ -407,3 +406,36 @@ def test_assets_load_completely():
     state = model.new_state(voice)
     wav = model.stream(state, voice, [4218] * 3 + [100] * 25, last=False)
     assert wav.shape == (1, 50 * 480) and torch.isfinite(wav).all()
+
+
+@pytest.mark.parametrize("device", [
+    "cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+])
+def test_window_short_of_its_stop_code(random_token2wav, device):
+    """A window that carried the TTS's stop code is a code short (the node drops it) and
+    not the last; the reply's last window comes after it. The caches' positions follow
+    what each window wrote, so the batched path still matches ``stream``."""
+    import copy
+
+    model = copy.deepcopy(random_token2wav).to(device)
+    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=1e-3)
+    p = 50
+    torch.manual_seed(2)
+    voice = model.prepare_voice(VoicePrompt(
+        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32).to(device),
+        spk_emb=torch.randn(1, 192).to(device), mel=torch.randn(1, 2 * p, 80).to(device),
+    ))
+    full = [w for w, last in stream_windows(torch.randint(0, 6561, (200,)).tolist()) if not last]
+    windows = [(w, False) for w in full[:4]] + [(full[4][:-1], False), (full[4][-4:], True)]
+    kv_steps = _CacheSteps(voice, 2, device)
+    layout = slot_layout(CacheCapacity(p))
+    blocks = {name: torch.zeros((2, *blk.shape), dtype=blk.dtype, device=device) for name, blk in layout.items()}
+    one = torch.tensor([1], device=device)
+    ref = model.new_state(voice)
+    for i, (win, last) in enumerate(windows):
+        tokens = torch.tensor([win], dtype=torch.int32, device=device)
+        mel = model.flow_chunk(ref, voice, tokens, last)
+        kv, commit = kv_steps.window(["r0"], len(win), last)
+        got = model.window_flow(blocks, one, torch.tensor([i == 0], device=device), voice, tokens, kv, last)
+        commit()
+        torch.testing.assert_close(got, mel, **tol)
