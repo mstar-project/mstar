@@ -15,6 +15,7 @@ import torch
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.recurrent.config import (
     RecurrentStateConfig,
     RecurrentStateSpec,
@@ -89,7 +90,7 @@ class RecurrentStatePool(Resource):
         self._blocks: dict[str, torch.Tensor] = {
             name: torch.zeros(
                 (*((config.num_layers,) if block.per_layer else ()),
-                 config.max_slots, *block.shape),
+                 config.max_slots + config.prefix_slots, *block.shape),
                 dtype=block.dtype,
                 device=device,
             )
@@ -127,6 +128,41 @@ class RecurrentStatePool(Resource):
         # copies). Forks are not staged; see `_pending_fork_state`.
         self._preplanned = False
         self._cached_plan_output: dict[str, RecurrentAddressing] | None = None
+
+        # Prefix snapshots, in the `prefix_slots` past the request slots: the state a prompt
+        # reached at a page boundary, under the KV chain's key there. Reserved at admit,
+        # written by the forward, indexed at commit, and stamped by the commits that read
+        # them: each TP rank does all of it in step order, so they evict alike.
+        first = config.max_slots
+        self._snap_free = list(reversed(range(first, first + config.prefix_slots)))
+        self._snap_by_key: dict[bytes, int] = {}
+        # snapshot slot -> (key, tokens, stamp)
+        self._snap_meta: dict[int, tuple[bytes, int, int]] = {}
+        # snapshot slot -> leases and restores holding it
+        self._snap_refs: dict[int, int] = {}
+        self._snap_clock = 0
+        self._prefix_root: bytes | None = None
+        # label -> the walks its keys describe
+        self._keyed: dict[str, frozenset[str]] = {}
+        # rid -> label -> the prompt's page keys, unrooted
+        self._prefix_keys: dict[str, dict[str, list[bytes]]] = {}
+        # under TP rank 0 decides each hit (`adopt_cached_prefix`)
+        self._follower = (
+            comm_group is not None and comm_group.world_size > 1
+            and getattr(comm_group, "rank", 0) != 0
+        )
+        # rid -> (label, snapshot slot, tokens): a hit held from the probe until admit
+        self._leases: dict[str, tuple[str, int, int]] = {}
+        # (rid, label) -> (snapshot slot, tokens) the request's first step copies in at plan
+        self._restores: dict[tuple[str, str], tuple[int, int]] = {}
+        # (rid, label) -> snapshot slot restored, stamped by the step's commit
+        self._restored: dict[tuple[str, str], int] = {}
+        # (rid, label, tokens) -> snapshot slot reserved for the forward to write
+        self._snap_writes: dict[tuple[str, str, int], int] = {}
+        self._snap_written: set[int] = set()
+        # what the latest admit took, for `rollback_admit` / `clear_preplan`
+        self._admit_restores: list[tuple[str, str]] = []
+        self._admit_snaps: list[tuple[str, str, int]] = []
 
         logger.info(
             "recurrent state pool: %d usable slots (+%d sink) x %d layers, "
@@ -168,16 +204,30 @@ class RecurrentStatePool(Resource):
     # Request lifecycle
 
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None = None):
-        del overrides
         with self._lock:
             # Idempotent: the conductor sends one NewRequest per partition, so
             # a worker serving two ingests twice.
             self._slots.setdefault(rid, {})
+            # a declared stream's config is the conductor's KVReqConfig
+            keys = getattr(overrides, "prefix_keys", None)
+            if keys and getattr(overrides, "prefix_cache", True):
+                self._prefix_keys.setdefault(rid, keys)
 
     def remove_request(self, rid: str):
         self.reset_request(rid, free=True)
         with self._lock:
             self._slots.pop(rid, None)
+            self._prefix_keys.pop(rid, None)
+            self._drop_lease(rid)
+            for key in [k for k in self._restores if k[0] == rid]:
+                self._unref(self._restores.pop(key)[0])
+            for key in [k for k in self._restored if k[0] == rid]:
+                del self._restored[key]
+            # reserved by an admit whose step never committed (its forward raised)
+            for key in [k for k in self._snap_writes if k[0] == rid]:
+                snap = self._snap_writes.pop(key)
+                self._snap_written.discard(snap)
+                self._snap_free.append(snap)
 
     def reset_request(self, rid: str, free: bool = False):
         """Drop a request's slots. ``free`` hands them back to the pool.
@@ -234,6 +284,7 @@ class RecurrentStatePool(Resource):
             # refusal after this no-op must still find that reservation.
             if not (self._preplanned and not ctx.is_preplan):
                 self._admit_reserved.clear()
+                self._admit_restores, self._admit_snaps = [], []
             if ctx.is_preplan:
                 self._preplan_reserved = []
         for segment in step.segments or ():
@@ -242,6 +293,23 @@ class RecurrentStatePool(Resource):
                 continue
             if self._alloc(segment.request_id, segment.label) is None:
                 return self._out_of_slots(segment.request_id, segment.label)
+            with self._lock:
+                lease = self._leases.get(segment.request_id)
+                if lease is not None and lease[0] == segment.label:
+                    # a hit's first step: plan copies the snapshot into its slot
+                    del self._leases[segment.request_id]
+                    key = (segment.request_id, segment.label)
+                    self._restores[key] = lease[1:]
+                    self._admit_restores.append(key)
+        with self._lock:
+            for rid, label, tokens in step.snapshots:
+                if (ctx.is_padding_row(rid) or self._prefix_root is None
+                        or (rid, label, tokens) in self._snap_writes):  # a step admitted again
+                    continue
+                snap = self._reserve_snapshot()
+                if snap is not None:
+                    self._snap_writes[(rid, label, tokens)] = snap
+                    self._admit_snaps.append((rid, label, tokens))
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
@@ -266,6 +334,7 @@ class RecurrentStatePool(Resource):
             reserved, self._admit_reserved = self._admit_reserved, []
             self._preplan_reserved = []
             self._release(reserved)
+            self._undo_prefix_admit()
 
     def _release(self, reserved: list[tuple[str, str, SlotState]]) -> None:
         """Free the slots of ``reserved`` still held as taken, newest first and
@@ -335,6 +404,7 @@ class RecurrentStatePool(Resource):
             # `_pending_fork_state`.
             self._current = self._cached_plan_output
             self._maybe_apply_forks(step, ctx)
+            self._apply_restores(step)
             self._drop_stage()
             self._preplan_reserved = []  # the live step's now: commit or roll back
             return self._current
@@ -343,9 +413,13 @@ class RecurrentStatePool(Resource):
         # only reads the flag the fork will land.
         if ctx.is_preplan:
             pending = self._pending_fork_state(step)
+            # a restore lands at promotion too, and its slot then holds state
+            pending.update({key: True for key in self._restores
+                            if key[0] in {seg.request_id for seg in step.segments or ()}})
         else:
             pending = {}
             self._maybe_apply_forks(step, ctx)
+            self._apply_restores(step)
 
         self._current = {}
         for label, segments in self._group_by_label(step.segments or ()).items():
@@ -369,6 +443,7 @@ class RecurrentStatePool(Resource):
             ids = {id(slot) for _, _, slot in staged}
             self._admit_reserved = [r for r in self._admit_reserved if id(r[2]) not in ids]
             self._release(staged)
+            self._undo_prefix_admit()
 
     def _drop_stage(self) -> None:
         self._preplanned = False
@@ -394,6 +469,7 @@ class RecurrentStatePool(Resource):
                 continue
             for from_label, to_label in step.post_forks:
                 self._apply_fork(rid, from_label, to_label)
+        self._commit_snapshots(step)
 
     def _apply_fork(
         self, rid: str, from_label: str, to_label: str,
@@ -419,6 +495,253 @@ class RecurrentStatePool(Resource):
                 to.copy_(from_)
             dst.has_state = src.has_state
             dst.generation += 1
+
+    # Prefix reuse: a hit restores the state a snapshot holds at the agreed length
+
+    def enable_prefix_cache(
+        self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
+    ) -> bool:
+        self._keyed = {
+            label: frozenset(walk for walk in named if walk is not None)
+            for label, named in (walks or {}).items()
+        }
+        if not (self.config.prefix_slots and self.config.prefix_page_size):
+            # keyed but keeping nothing: every probe answers 0, so no hit skips its state
+            return False
+        self._prefix_root = root
+        return True
+
+    def close_prefix_cache(self) -> None:
+        self._prefix_root = None
+
+    @property
+    def keeps_snapshots(self) -> bool:
+        """Whether a prefill should save its state for prefix reuse."""
+        return self._prefix_root is not None
+
+    def fingerprint(self) -> bytes:
+        """What a snapshot's bytes depend on beyond its tokens: the blocks, as sharded."""
+        world = self._comm_group.world_size if self._comm_group is not None else 1
+        blocks = sorted((n, b.shape, str(b.dtype)) for n, b in self.config.blocks.items())
+        return fingerprint(blocks, world, self.config.prefix_page_size)
+
+    def _keyed_label(self, rid: str, graph_walk: str) -> str | None:
+        keys = self._prefix_keys.get(rid) or {}
+        for label, walks in self._keyed.items():
+            if graph_walk in walks and keys.get(label):
+                return label
+        return None
+
+    def _rooted(self, keys: list[bytes]) -> list[bytes]:
+        return [fingerprint(self._prefix_root, key) for key in keys]
+
+    def _find_snapshot(self, rooted: list[bytes], limit: int) -> tuple[int, int] | None:
+        """The longest snapshot along this chain of at most ``limit`` tokens: (slot, tokens)."""
+        size = self.config.prefix_page_size
+        for pages in range(min(len(rooted), limit // size), 0, -1):
+            snap = self._snap_by_key.get(rooted[pages - 1])
+            if snap is not None and self._snap_meta[snap][1] == pages * size:
+                return snap, pages * size
+        return None
+
+    def _lease(self, rid: str, label: str, snap: int, tokens: int) -> None:
+        self._snap_refs[snap] = self._snap_refs.get(snap, 0) + 1
+        self._leases[rid] = (label, snap, tokens)
+
+    def _unref(self, snap: int) -> None:
+        self._snap_refs[snap] -= 1
+        if not self._snap_refs[snap]:
+            del self._snap_refs[snap]
+
+    def _drop_lease(self, rid: str) -> None:
+        lease = self._leases.pop(rid, None)
+        if lease is not None:
+            self._unref(lease[1])
+
+    def resolve_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+    ) -> int | None:
+        """The longest prefix a snapshot holds for this request, held until admit."""
+        del node_name
+        with self._lock:
+            label = self._keyed_label(rid, graph_walk)
+            if label is None:
+                return None
+            if rid in self._leases:
+                return self._leases[rid][2]
+            slot = self._slots.get(rid, {}).get(label)
+            if (slot is not None and slot.has_state) or (rid, label) in self._restores:
+                return None
+            if self._prefix_root is None or self._follower:
+                return 0
+            keys = list(self._prefix_keys[rid][label])
+        rooted = self._rooted(keys)
+        with self._lock:
+            if rid not in self._slots:
+                return None
+            # one key short, as the KV cache: a fully cached prompt still runs a token
+            found = self._find_snapshot(rooted, (len(rooted) - 1) * self.config.prefix_page_size)
+            if found is None:
+                return 0
+            self._lease(rid, label, *found)
+            return found[1]
+
+    def cap_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, length: int,
+    ) -> int:
+        """Snapshots sit at some page boundaries only: the longest at or under ``length``."""
+        del node_name, graph_walk
+        with self._lock:
+            lease = self._leases.get(rid)
+            if lease is None:
+                return length
+            if lease[2] <= length:
+                return lease[2]
+            label = lease[0]
+            keys = list(self._prefix_keys[rid][label])
+        rooted = self._rooted(keys)
+        with self._lock:
+            self._drop_lease(rid)
+            found = self._find_snapshot(rooted, length)
+            if found is None:
+                return 0
+            self._lease(rid, label, *found)
+            return found[1]
+
+    def apply_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
+    ) -> None:
+        del node_name, graph_walk, inputs
+        with self._lock:
+            lease = self._leases.get(rid)
+            if lease is None:
+                return
+            if matched_len <= 0:
+                self._drop_lease(rid)
+            elif lease[2] != matched_len:
+                raise RuntimeError(
+                    f"recurrent state: {rid} holds a snapshot of {lease[2]} tokens, but the "
+                    f"agreed prefix is {matched_len}")
+
+    def cached_prefix_pages(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+    ) -> list[int] | None:
+        del node_name, graph_walk, matched_len
+        with self._lock:
+            lease = self._leases.get(rid)
+            return None if lease is None else [lease[1]]
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+        pages: list[int] | None = None,
+    ) -> bool:
+        """On a TP follower, take rank 0's snapshot of ``matched_len`` tokens: False while
+        this rank's commit of the step that wrote it trails rank 0's."""
+        del node_name
+        if pages is None:  # rank 0 restored no snapshot for this request
+            return True
+        with self._lock:
+            label = self._keyed_label(rid, graph_walk)
+            if label is None or rid in self._leases:
+                return True
+            if self._prefix_root is None:
+                raise RuntimeError(
+                    f"recurrent state: rank 0 restored {matched_len} tokens for {rid}, but "
+                    "this rank keeps no snapshots")
+            keys = list(self._prefix_keys[rid][label][:matched_len // self.config.prefix_page_size])
+        rooted = self._rooted(keys)
+        with self._lock:
+            snap = self._snap_by_key.get(rooted[-1]) if rooted else None
+            if snap is None or self._snap_meta[snap][1] != matched_len:
+                return False
+            if pages and pages[0] != snap:
+                raise RuntimeError(
+                    f"recurrent state: snapshots diverged from rank 0 for {rid}: slot {snap} "
+                    f"here, {pages[0]} there")
+            self._lease(rid, label, snap, matched_len)
+            return True
+
+    def write_snapshot(self, rid: str, label: str, tokens: int) -> None:
+        """Called by the forward once ``rid``'s state stands at ``tokens``: copy it into the
+        snapshot slot admit reserved, if one was."""
+        snap = self._snap_writes.get((rid, label, tokens))
+        if snap is None:
+            return
+        slot = self._slots[rid][label]
+        for to, from_ in zip(self._slot_views(snap), self._slot_views(slot.index), strict=True):
+            to.copy_(from_)
+        self._snap_written.add(snap)
+
+    def _reserve_snapshot(self) -> int | None:
+        """A free snapshot slot, else the oldest nothing holds. Caller holds the lock."""
+        if self._snap_free:
+            return self._snap_free.pop()
+        idle = [(meta[2], snap) for snap, meta in self._snap_meta.items()
+                if snap not in self._snap_refs]
+        if not idle:
+            return None
+        _, snap = min(idle)
+        del self._snap_by_key[self._snap_meta.pop(snap)[0]]
+        return snap
+
+    def _apply_restores(self, step: RecurrentStep) -> None:
+        """Copy each hit's snapshot into its slot before its first step reads it."""
+        rids = {seg.request_id for seg in step.segments or ()}
+        with self._lock:
+            for key in [k for k in self._restores if k[0] in rids]:
+                snap, _ = self._restores.pop(key)
+                slot = self._slots.get(key[0], {}).get(key[1])
+                if slot is not None:
+                    for to, from_ in zip(
+                        self._slot_views(slot.index), self._slot_views(snap), strict=True,
+                    ):
+                        to.copy_(from_)
+                    slot.has_state = True
+                    self._restored[key] = snap
+                # the copy is queued ahead of anything that could overwrite the snapshot
+                self._unref(snap)
+
+    def _commit_snapshots(self, step: RecurrentStep) -> None:
+        """Index what this step's forward saved, and stamp what it restored."""
+        rids = {seg.request_id for seg in step.segments or ()}
+        with self._lock:
+            for key in [k for k in self._restored if k[0] in rids]:
+                snap = self._restored.pop(key)
+                meta = self._snap_meta.get(snap)
+                if meta is not None:
+                    self._snap_clock += 1
+                    self._snap_meta[snap] = (*meta[:2], self._snap_clock)
+            for key in [k for k in self._snap_writes if k[0] in rids]:
+                snap = self._snap_writes.pop(key)
+                rid, label, tokens = key
+                keys = self._prefix_keys.get(rid, {}).get(label) or []
+                pages = tokens // self.config.prefix_page_size
+                written = snap in self._snap_written
+                self._snap_written.discard(snap)
+                if not written or not 0 < pages <= len(keys):
+                    self._snap_free.append(snap)
+                    continue
+                name = fingerprint(self._prefix_root, keys[pages - 1])
+                if name in self._snap_by_key:
+                    self._snap_free.append(snap)  # an earlier request's copy stands
+                    continue
+                self._snap_clock += 1
+                self._snap_by_key[name] = snap
+                self._snap_meta[snap] = (name, tokens, self._snap_clock)
+
+    def _undo_prefix_admit(self) -> None:
+        """Hand back what the latest admit took: restores become leases again, and
+        reserved snapshot slots go back. Caller holds the lock."""
+        for rid, label in self._admit_restores:
+            restore = self._restores.pop((rid, label), None)
+            if restore is not None:
+                self._leases[rid] = (label, *restore)
+        for key in self._admit_snaps:
+            snap = self._snap_writes.pop(key, None)
+            if snap is not None:
+                self._snap_written.discard(snap)
+                self._snap_free.append(snap)
+        self._admit_restores, self._admit_snaps = [], []
 
     # Addressing
 

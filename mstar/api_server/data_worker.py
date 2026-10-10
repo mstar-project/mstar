@@ -116,14 +116,17 @@ def _preprocess_loop(**kwargs):
 
 
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
-    """Page size per KV resource, after this deployment's YAML has been applied."""
+    """Page size per keyed resource, after this deployment's YAML has been applied: a KV
+    resource's own, or the one a recurrent pool's snapshots are keyed over."""
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, model_config)
-    return {
-        spec.resource_key: spec.config.page_size
-        for spec in specs
-        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
-    }
+    sizes = {}
+    for spec in specs:
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig):
+            sizes[spec.resource_key] = spec.config.page_size
+        elif getattr(getattr(spec, "config", None), "prefix_page_size", 0):
+            sizes[spec.resource_key] = spec.config.prefix_page_size
+    return sizes
 
 
 NameToLoopIndices = dict[str, NestedLoopIndices]

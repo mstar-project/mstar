@@ -119,13 +119,24 @@ class StepRunner:
         A resource with no opinion is not an answer of zero.
         """
         matched = None
-        for key in self._sweep(self._node_order, self._order, node_name):
+        keys = self._sweep(self._node_order, self._order, node_name)
+        for key in keys:
             answer = self._resources[key].resolve_cached_prefix(
                 rid, node_name, graph_walk,
             )
             if answer is not None and (matched is None or answer < matched):
                 matched = answer
-        return matched or 0
+        # a resource that holds some lengths only (a snapshot per boundary) caps the rest,
+        # and each lets go of what it held past the cap: every pass can only shorten it
+        matched = matched or 0
+        while True:
+            capped = min((
+                self._resources[key].cap_cached_prefix(rid, node_name, graph_walk, matched)
+                for key in keys
+            ), default=matched)
+            if capped == matched:
+                return matched
+            matched = capped
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,

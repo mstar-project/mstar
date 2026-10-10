@@ -23,7 +23,7 @@ import torch  # noqa: E402
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the tags)
 from mstar.communication.wire import decode, encode  # noqa: E402
 from mstar.engine.engine import Engine  # noqa: E402
-from mstar.engine.resources import StepRunner  # noqa: E402
+from mstar.engine.resources import Resource, StepRunner  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.keys import chain  # noqa: E402
@@ -78,6 +78,11 @@ def _manager(rank: int, max_num_pages: int = 32, opt_in: bool = True) -> KVManag
 def test_above_one_rank_the_cache_stays_off_unless_the_deployment_opts_in():
     assert _manager(0, opt_in=False)._index is None
     assert _manager(0)._index is not None
+
+
+def test_a_cap_keeps_only_whole_pages():
+    # a snapshot pool may cap at a length this cache holds only part of a page of
+    assert _manager(0).cap_cached_prefix("r", NODE, WALK, PAGE_SIZE + 3) == PAGE_SIZE
 
 
 def _tokens(n: int, seed: int) -> list[int]:
@@ -136,6 +141,20 @@ def _batch(rid: str):
         node_name=NODE, graph_walk=WALK, request_ids=(rid,), step_context=_ctx(rid),
         per_request_info_wrapped={rid: None}, cached_prefix=None,
     )
+
+
+class _Capping(Resource):
+    """Serves some lengths only, as a recurrent pool's snapshots do: caps a hit at ``at``."""
+
+    def __init__(self, at: int):
+        self._at = at
+
+    @classmethod
+    def build(cls, spec, info):
+        raise NotImplementedError
+
+    def cap_cached_prefix(self, rid, node_name, graph_walk, length):
+        return min(length, self._at)
 
 
 def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
@@ -255,6 +274,35 @@ def test_rank_0_prepares_the_length_it_decided_though_a_commit_since_holds_more(
     inputs = ARNodeInputs(input_ids=torch.tensor(b), input_seq_len=len(b))
     assert engine._skip_cached_prefix(batch, "b", inputs).input_seq_len == len(b)
     assert leader._streams["b"]["main"].lease is None
+
+
+def test_rank_0_holds_only_the_agreed_pages_once_it_decides():
+    """The KV cache matches 5 pages and another resource on the node serves 2: rank 0 lets
+    the other 3 go as it decides, not when the step is prepared. A request that then fails
+    to prepare holds on rank 0 what the followers adopted, and the ranks evict alike."""
+    ranks = leader, follower = _manager(0, max_num_pages=12), _manager(1, max_num_pages=12)
+    run = StepRunner({"kv": leader, "pool": _Capping(2 * PAGE_SIZE)},
+                     node_resources={NODE: ["kv", "pool"]})
+    shared, other = _tokens(5 * PAGE_SIZE + 1, seed=20), _tokens(5 * PAGE_SIZE + 1, seed=21)
+    hit = shared[:5 * PAGE_SIZE] + _tokens(3, seed=22)
+    for kv in ranks:
+        for rid, tokens in (("a", shared), ("o", other)):
+            _ingest(kv, rid, tokens)
+            _run(kv, rid, tokens)
+            kv.remove_request(rid)
+        _ingest(kv, "b", hit)
+    agreed = run.resolve_cached_prefix("b", NODE, WALK)
+    assert agreed == 2 * PAGE_SIZE
+    pages = leader.cached_prefix_pages("b", NODE, WALK, agreed)
+    assert follower.adopt_cached_prefix("b", NODE, WALK, agreed, pages)
+    assert leader._streams["b"]["main"].lease == follower._streams["b"]["main"].lease == pages
+    # b's prepare raises; the step's other request needs most of the pool
+    big = _tokens(4 * PAGE_SIZE, seed=23)
+    for kv in ranks:
+        _ingest(kv, "big", big)
+        _run(kv, "big", big)
+    assert sorted(leader._index.pages()) == sorted(follower._index.pages())
+    assert _pages(leader, "big") == _pages(follower, "big")
 
 
 def test_under_tp_a_stream_keys_its_prompt_only():

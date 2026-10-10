@@ -298,6 +298,12 @@ class RecurrentStateConfig:
     # TODO: derive this from (backend, dtype, ...) automatically.
     disable_sink_slot: bool = False
 
+    # Snapshots kept for prefix reuse, in slots past max_slots: the state a prompt reached
+    # at a page boundary, under the KV chain's page key there. 0 keeps none.
+    prefix_slots: int = 0
+    # The KV cache's page size, which those keys chain over
+    prefix_page_size: int = 0
+
     def __post_init__(self):
         if not self.blocks:
             raise ValueError("a recurrent state pool must declare a block")
@@ -327,7 +333,7 @@ class RecurrentStateConfig:
 
     @property
     def total_bytes(self) -> int:
-        return self.slot_bytes * self.max_slots
+        return self.slot_bytes * (self.max_slots + self.prefix_slots)
 
 
 @dataclass
@@ -342,6 +348,7 @@ class RecurrentStateSpec(NodeResourceSpec):
 
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
+        prefix_slots: int | None = None, prefix_page_size: int | None = None,
     ):
         """How many slots this deployment gets, and the state's dtype.
 
@@ -351,6 +358,10 @@ class RecurrentStateSpec(NodeResourceSpec):
         """
         if max_slots is not None:
             self.config.max_slots = max_slots
+        if prefix_slots is not None:
+            self.config.prefix_slots = prefix_slots
+        if prefix_page_size is not None:
+            self.config.prefix_page_size = prefix_page_size
         if state_dtype is not None:
             try:
                 dtype = getattr(torch, state_dtype)
@@ -382,3 +393,6 @@ class RecurrentStep(ResourceStep):
 
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
+    # (rid, label, tokens): the forward saves the state its request reaches at ``tokens``
+    # (``RecurrentStatePool.write_snapshot``) into a snapshot slot admit reserves
+    snapshots: tuple[tuple[str, str, int], ...] = ()

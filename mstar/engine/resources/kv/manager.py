@@ -559,6 +559,9 @@ class KVManager(AttentionResource):
         self._index = PrefixIndex(self._arena)
         return True
 
+    def close_prefix_cache(self) -> None:
+        self._index = None
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
     ) -> int | None:
@@ -600,6 +603,15 @@ class KVManager(AttentionResource):
             self._arena.retain(matched)
             stream.lease = matched
             return len(matched) * self.config.page_size
+
+    def cap_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, length: int,
+    ) -> int:
+        """Down to a whole page; the lease past it goes now, so a request that fails
+        before its step holds only what rank 0 told the other ranks."""
+        length = length // self.config.page_size * self.config.page_size
+        self.apply_cached_prefix(rid, node_name, graph_walk, None, length)
+        return length
 
     def cached_prefix_pages(
         self, rid: str, node_name: str, graph_walk: str, matched_len: int,

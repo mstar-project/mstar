@@ -102,6 +102,11 @@ class Resource(ABC):
         """
         return False
 
+    def close_prefix_cache(self) -> None:
+        """Undo `enable_prefix_cache` before any request: another resource on a node this
+        one serves keeps no cache, so a hit here would skip tokens it lacks."""
+        return
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
     ) -> int | None:
@@ -110,6 +115,13 @@ class Resource(ABC):
         None leaves the length to other resources; 0 means nothing can be skipped.
         """
         return None
+
+    def cap_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, length: int,
+    ) -> int:
+        """The longest prefix up to ``length`` this resource can serve, once the
+        resources' answers met at ``length``; any length, unless overridden."""
+        return length
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,

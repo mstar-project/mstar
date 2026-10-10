@@ -29,8 +29,10 @@ from mstar.engine.resources import (
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep
 from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.position.config import PositionSpec, PositionStep, PosScheme
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.model.base import PrefixStream
@@ -298,6 +300,39 @@ def test_a_resource_that_cannot_skip_loads_beside_a_declared_node():
 
 def test_a_declared_node_of_caches_positions_attention_and_sampling_loads():
     _refuse_unskippable_resources(_specs(PosScheme.SEQUENTIAL), _Model(KV))
+
+
+@dataclass
+class _ClassSpec(NodeResourceSpec):
+    """Declares ``cls`` on the test's nodes, planned after ``after``."""
+
+    cls: type = _Unskippable
+    after: frozenset = frozenset()
+
+    def depends_on(self):
+        return set(self.after)
+
+    @property
+    def resource_class(self):
+        return self.cls
+
+
+def _recurrent(*nodes: str) -> list:
+    return _specs(PosScheme.SEQUENTIAL) + [
+        _ClassSpec(resource_key="recurrent_state", nodes=set(nodes), cls=RecurrentStatePool),
+        _ClassSpec(resource_key="linear", nodes=set(nodes), cls=LinearAttnManager,
+                   after=frozenset({"recurrent_state"})),
+    ]
+
+
+def test_recurrent_state_nobody_keyed_is_refused():
+    # a KV hit would run the rest of the prompt from a zero state
+    with pytest.raises(ValueError, match="recurrent_state"):
+        _refuse_unskippable_resources(_recurrent(NODE), _Model(KV))
+
+
+def test_recurrent_state_keyed_beside_the_cache_loads():
+    _refuse_unskippable_resources(_recurrent(NODE), _Model(KV, "recurrent_state"))
 
 
 # ── the walks a declaration names ───────────────────────────────────────

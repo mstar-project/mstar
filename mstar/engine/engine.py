@@ -702,10 +702,13 @@ class Engine:
                 self._keyed_walks.setdefault(node, set()).update(
                     stream.walk for stream in by_label.values()
                 )
+        opened: set[str] = set()
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
                 config = specs_by_key[key].config
-                if config.prefix_cache and not config.prefix_cache_salt:
+                # a recurrent pool's snapshots carry no salt of their own
+                if (getattr(config, "prefix_cache", True)
+                        and not getattr(config, "prefix_cache_salt", "")):
                     logger.info(
                         "KV %s: prefix cache off: %s names no checkpoint, so "
                         "builds that differ only in their weights cannot be "
@@ -722,16 +725,34 @@ class Engine:
                     mark = built.fingerprint() if built is not None else None
                     if mark is not None:
                         parts.append(mark)
-            opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
+            if resource.enable_prefix_cache(fingerprint(*shared, *parts), {
                 label: (stream.walk, stream.decode_walk)
                 for label, stream in declared.get(key, {}).items()
-            })
-            if not opened or not declared.get(key):
-                continue
+            }) and declared.get(key):
+                opened.add(key)
+        # a node's caches open together: one left closed answers no hit, and another's
+        # would skip the tokens it lacks
+        on_node = {
+            node: {key for key in declared if node in specs_by_key[key].nodes}
+            for node in self._keyed_walks
+        }
+        while partial := [node for node, keys in on_node.items() if not keys <= opened]:
+            for node in partial:
+                keys = on_node.pop(node)
+                del self._keyed_walks[node]
+                for key in sorted(keys & opened):
+                    logger.info("KV %s: prefix cache off: %s on %s keeps none", key,
+                                ", ".join(sorted(keys - opened)), node)
+                    self._resources[key].close_prefix_cache()
+                    opened.discard(key)
+        for key in sorted(opened):
+            resource = self._resources[key]
             nodes = ", ".join(sorted(specs_by_key[key].nodes))
             for label in declared[key]:
                 logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
-            if not resource.supports_eviction:
+            # (a recurrent pool's snapshots sit in slots of their own)
+            if not resource.supports_eviction and not getattr(
+                    specs_by_key[key].config, "prefix_slots", 0):
                 # a hit allocates only the prompt's tail, so admission no longer
                 # bounds how many requests decode at once
                 logger.warning(
