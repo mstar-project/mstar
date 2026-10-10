@@ -52,6 +52,7 @@ Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import torch
@@ -1196,6 +1197,9 @@ class Cosmos3Model(Model):
                 1, int(mk.get("max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH))
             ),
         }
+        # the packing divides by it, and postprocess muxes at it
+        if not math.isfinite(params["fps"]) or params["fps"] <= 0:
+            raise ValueError(f"Cosmos3 fps must be positive and finite; got {mk.get('fps')!r}.")
         # Video-to-video: a non-action video input pins clean conditioning
         # latent frames taken from the request video (reference recipe defaults:
         # indexes (0, 1), keep "first", flow_shift 10.0). Validated here so a
