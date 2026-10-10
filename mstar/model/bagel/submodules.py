@@ -1579,10 +1579,12 @@ class LLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if "new_token" not in outputs:
+        # a prefill walk has no decode_loop to stop; a 1-token budget ends at the prefill transition
+        if "new_token" not in outputs or request_info.graph_walk != "decode":
             return set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
+        # +2: the prefill-sampled token, and this step's 0-based loop count
         if (not ignore_eos and self.eos_token_id == token) or \
                 (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2 >= request_info.max_tokens):
             return {"decode_loop"}

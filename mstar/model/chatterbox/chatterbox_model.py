@@ -95,11 +95,19 @@ PREV_TOKEN = "prev_token"        # T3 decode input: the previous speech token
 AUDIO_CHUNK = "audio_chunk"
 
 BUILTIN_VOICE = "default"
-_BUILTIN_VOICE_ALIASES = {None, "", BUILTIN_VOICE, "builtin", "built-in"}
+_BUILTIN_VOICE_ALIASES = {None, BUILTIN_VOICE, "builtin", "built-in"}
 
 # Per-request generation knobs that ride on the conductor metadata
 _T3_KNOBS = ("cfg_weight", "exaggeration", "min_p", "max_new_tokens")
 _S3GEN_KNOBS = ("n_cfm_timesteps", "watermark")
+# Knobs Turbo does not have; only its own default (0) is accepted
+_TURBO_FIXED = ("cfg_weight", "exaggeration", "min_p")
+# Every model_kwargs key read, the speech adapter's included; Multilingual adds language_id
+_REQUEST_KWARGS = frozenset({
+    "voice", "temperature", "top_p", "top_k", "min_p", "repetition_penalty",
+    "penalize_prompt", "cfg_weight", "exaggeration", "max_output_tokens",
+    "n_cfm_timesteps", "watermark", "ignore_eos", "seed",
+})
 
 MAX_REFERENCE_SECONDS = 30.0
 # Sound left after the voice encoder's silence trim; shorter clips crash its
@@ -111,6 +119,7 @@ MIN_REFERENCE_PEAK = 1e-3
 # Bounds S3Gen time per chunk; the reference uses 10 (Turbo 2)
 MAX_CFM_TIMESTEPS = 100
 # The conductor's seed is an int64; sentence chunking wraps its per-chunk seeds into it
+MIN_SEED = -(2**63)
 MAX_SEED = 2**63 - 1
 # The reference demo's slider maxima. Far past them T3 runs to max_new_tokens,
 # and a value that overflows the sampler's fp32 row fails the whole batch.
@@ -118,9 +127,7 @@ MAX_TEMPERATURE = 5.0
 MAX_REPETITION_PENALTY = 2.0
 MAX_CFG_WEIGHT = 1.0
 MAX_EXAGGERATION = 2.0
-# Dividing the logits by a smaller value overflows the same way: a temperature
-# under it samples greedily (vLLM's convention), a penalty under it is refused
-MIN_TEMPERATURE = 1e-5
+# Dividing the logits by a smaller penalty overflows the same way; it is refused
 MIN_REPETITION_PENALTY = 1e-5
 
 
@@ -351,6 +358,7 @@ class ChatterboxModel(Model):
                 repetition_penalty=knobs["repetition_penalty"],
                 min_p=knobs["min_p"],
                 ignore_eos=knobs["ignore_eos"],
+                penalize_prompt=knobs["penalize_prompt"],
             ),
             T3_KV: KVReqConfig(needed_labels=labels),
         }
@@ -359,36 +367,35 @@ class ChatterboxModel(Model):
         """Every public knob, defaulted from the variant's generation config.
 
         Turbo has no guidance, no exaggeration and no min-p; a request that
-        asks for them gets the reference behaviour (ignored) with a warning.
+        sets one to anything but Turbo's default is refused.
 
         Every value is checked here, so ``process_prompt`` answers a bad one
         with a 400 before the conductor or a worker sees it.
         """
-        mk = dict(model_kwargs or {})
+        mk = {k: v for k, v in (model_kwargs or {}).items() if v is not None}
         g = self.config.generation
-        do_sample = _flag("do_sample", mk.get("do_sample", True))
-        temperature = _number(
-            "temperature", mk.get("temperature", g.temperature), low=0.0, high=MAX_TEMPERATURE,
-        )
-        if temperature < MIN_TEMPERATURE:
-            temperature = 0.0
-        top_k = _integer("top_k", mk.get("top_k", g.top_k), low=0)
-        limit = self.config.max_new_tokens_limit or self.config.t3.max_speech_tokens
+        limit = self.get_max_output_tokens_limit()
         max_new_tokens = _integer(
-            "max_new_tokens",
-            mk.get("max_new_tokens", mk.get("max_output_tokens", min(g.max_new_tokens, limit))),
+            "max_output_tokens", mk.get("max_output_tokens", min(g.max_new_tokens, limit)),
             low=1, high=self.config.t3.max_speech_tokens,
         )
         if max_new_tokens > limit:
             raise ValueError(
-                f"max_new_tokens={max_new_tokens} is over this deployment's limit of {limit} "
+                f"max_output_tokens={max_new_tokens} is over this deployment's limit of {limit} "
                 "(max_new_tokens_limit, sized with max_concurrent_requests to fit the KV cache)"
             )
+        top_p = _number("top_p", mk.get("top_p", g.top_p), low=0.0, high=1.0)
+        if top_p <= 0.0:
+            raise ValueError(f"top_p must be in (0, 1] (greedy is temperature 0); got {top_p}")
+        top_k = _integer("top_k", mk.get("top_k", g.top_k), low=0)
         knobs = {
-            "temperature": temperature if do_sample else 0.0,
-            "top_p": _number("top_p", mk.get("top_p", g.top_p), low=0.0, high=1.0),
-            # the whole vocab is no filter; past it the sampler's int32 row would overflow
-            "top_k": min(top_k, self.config.t3.speech_vocab_size),
+            # under 1e-5 the engine samples greedily
+            "temperature": _number(
+                "temperature", mk.get("temperature", g.temperature), low=0.0, high=MAX_TEMPERATURE,
+            ),
+            "top_p": top_p,
+            # the whole vocab or more is off, the same as 0
+            "top_k": top_k if top_k < self.config.t3.speech_vocab_size else 0,
             "min_p": _number("min_p", mk.get("min_p", g.min_p), low=0.0, high=1.0),
             "repetition_penalty": _number(
                 "repetition_penalty", mk.get("repetition_penalty", g.repetition_penalty),
@@ -407,21 +414,28 @@ class ChatterboxModel(Model):
             ),
             "watermark": _flag("watermark", mk.get("watermark", g.watermark)),
             "ignore_eos": _flag("ignore_eos", mk.get("ignore_eos", False)),
+            "penalize_prompt": _flag("penalize_prompt", mk.get("penalize_prompt", True)),
         }
         # the conductor seeds the request with it; checked here, not returned
-        if mk.get("seed") is not None:
-            _integer("seed", mk["seed"], low=0, high=MAX_SEED)
-        if self.config.is_turbo and (
-            knobs["cfg_weight"] > 0 or knobs["exaggeration"] > 0 or knobs["min_p"] > 0
-        ):
-            logger.warning(
-                "Chatterbox-Turbo ignores cfg_weight, exaggeration and min_p"
-            )
-            knobs.update(cfg_weight=0.0, exaggeration=0.0, min_p=0.0)
+        if "seed" in mk:
+            _integer("seed", mk["seed"], low=MIN_SEED, high=MAX_SEED)
+        if self.config.is_turbo:
+            for name in _TURBO_FIXED:
+                if name in mk and knobs[name] != getattr(g, name):
+                    raise ValueError(
+                        f"Chatterbox-Turbo has no {name}; send {getattr(g, name)} or leave it unset"
+                    )
         return knobs
 
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
         return self.resolve_generation_kwargs(model_kwargs)["max_new_tokens"]
+
+    def get_max_output_tokens_limit(self) -> int:
+        return self.config.max_new_tokens_limit or self.config.t3.max_speech_tokens
+
+    def request_kwargs(self) -> frozenset[str]:
+        keys = _REQUEST_KWARGS
+        return keys | {"language_id"} if self.config.is_multilingual else keys
 
     # -----------------------------------------------------------------------
     # Graph
@@ -625,7 +639,7 @@ class ChatterboxModel(Model):
             raise ValueError("Chatterbox takes text plus an optional reference audio clip")
         if set(output_modalities) != {"audio"}:
             raise ValueError("Chatterbox produces audio output only")
-        # a bad knob fails here as a 400; past this point it would hang the request
+        # a bad knob fails here, as a 400
         self.resolve_generation_kwargs(kwargs)
 
         text_ids = self._tokenize(prompt, kwargs.get("language_id"))
@@ -637,6 +651,8 @@ class ChatterboxModel(Model):
         out: NameToTensorList = {TEXT_INPUTS: [text_ids]}
 
         voice = kwargs.get("voice")
+        if voice is not None and (not isinstance(voice, str) or not voice.strip()):
+            raise ValueError(f"voice must be a non-empty name; got {voice!r}")
         uploaded = (tensors or {}).get("audio_inputs") or []
         if len(uploaded) > 1:
             raise ValueError("Give one reference clip per request")
@@ -645,7 +661,7 @@ class ChatterboxModel(Model):
         elif voice in _BUILTIN_VOICE_ALIASES:
             return out
         else:
-            wav = self.load_audio(str(self._preset_voice_path(str(voice))), "cpu").data
+            wav = self.load_audio(str(self._preset_voice_path(voice)), "cpu").data
         wav = self._prepare_reference(wav)
         out[REF_AUDIO] = [wav]
         out[VOICE_KEY] = [voice_key_for(wav)]
@@ -658,8 +674,7 @@ class ChatterboxModel(Model):
         if self.config.is_multilingual:
             lang = language_id if language_id is not None else self.config.default_language
             return self.tokenizer(prompt, language_id=lang)
-        if language_id is not None:
-            logger.warning("language_id %r is ignored: only Chatterbox Multilingual takes a language", language_id)
+        # other variants do not declare language_id, so a sent one is reported as ignored
         return self.tokenizer(prompt)
 
     # -----------------------------------------------------------------------
@@ -1019,9 +1034,7 @@ def _number(name: str, value: Any, *, low: float | None = None, high: float | No
 
 
 def _integer(name: str, value: Any, *, low: int, high: int | None = None) -> int:
-    """An integer in [low, high]; a float is taken only when it is whole (2.0, not 2.5)."""
-    if isinstance(value, float) and value.is_integer():
-        value = int(value)
+    """An integer in [low, high]; a float (even 2.0) is refused."""
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer, got {value!r}")
     if value < low or (high is not None and value > high):

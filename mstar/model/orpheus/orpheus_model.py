@@ -20,6 +20,7 @@ triggers SNAC chunks using a sliding window (28 tokens, stride 7) and extracts
 the middle region of the decoded audio for low-latency output.
 """
 
+import dataclasses
 import logging
 from pathlib import Path
 
@@ -45,10 +46,38 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, PrefixStream
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import load_generation_defaults
 from mstar.streaming.chunk_policy import SlidingWindowChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
+
+# model_kwargs forwarded to the engine sampler; an unset one takes the config's value
+SAMPLING_KEYS = (
+    "temperature", "top_p", "top_k", "min_p",
+    "repetition_penalty", "penalize_prompt", "ignore_eos",
+)
+
+
+def _checkpoint_sampling_defaults(model_path_hf: str, cache_dir: str | None) -> dict:
+    """The sampling knobs the checkpoint's generation_config.json sets; {} when
+    it is unreachable (the repo is gated)."""
+    if not model_path_hf:
+        return {}
+    if Path(model_path_hf).is_dir():
+        checkpoint_dir = model_path_hf
+    else:
+        from huggingface_hub import hf_hub_download
+
+        try:
+            checkpoint_dir = Path(hf_hub_download(
+                model_path_hf, "generation_config.json", cache_dir=cache_dir,
+            )).parent
+        except Exception as e:
+            logger.warning("No generation_config.json for %s (%s); using config defaults", model_path_hf, e)
+            return {}
+    defaults = load_generation_defaults(checkpoint_dir)
+    return {k: v for k, v in defaults.items() if k in SAMPLING_KEYS}
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -77,7 +106,10 @@ class OrpheusModel(Model):
     ):
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
-        self.config = OrpheusModelConfig()
+        self.config = dataclasses.replace(
+            OrpheusModelConfig(),
+            **_checkpoint_sampling_defaults(model_path_hf, cache_dir),
+        )
 
         tokenizer_source = _resolve_local_hf_snapshot(
             "canopylabs/orpheus-3b-0.1-pretrained",
@@ -283,18 +315,18 @@ class OrpheusModel(Model):
         if prompt is None:
             return {}
 
-        # An explicit empty/None voice keeps the unprefixed prompt.
         voice = kwargs.get("voice", self.config.default_voice)
-        if voice:
-            voice = str(voice).lower()
-            if voice not in self.config.available_voices:
-                supported = ", ".join(self.config.available_voices)
-                raise ValueError(
-                    f"Unsupported Orpheus voice {voice!r}; supported: {supported}"
-                )
+        if not isinstance(voice, str) or not voice:
+            raise ValueError(f"voice must be a non-empty name; got {voice!r}")
+        voice = voice.lower()
+        if voice not in self.config.available_voices:
+            supported = ", ".join(self.config.available_voices)
+            raise ValueError(
+                f"Unsupported Orpheus voice {voice!r}; supported: {supported}"
+            )
 
         # Format: "{voice}: {text}"
-        adapted_prompt = f"{voice}: {prompt}" if voice else prompt
+        adapted_prompt = f"{voice}: {prompt}"
         prompt_tokens = self.tokenizer(adapted_prompt, return_tensors="pt")
 
         # Wrap with special tokens: [128259, ...tokens..., 128009, 128260, 128261, 128257]
@@ -393,7 +425,9 @@ class OrpheusModel(Model):
                 resource_key=SAMPLER,
                 nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True
+                enable_repetion_penalty=True,
+                # off unless the checkpoint defaults it on; a request min_p > 0 is refused
+                enable_min_p=self.config.min_p > 0,
             ),
             PositionSpec(
                 resource_key=ROPE,
@@ -415,18 +449,21 @@ class OrpheusModel(Model):
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args
         model_kwargs = model_kwargs or {}
-        keys = [
-            "temperature", "top_p", "repetition_penalty",
-            "ignore_eos"
-        ]
         return {
             SAMPLER: SamplingReqConfig(
                 **{
                     k: model_kwargs.get(k, getattr(self.config, k))
-                    for k in keys
+                    for k in SAMPLING_KEYS
                 }
             )
         }
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"voice", "max_output_tokens", *SAMPLING_KEYS})
+
+    def get_max_output_tokens_limit(self) -> int:
+        # the decode Loop is built with max_iters at this value
+        return self.get_max_output_tokens()
 
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:

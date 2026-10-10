@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> None:
     # there the seeded default sampling is what must repeat.
     repeat = {**base, "input": TEXT, "seed": 7}
     if args.variant != "base":
-        repeat.update(do_sample=False, subtalker_dosample=False)
+        repeat.update(temperature=0.0, code_predictor_temperature=0.0)
     first = run("repeat_a", repeat, stream=True, min_seconds=3.0, max_seconds=12.0)
     second = run("repeat_b", repeat, stream=True, min_seconds=3.0, max_seconds=12.0)
     report["seed_repeatable"] = first == second

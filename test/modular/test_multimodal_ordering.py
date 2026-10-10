@@ -1,6 +1,5 @@
 """Ordering guarantees of the multimodal prompt adapter."""
 
-import logging
 import re
 from types import SimpleNamespace
 
@@ -252,29 +251,20 @@ def test_bagel_refuses_an_attachment_it_has_no_encoder_for(bagel):
         bagel.process_prompt("describe it", ["audio", "text"], ["text"])
 
 
-def test_bagel_skips_a_part_it_cannot_prefill(caplog):
-    """A part with no matching input is skipped and logged, not raised.
-
-    This runs in the conductor, whose loop only logs what escapes it, so a
-    raise here strands the request instead of answering it. check_plan
-    already rejected the mismatch at intake, where a 400 can still reach
-    the client.
-    """
+def test_bagel_refuses_a_part_it_cannot_prefill():
+    """A part with no matching input is a ValueError, which the conductor
+    answers as a 400 before dispatch. check_plan already rejects the mismatch
+    at intake; this is the backstop."""
     from mstar.model.bagel.bagel_model import BagelModel
 
     model = BagelModel.__new__(BagelModel)
-    with caplog.at_level(logging.WARNING):
-        schedule = BagelModel._build_prefill_schedule(
+    with pytest.raises(ValueError, match="image span at index 1"):
+        BagelModel._build_prefill_schedule(
             model,
             input_modalities=["image", "image", "text"],
             input_signals={"text_inputs": ["t0", "t1"], "image_inputs": ["i0"]},
             is_understanding=True,
         )
-    # The image it has still prefills; only the one with no input drops.
-    assert [walk for walk, _ in schedule] == [
-        "prefill_text", "prefill_vit", "prefill_text",
-    ]
-    assert "skipping it" in caplog.text
 
 
 def test_bagel_spans_come_from_one_tokenization(bagel):

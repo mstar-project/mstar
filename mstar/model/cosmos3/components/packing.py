@@ -161,6 +161,8 @@ def normalize_condition_frame_indexes(value, default: tuple[int, ...]) -> tuple[
     elif isinstance(value, int):
         value = [value]
     try:
+        if any(isinstance(v, (bool, float)) for v in value):
+            raise TypeError("indexes are integers")
         indexes = tuple(sorted({int(v) for v in value}))
     except (TypeError, ValueError) as exc:
         raise ValueError(
@@ -219,15 +221,19 @@ def resolve_action_domain_id(domain_id, domain_name) -> int:
     two is required — the domain conditions the action pathway, and a silent
     default would predict actions for the wrong embodiment."""
     if domain_id is not None:
-        resolved = int(domain_id)
+        if isinstance(domain_id, bool) or not isinstance(domain_id, int):
+            raise ValueError(f"Cosmos3 domain_id must be an integer, got {domain_id!r}.")
+        resolved = domain_id
         if resolved < 0:
             raise ValueError(f"Cosmos3 domain_id must be non-negative, got {resolved}.")
         return resolved
-    if domain_name is None or not str(domain_name).strip():
+    if domain_name is not None and not isinstance(domain_name, str):
+        raise ValueError(f"Cosmos3 domain_name must be a string, got {domain_name!r}.")
+    if domain_name is None or not domain_name.strip():
         raise ValueError(
             "Cosmos3 action requests require 'domain_id' or a non-empty 'domain_name'."
         )
-    key = str(domain_name).strip().lower()
+    key = domain_name.strip().lower()
     if key not in EMBODIMENT_TO_DOMAIN_ID:
         raise ValueError(
             f"Unknown Cosmos3 action domain_name={domain_name!r}; expected one of "

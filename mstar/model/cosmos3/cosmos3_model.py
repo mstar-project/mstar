@@ -52,6 +52,7 @@ Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import torch
@@ -114,6 +115,7 @@ from mstar.model.cosmos3.submodules import (
     Cosmos3VisionEncoderSubmodule,
 )
 from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
+from mstar.model.utils import load_generation_defaults
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -126,6 +128,78 @@ AUDIO_DECODER_NODE = "audio_decoder"
 VAE_DECODER_AR_NODE = "vae_decoder_ar"
 VISION_ENCODER_NODE = "vision_encoder"
 REASONER_NODE = "reasoner"
+
+# every request key the model reads; the Cosmos3 adapters map onto these names
+_REQUEST_KWARGS = frozenset({
+    # reasoner (text output)
+    "temperature", "top_k", "top_p", "min_p", "repetition_penalty", "penalize_prompt",
+    "ignore_eos", "max_output_tokens", "seed", "enable_thinking", "system_prompt",
+    "video_num_frames", "video_fps",
+    # generation (image / video / action)
+    "size", "width", "height", "num_frames", "fps", "num_inference_steps", "guidance_scale",
+    "guidance_interval", "flow_shift", "use_karras_sigmas", "max_sequence_length",
+    "negative_prompt", "use_system_prompt", "use_resolution_template", "use_duration_template",
+    "condition_frame_indexes_vision", "condition_video_keep",
+    "action_mode", "action_chunk_size", "action_fps", "action", "domain_id", "domain_name",
+    "raw_action_dim", "generate_sound", "sound_gen", "sound_duration",
+    "window_mode", "window_frames", "overlap_frames", "context_frames", "stream_video",
+    "session_id", "resume_session", "end_session", "session_timeout_s",
+})
+
+
+def _int_kwarg(mk: dict, key: str, default, lo: int | None = None, hi: int | None = None):
+    """A request integer, strictly typed; ``ValueError`` outside ``[lo, hi]``."""
+    value = mk.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Cosmos3 {key} must be an integer; got {value!r}.")
+    if (lo is not None and value < lo) or (hi is not None and value > hi):
+        bounds = f"in [{lo}, {hi}]" if hi is not None else f">= {lo}"
+        raise ValueError(f"Cosmos3 {key} must be {bounds}; got {value}.")
+    return value
+
+
+def _num_kwarg(mk: dict, key: str, default, positive: bool = False):
+    """A request number (int or float), strictly typed; finite, optionally > 0."""
+    value = mk.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"Cosmos3 {key} must be a finite number; got {value!r}.")
+    if positive and value <= 0:
+        raise ValueError(f"Cosmos3 {key} must be > 0; got {value}.")
+    return float(value)
+
+
+def _bool_kwarg(mk: dict, key: str, default=False):
+    """A request boolean; strings like ``"false"`` are refused, not truthy."""
+    value = mk.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"Cosmos3 {key} must be true or false; got {value!r}.")
+    return value
+
+
+def _str_kwarg(mk: dict, key: str, default=None):
+    """A request string, strictly typed."""
+    value = mk.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(f"Cosmos3 {key} must be a string; got {value!r}.")
+    return value
+
+
+def _parse_size(size) -> tuple[int, int]:
+    """``"WxH"`` with positive integer sides, else ``ValueError``."""
+    parts = size.lower().split("x") if isinstance(size, str) else []
+    if len(parts) == 2 and all(p.strip().isdigit() for p in parts):
+        width, height = int(parts[0]), int(parts[1])
+        if width > 0 and height > 0:
+            return width, height
+    raise ValueError(f"Cosmos3 size must be 'WIDTHxHEIGHT' with positive integers; got {size!r}.")
 
 
 
@@ -193,6 +267,11 @@ class Cosmos3Model(Model):
         self._detokenizer = None
         self.config: Cosmos3Config = self._load_config()
         self.tokenizer = self._load_tokenizer()
+        # reasoner sampling defaults the checkpoint ships; the config is the fallback
+        local = self._repo_dir or Path(model_path_hf)
+        self._generation_defaults = (
+            load_generation_defaults(local) if self._reasoner_enabled() and local.is_dir() else {}
+        )
 
         self._submodule_cache: dict[str, torch.nn.Module | None] = {}
         # The Wan VAE is shared between the DiT submodule (conditioning encode)
@@ -361,8 +440,9 @@ class Cosmos3Model(Model):
                 KV_CACHE: KVReqConfig(needed_labels=[REASONER_LABEL]),
                 SAMPLER: SamplingReqConfig(
                     temperature=sampling.temperature, top_k=sampling.top_k,
-                    top_p=sampling.top_p, repetition_penalty=sampling.repetition_penalty,
-                    ignore_eos=sampling.ignore_eos,
+                    top_p=sampling.top_p, min_p=sampling.min_p,
+                    repetition_penalty=sampling.repetition_penalty,
+                    penalize_prompt=sampling.penalize_prompt, ignore_eos=sampling.ignore_eos,
                 ),
             }
         return {
@@ -371,19 +451,43 @@ class Cosmos3Model(Model):
 
     def get_sampling_config(self, node_name: str, model_kwargs: dict | None = None):
         """The reasoner's sampling knobs: OpenAI-standard ``temperature`` /
-        ``top_p`` plus ``top_k`` / ``repetition_penalty`` / ``ignore_eos``
-        from ``extra_body``. Greedy at temperature 0."""
+        ``top_p`` plus ``top_k`` / ``min_p`` / ``repetition_penalty`` /
+        ``penalize_prompt`` / ``ignore_eos`` from ``extra_body``. A knob the
+        request leaves unset takes the checkpoint's ``generation_config.json``
+        value, then the config's. Values pass through unconverted; the
+        sampler's ``validate`` refuses a wrong type or range."""
         from mstar.engine.resources.sampler.utils import SamplingConfig
 
         mk = model_kwargs or {}
+        defaults = {
+            "temperature": self.config.reasoner_temperature, "top_k": 0, "top_p": 1.0,
+            "min_p": 0.0, "repetition_penalty": 1.0,
+            **getattr(self, "_generation_defaults", {}),
+            "penalize_prompt": True, "ignore_eos": False,
+        }
+
+        def pick(key):
+            value = mk.get(key)
+            return defaults[key] if value is None else value
+
         return SamplingConfig(
             vocab_size=self.config.vocab_size,
-            temperature=float(mk.get("temperature", self.config.reasoner_temperature)),
-            top_k=int(mk.get("top_k", 0)),
-            top_p=float(mk.get("top_p", 1.0)),
-            repetition_penalty=float(mk.get("repetition_penalty", 1.0)),
-            ignore_eos=bool(mk.get("ignore_eos", False)),
+            temperature=pick("temperature"),
+            top_k=pick("top_k"),
+            top_p=pick("top_p"),
+            min_p=pick("min_p"),
+            repetition_penalty=pick("repetition_penalty"),
+            penalize_prompt=pick("penalize_prompt"),
+            ignore_eos=pick("ignore_eos"),
         )
+
+    def get_max_output_tokens_limit(self) -> int | None:
+        """The reasoner decode loop's static ``max_iters``; None without a reasoner."""
+        return self.get_max_output_tokens() if self._reasoner_enabled() else None
+
+    def request_kwargs(self) -> frozenset[str]:
+        """Every request key this model reads, adapter-mapped ones included."""
+        return _REQUEST_KWARGS
 
     @staticmethod
     def _is_text_request(partition_fwd_args: dict[str, ForwardPassArgs] | None) -> bool:
@@ -841,7 +945,7 @@ class Cosmos3Model(Model):
         # sentences; action prompts are tokenized raw.
         from mstar.model.cosmos3.components.packing import tokenize_prompt
 
-        negative_prompt = kwargs.get("negative_prompt")
+        negative_prompt = _str_kwarg(kwargs, "negative_prompt")
         p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
         # The chat system prompt and the resolution/duration metadata sentences
         # are opt-in, off by default: the model sees the bare user prompt, which
@@ -855,9 +959,9 @@ class Cosmos3Model(Model):
         cond_ids, uncond_ids = tokenize_prompt(
             self.tokenizer, prompt, negative_prompt,
             num_frames=p["num_frames"], height=p["height"], width=p["width"], fps=p["fps"],
-            use_system_prompt=allow_templates and bool(kwargs.get("use_system_prompt", False)),
-            add_resolution_template=allow_templates and bool(kwargs.get("use_resolution_template", False)),
-            add_duration_template=allow_templates and bool(kwargs.get("use_duration_template", False)),
+            use_system_prompt=allow_templates and _bool_kwarg(kwargs, "use_system_prompt"),
+            add_resolution_template=allow_templates and _bool_kwarg(kwargs, "use_resolution_template"),
+            add_duration_template=allow_templates and _bool_kwarg(kwargs, "use_duration_template"),
             max_sequence_length=p["max_sequence_length"],
         )
         return {
@@ -916,7 +1020,8 @@ class Cosmos3Model(Model):
             source_fps = meta.get("average_fps") or meta.get("fps")
             pv, grid = preprocess_video(
                 video.cpu(), reasoner.video_processor, source_fps,
-                num_frames=model_kwargs.get("video_num_frames"), fps=model_kwargs.get("video_fps"),
+                num_frames=_int_kwarg(model_kwargs, "video_num_frames", None, lo=1),
+                fps=_num_kwarg(model_kwargs, "video_fps", None, positive=True),
             )
             patches.append(pv)
             video_grids.append(grid)
@@ -938,8 +1043,8 @@ class Cosmos3Model(Model):
 
         text = render_chat(
             self.tokenizer, parts, reasoner,
-            enable_thinking=model_kwargs.get("enable_thinking"),
-            system_prompt=model_kwargs.get("system_prompt"),
+            enable_thinking=_bool_kwarg(model_kwargs, "enable_thinking", None),
+            system_prompt=_str_kwarg(model_kwargs, "system_prompt"),
         )
         text = expand_placeholders(text, self.tokenizer, reasoner, image_grids, video_grids)
         ids = torch.tensor(self.tokenizer(text, add_special_tokens=False)["input_ids"], dtype=torch.long)
@@ -1105,19 +1210,14 @@ class Cosmos3Model(Model):
         if is_video_request and self.config.video_size_default is not None:
             default_size = self.config.video_size_default
         width, height = int(default_size[0]), int(default_size[1])
-        size = mk.get("size")
-        if isinstance(size, str) and "x" in size.lower():
-            sw, sh = size.lower().split("x", 1)
-            try:
-                width, height = int(sw), int(sh)
-            except ValueError:
-                pass
+        if mk.get("size") is not None:
+            width, height = _parse_size(mk["size"])
 
         # Action requests resolve their mode up front: it switches the frame,
         # step, guidance and flow-shift defaulting below to the action recipe.
-        action_mode = mk.get("action_mode")
+        action_mode = _str_kwarg(mk, "action_mode")
         if action_mode is not None:
-            action_mode = str(action_mode).strip().lower()
+            action_mode = action_mode.strip().lower()
             if action_mode not in ACTION_MODES:
                 raise ValueError(
                     f"Unsupported Cosmos3 action_mode={mk.get('action_mode')!r}; "
@@ -1129,19 +1229,19 @@ class Cosmos3Model(Model):
             # frame count and the chunk length are coupled (num_frames = chunk
             # or chunk + 1) and default off each other; chunk 16 when neither
             # is sent (the reference action default).
-            raw_chunk = mk.get("action_chunk_size")
-            raw_frames = mk.get("num_frames")
+            raw_chunk = _int_kwarg(mk, "action_chunk_size", None)
+            raw_frames = _int_kwarg(mk, "num_frames", None)
             if raw_chunk is not None:
-                action_chunk = int(raw_chunk)
+                action_chunk = raw_chunk
             elif raw_frames is not None:
-                action_chunk = int(raw_frames) - 1
+                action_chunk = raw_frames - 1
             else:
                 action_chunk = 16
             if action_chunk <= 0:
                 raise ValueError(
                     f"Cosmos3 action_chunk_size must be positive, got {action_chunk}."
                 )
-            num_frames = int(raw_frames) if raw_frames is not None else action_chunk + 1
+            num_frames = raw_frames if raw_frames is not None else action_chunk + 1
             if num_frames not in (action_chunk, action_chunk + 1):
                 raise ValueError(
                     "Cosmos3 action requests require num_frames to equal "
@@ -1160,20 +1260,21 @@ class Cosmos3Model(Model):
             default_frames = (
                 self.config.num_frames_video if "video" in (output_modalities or []) else 1
             )
-            num_frames = int(mk.get("num_frames", default_frames))
+            num_frames = _int_kwarg(mk, "num_frames", default_frames, lo=1)
         # The cookbook step counts differ per mode (image 50, video 35, action
         # 30 — configs override the action count per checkpoint); default by
         # mode and let the request override. The denoise loop runs this many
         # steps and stops early (Cosmos3DiTSubmodule.check_stop), so the value
-        # is only bounded above by the loop's static max_iters.
+        # is bounded above by the loop's static max_iters.
         if action_mode is not None:
             default_steps = self.config.num_inference_steps_action
         elif num_frames > 1:
             default_steps = self.config.num_inference_steps_video
         else:
             default_steps = self.config.num_inference_steps
-        steps = int(mk.get("num_inference_steps", default_steps))
-        steps = max(1, min(steps, self.config.max_inference_steps))
+        steps = _int_kwarg(
+            mk, "num_inference_steps", default_steps, lo=1, hi=self.config.max_inference_steps,
+        )
         default_guidance = (
             self.config.guidance_scale_action if action_mode is not None else self.config.guidance_scale
         )
@@ -1182,18 +1283,18 @@ class Cosmos3Model(Model):
                 mk, steps, action_mode, input_modalities, output_modalities,
             )
         params = {
-            "width": int(mk.get("width", width)),
-            "height": int(mk.get("height", height)),
+            "width": _int_kwarg(mk, "width", width, lo=1),
+            "height": _int_kwarg(mk, "height", height, lo=1),
             "num_frames": num_frames,
-            "fps": float(mk.get("fps", self.config.fps)),
-            "guidance_scale": float(mk.get("guidance_scale", default_guidance)),
+            "fps": _num_kwarg(mk, "fps", float(self.config.fps), positive=True),
+            # sign is not checked; guidance semantics are the recipe's
+            "guidance_scale": _num_kwarg(mk, "guidance_scale", float(default_guidance)),
             "num_inference_steps": steps,
             "has_image_condition": "image" in (input_modalities or []),
-            "use_karras_sigma": mk.get("use_karras_sigmas"),
-            # Prompt-token truncation cap (reference serving default 4096),
-            # request-overridable; floor 1 so a bad value can't empty the prompt.
-            "max_sequence_length": max(
-                1, int(mk.get("max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH))
+            "use_karras_sigma": _bool_kwarg(mk, "use_karras_sigmas", None),
+            # Prompt-token truncation cap (reference serving default 4096), request-overridable
+            "max_sequence_length": _int_kwarg(
+                mk, "max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH, lo=1,
             ),
         }
         # Video-to-video: a non-action video input pins clean conditioning
@@ -1216,7 +1317,7 @@ class Cosmos3Model(Model):
                     f"Cosmos3 condition_frame_indexes_vision {indexes} is outside the latent "
                     f"video ({latent_frames} latent frames for num_frames={num_frames})."
                 )
-            keep = str(mk.get("condition_video_keep") or constants.DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
+            keep = _str_kwarg(mk, "condition_video_keep", constants.DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
             if keep not in ("first", "last"):
                 raise ValueError("Cosmos3 condition_video_keep must be 'first' or 'last'.")
             params["has_video_condition"] = True
@@ -1230,7 +1331,7 @@ class Cosmos3Model(Model):
         # reference V2V flow shift; other image-conditioned / video paths keep
         # their own defaults (full CFG, scheduler-config flow_shift).
         is_t2i = num_frames == 1 and not params["has_image_condition"] and action_mode is None
-        fs = mk.get("flow_shift")
+        fs = _num_kwarg(mk, "flow_shift", None, positive=True)
         if fs is None and action_mode is not None:
             fs = self.config.flow_shift_action
         if fs is None and is_t2i:
@@ -1244,6 +1345,11 @@ class Cosmos3Model(Model):
         if fs is not None:
             params["flow_shift"] = float(fs)
         gi = mk.get("guidance_interval")
+        if gi is not None and (
+            not isinstance(gi, (list, tuple)) or len(gi) != 2
+            or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in gi)
+        ):
+            raise ValueError(f"Cosmos3 guidance_interval must be two numbers [low, high]; got {gi!r}.")
         if gi is None and is_t2i:
             gi = (400.0, 1000.0)
         if gi is not None:
@@ -1261,7 +1367,7 @@ class Cosmos3Model(Model):
             params["domain_id"] = resolve_action_domain_id(
                 mk.get("domain_id"), mk.get("domain_name")
             )
-            raw_dim = mk.get("raw_action_dim")
+            raw_dim = _int_kwarg(mk, "raw_action_dim", None)
             if raw_dim is None and action_mode == "forward_dynamics" and mk.get("action") is not None:
                 try:
                     raw_dim = int(torch.as_tensor(mk["action"]).shape[-1])
@@ -1272,19 +1378,19 @@ class Cosmos3Model(Model):
                     "Cosmos3 action requests require 'raw_action_dim' "
                     "(forward_dynamics may omit it when the 'action' array carries the width)."
                 )
-            raw_dim = int(raw_dim)
             if not 1 <= raw_dim <= self.config.max_action_dim:
                 raise ValueError(
                     f"Cosmos3 raw_action_dim must be in [1, {self.config.max_action_dim}], "
                     f"got {raw_dim}."
                 )
             params["raw_action_dim"] = raw_dim
-            for k in ("action_fps", "action"):
-                if k in mk:
-                    params[k] = mk[k]
+            if mk.get("action_fps") is not None:
+                params["action_fps"] = _num_kwarg(mk, "action_fps", None, positive=True)
+            if "action" in mk:
+                params["action"] = mk["action"]
         # Opt-in sound generation: video-only (image and action requests carry
         # no sound band), and only when the served checkpoint/config enable it.
-        if mk.get("generate_sound") or mk.get("sound_gen"):
+        if _bool_kwarg(mk, "generate_sound") or _bool_kwarg(mk, "sound_gen"):
             if num_frames <= 1 or action_mode is not None:
                 raise ValueError(
                     "Cosmos3 sound generation is supported only for video requests "
@@ -1297,7 +1403,7 @@ class Cosmos3Model(Model):
                 )
             params["generate_sound"] = True
             if mk.get("sound_duration") is not None:
-                params["sound_duration"] = float(mk["sound_duration"])
+                params["sound_duration"] = _num_kwarg(mk, "sound_duration", None, positive=True)
         self._resolve_window_params(mk, params, num_frames, action_mode, has_video_condition)
         return params
 
@@ -1308,12 +1414,12 @@ class Cosmos3Model(Model):
         video-to-video or windowed modes. Mirrors the reference's
         ``Cosmos3DistilledSetTimestepsStep`` checks."""
         fixed = len(self.config.distilled_sigmas)
-        if mk.get("num_inference_steps") is not None and int(mk["num_inference_steps"]) != fixed:
+        if mk.get("num_inference_steps") is not None and mk["num_inference_steps"] != fixed:
             raise ValueError(
                 f"This Cosmos3 checkpoint is distilled: num_inference_steps is fixed at {fixed} "
                 f"(got {mk['num_inference_steps']}); leave it unset."
             )
-        if mk.get("guidance_scale") is not None and float(mk["guidance_scale"]) != 1.0:
+        if mk.get("guidance_scale") is not None and mk["guidance_scale"] != 1.0:
             raise ValueError(
                 "This Cosmos3 checkpoint is distilled: classifier-free guidance is baked into the "
                 f"weights, guidance_scale must be 1.0 (got {mk['guidance_scale']}); leave it unset."
@@ -1336,16 +1442,16 @@ class Cosmos3Model(Model):
         quantized to latent frames here so the whole pipeline agrees on the
         schedule; validation up front so malformed requests fail at
         submission."""
-        window_mode = mk.get("window_mode")
+        window_mode = _str_kwarg(mk, "window_mode")
         if window_mode is None:
-            if mk.get("stream_video"):
+            if _bool_kwarg(mk, "stream_video"):
                 # The non-windowed walks emit one video at the very end; there
                 # is nothing to deliver incrementally.
                 raise ValueError(
                     "Cosmos3 stream_video requires a windowed request (set window_mode)."
                 )
             return
-        window_mode = str(window_mode).strip().lower()
+        window_mode = window_mode.strip().lower()
         if window_mode not in ("chained", "kv"):
             raise ValueError(
                 f"Cosmos3 window_mode must be 'chained' or 'kv', got {mk.get('window_mode')!r}."
@@ -1364,7 +1470,7 @@ class Cosmos3Model(Model):
         if not is_kv and mk.get("context_frames") is not None:
             raise ValueError("Cosmos3 context_frames applies to window_mode='kv' only.")
         tf = self.config.vae.scale_factor_temporal
-        window_frames = int(mk.get("window_frames", self.config.window_frames_default))
+        window_frames = _int_kwarg(mk, "window_frames", self.config.window_frames_default)
         if window_frames < 1 + tf:
             raise ValueError(f"Cosmos3 window_frames must be at least {1 + tf}, got {window_frames}.")
         window_units = 1 + (window_frames - 1) // tf
@@ -1372,13 +1478,13 @@ class Cosmos3Model(Model):
         # conditioning flows through the committed K/V, and a zero overlap
         # keeps each commit exactly covering the span its denoise steps wrote.
         default_overlap = 0 if is_kv else self.config.overlap_frames_default
-        overlap_frames = int(mk.get("overlap_frames", default_overlap))
+        overlap_frames = _int_kwarg(mk, "overlap_frames", default_overlap, lo=0)
         if is_kv and overlap_frames:
             raise ValueError(
                 "Cosmos3 window_mode='kv' does not support overlap_frames; "
                 "cross-window conditioning comes from the committed context."
             )
-        overlap_units = min(max(round(overlap_frames / tf), 0), window_units - 1)
+        overlap_units = round(overlap_frames / tf)
         if overlap_frames > 0 and overlap_units == 0:
             logger.warning(
                 "Cosmos3 overlap_frames=%d rounds to no latent frames (temporal scale %d); "
@@ -1396,7 +1502,7 @@ class Cosmos3Model(Model):
             )
         context_units = 0
         if is_kv:
-            context_frames = int(mk.get("context_frames", self.config.context_frames_default))
+            context_frames = _int_kwarg(mk, "context_frames", self.config.context_frames_default)
             if context_frames < 0:
                 raise ValueError(f"Cosmos3 context_frames must be >= 0, got {context_frames}.")
             # 0 retains all committed frames (no release).
@@ -1408,9 +1514,9 @@ class Cosmos3Model(Model):
         # of window 0 as clean conditioning (the chained overlap, at least the
         # two-frame V2V floor), and the schedule grows by those units so
         # ``num_frames`` stays the count of new frames the client receives.
-        session_id = mk.get("session_id")
-        resume = bool(mk.get("resume_session"))
-        end_session = bool(mk.get("end_session"))
+        session_id = _str_kwarg(mk, "session_id")
+        resume = _bool_kwarg(mk, "resume_session")
+        end_session = _bool_kwarg(mk, "end_session")
         if resume and not session_id:
             raise ValueError("Cosmos3 resume_session requires a session_id.")
         if end_session and not session_id:
@@ -1421,15 +1527,15 @@ class Cosmos3Model(Model):
                 "drop the conditioning image."
             )
         if session_id is not None:
-            params["session_id"] = str(session_id)
+            params["session_id"] = session_id
             # Drop the session once this request is done instead of keeping it.
             params["end_session"] = end_session
-            timeout = mk.get("session_timeout_s")
+            timeout = _num_kwarg(mk, "session_timeout_s", None, positive=True)
             if timeout is not None:
-                timeout = float(timeout)
-                if not timeout > 0:
-                    raise ValueError("Cosmos3 session_timeout_s must be > 0.")
-                params["session_timeout_s"] = min(timeout, float(self.config.session_timeout_max_s))
+                limit = float(self.config.session_timeout_max_s)
+                if timeout > limit:
+                    raise ValueError(f"Cosmos3 session_timeout_s must be in (0, {limit:g}]; got {timeout:g}.")
+                params["session_timeout_s"] = timeout
         resume_units = max(overlap_units, 2) if resume else 0
         if resume_units and resume_units >= window_units:
             raise ValueError(
@@ -1460,7 +1566,7 @@ class Cosmos3Model(Model):
         params["context_latent_units"] = context_units
         params["total_latent_units"] = total_units
         params["num_windows"] = schedule.num_windows
-        params["stream_video"] = bool(mk.get("stream_video"))
+        params["stream_video"] = _bool_kwarg(mk, "stream_video")
         # Every window after the first is conditioned generation, which the
         # reference recipe runs at the V2V flow shift; one shift for all
         # windows keeps the per-window schedules consistent. A deployment's

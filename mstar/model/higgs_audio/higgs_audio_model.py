@@ -52,8 +52,25 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.higgs_audio.config import ATTN, KV_CACHE, ROPE, SAMPLER, HiggsAudioModelConfig
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import load_generation_defaults
 
 logger = logging.getLogger(__name__)
+
+# model_kwargs forwarded to the engine sampler when the request sets them
+SAMPLING_KEYS = (
+    "temperature", "top_p", "top_k", "min_p",
+    "repetition_penalty", "penalize_prompt", "ignore_eos",
+)
+# the reference eval decodes greedily; the checkpoint's generation_config.json overrides
+DEFAULT_SAMPLING = {"temperature": 0.0, "top_p": 1.0}
+# reference transcribe.py generates up to 1024 new tokens
+MAX_OUTPUT_TOKENS = 1024
+
+
+def sampling_defaults(checkpoint_dir) -> dict:
+    """``DEFAULT_SAMPLING`` under the knobs the checkpoint's generation_config.json sets."""
+    checkpoint = load_generation_defaults(checkpoint_dir)
+    return {**DEFAULT_SAMPLING, **{k: v for k, v in checkpoint.items() if k in SAMPLING_KEYS}}
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -89,6 +106,7 @@ class HiggsAudioModel(Model):
 
         self.local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
         self.config = HiggsAudioModelConfig.from_pretrained(self.local_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir)
 
         from transformers import AutoFeatureExtractor, AutoTokenizer
 
@@ -143,8 +161,10 @@ class HiggsAudioModel(Model):
                 resource_key=SAMPLER, nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
                 # ASR transcription: the reference decodes greedily and
-                # exposes no penalty knob, so no seen-token buffers.
-                enable_repetion_penalty=False,
+                # exposes no penalty knob, so no seen-token buffers; without
+                # the capability a request penalty or min_p is refused.
+                enable_repetion_penalty=self.sampling_defaults.get("repetition_penalty", 1) != 1,
+                enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
         ]
 
@@ -154,22 +174,26 @@ class HiggsAudioModel(Model):
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args
         model_kwargs = model_kwargs or {}
-        return {
-            SAMPLER: SamplingReqConfig(
-                # Reference eval decodes greedily (do_sample=False).
-                temperature=model_kwargs.get("temperature", 0.0),
-                top_p=model_kwargs.get("top_p", 1.0),
-                ignore_eos=model_kwargs.get("ignore_eos", False),
-            )
+        sampling = {
+            **self.sampling_defaults,
+            **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs},
         }
+        return {SAMPLER: SamplingReqConfig(**sampling)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        # ``language`` and ``timestamps`` from the transcription adapter are not read
+        return frozenset({"enable_thinking", "max_output_tokens", *SAMPLING_KEYS})
 
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
     # -------------------------------------------------------------------
 
     def get_max_output_tokens(self, **model_kwargs):
-        # Reference transcribe.py generates up to 1024 new tokens.
-        return model_kwargs.get("max_output_tokens", 1024)
+        return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
+
+    def get_max_output_tokens_limit(self) -> int:
+        # the decode Loop is built with max_iters at this value
+        return MAX_OUTPUT_TOKENS
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         llm_prefill_outputs = [
@@ -383,6 +407,9 @@ class HiggsAudioModel(Model):
         appends the empty think block so the transcript starts
         immediately.
         """
+        enable_thinking = kwargs.get("enable_thinking", False)
+        if not isinstance(enable_thinking, bool):
+            raise ValueError(f"enable_thinking must be a boolean; got {enable_thinking!r}")
         raw_audio_inputs = (tensors or {}).get("audio_inputs", [])
         if len(raw_audio_inputs) != 1:
             raise ValueError(
@@ -419,7 +446,7 @@ class HiggsAudioModel(Model):
             + enc("<|audio_bos|>")
         )
         post_ids = enc("<|audio_eos|>") + enc("<|im_end|>\n<|im_start|>assistant\n")
-        if not kwargs.get("enable_thinking", False):
+        if not enable_thinking:
             post_ids += enc("<think>\n\n</think>\n\n")
 
         return {

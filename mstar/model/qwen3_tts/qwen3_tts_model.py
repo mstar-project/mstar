@@ -31,6 +31,7 @@ import contextlib
 import importlib.metadata
 import importlib.util
 import inspect
+import logging
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -78,8 +79,33 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import load_generation_defaults
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+
+logger = logging.getLogger(__name__)
+
+# sampler knobs: plain or ``talker_<knob>`` for the Talker, ``code_predictor_<knob>`` for groups 1-15
+SAMPLING_KNOBS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty", "penalize_prompt")
+# deprecated HF-name prefix for the CodePredictor knobs
+_DEPRECATED_CODE_PRED_PREFIX = "subtalker_"
+_warned_deprecated: set[str] = set()
+
+def _text(kwargs: dict[str, Any], name: str, default: str) -> str:
+    """A string request knob; a non-string is a ValueError, never ``str()``."""
+    value = kwargs.get(name, default)
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string; got {value!r}")
+    return value
+
+
+def _flag(kwargs: dict[str, Any], name: str, default: bool) -> bool:
+    """A boolean request knob; a non-bool is a ValueError, never truthiness."""
+    value = kwargs.get(name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false; got {value!r}")
+    return value
+
 
 # ---------------------------------------------------------------------------
 # Checkpoint discovery
@@ -524,7 +550,7 @@ class Qwen3TTSModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.get_max_output_tokens_limit(),
             outputs=[],
         )
         walks = {
@@ -648,7 +674,9 @@ class Qwen3TTSModel(Model):
         than something to ignore silently.
         """
         requested = kwargs.get("speaker", kwargs.get("voice"))
-        if requested is None or requested == "":
+        if requested is not None and (not isinstance(requested, str) or not requested):
+            raise ValueError(f"voice must be a non-empty name; got {requested!r}")
+        if requested is None:
             requested = self.config.default_speaker
             if requested is None:
                 return None, -1
@@ -658,7 +686,7 @@ class Qwen3TTSModel(Model):
                 "built-in speakers; describe the voice with 'instruct' "
                 "(VoiceDesign) or supply reference audio (Base) instead of 'voice'"
             )
-        speaker = str(requested).lower()
+        speaker = requested.lower()
         if speaker not in self.config.talker.spk_id:
             supported = ", ".join(sorted(self.config.talker.spk_id))
             raise ValueError(
@@ -668,7 +696,7 @@ class Qwen3TTSModel(Model):
 
     def _resolve_language(self, kwargs: dict[str, Any], speaker: str | None) -> int:
         """Map ``language`` onto a codec language tag (``-1`` = automatic)."""
-        language = str(kwargs.get("language", self.config.default_language)).lower()
+        language = _text(kwargs, "language", self.config.default_language).lower()
         dialect = (
             self.config.talker.spk_is_dialect.get(speaker, False)
             if speaker is not None
@@ -691,8 +719,8 @@ class Qwen3TTSModel(Model):
 
     def _resolve_instruct(self, kwargs: dict[str, Any]) -> str:
         """Style/voice instruction; ``instructions`` is the OpenAI field name."""
-        instruct = kwargs.get("instruct", kwargs.get("instructions")) or ""
-        instruct = str(instruct).strip()
+        name = "instruct" if "instruct" in kwargs else "instructions"
+        instruct = _text(kwargs, name, "").strip()
         if instruct and not self.config.supports_instruct:
             raise ValueError(
                 f"Qwen3-TTS {self.config.tts_model_size} "
@@ -738,8 +766,8 @@ class Qwen3TTSModel(Model):
         # Both modes run the speaker encoder over the whole clip.
         num_samples = int(clips[0].reshape(-1).shape[0])
         self._check_reference_duration(num_samples / self.config.codec.input_sample_rate)
-        ref_text = str(kwargs.get("ref_text") or "").strip()
-        if kwargs.get("x_vector_only_mode", False):
+        ref_text = _text(kwargs, "ref_text", "").strip()
+        if _flag(kwargs, "x_vector_only_mode", False):
             return "", 0
         if not ref_text:
             raise ValueError(
@@ -795,8 +823,8 @@ class Qwen3TTSModel(Model):
         language_id = self._resolve_language(kwargs, speaker)
         instruct = self._resolve_instruct(kwargs)
         ref_text, ref_frames = self._resolve_reference(kwargs, tensors, input_modalities)
-        stream_text = not bool(
-            kwargs.get("non_streaming_mode", self.config.default_non_streaming_mode)
+        stream_text = not _flag(
+            kwargs, "non_streaming_mode", self.config.default_non_streaming_mode,
         )
 
         assistant_ids = self._tokenize(self.ASSISTANT_TEMPLATE.format(text=prompt))
@@ -964,52 +992,83 @@ class Qwen3TTSModel(Model):
     ) -> dict[str, ResourceReqConfig]:
         """Per-request sampling: Talker head (group 0) + CodePredictor (1-15).
 
-        The CodePredictor's ``subtalker_*`` knobs drive its own sampler
-        resource; ``*_dosample=False`` maps to temperature 0 (greedy)."""
+        Plain keys target the Talker; ``talker_<knob>`` wins over a plain one.
+        ``code_predictor_<knob>`` drives the CodePredictor's sampler, and the
+        deprecated ``subtalker_<knob>`` is read only when it is absent."""
         del partition_fwd_args
         model_kwargs = model_kwargs or {}
-        generation = self.config.generation
-        do_sample = model_kwargs.get("do_sample", generation.do_sample)
-        temperature = model_kwargs.get(
-            "temperature",
-            model_kwargs.get("talker_temperature", generation.temperature),
-        )
-        if not do_sample:
-            temperature = 0.0
-        sub_do_sample = model_kwargs.get(
-            "subtalker_dosample", generation.subtalker_dosample
-        )
+        defaults = self._generation_defaults()
+        talker, code_pred = {}, {}
+        for knob in SAMPLING_KNOBS:
+            for key in ("talker_" + knob, knob):
+                if key in model_kwargs:
+                    talker[knob] = model_kwargs[key]
+                    break
+            else:
+                if knob in defaults:
+                    talker[knob] = defaults[knob]
+            key = "code_predictor_" + knob
+            old = _DEPRECATED_CODE_PRED_PREFIX + knob
+            if key in model_kwargs:
+                code_pred[knob] = model_kwargs[key]
+            elif old in model_kwargs:
+                if old not in _warned_deprecated:
+                    _warned_deprecated.add(old)
+                    logger.warning("Qwen3-TTS: %r is deprecated; send %r", old, key)
+                code_pred[knob] = model_kwargs[old]
+            elif key in defaults:
+                code_pred[knob] = defaults[key]
         return {
             TALKER_SAMPLER: SamplingReqConfig(
-                temperature=temperature,
-                top_k=model_kwargs.get("top_k", generation.top_k),
-                top_p=model_kwargs.get("top_p", generation.top_p),
-                repetition_penalty=model_kwargs.get(
-                    "repetition_penalty", generation.repetition_penalty
-                ),
-                ignore_eos=model_kwargs.get("ignore_eos", False),
+                **talker, ignore_eos=model_kwargs.get("ignore_eos", False),
             ),
-            CODE_PRED_SAMPLER: SamplingReqConfig(
-                temperature=(
-                    model_kwargs.get(
-                        "subtalker_temperature", generation.subtalker_temperature
-                    )
-                    if sub_do_sample
-                    else 0.0
-                ),
-                top_k=model_kwargs.get(
-                    "subtalker_top_k", generation.subtalker_top_k
-                ),
-                top_p=model_kwargs.get(
-                    "subtalker_top_p", generation.subtalker_top_p
-                ),
-            ),
+            CODE_PRED_SAMPLER: SamplingReqConfig(**code_pred),
         }
 
+    def _generation_defaults(self) -> dict:
+        """Talker knobs plain, CodePredictor knobs ``code_predictor_``: the
+        checkpoint's ``generation_config.json`` over the config dataclass.
+        ``do_sample: false`` there is a temperature-0 default."""
+        cached = getattr(self, "_generation_defaults_cache", None)
+        if cached is None:
+            generation = self.config.generation
+            local_dir = getattr(self, "local_dir", None)
+            cached = {
+                "temperature": generation.temperature,
+                "top_k": generation.top_k,
+                "top_p": generation.top_p,
+                "repetition_penalty": generation.repetition_penalty,
+                "max_output_tokens": generation.max_new_tokens,
+                "code_predictor_temperature": generation.subtalker_temperature,
+                "code_predictor_top_k": generation.subtalker_top_k,
+                "code_predictor_top_p": generation.subtalker_top_p,
+                **load_generation_defaults(local_dir),
+                **load_generation_defaults(
+                    local_dir, prefix="subtalker_", stage="code_predictor_",
+                ),
+            }
+            # the config dataclass's own switch, for a checkpoint without the json
+            if generation.subtalker_dosample is False:
+                cached["code_predictor_temperature"] = 0.0
+            self._generation_defaults_cache = cached
+        return cached
+
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
-        return model_kwargs.get(
-            "max_output_tokens",
-            model_kwargs.get("max_new_tokens", self.config.generation.max_new_tokens),
+        return model_kwargs.get("max_output_tokens", self._generation_defaults()["max_output_tokens"])
+
+    def get_max_output_tokens_limit(self) -> int:
+        # the Talker decode loop's max_iters, in codec frames
+        return self._generation_defaults()["max_output_tokens"]
+
+    def request_kwargs(self) -> frozenset[str]:
+        prefixes = ("", "talker_", "code_predictor_", _DEPRECATED_CODE_PRED_PREFIX)
+        return frozenset(
+            {prefix + knob for prefix in prefixes for knob in SAMPLING_KNOBS}
+            | {
+                "ignore_eos", "max_output_tokens", "seed",
+                "voice", "speaker", "language", "instruct", "instructions",
+                "non_streaming_mode", "ref_text", "x_vector_only_mode",
+            }
         )
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
