@@ -473,12 +473,12 @@ class Qwen3TTSModel(Model):
             SamplerSpec(
                 resource_key=TALKER_SAMPLER, nodes={"Talker"},
                 vocab_size=talker.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
             ),
             SamplerSpec(
                 resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
                 vocab_size=cp.vocab_size,
-                enable_repetion_penalty=False,
+                enable_repetition_penalty=False,
             ),
         ]
 

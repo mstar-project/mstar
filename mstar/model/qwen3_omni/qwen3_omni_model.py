@@ -256,19 +256,19 @@ class Qwen3OmniModel(Model):
                 resource_key=THINKER_SAMPLER,
                 nodes={"Thinker"},
                 vocab_size=self.config.thinker_text.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
             ),
             SamplerSpec(
                 resource_key=TALKER_SAMPLER,
                 nodes={"Talker"},
                 vocab_size=self.config.talker_text.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
             ),
             SamplerSpec(
                 resource_key=CODE_PRED_SAMPLER,
                 nodes={"Talker"},
                 vocab_size=self.config.code_predictor.vocab_size,
-                enable_repetion_penalty=False,
+                enable_repetition_penalty=False,
             )
         ]
 

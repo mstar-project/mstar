@@ -425,7 +425,7 @@ class OrpheusModel(Model):
                 resource_key=SAMPLER,
                 nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
                 # off unless the checkpoint defaults it on; a request min_p > 0 is refused
                 enable_min_p=self.config.min_p > 0,
             ),

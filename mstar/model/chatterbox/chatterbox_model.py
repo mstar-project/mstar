@@ -336,7 +336,7 @@ class ChatterboxModel(Model):
             SamplerSpec(
                 resource_key=T3_SAMPLER, nodes={T3_NODE},
                 vocab_size=t3.speech_vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
                 # the reference samples with min_p 0.05 (Turbo does not)
                 enable_min_p=not self.config.is_turbo,
             ),

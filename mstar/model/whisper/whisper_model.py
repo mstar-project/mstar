@@ -186,7 +186,7 @@ class WhisperModel(Model):
                 vocab_size=self.config.vocab_size,
                 # ASR decodes greedily; without the capability a request
                 # penalty or min_p is refused at admission.
-                enable_repetion_penalty=self.sampling_defaults.get("repetition_penalty", 1) != 1,
+                enable_repetition_penalty=self.sampling_defaults.get("repetition_penalty", 1) != 1,
                 enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
         ]

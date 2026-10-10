@@ -1315,7 +1315,7 @@ def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
         if isinstance(spec, SamplerSpec)
     }
     assert specs[TALKER_SAMPLER].vocab_size is not None
-    assert specs[CODE_PRED_SAMPLER].enable_repetion_penalty is False
+    assert specs[CODE_PRED_SAMPLER].enable_repetition_penalty is False
 
     # The conductor seeds each stream; they are seeded independently.
     configs[TALKER_SAMPLER].apply_conductor_config(seed=99)

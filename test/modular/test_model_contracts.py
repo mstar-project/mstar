@@ -409,7 +409,7 @@ def test_qwen3_5_real_0_8b_has_no_generation_config_and_no_min_p_capability():
     model = Qwen3_5DenseModel(str(next(CACHED_0_8B.iterdir())))
     assert model.sampling_defaults == {}
     spec = next(s for s in model.get_node_resources() if s.resource_key == QWEN3_5_SAMPLER)
-    assert spec.enable_repetion_penalty and not spec.enable_min_p
+    assert spec.enable_repetition_penalty and not spec.enable_min_p
 
 
 
@@ -500,7 +500,7 @@ def test_qwen3_omni_plain_keys_target_the_thinker_and_prefixed_keys_win(omni_rel
 
 
 def test_qwen3_omni_code_predictor_gets_no_penalty_and_refuses_one(omni_released):
-    spec = SimpleNamespace(enable_repetion_penalty=False, enable_min_p=False)
+    spec = SimpleNamespace(enable_repetition_penalty=False, enable_min_p=False)
     config = omni_released.get_request_resource_configs({}, {})[CODE_PRED_SAMPLER]
     assert config.repetition_penalty == 1
     config.validate(spec)

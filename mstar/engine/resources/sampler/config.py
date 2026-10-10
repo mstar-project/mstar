@@ -27,7 +27,7 @@ class SamplerSpec(NodeResourceSpec):
     # the kernel variant baked into the captured graph. Whether the penalty
     # actually runs on a given step is settled per step from the resident
     # requests' `repetition_penalty` — see `SamplerResource.admit`.
-    enable_repetion_penalty: bool = True
+    enable_repetition_penalty: bool = True
     # Same kind of capability for min-p: whether the node's sampler (eager and
     # graph-captured) carries the filter. It costs two passes over ``[B, V]``
     # per step, so nodes that never ask for it pay nothing; a request that
@@ -89,7 +89,7 @@ class SamplingReqConfig(ResourceReqConfig):
         # refused here, not ignored: the node's sampler has no such filter
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
-        if self.repetition_penalty not in (None, 1) and not spec.enable_repetion_penalty:
+        if self.repetition_penalty not in (None, 1) and not spec.enable_repetition_penalty:
             raise ValueError(
                 "this model does not support repetition_penalty; send 1 or leave it unset"
             )

@@ -403,7 +403,7 @@ class Cosmos3Model(Model):
             specs.append(SamplerSpec(
                 resource_key=SAMPLER, nodes={REASONER_NODE},
                 vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
             ))
         if self.config.attention_backend == "dense_gen":
             specs.append(AttentionSpec(

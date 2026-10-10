@@ -31,7 +31,7 @@ MATCHED = 96
 
 def _sampler(penalty: float = 1.2) -> SamplerResource:
     resource = SamplerResource(
-        vocab_size=256, enable_repetion_penalty=True,
+        vocab_size=256, enable_repetition_penalty=True,
         device=torch.device("cpu"), comm_group=None,
     )
     resource.ingest_request(RID, SamplingReqConfig(repetition_penalty=penalty))
