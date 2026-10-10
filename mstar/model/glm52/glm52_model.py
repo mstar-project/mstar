@@ -495,10 +495,7 @@ class Glm52Model(Model):
             if model_kwargs.get(k) is not None:
                 params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
-            # MTP is greedy-only, so greedy is the declared default on MTP
-            # configs: a bare request serves instead of inheriting the config
-            # temperature and being refused by prepare_inputs. An explicit
-            # temperature > 0 still refuses.
+            # greedy is the declared default on MTP configs; a request asks for a temperature
             params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
 

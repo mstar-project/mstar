@@ -40,7 +40,13 @@ def _force_cpu_flashinfer(monkeypatch):
 
 from request_walks import run_walks  # noqa: E402
 
-from mstar.engine.resources import AllocationFailed, StepContext  # noqa: E402
+from mstar.engine.resources import (  # noqa: E402
+    AllocationFailed,
+    SamplingReqConfig,
+    StepContext,
+    StepRunner,
+)
+from mstar.engine.resources.sampler.resource import SamplerResource  # noqa: E402
 from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
@@ -379,13 +385,73 @@ def test_batch_of_two_matches_single_streams():
         assert torch.equal(got, singles[rid]), f"{rid}: {got.tolist()} vs {singles[rid].tolist()}"
 
 
-def test_non_greedy_request_is_refused_under_mtp():
+def test_a_penalised_request_is_refused_under_mtp():
     cfg = _cfg(2, True)
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     info = _fwd_info("r0", 8, True)
-    info.resource_configs[SAMPLER_RESOURCE].temperature = 0.7
-    with pytest.raises(RuntimeError, match="greedy-only"):
+    info.resource_configs[SAMPLER_RESOURCE].repetition_penalty = 1.1
+    with pytest.raises(RuntimeError, match="repetition_penalty"):
         sub.prepare_inputs("prefill", info, {"text_inputs": [torch.tensor([1, 2, 3])]})
+
+
+def test_a_sampled_request_takes_the_sampled_verify_under_mtp():
+    """temperature > 0: served, its decode inputs and the step's key name the sampled
+    capture, and the step plans the sampler for the speculative draw."""
+    cfg = _cfg(2, True)
+    sub = Glm52LLMSubmodule(_model(cfg), cfg)
+    sub.bind_node_resources(build_cpu_resources(cfg, ["r0"])[0])
+    info = _fwd_info("r0", 8, True)
+    info.resource_configs[SAMPLER_RESOURCE].temperature = 0.7
+    sub.prepare_inputs("prefill", info, {"text_inputs": [torch.tensor([1, 2, 3])]})
+    inputs = [sub.prepare_inputs("decode", info, {"text_inputs": [torch.tensor([4])]})]
+    assert sub.cg_key_info("decode", {"r0": info}) == "sampled"
+    step = sub.declare_step("decode", ["r0"], inputs)
+    assert step.cg_key_info == "sampled" and "sampler" in set(step.keys())
+
+
+def test_a_sampled_request_is_served_beside_a_greedy_one():
+    """temperature > 0 under MTP: its verify steps sample speculatively, and a greedy request
+    in the same steps still emits exactly what it does alone."""
+    cfg = _cfg(2, True)
+    model = _model(cfg)
+    prompts = {"g": torch.arange(5, dtype=torch.long) + 3, "s": torch.arange(3, dtype=torch.long) + 9}
+    want = _drive(_Driver(Glm52LLMSubmodule(model, cfg), cfg, ["g"]), prompts["g"],
+                  _fwd_info("g", 14, True))
+    sub = Glm52LLMSubmodule(model, cfg)
+    driver = _Driver(sub, cfg, [])
+    # the real sampler: its sample() runs on a GPU only, so a prefill's first token is argmax
+    # here, and every verify step goes through speculative_sample's torch rule
+    sampler = SamplerResource(vocab_size=None, enable_repetion_penalty=False,
+                              device=torch.device("cpu"))
+    sampler.sample = lambda request_ids, logits, **kw: logits.argmax(-1)
+    driver.resources = {**driver.resources, SAMPLER_RESOURCE: sampler}
+    driver.runner = StepRunner(driver.resources, node_resources={"LLM": list(driver.resources)})
+    sub.bind_node_resources(driver.resources)
+    infos = {}
+    for rid, temperature in (("g", 0.0), ("s", 0.8)):
+        driver.runner.ingest_request(rid, {SAMPLER_RESOURCE: SamplingReqConfig(
+            temperature=temperature, top_p=0.9, ignore_eos=True)})
+        infos[rid] = _fwd_info(rid, 14, True)
+        infos[rid].resource_configs[SAMPLER_RESOURCE].temperature = temperature
+    emitted, texts = {rid: [] for rid in prompts}, {}
+    for rid, prompt in prompts.items():
+        out = driver.step("prefill", {rid: (infos[rid], prompt)})[rid]
+        emitted[rid].append(out["new_token"][0])
+        assert not sub.check_stop(rid, infos[rid], out)
+        texts[rid] = out["text_inputs"][0]
+    live = set(prompts)
+    for _ in range(20):
+        if not live:
+            break
+        outs = driver.step("decode", {rid: (infos[rid], texts[rid]) for rid in sorted(live)})
+        for rid in sorted(live):
+            emitted[rid].append(outs[rid]["new_token"][0])
+            texts[rid] = outs[rid]["text_inputs"][0]
+            if sub.check_stop(rid, infos[rid], outs[rid]):
+                live.discard(rid)
+    assert torch.equal(torch.cat(emitted["g"]), want)
+    got = torch.cat(emitted["s"])
+    assert got.numel() >= 14 and bool(((got >= 0) & (got < cfg.vocab_size)).all())
 
 
 def test_declare_step_shapes():

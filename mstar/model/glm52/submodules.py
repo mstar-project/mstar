@@ -48,6 +48,8 @@ from mstar.utils.pinned_staging import to_device_async
 logger = logging.getLogger(__name__)
 
 _MAIN = "main"
+# the verify step that samples speculatively (a request with temperature > 0)
+SAMPLED = "sampled"
 # How long the host waits for an MTP step to stage its verdict before giving up.
 _VERDICT_TIMEOUT_S = 120.0
 
@@ -222,12 +224,16 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             steps[ATTN_RESOURCE] = AttentionStep(causal=True)
         if long_context:
             steps[INDEX_KV_RESOURCE] = KVStep()
+        sampled = any(inp.resource_step_info == SAMPLED for inp in inputs)
         if self.mtp_k > 0 and graph_walk == "decode":
             # Under TP async the plan thread declares, admits and plans this step before
-            # prepare_inputs runs, so the last verdict's trim lands here. The verify and the
-            # drafts are argmaxes in the forward: no sampler.
+            # prepare_inputs runs, so the last verdict's trim lands here. The drafts are
+            # argmaxes in the forward, and so is a greedy step's verify; a sampled one samples
+            # speculatively with the sampler's per-request settings.
             for rid in request_ids:
                 self._apply_verdict(rid)
+            if sampled:
+                steps[SAMPLER_RESOURCE] = SamplerStep(apply_penalty=False)
         else:
             steps[SAMPLER_RESOURCE] = SamplerStep(
                 apply_penalty=True, prefill_tracked_tokens=prefill_tokens)
@@ -237,11 +243,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
             steps=steps,
-            cg_key_info=self._cg_key(graph_walk, request_ids),
+            cg_key_info=SAMPLED if sampled else self._cg_key(graph_walk, request_ids),
         )
 
     def cg_key_info(self, graph_walk: str, per_request_info: dict,
                     per_request_input_metadata=None, **kwargs) -> str | None:
+        if self.mtp_k > 0 and graph_walk == "decode" and any(
+                (getattr(info.resource_configs.get(SAMPLER_RESOURCE), "temperature", 0) or 0) > 0
+                for info in per_request_info.values() if info.resource_configs):
+            return SAMPLED
         return self._cg_key(graph_walk, per_request_info)
 
     def _cg_key(self, graph_walk: str, rids) -> str | None:
@@ -381,6 +391,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.MTP_CAPTURE_BATCH_SIZES if self.mtp_k else None,
                 **flags,
             ),
+            # a verify step with a sampled request in it: speculative sampling
+            *([BatchedCudaGraphConfig(
+                capture_graph_walk="decode",
+                additional_key_info=SAMPLED,
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                    input_seq_len=self.mtp_block, resource_step_info=SAMPLED,
+                ),
+                capture_batch_sizes=self.MTP_CAPTURE_BATCH_SIZES,
+                **flags,
+            )] if self.mtp_k else []),
             *(
                 _PackedPrefillConfig(
                     max_row_tokens=self._context_limit(),
@@ -445,23 +466,25 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # the handle, which the batch, check_stop and cleanup_request key by
             rid = fwd_info.rid_handle
             sampling = fwd_info.resource_configs[SAMPLER_RESOURCE]
-            # Greedy-only: decode drafts and verification bypass the sampler,
-            # so a temperature would be silently ignored and a repetition
-            # penalty would move even the prefill argmax. Refuse this rid.
-            if sampling.temperature != 0 or sampling.repetition_penalty != 1:
+            # A verify step samples speculatively but tracks no seen tokens: a repetition
+            # penalty (which would also move the prefill argmax) or min_p is refused
+            if sampling.repetition_penalty != 1 or (getattr(sampling, "min_p", 0) or 0) > 0:
                 raise RuntimeError(
-                    f"request {fwd_info.request_id}: MTP speculative decoding is greedy-only "
-                    f"but the request asks for temperature={sampling.temperature}, "
-                    f"repetition_penalty={sampling.repetition_penalty}. Send "
-                    "temperature=0 without a penalty, or serve a k=0 config."
+                    f"request {fwd_info.request_id}: MTP takes no repetition_penalty or "
+                    f"min_p (repetition_penalty={sampling.repetition_penalty}, "
+                    f"min_p={getattr(sampling, 'min_p', None)}); send none, or serve a k=0 "
+                    "config."
                 )
+            sampled = (sampling.temperature or 0) > 0
             # capped by the prefill's context-limit clamp once that has run
             self._mtp_max_tokens[rid] = min(
                 fwd_info.max_tokens, self._token_budget.get(rid, fwd_info.max_tokens))
             self._mtp_ignore_eos[rid] = sampling.ignore_eos
             if graph_walk == "decode":
-                # one id in, the last emitted token: the step verifies it and k drafts
-                return ARNodeInputs(input_ids=text_inputs, input_seq_len=self.mtp_block)
+                # one id in, the last emitted token: the step verifies it and k drafts; a
+                # sampled request's step runs the sampled capture (`cg_key_info`)
+                return ARNodeInputs(input_ids=text_inputs, input_seq_len=self.mtp_block,
+                                    resource_step_info=SAMPLED if sampled else None)
             self._mtp_emitted[rid] = 1
             if rid not in self._mtp_slot:
                 self._mtp_slot[rid] = self._mtp_free_slots.pop()
@@ -899,8 +922,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         drafts = torch.stack(drafts, 1)
         ids = torch.cat([input_ids.view(n, 1), drafts], 1).view(-1)
         hidden, prenorm = self._hidden(ids, position_ids, dsa_ctx, with_prenorm=True)
-        target = self.lm_head(hidden).argmax(-1).view(n, block)
-        accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
+        step = getattr(engine_inputs, "step", None)
+        if step is not None and step.cg_key_info == SAMPLED:
+            target, accepted = engine_inputs.resources[SAMPLER_RESOURCE].speculative_sample(
+                engine_inputs.request_ids, self.lm_head(hidden).view(n, block, -1), drafts)
+        else:
+            target = self.lm_head(hidden).argmax(-1).view(n, block)
+            accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
         self._stage_verdict(engine_inputs, torch.cat([target, accepted[:, None]], 1), mtp_seq)
         h_head, h_raw = lm.mtp(
             embed(target.view(-1)), self._mtp_pair_rows(hidden, prenorm), position_ids + 1,
