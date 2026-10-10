@@ -43,6 +43,17 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
+from mstar.model.minicpm_o.components.token2wav import (
+    CACHE_FAMILIES,
+    LAST_WINDOW_TOKENS,
+    LEAD_SILENCE,
+    SILENCE_CODE,
+    WINDOW,
+    AttentionCache,
+    WindowCaches,
+    window_frames,
+    window_tokens,
+)
 from mstar.model.minicpm_o.components.token2wav_flow import MEL_BINS as MEL_BINS_T2W
 from mstar.model.minicpm_o.components.token2wav_flow import UP_RATE as UP_RATE_T2W
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
@@ -738,11 +749,10 @@ class Token2WavSubmodule(NodeSubmodule):
         self.eos_code = eos_code
         # (family, voice) -> the voice's cache in that family's stream order
         self._sources: dict[tuple[str, str], torch.Tensor] = {}
+        self._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
 
     def _caches(self, resources: Mapping, voice_name: str, plans: Mapping[str, Any]):
         """A batch of one voice's ``WindowCaches``, on these plans of the cache resources."""
-        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES, AttentionCache, WindowCaches
-
         caches = {}
         for name, family in CACHE_FAMILIES.items():
             source = self._sources.get((name, voice_name))
@@ -755,8 +765,6 @@ class Token2WavSubmodule(NodeSubmodule):
         self, request_ids: list[str], voices: list[str], num_tokens: list[int], lasts: list[bool],
     ) -> dict[str, BoundedKVStep]:
         """Each cache resource's step: every row's stream position and what its window adds."""
-        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES
-
         positions = []
         for rid, voice in zip(request_ids, voices, strict=True):
             req = self.request_states.get(rid)
@@ -788,20 +796,24 @@ class Token2WavSubmodule(NodeSubmodule):
         is_final_stream_chunk: bool = False,
         **kwargs: Any,
     ) -> NodeInputs | None:
-        from mstar.model.minicpm_o.components.token2wav import LEAD_SILENCE, SILENCE_CODE
-
-        codes = inputs["tts_code"][0].reshape(-1).tolist() if inputs.get("tts_code") else []
+        if not inputs.get("tts_code"):
+            return None
+        # A host sync, which serializes this node's async pipeline. It is needed either
+        # way: a window's length decides its capture and its cache writes. Filtering
+        # the stop code on the device would need check_stop to filter outputs (an
+        # engine change), and would still leave the length on the device.
+        codes = inputs["tts_code"][0].reshape(-1).to("cpu", torch.int32)
         # the TTS's stop code is streamed before its stop is seen; it is not speech
-        codes = [c for c in codes if c != self.eos_code]
-        if not codes:
+        codes = codes[codes != self.eos_code]
+        if codes.numel() == 0:
             # a text-only reply's stream closes with one empty chunk
             return None
         # keyed by the worker handle, as the forward and the engine's cleanup are
         state = self.request_state(fwd_info.rid_handle)
         if not state.get("started", False):
-            codes = [SILENCE_CODE] * LEAD_SILENCE + codes
+            codes = torch.cat([self._lead_silence, codes])
         return NodeInputs(
-            tensor_inputs={"codes": torch.tensor([codes], dtype=torch.int32)},
+            tensor_inputs={"codes": codes[None]},
             kwargs={"last": is_final_stream_chunk, "voice": fwd_info.step_metadata.get("voice")},
         )
 
@@ -831,8 +843,6 @@ class Token2WavSubmodule(NodeSubmodule):
     def get_piecewise_cuda_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
-        from mstar.model.minicpm_o.components.token2wav import LAST_WINDOW_TOKENS, WINDOW, window_frames
-
         def static_tokens(num_tokens: int):
             def make(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
                 return {"tokens": torch.zeros(shape.bs, num_tokens, dtype=torch.int32, device=device)}
@@ -946,8 +956,6 @@ class Token2WavSubmodule(NodeSubmodule):
         """Each window in two stages: the flow, batched over every row of one voice and
         window length whatever its position, then HiFT, batched over rows that are all
         or none their request's first window."""
-        from mstar.model.minicpm_o.components.token2wav import window_tokens
-
         pool = engine_inputs.resources[T2W_STATE]
         blocks = {name: pool.block(name, 0) for name in pool.config.blocks}
         # the node step's layouts, before a captured region plans its own

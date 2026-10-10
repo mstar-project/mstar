@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -97,6 +98,15 @@ class BoundedLayerKV:
 
 # what an attention layer is handed
 KVCache = DenseKV | BoundedLayerKV
+
+
+class FlowKV(NamedTuple):
+    """The flow's attention caches: one per 25 Hz and per 50 Hz conformer layer, and one
+    per Euler step per DiT block."""
+
+    enc1: list[KVCache]
+    enc2: list[KVCache]
+    dit: list[list[KVCache]]
 
 
 def rel_position_table(d_model: int, max_len: int = 5000) -> torch.Tensor:
@@ -616,18 +626,15 @@ class Token2WavFlow(nn.Module):
         cond: torch.Tensor | None,
         last_chunk: bool,
         enc_cnn: torch.Tensor,
-        enc_kv1: list[KVCache],
-        enc_kv2: list[KVCache],
         dit_cnn: torch.Tensor,
-        dit_kv: list[list[KVCache]],
+        kv: FlowKV,
     ) -> torch.Tensor:
-        """``tokens [B, T]`` (int) -> mel ``[B, 80, 2 (T - 3)]`` (``2T`` when ``last_chunk``);
-        ``spk [B, 80]`` is ``project_speaker``'s output, ``cond`` the prompt mel ``[B, 80,
-        frames]`` when building a voice's cache, else zeros. ``enc_cnn [B, 512, 6]`` and
-        ``dit_cnn [steps, depth, 2B, 1024, 2]`` are updated in place, the attention caches
-        through their ``KVCache``; the caller advances the lengths."""
-        h = self.encoder(self.input_embedding(tokens), last_chunk, enc_cnn, enc_kv1, enc_kv2)
+        """``tokens [B, T]`` (int) -> mel ``[B, 80, 2 (T - 3)]`` (``2T`` when ``last_chunk``).
+        ``spk [B, 80]`` is ``project_speaker``'s output, ``cond`` the prompt mel when
+        building a voice's caches, else zeros. ``enc_cnn [B, 512, 6]`` and ``dit_cnn [steps,
+        depth, 2B, 1024, 2]`` are updated in place, the attention caches through ``kv``."""
+        h = self.encoder(self.input_embedding(tokens), last_chunk, enc_cnn, kv.enc1, kv.enc2)
         h = self.encoder_proj(h)
         if cond is None:
             cond = torch.zeros_like(h).transpose(1, 2).contiguous()
-        return self.decoder(h.transpose(1, 2).contiguous(), spk, cond, dit_cnn, dit_kv)
+        return self.decoder(h.transpose(1, 2).contiguous(), spk, cond, dit_cnn, kv.dit)

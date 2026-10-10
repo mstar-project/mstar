@@ -58,7 +58,18 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.minicpm_o.components.tts import TTSConfig
+from mstar.model.minicpm_o import weight_loader
+from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
+from mstar.model.minicpm_o.components.token2wav import (
+    CACHE_FAMILIES,
+    HOP,
+    LEAD_SILENCE,
+    CacheCapacity,
+    load_token2wav,
+    slot_layout,
+)
+from mstar.model.minicpm_o.components.tts import MiniCPMTTS, TTSConfig
+from mstar.model.minicpm_o.components.vision import MiniCPMOVision
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
     LLM_ATTN,
@@ -75,6 +86,13 @@ from mstar.model.minicpm_o.config import (
     VISION_ATTN,
     MiniCPMOConfig,
     TTSSampling,
+)
+from mstar.model.minicpm_o.submodules import (
+    AudioEncoderSubmodule,
+    LLMSubmodule,
+    Token2WavSubmodule,
+    TTSSubmodule,
+    VisionEncoderSubmodule,
 )
 from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
 from mstar.model.submodule_base import NodeSubmodule
@@ -281,8 +299,6 @@ class MiniCPMOModel(Model):
         """Token2wav's caches sized for the longest bundled voice."""
         import soundfile as sf
 
-        from mstar.model.minicpm_o.components.token2wav import CacheCapacity
-
         seconds = max(
             sf.info(str(Path(self.local_dir) / "assets" / f)).duration for f in VOICES.values()
         )
@@ -290,14 +306,10 @@ class MiniCPMOModel(Model):
         return CacheCapacity(int(seconds * 25) + 1)
 
     def _t2w_slot_layout(self) -> dict:
-        from mstar.model.minicpm_o.components.token2wav import slot_layout
-
         return slot_layout(self._t2w_capacity())
 
     def _t2w_kv(self) -> list[BoundedKVSpec]:
         """Token2wav's attention caches, sized for the longest bundled voice."""
-        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES
-
         voice_tokens = self._t2w_capacity().prompt_tokens
         return [
             BoundedKVSpec(
@@ -457,8 +469,6 @@ class MiniCPMOModel(Model):
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
-        from mstar.model.minicpm_o.components.token2wav import HOP, LEAD_SILENCE
-
         return PartitionTopology(
             partitions=[MAIN, TOKEN2WAV],
             connections=[Connection(
@@ -784,9 +794,6 @@ class MiniCPMOModel(Model):
         return snapshot_download(repo_id=self.model_path_hf, cache_dir=self.cache_dir)
 
     def _create_token2wav(self, weights: str, device: str) -> NodeSubmodule:
-        from mstar.model.minicpm_o import submodules
-        from mstar.model.minicpm_o.components.token2wav import load_token2wav
-
         t2w = load_token2wav(str(Path(weights) / "assets" / "token2wav"), device=device)
         # the reference prepares voice prompts on the CPU; it is once per voice
         t2w.voice_encoder.cpu()
@@ -795,7 +802,7 @@ class MiniCPMOModel(Model):
             for name in VOICES
         }
         logger.info("Loaded MiniCPM-o token2wav with voices %s onto %s", sorted(voices), device)
-        return submodules.Token2WavSubmodule(t2w.requires_grad_(False), voices, self.tts_config.eos_code)
+        return Token2WavSubmodule(t2w.requires_grad_(False), voices, self.tts_config.eos_code)
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
@@ -808,29 +815,25 @@ class MiniCPMOModel(Model):
             torch.set_default_dtype(torch.float32)
 
     def _create_submodule(self, node_name: str, device: str, tp_group, dtype: torch.dtype) -> NodeSubmodule | None:
-        from mstar.model.minicpm_o import submodules, weight_loader
 
         if node_name not in (LLM, VISION, AUDIO, TTS, TOKEN2WAV):
             return None
         weights = self._weights_dir()
         if node_name == VISION:
-            from mstar.model.minicpm_o.components.vision import MiniCPMOVision
 
             tower = self._build(lambda: MiniCPMOVision(self.config.vision, self.config.resampler), dtype, device)
             weight_loader.load_vision_weights(tower, weights, device)
-            return submodules.VisionEncoderSubmodule(tower.requires_grad_(False).eval(), self.config)
+            return VisionEncoderSubmodule(tower.requires_grad_(False).eval(), self.config)
         if node_name == AUDIO:
-            from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 
             tower = self._build(lambda: MiniCPMOAudio(self.config.audio), dtype, device)
             weight_loader.load_audio_weights(tower, weights, device)
-            return submodules.AudioEncoderSubmodule(tower.requires_grad_(False).eval(), self.config)
+            return AudioEncoderSubmodule(tower.requires_grad_(False).eval(), self.config)
 
         if node_name == TOKEN2WAV:
             return self._create_token2wav(weights, device)
         if node_name == TTS:
             from mstar.model.loader.iterators import iter_safetensors_shards
-            from mstar.model.minicpm_o.components.tts import MiniCPMTTS
 
             tts = self._build(
                 lambda: MiniCPMTTS(self.tts_config, attn_key=TTS_ATTN, kv_key=TTS_KV, pos_key=TTS_POS),
@@ -840,7 +843,7 @@ class MiniCPMOModel(Model):
                 (name.removeprefix("tts."), tensor)
                 for name, tensor in iter_safetensors_shards(weights, device=device, prefix="tts.")
             )
-            return submodules.TTSSubmodule(tts.requires_grad_(False).eval(), self.config, TTS_SAMPLING)
+            return TTSSubmodule(tts.requires_grad_(False).eval(), self.config, TTS_SAMPLING)
 
         from mstar.model.components.qwen3_lm import Qwen3DenseLM
 
@@ -852,4 +855,4 @@ class MiniCPMOModel(Model):
         )
         weight_loader.load_llm_weights(lm, weights, device)
         logger.info("Loaded MiniCPM-o LLM onto %s", device)
-        return submodules.LLMSubmodule(lm.requires_grad_(False).eval(), self.config)
+        return LLMSubmodule(lm.requires_grad_(False).eval(), self.config)

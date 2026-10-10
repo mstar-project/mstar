@@ -1,34 +1,21 @@
 """MiniCPM-o's token2wav: streamed s3 speech codes -> 24 kHz waveform.
 
-Ported from Step-Audio2's ``Token2wav`` (``stepaudio2/token2wav.py`` in ``minicpmo-utils``,
-Apache-2.0), streaming path (``set_stream_cache`` + ``stream``). Per voice, ``setup`` runs the
-flow over the voice prompt's tokens (plus three silence tokens of lookahead) and mel and keeps
-the resulting caches; a request starts from a copy of them. Each ``stream`` call then turns a
-window of codes into mel (``token2wav_flow``) and the mel into audio (HiFT), cross-fading with
-the previous call's tail.
+Ported from Step-Audio2's ``Token2wav`` streaming path (``set_stream_cache`` + ``stream``,
+``minicpmo-utils``, Apache-2.0). A voice's caches are prepared once by running the flow over
+its prompt; each window of 28 codes (25 new, 3 lookahead; ``stream_windows``) then becomes mel
+(``token2wav_flow``) and audio (HiFT), cross-faded with the previous window's tail.
 
-The caller drives the windows as the reference's ``streaming_generate`` does: three silence
-codes first, 28-code windows advancing by 25 (the last 3 are lookahead), then one final window
-with whatever is left (``stream_windows``).
+Two paths. The per-request one (``stream`` over a ``Token2WavState``) is bit-exact against the
+reference at fp32; serving does not use it, the tests compare against it. The batched one runs
+a window in two captured stages: ``window_flow``, whose attention caches are on bounded KV
+resources (``CACHE_FAMILIES``) so windows at any position batch, and ``window_vocode`` (HiFT),
+which batches a request's first window apart from later ones. It matches the reference to
+summation order and TF32.
 
-All of a request's state is one ``Token2WavState``: fixed-capacity cache tensors plus their
-valid lengths. The lengths only depend on the prompt length and how many windows came before,
-so they are host integers, and every shape an eager call sees is a slice of the slot.
-
-The batched path runs a window in two stages, both captured per batch size. The flow
-(``Token2Wav.window_flow``) keeps its attention caches on the engine's bounded KV resources
-(one per ``CACHE_FAMILIES`` entry), which know each row's position, so windows of any
-position batch together; the conv caches live in a slot of the state pool. HiFT
-(``window_vocode``) takes the slot's held-back frames except on a request's first window,
-so first and later windows batch separately. ``window_finish`` does the inverse STFT and
-cross-fade. On CUDA the DiT runs on fused kernels (``token2wav_kernels``). The result
-matches ``stream`` to summation order (the DiT attends the same keys in another order)
-and TF32.
-
-Randomness: the flow's initial noise is a slice of a fixed buffer (``ChunkCFM.rand_noise``),
-and HiFT draws its excitation per call (``StepAudioHiFT``) from the global RNG unless given a
-generator or the draws themselves.
+The flow's initial noise is a slice of a fixed buffer (``ChunkCFM.rand_noise``); HiFT draws its
+excitation from the global RNG unless given a generator or the draws themselves.
 """
+
 from __future__ import annotations
 
 import math
@@ -60,6 +47,7 @@ from mstar.model.minicpm_o.components.token2wav_flow import (
     UP_RATE,
     BoundedLayerKV,
     DenseKV,
+    FlowKV,
     Token2WavFlow,
 )
 from mstar.model.minicpm_o.components.voice_prompt import (
@@ -139,21 +127,15 @@ class CacheCapacity:
 
 @dataclass(slots=True)
 class Token2WavState:
-    """Everything one request carries between ``stream`` calls on the per-request path (the
-    reference, and how a voice's caches are prepared); the batched path keeps the attention
-    caches on bounded KV resources and the rest in a slot (``slot_layout``). Batch dims of 1
-    are kept so the tensors feed the modules as they are. With ``C1 = P + 77`` and
-    ``C2 = 2P + 154`` for a ``P``-token voice prompt (``CacheCapacity``), float32:
+    """A request's state on the per-request path (and a voice's prepared caches), float32,
+    batch dims of 1 kept. The batched path keeps the attention caches on bounded KV
+    resources and the rest in a slot (``slot_layout``).
 
-    - ``enc_cnn [1, 512, 6]``: the lookahead conv's and the upsampler's left context;
-    - ``enc_kv1 [6, 1, 8, C1, 128]`` / ``enc_kv2 [4, 1, 8, C2, 128]``: the 25 Hz / 50 Hz
-      conformer keys|values, oldest first;
-    - ``dit_cnn [10, 16, 2, 1024, 2]``: per Euler step, per DiT block, for the conditional
-      and unconditional rows, both causal convs' left context;
-    - ``dit_kv [10, 16, 2, 8, C2, 128]``: per Euler step and block, keys|values, newest chunk
-      first (the reference's order). This is ~1.3 MB per frame: ~600 MB at ``P = 151``;
-    - ``hift_mel [1, 80, 8]``, ``hift_source [1, 1, 3840]``, ``hift_speech [1, 3840]``: the
-      previous call's last mel frames, excitation and (un-faded) samples.
+    - ``enc_cnn``, ``dit_cnn``: the conformer's and DiT's conv left context;
+    - ``enc_kv1`` / ``enc_kv2``: the 25 Hz / 50 Hz conformer keys|values, oldest first;
+    - ``dit_kv``: per Euler step and block, keys|values, newest window first;
+    - ``hift_mel``, ``hift_source``, ``hift_speech``: the previous window's last mel frames,
+      excitation and un-faded samples.
     """
 
     enc_cnn: torch.Tensor
@@ -196,20 +178,17 @@ class Token2WavState:
             else:
                 setattr(self, f.name, src)
 
-    def kv_caches(self) -> tuple[list[DenseKV], list[DenseKV], list[list[DenseKV]]]:
-        """The attention caches as the flow takes them: 25 Hz and 50 Hz conformer layers, and
-        per Euler step per DiT block."""
-        return (
+    def kv_caches(self) -> FlowKV:
+        return FlowKV(
             [DenseKV(kv, self.enc_len1) for kv in self.enc_kv1],
             [DenseKV(kv, self.enc_len2) for kv in self.enc_kv2],
             [[DenseKV(kv, self.dit_len) for kv in step] for step in self.dit_kv],
         )
 
     def truncate(self) -> None:
-        """The reference's bound on the 50 Hz caches: past ``2P + 100`` frames keep the first
-        ``2P`` entries and the last 100. The 25 Hz conformer cache is stored by the
-        reference tiled twice along time (so it lines up with the 50 Hz one) and read back as
-        the first half of the truncated tiling; the gather reproduces that."""
+        """The reference's bound: past ``2P + 100`` frames the 50 Hz caches keep their first
+        ``2P`` entries and last 100. The 25 Hz cache follows the reference's tiled layout,
+        which in effect keeps its first ``P + 50``."""
         limit = self.prompt_frames + KEEP_RECENT
         if self.dit_len > limit:
             n = self.dit_len
@@ -345,6 +324,13 @@ class WindowCaches(NamedTuple):
     enc2: AttentionCache
     dit: AttentionCache
 
+    def flow_kv(self) -> FlowKV:
+        return FlowKV(
+            [self.enc1.layer(i) for i in range(ENC_BLOCKS)],
+            [self.enc2.layer(i) for i in range(ENC_UP_BLOCKS)],
+            [[self.dit.layer(step * DIT_DEPTH + i) for i in range(DIT_DEPTH)] for step in range(N_TIMESTEPS)],
+        )
+
 
 class Token2WavVoice(NamedTuple):
     """A voice ready to stream: its prompt, its projected speaker condition and the state a
@@ -361,12 +347,9 @@ class Token2WavVoice(NamedTuple):
 
 
 class SineGen2Source(nn.Module):
-    """Step-Audio2's 24 kHz harmonic source (``SourceModuleHnNSF2`` / ``SineGen2``): the phase
-    is integrated at the mel rate and linearly upsampled, unlike Chatterbox's per-sample
-    ``HarmonicSource``. Its draws, in the reference's order, are an initial phase per
-    harmonic ``[B, H+1]``, Gaussian noise ``[B, L, H+1]`` (drawn as ``[B, H+1, L]``) and a
-    ``[B, L, 1]`` field it discards; they travel as ``HiFTNoise(phase, harmonic)`` in this
-    layout."""
+    """Step-Audio2's 24 kHz harmonic source (``SineGen2``): unlike Chatterbox's
+    ``HarmonicSource``, the phase is integrated at the mel rate and upsampled. Its random
+    draws, in the reference's order, travel as ``HiFTNoise(phase, harmonic)``."""
 
     def __init__(self, config: S3GenHiFTConfig):
         super().__init__()
@@ -460,13 +443,15 @@ class Token2Wav(nn.Module):
         state = Token2WavState.allocate(CacheCapacity(p), device)
         state.prompt_frames = UP_RATE * p
         silence = torch.full((1, LEAD_SILENCE), SILENCE_CODE, dtype=tokens.dtype, device=device)
-        kv1, kv2, dit_kv = state.kv_caches()
         self.flow(
             torch.cat([tokens, silence], dim=1), spk, prompt.mel.to(device).transpose(1, 2).contiguous(), False,
-            state.enc_cnn, kv1, kv2, state.dit_cnn, dit_kv,
+            state.enc_cnn, state.dit_cnn, state.kv_caches(),
         )
         state.enc_len1, state.enc_len2, state.dit_len = p, UP_RATE * p, UP_RATE * p
         return Token2WavVoice(prompt=prompt, spk=spk, initial=state)
+
+    # -- the per-request path: not used in serving; the tests' reference, and where voice
+    # cloning (per-request voices) would start ------------------------------------------
 
     def new_state(self, voice: Token2WavVoice, capacity: CacheCapacity | None = None) -> Token2WavState:
         state = Token2WavState.allocate(
@@ -480,8 +465,7 @@ class Token2Wav(nn.Module):
         self, state: Token2WavState, voice: Token2WavVoice, tokens: torch.Tensor, last: bool,
     ) -> torch.Tensor:
         """``tokens [1, n]`` -> mel ``[1, 80, window_frames(n, last)]``; advances the caches."""
-        kv1, kv2, dit_kv = state.kv_caches()
-        mel = self.flow(tokens, voice.spk, None, last, state.enc_cnn, kv1, kv2, state.dit_cnn, dit_kv)
+        mel = self.flow(tokens, voice.spk, None, last, state.enc_cnn, state.dit_cnn, state.kv_caches())
         frames = mel.shape[2]
         state.enc_len1 += frames // UP_RATE
         state.enc_len2 += frames
@@ -545,14 +529,10 @@ class Token2Wav(nn.Module):
         caches: WindowCaches,
         last: bool = False,
     ) -> torch.Tensor:
-        """The flow for ``B`` windows of one voice, straight on the slot pool: ``tokens [B, n]``
-        -> mel ``[B, 80, frames]``. Rows may be at any window of their request: their
-        attention caches are on the bounded KV resources (``caches``, which know each row's
-        position), and ``fresh [B]`` (bool, device) marks rows whose slot has no state yet
-        (a first window), which read the voice's conv caches instead. ``blocks`` maps each
-        slot field to its pool tensor ``[max_slots, *slot_layout]``, ``slots [B]`` (device)
-        are the rows' slots. A last window writes no caches. Nothing depends on data and
-        nothing syncs, so it can be captured per batch size and replayed."""
+        """The flow for ``B`` windows of one voice at any positions: ``tokens [B, n]`` -> mel
+        ``[B, 80, frames]``. ``caches`` know each row's position; ``fresh [B]`` marks rows on
+        their first window, which read the voice's conv caches rather than their slot's
+        (``blocks``, at ``slots``). A last window writes no caches. Capturable."""
         slots = slots.long()
         b = tokens.shape[0]
         init = voice_blocks(voice)
@@ -564,10 +544,7 @@ class Token2Wav(nn.Module):
         enc_cnn = conv_cache("enc_cnn")
         # guidance rows of a request side by side, as the flow runs them
         dit_cnn = conv_cache("dit_cnn").permute(1, 2, 0, 3, 4, 5).contiguous().flatten(2, 3)
-        kv1 = [caches.enc1.layer(i) for i in range(ENC_BLOCKS)]
-        kv2 = [caches.enc2.layer(i) for i in range(ENC_UP_BLOCKS)]
-        dit_kv = [[caches.dit.layer(step * DIT_DEPTH + i) for i in range(DIT_DEPTH)] for step in range(N_TIMESTEPS)]
-        mel = self.flow(tokens, voice.spk.expand(b, -1), None, last, enc_cnn, kv1, kv2, dit_cnn, dit_kv)
+        mel = self.flow(tokens, voice.spk.expand(b, -1), None, last, enc_cnn, dit_cnn, caches.flow_kv())
         if not last:
             blocks["enc_cnn"].index_copy_(0, slots, enc_cnn)
             blocks["dit_cnn"].index_copy_(0, slots, dit_cnn.unflatten(2, (b, 2)).permute(2, 0, 1, 3, 4, 5))
@@ -583,10 +560,9 @@ class Token2Wav(nn.Module):
         last: bool = False,
         noise: HiFTNoise | None = None,
     ) -> dict[str, torch.Tensor]:
-        """HiFT up to its output spectrum for ``B`` windows' mel, after the slot's held-back
-        frames unless it is the rows' ``first`` window (its input is then shorter, so first
-        and later windows do not batch). HiFT's excitation comes from the global RNG unless
-        ``noise`` (``[B]`` rows) is given. Finish with ``window_finish``."""
+        """HiFT up to its output spectrum for ``B`` windows' mel, prefixed by the slot's
+        held-back frames unless they are their requests' ``first`` (a shorter input, so the
+        two do not batch). Finish with ``window_finish``."""
         slots = slots.long()
         if first:
             hift_mel, cache_source = mel, None
