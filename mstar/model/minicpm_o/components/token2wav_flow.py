@@ -8,9 +8,8 @@ Ported from Step-Audio2's ``CausalMaskedDiffWithXvec`` (``cosyvoice2/flow/flow.p
 The reference keeps its streaming caches in buffers shared by every caller. Here every
 attention layer is handed a ``KVCache`` saying where its keys|values live: ``DenseKV`` over a
 request's own cache tensor (any window, one request; ops, operand layouts and concatenation
-orders follow the reference so the result is bit-identical), ``PoolKV`` straight over the rows
-of a slot pool (the conformer's caches for a batch of windows, gathered and scattered by slot
-index so it can be captured), or ``RingKV`` (the DiT's caches on the pool, updated in place).
+orders follow the reference so the result is bit-identical), or ``BoundedLayerKV`` on the
+engine's bounded KV resource (a batch of windows at any positions, capturable).
 
 Classifier-free guidance runs the conditional and unconditional rows of a request side by side
 (rows ``2b`` and ``2b + 1``), which is also how the DiT caches store them.
@@ -79,12 +78,10 @@ class DenseKV(KVCache):
 
 class BoundedLayerKV(KVCache):
     """A DiT layer's cache on the engine's bounded KV resource: ``plan`` is this
-    batch's rows of the step's layout, ``source [2, H, 2P, 2d]`` the layer's voice in
-    stream order (``token2wav.dit_source``). ``length`` is how many entries the rows
-    retain, as the flow's noise offset."""
+    batch's rows of the step's layout, ``source [rows, H, L, 2d]`` the layer's voice
+    in stream order (``token2wav.CACHE_FAMILIES``). Rows may be at different positions."""
 
-    def __init__(self, resource, layer_idx: int, source: torch.Tensor, plan, length: int):
-        self.length = length
+    def __init__(self, resource, layer_idx: int, source: torch.Tensor, plan):
         self.resource = resource
         self.layer_idx = layer_idx
         self.source = source
@@ -300,10 +297,11 @@ class StreamingTokenEncoder(nn.Module):
         chunk, whose lookahead is zero padding). ``cnn_cache [B, 512, 6]`` (updated in place);
         ``kv1`` / ``kv2``: one cache per 25 Hz / 50 Hz layer. The reference positions the 25 Hz
         stage at ``len2 // 2``, which equals ``len1`` because ``len2 == 2 * len1`` on entry."""
-        len1, len2 = kv1[0].length, kv2[0].length
-        assert len2 == UP_RATE * len1, (len1, len2)
         # on bounded caches each row's positions come from its own plan
         bounded = isinstance(kv1[0], BoundedLayerKV)
+        if not bounded:
+            len1, len2 = kv1[0].length, kv2[0].length
+            assert len2 == UP_RATE * len1, (len1, len2)
         xs = self.embed(xs)
         if last_chunk:
             xs = F.pad(xs, (0, 0, 0, PRE_LOOKAHEAD))
@@ -568,10 +566,16 @@ class ChunkCFM(nn.Module):
         kv: list[list[KVCache]],
     ) -> torch.Tensor:
         """``mu, cond [B, 80, T]``, ``spks [B, 80]``; ``cnn_cache [steps, depth, 2B, 1024, 2]``
-        and ``kv`` (per step, per block) over the ``2B`` guidance rows. Every row has the same
-        cache length, which is also the noise offset."""
-        b, n_cached = mu.shape[0], kv[0][0].length
-        x = self.rand_noise[:, :, n_cached:n_cached + mu.size(2)].expand(b, -1, -1) * 1.0
+        and ``kv`` (per step, per block) over the ``2B`` guidance rows. A row's cache length
+        is its noise offset: shared by the rows of dense caches, per row on bounded ones."""
+        b, t = mu.shape[0], mu.size(2)
+        if isinstance(kv[0][0], BoundedLayerKV):
+            offsets = kv[0][0].plan.retained()[:b].long()
+            index = offsets[:, None] + torch.arange(t, device=mu.device)
+            x = self.rand_noise[0][:, index].transpose(0, 1).contiguous()
+        else:
+            n_cached = kv[0][0].length
+            x = self.rand_noise[:, :, n_cached:n_cached + t].expand(b, -1, -1) * 1.0
         consts = self.constants(mu.device, mu.dtype)
         mods, finals = consts.mods, consts.finals
         if mods.shape[-3] != 1 and b != 1:

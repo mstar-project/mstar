@@ -43,6 +43,7 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
+from mstar.model.minicpm_o.components.token2wav_flow import MEL_BINS as MEL_BINS_T2W
 from mstar.model.minicpm_o.components.token2wav_flow import UP_RATE as UP_RATE_T2W
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
@@ -824,31 +825,29 @@ class Token2WavSubmodule(NodeSubmodule):
         )
 
     @staticmethod
-    def window_region(voice: str, phase: int) -> str:
-        return f"t2w/{voice}/{phase}"
+    def flow_region(voice: str, num_tokens: int, last: bool) -> str:
+        return f"t2w/{voice}/flow{'_last' if last else ''}{num_tokens}"
 
     @staticmethod
-    def last_window_region(voice: str, num_tokens: int) -> str:
-        return f"t2w/{voice}/last{num_tokens}"
+    def hift_region(first: bool, frames: int, last: bool) -> str:
+        return f"t2w/hift/{'first' if first else 'next'}{'_last' if last else ''}{frames}"
 
     def get_piecewise_cuda_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
-        from mstar.model.minicpm_o.components.token2wav import (
-            LAST_WINDOW_TOKENS,
-            PHASE_FIRST,
-            PHASE_SECOND,
-            PHASE_STEADY,
-            WINDOW,
-            phase_lengths,
-        )
+        from mstar.model.minicpm_o.components.token2wav import LAST_WINDOW_TOKENS, WINDOW, window_frames
 
-        def static_inputs(num_tokens: int):
+        def static_tokens(num_tokens: int):
             def make(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
                 return {"tokens": torch.zeros(shape.bs, num_tokens, dtype=torch.int32, device=device)}
             return make
 
-        def declare_step_for(voice_name: str, last: bool):
+        def static_mel(frames: int):
+            def make(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
+                return {"mel": torch.zeros(shape.bs, MEL_BINS_T2W, frames, device=device)}
+            return make
+
+        def declare_flow(voice_name: str, last: bool):
             def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
                 n = len(request_ids)
                 return SubmoduleStep(
@@ -860,39 +859,75 @@ class Token2WavSubmodule(NodeSubmodule):
                 )
             return declare_step
 
-        def region(voice_name, voice, phase, last):
-            lengths = phase_lengths(voice.initial.prompt_frames, phase)
+        def declare_hift(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
+            return SubmoduleStep(
+                segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
+                steps={T2W_STATE: RecurrentStep()},
+            )
+
+        def flow(voice_name: str, last: bool):
+            voice = self.voices[voice_name]
 
             def capture(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
                 pool = call.resources[T2W_STATE]
                 tokens = call.static_inputs["tokens"]
+                rows = pool.addressing("main")
                 plans = {name: call.resources[key].current for name, key in T2W_KV.items()}
-                return self.model.window_spectrum(
+                return {"mel": self.model.window_flow(
                     {name: pool.block(name, 0) for name in pool.config.blocks},
-                    pool.addressing("main").slot_indices[: tokens.shape[0]],
-                    voice, lengths, tokens, self._caches(call.resources, voice_name, plans), last,
+                    rows.slot_indices[: tokens.shape[0]], ~rows.has_state[: tokens.shape[0]],
+                    voice, tokens, self._caches(call.resources, voice_name, plans), last,
+                )}
+            return capture
+
+        def hift(first: bool, last: bool):
+            def capture(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+                pool = call.resources[T2W_STATE]
+                mel = call.static_inputs["mel"]
+                return self.model.window_vocode(
+                    {name: pool.block(name, 0) for name in pool.config.blocks},
+                    pool.addressing("main").slot_indices[: mel.shape[0]], mel, first, last,
                 )
             return capture
 
         configs = {}
-        for name, voice in self.voices.items():
-            for phase in (PHASE_FIRST, PHASE_SECOND, PHASE_STEADY):
-                configs[self.window_region(name, phase)] = PiecewiseBatchedConfig(
-                    capture_fn=region(name, voice, phase, last=False),
-                    make_static_inputs=static_inputs(WINDOW),
-                    declare_step=declare_step_for(name, last=False),
-                    seq_len=WINDOW,
-                    capture_batch_sizes=self.WINDOW_CAPTURE_BATCH_SIZES,
-                )
-            # a reply's last window, entering after at least two full ones
+        # Full windows at any position of any request, one graph per batch size; a
+        # request's last window (after at least one full one) has one of HOP lengths
+        # and rarely meets another of its length, so those are captured for one row.
+        for name in self.voices:
+            configs[self.flow_region(name, WINDOW, False)] = PiecewiseBatchedConfig(
+                capture_fn=flow(name, last=False),
+                make_static_inputs=static_tokens(WINDOW),
+                declare_step=declare_flow(name, last=False),
+                seq_len=WINDOW,
+                capture_batch_sizes=self.WINDOW_CAPTURE_BATCH_SIZES,
+            )
             for n in LAST_WINDOW_TOKENS:
-                configs[self.last_window_region(name, n)] = PiecewiseBatchedConfig(
-                    capture_fn=region(name, voice, PHASE_STEADY, last=True),
-                    make_static_inputs=static_inputs(n),
-                    declare_step=declare_step_for(name, last=True),
+                configs[self.flow_region(name, n, True)] = PiecewiseBatchedConfig(
+                    capture_fn=flow(name, last=True),
+                    make_static_inputs=static_tokens(n),
+                    declare_step=declare_flow(name, last=True),
                     seq_len=n,
                     capture_batch_sizes=self.LAST_CAPTURE_BATCH_SIZES,
                 )
+        full = window_frames(WINDOW, False)
+        for first in (True, False):
+            configs[self.hift_region(first, full, False)] = PiecewiseBatchedConfig(
+                capture_fn=hift(first, last=False),
+                make_static_inputs=static_mel(full),
+                declare_step=declare_hift,
+                seq_len=full,
+                capture_batch_sizes=self.WINDOW_CAPTURE_BATCH_SIZES,
+            )
+        for n in LAST_WINDOW_TOKENS:
+            frames = window_frames(n, True)
+            configs[self.hift_region(False, frames, True)] = PiecewiseBatchedConfig(
+                capture_fn=hift(first=False, last=True),
+                make_static_inputs=static_mel(frames),
+                declare_step=declare_hift,
+                seq_len=frames,
+                capture_batch_sizes=self.LAST_CAPTURE_BATCH_SIZES,
+            )
         return configs
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
@@ -912,64 +947,84 @@ class Token2WavSubmodule(NodeSubmodule):
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, rows: list, **kwargs,
     ) -> dict[str, NameToTensorList]:
-        from mstar.model.minicpm_o.components.token2wav import (
-            PHASE_STEADY,
-            entering_phase,
-            state_lengths,
-            window_batch_key,
-        )
+        """Each window in two stages: the flow, batched over every row of one voice and
+        window length whatever its position, then HiFT, batched over rows that are all
+        or none their request's first window."""
+        from mstar.model.minicpm_o.components.token2wav import lengths_after, state_lengths
 
-        # Rows of one voice with the same window_batch_key run as one batch: a
-        # captured phase when one fits, else the same computation eagerly.
-        # Each row advances its own lengths.
-        groups: dict[tuple, list[tuple[str, torch.Tensor, dict[str, int]]]] = {}
+        pool = engine_inputs.resources[T2W_STATE]
+        blocks = {name: pool.block(name, 0) for name in pool.config.blocks}
+        # the node step's layouts, before a captured region plans its own
+        node_plans = {name: engine_inputs.resources[key].current for name, key in T2W_KV.items()}
+        node_rows = {rid: i for i, rid in enumerate(engine_inputs.request_ids)}
+
+        lengths, num_tokens, flows = {}, {}, {}
         for rid, (codes, last, voice_name) in zip(engine_inputs.request_ids, rows, strict=True):
             req = self.request_state(rid)
-            lengths = req["lengths"] if "lengths" in req else state_lengths(self.voices[voice_name].initial)
-            key = (voice_name, *window_batch_key(lengths, codes.shape[1], last))
-            groups.setdefault(key, []).append((rid, codes, lengths))
-        pool = engine_inputs.resources[T2W_STATE]
-        # the node step's layouts, before a captured region plans its own
-        self._node_plans = {name: engine_inputs.resources[key].current for name, key in T2W_KV.items()}
-        self._node_rows = {rid: i for i, rid in enumerate(engine_inputs.request_ids)}
+            lengths[rid] = req["lengths"] if "lengths" in req else state_lengths(self.voices[voice_name].initial)
+            num_tokens[rid] = codes.shape[1]
+            flows.setdefault((voice_name, codes.shape[1], last), []).append((rid, codes))
+
+        mels, hifts = {}, {}
+        for (voice_name, n, last), group in flows.items():
+            region = self.flow_region(voice_name, n, last)
+            for chunk in self._chunks(engine_inputs, region, group, last):
+                rids = [rid for rid, _ in chunk]
+                tokens = torch.cat([codes for _, codes in chunk])
+                mel = self._run_flow(
+                    engine_inputs, pool, blocks, node_plans, node_rows, voice_name, region, rids, tokens,
+                    [lengths[rid]["calls"] == 0 for rid in rids], last,
+                )
+                for i, rid in enumerate(rids):
+                    mels[rid] = mel[i]
+                    first = lengths[rid]["calls"] == 0
+                    hifts.setdefault((first, mel.shape[-1], last), []).append(rid)
+
         out = {}
-        for key, group in groups.items():
-            voice_name, phase, shared, num_tokens, last = key
-            shared = dict(shared)
-            if phase is not None:
-                region, cap = self.window_region(voice_name, phase), self.WINDOW_CAPTURE_BATCH_SIZES[-1]
-            elif last and entering_phase(shared) == PHASE_STEADY:
-                region, cap = self.last_window_region(voice_name, num_tokens), self.LAST_CAPTURE_BATCH_SIZES[-1]
-            else:
-                region, cap = None, len(group)
-            for i in range(0, len(group), cap):
-                out.update(self._windows(engine_inputs, pool, voice_name, region, shared, last, group[i:i + cap]))
+        for (first, frames, last), rids in hifts.items():
+            region = self.hift_region(first, frames, last)
+            for chunk in self._chunks(engine_inputs, region, rids, last):
+                mel = torch.stack([mels[rid] for rid in chunk])
+                slots = self._slots(pool, chunk, mel.device)
+                runner = engine_inputs.piecewise_runners.get(region)
+                if runner is not None and runner.can_run(len(chunk)):
+                    spectrum = runner.run(static_inputs={"mel": mel}, request_ids=chunk, real_bs=len(chunk))
+                    magnitude, phase = spectrum.get_view("magnitude"), spectrum.get_view("phase")
+                else:
+                    spectrum = self.model.window_vocode(blocks, slots, mel, first, last)
+                    magnitude, phase = spectrum["magnitude"], spectrum["phase"]
+                wav = self.model.window_finish(blocks, slots, magnitude, phase, first, last)
+                for i, rid in enumerate(chunk):
+                    req = self.request_state(rid)
+                    req.add("lengths", lengths_after(lengths[rid], num_tokens[rid], last))
+                    req.add("started", True)
+                    out[rid] = {"audio_chunk": [wav[i]]}
         return out
+
+    def _chunks(self, engine_inputs, region: str, group: list, last: bool) -> list[list]:
+        """``group`` in batches its captured region can replay (all of it when uncaptured)."""
+        runner = engine_inputs.piecewise_runners.get(region)
+        if runner is None or not runner.any_graphs:
+            return [group]
+        cap = (self.LAST_CAPTURE_BATCH_SIZES if last else self.WINDOW_CAPTURE_BATCH_SIZES)[-1]
+        return [group[i:i + cap] for i in range(0, len(group), cap)]
+
+    @staticmethod
+    def _slots(pool, rids: list[str], device) -> torch.Tensor:
+        return torch.tensor([pool.slot_index(rid) for rid in rids], dtype=torch.long, device=device)
 
     @torch.compiler.disable
-    def _windows(self, engine_inputs, pool, voice_name, region, lengths, last, group) -> dict[str, NameToTensorList]:
-        from mstar.model.minicpm_o.components.token2wav import lengths_after
-
-        rids = [rid for rid, _, _ in group]
-        tokens = torch.cat([codes for _, codes, _ in group])
-        blocks = {name: pool.block(name, 0) for name in pool.config.blocks}
-        slots = torch.tensor([pool.slot_index(rid) for rid in rids], dtype=torch.long, device=tokens.device)
-        voice = self.voices[voice_name]
-        runner = None if region is None else engine_inputs.piecewise_runners.get(region)
+    def _run_flow(
+        self, engine_inputs, pool, blocks, node_plans, node_rows, voice_name, region, rids, tokens, fresh, last,
+    ) -> torch.Tensor:
+        runner = engine_inputs.piecewise_runners.get(region)
         if runner is not None and runner.can_run(len(rids)):
-            spectrum = runner.run(static_inputs={"tokens": tokens}, request_ids=rids, real_bs=len(rids))
-            wav = self.model.window_finish(
-                blocks, slots, spectrum.get_view("magnitude"), spectrum.get_view("phase"), lengths, last,
-            )
-        else:
-            rows = [self._node_rows[rid] for rid in rids]
-            plans = {name: plan.select(rows) for name, plan in self._node_plans.items()}
-            caches = self._caches(engine_inputs.resources, voice_name, plans)
-            wav = self.model.stream_batched(blocks, slots, voice, lengths, tokens, caches, last)
-        out = {}
-        for i, (rid, _, row_lengths) in enumerate(group):
-            req = self.request_state(rid)
-            req.add("lengths", lengths_after(row_lengths, tokens.shape[1], last))
-            req.add("started", True)
-            out[rid] = {"audio_chunk": [wav[i]]}
-        return out
+            # copied out: the next replay of this region reuses the buffer
+            return runner.run(static_inputs={"tokens": tokens}, request_ids=rids, real_bs=len(rids)).get_view(
+                "mel").clone()
+        rows = [node_rows[rid] for rid in rids]
+        plans = {name: plan.select(rows) for name, plan in node_plans.items()}
+        return self.model.window_flow(
+            blocks, self._slots(pool, rids, tokens.device), torch.tensor(fresh, device=tokens.device),
+            self.voices[voice_name], tokens, self._caches(engine_inputs.resources, voice_name, plans), last,
+        )

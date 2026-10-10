@@ -18,9 +18,6 @@ import torch
 from mstar.model.minicpm_o.components.token2wav import (
     HIFT_TAIL,
     KEEP_RECENT,
-    PHASE_FIRST,
-    PHASE_SECOND,
-    PHASE_STEADY,
     CacheCapacity,
     SineGen2Source,
     Token2Wav,
@@ -32,9 +29,7 @@ from mstar.model.minicpm_o.components.token2wav import (
     state_from_slot,
     state_lengths,
     stream_windows,
-    window_batch_key,
     window_frames,
-    window_phase,
     window_samples,
 )
 from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt, _module_path
@@ -262,30 +257,12 @@ def test_stream_shapes_and_capacity_independence(random_token2wav):
     assert torch.equal(outs[0], outs[1])
 
 
-def test_window_phase_and_lengths():
-    p2 = 302
-    fresh = {"prompt_frames": p2, "enc_len1": 151, "enc_len2": 302, "dit_len": 302, "calls": 0}
-    phases, lengths = [], fresh
-    for _ in range(5):
-        phases.append(window_phase(lengths, 28, False))
-        lengths = lengths_after(lengths, 28, False)
-    assert phases == [PHASE_FIRST, PHASE_SECOND, PHASE_STEADY, PHASE_STEADY, PHASE_STEADY]
-    assert lengths == {"prompt_frames": p2, "enc_len1": 201, "enc_len2": 402, "dit_len": 402, "calls": 5}
-    assert window_phase(lengths, 28, True) is None and window_phase(lengths, 20, False) is None
-    small = {"prompt_frames": 60, "enc_len1": 30, "enc_len2": 60, "dit_len": 60, "calls": 0}
-    assert window_phase(small, 28, False) is None
-
-
-def test_steady_windows_share_a_batch_key():
+def test_lengths_after():
     p2 = 302
     lengths = {"prompt_frames": p2, "enc_len1": 151, "enc_len2": 302, "dit_len": 302, "calls": 0}
-    keys = []
-    for _ in range(6):
-        keys.append(window_batch_key(lengths, 28, False))
+    for _ in range(5):
         lengths = lengths_after(lengths, 28, False)
-    assert len({keys[0], keys[1], keys[2]}) == 3
-    assert keys[2] == keys[3] == keys[4] == keys[5]
-    assert window_batch_key(lengths, 9, True) != window_batch_key(lengths, 10, True)
+    assert lengths == {"prompt_frames": p2, "enc_len1": 201, "enc_len2": 402, "dit_len": 402, "calls": 5}
 
 
 def test_lengths_after_matches_state(random_token2wav):
@@ -374,9 +351,10 @@ def test_batched_windows_on_pool(random_token2wav, device):
         want = model.vocode_chunk(ref, mel, last, noise=row0)
         tokens = torch.tensor([win], dtype=torch.int32, device=device)
         kv, commit = kv_steps.window(["r0"], len(win), last)
-        out = model.window_spectrum(blocks, one, voice, lengths, tokens, kv, last, row0)
+        first = lengths["calls"] == 0
+        out = model.window_spectrum(blocks, one, voice, first, tokens, kv, last, row0)
         commit()
-        got = model.window_finish(blocks, one, out["magnitude"], out["phase"], lengths, last)
+        got = model.window_finish(blocks, one, out["magnitude"], out["phase"], first, last)
         torch.testing.assert_close(out["mel"], mel, **tol)
         torch.testing.assert_close(got, want, **tol)
         if not last:
@@ -385,17 +363,25 @@ def test_batched_windows_on_pool(random_token2wav, device):
         mels.append(mel)
         noises.append(nz)
 
+    # The same utterance in two rows two windows apart, their full windows' flow in one
+    # batch: rows at different positions (a first window beside a later one, then
+    # rows on either side of the caches' bound) each match the one-row run.
     for t in blocks.values():
         t.zero_()
     kv_steps = _CacheSteps(voice, 3, device)
-    lengths = state_lengths(voice.initial)
-    for k, ((w0, last), (w1, _)) in enumerate(zip(wins[0], wins[1], strict=True)):
-        tokens = torch.tensor([w0, w1], dtype=torch.int32, device=device)
-        kv, commit = kv_steps.window(["a", "b"], len(w0), last)
-        out = model.window_spectrum(blocks, two, voice, lengths, tokens, kv, last, noises[k])
+    full = [win for win, last in wins[0] if not last]
+    lag = 2
+    for k in range(len(full) + lag):
+        rows = [(r, k - off) for r, off in (("a", 0), ("b", lag)) if 0 <= k - off < len(full)]
+        rids = [r for r, _ in rows]
+        tokens = torch.tensor([full[w] for _, w in rows], dtype=torch.int32, device=device)
+        fresh = torch.tensor([w == 0 for _, w in rows], device=device)
+        slots = torch.tensor([1 if r == "a" else 2 for r in rids], device=device)
+        kv, commit = kv_steps.window(rids, len(full[0]), False)
+        mel = model.window_flow(blocks, slots, fresh, voice, tokens, kv)
         commit()
-        torch.testing.assert_close(out["mel"][:1], mels[k], **tol)
-        lengths = lengths_after(lengths, len(w0), last)
+        for i, (_, w) in enumerate(rows):
+            torch.testing.assert_close(mel[i:i + 1], mels[w], **tol)
 
 
 def test_onnx_scope_paths():

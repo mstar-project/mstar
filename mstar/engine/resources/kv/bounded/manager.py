@@ -17,6 +17,7 @@ from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInf
 from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec, BoundedKVStep
 from mstar.engine.resources.kv.bounded.layout import (
     EMPTY_ROW,
+    NUM_READS,
     READ_FROM_SOURCE,
     ROW_INTS,
     RowLayout,
@@ -32,6 +33,10 @@ class BoundedPlan(NamedTuple):
     table: torch.Tensor  # [>= rows, ROW_INTS] int32
     # (slot, layout) per row, padding included; what the table holds
     rows: tuple[tuple[int, RowLayout], ...]
+
+    def retained(self) -> torch.Tensor:
+        """Each row's retained keys before its step, ``[rows]`` int32 on the device."""
+        return self.table[: len(self.rows), 2:2 + 2 * NUM_READS:2].sum(1)
 
     def select(self, rows: list[int]) -> "BoundedPlan":
         """These rows of the plan, for a forward that runs a subset of its batch."""
