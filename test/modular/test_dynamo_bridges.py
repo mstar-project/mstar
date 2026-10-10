@@ -454,6 +454,42 @@ def test_chat_reaches_the_server_with_its_prompt_parts(tmp_path):
     ], "the bridge dropped the prompt parts, so the chat reaches the model as one user turn"
 
 
+def _chat_through_bridge(server, fields):
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["qwen3_omni"], "q3o")
+
+    async def run():
+        return [out async for out in bridge.generate({
+            "messages": [{"role": "user", "content": "Weather in Paris?"}], **fields,
+        }, _Ctx())]
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize("fields", [
+    {"tools": [{"type": "function", "function": {"name": "get_weather"}}]},
+    {"tool_choice": "required"},
+    {"tool_choice": {"type": "function", "function": {"name": "get_weather"}}},
+], ids=["tools", "required", "named"])
+def test_a_chat_that_asks_for_a_tool_call_is_a_400_with_the_adapters_message(tmp_path, fields):
+    """Stripped before the adapter, the fields left a chat that ran and answered in plain text.
+
+    Dynamo's worker sends the client the ``code`` and ``message`` it finds on the exception.
+    """
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    with pytest.raises(ValueError) as refused:
+        _chat_through_bridge(server, fields)
+    assert (refused.value.code, refused.value.message) == (400, "tool calling is not supported for this model"), (
+        "the client gets a 400 without the adapter's own message"
+    )
+    assert not server.submitted, "the chat reached the model, which answers in plain text"
+
+
+def test_the_tool_fields_clients_send_by_default_reach_the_model(tmp_path):
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    _chat_through_bridge(server, {"tools": [], "tool_choice": "auto"})
+    assert server.submitted, "a client's default tool fields refused a plain chat"
+
+
 def test_images_cancel_before_first_chunk(tmp_path):
     # Media requests emit nothing until nearly done; a client that goes
     # away mid-generation must still cancel promptly.

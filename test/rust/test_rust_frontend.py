@@ -503,6 +503,56 @@ def test_nonstreaming_backend_error_maps_to_real_status():
         assert code == 400, (code, body)
 
 
+_EDIT_BOUNDARY = "----editboundary"
+_EDIT_FORM = (
+    f'--{_EDIT_BOUNDARY}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\nmake it neon\r\n'
+    f'--{_EDIT_BOUNDARY}\r\nContent-Disposition: form-data; name="image"; filename="in.png"\r\n'
+    f"Content-Type: image/png\r\n\r\nPNG\r\n--{_EDIT_BOUNDARY}--\r\n"
+).encode()
+
+
+def _error_of(port, path, body):
+    """POST ``body`` (JSON, or the image edit's form as bytes); return the
+    OpenAI error object, from the stream's error event when it streams."""
+    if isinstance(body, bytes):
+        data, ctype = body, f"multipart/form-data; boundary={_EDIT_BOUNDARY}"
+    else:
+        data, ctype = json.dumps(body).encode(), "application/json"
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=data, headers={"Content-Type": ctype})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            lines = r.read().decode().splitlines()
+            return [json.loads(ln[6:]) for ln in lines if ln.startswith("data: {")][-1]["error"]
+    except urllib.error.HTTPError as e:
+        error = json.loads(e.read())["error"]
+        assert e.code == error["code"], (e.code, error)
+        return error
+
+
+_CHAT = {"messages": [{"role": "user", "content": "hi"}]}
+
+
+@pytest.mark.parametrize("status,error_type", [(400, "invalid_request_error"), (500, "server_error")])
+@pytest.mark.parametrize("model,path,body", [
+    ("qwen3_omni", "/v1/chat/completions", {"model": "qwen3_omni", **_CHAT}),
+    ("qwen3_omni", "/v1/chat/completions", {"model": "qwen3_omni", **_CHAT, "stream": True}),
+    ("qwen3_omni", "/v1/audio/speech", {"model": "qwen3_omni", "input": "hi"}),
+    ("cosmos3", "/v1/images/generations", {"model": "cosmos3", "prompt": "a cat"}),
+    ("cosmos3", "/v1/videos/generations", {"model": "cosmos3", "prompt": "a cat"}),
+    ("bagel", "/v1/images/edits", _EDIT_FORM),
+], ids=["chat", "chat-stream", "speech", "images", "videos", "edits"])
+def test_a_backend_error_is_typed_by_its_status(model, path, body, status, error_type):
+    """A 400 the backend reports (a ``ValueError`` in the data worker) is the
+    request's fault, as the Python server types it; ``server_error`` says the
+    opposite."""
+    stub = _ErrorChunkStub(status)
+    with _model_stack(model, stub) as (port, _up):
+        error = _error_of(port, path, body)
+    assert stub.submitted, "the frontend refused the request before the backend saw it"
+    assert (error["code"], error["type"]) == (status, error_type), "the error type ignores the status"
+
+
 def test_images_generations_on_cosmos3():
     """Cosmos3 also serves `/v1/images/generations` (text-to-image)."""
     import base64

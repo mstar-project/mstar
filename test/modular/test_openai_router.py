@@ -421,6 +421,32 @@ def test_image_routes_report_validation_errors_as_400(client_and_stub):
     )
     assert resp.status_code == 400
 
+
+def _refuse(**kw):
+    raise ValueError("size must be 'WxH'")
+
+
+@pytest.mark.parametrize("model,path,body", [
+    ("bagel", "/v1/chat/completions", {"json": {"messages": [{"role": "tool", "content": "sunny"}]}}),
+    ("orpheus", "/v1/audio/speech", {"json": {"input": "hi", "response_format": "xyz"}}),
+    ("whisper_large", "/v1/audio/transcriptions",
+     {"data": {"long_form": "xyz"}, "files": {"file": ("a.wav", b"RIFF", "audio/wav")}}),
+    ("bagel", "/v1/images/generations", {"json": {"prompt": "a cat"}}),
+    ("bagel", "/v1/images/edits",
+     {"data": {"prompt": "make it neon"}, "files": {"image": ("in.png", b"\x89PNGinput", "image/png")}}),
+    ("wan22", "/v1/videos/generations", {"json": {"prompt": "x", "video": "data:video/mp4;base64,AAAA"}}),
+], ids=["chat", "speech", "transcriptions", "images", "edits", "videos"])
+def test_every_route_calls_a_400_an_invalid_request_error(client_and_stub, model, path, body):
+    """OpenAI types a 400 ``invalid_request_error``: the request is at fault, and sending it again gets the same
+    400. ``server_error`` says the opposite."""
+    client, stub = client_and_stub
+    stub.model_name = model
+    stub.submit_request = _refuse  # bagel's image adapters refuse no field, so its routes refuse at submit
+    r = client.post(path, **body)
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error", "a 400 reads as the server's fault"
+
+
 def test_audio_voices_lists_model_voices(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "orpheus"

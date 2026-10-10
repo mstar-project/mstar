@@ -694,6 +694,48 @@ mod tests {
         assert_eq!(err, "a message's role must be system, developer, user or assistant, not 'tool'");
     }
 
+    fn chat_with(fields: &str) -> ChatCompletionRequest {
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"Hi."}}],{fields}}}"#);
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[test]
+    fn a_chat_that_asks_for_a_tool_call_is_refused() {
+        for fields in [
+            r#""tools":[{"type":"function","function":{"name":"get_weather"}}]"#,
+            r#""tool_choice":"required""#,
+            r#""tool_choice":{"type":"function","function":{"name":"get_weather"}}"#,
+            r#""functions":[{"name":"get_weather"}]"#,
+            r#""function_call":{"name":"get_weather"}"#,
+        ] {
+            for adapter in [Adapter::Bagel, Adapter::Qwen3Omni] {
+                let err = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
+                assert_eq!(err, "tool calling is not supported for this model", "{fields} reached {adapter:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_tool_fields_clients_send_by_default_pass() {
+        for fields in [
+            r#""tools":[]"#,
+            r#""tools":null"#,
+            r#""tool_choice":"none""#,
+            r#""tool_choice":"auto""#,
+            r#""tool_choice":null"#,
+            r#""functions":[]"#,
+            r#""functions":null"#,
+            r#""function_call":"none""#,
+            r#""function_call":"auto""#,
+            r#""function_call":null"#,
+        ] {
+            for adapter in [Adapter::Bagel, Adapter::Qwen3Omni] {
+                let args = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
+                assert!(args.is_ok(), "{fields} refused a plain chat on {adapter:?}");
+            }
+        }
+    }
+
     #[test]
     fn an_attachment_keeps_its_place_between_text() {
         let (text, file_paths, in_mods, parts) = flatten(

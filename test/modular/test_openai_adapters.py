@@ -162,6 +162,36 @@ def test_extra_body_passthrough(tmp_path):
     assert sa.model_kwargs.get("think_mode") is True
 
 
+_CHAT_ADAPTERS = [
+    adapters.BagelAdapter, adapters.Qwen3OmniAdapter, adapters.Qwen3_5Adapter, adapters.Cosmos3EdgeAdapter,
+]
+_FUNCTION = {"name": "get_weather"}
+_NAMED = {"type": "function", "function": _FUNCTION}
+
+
+@pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
+@pytest.mark.parametrize("fields", [
+    {"tools": [_NAMED]}, {"tool_choice": "required"}, {"tool_choice": _NAMED},
+    {"functions": [_FUNCTION]}, {"function_call": _FUNCTION},
+], ids=["tools", "required", "named", "functions", "function_call"])
+def test_a_chat_that_asks_for_a_tool_call_is_refused(tmp_path, adapter, fields):
+    """Plain text back would read as the model declining the tool. The ValueError is what makes it a 400."""
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "Weather in Paris?"}], **fields)
+    with pytest.raises(ValueError, match="^tool calling is not supported for this model$"):
+        adapter().chat_to_request(req, tmp_path)
+
+
+@pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
+@pytest.mark.parametrize("fields", [
+    {"tools": []}, {"tools": None}, {"tool_choice": "none"}, {"tool_choice": "auto"}, {"tool_choice": None},
+    {"functions": []}, {"functions": None}, {"function_call": "none"}, {"function_call": "auto"},
+    {"function_call": None},
+], ids=lambda f: "=".join(map(str, *f.items())))
+def test_the_tool_fields_clients_send_by_default_pass(tmp_path, adapter, fields):
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
+    assert adapter().chat_to_request(req, tmp_path).text == "hi", "a client's default tool fields refused a plain chat"
+
+
 def test_qwen3_chat_audio_url_input(tmp_path):
     raw = b"RIFFfakewavbytes"
     url = "data:audio/wav;base64," + base64.b64encode(raw).decode()
