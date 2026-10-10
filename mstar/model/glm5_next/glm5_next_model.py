@@ -34,7 +34,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, PrefixStream
 from mstar.model.glm5_next.config import (
     ATTN,
     KDA,
@@ -199,6 +199,17 @@ class Glm5NextModel(Model):
     # Model ABC: KV cache config
     # -------------------------------------------------------------------
 
+    def checkpoint_path(self) -> str | None:
+        return self._resolve_checkpoint()
+
+    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+        """Under dsa_long_context the prompt's ids key the MLA cache and the KDA state's
+        snapshots beside it: a hit needs both. Replies are not keyed, as GLM-5.2's."""
+        if not self.config.dsa_long_context:
+            return {}
+        stream = PrefixStream("text_inputs", "ids", "prefill")
+        return {KV_CACHE: {"main": stream}, KDA_STATE: {"main": stream}}
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """The LLM node's five resources."""
         num_kv_layers = self.config.num_kv_planes
@@ -258,6 +269,9 @@ class Glm5NextModel(Model):
                     num_layers=len(self.config.kda_layer_indices),
                     blocks=kda_blocks,
                     max_slots=self.kda_max_requests + 1,  # + the sink
+                    # prefix reuse past a long prompt: its KDA state at page boundaries
+                    prefix_slots=16 if self.config.dsa_long_context else 0,
+                    prefix_page_size=128,
                 ),
             ),
             LinearAttnSpec(

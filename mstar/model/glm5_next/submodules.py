@@ -71,6 +71,9 @@ PREFILL_CAPTURE_BATCH_SIZES = (1, 2, 4)
 # The rope slot of a rejected draft row: against a query rope part of ones, a -6.4e5 score term.
 HOLE_KPE = -1.0e4
 _VERDICT_TIMEOUT_S = 120.0
+# KDA snapshots one prompt may reserve: its last whole page and its newest window ends,
+# leaving the pool's other slots to other prompts
+_SNAPSHOTS_PER_PROMPT = 4
 
 
 def _fused_kda(config: Glm5NextModelConfig) -> bool:
@@ -118,6 +121,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self._mtp_len: torch.Tensor | None = None
         self._pad_slot: int | None = None
         self._pad_kpe: torch.Tensor | None = None
+        # prefix reuse: the KV page size an eager prefill's KDA snapshots fall on (None: off)
+        self._snapshot_page: int | None = None
         # accepted-draft counts since the last log line: a histogram over 0..k
         self._mtp_hist = [0] * (self.mtp_k + 1)
         self._mtp_logged = time.monotonic()
@@ -166,6 +171,16 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         kda = resources.get(KDA)
         if kda is not None and (kda.kernels is None or not _fused_kda(self.config)):
             kda.set_kernels(TorchKDAKernels())
+        # prefix reuse: an eager long prefill saves its KDA state at page boundaries
+        pool = resources.get(KDA_STATE)
+        self._snapshot_page = None
+        if pool is not None and pool.keeps_snapshots and KV_CACHE in resources:
+            page = resources[KV_CACHE].kv_cache.page_size
+            if pool.config.prefix_page_size != page:
+                raise ValueError(
+                    f"kda_state.prefix_page_size={pool.config.prefix_page_size} must equal the "
+                    f"KV page_size={page}: a snapshot is keyed by the page it ends")
+            self._snapshot_page = page
 
     # -- CUDA-graph configs ----------------------------------------------
 
@@ -359,6 +374,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 "index_topk, where dense MLA is exactly GLM-5.3-Flash's DSA."
             )
         if graph_walk == "prefill":
+            # a hit's split sets it again after this; one from a refused admit must not stay
+            state.add("cached_prefix", 0)
             state.add("prompt_len", committed + seq_len)
             if self.mtp_k > 0:
                 state.add_all(mtp_generated=1, mtp_pending=None)
@@ -411,13 +428,55 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if self.config.dsa_long_context:
             # every MLA layer attends sparse (dsa.py): no dense plan over the whole context
             del steps[ATTN]
+        snapshots = self._snapshot_points(graph_walk, request_ids, inputs, slot_lease)
+        if snapshots:
+            steps[KDA_STATE] = RecurrentStep(snapshots=snapshots)
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
             steps=steps,
+            cg_key_info=self._cg_key(graph_walk, request_ids),
         )
+
+    def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
+        if graph_walk == "prefill" and start > 0:
+            # a cached prefix: postprocess counts it as context, and the step runs eager
+            self.request_state(fwd_info.rid_handle).add("cached_prefix", start)
+        return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+
+    def cg_key_info(self, graph_walk: str, per_request_info: dict,
+                    per_request_input_metadata=None, **kwargs) -> str | None:
+        return self._cg_key(graph_walk, per_request_info)
+
+    def _cg_key(self, graph_walk: str, rids) -> str | None:
+        """Every capture's key (None), or for a prefill with a request past a cached prefix
+        one no capture has: a bucket's sparse plan holds whole prompts no longer than it."""
+        if graph_walk == "prefill" and any(
+                self.request_states[rid].get("cached_prefix", 0)
+                for rid in rids if rid in self.request_states):
+            return "eager"
+        return None
+
+    def _snapshot_points(
+        self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None,
+    ) -> tuple[tuple[str, str, int], ...]:
+        """Where an eager long prefill saves its request's KDA state for a later prompt that
+        shares it: its last whole page, which a next turn extending the prompt needs, then
+        its windows' ends from the newest, where pages end. Admit reserves them in order."""
+        if (self._snapshot_page is None or graph_walk != "prefill" or slot_lease is not None
+                or len(request_ids) != 1 or not self.config.dsa_long_context):
+            return ()
+        rid, n = request_ids[0], inputs[0].input_seq_len
+        state = self.request_states.get(rid)
+        start = state.get("cached_prefix", 0) if state is not None else 0
+        page, size = self._snapshot_page, self.config.prefill_window_tokens
+        last = (start + n) // page * page
+        ends = sorted({start + k * size for k in range(1, -(-n // size))} - {last}, reverse=True)
+        points = [p for p in (last, *ends) if start < p and p % page == 0]
+        return tuple((rid, LABEL, p) for p in points[:_SNAPSHOTS_PER_PROMPT])
 
     def preprocess(
         self,
@@ -545,7 +604,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         keep, start = [1.0] * num_tokens, 0
         for rid, inp in zip(engine_inputs.request_ids, inputs, strict=True):
             state = self.request_states.get(rid)
-            fresh = state is None or state.get("context", 0) == 0
+            fresh = state is None or not (state.get("context", 0) or state.get("cached_prefix", 0))
             if fresh and inp.input_seq_len > 0 and start < num_tokens:
                 keep[start] = 0.0
             start += inp.input_seq_len
@@ -651,11 +710,15 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         last = [r0 + n - 1 for r0, n, _ in ctx.spans]
         # one window: the step's own plans (one-token prompts plan as decode, unsplittable)
         split = total > size and len(ctx.spans) != total
+        # rows after which the KDA state is saved for prefix reuse (`_snapshot_points`)
+        cuts = self._snapshot_cuts(engine_inputs, ctx)
+        split = split or bool(cuts)
+        bounds = sorted({*range(size, total, size), *cuts, total}) if split else [total]
+        pool = engine_inputs.resources.get(KDA_STATE)
         hidden: list[torch.Tensor | None] = [None] * len(last)
         nxt = torch.roll(input_ids, -1) if self.mtp_k > 0 else None
         try:
-            for start in range(0, total, size if split else total):
-                end = min(start + size, total) if split else total
+            for start, end in zip([0, *bounds[:-1]], bounds, strict=True):
                 ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
                 with contextlib.ExitStack() as scope:
                     if split:
@@ -676,6 +739,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                         out = full.index_select(0, rows)
                 for k, (i, _) in enumerate(ends):
                     hidden[i] = out[k]
+                if end in cuts:
+                    pool.write_snapshot(*cuts[end])
             last_hidden = torch.stack(hidden)
             new_tokens = sampler.sample(engine_inputs.request_ids, logits=self.lm_head(last_hidden))
             if nxt is not None:
@@ -690,6 +755,17 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         finally:
             self._dsa.ctx = ctx
         return new_tokens
+
+    @staticmethod
+    def _snapshot_cuts(engine_inputs: ModelInputsFromEngine, ctx) -> dict[int, tuple]:
+        """The step's KDA snapshots by the row they follow: one request, from its first row."""
+        step = getattr(engine_inputs, "step", None)
+        rec = step.steps.get(KDA_STATE) if step is not None else None
+        snaps = getattr(rec, "snapshots", ())
+        if not snaps:
+            return {}
+        first = ctx.host_pos[0]
+        return {tokens - first: (rid, label, tokens) for rid, label, tokens in snaps}
 
     # -- MTP device side ---------------------------------------------------
 
@@ -987,7 +1063,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # The step ran, so its tokens are the request's context now.
         if inputs is not None:
             state = self.request_state(request_id)
-            state.add("context", state.get("context", 0) + inputs.input_seq_len)
+            # a cached prefix's tokens are context too, though this step did not run them
+            state.add("context", state.get("context", 0) + inputs.input_seq_len
+                      + state.get("cached_prefix", 0))
+            state.add("cached_prefix", 0)
         # Seed the next decode step from the emitted token: the walk's
         # text_inputs loop-back edge (get_graph_walk_graphs) carries it. An MTP
         # verify step already set it: the token after the accepted drafts.

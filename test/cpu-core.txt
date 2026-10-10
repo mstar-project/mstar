@@ -161,4 +161,5 @@ test/modular/test_sparse_mla.py
 test/modular/test_glm52_dsa_paged.py
 test/modular/test_kv_prefix_tp.py
 test/modular/test_recurrent_prefix_snapshots.py
+test/modular/test_glm5next_prefix_cpu.py
 test/modular/test_speculative_sampling.py

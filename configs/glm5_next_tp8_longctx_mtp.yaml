@@ -32,6 +32,8 @@ resources:
     # ~32 GB/rank next to ~38 GB of weights.
     max_num_pages: 8960
     page_size: 128
+    # the prefix cache at TP > 1: rank 0 decides each hit and the other ranks adopt it
+    prefix_cache_tp: true
   kda_state:
     max_slots: 65
 # glm5_next_tp8_longctx.yaml's warmups: the eager windowed prefill (with its MTP pass) compiles before
