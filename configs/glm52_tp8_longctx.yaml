@@ -48,9 +48,12 @@ resources:
     # 2304 x 128-token pages = 295k tokens/rank: one full window and change
     max_num_pages: 2304
     page_size: 128
+    # the prefix cache at TP > 1: rank 0 decides each hit and the other ranks adopt it
+    prefix_cache_tp: true
   kv_index:
     max_num_pages: 2304
     page_size: 128
+    prefix_cache_tp: true
 # A prompt past the captured buckets prefills eager (in row chunks past prefill_chunk_tokens), and its
 # kernels compile on first use. Three lengths (6k, 12.5k and 20k tokens) take those compiles before
 # the server binds, not the first long request.

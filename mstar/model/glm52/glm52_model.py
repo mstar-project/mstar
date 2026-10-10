@@ -23,7 +23,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.attn.sparse_mla import check_flashinfer
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, PrefixStream
 from mstar.model.glm52.components.indexer import full_indexer_layers
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
@@ -217,6 +217,20 @@ class Glm52Model(Model):
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
+
+    def checkpoint_path(self) -> str | None:
+        return self._resolve_checkpoint()
+
+    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+        """The prompt's ids key the latent cache, and under dsa_long_context the index
+        keys beside it: a hit needs both. Replies are not keyed: the chat template
+        renders a reply again, and under TP each rank's host reads a reply's ids at its
+        own step, where the ranks' indexes have to change in step."""
+        stream = PrefixStream("text_inputs", "ids", "prefill")
+        streams = {KV_RESOURCE: {"main": stream}}
+        if self.config.dsa_long_context:
+            streams[INDEX_KV_RESOURCE] = {"main": stream}
+        return streams
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         # Absorbed MLA caches one latent row per token per layer
