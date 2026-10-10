@@ -144,6 +144,9 @@ class PrefixChain:
     consumed: int = 0
     # the span the latest probe answered for
     probed: int | None = None
+    # the prompt's keys under the root: hashed by the first probe and kept, since one that
+    # misses is asked again and no key changes before the stream writes
+    rooted: list[bytes] | None = None
     # how many of this stream's pages the index already holds
     cursor: int = 0
     # set once this stream has been reported, so a request that is admitted
@@ -535,12 +538,14 @@ class KVManager(AttentionResource):
                 return self._answer(label, chain, len(stream.lease) * self.config.page_size)
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
-            keys = list(chain.keys)
-        # outside the lock: one SHA-256 per page, and admit, commit and remove would wait on it
-        rooted = [fingerprint(self._prefix_root, key) for key in keys]
+            keys, rooted = list(chain.keys), chain.rooted
+        if rooted is None:
+            # outside the lock: one SHA-256 per page, and admit, commit and remove would wait on it
+            rooted = [fingerprint(self._prefix_root, key) for key in keys]
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return None
+            chain.rooted = rooted
             # a lease another thread took while this one hashed is the one to answer from
             if stream.lease is None:
                 # one key short, so a fully cached prompt still leaves a token to run
