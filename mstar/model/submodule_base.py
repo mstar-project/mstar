@@ -495,6 +495,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
 
+    # Set True on a submodule whose decode walk may read its last sampled
+    # tokens back off the sampler's slot masters (``device_loopback_signals``).
+    # The sampler keeps the masters only for a node that says so: the eager
+    # step write behind them is a small synchronous host-to-device copy per
+    # step, which a node that reads its tokens on the host (Whisper's decoder)
+    # would pay for nothing.
+    reads_device_loopback: bool = False
+
     def __init__(self):
         super().__init__()
         # Per-request state store. prepare_inputs-time code (no engine inputs
