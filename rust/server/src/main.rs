@@ -232,6 +232,16 @@ enum Surface {
     Videos,
 }
 
+/// The OpenAI error `type` for a status: a 4xx is the client's
+/// (`invalid_request_error`), anything else is ours (`server_error`).
+fn error_type(status: u16) -> &'static str {
+    if (400..500).contains(&status) {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    }
+}
+
 fn error(status: u16, message: &str, type_: &str) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
@@ -334,7 +344,7 @@ fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
 /// An SSE data event carrying an OpenAI error envelope (terminal mid-stream).
 fn sse_error_event(status: u16, msg: &str) -> Event {
     Event::default().data(
-        json!({"error": {"message": msg, "type": "server_error", "code": status}}).to_string(),
+        json!({"error": {"message": msg, "type": error_type(status), "code": status}}).to_string(),
     )
 }
 
@@ -397,7 +407,7 @@ async fn chat_completions(
             &st.model_name, &request_id, chunks, st.sample_rate,
         ))
         .into_response(),
-        Err((status, msg)) => error(status, &msg, "server_error"),
+        Err((status, msg)) => error(status, &msg, error_type(status)),
     }
 }
 
@@ -590,7 +600,7 @@ async fn audio_speech(
 
     let chunks = match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => chunks,
-        Err((status, msg)) => return error(status, &msg, "server_error"),
+        Err((status, msg)) => return error(status, &msg, error_type(status)),
     };
     let mut pcm: Vec<u8> = Vec::new();
     for c in &chunks {
@@ -644,7 +654,7 @@ async fn images_generations(
     for r in futures::future::join_all(futs).await {
         match r {
             Ok(chunks) => all.extend(chunks),
-            Err((status, msg)) => return error(status, &msg, "server_error"),
+            Err((status, msg)) => return error(status, &msg, error_type(status)),
         }
     }
     Json(images_response(all)).into_response()
@@ -672,7 +682,7 @@ async fn videos_generations(
     let request_id = rid("vid");
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(videos_response(chunks)).into_response(),
-        Err((status, msg)) => error(status, &msg, "server_error"),
+        Err((status, msg)) => error(status, &msg, error_type(status)),
     }
 }
 
@@ -752,7 +762,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     let request_id = rid("img");
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(images_response(chunks)).into_response(),
-        Err((status, msg)) => error(status, &msg, "server_error"),
+        Err((status, msg)) => error(status, &msg, error_type(status)),
     }
 }
 
