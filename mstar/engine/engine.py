@@ -501,6 +501,11 @@ class Engine:
         Compiles each submodule's ``forward`` and ``forward_batched`` with the
         default mode (fullgraph=False, dynamic=None), which in general provides
         performance gains without frequent slow recompiles.
+
+        A node whose output a laid-out stream caches as KV under its input's
+        digest is compiled dynamic instead: the graph it would recompile to on
+        a second input shape rounds differently from the first, so the KV
+        cached before that would not be what it computes after.
         """
         if not torch.cuda.is_available():
             return
@@ -512,16 +517,17 @@ class Engine:
                 logger.info("Engine: torch.compile disabled for %s (submodule opt-out)", node_name)
                 continue
 
+            dynamic = True if node_name in self._item_encoders else None
             try:
                 submodule_mgmt.forward = torch.compile(
                     submodule.forward,
                     fullgraph=False,
-                    dynamic=None,
+                    dynamic=dynamic,
                 )
                 submodule_mgmt.forward_batched = torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
-                    dynamic=None,
+                    dynamic=dynamic,
                 )
                 logger.info("Engine: torch.compile applied to %s", node_name)
             except Exception:
@@ -652,6 +658,14 @@ class Engine:
                     walk for stream in by_label.values()
                     for walk in (stream.walk, *stream.layout_walks)
                 )
+        # the nodes a laid-out stream's other walks run beside its keyed ones: what
+        # they make of an item is cached as KV under the item's digest
+        self._item_encoders: set[str] = set()
+        for key, by_label in declared.items():
+            for stream in by_label.values():
+                for walk in stream.layout_walks:
+                    nodes = model.get_graph_walk_graphs()[walk].get_nodes()
+                    self._item_encoders.update(set(nodes) - specs_by_key[key].nodes)
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
                 config = specs_by_key[key].config

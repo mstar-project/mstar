@@ -177,6 +177,9 @@ class _StubModel:
     def prefix_key_streams(self):
         return {"kv": {"main": PrefixStream("text_inputs", "ids", WALK, "decode", ("prefill_image",))}}
 
+    def get_graph_walk_graphs(self):
+        return {"prefill_image": SimpleNamespace(get_nodes=dict)}
+
 
 def test_the_layout_walks_reach_both_the_probe_and_the_cache(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", lambda *args, **kwargs: None)
