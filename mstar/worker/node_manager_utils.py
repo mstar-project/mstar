@@ -195,14 +195,6 @@ class PerPartitionInfo:
     )
 
 
-@dataclass(slots=True)
-class AssignedWalk:
-    """What a producer worker last assigned a producer-triggered consumer."""
-    consumer_walk: str
-    producer_walk: str
-    pass_in_walk: int
-
-
 @dataclass
 class PerRequestInfo:
     """What the worker still owns for a request.
@@ -221,8 +213,6 @@ class PerRequestInfo:
     ended_streams: set[str] = field(default_factory=set)
     # conductor inputs for a walk the stream has not moved this partition into
     parked_inputs: list[InputSignals] = field(default_factory=list)
-    # producer side: consumer partition -> the walk last assigned its stream
-    assigned_walks: dict[str, AssignedWalk] = field(default_factory=dict)
     per_partition_info: dict[str, PerPartitionInfo] = field(default_factory=dict)
 
 

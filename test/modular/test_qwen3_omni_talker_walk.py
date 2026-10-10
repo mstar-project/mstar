@@ -19,12 +19,14 @@ _FWD = CurrentForwardPassInfo(
 )
 
 
-def test_the_first_decode_pass_closes_the_talker_prefill():
+def test_the_first_decode_iteration_closes_the_talker_prefill():
     walks = [
-        _talker_walk(ProducerWalkCtx(walk, n, None, _FWD))  # a fresh ctx per call is fine here
-        for walk, n in [
-            ("prefill_text", 0), ("prefill_audio", 0), ("prefill_text", 0),
-            ("thinker_decode", 0), ("thinker_decode", 1), ("thinker_decode", 2),
+        _talker_walk(ProducerWalkCtx(walk, "Thinker", iters, _FWD))
+        for walk, iters in [
+            ("prefill_text", {}), ("prefill_audio", {}), ("prefill_text", {}),
+            ("thinker_decode", {"thinker_decode_loop": 0}),
+            ("thinker_decode", {"thinker_decode_loop": 1}),
+            ("thinker_decode", {"thinker_decode_loop": 2}),
         ]
     ]
     assert walks == ["talker_prefill"] * 3 + [

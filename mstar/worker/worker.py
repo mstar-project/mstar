@@ -76,7 +76,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.node_manager_utils import AssignedWalk, PerRequestInfo, RequestStateManager
+from mstar.worker.node_manager_utils import PerRequestInfo, RequestStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -1097,10 +1097,9 @@ class Worker:
         self, batch_N: PendingBatch, rids: list[int],
     ) -> None:
         """Decide the consumer walk of this pass's streamed items, per rid and
-        producer-triggered consumer partition: kept in the rid's
-        assigned_walks, and stamped on the fwd_info that rides with the remote
-        sends. Runs on every emitting step, so it allocates only on a rid's
-        first emission."""
+        producer-triggered consumer partition, and stamp it on the fwd_info
+        that rides with the remote sends. Runs on every emitting step, so it
+        allocates nothing per row."""
         key = (batch_N.node_name, batch_N.graph_walk)
         drivers = self._emitted_walk_drivers.get(key)
         if drivers is None:
@@ -1116,35 +1115,22 @@ class Worker:
             self._emitted_walk_drivers[key] = drivers
         if not drivers:
             return
-        walk = batch_N.graph_walk
         ctx = self._walk_ctx
-        ctx.producer_walk = walk
+        ctx.producer_walk = batch_N.graph_walk
+        ctx.node = batch_N.node_name
+        input_metadata = batch_N.node_batch.per_request_input_metadata
         for rid in rids:
             req_info = self.request_state.per_request_info.get(rid)
             if req_info is None:
                 continue
             fwd_info = req_info.per_partition_info[batch_N.partition].current_fwd_info
+            meta = input_metadata.get(rid)
+            ctx.loop_iters = meta.dynamic_loop_iter_counts if meta else {}
             ctx.fwd_info = fwd_info
             for conn in drivers:
-                last = req_info.assigned_walks.get(conn.to_partition)
-                if last is None:
-                    ctx.pass_in_walk, ctx.consumer_walk = 0, None
-                else:
-                    ctx.pass_in_walk = (
-                        last.pass_in_walk + 1 if last.producer_walk == walk else 0
-                    )
-                    ctx.consumer_walk = last.consumer_walk
-                consumer_walk = conn.consumer_walk(ctx)
-                if last is None:
-                    req_info.assigned_walks[conn.to_partition] = AssignedWalk(
-                        consumer_walk, walk, ctx.pass_in_walk,
-                    )
-                else:
-                    last.consumer_walk = consumer_walk
-                    last.producer_walk = walk
-                    last.pass_in_walk = ctx.pass_in_walk
-                fwd_info.stream_consumer_walks[conn.to_partition] = consumer_walk
+                fwd_info.stream_consumer_walks[conn.to_partition] = conn.consumer_walk(ctx)
         ctx.fwd_info = None
+        ctx.loop_iters = {}
 
     def _release_parked_inputs(
         self, request_id: int, req_info: PerRequestInfo,
@@ -3149,9 +3135,9 @@ class Worker:
             for rid, uuid in per_signal:
                 req_info = self.request_state.per_request_info[rid]
                 stream_buf = req_info.stream_buffers[signal]
-                assigned = consumer and req_info.assigned_walks.get(consumer)
+                walks = req_info.per_partition_info[batch_N.partition].current_fwd_info.stream_consumer_walks
                 stream_buf.pre_read_register(
-                    uuid, assigned.consumer_walk if assigned else None,
+                    uuid, walks.get(consumer) if consumer else None,
                 )
                 tensor = self.tensor_manager.get_tensor(uuid)
                 stream_buf.put(uuid, tensor.clone())

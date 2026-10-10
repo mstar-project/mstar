@@ -1753,10 +1753,11 @@ A consumer whose walk should follow the producer's progress, rather than a count
 ingest, is *producer-triggered*: the producer decides the consumer's walk. Set the same
 ``consumer_walk`` function on every connection into the consumer, all from one producer
 partition. The producer worker calls it for each pass that emits on those edges, with a
-``ProducerWalkCtx``: the producer's walk, the pass's index among its consecutive passes
-in that walk, the consumer walk it last assigned, and the producer's full
-``CurrentForwardPassInfo`` (``step_metadata`` and all; the hook runs on the producer).
-The pass's streamed items run under the walk it returns.
+``ProducerWalkCtx``: the producer's walk, the node that just completed, the iteration
+each enclosing dynamic loop is on, and the producer's full ``CurrentForwardPassInfo``
+(``step_metadata`` and all; the hook runs on the producer). The pass's streamed items
+run under the walk it returns. The context is reused across calls, so a hook must not
+keep it.
 
 - Each streamed item carries its assigned walk, and a chunk never spans two walks, so
   these connections need a ``FixedChunkPolicy``.
@@ -1766,8 +1767,8 @@ The pass's streamed items run under the walk it returns.
   conductor learns each pass's walk from the worker's ``WORKER_GRAPHS_DONE``.
 
 Qwen3-Omni's Talker (``_talker_walk``) is the reference: Thinker prefill passes run
-``talker_prefill``, the first decode pass runs ``talker_last_prefill``, and later ones run
-``talker_decode``.
+``talker_prefill``, the first decode iteration runs ``talker_last_prefill``, and later
+ones run ``talker_decode``.
 
 Checklist
 ---------

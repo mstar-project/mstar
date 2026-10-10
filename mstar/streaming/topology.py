@@ -1,5 +1,5 @@
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Callable
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphEdge
@@ -29,12 +29,11 @@ class ProducerWalkCtx:
     runs per request on every emitting step: valid only during the call.
     """
     producer_walk: str = ""
-    # This pass's index among the producer worker's consecutive passes in
-    # producer_walk that emitted on the edge; re-entering a walk restarts at 0
-    pass_in_walk: int = 0
-    # The walk this producer worker last assigned the consumer; None before
-    # its first emission
-    consumer_walk: str | None = None
+    # The node whose completed pass emitted the items
+    node: str = ""
+    # Dynamic loop name -> the iteration this pass ran, for the loops it is in;
+    # the graph's own count, so every node and worker of the producer agrees
+    loop_iters: Mapping[str, int] = field(default_factory=dict)
     # The producer's forward-pass info for this pass (step_metadata and all);
     # the hook runs on the producer, so nothing here crosses the wire
     fwd_info: CurrentForwardPassInfo | None = None

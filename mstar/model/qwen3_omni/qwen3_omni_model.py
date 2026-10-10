@@ -102,8 +102,9 @@ def _talker_walk(ctx: ProducerWalkCtx) -> str:
     """The Talker walk a Thinker pass's streamed states run under."""
     if ctx.producer_walk != "thinker_decode":
         return "talker_prefill"
-    # The first decode pass closes the prefill and samples the first codec
-    return "talker_last_prefill" if ctx.pass_in_walk == 0 else "talker_decode"
+    # The first decode iteration closes the prefill and samples the first codec
+    first = ctx.loop_iters.get("thinker_decode_loop", 0) == 0
+    return "talker_last_prefill" if first else "talker_decode"
 
 # ---------------------------------------------------------------------------
 # Helpers
