@@ -190,6 +190,8 @@ class PrefixSpan:
     walk: str
     # an item's digest; None for ids
     digest: bytes | None = None
+    # an item ending inside a page: that page's key cut at its end, which a repeat reaches
+    end_key: bytes | None = None
 
 
 @dataclass

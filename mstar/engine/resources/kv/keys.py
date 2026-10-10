@@ -73,6 +73,14 @@ def page_key(
     return hasher.digest()
 
 
+def end_key(
+    prev: bytes, tokens: Sequence[int], items: Sequence[PageItem], end: int,
+) -> bytes:
+    """Key a page's first ``end`` slots, where an item on it ends."""
+    before = [item for item in items if item.start < end]
+    return page_key(prev, tokens[:end - sum(item.length - item.offset for item in before)], before)
+
+
 def page_items(
     spans: Iterable[tuple[int, bytes | None]], page_size: int,
 ) -> dict[int, list[PageItem]]:

@@ -134,6 +134,8 @@ class PrefixChain:
     # the prompt's keys under the root: hashed by the first probe and kept, since one that
     # misses is asked again and no key changes before the stream writes
     rooted: list[bytes] | None = None
+    # each image end's key under the root with the slot it ends at, hashed and kept with `rooted`
+    rooted_ends: list[tuple[int, bytes]] | None = None
     # how many of this stream's pages the index already holds
     cursor: int = 0
     # set once this stream has been reported, so a request that is admitted
@@ -201,8 +203,10 @@ class CacheStream:
     # None while the stream is unkeyed, and once its keys stop describing it
     chain: PrefixChain | None = None
     # pages the index matched for this stream and is holding for it, from the
-    # probe until `admit` converts them onto `page_indices`
+    # probe until `admit` converts them onto `page_indices`; an image's end until `plan` copies it
     lease: list[int] | None = None
+    # slots the lease holds: its whole pages, then an image's end if the index had it
+    lease_len: int = 0
     # set at conversion, cleared at `commit`, so a refused admit's re-probe answers the same
     converted: bool = False
     offloaded: bool = False
@@ -399,6 +403,8 @@ class KVManager(AttentionResource):
         self._keyed_walks: dict[str, frozenset[str]] = {}
         # nodes already warned that a declared stream reached them unkeyed
         self._warned_unkeyed: set[str] = set()
+        # streams whose lease still holds an image end for `plan` to copy, so a step with none looks at nothing
+        self._image_ends: list[CacheStream] = []
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
@@ -523,26 +529,50 @@ class KVManager(AttentionResource):
             if stream.converted:
                 return self._answer(label, chain, stream.stored_len)
             if stream.lease is not None:
-                return self._answer(label, chain, len(stream.lease) * self.config.page_size)
+                return self._answer(label, chain, stream.lease_len)
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
             keys, rooted = list(chain.keys), chain.rooted
+            spans, ends = chain.spans, chain.rooted_ends
+        total = sum(span.length for span in spans)
         if rooted is None:
             # outside the lock: one SHA-256 per page, and admit, commit and remove would wait on it
             rooted = [fingerprint(self._prefix_root, key) for key in keys]
+            ends, at = [], 0
+            for span in spans:
+                at += span.length
+                if span.end_key is not None:
+                    ends.append((at, fingerprint(self._prefix_root, span.end_key)))
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return None
             chain.rooted = rooted
+            chain.rooted_ends = ends
             # a lease another thread took while this one hashed is the one to answer from
             if stream.lease is None:
                 # one key short, so a fully cached prompt still leaves a token to run
                 matched = self._index.lookup(rooted)[:len(rooted) - 1]
+                held = len(matched) * self.config.page_size
+                self._arena.retain(matched)
+                # an image ending on the next page: its cached end, then this request's own page for it
+                for end, key in reversed(ends):
+                    if not held < end < min(held + self.config.page_size, total):
+                        continue
+                    cached = self._index.lookup([key])
+                    if cached:
+                        self._arena.retain(cached)
+                        own = self._arena.acquire(1)
+                        if own is None and self._index.evict(1):
+                            own = self._arena.acquire(1)
+                        if own is None:
+                            self._arena.release(cached)
+                        else:
+                            matched, held = matched + cached + own, end
+                    break
                 if not matched:
                     return None
-                self._arena.retain(matched)
-                stream.lease = matched
-            return self._answer(label, chain, len(stream.lease) * self.config.page_size)
+                stream.lease, stream.lease_len = matched, held
+            return self._answer(label, chain, stream.lease_len)
 
     def _check_positions(self, span: PrefixSpan, graph_walk: str, inputs) -> None:
         assert span.digest is not None or inputs.custom_pos_ids is None, (
@@ -622,10 +652,11 @@ class KVManager(AttentionResource):
             chain = stream.chain
             if prefix.tokens == chain.spans[chain.done].length:
                 return
-            keep = (chain.consumed + prefix.tokens) // self.config.page_size
-            if keep < len(stream.lease):
+            held = chain.consumed + prefix.tokens
+            if held < stream.lease_len:
+                keep = held // self.config.page_size
                 self._arena.release(stream.lease[keep:])
-                stream.lease = stream.lease[:keep] or None
+                stream.lease, stream.lease_len = stream.lease[:keep] or None, keep * self.config.page_size
 
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
         with self._lock:
@@ -669,6 +700,7 @@ class KVManager(AttentionResource):
         # a span that ends before this write starts was read in, matched or
         # served; only one this write reaches has to be the walk's own
         start = stream.stored_len - segment.span
+        ended = None
         while chain.done < len(chain.spans):
             end = chain.consumed + chain.spans[chain.done].length
             if chain.consumed < stream.stored_len and end > start and (
@@ -678,6 +710,8 @@ class KVManager(AttentionResource):
                 return
             if stream.stored_len < end:
                 break
+            if end > start and chain.spans[chain.done].end_key is not None:
+                ended = end, chain.spans[chain.done].end_key
             chain.consumed = end
             chain.done += 1
         filled = chain.pages_filled(stream.stored_len, self.config.page_size)
@@ -701,6 +735,24 @@ class KVManager(AttentionResource):
                 page = self._index.page_for(key)
             parent = page
             chain.cursor += 1
+        if ended is not None:
+            self._cache_image_end(stream, chain, *ended)
+
+    def _cache_image_end(self, stream: CacheStream, chain: PrefixChain, end: int, key: bytes) -> None:
+        """Index a copy of the page an image ends inside, cut at its end, for repeats with other text after it."""
+        page = end // self.config.page_size
+        rooted = fingerprint(self._prefix_root, key)
+        parent = self._index.page_for(fingerprint(self._prefix_root, chain.keys[page - 1])) if page else None
+        if (page and parent is None) or self._index.page_for(rooted) is not None:
+            return
+        # only from free pages: evicting a whole page to keep part of one is a bad trade
+        copy = self._arena.acquire(1)
+        if copy is None:
+            return
+        self.kv_cache.copy_slots(stream.page_indices[page], copy[0], end % self.config.page_size)
+        self._index.insert(rooted, copy[0], parent)
+        # the index is left its one owner, so it is evicted like any cached page
+        self._arena.release(copy)
 
     def _report_admission(self, segment: Segment, stream: CacheStream) -> None:
         """One line per request that a declared stream admitted."""
@@ -1031,10 +1083,15 @@ class KVManager(AttentionResource):
                         "walk its lease was never probed for, which would write over "
                         "the pages the lease holds for it"
                     )
-                    self._adopt(stream, stream.lease)
+                    whole = stream.lease_len // self.config.page_size
+                    self._adopt(stream, stream.lease[:whole] + stream.lease[whole + 1:])
+                    stream.stored_len = stream.lease_len
                     # they came out of the index, so they are already in it
-                    stream.chain.cursor = len(stream.lease)
-                    stream.lease = None
+                    stream.chain.cursor = whole
+                    # an image's cached end stays held until `plan` copies it, on the stream the step runs on
+                    stream.lease = stream.lease[whole:whole + 1] or None
+                    if stream.lease is not None:
+                        self._image_ends.append(stream)
                     stream.converted = True
                 self._report_admission(segment, stream)
             if ctx.is_preplan:
@@ -1330,6 +1387,19 @@ class KVManager(AttentionResource):
                     continue
                 self._apply_fork(rid, from_label, to_label)
 
+    def _copy_image_ends(self) -> None:
+        """Copy each image end a converted lease still holds onto the page its request writes next."""
+        if not self._image_ends:
+            return
+        with self._lock:
+            ends, self._image_ends = self._image_ends, []
+            for stream in ends:
+                # a reset or a remove has since released it, unless it still holds slots under a lease
+                if stream.lease is not None and stream.stored_len:
+                    whole, end = divmod(stream.stored_len, self.config.page_size)
+                    self.kv_cache.copy_slots(stream.lease[0], stream.page_indices[whole], end)
+                    self._release_lease(stream)
+
     def _pending_fork_state(
         self, step: KVStep, ctx: StepContext
     ) -> dict[tuple[str, str], tuple[int, int]]:
@@ -1372,6 +1442,7 @@ class KVManager(AttentionResource):
                 # Promotion: apply the fork copies staging left undone; see
                 # `_pending_fork_state`.
                 self._maybe_apply_forks(step, ctx)
+                self._copy_image_ends()
 
                 self._preplan_new_labels = []
                 self._preplan_marked = []
@@ -1390,6 +1461,7 @@ class KVManager(AttentionResource):
         else:
             pending = {}
             self._maybe_apply_forks(step, ctx)
+            self._copy_image_ends()
 
         res = KVPlanOutputs(
             {

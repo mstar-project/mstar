@@ -28,7 +28,7 @@ from mstar.api_server.request_types import (
 from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
-from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint, page_items
+from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.model.base import Model, PrefixStream, ProcessPromptOutput, Span
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
@@ -568,7 +568,7 @@ class PreprocessWorkerThread:
         """Key each page of every declared stream, as the kwargs that carry it.
 
         By resource and label: one unrooted key a page, the ids on the prompt's
-        partial last page, the layout as ``[length, advance, walk, digest]``,
+        partial last page, the layout as ``[length, advance, walk, digest, end_key]``,
         and the output tensor the stream's sampled ids arrive in.
         """
         # before any check: a worker built without a config keys nothing, and
@@ -611,15 +611,20 @@ class PreprocessWorkerThread:
                 pages, items = self._page_layout(
                     stream, layout, digests, tensors, page_size,
                 )
-                keys.setdefault(resource_key, {})[label] = chain(pages, items)
+                page_keys = chain(pages, items)
+                keys.setdefault(resource_key, {})[label] = page_keys
                 total = sum(span.length for span in layout)
                 tails.setdefault(resource_key, {})[label] = (
                     pages[-1] if total % page_size else []
                 )
-                layout_rows.setdefault(resource_key, {})[label] = [
-                    [span.length, span.advance, span.walk, digest]
-                    for span, digest in zip(layout, digests, strict=True)
-                ]
+                rows, at = [], 0
+                for span, digest in zip(layout, digests, strict=True):
+                    at += span.length
+                    page, end = divmod(at, page_size)
+                    rows.append([span.length, span.advance, span.walk, digest, end_key(
+                        page_keys[page - 1] if page else b"", pages[page], items.get(page, ()), end,
+                    ) if digest is not None and end else None])
+                layout_rows.setdefault(resource_key, {})[label] = rows
                 if stream.decode_walk is not None:
                     decode.setdefault(resource_key, {})[label] = stream.tensor
         if not keys:
