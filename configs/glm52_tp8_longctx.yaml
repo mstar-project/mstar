@@ -51,6 +51,13 @@ resources:
   kv_index:
     max_num_pages: 2304
     page_size: 128
+# A prompt past the captured buckets prefills eager (in row chunks past prefill_chunk_tokens), and its
+# kernels compile on first use. Three lengths (6k, 12.5k and 20k tokens) take those compiles before
+# the server binds, not the first long request.
+warmup_requests:
+  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 600, model_kwargs: {max_output_tokens: 4}}
+  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}
+  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
 node_groups:
   - node_names: [LLM]
     ranks: [0, 1, 2, 3, 4, 5, 6, 7]
