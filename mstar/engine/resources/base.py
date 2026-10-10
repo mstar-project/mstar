@@ -158,6 +158,17 @@ class Resource(ABC):
         """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
 
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
+        """On rank 0 of a TP node, lease the request's cached prefix as its step is sent, and
+        return the leased pages for the other ranks to adopt. None where nothing is leased."""
+        return None
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, pages: list[int],
+    ) -> bool:
+        """On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too."""
+        return True
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 

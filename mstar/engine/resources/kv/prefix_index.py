@@ -30,20 +30,29 @@ class PrefixIndex:
         self._leaves: list[tuple[int, int]] = []
         self._clock = 0
 
-    def lookup(self, keys: Sequence[bytes]) -> list[int]:
-        """Walk ``keys`` from the root and stop at the first one not indexed."""
+    def lookup(self, keys: Sequence[bytes], stamp: bool = True) -> list[int]:
+        """Walk ``keys`` from the root and stop at the first one not indexed.
+
+        ``stamp=False`` leaves recency alone, for a caller that stamps the hit
+        later with ``touch``."""
         pages: list[int] = []
         for key in keys:
             page = self._by_key.get(key)
             if page is None:
                 break
             pages.append(page)
+        if pages and stamp:
+            self.touch(pages)
+        return pages
+
+    def touch(self, pages: Sequence[int]) -> None:
+        """Stamp ``pages`` as just used, as a hit does."""
+        pages = [page for page in pages if self._key[page] is not None]
         if pages:
             # one stamp for the whole run, so recency stays monotone along it
             self._clock += 1
             for page in pages:
                 self._stamp[page] = self._clock
-        return pages
 
     def insert(self, key: bytes, page: int, parent: int | None = None) -> bool:
         """Name ``page`` by ``key`` under ``parent``; the first writer wins."""

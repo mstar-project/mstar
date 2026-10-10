@@ -564,16 +564,20 @@ class KVManager(AttentionResource):
         self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
     ) -> bool:
         """Open the index under ``root``, the identity every key hangs from."""
+        # Above one rank, key every walk except the decode walk, named[1]. Each rank keys generated tokens
+        # from its own read of the sampled ids, which can land at a different step on each rank.
         self._keyed_walks = {
-            label: frozenset(walk for walk in named if walk is not None)
+            label: frozenset(
+                walk for walk in (named[:1] + named[2:] if self._world_size > 1 else named)
+                if walk is not None
+            )
             for label, named in (walks or {}).items()
         }
         if not self.config.prefix_cache:
             return False
-        if self._world_size > 1:
+        if self._world_size > 1 and not self.config.prefix_cache_tp:
             logger.info(
-                "KV %s: prefix cache off at world size %d: the ranks index "
-                "independently and would match different lengths",
+                "KV %s: prefix cache off at world size %d (prefix_cache_tp opts in)",
                 self.name, self._world_size,
             )
             return False
@@ -614,26 +618,30 @@ class KVManager(AttentionResource):
                 return self._answer(label, chain, stream.lease_len)
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
-            keys, rooted = list(chain.keys), chain.rooted
-            spans, ends = chain.spans, chain.rooted_ends
-        total = sum(span.length for span in spans)
-        if rooted is None:
-            # outside the lock: one SHA-256 per page, and admit, commit and remove would wait on it
-            rooted = [fingerprint(self._prefix_root, key) for key in keys]
-            ends, at = [], 0
-            for span in spans:
-                at += span.length
-                if span.end_key is not None:
-                    ends.append((at, fingerprint(self._prefix_root, span.end_key)))
+            if self._world_size > 1:
+                # Above one rank only a lease from `lease_cached_prefix` or `adopt_cached_prefix` answers.
+                # A lookup here would see this rank's commits since rank 0 sent the step.
+                return self._answer(label, chain, 0)
+        if not self._lease(rid, label, stream, chain):
+            return None
+        with self._lock:
+            if stream.lease is None:
+                return None
+            return self._answer(label, chain, stream.lease_len)
+
+    def _lease(self, rid: str, label: str, stream: CacheStream, chain: PrefixChain) -> bool:
+        """Lease what the index holds of the stream's prompt, unless the stream holds a lease already.
+        False if the stream was removed while its keys were hashed."""
+        self._root(chain)
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
-                return None
-            chain.rooted = rooted
-            chain.rooted_ends = ends
+                return False
+            rooted, ends = chain.rooted, chain.rooted_ends
+            total = sum(span.length for span in chain.spans)
             # The lock was dropped to hash, so another thread's probe may have taken the lease already.
             if stream.lease is None:
                 # Matching the whole prompt would leave the walk an empty input, since it skips every matched page.
-                matched = self._index.lookup(rooted)[:len(rooted) - 1]
+                matched = self._index.lookup(rooted, stamp=self._world_size == 1)[:len(rooted) - 1]
                 held = len(matched) * self.config.page_size
                 self._arena.retain(matched)
                 # If an image ends inside the next page, look up its cached partial page.
@@ -651,10 +659,87 @@ class KVManager(AttentionResource):
                         else:
                             matched, held = matched + cached + own, end
                     break
-                if not matched:
-                    return None
-                stream.lease, stream.lease_len = matched, held
-            return self._answer(label, chain, stream.lease_len)
+                if matched:
+                    stream.lease, stream.lease_len = matched, held
+            return True
+
+    def _root(self, chain: PrefixChain) -> None:
+        """Hash the chain's keys and image ends under the root into `chain.rooted` and
+        `chain.rooted_ends`, once. Called without the lock held."""
+        with self._lock:
+            if chain.rooted is not None:
+                return
+            keys, spans = list(chain.keys), chain.spans
+        # outside the lock: one SHA-256 per page, and admit, commit and remove would wait on it
+        rooted = [fingerprint(self._prefix_root, key) for key in keys]
+        ends, at = [], 0
+        for span in spans:
+            at += span.length
+            if span.end_key is not None:
+                ends.append((at, fingerprint(self._prefix_root, span.end_key)))
+        with self._lock:
+            chain.rooted, chain.rooted_ends = rooted, ends
+
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
+        """The lease is returned with every step until `admit` converts it, so a follower that
+        dropped the first of those steps still adopts it."""
+        with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            if label is None:
+                return None
+            stream = self._ensure_label(rid, label)
+            chain = stream.chain
+            if stream.lease is not None:
+                return stream.lease
+            if (
+                chain is None or chain.done == len(chain.spans)
+                or chain.spans[chain.done].walk != graph_walk
+                or stream.converted or stream.stored_len or stream.offloaded or stream.read_pending
+            ):
+                return None
+        if not self._lease(rid, label, stream, chain):
+            return None
+        with self._lock:
+            return stream.lease
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, pages: list[int],
+    ) -> bool:
+        """On a TP follower, lease ``pages`` as rank 0 did.
+
+        False until this rank's index holds them, since its commit of the step that wrote
+        them can lag rank 0's. Raises if the index holds other pages under those keys: a
+        sharded prefill gathers cache slots across ranks, so the pages have to agree, not
+        only their count.
+        """
+        with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            if label is None:
+                return True
+            stream = self._ensure_label(rid, label)
+            chain = stream.chain
+            if stream.converted or stream.lease is not None:
+                return True
+            if chain is None or stream.stored_len:
+                raise RuntimeError(
+                    f"KV {self.name}: rank 0 leased {len(pages)} cached pages for {rid}/{label}, "
+                    "whose stream here already holds tokens or has no keys"
+                )
+        self._root(chain)
+        with self._lock:
+            if self._streams.get(rid, {}).get(label) is not stream:
+                return True
+            matched = self._index.lookup(chain.rooted[:len(pages)], stamp=False)
+            if len(matched) < len(pages):
+                return False
+            if matched != pages:
+                raise RuntimeError(
+                    f"KV {self.name}: prefix index diverged from rank 0 for {rid}/{label}: "
+                    f"pages {matched[:4]}... here, {pages[:4]}... there"
+                )
+            self._arena.retain(matched)
+            stream.lease, stream.lease_len = matched, len(matched) * self.config.page_size
+            return True
 
     def _check_positions(self, span: PrefixSpan, graph_walk: str, inputs) -> None:
         assert span.digest is not None or inputs.custom_pos_ids is None, (
@@ -2172,6 +2257,10 @@ class KVManager(AttentionResource):
                         self._plan_epoch += 1
                         continue
                     stream.stored_len += segment.span
+                    if stream.converted and self._world_size > 1 and stream.chain is not None:
+                        # above one rank a converted lease is stamped here, not at lookup: every rank
+                        # commits in step order, so their indexes age alike and evict alike
+                        self._index.touch(stream.page_indices[:stream.chain.cursor])
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
                     policy = (

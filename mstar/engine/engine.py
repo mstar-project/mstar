@@ -59,7 +59,7 @@ from mstar.model.submodule_base import (
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
 from mstar.utils.device import DeviceCapability
-from mstar.utils.ipc_format import OffloadDelta
+from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
     PHASE_PERIOD,
     mark,
@@ -1077,6 +1077,46 @@ class Engine:
                     rid, batch.node_name, batch.step_context.walk_of(rid), per_rid,
                     keys=keys,
                 )
+
+    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, list[int]]]:
+        """Rank 0's cached-prefix leases for a step it is about to send its TP followers, by wire id.
+
+        Taken as the step is scheduled, so the followers can take the same pages before
+        they build it. ``prepare_inputs`` then answers every rank from the leases.
+        """
+        keyed = self._keyed_walks.get(batch.node_name)
+        ctx = batch.step_context
+        if (
+            not keyed or (not ctx.request_walks and ctx.graph_walk not in keyed)
+            or not self._runner.prefix_chain_keys(batch.node_name)
+        ):
+            return {}
+        hits = {}
+        for rid in batch.request_ids:
+            walk = ctx.walk_of(rid)
+            if walk not in keyed:
+                continue
+            leases = self._runner.lease_cached_prefix(rid, batch.node_name, walk)
+            if leases:
+                hits[self._graph_runtime.get_rid_string(rid)] = leases
+        return hits
+
+    def adopt_cached_prefix(self, head: ScheduleTPNode) -> bool:
+        """A TP follower takes rank 0's cached-prefix leases before it builds the step.
+
+        False until every page is here: a request this rank has not ingested yet, or
+        pages its own commit of an earlier step has not indexed yet.
+        """
+        walk_idx = dict(zip(head.request_ids, head.walk_idx, strict=True)) if head.walks else None
+        ready = True
+        for wire_rid, leases in head.prefix_hits.items():
+            rid = self._graph_runtime.get_rid_handle(wire_rid)
+            if rid is None:
+                ready = False
+                continue
+            walk = head.walks[walk_idx[wire_rid]] if walk_idx else head.graph_walk
+            ready &= self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases)
+        return ready
 
     def _skip_cached_prefix(
         self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,

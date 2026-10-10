@@ -86,6 +86,9 @@ class PagedKVConfig(KVConfig):
     # folded into the root, not checked at match time
     prefix_cache_salt: str = ""
     prefix_cache: bool = True
+    # Above one rank the prefix cache also needs this. Rank 0 decides each hit and the other
+    # ranks adopt it, so every rank's allocator must match rank 0's.
+    prefix_cache_tp: bool = False
 
     def apply_yaml_overrides(
         self,
@@ -95,6 +98,7 @@ class PagedKVConfig(KVConfig):
         cpu_offload_pages: int | None = None,
         prefix_cache_salt: str | None = None,
         prefix_cache: bool | None = None,
+        prefix_cache_tp: bool | None = None,
     ) -> None:
         """How much cache this deployment gets, and how it is cut up."""
         for name, value in (
@@ -104,6 +108,7 @@ class PagedKVConfig(KVConfig):
             ("cpu_offload_pages", cpu_offload_pages),
             ("prefix_cache_salt", prefix_cache_salt),
             ("prefix_cache", prefix_cache),
+            ("prefix_cache_tp", prefix_cache_tp),
         ):
             if value is not None:
                 setattr(self, name, value)

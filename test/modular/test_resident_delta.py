@@ -192,6 +192,9 @@ class _Engine:
     reload_request = Engine.reload_request
     take_resident_delta = Engine.take_resident_delta
 
+    def decide_cached_prefix(self, batch):
+        return {}
+
     def __init__(self, role: str = "leader"):
         """``role`` is this rank's part for ``"node"``: ``leader`` (rank 0 of a
         sharded node — decides and journals), ``follower`` (another rank of one —

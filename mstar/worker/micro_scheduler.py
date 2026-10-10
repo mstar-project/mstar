@@ -410,7 +410,13 @@ class MicroScheduler:
         head = self.peek_tp_follow()
         if head is None:
             return True
-        return self._apply_delta_from_message(head)
+        if not self._apply_delta_from_message(head):
+            return False
+        # Rank 0's prefix-cache leases too. A step built without them would run tokens rank 0 skips.
+        if not head.prefix_hits:
+            return True
+        engine = self.engine_manager.get_engine(head.node_name)
+        return engine.adopt_cached_prefix(head)
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
