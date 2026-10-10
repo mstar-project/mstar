@@ -27,6 +27,7 @@ Then check you can actually run the reference, before any design work:
 
 - **Access.** Gated repos need a token and an accepted licence; ask for it now rather than mid-recon.
 - **Every format the weights ship in.** A model card may point at a single-file (e.g. ComfyUI) checkpoint while the diffusers- or transformers-format weights the oracle loads live in a separate repo under the same author.
+- **The reference's generation defaults.** Pin the oracle to greedy single-beam; a `chat()` helper may default to beam search even with sampling off.
 - **The oracle's library versions against the venv.** A newer model often needs a newer `transformers` or `diffusers` than the serving venv pins. Every other model imports those too, so a bump is an invariant-4 change and its own PR; for the oracle, use a separate venv with the same torch build.
 
 ## Phase 1 — Reconnaissance on the reference
@@ -40,7 +41,7 @@ What to extract:
 - **State and shape ledger**: one row per persistent tensor or buffer — lifetime (global / per request / per iteration), shape, which dims vary at request time and over what range, who allocates, who frees. This table is what Phase 5 consumes; it is the single most useful artifact of this phase.
 - **Size per component**: weight bytes per component (from the safetensors index) and a rough peak-activation estimate. It answers "is this hardware enough?" and is the starting point for placement in Phase 2.
 
-If a vLLM or SGLang port exists, record what it did — registration, cache config, attention backend, multimodal processor, batching hooks, special-cased code — and what it explicitly did not support.
+If a vLLM or SGLang port exists (check local checkouts and installed packages before upstream), record what it did — registration, cache config, attention backend, multimodal processor, batching hooks, special-cased code — and what it explicitly did not support.
 
 Diff your `state_dict()` against the checkpoint's safetensors index by **name and shape** before running anything — on `meta` device, so it costs nothing. A full match proves loading needs no reshaping or splitting, and it catches a misread projection layout before it becomes a parity hunt.
 
@@ -59,6 +60,13 @@ Diff your `state_dict()` against the checkpoint's safetensors index by **name an
 ## Phase 3 — Resources vs submodules
 
 A **resource** is state the engine must admit, plan, commit and clean up per request, and that must survive graph capture: persistent cross-step state, and anything planned over it. Everything else is a submodule.
+
+**Do an explicit resource pass before writing submodules**, one row per piece of per-request or per-step state and per attention, sampling or position operation:
+
+| state or op | lifetime and size | existing resource, as is | existing resource, changed (how; own PR?) | new resource (why nothing fits) | allocated in which walk; what happens when full | how the model reaches it |
+|---|---|---|---|---|---|---|
+
+Each row must hold up: the resource's layout expresses the mask or retention, checked against the reference (read the planner, not the kind's name; when retention isn't obvious, simulate the reference's cache on token ids); capacity becomes engine backpressure, and the request that waits is the one that needs it; eager and captured paths address it the same way; and the model reaches it only through the resource's API (invariant 1). The [engine-resources skill](../engine-resources/SKILL.md) lists what each existing resource expresses. MiniCPM-o (#381-#383) is a worked example: paged KV and ragged attention as is, a new block-causal ragged kind, an extended sampler, `RecurrentStatePool` for the vocoder's carry state, and a new bounded KV once paged KV with retention and `RingKVManager` were ruled out.
 
 Reuse KV, attention, cross-attention, ragged (cacheless) attention, position and sampler resources wherever their contracts fit. A genuinely new kind is a normal outcome and gets a package under `mstar/engine/resources/<kind>/` with declaration types, a manager, exports and focused tests, built on the existing spec, request-config, step and `Resource` interfaces. Several current model PRs add recurrent-state and linear-attention resources this way, modelled on the KV resource. Read the [engine-resources skill](../engine-resources/SKILL.md) before writing one.
 
@@ -82,6 +90,8 @@ Reuse from `mstar/model/components/`, and put anything reusable across models th
 
 **Port natively by default; reusing an upstream leaf module is accepted but second best.** A native port can be optimized (TP, capture, fused kernels) and doesn't break when `transformers` or `diffusers` moves. The hot path — the backbone or DiT — should always be native. Importing a cold leaf module such as a VAE or vocoder from the upstream library, lazily as wan22 and cosmos3 do, is accepted precedent when porting it would be high effort for little gain; say which parts are reused and why in the PR.
 
+A self-contained native port delegates well: record the oracle tensors first, make a parity harness the deliverable, and state which files the agent owns.
+
 Validate in this order:
 
 1. Component forwards and weight mapping against the reference.
@@ -93,6 +103,8 @@ Validate in this order:
 When a parity check fails, diff per-layer hidden states against the oracle, then split the first bad layer into its parts — each norm, the mixer, the MLP. A mixer compared in isolation can pass while its enclosing layer is wrong, because the isolated comparison feeds both sides the same input; the norms and the residual are where convention mismatches live.
 
 **When parity is close but not exact, find the configuration where it is exact before accepting a tolerance.** Served paths legitimately differ from the reference in shapes and kernel routes (running only the real prompt tokens instead of a padded batch, a different SDPA backend), and those differences alone produce ~0.3–1% per layer. Reproduce the reference's shapes and kernel route in a test-only mode; bit-exact output there proves the port and attributes the residue to the shape and kernel choices, and that mode becomes a regression test. Test each attribution by making it vanish rather than accepting it because it sounds right; on LTX-2.5's Gemma, one of two plausible causes was false.
+
+The reference is not ground truth either: measure both it and the port against a more accurate third configuration (fp32). A kernel toggle on an already-instantiated remote-code model may not take effect, so check that a reference-vs-reference spread is nonzero, and reset `torch.set_float32_matmul_precision("highest")` in a harness comparing against fp32 (`apply_torch_config` sets TF32 on import).
 
 **For a sampler that amplifies small differences** (a few-step distilled diffusion sampler, any sampled AR stage), the oracle's bytes are not the bar. Measure the reference against itself under a different, equally valid kernel (flash vs memory-efficient SDPA) and hold the served output to that spread, for per-step tensors and for the final media (PSNR for video, a log-spectrum distance for audio).
 
@@ -111,6 +123,7 @@ Each of these is a one-line convention that a reference implementation states so
 - **Whether a norm is Gemma-style.** `(1 + weight)` versus `weight`, and a model can use both — Qwen3.5's plain `RMSNorm` scales by `(1 + weight)` while its gated norm does not. The tell is in the checkpoint: a weight tensor whose mean is ~0 rather than ~1 is storing `weight - 1`. Reading `mean()` off one norm tensor is faster than any amount of parity debugging.
 - **Stop tokens: trust the tokenizer over `config.json`.** Qwen3.5's `config.json` names `<|endoftext|>` while `tokenizer.eos_token` is `<|im_end|>`, which is what a chat turn actually ends on. Stopping on the config's alone means every reply runs to `max_tokens`, which reads as a sampler or scheduler bug. Union the two.
 - **Base versus instruct.** Variants may differ only by a suffix — Qwen tags base checkpoints `-Base`, so the unsuffixed repo is the instruct one and needs the chat template. Applying no template to an instruct model gives fluent, wrong continuations.
+- **Key per-request submodule state by `fwd_info.rid_handle` in `prepare_inputs`**, not `request_id`: the forward and the engine's cleanup use the handle.
 - **The conductor merges each pass's `step_metadata` into the request's `metadata.kwargs`.** A model whose walks send *different* step metadata (multi-stage, multi-resolution) and also keeps request-level facts in kwargs under the same names has those facts overwritten by the previous walk's values: a stage-1 half-resolution `height` becomes the request's height for stage 2. Keep request-level facts under keys step metadata never uses (LTX-2.5 nests them under `kwargs["request"]`).
 
 ## Phase 5 — Batching and CUDA graphs
@@ -121,7 +134,11 @@ Take the shape ledger from Phase 1 and give **every varying dimension exactly on
 
 Per-request state is one struct with one cleanup, called on the completed, failed **and** aborted paths. For interactive models abort is the normal ending, so test it: cancel mid-stream, zero output after cancel, slot freed for the next request. A failing request still records its sequence in the reorder buffer.
 
-Cross-request batching needs a batched forward, per-request info threading, a row-independence test and a dedicated padding slot; find the knee with a sweep rather than assuming it.
+Cross-request batching needs a batched forward, per-request info threading, a row-independence test and a dedicated padding slot; find the knee with a sweep rather than assuming it. Then check the batch sizes the forward actually runs under concurrency: a per-request counter or position in a grouping key silently batches nothing.
+
+- A model with several KV-backed nodes sizes every KV in its yaml; the defaults assume one, and the last resource to build OOMs.
+- A node whose work splits into several piecewise regions runs every call through the runners with `eager_fallback=True` (#383), with eager-only regions for shapes it never captures, rather than keeping a hand-written eager path: each region then plans exactly the rows it runs.
+- Stream positions derive from what was written, never from a step count.
 
 Consider making capture a separate PR stacked on the eager MVP, and any **system** change your model needed a separate PR underneath — see "Splitting work across PRs" in AGENTS.md. Recommended, not required; large models are painfully slow without capture, so an eager-only merge is not always useful alone.
 
@@ -129,11 +146,13 @@ Consider making capture a separate PR stacked on the eager MVP, and any **system
 
 **Media output must be verified by a human, here and again before the PR goes up.** An agent is fine for sanity checks and for reading text, but audio, images and video need a person to listen to or look at them. Numerical parity passing is not evidence that generated audio sounds right.
 
+Before a person listens, transcribe generated speech (the served model's own audio input works) and compare it with the intended text; it tells wrong tokens from a broken vocoder.
+
 Hand the person files they can play: audio as WAV alongside any mp4, since AAC-in-MP4 does not decode in every player. Put the reference's output next to yours, and the reference-vs-reference numbers from Phase 4 next to the served-vs-reference ones.
 
 ## Phase 7 — Benchmark against the competition
 
-Against vLLM, vllm-omni, TensorRT-LLM, SGLang, sglang-omni — whichever serve this model. The goal is genuinely to be better than or on par with them; this is a target, not an observation.
+Against vLLM, vllm-omni, TensorRT-LLM, SGLang, sglang-omni — whichever serve this model. The goal is genuinely to be better than or on par with them; this is a target, not an observation. Benchmark the competitor's best working config, not its default deploy (which may run eager at batch 1), and say which knobs you tried.
 
 Across a **comprehensive** set, though, not one configuration. A single winning benchmark usually means it got tuned for, and the workloads you didn't measure are where the regression hides: don't buy `image_to_text` throughput with `text_to_text` or mixed-workload throughput. Report which workloads you checked, including the ones that didn't improve.
 

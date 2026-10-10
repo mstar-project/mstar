@@ -7,6 +7,22 @@ description: Pitfalls when writing or changing an engine Resource under mstar/en
 
 A resource's `plan` writes device buffers that a captured graph later reads, while the async worker is already planning the next step. Mistakes here rarely raise; they make a replay read the wrong layout, or read out of bounds several frames away from the cause. Read `Resource` in [mstar/engine/resources/base.py](../../../mstar/engine/resources/base.py) and an existing manager (`kv/manager.py`, `attn/flashinfer.py`) before starting, and the [async-worker skill](../async-worker/SKILL.md) for what is in flight when `plan` runs.
 
+## Which resource for which state
+
+| state | resource | expresses |
+|---|---|---|
+| a cache that grows with the request | paged KV (`KVSpec` + `PagedKVConfig`), optionally a `RetentionPolicy` | any length; retention keeps a protected prefix plus the newest pages |
+| attention within one forward, no cache | `RaggedAttentionSpec` | block-diagonal per span, optionally causal |
+| | `RaggedCrossAttentionSpec` | one contiguous key range per query segment |
+| | `RaggedBlockCausalAttentionSpec` (#381) | each block attends its span's prefix of blocks |
+| a fixed-size cache per request: a sink plus a sliding window, optionally after a shared read-only prefix | bounded KV (`BoundedKVSpec`, #383) | rows at any position in one batch; per-row source; a per-distance score term |
+| fixed-size opaque state per request (recurrent, conv tails) | `RecurrentStatePool` | slots read and written through the step's addressing (`gather` / `scatter_`, #383) |
+| frame rings (Waypoint) | `RingKVManager` | to be merged into bounded KV |
+
+A resource that holds per-request state gives models operations driven by the step (`gather` / `scatter_`, `attend` over the current plan). It never asks a model to index its storage or to hold and select rows of its plans.
+
+Prototype a new kernel standalone against a dense reference before writing the resource, and for retention, check against a brute-force simulation of the reference's cache on token ids.
+
 ## Buffers and the async worker
 
 **`force_double_buffer` guards a race between consecutive steps; pre-plan is not what causes it.** If `plan` stages a step's layout into a reused buffer that a replay reads (index tensors, block tables, FlashInfer's per-wrapper plan buffers), `plan(N+1)` can overwrite it before step N's kernels have consumed it, and N replays with N+1's layout. The main runner already double-buffers any resource that `supports_preplan`; the flag extends that to runners with no pre-plan path, notably the piecewise runner. If your resource has the hazard, set it. The docstring on `Resource.force_double_buffer` is authoritative.
@@ -29,6 +45,7 @@ KV pages and recurrent (GDN/Mamba) state slots are two forms of the same per-req
 
 ## Attention backends
 
+- **Attention over several short key ranges tiles them as one sequence** (key to range by index math) and selects the pointer before loading: per-range tile loops and a masked load per source each cost about a quarter of the kernel on the token2wav DiT.
 - **Verify a kernel swap numerically, not just that it runs.** FlashInfer at head_dim 72 runs and returns wrong values (see `check_flashinfer_head_dim` in `attn/wrappers.py`).
 - **FlashInfer accepts `(k_cache, v_cache)` as a tuple of 4-D tensors**, not only the paired 5-D layout. With the paired layout it calls `.unbind(dim=1)` on every attention call (`flashinfer/utils.py::_unpack_paged_kv_cache`) and hands the kernel strided views. A split K/V layout avoids that.
 - **FlashAttention's causal mask is bottom-right aligned** (the new queries are the last positions); `F.scaled_dot_product_attention(is_causal=True)` is top-left aligned. They disagree whenever `q_len != kv_len`, so build the mask explicitly in a reference or you will "find" an FA bug that isn't there.

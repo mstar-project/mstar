@@ -23,6 +23,19 @@ On a shared box: pick explicit GPUs and check `nvidia-smi` first, then again dur
 
 ## Start a server
 
+**Start and stop every server through [`scripts/server.sh`](scripts/server.sh)**, M*'s and the competitors' alike. It refuses a busy port, records the real server PID rather than a wrapper's, fails fast with the log tail if the server dies during startup, checks that the process answering `/health` is the one it started, and on `stop` escalates from SIGINT to the process group and reaps the session's leftovers. Each of those has cost a run (or a whole A/B) when done by hand:
+
+```
+CUDA_HOME=... PYTHONPATH=$WT .claude/skills/benchmarking/scripts/server.sh start main 8100 -- mstar serve <model> --gpus 0
+.claude/skills/benchmarking/scripts/server.sh start vllm 8200 --timeout 1200 -- vllm serve <model> ...
+.claude/skills/benchmarking/scripts/server.sh status
+.claude/skills/benchmarking/scripts/server.sh stop main
+```
+
+`server.sh mps-start <gpu>` / `mps-stop <gpu>` run a per-user MPS daemon for one GPU. Several worker processes on one GPU (M*'s per-node workers, vllm-omni's stages) otherwise time-slice it instead of overlapping kernels; measure with and without, and give the competitor the same. MPS clients see the daemon's GPU as device 0, so a client launched with `CUDA_VISIBLE_DEVICES=<physical index>` finds no GPU.
+
+The rest of this section is what the script does for you, and why.
+
 ```bash
 mstar serve <model> --gpus 0,1          # mstar serve -h lists the models
 mstar serve <model> --gpus 0,1 --config configs/<name>.yaml
@@ -92,6 +105,8 @@ Give every run its own `--output-dir` — the example scripts hardcode `.bench_o
 
 **Prefer output-length-agnostic metrics.** How much text or audio gets produced varies run to run, because it depends on how requests happened to batch. TTFT, RTF for audio, and throughput in tok/s or audio-sec/s are robust; req/s and total benchmark time are not.
 
+This holds across systems even when the input is identical. Against a competitor, report speech throughput as audio-sec/s, never req/s: two systems reading the *same words* can produce different amounts of audio (different TTS sampling, conditioning or voice), and req/s rewards the one that says less. MiniCPM-o vs vllm-omni on a read-aloud set made this concrete: M* produced 4-9% more audio per request for identical text, so req/s understated it by that much. Also check the systems are producing the same content at all: thinker-talker models given different system prompts write different replies (vllm-omni's ran ~40% longer), and then neither metric compares serving. A read-aloud prompt set ("read this text aloud exactly") fixes the words; compare each side's audio length against the reference model's on the same text to know whose speech rate is faithful.
+
 ## CPU-bound or GPU-bound
 
 Answer this before optimizing anything. It is what `benchmark/worker_phases/` is for (see its [README](../../../benchmark/worker_phases/README.md)):
@@ -108,6 +123,9 @@ Reading the table:
 - **`await_gpu` is not that signal.** It is waiting for the CPU part of the GPU thread.
 - **`check_stop` is a side-stream D2H**, not pure Python/Rust CPU work.
 - **A host sync hides in whatever phase encloses it** and makes `event_sync` look smaller. An unexpectedly expensive `prepare_inputs` is the usual tell.
+- **ITL ≈ k × `iter_total` at steady concurrency** means rows alternate between steps: something keeps them out of speculation (see the async-worker skill).
+- **A worker's `gpu_exec` mean ≫ median** means a few huge steps (an eager fallback, a batch split into tiny groups, a recompile), not general slowness. Check the batch sizes the step actually runs.
+- **Workers sharing a GPU time-slice it** unless MPS is on. Sum `gpu_exec` per worker against wall time: a stage stepping at small batch can starve one at large batch.
 
 The README's table of which phases are waits and which are work is worth reading before you draw any conclusion. Summing a wait into a work total is the most common way to misread this output.
 
@@ -127,6 +145,8 @@ The editable install maps the `mstar` package to this checkout's absolute path v
 find mstar -name __pycache__ -type d -prune -exec rm -rf {} +
 python -c "import mstar, mstar.conductor.conductor, mstar.worker.worker"
 ```
+
+**Report a delta only from arms run back to back in one allocation**, two or more repetitions each. A comparison across allocations or nodes is not evidence.
 
 **Two arms never share a GPU at the same time.** That covers a reference/oracle run against the server as much as two builds: when nothing is being timed, run them in parallel on different GPUs; when something is, run them back to back.
 
@@ -176,6 +196,7 @@ How many repeats, and how large a delta counts as real, depend on the model and 
 - **Profile one process, not the server tree.** `py-spy record --subprocesses` at a high rate fell a minute behind and dropped ~40% of samples, leaving the worker with 183 samples on one side and 3394 on the other. Attach to the GPU worker's pid alone at a modest rate (~50–100 Hz). If the sample counts on the two sides of an A/B differ a lot, discard the profile.
 - **Single A/B jobs vary even with ABBA ordering and two restarts per side.** The same code pair measured −1.4% to −5.5% across separate jobs. Pool several jobs and report the range.
 - **On a shared machine with CPU contention, host-bound arms drift by tens of percent between runs hours apart, while GPU-bound arms barely move.** One build of Qwen3.5 0.8B `image_to_text` measured 394 tok/s in a sweep and 489–510 a few hours later on the same node; 4B and up moved a few percent. (A quiet box doesn't behave like this.) So interleave systems and variants within each round (mstar/vLLM/SGLang per round, or A B A B), log the load average per arm, and don't compare absolute numbers from separate jobs for small or host-bound models.
+- **Profile a captured region without a server**: build its resources directly, capture one call, and profile replays. Check replay against eager and eager against eager (that tells a capture difference from a nondeterministic kernel), restore any in-place caches between comparisons, and run under `torch.inference_mode()` if the code is decorated with it. Capture cost: time from the server log's capture lines, memory as `memory_reserved()` after `empty_cache()`.
 - **When the expected effect is smaller than the noise, time the mechanism directly.** Two end-to-end A/Bs of one question gave +3–5% and −6–8%, both noise (the same unmodified build measured 489 and 510 tok/s in consecutive A/Bs). A 30-line CUDA-graph microbenchmark of the attention in question settled it in minutes, and stopped an engine change that would have bought nothing.
 - **Output-equivalence checks need a same-code control.** Greedy output isn't byte-reproducible across server processes (see trap 1): two runs of identical code matched on 3/8 and 6/8 prompts. Nor is it within one server once requests batch together: two greedy rounds against one server differed on 2–4 of 6 prompts, and a near-tie first token flipped between builds and back again on a later run. Run A against A to get the noise floor, then compare B against A to that floor. For audio, compare waveforms, not bytes.
 - **Verify what the client actually sent.** `benchmark.runner` can fall back to its default dataset when a flag (e.g. `--dataset text`) is omitted, and samples prompts randomly. A "long prompt" probe once ran on short prompts. Check input lengths in the results before trusting a targeted probe.

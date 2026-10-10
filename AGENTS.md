@@ -44,6 +44,7 @@ For example, nothing under `mstar/model/` should:
 - **Allocate, free, or evict resource state.** No calls into `PageArena`, `PageAllocator`, `CacheStream`, `CPUPagePool`, or `WorkspacePool`, and no direct `admit`/`commit`. Declare resources in `Model.get_node_resources()` and declare each step's effect on them in `NodeSubmodule.declare_step()`. The engine runs the lifecycle.
 - **Choose which requests form a batch.** Batch *selection* is the micro-scheduler's job: implement `can_batch` and `forward_batched`, set `input_seq_len` in `prepare_inputs`, and let it decide. (Note: given a batch, mechanically stacking or concatenating tensors in `preprocess` is normal and expected, and some audio submodules also pad to a maximum sequence length themselves for capture compatibility).
 - **Manage streams or synchronize.** No `torch.cuda.Stream`, `torch.cuda.synchronize`, or `torch.cuda.Event` under `mstar/model/`.
+- **Index a resource's storage or hold its plans.** No `pool.block(...).index_select` / `index_copy_`, host-side slot lookups, or keeping `resource.current` to select rows from later. The resource exposes the access, driven by the step (e.g., `RecurrentStatePool.gather` / `scatter_`, `attend` over the current plan), so eager and captured paths address rows the same way.
 
 Things that look model-specific but belong to the system:
 
@@ -87,7 +88,7 @@ Things to be wary of that have caused issues in the past, by no means a comprehe
 - Scheduling changes that involve checking more requests per-step, or increasing the amount of engine-level checks on the scheduling path
 - Per-tensor computation / data transfer that could naturally be batched
 - Passing many small objects through the Python <> Rust boundary. For instance, a `list[tuple]` or `list[dataclass]` is going to have a lot more overhead on the boundary than a parallel/columnar format. Specifically: `requests: list[int], values: list[int]` is preferable to `request_vals: list[tuple[int, int]]`.
-- Sending large objects over ZMQ
+- Sending large objects over ZMQ. Per-request bulk data (an audio clip, say) travels as a tensor edge, not in `step_metadata` or kwargs, which are pickled into control messages.
 - A field on a per-step message whose declared type the wire codec has no encoder for. It falls back to pickle silently, once per peer per step; `wire._encoder(T).__name__` says which path a type takes. A `@dataclass` of lists encodes typed where a `NamedTuple` of `deque`s does not.
 - Work repeated every pass for requests that are waiting. When the ready set exceeds a batch cap, some rows wait in the backlog across many steps, so anything done per pass for them (re-measuring sequence lengths, rebuilding input tensors, readiness checks) is paid every step at high concurrency. Do the cheap checks (e.g., "is the caller's batch already full?") before touching queues or the backlog.
 
@@ -107,7 +108,7 @@ There's no mechanical rule to follow here (e.g., no "every mutation on the norma
 
 Some additional information:
 - **Speculation "wastes" the last step of a dynamic loop.** AR decode accepts that cost, because it cannot know its length in advance. Flow and diffusion nodes know their iteration count at request ingestion, so they exit early in `prepare_inputs` for the extra step and pay no extra compute (only some CPU work). A node that can do neither sets `enable_async_scheduling=False`.
-- **A host sync outside `check_stop` forces synchronous execution.** `check_stop` is fed CPU tensors after a D2H that the worker prematerializes on a side stream, so it is free. Any other `.item()`, `.cpu()`, `.tolist()`, `.numpy()`, `bool()`/`if` on a device tensor, or print of one in the step path collapses the pipeline back to serial and usually costs more than it appears. Values that are already known on the host (e.g., request settings decided in `process_prompt`) should travel in `step_metadata`, not round-trip through the device.
+- **A host sync outside `check_stop` forces synchronous execution.** `check_stop` is fed CPU tensors after a D2H that the worker prematerializes on a side stream, so it is free. Any other `.item()`, `.cpu()`, `.tolist()`, `.numpy()`, `bool()`/`if` on a device tensor, or print of one in the step path collapses the pipeline back to serial and usually costs more than it appears. So does building a device tensor from host data per row in `prepare_inputs` (`torch.tensor(x, device="cuda")`, `.to("cuda")` of a pageable tensor): it is a synchronous copy. Values that are already known on the host (e.g., request settings decided in `process_prompt`) should travel in `step_metadata`, not round-trip through the device.
 - **A new resource doing H2D into fixed buffers must set `force_double_buffer`** (see `Resource.force_double_buffer` in [mstar/engine/resources/base.py](mstar/engine/resources/base.py)). Without it, step N+1 overwrites buffers step N is still reading.
 - **Moving GIL-holding Python to another thread does not parallelize it**; it only adds contention (overlapping `prepare_inputs` with the plan thread measured worse). For a host-bound step, the fix is deleting work, not moving it.
 
@@ -218,7 +219,7 @@ Recommended practice: the reviewer raises these as notes and never blocks on the
 
 ## Style and structure
 
-Readability rules the reviewer may cite as **S1**, **S2**, **S3**. These are the ones that come up frequently in AI-assisted PRs.
+Readability rules the reviewer may cite as **S1** through **S4**. These are the ones that come up frequently in AI-assisted PRs.
 
 **S1. Name your aggregates.** A `NamedTuple` or `@dataclass` instead of a long tuple. Prefer a `LoraAdapter` with fields `a`, `b` and `sigma` over `tuple[torch.Tensor, torch.Tensor, float]`, which is opaque at every call site and gets worse as it grows. This applies to return types and to anything that crosses a function boundary more than once. Pick the type to signal intent: a `NamedTuple` (or frozen dataclass) for a value that shouldn't change, and a mutable `@dataclass(slots=True)` for state that is updated in place, e.g., a row's chunked-prefill progress.
 
@@ -227,9 +228,12 @@ Readability rules the reviewer may cite as **S1**, **S2**, **S3**. These are the
 - No references to a plan's numbered or lettered steps.
 - Don't narrate a specific failure in depth when the general statement is the actual justification. "This is required to maintain symmetric resource state between TP ranks and avoid deadlock" is better than several sentences tracing one rank admitting a batch, the other refusing, and a thread spinning on a collective until the NCCL timeout.
 - Explain why, not what. Match the comment density of the file you're editing.
+- Once the implementation or optimization settles, do a pass over the comments and docstrings you wrote and cut them down. Keep the TL;DR and whatever a reader would not guess from the code (an invariant, a surprising constraint, why the obvious alternative was rejected); drop restatements of the code and accounts of how it got there, which belong in the commit message or PR. Agent-written comments drift long and tend to stay long, so make this a deliberate step rather than relying on writing them short the first time.
 - Check comments for staleness when the code under them changes, especially comments that state lifecycle or ordering semantics. A comment that was true of an earlier draft (e.g., "a chunked prompt forks on its first chunk", when pre-fork happens on the first chunk and post-fork on the last) is worse than none.
 
 **S3. Reach for a class when the shape calls for one.** Several related functions with differing implementations — attention backends being the obvious case — want a base class with subclasses, particularly where the alternative is module-level global state. Likewise, a cluster of related fields and methods accreting on `Worker` or `Engine` usually wants to be its own object; the graph runtime on the worker and submodule management / the CUDA graph runner on the engine are the examples worth imitating. And when a new behaviour differs enough from an existing class's that supporting it means an optional argument that switches what the class does, consider a sibling class over a shared base instead. This is a judgement call rather than a rule: the ragged attention resource gained cross-attention as `RaggedCrossAttentionSpec` / `RaggedCrossPrefillWrapper` beside the self-attention classes, rather than an optional `kv_cu_seqlens` that changed what a plan meant, and the self-attention API stayed untouched.
+
+**S4. Keep abstractions semantically coherent.** Don't bundle concerns into one dataclass, gather or code path because they arrived together for one model; split them by what each needs (per-request state versus static settings, say), and add a feature to an existing path as a branch rather than a parallel copy of it, unless there is a stated reason.
 
 **Also**:
 
