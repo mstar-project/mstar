@@ -51,6 +51,10 @@ class Glm5NextDsaContext:
     topk: int
     kpool: int
     sparse_plan: sparse_mla.SparseGraphPlan | sparse_mla.EagerSparsePlan | None = None
+    # a graph plan made for longer rows than the step's (MTP trimmed on device): each row's
+    # true length and the masked slot its spare entries attend
+    valid: torch.Tensor | None = None
+    pad_slot: int | None = None
 
     @property
     def width(self) -> int:
@@ -82,6 +86,12 @@ def attn_lens(positions: list[int], topk: int, kpool: int) -> list[int]:
     """Keys each row attends: its selected pools' tokens plus its tail."""
     cap = topk // kpool
     return [kpool * min((p + 1) // kpool, cap) + (p + 1) % kpool for p in positions]
+
+
+def attn_lens_device(positions: torch.Tensor, topk: int, kpool: int) -> torch.Tensor:
+    """``attn_lens`` of device positions, without a sync."""
+    p = positions.long() + 1
+    return kpool * torch.clamp(p // kpool, max=topk // kpool) + p % kpool
 
 
 # -- the step's index keys --------------------------------------------------------------------
@@ -267,4 +277,6 @@ def sparse_attend(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor
         ctx.sparse_plan = sparse_mla.EagerSparsePlan(
             ctx.attn_lens(), ctx.width, q_nope.shape[1], q_nope.shape[-1], q_pe.shape[-1],
             sm_scale, q_nope.device)
+    if ctx.valid is not None:
+        return ctx.sparse_plan.attend(q_nope, q_pe, latent, slots, ctx.valid, ctx.pad_slot)
     return ctx.sparse_plan.attend(q_nope, q_pe, latent, slots)

@@ -76,11 +76,13 @@ class Glm5NextMTPModule(nn.Module):
         prev_hidden: torch.Tensor,
         row: int | None = None,
         latents: torch.Tensor | None = None,
+        index_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """The shared-head norm output: the LM head's input, and also the next
         draft step's ``prev_hidden`` (vLLM's Glm5NextMTP recycles the normed
-        state). ``row`` and ``latents`` run one query per request inside the
-        step's block (``Glm5NextPlainDecoderLayer.forward``)."""
+        state). ``row``, ``latents`` and ``index_rows`` run one query per request
+        inside the step's block (``Glm5NextPlainDecoderLayer.forward``)."""
         hidden_states = self.fuse(token_embeds, prev_hidden)
-        hidden_states = self.transformer_layer(hidden_states, row=row, latents=latents)
+        hidden_states = self.transformer_layer(
+            hidden_states, row=row, latents=latents, index_rows=index_rows)
         return self.shared_head(hidden_states)
