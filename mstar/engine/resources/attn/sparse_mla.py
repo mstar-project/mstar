@@ -98,15 +98,24 @@ class SparseGraphPlan:
             workspace, use_cuda_graph=True, qo_indptr=self._qo, kv_indptr=self._kv,
             kv_indices=self.indices, kv_len_arr=self._lens, backend="auto")
         self._planned: torch.cuda.Event | None = None
+        # what the wrapper was last planned for (a plan lives in the wrapper's own buffers;
+        # the float workspace it shares with other buckets holds no plan between runs)
+        self._stamp: tuple | None = None
 
     def plan(self, lens: list[int], heads: int, kv_lora_rank: int, kpe: int,
              sm_scale: float) -> None:
         assert len(lens) == self.rows
+        lens = _lens(lens, self.width)
+        stamp = (tuple(lens), heads, kv_lora_rank, kpe, sm_scale)
+        if self._stamp == stamp:
+            # the same plan stands (MTP over a long context plans every row at the cap, step
+            # after step): its buffers are as they were
+            return
         if self._planned is not None:
             # the last plan's copy out of the wrapper's pinned buffer may still be queued
             self._planned.synchronize()
-        _plan(self.wrapper, self.indices, _lens(lens, self.width), heads, kv_lora_rank, kpe,
-              sm_scale)
+        _plan(self.wrapper, self.indices, lens, heads, kv_lora_rank, kpe, sm_scale)
+        self._stamp = stamp
         self._planned = torch.cuda.Event()
         self._planned.record()
 
