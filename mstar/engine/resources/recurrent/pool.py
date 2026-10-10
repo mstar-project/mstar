@@ -60,13 +60,6 @@ class RecurrentAddressing:
     has_state: torch.Tensor     # [rows] bool, False where the slot reads as zeros
     num_rows: int               # the rows the step declared, a replay's padding rows included
 
-    def select(self, rows: list[int]) -> RecurrentAddressing:
-        """These rows of the step, for a forward that runs a subset of its batch."""
-        index = torch.tensor(rows, dtype=torch.long, device=self.slot_indices.device)
-        return RecurrentAddressing(
-            self.slot_indices.index_select(0, index), self.has_state.index_select(0, index), len(rows),
-        )
-
 
 class RecurrentStatePool(Resource):
     @classmethod
@@ -139,9 +132,9 @@ class RecurrentStatePool(Resource):
     def gather(self, name: str, rows: RecurrentAddressing, layer_idx: int = 0) -> torch.Tensor:
         """Block ``name`` of these rows' slots, ``[rows, *shape]`` (a copy).
 
-        ``rows`` is the step's addressing (``addressing``) or a ``select`` of it,
-        so a captured and an eager forward address the same slots; padding
-        rows read the sink."""
+        ``rows`` is the step's addressing (``addressing``), so a captured and an
+        eager forward address their slots the same way; padding rows read the
+        sink."""
         index = rows.slot_indices[: rows.num_rows].long()
         return self._blocks[name][layer_idx].index_select(0, index)
 

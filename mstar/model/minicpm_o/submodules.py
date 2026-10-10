@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -39,7 +39,6 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
-from mstar.engine.resources.kv.bounded.manager import BoundedPlan
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
@@ -91,7 +90,7 @@ from mstar.model.submodule_base import (
 )
 
 if TYPE_CHECKING:
-    from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -761,14 +760,11 @@ class Token2WavSubmodule(NodeSubmodule):
         self.bank = VoiceBank.build(voices)
         self._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
 
-    def _caches(
-        self, resources: Mapping, plans: Mapping[str, Any], custom: SlotRows | None = None,
-    ) -> WindowCaches:
-        """A batch's ``WindowCaches``, on these plans of the cache resources (and its rows
-        of the voice pool, ``custom``)."""
+    def _caches(self, resources: Mapping, custom: SlotRows | None = None) -> WindowCaches:
+        """The step's ``WindowCaches`` (and its rows of the voice pool, ``custom``)."""
         return WindowCaches(**{
             name: AttentionCache(
-                resources[T2W_KV[name]], self.bank.sources[name], plans[name],
+                resources[T2W_KV[name]], self.bank.sources[name],
                 None if custom is None else (custom.pool.block(f"src_{name}", 0), custom.rows.slot_indices),
             )
             for name in CACHE_FAMILIES
@@ -869,6 +865,9 @@ class Token2WavSubmodule(NodeSubmodule):
                 segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
                 steps={T2W_VOICES: RecurrentStep()},
             )
+        # This step admits the windows (slots, positions), which has to happen before
+        # the forward. Its plan goes unused: each region re-plans the rows it runs.
+        # TODO: an admit-only step would save that plan's host work.
         return SubmoduleStep(
             segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
             steps={
@@ -881,6 +880,11 @@ class Token2WavSubmodule(NodeSubmodule):
             },
         )
 
+    # Each window's flow and HiFT run through a piecewise region: replayed when a graph
+    # fits, else eagerly through the same step, so the resources always hold the plan
+    # of exactly the rows being run. Shapes that are never captured (a window short of
+    # the TTS's stop code, a one-window reply's HiFT) have eager-only regions.
+
     @staticmethod
     def flow_region(num_tokens: int, last: bool) -> str:
         return f"t2w/flow{'_last' if last else ''}{num_tokens}"
@@ -888,6 +892,10 @@ class Token2WavSubmodule(NodeSubmodule):
     @staticmethod
     def hift_region(first: bool, frames: int, last: bool) -> str:
         return f"t2w/hift/{'first' if first else 'next'}{'_last' if last else ''}{frames}"
+
+    @staticmethod
+    def eager_region(stage: str, first: bool, last: bool) -> str:
+        return f"t2w/{stage}_eager/{'first' if first else 'next'}{'_last' if last else ''}"
 
     def get_piecewise_cuda_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs,
@@ -925,26 +933,31 @@ class Token2WavSubmodule(NodeSubmodule):
             )
 
         def flow(last: bool):
-            def capture(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+            def run(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
                 pool = call.resources[T2W_STATE]
-                plans = {name: call.resources[key].current for name, key in T2W_KV.items()}
                 custom = None
                 if self.custom_voices:
                     voices = call.resources[T2W_VOICES]
                     custom = SlotRows(voices, voices.addressing("main"))
                 return {"mel": self.model.window_flow(
                     SlotRows(pool, pool.addressing("main")), self.bank, call.static_inputs["voices"],
-                    call.static_inputs["tokens"], self._caches(call.resources, plans, custom), last, custom,
+                    call.static_inputs["tokens"], self._caches(call.resources, custom), last, custom,
                 )}
-            return capture
+            return run
 
         def hift(first: bool, last: bool):
-            def capture(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+            def run(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
                 pool = call.resources[T2W_STATE]
                 return self.model.window_vocode(
                     SlotRows(pool, pool.addressing("main")), call.static_inputs["mel"], first, last,
                 )
-            return capture
+            return run
+
+        def region(run, make_static_inputs, declare_step, seq_len, batch_sizes):
+            return PiecewiseBatchedConfig(
+                capture_fn=run, make_static_inputs=make_static_inputs, declare_step=declare_step,
+                seq_len=seq_len, capture_batch_sizes=batch_sizes, eager_fallback=True,
+            )
 
         # Full windows at any position share one graph per batch size. A last window has
         # one of HOP lengths and rarely meets another of its length, so each length is
@@ -956,41 +969,26 @@ class Token2WavSubmodule(NodeSubmodule):
         #
         # Each row's voice is an input (an index into ``bank``), so one graph serves every
         # voice and rows of different voices share a batch.
-        configs = {
-            self.flow_region(WINDOW, False): PiecewiseBatchedConfig(
-                capture_fn=flow(last=False),
-                make_static_inputs=static_tokens(WINDOW),
-                declare_step=declare_flow(last=False),
-                seq_len=WINDOW,
-                capture_batch_sizes=self.WINDOW_CAPTURE_BATCH_SIZES,
-            ),
-        }
-        for n in LAST_WINDOW_TOKENS:
-            configs[self.flow_region(n, True)] = PiecewiseBatchedConfig(
-                capture_fn=flow(last=True),
-                make_static_inputs=static_tokens(n),
-                declare_step=declare_flow(last=True),
-                seq_len=n,
-                capture_batch_sizes=self.LAST_CAPTURE_BATCH_SIZES,
-            )
         full = window_frames(WINDOW, False)
+        configs = {
+            self.flow_region(WINDOW, False): region(
+                flow(False), static_tokens(WINDOW), declare_flow(False), WINDOW, self.WINDOW_CAPTURE_BATCH_SIZES),
+        }
         for first in (True, False):
-            configs[self.hift_region(first, full, False)] = PiecewiseBatchedConfig(
-                capture_fn=hift(first, last=False),
-                make_static_inputs=static_mel(full),
-                declare_step=declare_hift,
-                seq_len=full,
-                capture_batch_sizes=self.WINDOW_CAPTURE_BATCH_SIZES,
-            )
+            configs[self.hift_region(first, full, False)] = region(
+                hift(first, False), static_mel(full), declare_hift, full, self.WINDOW_CAPTURE_BATCH_SIZES)
         for n in LAST_WINDOW_TOKENS:
             frames = window_frames(n, True)
-            configs[self.hift_region(False, frames, True)] = PiecewiseBatchedConfig(
-                capture_fn=hift(first=False, last=True),
-                make_static_inputs=static_mel(frames),
-                declare_step=declare_hift,
-                seq_len=frames,
-                capture_batch_sizes=self.LAST_CAPTURE_BATCH_SIZES,
-            )
+            configs[self.flow_region(n, True)] = region(
+                flow(True), static_tokens(n), declare_flow(True), n, self.LAST_CAPTURE_BATCH_SIZES)
+            configs[self.hift_region(False, frames, True)] = region(
+                hift(False, True), static_mel(frames), declare_hift, frames, self.LAST_CAPTURE_BATCH_SIZES)
+        for last in (False, True):
+            configs[self.eager_region("flow", False, last)] = region(
+                flow(last), static_tokens(WINDOW), declare_flow(last), WINDOW, [])
+            for first in (False, True):
+                configs[self.eager_region("hift", first, last)] = region(
+                    hift(first, last), static_mel(full), declare_hift, full, [])
         return configs
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
@@ -998,6 +996,10 @@ class Token2WavSubmodule(NodeSubmodule):
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
+
+    def max_batch_size(self, graph_walk: str):
+        # one at a time: a full voice pool then holds back only the request that waits
+        return 1 if graph_walk == T2W_VOICE else None
 
     def preprocess(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs],
@@ -1015,15 +1017,7 @@ class Token2WavSubmodule(NodeSubmodule):
         their request's first window."""
         if graph_walk == T2W_VOICE:
             return self._prepare_voices(engine_inputs)
-        pool = engine_inputs.resources[T2W_STATE]
-        voices = engine_inputs.resources.get(T2W_VOICES)
-        step = _NodeStep(
-            engine_inputs=engine_inputs,
-            state=SlotRows(pool, pool.addressing("main")),
-            voices=None if voices is None else SlotRows(voices, voices.addressing("main")),
-            plans={name: engine_inputs.resources[key].current for name, key in T2W_KV.items()},
-            rows={rid: i for i, rid in enumerate(engine_inputs.request_ids)},
-        )
+        runners = engine_inputs.piecewise_runners
         first, num_tokens, flows = {}, {}, {}
         for rid, (codes, last) in zip(engine_inputs.request_ids, rows, strict=True):
             first[rid] = not self.request_state(rid).get("started", False)
@@ -1032,20 +1026,22 @@ class Token2WavSubmodule(NodeSubmodule):
 
         mels, hifts = {}, {}
         for (n, last), group in flows.items():
-            region = self.flow_region(n, last)
-            for chunk in self._chunks(step, region, group, last):
+            runner = runners.get(self.flow_region(n, last)) or runners[self.eager_region("flow", False, last)]
+            for chunk in self._chunks(runner, group, last):
                 rids = [rid for rid, _ in chunk]
                 tokens = torch.cat([codes for _, codes in chunk])
-                mel = self._run_flow(step, region, rids, tokens, last)
+                mel = self._run_flow(runner, rids, tokens)
                 for i, rid in enumerate(rids):
                     mels[rid] = mel[i]
                     hifts.setdefault((first[rid], mel.shape[-1], last), []).append(rid)
 
         out = {}
         for (is_first, frames, last), rids in hifts.items():
-            region = self.hift_region(is_first, frames, last)
-            for chunk in self._chunks(step, region, rids, last):
-                wav = self._run_hift(step, region, chunk, torch.stack([mels[rid] for rid in chunk]), is_first, last)
+            runner = runners.get(self.hift_region(is_first, frames, last)) or runners[
+                self.eager_region("hift", is_first, last)]
+            for chunk in self._chunks(runner, rids, last):
+                mel = torch.stack([mels[rid] for rid in chunk])
+                wav = self._run_hift(engine_inputs, runner, chunk, mel, is_first, last)
                 for i, rid in enumerate(chunk):
                     req = self.request_state(rid)
                     # the attention caches' stream position (``_cache_steps``)
@@ -1054,97 +1050,51 @@ class Token2WavSubmodule(NodeSubmodule):
                     out[rid] = {"audio_chunk": [wav[i]]}
         return out
 
-    def max_batch_size(self, graph_walk: str):
-        # one at a time: a full voice pool then holds back only the request that waits
-        return 1 if graph_walk == T2W_VOICE else None
-
     @torch.compiler.disable
     def _prepare_voices(self, engine_inputs: ModelInputsFromEngine) -> dict[str, NameToTensorList]:
-        """Prepare each request's custom voice (the flow over its prompt, as for a bundled
-        voice at load) into its entry of the voice pool."""
+        """Prepare a request's custom voice (the flow over its prompt, as for a bundled
+        voice at load) into its entry of the voice pool. One request a step."""
+        (rid,) = engine_inputs.request_ids
         pool = engine_inputs.resources[T2W_VOICES]
-        rows = SlotRows(pool, pool.addressing("main"))
-        layout = dict(pool.config.blocks)
-        for i, rid in enumerate(engine_inputs.request_ids):
-            voice = self.model.prepare_voice(self.request_state(rid)["voice_prompt"])
-            one = SlotRows(pool, rows.rows.select([i]))
-            for name, value in voice_entry(voice, layout).items():
-                one.set(name, value)
-        return {rid: {} for rid in engine_inputs.request_ids}
+        voice = self.model.prepare_voice(self.request_state(rid)["voice_prompt"])
+        entry = SlotRows(pool, pool.addressing("main"))
+        for name, value in voice_entry(voice, dict(pool.config.blocks)).items():
+            entry.set(name, value)
+        return {rid: {}}
 
-    def _chunks(self, step: _NodeStep, region: str, group: list, last: bool) -> list[list]:
-        """``group`` in batches its captured region can replay (all of it when uncaptured)."""
-        runner = step.runner(region)
-        if runner is None or not runner.any_graphs:
+    def _chunks(self, runner, group: list, last: bool) -> list[list]:
+        """``group`` in batches its region can replay (all of it when it runs eagerly)."""
+        if not runner.any_graphs:
             return [group]
         cap = (self.LAST_CAPTURE_BATCH_SIZES if last else self.WINDOW_CAPTURE_BATCH_SIZES)[-1]
         return [group[i:i + cap] for i in range(0, len(group), cap)]
 
     @torch.compiler.disable
-    def _run_flow(
-        self,
-        step: _NodeStep,
-        region: str,
-        rids: list[str],
-        tokens: torch.Tensor,
-        last: bool,
-    ) -> torch.Tensor:
-        """``window_flow`` for these rows: the captured region when it fits, else eagerly."""
+    def _run_flow(self, runner, rids: list[str], tokens: torch.Tensor) -> torch.Tensor:
+        """``window_flow`` for these rows (``[B, 80, frames]``)."""
         voices = self._voice_ids(rids, tokens.device)
-        runner = step.runner(region)
-        if runner is not None and runner.can_run(len(rids)):
-            out = runner.run(static_inputs={"tokens": tokens, "voices": voices}, request_ids=rids, real_bs=len(rids))
-            # copied out: the next replay of this region reuses the buffer
-            return out.get_view("mel").clone()
-        plans = {name: plan.select(step.select(rids)) for name, plan in step.plans.items()}
-        custom = step.voices_of(rids) if step.voices is not None else None
-        caches = self._caches(step.engine_inputs.resources, plans, custom)
-        return self.model.window_flow(step.state_of(rids), self.bank, voices, tokens, caches, last, custom)
+        out = runner.run(
+            static_inputs={"tokens": tokens, "voices": voices}, request_ids=rids,
+            seq_lens=[tokens.shape[1]] * len(rids), real_bs=len(rids),
+        )
+        # copied out: the next replay of this region reuses the buffer
+        return out.get_view("mel").clone()
 
     @torch.compiler.disable
     def _run_hift(
         self,
-        step: _NodeStep,
-        region: str,
+        engine_inputs: ModelInputsFromEngine,
+        runner,
         rids: list[str],
         mel: torch.Tensor,
         first: bool,
         last: bool,
     ) -> torch.Tensor:
-        """``window_vocode`` (captured when it fits) and ``window_finish``: the rows' samples."""
-        state = step.state_of(rids)
-        runner = step.runner(region)
-        if runner is not None and runner.can_run(len(rids)):
-            out = runner.run(static_inputs={"mel": mel}, request_ids=rids, real_bs=len(rids))
-            magnitude, phase = out.get_view("magnitude"), out.get_view("phase")
-        else:
-            out = self.model.window_vocode(state, mel, first, last)
-            magnitude, phase = out["magnitude"], out["phase"]
-        return self.model.window_finish(state, magnitude, phase, first, last)
-
-
-class _NodeStep(NamedTuple):
-    """One token2wav forward's view of the node's resources, shared by its window groups."""
-
-    engine_inputs: ModelInputsFromEngine
-    # the node step's rows of the state and voice pools and its cache plans, taken before
-    # a captured region plans its own
-    state: SlotRows
-    voices: SlotRows | None
-    plans: dict[str, BoundedPlan]
-    # request -> its row in the node step
-    rows: dict[str, int]
-
-    def runner(self, region: str) -> PiecewiseCudaGraphRunner | None:
-        return self.engine_inputs.piecewise_runners.get(region)
-
-    def select(self, rids: list[str]) -> list[int]:
-        return [self.rows[rid] for rid in rids]
-
-    def state_of(self, rids: list[str]) -> SlotRows:
-        """These requests' rows of the node step's state, for an eager window."""
-        return SlotRows(self.state.pool, self.state.rows.select(self.select(rids)))
-
-    def voices_of(self, rids: list[str]) -> SlotRows:
-        """These requests' rows of the node step's voice pool."""
-        return SlotRows(self.voices.pool, self.voices.rows.select(self.select(rids)))
+        """``window_vocode`` and then (eagerly: the inverse STFT syncs) ``window_finish``,
+        on the rows the region just planned: the rows' samples."""
+        out = runner.run(
+            static_inputs={"mel": mel}, request_ids=rids, seq_lens=[mel.shape[-1]] * len(rids), real_bs=len(rids),
+        )
+        pool = engine_inputs.resources[T2W_STATE]
+        state = SlotRows(pool, pool.addressing("main")).head(len(rids))
+        return self.model.window_finish(state, out.get_view("magnitude"), out.get_view("phase"), first, last)

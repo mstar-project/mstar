@@ -18,6 +18,7 @@ excitation from the global RNG unless given a generator or the draws themselves.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, fields
@@ -350,6 +351,10 @@ class SlotRows(NamedTuple):
     def set(self, name: str, value: torch.Tensor) -> None:
         self.pool.scatter_(name, self.rows, value)
 
+    def head(self, n: int) -> SlotRows:
+        """The step's first ``n`` rows: its real ones, a captured replay's padding after."""
+        return SlotRows(self.pool, dataclasses.replace(self.rows, num_rows=n))
+
     @property
     def fresh(self) -> torch.Tensor:
         """``[B]`` rows whose slot holds no state yet: their request's first window."""
@@ -392,19 +397,18 @@ class VoiceBank(NamedTuple):
 
 
 class AttentionCache(NamedTuple):
-    """Where a batch's caches of one family are: the bounded KV resource, the model's
-    voices' sources (``VoiceBank.sources``), the batch's rows of the step's plan, and for
-    rows in a custom voice their entries of the voice pool (its ``src_<family>`` block
+    """Where a batch's caches of one family are: the bounded KV resource (whose step
+    planned the batch's rows), the model's voices' sources (``VoiceBank.sources``), and
+    for rows in a custom voice their entries of the voice pool (its ``src_<family>`` block
     and the rows' slots)."""
 
     resource: object
     sources: torch.Tensor
-    plan: object
     custom: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def layer(self, idx: int) -> BoundedLayerKV:
         row_source = None if self.custom is None else (self.custom[0][:, idx], self.custom[1])
-        return BoundedLayerKV(self.resource, idx, self.sources[:, idx], self.plan, row_source)
+        return BoundedLayerKV(self.resource, idx, self.sources[:, idx], row_source)
 
 
 class WindowCaches(NamedTuple):

@@ -159,7 +159,8 @@ def test_gather_scatter_follow_the_step_addressing():
     value = torch.arange(2 * 96 * 3, dtype=torch.float32).view(2, 96, 3)
     pool.scatter_("conv", rows, value, layer_idx=1)
     torch.testing.assert_close(pool.gather("conv", rows, layer_idx=1), value)
-    torch.testing.assert_close(pool.gather("conv", rows.select([1]), layer_idx=1), value[1:])
+    one = StepContext(request_ids=["b"], graph_walk="decode", slot=0, capture=False)
+    torch.testing.assert_close(pool.gather("conv", pool.plan(decode_step(["b"]), one)["main"], layer_idx=1), value[1:])
     untouched = pool.block("conv", 0).clone()
 
     padded = decode_step(["a", "b", "pad0", "pad1"])

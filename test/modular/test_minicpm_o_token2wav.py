@@ -108,16 +108,21 @@ class _CacheSteps:
         if self.voice_pool is not None:
             from mstar.model.minicpm_o.components.token2wav import voice_entry
 
+            # a custom voice is prepared first, one request a step, as the t2w_voice walk does
+            for r in rids:
+                if self.voice[r] < 0 and r not in self.custom_tokens:
+                    self.custom_tokens[r] = custom[r].prompt.tokens.shape[1]
+                    one_ctx = StepContext(request_ids=[r], graph_walk="t2w_voice", slot=0, capture=False)
+                    one_step = RecurrentStep(segments=[Segment(request_id=r, label="main", span=1)])
+                    assert self.voice_pool.admit(one_step, one_ctx).ok
+                    entry = SlotRows(self.voice_pool, self.voice_pool.plan(one_step, one_ctx)["main"])
+                    for name, value in voice_entry(custom[r], self.voice_layout).items():
+                        entry.set(name, value)
+                    self.voice_pool.commit(one_step, one_ctx)
             voice_step = RecurrentStep(segments=[
                 Segment(request_id=r, label="main", span=1 if self.voice[r] < 0 else 0) for r in rids])
             assert self.voice_pool.admit(voice_step, ctx).ok
             voice_rows = SlotRows(self.voice_pool, self.voice_pool.plan(voice_step, ctx)["main"])
-            for i, r in enumerate(rids):
-                if self.voice[r] < 0 and r not in self.custom_tokens:
-                    self.custom_tokens[r] = custom[r].prompt.tokens.shape[1]
-                    one = SlotRows(self.voice_pool, voice_rows.rows.select([i]))
-                    for name, value in voice_entry(custom[r], self.voice_layout).items():
-                        one.set(name, value)
         caches, steps = {}, {}
         for name, family in self.families.items():
             positions = {}
@@ -130,9 +135,10 @@ class _CacheSteps:
             )
             resource = self.resources[name]
             assert resource.admit(step, ctx).ok
+            resource.plan(step, ctx)
             own = None if voice_rows is None else (
                 self.voice_pool.block(f"src_{name}", 0), voice_rows.rows.slot_indices)
-            caches[name] = AttentionCache(resource, self.bank.sources[name], resource.plan(step, ctx), own)
+            caches[name] = AttentionCache(resource, self.bank.sources[name], own)
 
         def commit():
             self.pool.commit(state_step, ctx)

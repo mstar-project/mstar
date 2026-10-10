@@ -56,4 +56,5 @@ test/modular/test_sampler_generation_controls.py
 test/modular/test_minicpm_o.py
 test/modular/test_minicpm_o_token2wav.py
 test/modular/test_bounded_kv.py
+test/modular/test_piecewise_shared_pool.py
 test/modular/test_rope_fused.py

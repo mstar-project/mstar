@@ -39,10 +39,6 @@ class BoundedPlan(NamedTuple):
         """Each row's retained keys before its step, ``[rows]`` int32 on the device."""
         return self.table[: len(self.rows), ROW_HEAD + 1:ROW_HEAD + 2 * NUM_READS:2].sum(1)
 
-    def select(self, rows: list[int]) -> "BoundedPlan":
-        """These rows of the plan, for a forward that runs a subset of its batch."""
-        index = torch.tensor(rows, dtype=torch.long, device=self.table.device)
-        return BoundedPlan(self.table.index_select(0, index), tuple(self.rows[i] for i in rows))
 
 
 class _Request:
@@ -107,8 +103,7 @@ class BoundedKVManager(Resource):
         keys (``source [sources, rows, H, L, 2D]`` is this layer's source prefixes,
         each row's picked by its ``StreamPosition.source``) and this
         step's own, then this step's keys into the slots. ``[B * rows, T, H, D]``.
-        ``plan`` defaults to the step's; a forward running a subset of its rows
-        passes ``select`` of it. ``rel_bias`` is a per-distance score term
+        ``plan`` defaults to the step's. ``rel_bias`` is a per-distance score term
         (``kernels.bounded_attention``), for relative-position attention. Rows whose
         source is -1 read theirs from ``row_source = (storage [slots, rows, H, L, 2D],
         slots [>= B])``, e.g. another resource's per-request entries."""

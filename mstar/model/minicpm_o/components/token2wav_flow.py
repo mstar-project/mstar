@@ -72,16 +72,19 @@ class DenseKV:
 
 
 class BoundedLayerKV:
-    """One layer's cache on the engine's bounded KV resource: ``plan`` is this
-    batch's rows of the step's layout, ``source [rows, H, L, 2d]`` the layer's voice
-    in stream order (``token2wav.CACHE_FAMILIES``). Rows may be at different positions."""
+    """One layer's cache on the engine's bounded KV resource, for the rows its step
+    planned (at any positions): ``source [voices, rows, H, L, 2d]`` the layer's voices in
+    stream order (``token2wav.CACHE_FAMILIES``), ``row_source`` the custom voices'."""
 
-    def __init__(self, resource, layer_idx: int, source: torch.Tensor, plan, row_source=None):
+    def __init__(self, resource, layer_idx: int, source: torch.Tensor, row_source=None):
         self.resource = resource
         self.layer_idx = layer_idx
         self.source = source
-        self.plan = plan
         self.row_source = row_source
+
+    def retained(self) -> torch.Tensor:
+        """``[rows]`` each row's retained entries, which is also its noise offset."""
+        return self.resource.current.retained()
 
     @property
     def max_keys(self) -> int:
@@ -94,8 +97,8 @@ class BoundedLayerKV:
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``q, k, v [N, H, T, d]`` -> ``[N, T, H, d]``."""
-        return self.resource.attend(
-            self.layer_idx, q, k, v, self.source, self.plan, rel_bias, row_source=self.row_source)
+        return self.resource.attend(self.layer_idx, q, k, v, self.source, rel_bias=rel_bias,
+                                    row_source=self.row_source)
 
 
 # what an attention layer is handed
@@ -580,7 +583,7 @@ class ChunkCFM(nn.Module):
         is its noise offset: shared by the rows of dense caches, per row on bounded ones."""
         b, t = mu.shape[0], mu.size(2)
         if isinstance(kv[0][0], BoundedLayerKV):
-            offsets = kv[0][0].plan.retained()[:b].long()
+            offsets = kv[0][0].retained()[:b].long()
             index = offsets[:, None] + torch.arange(t, device=mu.device)
             x = self.rand_noise[0][:, index].transpose(0, 1).contiguous()
         else:
