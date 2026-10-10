@@ -6,11 +6,15 @@ segments of one packed forward. There is nothing to page, nothing to advance,
 and nothing to carry between steps: the resource holds only planned wrappers.
 """
 
-from mstar.engine.resources.attn.ragged.config import RaggedAttentionSpec, RaggedCrossAttentionSpec
+from mstar.engine.resources.attn.ragged.config import (
+    RaggedAttentionSpec,
+    RaggedBlockCausalAttentionSpec,
+    RaggedCrossAttentionSpec,
+)
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 
 
-def _build_ragged(spec, info: EngineResourceInfo, manager_cls):
+def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
     config = spec.config
     if info.joint_comm_group is not None:
         config.shard(info.joint_comm_group.world_size)
@@ -21,7 +25,7 @@ def _build_ragged(spec, info: EngineResourceInfo, manager_cls):
             "RaggedAttentionConfig.dtype on a node without a KV-backed attention "
             "(the engine has no KV dtype to fall back on)."
         )
-    return manager_cls(device=info.device, dtype=dtype, config=config)
+    return manager_cls(device=info.device, dtype=dtype, config=config, **kwargs)
 
 
 class RaggedAttnManager(AttentionResource):
@@ -55,3 +59,20 @@ class RaggedCrossAttnManager(AttentionResource):
         )
 
         return _build_ragged(spec, info, FlashInferRaggedCrossManager)
+
+
+class RaggedBlockCausalAttnManager(AttentionResource):
+    """Cacheless block-causal self-attention within each span; see
+    ``RaggedBlockCausalAttentionSpec``."""
+
+    prefix_skip_safe = True
+
+    @classmethod
+    def build(cls, spec: RaggedBlockCausalAttentionSpec, info: EngineResourceInfo):
+        from mstar.engine.resources.attn.ragged.flashinfer import (
+            FlashInferRaggedBlockCausalManager,
+        )
+
+        return _build_ragged(
+            spec, info, FlashInferRaggedBlockCausalManager, block_size=spec.block_size,
+        )

@@ -152,3 +152,23 @@ class RaggedCrossAttentionSpec(_RaggedSpecBase):
         from mstar.engine.resources.attn.ragged.base import RaggedCrossAttnManager
 
         return RaggedCrossAttnManager
+
+
+@dataclass
+class RaggedBlockCausalAttentionSpec(_RaggedSpecBase):
+    """Cacheless block-causal self-attention within each declared span: a token in
+    block ``b`` of its span (``block_size`` tokens a block, from the span's start)
+    attends every key of blocks ``0..b``. Declared with ``AttentionStep(causal=False)``,
+    since the block structure is the whole mask.
+
+    Its own kind, not a flag on ``RaggedAttentionSpec``: it runs a different kernel
+    (paged prefill over one-token pages, see ``attn.ragged.block_causal``).
+    """
+
+    block_size: int
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.ragged.base import RaggedBlockCausalAttnManager
+
+        return RaggedBlockCausalAttnManager

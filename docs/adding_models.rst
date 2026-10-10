@@ -201,6 +201,17 @@ There are two ``ResourceReqConfig`` subclasses:
   per-request seed. ``min_p`` follows the HF processor order (after the penalty and
   temperature, before top-k/top-p) and needs ``enable_min_p=True`` on the node's
   ``SamplerSpec``, which adds the filter to that node's captured sampler only.
+  Further knobs, each needing a ``SamplerSpec`` capability (CUDA only):
+
+  - ``repetition_window`` (``max_repetition_window``): the penalty counts a token's
+    occurrences in the last N generated tokens, ``repetition_penalty ** n``.
+  - ``min_tokens`` (``min_tokens_stop_ids``): those ids are barred until
+    ``min_tokens`` tokens exist; applied after top-k/top-p.
+  - ``top_p_first``, ``top_p_min_keep`` (``enable_top_p_first``): HF's order (top-p,
+    then top-k) instead of FlashInfer's, and HF's ``min_tokens_to_keep``.
+
+  ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
+  TTS's first code); declare it the same way on every step of a walk.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
@@ -372,6 +383,10 @@ The spec types are:
      - The cross-attention counterpart: one span of each request attends another
        (``RaggedCrossAttentionStep(pairs=...)``). Same config. See `Cross-attention
        between spans`_.
+   * - ``RaggedBlockCausalAttentionSpec(config=RaggedAttentionConfig(...), block_size=...)``
+     - Block-causal self-attention within each span (``AttentionStep(causal=False)``): causal
+       between ``block_size``-token blocks, bidirectional within one. Same config. See
+       `Block-causal attention within spans`_.
    * - ``PositionSpec(config=PositionConfig(kv_cache=...))``
      - Position tracking and RoPE. ``scheme`` is ``PosScheme.SEQUENTIAL`` or
        ``PosScheme.BLOCK``. The RoPE parameters are set here: ``rope_theta``,
@@ -385,6 +400,9 @@ The spec types are:
        intention. It selects which kernel variant is recorded into the captured graph.
        Whether the penalty runs on a given step is decided from the
        ``repetition_penalty`` values of the resident requests.
+       ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
+       ``enable_top_p_first`` are capabilities of the same kind. See
+       ``SamplingReqConfig`` above.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -601,6 +619,21 @@ request's ``kv_label`` span; cross-attention is never causal. A layer attends th
 span's tokens as ``k`` and ``v``. One resource has one head geometry, so a model whose
 attentions differ in head count or head dim declares one spec per (kind, geometry).
 LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
+
+Block-causal attention within spans
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A Whisper-style encoder trained for streaming masks attention by chunk: a frame in chunk
+``b`` sees every frame of chunks ``0..b`` and nothing later. Declare it as a
+``RaggedBlockCausalAttentionSpec`` with the chunk length as ``block_size``, and step it like
+any ragged self-attention, one segment per independently attending span, with
+``AttentionStep(causal=False)``. Blocks are counted from each span's start, so a span need
+not be a multiple of ``block_size``.
+
+The prefixes overlap, which a ragged layout cannot express, so this kind runs FlashInfer's
+paged prefill over the packed keys viewed as one-token pages, each query block listing its
+prefix; nothing is copied. Under a captured graph the block count and page list are sized
+for the worst layout the bucket's token count allows.
 
 .. note::
 

@@ -31,6 +31,14 @@ class SamplerSpec(NodeResourceSpec):
     # per step, so nodes that never ask for it pay nothing; a request that
     # sets ``min_p`` on a node without it is refused at ingest.
     enable_min_p: bool = False
+    # Capabilities for the generation-aware request knobs below; each off by
+    # default, leaving the node's sampler as it was.
+    # The longest ``repetition_window`` a request may ask for (sizes the history).
+    max_repetition_window: int = 0
+    # The ids ``min_tokens`` bars (the model's EOS ids).
+    min_tokens_stop_ids: tuple[int, ...] = ()
+    # Allows ``top_p_first`` / ``top_p_min_keep``.
+    enable_top_p_first: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -50,6 +58,18 @@ class SamplingReqConfig(ResourceReqConfig):
     # probability is below ``min_p`` times the most likely token's, after the
     # penalty and temperature and before top-k/top-p. 0 disables.
     min_p: float = 0.0
+    # > 0: the penalty is ``repetition_penalty ** n``, n a token's count among
+    # the last ``repetition_window`` generated tokens; 0: presence over prompt
+    # and output.
+    repetition_window: int = 0
+    # The spec's stop ids get no probability until this many tokens exist
+    # (applied after top-k/top-p).
+    min_tokens: int = 0
+    # HF's order, top-p then top-k, each on the full distribution (FlashInfer's
+    # is top-k, then top-p over the renormalised top-k).
+    top_p_first: bool = False
+    # Top-p keeps at least this many tokens (HF's ``min_tokens_to_keep``).
+    top_p_min_keep: int = 1
     _seed: int = 0 # set by the conductor
 
     def apply_conductor_config(
@@ -66,5 +86,8 @@ class SamplingReqConfig(ResourceReqConfig):
 @dataclass(frozen=True)
 class SamplerStep(ResourceStep):
     apply_penalty: bool = True
+    # False turns top-k/top-p off for this step (e.g. a TTS's first code).
+    # Captured graphs bake it: declare it the same way on every step of a walk.
+    apply_filters: bool = True
     # rid -> prefill tokens for the repetition penalty
     prefill_tracked_tokens: dict[str, torch.Tensor] = field(default_factory=dict)

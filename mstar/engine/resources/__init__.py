@@ -22,6 +22,7 @@ from mstar.engine.resources.attn.config import (
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
+    RaggedBlockCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
     cross_label,
@@ -102,6 +103,7 @@ __all__ = [
     "PublishedInfo",
     "RaggedAttentionConfig",
     "RaggedAttentionSpec",
+    "RaggedBlockCausalAttentionSpec",
     "RaggedCrossAttentionSpec",
     "RaggedCrossAttentionStep",
     "Resource",

@@ -6,7 +6,12 @@ import torch
 
 from mstar.engine.resources.attn.base import EagerSlotKey, WorkspacePool
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.attn.ragged.base import RaggedAttnManager, RaggedCrossAttnManager
+from mstar.engine.resources.attn.ragged.base import (
+    RaggedAttnManager,
+    RaggedBlockCausalAttnManager,
+    RaggedCrossAttnManager,
+)
+from mstar.engine.resources.attn.ragged.block_causal import RaggedBlockCausalWrapper
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedCrossAttentionStep,
@@ -254,4 +259,32 @@ class FlashInferRaggedCrossManager(_FlashInferRaggedBase, RaggedCrossAttnManager
             label = cross_label(q_label, kv_label)
             wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label)
             wrapper.plan(self._cu_seqlens(q_segments), self._cu_seqlens(kv_segments))
+            plan_states[label] = wrapper
+
+
+class FlashInferRaggedBlockCausalManager(_FlashInferRaggedBase, RaggedBlockCausalAttnManager):
+    """Block-causal self-attention: every label in the step is its own layout,
+    each segment attending block-causally within itself."""
+
+    wrapper_class = RaggedBlockCausalWrapper
+
+    def __init__(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        config: RaggedAttentionConfig,
+        block_size: int,
+    ):
+        super().__init__(device=device, dtype=dtype, config=config)
+        self._kwargs["block_size"] = block_size
+
+    def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states) -> None:
+        if step.causal:
+            raise ValueError(
+                "block-causal attention is its own mask; declare it with "
+                "AttentionStep(causal=False)"
+            )
+        for label, segments in self._group_segments_by_label(step.segments or ()).items():
+            wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label)
+            wrapper.plan([seg.span for seg in segments])
             plan_states[label] = wrapper
