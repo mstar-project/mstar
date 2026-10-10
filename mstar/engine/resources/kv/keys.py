@@ -11,7 +11,7 @@ variable-length field so that no two different spans encode alike.
 """
 
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import NamedTuple
 
 # 4 bytes a token, not 8: a full page of 128 then hashes 512 bytes
@@ -71,6 +71,28 @@ def page_key(
     )))
     hasher.update(_field(b"".join(_item(item) for item in items)))
     return hasher.digest()
+
+
+def page_items(
+    spans: Iterable[tuple[int, bytes | None]], page_size: int,
+) -> dict[int, list[PageItem]]:
+    """Each page's items, from every span's length and its digest, None for ids.
+
+    The one reading of a layout: the preprocess worker keys a prompt's pages by
+    it and the engine keys the page generation fills by it, and two readings
+    that differed would give that page a key nothing matches.
+    """
+    items: dict[int, list[PageItem]] = {}
+    at = 0
+    for length, digest in spans:
+        if digest is not None:
+            for page in range(at // page_size, -(-(at + length) // page_size)):
+                first = max(at, page * page_size)
+                items.setdefault(page, []).append(
+                    PageItem(first - page * page_size, first - at, length, digest),
+                )
+        at += length
+    return items
 
 
 def chain(

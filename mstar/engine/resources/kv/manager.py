@@ -25,7 +25,7 @@ from mstar.engine.resources.kv.config import (
     RetentionPolicy,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
-from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_key
+from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     KVPlanOutput,
@@ -110,19 +110,6 @@ class PageArena:
         return self.allocator.num_free
 
 
-def _items_on(spans: list[PrefixSpan], page: int, page_size: int) -> list[PageItem]:
-    """The items with a slot on ``page``, as the preprocess worker keyed them."""
-    first_slot, end = page * page_size, (page + 1) * page_size
-    items = []
-    at = 0
-    for span in spans:
-        if span.digest is not None and at < end and at + span.length > first_slot:
-            first = max(at, first_slot)
-            items.append(PageItem(first - first_slot, first - at, span.length, span.digest))
-        at += span.length
-    return items
-
-
 @dataclass
 class PrefixChain:
     """The keys that name a stream's pages, and how far the index holds them."""
@@ -159,9 +146,10 @@ class PrefixChain:
     ) -> "PrefixChain":
         total = sum(span.length for span in spans)
         whole = total // page_size
+        items = page_items(((span.length, span.digest) for span in spans), page_size)
         return cls(
             keys=list(keys), unkeyed=tail, keyed_pages=whole, covered_len=total,
-            spans=list(spans), unkeyed_items=_items_on(spans, whole, page_size),
+            spans=list(spans), unkeyed_items=items.get(whole, []),
         )
 
     def extend(self, tokens: list[int], page_size: int) -> None:

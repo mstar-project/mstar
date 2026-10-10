@@ -28,7 +28,7 @@ from mstar.api_server.request_types import (
 from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
-from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint
+from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.model.base import Model, PrefixStream, ProcessPromptOutput, Span
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
@@ -640,9 +640,8 @@ class PreprocessWorkerThread:
         entries: dict[str, int] = {}
         total = sum(span.length for span in layout)
         pages: list[list[int]] = [[] for _ in range(-(-total // page_size))]
-        items: dict[int, list[PageItem]] = {}
         at = 0
-        for span, digest in zip(layout, digests, strict=True):
+        for span in layout:
             assert span.kind in ("ids", "digest"), f"a span of kind {span.kind!r}"
             assert span.walk in walks, (
                 f"a {span.kind} span names walk {span.walk!r}, which the "
@@ -674,13 +673,8 @@ class PreprocessWorkerThread:
                 assert span.length > 0, (
                     "a zero-length digest span has no slot, so no page to fold into"
                 )
-                for page in touched:
-                    first = max(at, page * page_size)
-                    items.setdefault(page, []).append(PageItem(
-                        first - page * page_size, first - at, span.length, digest,
-                    ))
             at += span.length
-        return pages, items
+        return pages, page_items(zip((span.length for span in layout), digests, strict=True), page_size)
 
     def _digest(
         self, span: Span, file_paths: dict | None,
