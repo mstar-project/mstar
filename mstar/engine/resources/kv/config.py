@@ -89,6 +89,9 @@ class PagedKVConfig(KVConfig):
     # folded into the root, not checked at match time
     prefix_cache_salt: str = ""
     prefix_cache: bool = True
+    # above one rank the cache needs this too: rank 0 decides each hit and the
+    # other ranks adopt it, which every rank's allocator must then match
+    prefix_cache_tp: bool = False
     # MLA only: the latent is ``[ckv (kv_lora_rank) | kpe (qk_rope_head_dim)]``
     kv_lora_rank: int | None = None
     qk_rope_head_dim: int | None = None
@@ -121,6 +124,7 @@ class PagedKVConfig(KVConfig):
         cpu_offload_pages: int | None = None,
         prefix_cache_salt: str | None = None,
         prefix_cache: bool | None = None,
+        prefix_cache_tp: bool | None = None,
     ) -> None:
         """How much cache this deployment gets, and how it is cut up."""
         for name, value in (
@@ -130,6 +134,7 @@ class PagedKVConfig(KVConfig):
             ("cpu_offload_pages", cpu_offload_pages),
             ("prefix_cache_salt", prefix_cache_salt),
             ("prefix_cache", prefix_cache),
+            ("prefix_cache_tp", prefix_cache_tp),
         ):
             if value is not None:
                 setattr(self, name, value)

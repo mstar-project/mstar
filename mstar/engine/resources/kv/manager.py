@@ -452,6 +452,9 @@ class KVManager(AttentionResource):
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
+        # TP: rank 0 decides each hit as it schedules the step and the other ranks
+        # take the same pages (`adopt_cached_prefix`)
+        self._follower = self._world_size > 1 and self._rank != 0
         self._device = device
         self._lock = threading.RLock()
 
@@ -536,16 +539,19 @@ class KVManager(AttentionResource):
         self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
     ) -> bool:
         """Open the index under ``root``, the identity every key hangs from."""
+        # Under TP the ranks agree on a prompt's hits (rank 0 decides them); pages keyed from
+        # each rank's own read of what it generated could be indexed at different steps
+        prompt_only = self._world_size > 1
         self._keyed_walks = {
-            label: frozenset(walk for walk in named if walk is not None)
+            label: frozenset(walk for walk in (named[:1] if prompt_only else named)
+                             if walk is not None)
             for label, named in (walks or {}).items()
         }
         if not self.config.prefix_cache:
             return False
-        if self._world_size > 1:
+        if self._world_size > 1 and not self.config.prefix_cache_tp:
             logger.info(
-                "KV %s: prefix cache off at world size %d: the ranks index "
-                "independently and would match different lengths",
+                "KV %s: prefix cache off at world size %d (prefix_cache_tp opts in)",
                 self.name, self._world_size,
             )
             return False
@@ -574,19 +580,77 @@ class KVManager(AttentionResource):
                 return len(stream.lease) * self.config.page_size
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
+            if self._follower:
+                # rank 0 decides; its hits were adopted before this step was built
+                return 0
             keys = list(stream.chain.keys)
         # outside the lock: one SHA-256 per page, and admit, commit and remove would wait on it
         rooted = [fingerprint(self._prefix_root, key) for key in keys]
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return None
-            # one key short, so a fully cached prompt still leaves a token to run
-            matched = self._index.lookup(rooted)[:len(rooted) - 1]
+            # one key short, so a fully cached prompt still leaves a token to run.
+            # Under TP the hit is stamped at its commit, the point every rank
+            # reaches in the same order
+            matched = self._index.lookup(rooted, stamp=self._world_size == 1)
+            matched = matched[:len(rooted) - 1]
             if not matched:
-                return None
+                # 0, not None: another keyed resource's hit must not skip tokens this one lacks
+                return 0
             self._arena.retain(matched)
             stream.lease = matched
             return len(matched) * self.config.page_size
+
+    def cached_prefix_pages(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+    ) -> list[int] | None:
+        """The pages of this request's lease that cover ``matched_len``, for rank 0 to
+        tell the other ranks; None where this resource holds no lease."""
+        with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            stream = None if label is None else self._streams.get(rid, {}).get(label)
+            if stream is None or stream.lease is None:
+                return None
+            return stream.lease[:matched_len // self.config.page_size]
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+        pages: list[int] | None = None,
+    ) -> bool:
+        """Take the first ``matched_len`` tokens rank 0 matched from this rank's own index.
+
+        False while this rank has not indexed them yet (its commit of the step that
+        wrote them can trail rank 0's); a lease already taken answers True again.
+        ``pages`` are rank 0's: sharded prefill gathers cache slots across ranks,
+        so the pages have to agree, not only the length.
+        """
+        with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            if label is None:
+                return True
+            stream = self._ensure_label(rid, label)
+            need = matched_len // self.config.page_size
+            if stream.converted or stream.lease is not None:
+                return True
+            if stream.stored_len or stream.offloaded or stream.read_pending:
+                raise RuntimeError(
+                    f"KV {self.name}: rank 0 hit {matched_len} cached tokens for "
+                    f"{rid}/{label}, whose stream here already holds tokens")
+            keys = list(stream.chain.keys)[:need]
+        rooted = [fingerprint(self._prefix_root, key) for key in keys]
+        with self._lock:
+            if self._streams.get(rid, {}).get(label) is not stream:
+                return True
+            matched = self._index.lookup(rooted, stamp=False)
+            if len(matched) < need:
+                return False
+            if pages is not None and matched != list(pages):
+                raise RuntimeError(
+                    f"KV {self.name}: prefix index diverged from rank 0 for "
+                    f"{rid}/{label}: pages {matched[:4]}... here, {list(pages)[:4]}... there")
+            self._arena.retain(matched)
+            stream.lease = matched
+            return True
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
@@ -1978,6 +2042,10 @@ class KVManager(AttentionResource):
                         self._plan_epoch += 1
                         continue
                     stream.stored_len += segment.span
+                    if stream.converted and self._world_size > 1 and stream.chain is not None:
+                        # a TP hit is stamped here, not at lookup: every rank commits in
+                        # step order, so their indexes age alike and evict alike
+                        self._index.touch(stream.page_indices[:stream.chain.cursor])
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
                     policy = (

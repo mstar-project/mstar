@@ -136,6 +136,21 @@ class Resource(ABC):
         every step."""
         return False
 
+    def cached_prefix_pages(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+    ) -> list[int] | None:
+        """What holds the request's first ``matched_len`` tokens here, for rank 0 to
+        send the TP followers; None where this resource holds nothing for it."""
+        return None
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+        pages: list[int] | None = None,
+    ) -> bool:
+        """On a TP follower, take the prefix rank 0 matched (``pages`` are rank 0's).
+        False until this rank holds it too."""
+        return True
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 

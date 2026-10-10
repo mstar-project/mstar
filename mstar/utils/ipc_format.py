@@ -176,6 +176,14 @@ class OffloadDelta:
 
 
 @dataclass
+class PrefixHit:
+    """Rank 0's prefix-cache hit for one request: the leading tokens the step skips,
+    and each resource's pages for them, which a follower's must equal."""
+    tokens: int
+    pages: dict[str, list[int]] = field(default_factory=dict)
+
+
+@dataclass
 class ScheduleTPNode(MessageBody):
     node_name: str
     graph_walk: str
@@ -184,6 +192,8 @@ class ScheduleTPNode(MessageBody):
     spec_seq: int = -1
     spec_from_seq: int = -1
     resident_delta: OffloadDelta = field(default_factory=OffloadDelta.new)
+    # by wire request id; the followers take these before building the step
+    prefix_hits: dict[str, PrefixHit] = field(default_factory=dict)
 
 
 @dataclass

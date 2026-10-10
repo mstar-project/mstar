@@ -55,7 +55,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
 )
 from mstar.profile.worker import ExecTimings
-from mstar.utils.ipc_format import OffloadDelta
+from mstar.utils.ipc_format import OffloadDelta, PrefixHit
 from mstar.utils.profiler import (
     PHASE_PERIOD,
     mark,
@@ -282,6 +282,10 @@ class ExecutingBatch:
     # rids for which this step ends every finite stream into the partition;
     # this step reports the partition done
     stream_partition_done_rids: set[str] = field(default_factory=set)
+
+    # Rank 0 of a TP node: each request's cached prefix, decided as the step was sent to
+    # the followers. Prepare applies exactly this, though a commit since may hold more.
+    cached_prefix: dict[int, int] | None = None
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -881,6 +885,45 @@ class Engine:
                     rid, batch.node_name, walk, per_rid, keys=keys,
                 )
 
+    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, PrefixHit]:
+        """Rank 0's hits for a step it is about to send its TP followers, by wire id.
+
+        Probed as the step is scheduled, so the followers can take the same pages before
+        they build it. A miss is decided too: ``prepare_inputs`` applies the batch's
+        lengths, where a probe after this rank's next commit could hit.
+        """
+        node, walk = batch.node_name, batch.graph_walk
+        if walk not in self._keyed_walks.get(node, ()):
+            return {}
+        hits = {}
+        batch.cached_prefix = {}
+        for rid in batch.request_ids:
+            matched = self._runner.resolve_cached_prefix(rid, node, walk)
+            batch.cached_prefix[rid] = matched
+            if matched > 0:
+                hits[self._graph_runtime.get_rid_string(rid)] = PrefixHit(
+                    matched, self._runner.cached_prefix_pages(rid, node, walk, matched))
+        return hits
+
+    def adopt_cached_prefix(
+        self, node_name: str, graph_walk: str, hits: dict[str, PrefixHit],
+    ) -> bool:
+        """A TP follower takes rank 0's hits before it builds the step.
+
+        False until every page is here: a request this rank has not ingested yet, or
+        pages its own commit of an earlier step has not indexed yet.
+        """
+        ready = True
+        for wire_rid, hit in hits.items():
+            rid = self._graph_runtime.get_rid_handle(wire_rid)
+            if rid is None:
+                ready = False
+                continue
+            ready &= self._runner.adopt_cached_prefix(
+                rid, node_name, graph_walk, hit.tokens, hit.pages,
+            )
+        return ready
+
     def _skip_cached_prefix(
         self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,
     ) -> NodeInputs:
@@ -897,8 +940,14 @@ class Engine:
             "for prefix reuse, but that walk places positions of its own"
         )
         if inputs.tensor_inputs or inputs.kwargs or inputs.resource_step_info:
+            # rank 0 probes a TP step as it schedules it: give back what it held
+            self._runner.apply_cached_prefix(rid, batch.node_name, walk, inputs, 0)
             return inputs
-        matched = self._runner.resolve_cached_prefix(rid, batch.node_name, walk)
+        decided = batch.cached_prefix
+        if decided is not None and rid in decided:
+            matched = decided[rid]
+        else:
+            matched = self._runner.resolve_cached_prefix(rid, batch.node_name, walk)
         self._runner.apply_cached_prefix(
             rid, batch.node_name, walk, inputs, matched,
         )

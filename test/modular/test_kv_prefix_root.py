@@ -6,7 +6,8 @@ KV resource and of every resource planned against it. Anything left out of that
 fold is a way for one deployment to match pages another one wrote.
 
 The other half is where the cache stays shut: above one rank, because the ranks
-walk their indexes independently and would match different lengths; and for a
+walk their indexes independently and would match different lengths (unless the
+deployment sets prefix_cache_tp, and rank 0 decides each hit); and for a
 model that names no checkpoint, until the deployment sets a salt, because two
 builds that differ only in their weights would share every key.
 
@@ -190,6 +191,17 @@ def test_a_rank_above_one_never_opens_its_index():
     assert kv._index is None and kv._prefix_root is None, (
         "the index opened at a world size that cannot agree on a match length"
     )
+
+
+def test_an_opted_in_rank_above_one_opens_its_index_but_never_probes_it():
+    """With prefix_cache_tp rank 0 decides each hit and the other ranks adopt it
+    (test_kv_prefix_tp.py), so a follower's index opens but answers no probe."""
+    kv = _kv(prefix_cache_tp=True)
+    kv._world_size, kv._rank, kv._follower = 2, 1, True
+
+    _root(kv=kv)
+
+    assert kv._index is not None and kv._prefix_root is not None
 
 
 def test_a_deployment_can_turn_the_cache_off():

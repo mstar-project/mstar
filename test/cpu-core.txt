@@ -159,3 +159,4 @@ test/modular/test_glm5next_loading_guards.py
 test/modular/test_glm5next_dsa.py
 test/modular/test_sparse_mla.py
 test/modular/test_glm52_dsa_paged.py
+test/modular/test_kv_prefix_tp.py

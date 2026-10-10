@@ -161,7 +161,8 @@ def test_a_request_that_matches_nothing_gets_no_lease():
     _seed(kv, list(range(100)))
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": _keys([7] * 100)}))
 
-    assert kv.resolve_cached_prefix("r1", NODE, WALK) is None, (
+    # 0, not None: another keyed resource's hit must not skip the tokens this one lacks
+    assert kv.resolve_cached_prefix("r1", NODE, WALK) == 0, (
         "a prompt sharing no page with anything indexed was answered a length"
     )
     assert kv._streams["r1"]["main"].lease is None, (
