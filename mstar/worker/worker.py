@@ -508,6 +508,8 @@ class Worker:
             )
         }
         self._emitted_walk_drivers: dict[tuple[str, str], list[Connection]] = {}
+        # refilled for every walk-hook call rather than built per request per step
+        self._walk_ctx = ProducerWalkCtx()
 
         # Set of edge names that arrive via streaming (used to distinguish
         # streaming inputs from conductor-triggered non-streaming inputs
@@ -1093,10 +1095,12 @@ class Worker:
 
     def _assign_consumer_walks(
         self, batch_N: PendingBatch, rids: list[int],
-    ) -> dict[int, dict[str, str]]:
+    ) -> None:
         """Decide the consumer walk of this pass's streamed items, per rid and
-        producer-triggered consumer partition, and stamp it on the fwd_info
-        that rides with the remote sends."""
+        producer-triggered consumer partition: kept in the rid's
+        assigned_walks, and stamped on the fwd_info that rides with the remote
+        sends. Runs on every emitting step, so it allocates only on a rid's
+        first emission."""
         key = (batch_N.node_name, batch_N.graph_walk)
         drivers = self._emitted_walk_drivers.get(key)
         if drivers is None:
@@ -1111,28 +1115,36 @@ class Worker:
             ]
             self._emitted_walk_drivers[key] = drivers
         if not drivers:
-            return {}
+            return
         walk = batch_N.graph_walk
-        assigned: dict[int, dict[str, str]] = {}
+        ctx = self._walk_ctx
+        ctx.producer_walk = walk
         for rid in rids:
             req_info = self.request_state.per_request_info.get(rid)
             if req_info is None:
                 continue
             fwd_info = req_info.per_partition_info[batch_N.partition].current_fwd_info
-            walks = {}
+            ctx.fwd_info = fwd_info
             for conn in drivers:
                 last = req_info.assigned_walks.get(conn.to_partition)
-                n = last.pass_in_walk + 1 if last and last.producer_walk == walk else 0
-                consumer_walk = conn.consumer_walk(ProducerWalkCtx(
-                    walk, n, last.consumer_walk if last else None, fwd_info,
-                ))
-                req_info.assigned_walks[conn.to_partition] = AssignedWalk(
-                    consumer_walk, walk, n,
-                )
-                walks[conn.to_partition] = consumer_walk
-            fwd_info.stream_consumer_walks = walks
-            assigned[rid] = walks
-        return assigned
+                if last is None:
+                    ctx.pass_in_walk, ctx.consumer_walk = 0, None
+                else:
+                    ctx.pass_in_walk = (
+                        last.pass_in_walk + 1 if last.producer_walk == walk else 0
+                    )
+                    ctx.consumer_walk = last.consumer_walk
+                consumer_walk = conn.consumer_walk(ctx)
+                if last is None:
+                    req_info.assigned_walks[conn.to_partition] = AssignedWalk(
+                        consumer_walk, walk, ctx.pass_in_walk,
+                    )
+                else:
+                    last.consumer_walk = consumer_walk
+                    last.producer_walk = walk
+                    last.pass_in_walk = ctx.pass_in_walk
+                fwd_info.stream_consumer_walks[conn.to_partition] = consumer_walk
+        ctx.fwd_info = None
 
     def _release_parked_inputs(
         self, request_id: int, req_info: PerRequestInfo,
@@ -3127,7 +3139,7 @@ class Worker:
 
         # Before the sends below: remote consumers read the walks off the
         # fwd_info that rides with the streamed edges.
-        assigned_walks = self._assign_consumer_walks(batch_N, rids)
+        self._assign_consumer_walks(batch_N, rids)
 
         # Local streaming stays here: a StreamBuffer holds real tensors, so it
         # cannot move behind the runtime's contract.
@@ -3137,8 +3149,9 @@ class Worker:
             for rid, uuid in per_signal:
                 req_info = self.request_state.per_request_info[rid]
                 stream_buf = req_info.stream_buffers[signal]
+                assigned = consumer and req_info.assigned_walks.get(consumer)
                 stream_buf.pre_read_register(
-                    uuid, assigned_walks.get(rid, {}).get(consumer),
+                    uuid, assigned.consumer_walk if assigned else None,
                 )
                 tensor = self.tensor_manager.get_tensor(uuid)
                 stream_buf.put(uuid, tensor.clone())

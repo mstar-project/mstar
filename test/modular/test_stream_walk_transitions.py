@@ -268,6 +268,7 @@ def _producer():
     w._walk_drivers = topology.walk_drivers()
     w._signal_consumer = {c.edge_name: c.to_partition for c in topology.connections}
     w._emitted_walk_drivers = {}
+    w._walk_ctx = ProducerWalkCtx()
     w._graph_runtime = SimpleNamespace(
         get_output_signals=lambda node, walk: (
             ["thinker_mask", "thinker_states"] if (node, walk) in _EMITS else ["audio_embeds"]
@@ -279,8 +280,16 @@ def _producer():
 
 
 def _pass(w, node, walk):
+    """The Talker walk this pass's states were assigned, or None if it emitted none."""
     batch = SimpleNamespace(node_name=node, graph_walk=walk, partition="Thinker")
-    return w._assign_consumer_walks(batch, [0]).get(0)
+    req_info = w.request_state.per_request_info[0]
+    before = req_info.assigned_walks.get("Talker")
+    before = before and (before.producer_walk, before.pass_in_walk)
+    w._assign_consumer_walks(batch, [0])
+    after = req_info.assigned_walks.get("Talker")
+    if after is None or (after.producer_walk, after.pass_in_walk) == before:
+        return None
+    return after.consumer_walk
 
 
 def test_the_thinker_walks_the_talker_through_its_prefill():
@@ -295,7 +304,7 @@ def test_the_thinker_walks_the_talker_through_its_prefill():
         ("Thinker", "thinker_decode"),
     ]
     got = [_pass(w, node, walk) for node, walk in passes]
-    assert [g and g["Talker"] for g in got] == [
+    assert got == [
         "talker_prefill", None, "talker_prefill", "talker_prefill",
         "talker_last_prefill", "talker_decode", "talker_decode",
     ]
@@ -308,7 +317,8 @@ def test_the_hook_sees_the_producers_state():
     seen = []
 
     def record(ctx: ProducerWalkCtx) -> str:
-        seen.append(ctx)
+        # The context is reused across calls: copy what is needed during the call
+        seen.append((ctx.producer_walk, ctx.pass_in_walk, ctx.consumer_walk, ctx.fwd_info))
         return "talker_prefill"
 
     w = _producer()
@@ -321,11 +331,22 @@ def test_the_hook_sees_the_producers_state():
     _pass(w, "Thinker", "prefill_text")
     _pass(w, "Thinker", "thinker_decode")
     assert seen == [
-        ProducerWalkCtx("prefill_text", 0, None, fwd),
-        ProducerWalkCtx("prefill_text", 1, "talker_prefill", fwd),
-        ProducerWalkCtx("thinker_decode", 0, "talker_prefill", fwd),
+        ("prefill_text", 0, None, fwd),
+        ("prefill_text", 1, "talker_prefill", fwd),
+        ("thinker_decode", 0, "talker_prefill", fwd),
     ]
-    assert seen[0].fwd_info.step_metadata == {"is_last_prefill": True}
+    assert seen[0][3].step_metadata == {"is_last_prefill": True}
+
+
+def test_a_pass_allocates_nothing_once_the_request_has_emitted():
+    w = _producer()
+    _pass(w, "Thinker", "thinker_decode")
+    record = w.request_state.per_request_info[0].assigned_walks["Talker"]
+    walks = w.request_state.get_fwd_info(0, "Thinker").stream_consumer_walks
+    _pass(w, "Thinker", "thinker_decode")
+    assert w.request_state.per_request_info[0].assigned_walks["Talker"] is record
+    assert w.request_state.get_fwd_info(0, "Thinker").stream_consumer_walks is walks
+    assert record.pass_in_walk == 1
 
 
 # --- conductor ---------------------------------------------------------------

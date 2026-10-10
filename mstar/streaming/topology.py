@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Callable, NamedTuple
+from typing import Callable
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphEdge
@@ -21,18 +21,23 @@ class StreamingGraphEdge(GraphEdge):
         self.is_streaming = True
 
 
-class ProducerWalkCtx(NamedTuple):
-    """The producer's state for one pass that emits on a walk-driving edge."""
-    producer_walk: str
+@dataclass(slots=True)
+class ProducerWalkCtx:
+    """The producer's state for one pass that emits on a walk-driving edge.
+
+    The producer worker refills one instance for every call, since the hook
+    runs per request on every emitting step: valid only during the call.
+    """
+    producer_walk: str = ""
     # This pass's index among the producer worker's consecutive passes in
     # producer_walk that emitted on the edge; re-entering a walk restarts at 0
-    pass_in_walk: int
+    pass_in_walk: int = 0
     # The walk this producer worker last assigned the consumer; None before
     # its first emission
-    consumer_walk: str | None
+    consumer_walk: str | None = None
     # The producer's forward-pass info for this pass (step_metadata and all);
     # the hook runs on the producer, so nothing here crosses the wire
-    fwd_info: CurrentForwardPassInfo
+    fwd_info: CurrentForwardPassInfo | None = None
 
 
 @dataclass
