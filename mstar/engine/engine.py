@@ -648,13 +648,14 @@ class Engine:
             return pools, free, plan_captures(pools, free)
 
         pools, free, plan = planned(lambda runner: runner.size_captures())
-        if any(
+        # a walk's smaller buckets were sized by its largest, which is enough
+        # while every graph fits. If one doesn't, here or on another rank of a
+        # runner's group, each is sized by its own capture, and the plan made again
+        short = any(
             cost.graph is not None and bucket not in plan.buckets[pool]
             for pool, costs in pools.items() for bucket, cost in costs.items()
-        ):
-            # a walk's smaller buckets were sized by its largest, which is enough
-            # while every graph fits. Here one doesn't, so each is sized by its own capture
-            pools, free, plan = planned(lambda runner: runner.size_lent_captures())
+        )
+        pools, free, plan = planned(lambda runner: runner.size_lent_captures(short))
         logger.info(
             "CapturePlan[%s]: %.0f MiB free, %.0f for the largest eager step",
             self._device, free / 2**20, plan.floor / 2**20,

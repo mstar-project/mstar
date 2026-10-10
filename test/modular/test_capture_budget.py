@@ -333,7 +333,7 @@ def test_the_cap_bounds_the_plan(monkeypatch, fraction, reserved, planned):
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: reserved * _GIB)
     # graphs that share no scratch, so each takes its full GiB
     costs = {bs: CaptureCost(peak=2 * _GIB, graph=_GIB, kept=_GIB, slots=1) for bs in range(8)}
-    talker = SimpleNamespace(size_captures=lambda: costs, size_lent_captures=lambda: costs)
+    talker = SimpleNamespace(size_captures=lambda: costs, size_lent_captures=lambda wanted: costs)
     engine = SimpleNamespace(
         _device=torch.device("cuda", 0), _submodules={"Talker": None}, _gpu_memory_fraction=fraction,
     )

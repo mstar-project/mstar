@@ -633,13 +633,17 @@ class CudaGraphRunner:
                 )
         return self._capture_costs
 
-    def size_lent_captures(self) -> dict[BucketKey, CaptureCost]:
-        """Capture every bucket a lender sized, thrown away: a plan that leaves
-        graphs out needs what each takes, not what its walk's largest does.
+    def size_lent_captures(self, wanted: bool) -> dict[BucketKey, CaptureCost]:
+        """Capture every bucket a lender sized, thrown away, if ``wanted`` here
+        or on another rank: a plan that leaves graphs out needs what each
+        takes, not what its walk's largest does.
 
-        With no forward and no barrier: sizing ran the forwards, and a capture
-        runs no collective, so each rank does this or not by its own plan.
+        Every rank asks, so the ranks of a group size again together or not at
+        all, and plan on the same kind of cost. With no forward and no barrier:
+        sizing ran the forwards, and a capture runs no collective.
         """
+        if not most_across_ranks(self._comm_group, [int(wanted)], self._device)[0]:
+            return self._capture_costs
         for spec in self.prepare_for_capture():
             if spec.slot != 0 or spec.bucket not in self._lent:
                 continue
@@ -1538,9 +1542,11 @@ class PiecewiseCudaGraphRunner:
         self._dummy_rows.release_all()
         return self._capture_costs
 
-    def size_lent_captures(self) -> dict[BucketKey, CaptureCost]:
-        """Capture every shape a lender sized, thrown away; see
-        `CudaGraphRunner.size_lent_captures`."""
+    def size_lent_captures(self, wanted: bool) -> dict[BucketKey, CaptureCost]:
+        """Capture every shape a lender sized, thrown away, if ``wanted`` here
+        or on another rank; see `CudaGraphRunner.size_lent_captures`."""
+        if not most_across_ranks(self._comm_group, [int(wanted)], self._device)[0]:
+            return self._capture_costs
         for shape in self.prepare_for_capture():
             bucket = self._bucket(shape)
             if bucket not in self._lent:
