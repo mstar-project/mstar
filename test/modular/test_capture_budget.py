@@ -43,6 +43,7 @@ class _StubMeasuredRunner:
     """`size_captures` over stub warm-ups of ``steps``, two slots each, in capture order."""
 
     size_captures = CudaGraphRunner.size_captures
+    NUM_WARMUP = CudaGraphRunner.NUM_WARMUP
 
     def __init__(self, device: torch.device, steps: dict[BucketKey, CaptureCost]):
         self._steps = steps
@@ -60,7 +61,7 @@ class _StubMeasuredRunner:
         return [CGSlotSpec(bucket=b, slot=s, config=SimpleNamespace()) for b in self._steps for s in (0, 1)]
 
     @contextmanager
-    def _warmed(self, spec):
+    def _warmed(self, spec, forwards):
         self.warmed.append((spec.bucket, spec.slot))
         if (spec.bucket, spec.slot) in self.failing:
             raise RuntimeError(f"capture admit failed for {spec.bucket}")

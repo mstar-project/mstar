@@ -569,7 +569,7 @@ class CudaGraphRunner:
             self._comm_group.tp_group.barrier()
             self._comm_group.sp_group.barrier()
             try:
-                with self._warmed(spec) as warmed:
+                with self._warmed(spec, self.NUM_WARMUP) as warmed:
                     if spec.slot == 0:
                         graph, kept = _capture_thrown_away(
                             partial(
@@ -737,9 +737,10 @@ class CudaGraphRunner:
         )
 
     def _capture_one(self, spec: CGSlotSpec) -> CudaGraphSlot:
-        with self._warmed(spec) as warmed:
-            # the warm-up's blocks sit cached in the allocator, where the
-            # capture's own pool can't reach them
+        # no forward first: `size_captures` already ran this spec's
+        with self._warmed(spec, forwards=0) as warmed:
+            # what preparing it left cached in the allocator is out of the
+            # capture pool's reach
             torch.cuda.empty_cache()
             graph, output = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
@@ -755,8 +756,9 @@ class CudaGraphRunner:
             )
 
     @contextmanager
-    def _warmed(self, spec: CGSlotSpec) -> Iterator[WarmedSpec]:
-        """Prepare ``spec`` and run its forward eagerly, as its capture needs first."""
+    def _warmed(self, spec: CGSlotSpec, forwards: int) -> Iterator[WarmedSpec]:
+        """Prepare ``spec`` and run its forward eagerly ``forwards`` times, as
+        its first capture needs."""
         walk = spec.bucket.graph_walk
         config = spec.config
         dummy_rids = self._dummy_rows.ensure(
@@ -824,7 +826,8 @@ class CudaGraphRunner:
 
             torch.cuda.set_device(self._device)
             torch.cuda.synchronize()
-            for _ in range(self.NUM_WARMUP):
+            peak = 0
+            for _ in range(forwards):
                 # the last forward's peak, not the first's: that one may compile and autotune
                 live = torch.cuda.memory_allocated(self._device)
                 torch.cuda.reset_peak_memory_stats(self._device)
@@ -1335,6 +1338,8 @@ class PiecewiseCudaGraphRunner:
         self.dropped_shapes: list[tuple[int, int]] = []
         # bucket -> what it costs, from size_captures
         self._capture_costs: dict[BucketKey, CaptureCost] = {}
+        # bucket -> the shape, dtype and device of each output of its warm-up
+        self._output_likes: dict[BucketKey, dict[str, tuple]] = {}
         self._dummy_rows = DummyRowPool(
             prefix=f"pw_{label}", step_runner=step_runner, resources=resources,
         )
@@ -1422,7 +1427,11 @@ class PiecewiseCudaGraphRunner:
                     self._comm_group.tp_group.barrier()
                     self._comm_group.sp_group.barrier()
                 try:
-                    with self._warmed(shape, slot) as warmed:
+                    with self._warmed(shape, slot, self.NUM_WARMUP) as warmed:
+                        self._output_likes[self._bucket(shape)] = {
+                            name: (value.shape, value.dtype, value.device)
+                            for name, value in warmed.warm_outputs.items()
+                        }
                         if slot == 0:
                             graph, kept = _capture_thrown_away(
                                 partial(
@@ -1449,6 +1458,14 @@ class PiecewiseCudaGraphRunner:
         # admit after them on a node that shares the resource
         self._dummy_rows.release_all()
         return self._capture_costs
+
+    def _outputs_like(self, bucket: BucketKey) -> dict[str, torch.Tensor]:
+        """Tensors shaped as the outputs of sizing's warm-up of ``bucket``, one
+        element each, expanded: a capture reads their shape and dtype."""
+        return {
+            name: torch.empty((), dtype=dtype, device=device).expand(size)
+            for name, (size, dtype, device) in self._output_likes[bucket].items()
+        }
 
     def warmup_and_capture(self, planned: Collection[BucketKey]) -> None:
         if self._device is None or not torch.cuda.is_available():
@@ -1539,11 +1556,11 @@ class PiecewiseCudaGraphRunner:
             )
 
     def _capture_one(self, shape: PiecewiseCaptureShape, slot: int) -> None:
-        with self._warmed(shape, slot) as warmed:
-            # as in `CudaGraphRunner._capture_one`
+        # as in `CudaGraphRunner._capture_one`
+        with self._warmed(shape, slot, forwards=0) as warmed:
             torch.cuda.empty_cache()
             graph, static_outputs = capture_with_static_outputs(
-                warmed.run, warmed.warm_outputs, self._memory_pool, self._device,
+                warmed.run, self._outputs_like(self._bucket(shape)), self._memory_pool, self._device,
                 self._autocast_dtype,
             )
 
@@ -1559,9 +1576,9 @@ class PiecewiseCudaGraphRunner:
         )
 
     @contextmanager
-    def _warmed(self, shape: PiecewiseCaptureShape, slot: int) -> Iterator[WarmedRegion]:
-        """Plan ``shape`` and run the region eagerly, as its capture needs first;
-        see ``CudaGraphRunner._warmed``."""
+    def _warmed(self, shape: PiecewiseCaptureShape, slot: int, forwards: int) -> Iterator[WarmedRegion]:
+        """Plan ``shape`` and run the region eagerly ``forwards`` times; see
+        ``CudaGraphRunner._warmed``."""
         dummy_rids = self._dummy_rows.ensure(
             self._dummy_key(shape, slot), shape.bs
         )
@@ -1584,8 +1601,8 @@ class PiecewiseCudaGraphRunner:
         try:
             self._plan(step, shape)
             torch.cuda.synchronize()
-            warm_outputs = None
-            for _ in range(self.NUM_WARMUP):
+            warm_outputs, peak = None, 0
+            for _ in range(forwards):
                 # as in `CudaGraphRunner._warmed`
                 live = torch.cuda.memory_allocated(self._device)
                 torch.cuda.reset_peak_memory_stats(self._device)
