@@ -57,6 +57,7 @@ class _StubMeasuredRunner:
         group = SimpleNamespace(world_size=1, barrier=lambda: None)
         self._comm_group = SimpleNamespace(tp_group=group, sp_group=group)
         self.warmed: list[tuple[BucketKey, int]] = []
+        self.forwards: list[int] = []
         self.failing: set[tuple[BucketKey, int]] = set()
 
     def prepare_for_capture(self):
@@ -65,6 +66,7 @@ class _StubMeasuredRunner:
     @contextmanager
     def _warmed(self, spec, forwards):
         self.warmed.append((spec.bucket, spec.slot))
+        self.forwards.append(forwards)
         if (spec.bucket, spec.slot) in self.failing:
             raise RuntimeError(f"capture admit failed for {spec.bucket}")
         step = self._steps[spec.bucket]
@@ -103,6 +105,144 @@ def test_every_bucket_is_measured_once_before_any_capture(measured):
     assert kept == steps, "every bucket's step must be kept to size its capture"
 
 
+def test_a_walks_two_largest_buckets_are_captured_to_size_the_rest(measured):
+    """Bagel's 29 buckets were each captured once to be sized, and thrown away.
+    A walk runs one forward at every shape, so in the pool they share the
+    smaller graphs fit in the scratch the largest leaves free: 132 MiB for the
+    64-row decode, where the 4-row one took 54 MiB of a pool of its own."""
+    walk = {
+        _bucket("decode", 64, 64): CaptureCost(93 * _MIB, 133 * _MIB, _MIB, 2),
+        _bucket("decode", 32, 32): CaptureCost(46 * _MIB, 94 * _MIB, _MIB // 2, 2),
+        _bucket("decode", 8, 8): CaptureCost(13 * _MIB, 22 * _MIB, _MIB // 8, 2),
+        _bucket("decode", 4, 4): CaptureCost(7 * _MIB, 54 * _MIB, _MIB // 16, 2),
+    }
+    largest, second, *smaller = walk
+
+    costs = _StubMeasuredRunner(torch.device("cuda", 0), walk).size_captures()
+
+    assert measured == [walk[largest], walk[second]], "only the walk's two largest buckets are captured to size it"
+    for bucket in smaller:
+        assert costs[bucket] == walk[bucket]._replace(graph=132 * _MIB + walk[bucket].kept), (
+            "a smaller bucket takes the largest's scratch and adds its own outputs"
+        )
+
+
+def test_a_walk_whose_second_bucket_takes_more_than_its_largest_is_captured_whole(measured):
+    """Chatterbox's CFG decode takes 24 MiB at 32 rows and 56 MiB at 16, each
+    in a pool of its own. Sized by the largest, the walk would be planned at
+    24 MiB."""
+    walk = {
+        _bucket("decode", bs, 2 * bs): CaptureCost(8 * bs * _MIB // 32, graph * _MIB, 0, 2)
+        for bs, graph in ((32, 24), (16, 56), (8, 34), (4, 34))
+    }
+
+    costs = _StubMeasuredRunner(torch.device("cuda", 0), walk).size_captures()
+
+    assert measured == list(walk.values())
+    assert costs == walk, "a walk that doesn't nest keeps each bucket's own size"
+
+
+def test_a_bucket_that_peaks_above_its_walks_first_is_captured_too(measured):
+    """Capture order leads with batch size, not with the eager peak: Bagel's
+    prefill of 4 rows comes first and peaks at 278.0 MiB, and the 1-row prefill
+    of the same 2048 tokens, far down the order, peaks at 278.8."""
+    walk = {
+        _bucket("prefill_text", 4, 2048): CaptureCost(2780 * _MIB // 10, 336 * _MIB, 0, 2),
+        _bucket("prefill_text", 4, 1024): CaptureCost(139 * _MIB, 206 * _MIB, 0, 2),
+        _bucket("prefill_text", 4, 512): CaptureCost(70 * _MIB, 132 * _MIB, 0, 2),
+        _bucket("prefill_text", 1, 2048): CaptureCost(2788 * _MIB // 10, 340 * _MIB, 0, 2),
+        _bucket("prefill_text", 1, 1024): CaptureCost(140 * _MIB, 206 * _MIB, 0, 2),
+    }
+    first, second, between, higher, after = walk
+
+    costs = _StubMeasuredRunner(torch.device("cuda", 0), walk).size_captures()
+
+    assert measured == [walk[first], walk[second], walk[higher]], "a bucket that peaks above every one before it"
+    assert costs[between].graph == walk[first].graph
+    assert costs[after].graph == walk[higher].graph, "the bucket with the largest peak sizes the ones after it"
+
+
+def test_a_walk_whose_largest_cannot_be_captured_is_sized_by_the_next(measured):
+    """A largest bucket that runs out of memory in its capture has no scratch
+    to lend. The next ones down may still fit, and are captured to find out."""
+    walk = {
+        _bucket("prefill_vision", 1, 16384): CaptureCost(3 * _GIB, None, 0, 2),
+        _bucket("prefill_vision", 1, 4096): CaptureCost(_GIB, _GIB, 0, 2),
+        _bucket("prefill_vision", 1, 2048): CaptureCost(_GIB // 2, _GIB // 2, 0, 2),
+        _bucket("prefill_vision", 1, 1024): CaptureCost(_GIB // 4, _GIB // 2, 0, 2),
+    }
+    *captured, smallest = walk
+
+    costs = _StubMeasuredRunner(torch.device("cuda", 0), walk).size_captures()
+
+    assert measured == [walk[bucket] for bucket in captured]
+    assert costs[smallest].graph == _GIB, "the smallest is sized by the largest bucket that did capture"
+
+
+@pytest.mark.parametrize(("room", "captured", "planned"), [(8192, 2, 6), (1024, 6, 3)], ids=["roomy", "short"])
+def test_a_plan_that_leaves_a_graph_out_sizes_each_bucket_by_its_own_capture(
+    measured, monkeypatch, room, captured, planned,
+):
+    """Qwen3-Omni's Code2Wav takes 7088 MiB at 32 rows, on a GPU with 2 GiB
+    for graphs. Sized by it, every smaller bucket costs as much and stays out
+    of the plan with it, where the 4, 2 and 1-row graphs fit in 799 MiB."""
+    walk = {
+        _bucket("code2wav_chunk", bs, 0): CaptureCost(graph * _MIB // 2, graph * _MIB, bs * _MIB // 8, 1)
+        for bs, graph in ((32, 7088), (16, 3168), (8, 1552), (4, 794), (2, 390), (1, 176))
+    }
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: ((3544 + room) * _MIB, 80 * _GIB))
+    runner = _StubMeasuredRunner(torch.device("cuda", 0), walk)
+    runner._num_slots = 1
+    engine = SimpleNamespace(
+        _device=torch.device("cuda", 0), _submodules={"Code2Wav": None}, _gpu_memory_fraction=None,
+    )
+
+    plan = Engine._plan_captures(engine, {"Code2Wav": runner}, {"Code2Wav": {}})
+
+    assert len(measured) == captured, "two captures size the walk while every graph fits, and each its own when not"
+    assert plan.buckets["Code2Wav"] == set(list(walk)[-planned:])
+    assert runner.forwards[2 * len(walk):] == [0] * (captured - 2), "a later capture needs no second warm-up"
+
+
+@pytest.mark.parametrize(
+    ("wanted", "peer_wanted", "captured"), [(False, False, 2), (False, True, 4), (True, False, 4)],
+    ids=["neither", "the_peer", "this_rank"],
+)
+def test_a_tp_group_sizes_its_buckets_again_together(measured, wanted, peer_wanted, captured):
+    """Whether a plan leaves a graph out depends on the memory free on its own
+    rank. A rank that sized again alone would plan on each bucket's own size
+    while its peer still planned on the largest's."""
+    walk = {
+        _bucket("decode", bs, bs): CaptureCost(bs * _MIB, 2 * bs * _MIB, 0, 2) for bs in (16, 8, 4, 2)
+    }
+    runner = _StubMeasuredRunner(torch.device("cpu"), walk)
+    runner._comm_group.tp_group = _PeerGroup([peer_wanted])
+    runner.size_captures()
+
+    costs = runner.size_lent_captures(wanted)
+
+    assert len(measured) == captured, "a group's ranks capture their lender-sized buckets together or not at all"
+    assert (costs == walk) == (captured == 4)
+
+
+def test_a_regions_inputs_and_outputs_count_outside_its_pool(monkeypatch):
+    """A region's graph copies its outputs into buffers outside the pool, and
+    reads inputs from there, a set per graph. The pool a capture took is all
+    scratch: a smaller bucket takes it whole and adds its own buffers."""
+    monkeypatch.setattr(cuda_graph_runner, "_capture_thrown_away", lambda capture, what: 60 * _MIB)
+    captured = []
+
+    def size(peak: int, kept: int) -> tuple[CaptureCost, bool]:
+        return cuda_graph_runner._size_in_walk(
+            captured, CaptureCost(peak * _MIB, None, kept * _MIB, 1), False, None, "",
+        )
+
+    assert size(peak=8, kept=4) == (CaptureCost(8 * _MIB, 64 * _MIB, 4 * _MIB, 1), False)
+    assert size(peak=4, kept=2) == (CaptureCost(4 * _MIB, 62 * _MIB, 2 * _MIB, 1), False)
+    assert size(peak=2, kept=1) == (CaptureCost(2 * _MIB, 61 * _MIB, _MIB, 1), True)
+
+
 def test_every_slot_is_warmed_before_any_capture(measured):
     """A slot's first plan builds state of its own: FlashInfer's graph wrappers,
     and a 512 MiB workspace for the Talker's second slot. Warmed at slot 0 only,
@@ -113,6 +253,23 @@ def test_every_slot_is_warmed_before_any_capture(measured):
     runner.size_captures()
 
     assert runner.warmed == [(_DECODE, 0), (_DECODE, 1)], "every slot must be warmed before the plan reads free memory"
+
+
+def test_a_spec_is_warmed_up_to_size_it_and_not_again_to_capture_it(measured, monkeypatch):
+    """Sizing runs every spec's forward twice. Capture ran each twice more
+    before its real capture, as it had to when nothing ran before it: 5 s of
+    the 10 s sizing added to Bagel's 66 s boot."""
+    runner = _StubMeasuredRunner(torch.device("cuda", 0), {_DECODE: CaptureCost(_GIB, 2 * _GIB, 0, 2)})
+    runner._memory_pool = None
+    runner._build_slot_from_capture = lambda **slot: slot
+    runner.size_captures()
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(cuda_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, {}))
+
+    for spec in runner.prepare_for_capture():
+        CudaGraphRunner._capture_one(runner, spec)
+
+    assert runner.forwards == [2, 2, 0, 0], "a spec sizing warmed up is captured without another forward"
 
 
 def test_a_bucket_whose_second_slot_cannot_run_is_never_planned(measured):
