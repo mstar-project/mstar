@@ -598,7 +598,7 @@ class Sampler(BaseSampler):
     # sampling runs inside the forward; nothing here is worth tracing
     @torch.compiler.disable
     def sample(
-        self, request_ids: list[str], logits: torch.Tensor, **kwargs
+        self, request_ids: list[str], logits: torch.Tensor, discarded: frozenset[str] = frozenset(), **kwargs
     ) -> torch.Tensor:
         """Return the sampled tokens as a single [B] int tensor.
 
@@ -668,7 +668,8 @@ class Sampler(BaseSampler):
 
         if any_rep_pen:
             for i, rid in enumerate(request_ids):
-                self._seen_token_mask[rid].add_tokens(tokens[i:i+1])
+                if rid not in discarded:
+                    self._seen_token_mask[rid].add_tokens(tokens[i:i+1])
 
         # FlashInfer consumes one offset unit per sampled row. The XPU kernel
         # consumes one Philox region per logit in its row, so advancing by one
@@ -1059,14 +1060,14 @@ class CudaGraphableSampler(BaseSampler):
 
     @torch.compiler.disable
     def sync_seen_token_masks(
-        self, seen_masks: "Iterable[SeenTokenMask]",
+        self, seen_masks: "Iterable[SeenTokenMask | None]",
     ) -> None:
         """Copy the in-graph seen-token rows back into canonical ``SeenTokenMask``s.
 
         Called eagerly after graph replay (the captured ``sample`` scattered the
         newly sampled token into ``seen_tokens_buf``). ``seen_masks`` are in
         request order; padding rows beyond ``len(seen_masks)`` are ignored, and
-        not-yet-sized masks (``_seen_token_mask is None``) are skipped.
+        not-yet-sized masks (``_seen_token_mask is None``) and ``None`` are skipped.
         """
         if self.seen_tokens_buf is None:
             return
@@ -1077,7 +1078,7 @@ class CudaGraphableSampler(BaseSampler):
         dsts = []
         srcs = []
         for i, m in enumerate(seen_masks):
-            mask = m._seen_token_mask
+            mask = None if m is None else m._seen_token_mask
             if mask is not None:
                 dsts.append(mask)
                 srcs.append(self.seen_tokens_buf[i])

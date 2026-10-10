@@ -102,6 +102,11 @@ _VAE_TRANSFORM = ImageTransform(1024, 512, 16)
 _VIT_TRANSFORM = ImageTransform(980, 224, 14)
 
 
+def _keeps_prefill_sample(step_metadata: dict) -> bool:
+    """Whether a text walk keeps the token sampled after it; one before the prompt's last walk throws it away."""
+    return step_metadata.get("sample_prefill_token", True)
+
+
 def vit_image_slots(
     height: int, width: int, image_preprocess: str,
     patch_size: int, max_num_patches_per_side: int,
@@ -856,6 +861,7 @@ class LLMSubmodule(ARNodeSubmodule):
         if graph_walk == "prefill_text":
             node_inputs.input_ids = inputs["text_inputs"][0]
             node_inputs.input_seq_len = node_inputs.input_ids.shape[0]
+            node_inputs.discard_sample = not _keeps_prefill_sample(fwd_info.step_metadata)
 
         elif graph_walk == "decode":
             # NOTE: newly-sampled tokens automatically added to the seen token mask
@@ -1016,6 +1022,9 @@ class LLMSubmodule(ARNodeSubmodule):
                     for rid, inp in zip(request_ids, inputs, strict=True)
                     if inp.input_ids is not None
                 },
+                discarded=frozenset(
+                    rid for rid, inp in zip(request_ids, inputs, strict=True) if inp.discard_sample
+                ),
             )
         elif graph_walk in ("decode", "prefill_vit"):
             # prefill_vit is the last walk before decode for an image prompt,
@@ -1060,7 +1069,7 @@ class LLMSubmodule(ARNodeSubmodule):
         # passes in dummy metadata
         result["requires_cfg"] = requires_cfg_for_inputs(inputs)
         result["sample_token"] = any([
-            info.step_metadata.get("sample_prefill_token", True) \
+            _keeps_prefill_sample(info.step_metadata) \
                 for info in engine_inputs.per_request_info.values()
         ])
         return result

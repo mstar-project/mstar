@@ -253,6 +253,8 @@ class ARNodeInputs(NodeInputs):
 
     # Tensor for single cache label, dict for multi-label
     custom_pos_ids: torch.Tensor | dict[str, torch.Tensor] | None = None
+    # the model throws away the token this walk samples, so the sampler must not count it as seen
+    discard_sample: bool = False
 
     @classmethod
     def collate(cls, inputs_list: list["ARNodeInputs"], stacking_method=StackingMethod.NONE):

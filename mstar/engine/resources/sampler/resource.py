@@ -72,6 +72,8 @@ class SamplerResource(Resource):
         self._preplanned = False
         # rid -> position past them -> prompt tokens a cache hit kept out of a walk's inputs
         self._cached_prefix: dict[str, dict[int, torch.Tensor]] = {}
+        # the planned step's `SamplerStep.discarded`, for the eager sampler, which marks as it samples
+        self._discarded: frozenset[str] = frozenset()
 
     @property
     def _penalty_live(self) -> bool:
@@ -237,6 +239,8 @@ class SamplerResource(Resource):
 
     def plan(self, step: SamplerStep, ctx: StepContext):
         self._set_penalty_flags(step, ctx)
+        if not ctx.is_preplan:
+            self._discarded = step.discarded
         if not ctx.is_preplan and self._penalty_live:
             for rid, tokens in step.prefill_tracked_tokens.items():
                 self._sampler.get_token_mask(rid).add_tokens(tokens)
@@ -319,9 +323,10 @@ class SamplerResource(Resource):
         # copy back, and the rows go stale only for requests at penalty 1.0,
         # which never read them. See `_penalty_live` for why that stays sound.
         if self._penalty_needed_this_step:
-            self._cg_sampler.sync_seen_token_masks(
-                [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
-            )
+            self._cg_sampler.sync_seen_token_masks([
+                None if rid in step.discarded else self._sampler.get_token_mask(rid)
+                for rid in ctx.request_ids
+            ])
 
     ### Submodule-level functionality
 
@@ -345,4 +350,4 @@ class SamplerResource(Resource):
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step
             )
-        return self._sampler.sample(request_ids, logits)
+        return self._sampler.sample(request_ids, logits, discarded=self._discarded)
