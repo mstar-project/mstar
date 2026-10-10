@@ -124,6 +124,29 @@ def test_audio_placeholders_line_up_with_pooled_tokens(model):
 
 
 @needs_ckpt
+def test_spoken_reply_system_prompt_with_and_without_the_voice_clip(model):
+    """By default a spoken reply's system message carries the voice clip (upstream's
+    audio_assistant prompt); with ``voice_prompt=False`` it is the request's text system
+    prompt. Both use the speech template, which ends the prompt on <|tts_bos|>."""
+    from mstar.model.multimodal import PromptPart
+
+    tts_bos = model.tokenizer.convert_tokens_to_ids("<|tts_bos|>")
+    parts = [PromptPart("text", "Say hello.")]
+    voiced = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts)
+    assert voiced["audio_positions"][0].numel() > 0
+    assert voiced["text_inputs"][0][-1].item() == tts_bos
+    plain = model.process_prompt(
+        None, ["text"], ["text", "audio"], prompt_parts=parts,
+        voice_prompt=False, system_prompt="You are a helpful assistant.",
+    )
+    assert "audio_positions" not in plain
+    assert plain["text_inputs"][0][-1].item() == tts_bos
+    assert "You are a helpful assistant." in model.tokenizer.decode(plain["text_inputs"][0])
+    with pytest.raises(ValueError, match="unknown MiniCPM-o voice"):
+        model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, voice_prompt=False, voice="nope")
+
+
+@needs_ckpt
 @pytest.mark.parametrize(
     "tensors, walk",
     [
@@ -162,4 +185,6 @@ def test_every_node_gets_only_its_resources(model):
         "LLM": {"llm_kv", "llm_attn", "llm_pos", "llm_sampler"},
         "vision_encoder": {"vision_attn", "resampler_attn"},
         "audio_encoder": {"audio_attn"},
+        "TTS": {"tts_kv", "tts_attn", "tts_pos", "tts_sampler"},
+        "Token2Wav": {"t2w_state", "t2w_enc1_kv", "t2w_enc2_kv", "t2w_dit_kv"},
     }

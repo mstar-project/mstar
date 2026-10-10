@@ -242,8 +242,12 @@ class PiecewiseCudaGraphConfig(ABC):
     lease_before_step: bool = False
     # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
     forward_kwargs: dict[str, Any] = field(default_factory=dict)
-    # None => defer to the runner's default batch-size buckets
+    # None => defer to the runner's default batch-size buckets; [] captures nothing
     capture_batch_sizes: list[int] | None = None
+    # A shape with no captured graph runs the region eagerly through ``run``, its
+    # step declared, planned and committed over the real rows, rather than raising;
+    # the caller then has one path for both. Off: the caller checks ``can_run``.
+    eager_fallback: bool = False
     # Whether to torch.compile capture_fn before capture. Default off; the
     # block loop already benefits from graph capture alone.
     compile: bool = False

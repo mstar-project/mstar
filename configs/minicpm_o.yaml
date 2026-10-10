@@ -1,7 +1,33 @@
 model: "minicpm_o"
 max_seq_len: 16384
+# One GPU (the whole checkpoint is ~19 GB in bf16), three workers. The
+# encoders run once per request and then idle, so they share the LLM's
+# worker. The TTS and the vocoder each get their own worker loop: a vocoder
+# step takes 40-150 ms, which on a shared loop would hold up the
+# TTS's few-millisecond decode steps (and the LLM's).
+rank_devices: {0: 0, 1: 0, 2: 0}
 node_groups:
-  # The encoders run once per request and then idle, so they share the
-  # LLM's GPU (the whole checkpoint is ~19 GB in bf16).
   - node_names: [LLM, vision_encoder, audio_encoder]
     ranks: [0]
+  - node_names: [TTS]
+    ranks: [1]
+  - node_names: [Token2Wav]
+    ranks: [2]
+resources:
+  # 128-token pages. The LLM's ~144 KiB/token: 384 pages (49k tokens) is 6.8 GiB.
+  llm_kv:
+    max_num_pages: 384
+  # The TTS's ~60 KiB/token: a spoken reply's condition plus up to 2047 codes.
+  tts_kv:
+    max_num_pages: 256
+  # The vocoder holds a slot in each of these per spoken reply, ~0.4 GiB in all
+  # (t2w_state has one more, its sink). A reply waits for slots before its first
+  # audio, so they cap concurrent spoken replies.
+  t2w_state:
+    max_slots: 33
+  t2w_enc1_kv:
+    max_slots: 32
+  t2w_enc2_kv:
+    max_slots: 32
+  t2w_dit_kv:
+    max_slots: 32

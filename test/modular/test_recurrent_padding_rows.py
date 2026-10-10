@@ -145,3 +145,34 @@ def test_a_real_request_padding_and_release_across_the_rotation():
     assert pool.num_free_slots == 1
     pool.remove_request("r")
     assert pool.num_free_slots == 2
+
+
+def test_gather_scatter_follow_the_step_addressing():
+    """``gather`` / ``scatter_`` address the step's rows: a replay's padding rows
+    read and write the sink and nothing else, and a ``select`` of the step
+    addresses the same slots as the step."""
+    pool = build_pool(max_slots=6)
+    step = decode_step(["a", "b"])
+    eager = StepContext(request_ids=["a", "b"], graph_walk="decode", slot=0, capture=False)
+    pool.admit(step, eager)
+    rows = pool.plan(step, eager)["main"]
+    value = torch.arange(2 * 96 * 3, dtype=torch.float32).view(2, 96, 3)
+    pool.scatter_("conv", rows, value, layer_idx=1)
+    torch.testing.assert_close(pool.gather("conv", rows, layer_idx=1), value)
+    one = StepContext(request_ids=["b"], graph_walk="decode", slot=0, capture=False)
+    torch.testing.assert_close(pool.gather("conv", pool.plan(decode_step(["b"]), one)["main"], layer_idx=1), value[1:])
+    untouched = pool.block("conv", 0).clone()
+
+    padded = decode_step(["a", "b", "pad0", "pad1"])
+    ctx = padded_ctx(["a", "b"], ["a", "b", "pad0", "pad1"], bs=4)
+    pool.admit(padded, ctx)
+    rows = pool.plan(padded, ctx)["main"]
+    assert rows.num_rows == 4
+    got = pool.gather("conv", rows, layer_idx=1)
+    torch.testing.assert_close(got[:2], value)
+    pool.scatter_("conv", rows, torch.full((4, 96, 3), -1.0), layer_idx=1)
+    conv = pool.block("conv", 1)
+    live = {pool._slots[r]["main"].index for r in ("a", "b")}
+    assert all(bool((conv[i] == -1).all()) for i in live | {SINK_SLOT})
+    assert all(bool((conv[i] == 0).all()) for i in range(6) if i not in live | {SINK_SLOT})
+    torch.testing.assert_close(pool.block("conv", 0), untouched)

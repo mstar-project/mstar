@@ -411,6 +411,61 @@ class HiggsAudio(Model):
         }
 
 
+class MiniCPMO45(Model):
+    """MiniCPM-o 4.5, half-duplex chat (LLM -> TTS -> token2wav)."""
+
+    def get_hf_url(self):
+        return "openbmb/MiniCPM-o-4_5"
+
+    def get_supported_modalities(self):
+        return {
+            RequestType.T2T, RequestType.T2S,
+            RequestType.I2T, RequestType.I2S,
+            RequestType.A2T, RequestType.A2S,
+        }
+
+    # vllm-omni's MiniCPM-o examples. Both systems get it: M* would otherwise
+    # follow upstream chat() and put the voice's reference clip in a spoken
+    # reply's system message, which changes the reply and slows its speech
+    # (~11% longer audio for the same text, measured against upstream).
+    SYSTEM_PROMPT = (
+        "You are MiniCPM-o, a helpful multimodal assistant that can understand images, "
+        "audio and video, and respond in text and speech."
+    )
+
+    def get_openai_system_message(self) -> Optional[dict]:
+        return {"role": "system", "content": [{"type": "text", "text": self.SYSTEM_PROMPT}]}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        speech = request_type.get_output_modalities() == "audio"
+        # Greedy LLM, capped, no repetition penalty: vllm-omni's stage-0
+        # defaults. The TTS keeps each system's own sampling defaults (both
+        # upstream's temperature 0.8 / top-p 0.85 / top-k 25), since
+        # vllm-omni applies the request's temperature to stage 0 only.
+        # A spoken reply gets room to end on its own: vllm-omni's talker fails a
+        # reply the LLM's cap cut off before <|tts_eos|>.
+        cap = 1024 if speech else 256
+        kwargs = {
+            "temperature": 0.0,
+            "repetition_penalty": 1.0,
+            "max_tokens": cap,
+            "max_output_tokens": cap,
+            # vllm-omni only: the template thinks unless told not to, and
+            # speaks only with the TTS template
+            "chat_template_kwargs": {"enable_thinking": False, "use_tts_template": speech},
+            # vllm-omni slices images by config.json (one slice); upstream's
+            # chat() and M* default to the processor's nine
+            "max_slice_nums": 1,
+            # M* only: vllm-omni's system message, without the voice clip
+            "system_prompt": self.SYSTEM_PROMPT,
+            "voice_prompt": False,
+        }
+        if speech:
+            # raw 24 kHz int16 chunks, which RequestMetrics' duration maths assumes
+            kwargs["audio"] = {"format": "pcm"}
+        return kwargs
+
+
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
@@ -425,6 +480,7 @@ class ModelType(Enum):
     WHISPER_LARGE = "whisper_large"
     HIGGS_AUDIO = "higgs_audio"
     QWEN3_5 = "qwen3.5"
+    MINICPMO45 = "minicpmo45"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -451,6 +507,8 @@ class ModelType(Enum):
             return WhisperLarge(**kwargs)
         if self == ModelType.HIGGS_AUDIO:
             return HiggsAudio(**kwargs)
+        if self == ModelType.MINICPMO45:
+            return MiniCPMO45(**kwargs)
         if self == ModelType.QWEN3_5:
             return Qwen3_5_Dense(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")

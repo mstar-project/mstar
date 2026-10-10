@@ -102,6 +102,22 @@ class RopeManager(PositionManager):
                 cache_dtype,
             )
 
+        if config.fused:
+            if config.llama31_params or config.interleave:
+                raise NotImplementedError(
+                    "PositionConfig.fused supports standard non-interleaved RoPE only"
+                )
+            rotary_dim = config.rotary_dim or head_dim
+            if rotary_dim is None:
+                raise ValueError(
+                    "fused RoPE needs PositionConfig.rotary_dim or the "
+                    "dependent KV cache's head_dim"
+                )
+            self._fused_rotary_dim = rotary_dim
+            self._fused_cache = self._build_rope_cache(
+                rotary_dim, config.rope_scale, config.rope_theta, torch.float32,
+            )
+
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
         # rid -> tokens the prefix cache matched, until `admit`
@@ -451,6 +467,22 @@ class RopeManager(PositionManager):
         freqs = torch.outer(positions, inv_freq)
         return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(dtype)
 
+    def _apply_qk_fused(
+        self, q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Non-interleaved RoPE in float32 over the cached table, returned in the
+        inputs' dtype (as FlashInfer's kernel computes and stores it)."""
+        half = self._fused_rotary_dim // 2
+        cos, sin = self._fused_cache.index_select(0, pos_ids.long()).unsqueeze(1).split(half, dim=-1)
+
+        def rotate(x: torch.Tensor) -> torch.Tensor:
+            xf = x.float()
+            x1, x2 = xf[..., :half], xf[..., half:2 * half]
+            out = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin, xf[..., 2 * half:]], dim=-1)
+            return out.to(x.dtype)
+
+        return rotate(q), rotate(k)
+
     def apply_qk(
         self,
         q: torch.Tensor,
@@ -465,6 +497,8 @@ class RopeManager(PositionManager):
     ):
         pos_ids = self._current_pos_ids[label]
         config = self._config
+        if config.fused and q.device.type == "cuda":
+            return self._apply_qk_fused(q, k, pos_ids[:q.shape[0]])
 
         orig_dtype = q.dtype
         rope_dtype = rope_dtype if rope_dtype is not None else config.rope_dtype

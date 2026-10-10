@@ -58,7 +58,7 @@ class RecurrentAddressing:
 
     slot_indices: torch.Tensor  # [rows] int32, `pad_index` where nothing is addressed
     has_state: torch.Tensor     # [rows] bool, False where the slot reads as zeros
-    num_rows: int               # real rows, before a capture bucket's padding
+    num_rows: int               # the rows the step declared, a replay's padding rows included
 
 
 class RecurrentStatePool(Resource):
@@ -128,6 +128,22 @@ class RecurrentStatePool(Resource):
     def block(self, name: str, layer_idx: int) -> torch.Tensor:
         """One layer's contiguous slot-major view of a block: ``[max_slots, *shape]``."""
         return self._blocks[name][layer_idx]
+
+    def gather(self, name: str, rows: RecurrentAddressing, layer_idx: int = 0) -> torch.Tensor:
+        """Block ``name`` of these rows' slots, ``[rows, *shape]`` (a copy).
+
+        ``rows`` is the step's addressing (``addressing``), so a captured and an
+        eager forward address their slots the same way; padding rows read the
+        sink."""
+        index = rows.slot_indices[: rows.num_rows].long()
+        return self._blocks[name][layer_idx].index_select(0, index)
+
+    def scatter_(
+        self, name: str, rows: RecurrentAddressing, value: torch.Tensor, layer_idx: int = 0,
+    ) -> None:
+        """Write ``value [rows, *shape]`` into block ``name`` of these rows' slots."""
+        index = rows.slot_indices[: rows.num_rows].long()
+        self._blocks[name][layer_idx].index_copy_(0, index, value)
 
     @property
     def num_free_slots(self) -> int:
