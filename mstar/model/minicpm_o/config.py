@@ -26,6 +26,7 @@ TTS_ATTN = "tts_attn"
 TTS_POS = "tts_pos"
 TTS_SAMPLER = "tts_sampler"
 T2W_STATE = "t2w_state"
+T2W_DIT_KV = "t2w_dit_kv"
 
 # ragged span labels
 PATCHES = "patches"

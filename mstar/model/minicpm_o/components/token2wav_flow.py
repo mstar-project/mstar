@@ -206,6 +206,23 @@ class RingKV(KVCache):
         heads.index_copy_(0, slots, ((head - frames) % prompt_frames).to(heads.dtype))
 
 
+class BoundedLayerKV(KVCache):
+    """A DiT layer's cache on the engine's bounded KV resource: ``plan`` is this
+    batch's rows of the step's layout, ``source [2, H, 2P, 2d]`` the layer's voice in
+    stream order (``token2wav.dit_source``). ``length`` is how many entries the rows
+    retain, as the flow's noise offset."""
+
+    def __init__(self, resource, layer_idx: int, source: torch.Tensor, plan, length: int):
+        self.length = length
+        self.resource = resource
+        self.layer_idx = layer_idx
+        self.source = source
+        self.plan = plan
+
+    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return self.resource.attend(self.layer_idx, q, k, v, self.source, self.plan)
+
+
 def rel_position_table(d_model: int, max_len: int = 5000) -> torch.Tensor:
     """ESPnet's relative sinusoid table ``[1, 2 * max_len - 1, d_model]``, positive offsets
     reversed then negative ones; built on the host in float32 as the reference does."""
@@ -447,6 +464,8 @@ class DiTAttention(nn.Module):
         q = self.q_norm(self._heads(self.to_q(x)))
         k = self.k_norm(self._heads(self.to_k(x)))
         v = self._heads(self.to_v(x))
+        if isinstance(kv, BoundedLayerKV):
+            return self.proj(kv.attend(q, k, v).reshape(b, t, -1))
         if isinstance(kv, RingKV):
             if q.is_cuda:
                 x = kv.attend(q, k, v)  # [b, t, H, d]
@@ -574,7 +593,7 @@ class DiT(nn.Module):
         """``x, mu, cond [N, 80, T]``, ``spks [N, 80]``; ``mods [depth, 9, r, 1, 512]`` /
         ``final_mod [2, r, 1, 512]`` the step's time modulations (``ChunkCFM.constants``),
         ``cnn_cache [depth, N, 1024, 2]`` and ``kv`` (one per block) its caches."""
-        if x.is_cuda and kv and isinstance(kv[0], RingKV):
+        if x.is_cuda and kv and isinstance(kv[0], (RingKV, BoundedLayerKV)):
             from mstar.model.minicpm_o.components.token2wav_kernels import dit_forward
 
             return dit_forward(self, x, mu, mods, final_mod, spks, cond, cnn_cache, kv)

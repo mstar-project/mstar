@@ -49,6 +49,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.kv.bounded import BoundedKVConfig, BoundedKVSpec
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
     RecurrentStateConfig,
@@ -65,6 +66,7 @@ from mstar.model.minicpm_o.config import (
     LLM_POS,
     LLM_SAMPLER,
     RESAMPLER_ATTN,
+    T2W_DIT_KV,
     T2W_STATE,
     TTS_ATTN,
     TTS_KV,
@@ -272,19 +274,50 @@ class MiniCPMOModel(Model):
                     max_slots=T2W_DEFAULT_SLOTS,
                 ),
             ),
+            self._t2w_dit_kv(),
         ]
 
-    def _t2w_slot_layout(self) -> dict:
-        """Token2wav's per-request slot, sized for the longest bundled voice."""
+    def _t2w_capacity(self):
+        """Token2wav's caches sized for the longest bundled voice."""
         import soundfile as sf
 
-        from mstar.model.minicpm_o.components.token2wav import CacheCapacity, slot_layout
+        from mstar.model.minicpm_o.components.token2wav import CacheCapacity
 
         seconds = max(
             sf.info(str(Path(self.local_dir) / "assets" / f)).duration for f in VOICES.values()
         )
         # the s3 tokenizer runs at 25 Hz; one token of slack for rounding
-        return slot_layout(CacheCapacity(int(seconds * 25) + 1))
+        return CacheCapacity(int(seconds * 25) + 1)
+
+    def _t2w_slot_layout(self) -> dict:
+        from mstar.model.minicpm_o.components.token2wav import slot_layout
+
+        return slot_layout(self._t2w_capacity())
+
+    def _t2w_dit_kv(self) -> BoundedKVSpec:
+        from mstar.model.minicpm_o.components.token2wav import dit_retention
+        from mstar.model.minicpm_o.components.token2wav_flow import (
+            DIT_DEPTH,
+            DIT_HEAD_DIM,
+            DIT_HEADS,
+            N_TIMESTEPS,
+            UP_RATE,
+        )
+
+        return BoundedKVSpec(
+            resource_key=T2W_DIT_KV, nodes={TOKEN2WAV},
+            config=BoundedKVConfig(
+                num_layers=N_TIMESTEPS * DIT_DEPTH,
+                num_heads=DIT_HEADS,
+                head_dim=DIT_HEAD_DIM,
+                # the two guidance rows
+                rows_per_request=2,
+                max_source_len=UP_RATE * self._t2w_capacity().prompt_tokens,
+                retention=dit_retention,
+                max_slots=T2W_DEFAULT_SLOTS - 1,
+                reverse_step_order=True,
+            ),
+        )
 
     def _tts_resources(self) -> list[NodeResourceSpec]:
         tts = self.tts_config

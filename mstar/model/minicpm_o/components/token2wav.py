@@ -41,6 +41,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.engine.resources.kv.bounded import SinkWindow
 from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator, HiFTNoise
 from mstar.model.chatterbox.config import S3GenHiFTConfig
 from mstar.model.minicpm_o.components.token2wav_flow import (
@@ -57,10 +58,10 @@ from mstar.model.minicpm_o.components.token2wav_flow import (
     PRE_LOOKAHEAD,
     TOKEN_DIM,
     UP_RATE,
+    BoundedLayerKV,
     DenseKV,
     KVCache,
     PoolKV,
-    RingKV,
     Token2WavFlow,
 )
 from mstar.model.minicpm_o.components.voice_prompt import (
@@ -239,21 +240,35 @@ class SlotBlock(NamedTuple):
 
 def slot_layout(capacity: CacheCapacity) -> dict[str, SlotBlock]:
     """Per-request slot of the batched path, for voices of up to ``capacity.prompt_tokens``
-    tokens: ``Token2WavState``'s tensors without their batch axes, except that the DiT
-    caches are a ring of ``2P`` frames (``RingKV``) with its ``dit_head`` index."""
+    tokens: ``Token2WavState``'s tensors without their batch axes, except the DiT's
+    attention caches, which live in the bounded KV resource (``dit_retention``)."""
     meta = Token2WavState.allocate(capacity, "meta")
     layout = {}
     for f in fields(Token2WavState):
         t = getattr(meta, f.name)
-        if isinstance(t, torch.Tensor):
+        if isinstance(t, torch.Tensor) and f.name != "dit_kv":
             shape = list(t.shape)
             if f.name in _BATCH_AXIS:
                 del shape[_BATCH_AXIS[f.name]]
-            if f.name == "dit_kv":
-                shape[-2] = UP_RATE * capacity.prompt_tokens
             layout[f.name] = SlotBlock(tuple(shape), torch.float32)
-    layout["dit_head"] = SlotBlock((1,), torch.int32)
     return layout
+
+
+def dit_retention(source_len: int) -> SinkWindow:
+    """What the DiT's caches keep, over a stream of ``dit_source`` and then each window
+    last-first: upstream keeps the first ``2P`` of ``[newest window, ..., voice]`` and
+    the voice's last 100 frames."""
+    return SinkWindow(KEEP_RECENT, source_len)
+
+
+def dit_source(voice: "Token2WavVoice") -> torch.Tensor:
+    """The voice's DiT caches as the stream ``dit_retention`` starts from, per layer
+    (Euler step x block): ``[steps * depth, 2, H, 2P, 2d]``, its last 100 frames first,
+    then the rest last-first. Attention over them is order-free."""
+    p2 = voice.initial.prompt_frames
+    kv = voice.initial.dit_kv[..., :p2, :]
+    out = torch.cat([kv[..., p2 - KEEP_RECENT:, :], kv[..., :p2 - KEEP_RECENT, :].flip(-2)], dim=-2)
+    return out.flatten(0, 1).contiguous()
 
 
 def state_from_slot(blocks: dict[str, torch.Tensor], lengths: dict[str, int]) -> Token2WavState:
@@ -271,6 +286,15 @@ def state_lengths(state: Token2WavState) -> dict[str, int]:
         f.name: getattr(state, f.name) for f in fields(state)
         if not isinstance(getattr(state, f.name), torch.Tensor)
     }
+
+
+class BoundedDiT(NamedTuple):
+    """Where a batch's DiT caches are: the bounded KV resource, the voice's
+    ``dit_source`` and the batch's rows of the step's plan."""
+
+    resource: object
+    source: torch.Tensor
+    plan: object
 
 
 class Token2WavVoice(NamedTuple):
@@ -468,6 +492,7 @@ class Token2Wav(nn.Module):
         voice: Token2WavVoice,
         lengths: dict[str, int],
         tokens: torch.Tensor,
+        dit: BoundedDiT,
         last: bool = False,
         noise: HiFTNoise | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -501,15 +526,13 @@ class Token2Wav(nn.Module):
 
         kv1 = [kv("enc_kv1", (i,), lengths["enc_len1"], plan.enc_kv1) for i in range(ENC_BLOCKS)]
         kv2 = [kv("enc_kv2", (i,), lengths["enc_len2"], plan.enc_kv2) for i in range(ENC_UP_BLOCKS)]
-        p2, heads = lengths["prompt_frames"], blocks["dit_head"][:, 0]
         dit_kv = [
-            [RingKV(blocks["dit_kv"][:, step, i], heads, slots, voice.initial.dit_kv[step, i],
-                    p2, lengths["dit_len"], fresh, write=not last) for i in range(DIT_DEPTH)]
+            [BoundedLayerKV(dit.resource, step * DIT_DEPTH + i, dit.source[step * DIT_DEPTH + i], dit.plan,
+                            lengths["dit_len"])
+             for i in range(DIT_DEPTH)]
             for step in range(N_TIMESTEPS)
         ]
         mel = self.flow(tokens, voice.spk.expand(b, -1), None, last, enc_cnn, kv1, kv2, dit_cnn, dit_kv)
-        if not last:
-            RingKV.advance_heads(heads, slots, mel.shape[2], p2, fresh)
 
         if fresh:
             hift_mel, cache_source = mel, None
@@ -558,11 +581,12 @@ class Token2Wav(nn.Module):
         voice: Token2WavVoice,
         lengths: dict[str, int],
         tokens: torch.Tensor,
+        dit: BoundedDiT,
         last: bool = False,
         noise: HiFTNoise | None = None,
     ) -> torch.Tensor:
         """``B`` ``stream`` calls of one voice entering at the same lengths, eagerly."""
-        out = self.window_spectrum(blocks, slots, voice, lengths, tokens, last, noise)
+        out = self.window_spectrum(blocks, slots, voice, lengths, tokens, dit, last, noise)
         return self.window_finish(blocks, slots, out["magnitude"], out["phase"], lengths, last)
 
 

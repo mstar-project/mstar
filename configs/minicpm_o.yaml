@@ -25,3 +25,5 @@ resources:
   # concurrent spoken replies.
   t2w_state:
     max_slots: 33
+  t2w_dit_kv:
+    max_slots: 32
