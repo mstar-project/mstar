@@ -33,8 +33,8 @@ from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt, _module_p
 
 
 class _CacheSteps:
-    """Token2wav's three attention-cache resources for one voice, driven through admit /
-    plan / commit one window at a time, as the engine does."""
+    """Token2wav's resources for one voice (its state pool and its three attention caches),
+    driven through admit / plan / commit one window at a time, as the engine does."""
 
     def __init__(self, voice, slots: int, device):
         from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
@@ -52,14 +52,32 @@ class _CacheSteps:
             ), device)
             for name, f in CACHE_FAMILIES.items()
         }
+        from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig
+        from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+        from mstar.model.minicpm_o.components.token2wav import CacheCapacity
+
+        self.pool = RecurrentStatePool(device, RecurrentStateConfig(
+            num_layers=1, max_slots=slots + 1,
+            blocks={n: RecurrentBlockConfig(shape=b.shape, dtype=b.dtype)
+                    for n, b in slot_layout(CacheCapacity(self.p)).items()},
+        ))
         self.written: dict[str, int] = {}
+
+    def slot(self, rid) -> dict[str, torch.Tensor]:
+        """``rid``'s slot of the state pool, block by block."""
+        index = self.pool._slots[rid]["main"].index
+        return {name: self.pool.block(name, 0)[index] for name in self.pool.config.blocks}
 
     def window(self, rids, num_tokens: int, last: bool):
         from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
+        from mstar.engine.resources.recurrent.config import RecurrentStep
         from mstar.engine.resources.step import Segment, StepContext
-        from mstar.model.minicpm_o.components.token2wav import AttentionCache, WindowCaches, window_tokens
+        from mstar.model.minicpm_o.components.token2wav import AttentionCache, SlotRows, WindowCaches, window_tokens
 
         ctx = StepContext(request_ids=list(rids), graph_walk="t2w", slot=0, capture=False)
+        state_step = RecurrentStep(segments=[Segment(request_id=r, label="main", span=1) for r in rids])
+        assert self.pool.admit(state_step, ctx).ok
+        state = SlotRows(self.pool, self.pool.plan(state_step, ctx)["main"])
         caches, steps = {}, {}
         for name, family in self.families.items():
             step = steps[name] = BoundedKVStep(
@@ -71,11 +89,12 @@ class _CacheSteps:
             caches[name] = AttentionCache(resource, self.sources[name], resource.plan(step, ctx))
 
         def commit():
+            self.pool.commit(state_step, ctx)
             for name, step in steps.items():
                 self.resources[name].commit(step, ctx)
             for r in rids:
                 self.written[r] = self.written.get(r, 0) + window_tokens(num_tokens, last)
-        return WindowCaches(**caches), commit
+        return state, WindowCaches(**caches), commit
 
     def retained(self, name: str, rid) -> torch.Tensor:
         """The keys|values ``rid`` would attend next in ``name``'s caches, ``[layers, rows, H, n, 2d]``."""
@@ -286,10 +305,7 @@ def test_batched_windows_on_pool(random_token2wav, device):
         tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32).to(device),
         spk_emb=torch.randn(1, 192).to(device), mel=torch.randn(1, 2 * p, 80).to(device),
     ))
-    one, two = torch.tensor([1], device=device), torch.tensor([1, 2], device=device)
     kv_steps = _CacheSteps(voice, 3, device)
-    layout = slot_layout(CacheCapacity(p))
-    blocks = {name: torch.zeros((3, *blk.shape), dtype=blk.dtype, device=device) for name, blk in layout.items()}
     codes = [torch.randint(0, 6561, (215,)).tolist() for _ in range(2)]
     wins = [list(stream_windows(c)) for c in codes]  # 9 windows each, the last of 18 tokens
     gen = torch.Generator().manual_seed(9)
@@ -299,7 +315,7 @@ def test_batched_windows_on_pool(random_token2wav, device):
         nz = model.hift.m_source.draw_noise(rows, frames * 480, torch.float32, "cpu", gen)
         return HiFTNoise(phase=nz.phase.to(device), harmonic=nz.harmonic.to(device))
 
-    def check_slot(slot, st):
+    def check_slot(rid, st):
         from mstar.model.minicpm_o.components.token2wav_flow import DIT_DEPTH, N_TIMESTEPS
 
         # the conformer attends its caches in order; the DiT's only as a set
@@ -308,8 +324,8 @@ def test_batched_windows_on_pool(random_token2wav, device):
         _assert_same_frames(kv_steps.retained("dit", "r0").unflatten(0, (N_TIMESTEPS, DIT_DEPTH)),
                             st.dit_kv[..., :st.dit_len, :], tol=1e-2 if device == "cpu" else 0.5)
         # the slot holds the rest without the state's batch axes
-        for name, t in blocks.items():
-            torch.testing.assert_close(t[slot], getattr(st, name).reshape(t[slot].shape), **tol, msg=name)
+        for name, t in kv_steps.slot(rid).items():
+            torch.testing.assert_close(t, getattr(st, name).reshape(t.shape), **tol, msg=name)
 
     ref = model.new_state(voice)
     mels, noises = [], []
@@ -320,22 +336,20 @@ def test_batched_windows_on_pool(random_token2wav, device):
         mel = model.flow_chunk(ref, voice, torch.tensor([win], dtype=torch.int32, device=device), last)
         want = model.vocode_chunk(ref, mel, last, noise=row0)
         tokens = torch.tensor([win], dtype=torch.int32, device=device)
-        kv, commit = kv_steps.window(["r0"], len(win), last)
-        out = model.window_spectrum(blocks, one, voice, first, tokens, kv, last, row0)
+        state, kv, commit = kv_steps.window(["r0"], len(win), last)
+        out = model.window_spectrum(state, voice, first, tokens, kv, last, row0)
+        got = model.window_finish(state, out["magnitude"], out["phase"], first, last)
         commit()
-        got = model.window_finish(blocks, one, out["magnitude"], out["phase"], first, last)
         torch.testing.assert_close(out["mel"], mel, **tol)
         torch.testing.assert_close(got, want, **tol)
         if not last:
-            check_slot(1, ref)
+            check_slot("r0", ref)
         mels.append(mel)
         noises.append(nz)
 
     # The same utterance in two rows two windows apart, their full windows' flow in one
     # batch: rows at different positions (a first window beside a later one, then
     # rows on either side of the caches' bound) each match the one-row run.
-    for t in blocks.values():
-        t.zero_()
     kv_steps = _CacheSteps(voice, 3, device)
     full = [win for win, last in wins[0] if not last]
     lag = 2
@@ -343,10 +357,8 @@ def test_batched_windows_on_pool(random_token2wav, device):
         rows = [(r, k - off) for r, off in (("a", 0), ("b", lag)) if 0 <= k - off < len(full)]
         rids = [r for r, _ in rows]
         tokens = torch.tensor([full[w] for _, w in rows], dtype=torch.int32, device=device)
-        fresh = torch.tensor([w == 0 for _, w in rows], device=device)
-        slots = torch.tensor([1 if r == "a" else 2 for r in rids], device=device)
-        kv, commit = kv_steps.window(rids, len(full[0]), False)
-        mel = model.window_flow(blocks, slots, fresh, voice, tokens, kv)
+        state, kv, commit = kv_steps.window(rids, len(full[0]), False)
+        mel = model.window_flow(state, voice, tokens, kv)
         commit()
         for i, (_, w) in enumerate(rows):
             torch.testing.assert_close(mel[i:i + 1], mels[w], **tol)
@@ -397,14 +409,11 @@ def test_window_short_of_its_stop_code(random_token2wav, device):
     full = [w for w, last in stream_windows(torch.randint(0, 6561, (200,)).tolist()) if not last]
     windows = [(w, False) for w in full[:4]] + [(full[4][:-1], False), (full[4][-4:], True)]
     kv_steps = _CacheSteps(voice, 2, device)
-    layout = slot_layout(CacheCapacity(p))
-    blocks = {name: torch.zeros((2, *blk.shape), dtype=blk.dtype, device=device) for name, blk in layout.items()}
-    one = torch.tensor([1], device=device)
     ref = model.new_state(voice)
-    for i, (win, last) in enumerate(windows):
+    for win, last in windows:
         tokens = torch.tensor([win], dtype=torch.int32, device=device)
         mel = model.flow_chunk(ref, voice, tokens, last)
-        kv, commit = kv_steps.window(["r0"], len(win), last)
-        got = model.window_flow(blocks, one, torch.tensor([i == 0], device=device), voice, tokens, kv, last)
+        state, kv, commit = kv_steps.window(["r0"], len(win), last)
+        got = model.window_flow(state, voice, tokens, kv, last)
         commit()
         torch.testing.assert_close(got, mel, **tol)

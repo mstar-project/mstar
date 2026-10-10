@@ -41,7 +41,6 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
 from mstar.engine.resources.kv.bounded.manager import BoundedPlan
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
@@ -52,6 +51,7 @@ from mstar.model.minicpm_o.components.token2wav import (
     SILENCE_CODE,
     WINDOW,
     AttentionCache,
+    SlotRows,
     WindowCaches,
     window_frames,
     window_tokens,
@@ -881,23 +881,18 @@ class Token2WavSubmodule(NodeSubmodule):
 
             def capture(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
                 pool = call.resources[T2W_STATE]
-                tokens = call.static_inputs["tokens"]
-                rows = pool.addressing("main")
                 plans = {name: call.resources[key].current for name, key in T2W_KV.items()}
                 return {"mel": self.model.window_flow(
-                    {name: pool.block(name, 0) for name in pool.config.blocks},
-                    rows.slot_indices[: tokens.shape[0]], ~rows.has_state[: tokens.shape[0]],
-                    voice, tokens, self._caches(call.resources, voice_name, plans), last,
+                    SlotRows(pool, pool.addressing("main")), voice, call.static_inputs["tokens"],
+                    self._caches(call.resources, voice_name, plans), last,
                 )}
             return capture
 
         def hift(first: bool, last: bool):
             def capture(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
                 pool = call.resources[T2W_STATE]
-                mel = call.static_inputs["mel"]
                 return self.model.window_vocode(
-                    {name: pool.block(name, 0) for name in pool.config.blocks},
-                    pool.addressing("main").slot_indices[: mel.shape[0]], mel, first, last,
+                    SlotRows(pool, pool.addressing("main")), call.static_inputs["mel"], first, last,
                 )
             return capture
 
@@ -973,8 +968,7 @@ class Token2WavSubmodule(NodeSubmodule):
         pool = engine_inputs.resources[T2W_STATE]
         step = _NodeStep(
             engine_inputs=engine_inputs,
-            pool=pool,
-            blocks={name: pool.block(name, 0) for name in pool.config.blocks},
+            state=SlotRows(pool, pool.addressing("main")),
             plans={name: engine_inputs.resources[key].current for name, key in T2W_KV.items()},
             rows={rid: i for i, rid in enumerate(engine_inputs.request_ids)},
         )
@@ -990,7 +984,7 @@ class Token2WavSubmodule(NodeSubmodule):
             for chunk in self._chunks(step, region, group, last):
                 rids = [rid for rid, _ in chunk]
                 tokens = torch.cat([codes for _, codes in chunk])
-                mel = self._run_flow(step, region, voice_name, rids, tokens, [first[rid] for rid in rids], last)
+                mel = self._run_flow(step, region, voice_name, rids, tokens, last)
                 for i, rid in enumerate(rids):
                     mels[rid] = mel[i]
                     hifts.setdefault((first[rid], mel.shape[-1], last), []).append(rid)
@@ -1024,7 +1018,6 @@ class Token2WavSubmodule(NodeSubmodule):
         voice_name: str,
         rids: list[str],
         tokens: torch.Tensor,
-        fresh: list[bool],
         last: bool,
     ) -> torch.Tensor:
         """``window_flow`` for these rows: the captured region when it fits, else eagerly."""
@@ -1033,11 +1026,10 @@ class Token2WavSubmodule(NodeSubmodule):
             out = runner.run(static_inputs={"tokens": tokens}, request_ids=rids, real_bs=len(rids))
             # copied out: the next replay of this region reuses the buffer
             return out.get_view("mel").clone()
-        rows = [step.rows[rid] for rid in rids]
-        plans = {name: plan.select(rows) for name, plan in step.plans.items()}
+        plans = {name: plan.select(step.select(rids)) for name, plan in step.plans.items()}
         return self.model.window_flow(
-            step.blocks, step.slots(rids, tokens.device), torch.tensor(fresh, device=tokens.device),
-            self.voices[voice_name], tokens, self._caches(step.engine_inputs.resources, voice_name, plans), last,
+            step.state_of(rids), self.voices[voice_name], tokens,
+            self._caches(step.engine_inputs.resources, voice_name, plans), last,
         )
 
     @torch.compiler.disable
@@ -1051,24 +1043,23 @@ class Token2WavSubmodule(NodeSubmodule):
         last: bool,
     ) -> torch.Tensor:
         """``window_vocode`` (captured when it fits) and ``window_finish``: the rows' samples."""
-        slots = step.slots(rids, mel.device)
+        state = step.state_of(rids)
         runner = step.runner(region)
         if runner is not None and runner.can_run(len(rids)):
             out = runner.run(static_inputs={"mel": mel}, request_ids=rids, real_bs=len(rids))
             magnitude, phase = out.get_view("magnitude"), out.get_view("phase")
         else:
-            out = self.model.window_vocode(step.blocks, slots, mel, first, last)
+            out = self.model.window_vocode(state, mel, first, last)
             magnitude, phase = out["magnitude"], out["phase"]
-        return self.model.window_finish(step.blocks, slots, magnitude, phase, first, last)
+        return self.model.window_finish(state, magnitude, phase, first, last)
 
 
 class _NodeStep(NamedTuple):
     """One token2wav forward's view of the node's resources, shared by its window groups."""
 
     engine_inputs: ModelInputsFromEngine
-    pool: RecurrentStatePool
-    blocks: dict[str, torch.Tensor]
-    # the node step's cache plans, taken before a captured region plans its own
+    # the node step's state rows and cache plans, taken before a captured region plans its own
+    state: SlotRows
     plans: dict[str, BoundedPlan]
     # request -> its row in the node step
     rows: dict[str, int]
@@ -1076,5 +1067,9 @@ class _NodeStep(NamedTuple):
     def runner(self, region: str) -> PiecewiseCudaGraphRunner | None:
         return self.engine_inputs.piecewise_runners.get(region)
 
-    def slots(self, rids: list[str], device: torch.device) -> torch.Tensor:
-        return torch.tensor([self.pool.slot_index(rid) for rid in rids], dtype=torch.long, device=device)
+    def select(self, rids: list[str]) -> list[int]:
+        return [self.rows[rid] for rid in rids]
+
+    def state_of(self, rids: list[str]) -> SlotRows:
+        """These requests' rows of the node step's state, for an eager window."""
+        return SlotRows(self.state.pool, self.state.rows.select(self.select(rids)))

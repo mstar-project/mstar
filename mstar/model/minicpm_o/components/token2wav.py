@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.kv.bounded import SinkWindow
+from mstar.engine.resources.recurrent.pool import RecurrentAddressing, RecurrentStatePool
 from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator, HiFTNoise
 from mstar.model.chatterbox.config import S3GenHiFTConfig
 from mstar.model.minicpm_o.components.token2wav_flow import (
@@ -307,6 +308,25 @@ CACHE_FAMILIES = {
 }
 
 
+class SlotRows(NamedTuple):
+    """A batch's rows of the vocoder's state pool (``slot_layout``): the pool and the step's
+    addressing of them, the same in a captured and an eager forward."""
+
+    pool: RecurrentStatePool
+    rows: RecurrentAddressing
+
+    def get(self, name: str) -> torch.Tensor:
+        return self.pool.gather(name, self.rows)
+
+    def set(self, name: str, value: torch.Tensor) -> None:
+        self.pool.scatter_(name, self.rows, value)
+
+    @property
+    def fresh(self) -> torch.Tensor:
+        """``[B]`` rows whose slot holds no state yet: their request's first window."""
+        return ~self.rows.has_state[: self.rows.num_rows]
+
+
 class AttentionCache(NamedTuple):
     """Where a batch's caches of one family are: the bounded KV resource, the voice's
     source and the batch's rows of the step's plan."""
@@ -521,40 +541,37 @@ class Token2Wav(nn.Module):
     @torch.inference_mode()
     def window_flow(
         self,
-        blocks: dict[str, torch.Tensor],
-        slots: torch.Tensor,
-        fresh: torch.Tensor,
+        state: SlotRows,
         voice: Token2WavVoice,
         tokens: torch.Tensor,
         caches: WindowCaches,
         last: bool = False,
     ) -> torch.Tensor:
         """The flow for ``B`` windows of one voice at any positions: ``tokens [B, n]`` -> mel
-        ``[B, 80, frames]``. ``caches`` know each row's position; ``fresh [B]`` marks rows on
-        their first window, which read the voice's conv caches rather than their slot's
-        (``blocks``, at ``slots``). A last window writes no caches. Capturable."""
-        slots = slots.long()
+        ``[B, 80, frames]``. ``caches`` know each row's position; rows on their first window
+        (``state.fresh``) read the voice's conv caches rather than their slot's. A last
+        window writes no caches. Capturable."""
         b = tokens.shape[0]
         init = voice_blocks(voice)
+        fresh = state.fresh
 
         def conv_cache(name):
-            mask = fresh.view(-1, *([1] * (blocks[name].dim() - 1)))
-            return torch.where(mask, init[name], blocks[name].index_select(0, slots))
+            current = state.get(name)
+            return torch.where(fresh.view(-1, *([1] * (current.dim() - 1))), init[name], current)
 
         enc_cnn = conv_cache("enc_cnn")
         # guidance rows of a request side by side, as the flow runs them
         dit_cnn = conv_cache("dit_cnn").permute(1, 2, 0, 3, 4, 5).contiguous().flatten(2, 3)
         mel = self.flow(tokens, voice.spk.expand(b, -1), None, last, enc_cnn, dit_cnn, caches.flow_kv())
         if not last:
-            blocks["enc_cnn"].index_copy_(0, slots, enc_cnn)
-            blocks["dit_cnn"].index_copy_(0, slots, dit_cnn.unflatten(2, (b, 2)).permute(2, 0, 1, 3, 4, 5))
+            state.set("enc_cnn", enc_cnn)
+            state.set("dit_cnn", dit_cnn.unflatten(2, (b, 2)).permute(2, 0, 1, 3, 4, 5))
         return mel
 
     @torch.inference_mode()
     def window_vocode(
         self,
-        blocks: dict[str, torch.Tensor],
-        slots: torch.Tensor,
+        state: SlotRows,
         mel: torch.Tensor,
         first: bool,
         last: bool = False,
@@ -563,25 +580,23 @@ class Token2Wav(nn.Module):
         """HiFT up to its output spectrum for ``B`` windows' mel, prefixed by the slot's
         held-back frames unless they are their requests' ``first`` (a shorter input, so the
         two do not batch). Finish with ``window_finish``."""
-        slots = slots.long()
         if first:
             hift_mel, cache_source = mel, None
         else:
-            hift_mel = torch.cat([blocks["hift_mel"].index_select(0, slots), mel], dim=2)
-            cache_source = blocks["hift_source"].index_select(0, slots)
+            hift_mel = torch.cat([state.get("hift_mel"), mel], dim=2)
+            cache_source = state.get("hift_source")
         if noise is None:
             noise = self.hift.draw_noise(hift_mel, None)
         magnitude, phase, source = self.hift.spectrum(hift_mel, noise.phase, noise.harmonic, cache_source)
         if not last:
-            blocks["hift_mel"].index_copy_(0, slots, hift_mel[..., -HIFT_MEL_CACHE:])
-            blocks["hift_source"].index_copy_(0, slots, source[:, :, -HIFT_TAIL:])
+            state.set("hift_mel", hift_mel[..., -HIFT_MEL_CACHE:])
+            state.set("hift_source", source[:, :, -HIFT_TAIL:])
         return {"magnitude": magnitude, "phase": phase}
 
     @torch.inference_mode()
     def window_spectrum(
         self,
-        blocks: dict[str, torch.Tensor],
-        slots: torch.Tensor,
+        state: SlotRows,
         voice: Token2WavVoice,
         first: bool,
         tokens: torch.Tensor,
@@ -591,15 +606,13 @@ class Token2Wav(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """``window_flow`` and ``window_vocode`` for ``B`` windows that are all, or all not,
         their request's ``first``."""
-        fresh = torch.full((tokens.shape[0],), first, dtype=torch.bool, device=tokens.device)
-        mel = self.window_flow(blocks, slots, fresh, voice, tokens, caches, last)
-        return {"mel": mel, **self.window_vocode(blocks, slots, mel, first, last, noise)}
+        mel = self.window_flow(state, voice, tokens, caches, last)
+        return {"mel": mel, **self.window_vocode(state, mel, first, last, noise)}
 
     @torch.inference_mode()
     def window_finish(
         self,
-        blocks: dict[str, torch.Tensor],
-        slots: torch.Tensor,
+        state: SlotRows,
         magnitude: torch.Tensor,
         phase: torch.Tensor,
         first: bool,
@@ -608,21 +621,19 @@ class Token2Wav(nn.Module):
         """``window_spectrum``'s spectrum -> each row's samples ``[B, window_samples(...)]``:
         the inverse STFT (kept out of the capture: it syncs), the cross-fade with the slot's
         held-back tail, and the new tail, as ``vocode_chunk`` does them."""
-        slots = slots.long()
         speech = self.hift.waveform(magnitude, phase)
         if not first:
-            speech = fade_in_out(speech, blocks["hift_speech"].index_select(0, slots), self.speech_window)
+            speech = fade_in_out(speech, state.get("hift_speech"), self.speech_window)
         if last:
             return speech
-        blocks["hift_speech"].index_copy_(0, slots, speech[:, -HIFT_TAIL:])
+        state.set("hift_speech", speech[:, -HIFT_TAIL:])
         if first:
             return torch.cat([speech.new_zeros(speech.shape[0], HIFT_TAIL), speech[:, :-HIFT_TAIL]], dim=1)
         return speech[:, :-HIFT_TAIL]
 
     def stream_batched(
         self,
-        blocks: dict[str, torch.Tensor],
-        slots: torch.Tensor,
+        state: SlotRows,
         voice: Token2WavVoice,
         first: bool,
         tokens: torch.Tensor,
@@ -631,8 +642,8 @@ class Token2Wav(nn.Module):
         noise: HiFTNoise | None = None,
     ) -> torch.Tensor:
         """``B`` ``stream`` calls of one voice, all or none of them ``first``, eagerly."""
-        out = self.window_spectrum(blocks, slots, voice, first, tokens, caches, last, noise)
-        return self.window_finish(blocks, slots, out["magnitude"], out["phase"], first, last)
+        out = self.window_spectrum(state, voice, first, tokens, caches, last, noise)
+        return self.window_finish(state, out["magnitude"], out["phase"], first, last)
 
 
 # The token counts a last window after a full one can have: the left context plus 0 to
