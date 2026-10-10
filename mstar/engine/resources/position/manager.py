@@ -165,12 +165,13 @@ class RopeManager(PositionManager):
         self, rid: str, node_name: str, graph_walk: str, inputs,
         prefix: CachedPrefix | None,
     ) -> None:
-        """Move the stream's counter past what the cache holds of this walk, now.
+        """Move the stream's counter past what the cache holds of this walk.
 
-        A walk the cache serves never admits, and the walk after it can place
-        its positions in `prepare_inputs`, before its own admit: a counter
-        seeded at admit would put that walk on top of the ones served. The
-        position is absolute, so a repeated probe moves nothing.
+        The counter moves here and not at admit. A walk the cache serves never
+        admits, and the walk after it can place its positions in `prepare_inputs`,
+        before its own admit, so a counter seeded at admit would put that walk on
+        top of the served ones. The position is absolute, so a repeated probe
+        moves nothing.
         """
         del node_name, graph_walk, inputs
         if prefix is None:

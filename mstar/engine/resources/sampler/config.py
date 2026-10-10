@@ -68,5 +68,5 @@ class SamplerStep(ResourceStep):
     apply_penalty: bool = True
     # rid -> prefill tokens for the repetition penalty
     prefill_tracked_tokens: dict[str, torch.Tensor] = field(default_factory=dict)
-    # rids whose token from this step the model throws away: a walk the cache serves never samples it
+    # rids whose sampled token the model discards, so the repetition penalty doesn't count it
     discarded: frozenset[str] = frozenset()

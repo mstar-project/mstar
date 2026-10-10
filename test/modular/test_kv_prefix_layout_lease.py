@@ -1,13 +1,14 @@
 """One lease holds a hit across every walk of a layout, and each walk takes its share.
 
-A prompt laid out text, image, text is three walks into one stream. The first
-walk's probe matches the whole layout and holds it; the walks it covers are
-served from that lease without running, and the one it covers in part runs
-from the lease's end. A served walk never admits, so the position counter moves
-at the probe, and by an image block's one position, not its slots.
+A prompt laid out as text, image, text is written by three walks into one
+stream. The first walk's probe matches the whole layout and holds it. The walks
+the lease covers are served from it without running, and a walk it covers in
+part runs from the lease's end. A served walk never admits, so the position
+counter moves at the probe, and an image block moves it by one position rather
+than by its slot count.
 
-An image ending inside a page shares that page with the text after it, so the
-cache keeps a copy of the page cut at the image's end for a repeat to be served.
+An image that ends inside a page shares that page with the text after it, so
+the cache keeps a copy of the page up to the image's end for a repeat to reuse.
 """
 
 from __future__ import annotations
@@ -35,9 +36,9 @@ DIGEST = bytes(range(32))
 TEXT = list(range(1, 21))
 IMAGE = 30
 TAIL = list(range(100, 125))
-# slots 0-19 text, 20-49 image, 50-74 text: a hit of 4 pages covers the first two walks
+# Slots 0-19 are text, 20-49 the image and 50-74 text, so a hit of 4 pages covers the first two walks.
 PARTS = [TEXT, IMAGE, TAIL]
-# after TEXT and IMAGE the image ends two slots into page 3, which the question fills
+# After TEXT and IMAGE the image ends two slots into page 3, where the question starts.
 ASK, OTHER_ASK = list(range(200, 205)), list(range(300, 305))
 
 
@@ -47,7 +48,8 @@ def _no_transfer(monkeypatch):
 
 
 def _walks(parts: list) -> list[tuple[str, int]]:
-    """Each part's walk and slots: ids, or an image's slot count, alone or with its digest."""
+    """Each part's walk and slot count. A part is a list of ids, or an image's
+    slot count alone or paired with its digest."""
     return [
         (TEXT_WALK, len(part)) if isinstance(part, list) else (IMAGE_WALK, part if isinstance(part, int) else part[0])
         for part in parts
@@ -58,7 +60,7 @@ def _config(parts: list, text_walk: str = TEXT_WALK, image_walk: str = IMAGE_WAL
     """What the preprocess worker sends for ``parts``, keyed by its own code."""
     layout = [
         Span("ids", text_walk, slots, slots, "text_inputs") if isinstance(part, list)
-        # the digest rides where a file's name would, for the stand-in `_digest` to hand back
+        # The span's source holds the digest itself, which the stand-in `_digest` returns.
         else Span("digest", image_walk, slots, 1, part[1] if isinstance(part, tuple) else DIGEST)
         for part, (_, slots) in zip(parts, _walks(parts), strict=True)
     ]
@@ -95,7 +97,8 @@ class _Node(_TextNode):
         return prefix
 
     def walk(self, walk: str, length: int) -> int:
-        """One walk as the engine drives it, served whole or run from the hit's end; the slots it was served."""
+        """Drive one walk as the engine does, served whole or run from the hit's end.
+        Returns the slots it was served."""
         prefix = self.probe(walk, length)
         tokens = prefix.tokens if prefix is not None else 0
         if tokens == length:
@@ -144,7 +147,6 @@ def test_each_walk_the_cache_serves_moves_the_counter_by_its_advance_before_the_
 _DISAGREEING = {
     # one slot more than its span
     "a probe": lambda node: node.probe(IMAGE_WALK, IMAGE + 1),
-    # the engine will not cut it, so it writes whole over the lease
     "a walk the engine will not probe": lambda node: node.runner.apply_cached_prefix(
         RID, NODE, IMAGE_WALK, ARNodeInputs(input_seq_len=IMAGE), None,
     ),
@@ -169,7 +171,7 @@ def test_a_mismatch_the_served_walks_cannot_survive_fails_the_request():
     node = _Node()
     node.walk(TEXT_WALK, len(TEXT))
 
-    # served text ending inside a page: dropped, the image would be written with that text missing
+    # The served text ends inside a page, so its KV cannot be kept once the layout is dropped.
     with pytest.raises(RuntimeError, match="end inside a page"):
         node.probe(IMAGE_WALK, IMAGE + 1)
 
@@ -179,7 +181,7 @@ def test_a_keyed_text_walk_placing_its_own_positions_fails_probed_or_refused(pro
     node = _Node()
     inputs = ARNodeInputs(input_seq_len=len(TEXT), custom_pos_ids=torch.arange(len(TEXT)))
 
-    # keyed by its ids, whose positions are their count: its pages would be served at positions they never had
+    # Pages keyed by ids are cached at consecutive positions, which a walk that places its own does not have.
     with pytest.raises(AssertionError, match="the layout keys it by ids"):
         if probed:
             node.runner.resolve_cached_prefix(RID, NODE, TEXT_WALK, inputs)
@@ -205,7 +207,7 @@ def test_a_repeat_with_another_question_is_served_the_whole_image_and_the_slots_
 
 
 def test_a_missed_probe_asked_again_hashes_nothing_and_is_served_what_was_cached_since(monkeypatch):
-    # seeded with another prompt, so the first probe finds none of this one
+    # The cache is seeded with another prompt, so the first probe misses.
     node = _Node([TAIL], [TEXT, IMAGE, OTHER_ASK])
     assert node.probe(TEXT_WALK, len(TEXT)) is None
     node.runner.ingest_request("first", {"kv": _config([TEXT, IMAGE, ASK])})
@@ -238,7 +240,7 @@ def test_a_page_a_reply_fills_after_an_image_is_matched_by_the_next_turn():
 
 
 def test_a_different_image_is_never_served_another_images_end():
-    # three pages of text, then a small image wholly on page 3: only the image's end key tells the two apart
+    # Three pages of text, then a small image wholly on page 3, so only the image's end key tells the two images apart.
     text = list(range(1, 49))
     node = _Node([text, 10, ASK], [text, (10, bytes(32)), ASK])
     node.walk(TEXT_WALK, len(text))

@@ -49,7 +49,7 @@ class ProcessPromptOutput(NamedTuple):
 
 
 class PrefixStream(NamedTuple):
-    """What keys one cache stream's pages: one input tensor's ids, or the layout its walks write."""
+    """How one cache stream's pages are keyed: by one input tensor's token ids, or by a layout over several walks."""
     tensor: str
     keyed_by: str
     # the walk that writes the keyed span; a write from a walk not named here ends the chain
@@ -61,16 +61,19 @@ class PrefixStream(NamedTuple):
 
 
 class Span(NamedTuple):
-    """One write to a keyed stream, in the order its walks make it."""
+    """One write to a keyed stream. A layout lists them in the order the walks write.
+
+    ``length`` is how many KV slots the write fills, and ``advance`` is how far
+    it moves the position counter, which is the length for text. ``source`` is
+    the tensor whose next entry an ids span keys, or the file of a digest span
+    as ``(modality, index)``. ``params`` are the preprocessing arguments that
+    change the tensors made from the file.
+    """
     kind: str
     walk: str
-    # KV slots it fills
     length: int
-    # how far it moves the position counter: its length for text, the model's rule for a block
     advance: int
-    # the tensor whose next entry an ids span keys, or a digest span's file as ``(modality, index)``
     source: str | tuple[str, int]
-    # what preprocessing was told that changes the tensors made from the file
     params: tuple = ()
 
 

@@ -203,8 +203,8 @@ class _Node:
             return self._forward(rid, WALK, self.llm.model.embed_tokens(ids))
 
     def _forward(self, rid: str, walk: str, embeds: torch.Tensor) -> torch.Tensor:
-        """One step; an image block runs as Bagel's image walk does, every slot at
-        the stream's current position, attending the whole block, one position on."""
+        """Run one step. An image block runs as Bagel's image walk does: every slot sits at
+        the stream's current position and attends the whole block, and the counter advances by one."""
         image = walk == IMAGE_WALK
         rope = PositionStep(
             pos_ids={"main": torch.full(
@@ -232,14 +232,14 @@ class _Node:
         return hidden.float()
 
     def ingest_layout(self, rid: str, parts: list) -> None:
-        """What the preprocess worker sends for ``parts``: ids, or an image's embeds."""
-        # paged by the lease test's PAGE_SIZE, which is this file's
+        """Ingest what the preprocess worker sends for ``parts``, each a list of ids or an image's embeds."""
+        # `_config` pages by the lease test's PAGE_SIZE, which equals this file's
         slots = [part if isinstance(part, list) else len(part) for part in parts]
         self.runner.ingest_request(rid, {"kv": _config(slots, WALK, IMAGE_WALK)})
 
     def run_layout(self, rid: str, parts: list) -> tuple[list[int], torch.Tensor]:
-        """Probe, serve or run each walk of ``parts``; what each was served, and the
-        last walk's hidden states over the tokens it ran."""
+        """Probe each walk of ``parts``, then serve or run it. Returns what each walk was
+        served, and the last walk's hidden states over the tokens it ran."""
         served, hidden = [], None
         for part in parts:
             image = not isinstance(part, list)
@@ -318,7 +318,7 @@ def test_a_prompt_served_past_its_image_lands_within_the_repos_parity_tolerance(
         device=device, dtype=DTYPE,
     )
     before, after, tail = list(range(1, 41)), list(range(200, 290)), list(range(400, 437))
-    # slots 0-39 text, 40-89 image, 90-179 text: 11 pages, so a repeat is served 40, 50 and 86
+    # Slots 0-39 are text, 40-89 the image and 90-179 text. That is 11 pages, so a repeat is served 40, 50 and 86.
     seeded, repeat = [before, image, after], [before, image, after + tail]
 
     warm = _Node(device, cached=True, walks=walks)

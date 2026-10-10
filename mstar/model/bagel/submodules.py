@@ -97,22 +97,23 @@ def active_labels(graph_walk: str, cfg: bool, node_name: str) -> list[str]:
     return ["main"]
 
 
-# module level, not per ViT: `vit_patches` counts with the resizes prepare_inputs runs
+# Shared at module level so `vit_patches` counts with the same resizes `prepare_inputs` runs.
 _VAE_TRANSFORM = ImageTransform(1024, 512, 16)
 _VIT_TRANSFORM = ImageTransform(980, 224, 14)
-# an image in the LLM: its patches between two sentinels, at one position whatever their count.
-# The walks and the layout a prompt is keyed by both read these.
+# An image block is its patches between two sentinels, and occupies one position
+# regardless of token count. The walks and the prefix layout both read these.
 IMAGE_SENTINELS = 2
 IMAGE_ADVANCE = 1
 
 
 def vit_preprocess(image_preprocess: str | None) -> str:
-    """The resize the ViT gives an image under a request's ``image_preprocess``: any name but vllm's is the default."""
+    """The name of the resize the ViT applies for a request's ``image_preprocess``.
+    Any name but "vllm" means the default."""
     return "vllm" if image_preprocess == "vllm" else "default"
 
 
 def _keeps_prefill_sample(step_metadata: dict) -> bool:
-    """Whether a text walk keeps the token sampled after it; one before the prompt's last walk throws it away."""
+    """Whether a text walk keeps the token sampled after it. A walk that isn't the prompt's last discards it."""
     return step_metadata.get("sample_prefill_token", True)
 
 
@@ -120,7 +121,7 @@ def vit_patches(
     height: int, width: int, image_preprocess: str,
     patch_size: int, max_num_patches_per_side: int,
 ) -> int:
-    """The patches the ViT cuts an image of this size into, which its ``prepare_inputs`` holds itself to."""
+    """How many patches the ViT cuts an image of this size into. Its ``prepare_inputs`` asserts the same count."""
     if image_preprocess == "vllm":
         return max_num_patches_per_side ** 2
     height, width = _VAE_TRANSFORM.resize_transform.target_size(height, width)

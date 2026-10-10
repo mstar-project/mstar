@@ -182,15 +182,17 @@ class RingKVConfig(KVConfig):
 
 @dataclass(frozen=True)
 class PrefixSpan:
-    """One write to a keyed stream, as the preprocess worker laid it out."""
-    # the slots it fills
+    """One write to a keyed stream, as the preprocess worker laid it out.
+
+    ``length`` is how many slots the write fills and ``advance`` is how far it
+    moves the position counter. ``digest`` is an item's digest, and None for
+    ids. ``end_key`` is set for an item that ends inside a page, and keys that
+    page up to the item's end.
+    """
     length: int
-    # how far it moves the position counter
     advance: int
     walk: str
-    # an item's digest; None for ids
     digest: bytes | None = None
-    # an item ending inside a page: that page's key cut at its end, which a repeat reaches
     end_key: bytes | None = None
 
 
@@ -237,7 +239,7 @@ class KVReqConfig(ResourceReqConfig):
         if prefix_decode is not None:
             self.prefix_decode = prefix_decode
         if prefix_layout is not None:
-            # rows, not PrefixSpans, in the kwargs: a dataclass there pickles them all
+            # sent as plain lists. A dataclass in the kwargs would make the wire pickle all of them.
             self.prefix_layout = {
                 label: [PrefixSpan(*row) for row in rows]
                 for label, rows in prefix_layout.items()

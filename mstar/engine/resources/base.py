@@ -78,11 +78,13 @@ class EngineResourceInfo:
 
 
 class CachedPrefix(NamedTuple):
-    """How much of a walk a resource holds, and where that leaves its stream."""
+    """How much of a walk's input a resource already holds for ``label``.
+
+    ``tokens`` counts the walk's leading inputs held, and ``position`` is the
+    stream's position counter once they are skipped.
+    """
     label: str
-    # the walk's leading inputs held, never more than it has
     tokens: int
-    # the stream's position counter past them
     position: int
 
 
@@ -123,7 +125,7 @@ class Resource(ABC):
         self, rid: str, node_name: str, graph_walk: str,
         inputs: Any, prefix: CachedPrefix | None,
     ) -> None:
-        """Take on the prefix every resource agreed to skip, None if none was.
+        """Take on the prefix every resource agreed to skip, or None if there is none.
 
         The inputs are untrimmed, so a resource that needs the tokens being
         skipped can still read them.
@@ -137,7 +139,7 @@ class Resource(ABC):
         return
 
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
-        """Count a walk the cache served whole as written; it never admits or commits."""
+        """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
 
     def fingerprint(self) -> bytes | None:

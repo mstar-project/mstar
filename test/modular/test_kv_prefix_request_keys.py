@@ -388,7 +388,7 @@ def test_orpheus_is_handed_a_config_for_the_stream_it_declares():
 
 
 class _LaidOut(_Model):
-    """Lays its stream out as its text, then one image that a walk of its own writes."""
+    """A model whose layout is its text, then one image written by a separate walk."""
 
     def __init__(self, image: Span, rewrites: bytes | None = None):
         text = Span("ids", "prefill", len(PROMPT), len(PROMPT), "text_inputs")
@@ -415,7 +415,7 @@ def _image(params=("default",), modality="image") -> Span:
 
 
 def _laid_out_keys(tmp_path, content: bytes, image: Span, rewrites: bytes | None = None) -> list[bytes]:
-    """Preprocess one request showing a file of ``content`` and return the keys the conductor was sent."""
+    """Preprocess one request with a file holding ``content`` and return the keys the conductor was sent."""
     path = tmp_path / "file0"
     path.write_bytes(content)
     modality = image.source[0]
@@ -428,7 +428,7 @@ def _laid_out_keys(tmp_path, content: bytes, image: Span, rewrites: bytes | None
 
 
 _LARGE = b"\x89PNG" + bytes(range(256)) * 512
-# two runs of one layout over something that changes what the image's walk writes
+# Each pair is two runs of one layout that differ in something that changes what the image's walk writes.
 _APART = {
     "content": ((b"\x89PNG one", _image()), (b"\x89PNG two", _image())),
     "a large file's last byte": ((_LARGE + b"\x00", _image()), (_LARGE + b"\x01", _image())),

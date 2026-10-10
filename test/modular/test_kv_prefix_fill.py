@@ -123,8 +123,8 @@ def test_a_chunked_prefill_indexes_the_page_the_second_chunk_completes():
 
 def test_only_whole_pages_are_offered():
     kv = _manager()
-    # a span of three pages that this step writes in part, so the chain names
-    # page 2 while it is still partial
+    # The prompt is three pages and this step writes part of it, so the chain
+    # names page 2 while that page is still partial.
     kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": _keys(384)}, prefix_layout=_layout(384)))
 
     _step(kv, "r0", 300)

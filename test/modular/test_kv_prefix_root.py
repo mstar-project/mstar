@@ -412,13 +412,14 @@ def test_a_resource_with_nothing_to_open_leaves_the_cache_beside_it_open():
 
 # A walk the cache serves whole runs no forward and completes with no outputs,
 # so a node that reads them would read nothing, and nothing would say why. Only
-# a stream that names layout walks has such walks: a single span always runs at
-# least its last token, which is why Orpheus, whose prefill streams to its
-# codec, is not checked.
+# a stream that names layout walks has such walks. A stream with one span always
+# runs at least its last token, which is why Orpheus is not checked even though
+# its prefill streams to its codec.
 
 
 def _laid_out(text_feeds=EMIT_TO_CLIENT, image_feeds=EMIT_TO_CLIENT, image_walk_runs_llm=True):
-    """Declares a stream an image walk writes too, over graphs whose LLM feeds what it is told to."""
+    """A model whose stream is also written by an image walk. ``text_feeds`` and
+    ``image_feeds`` name what its LLM feeds in each walk."""
     def node(name, feeds):
         return GraphNode(name=name, input_names=["inputs"], outputs=[GraphEdge(next_node=feeds, name="out")])
 
@@ -458,7 +459,7 @@ def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(m
     engine = Engine.__new__(Engine)
     engine._resources = {}
     engine._open_prefix_caches({KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=_kv().config)}, _laid_out())
-    # an encoder no laid-out walk runs, as another model's or an edit's would be
+    # "vae" is an encoder that no layout walk runs, like an edit's.
     engine._submodules = {
         name: SimpleNamespace(submodule=SimpleNamespace(forward=None, forward_batched=None))
         for name in ("vit", "LLM", "vae")
@@ -469,7 +470,6 @@ def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(m
     engine._compile_submodules()
 
     compiled = {name: mgmt.forward for name, mgmt in engine._submodules.items()}
-    # recompiled on its second input shape, the encoder rounds differently from then on
     assert compiled == {"vit": True, "LLM": None, "vae": None}, (
         "an image encoder left to recompile caches KV it no longer computes for the same "
         "file, or a node the cache never keys from lost the compile main gives it"

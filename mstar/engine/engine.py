@@ -257,8 +257,8 @@ class ExecutingBatch:
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[str] = field(default_factory=set)
-    # skipped because the cache holds the whole walk: no forward, but their
-    # node still completes, or the request never reaches its next walk
+    # rids whose whole walk this node's resources already hold. They run no
+    # forward, but their node still completes so the request reaches its next walk.
     cached_rids: set[str] = field(default_factory=set)
     # rid -> error, for per-rid stages that raised. The rid leaves the batch;
     # the rest of it runs.
@@ -502,10 +502,10 @@ class Engine:
         default mode (fullgraph=False, dynamic=None), which in general provides
         performance gains without frequent slow recompiles.
 
-        A node whose output a laid-out stream caches as KV under its input's
-        digest is compiled dynamic instead: the graph it would recompile to on
-        a second input shape rounds differently from the first, so the KV
-        cached before that would not be what it computes after.
+        A node in ``_item_encoders`` is compiled with dynamic=True instead. Under
+        the default it recompiles on its second input shape and the new graph
+        rounds differently, so the KV cached from its earlier outputs would no
+        longer match what it computes.
         """
         if not torch.cuda.is_available():
             return
@@ -649,8 +649,8 @@ class Engine:
         ]
         declared = model.prefix_key_streams() if model is not None else {}
         self._prefix_model = type(model).__name__
-        # node -> the walks a probe may run on: the ones each stream declared
-        # on a cache the node uses names
+        # node -> the walks a probe may run on: the keyed walk and the layout walks
+        # of every stream declared on a cache the node uses
         self._keyed_walks: dict[str, set[str]] = {}
         for key, by_label in declared.items():
             for node in specs_by_key[key].nodes:
@@ -658,8 +658,8 @@ class Engine:
                     walk for stream in by_label.values()
                     for walk in (stream.walk, *stream.layout_walks)
                 )
-        # the nodes a laid-out stream's other walks run beside its keyed ones: what
-        # they make of an item is cached as KV under the item's digest
+        # the nodes of a layout walk that don't use the stream's cache, such as an image
+        # encoder. The KV computed from their output is cached under their input's digest.
         self._item_encoders: set[str] = set()
         for key, by_label in declared.items():
             for stream in by_label.values():
@@ -774,12 +774,14 @@ class Engine:
     def _skip_cached_prefix(
         self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,
     ) -> NodeInputs | None:
-        """Cut the leading tokens this node's resources already hold.
+        """Cut the leading tokens this node's resources already hold, or return
+        None when they hold the whole walk.
 
         Only the walks a keyed stream names are probed, and only when
         `split_inputs` can cut their inputs; a guided walk writes two labels
-        from one input, so it is skipped. A skipped walk is still reported
-        with no answer: it writes whole, over anything a lease holds for it.
+        from one input, so it is skipped. A skipped walk is still passed to
+        `apply_cached_prefix` with no prefix, because it writes over whatever
+        the resources hold for it.
         """
         walk = batch.step_context.graph_walk
         if walk not in self._keyed_walks.get(batch.node_name, ()):
@@ -1343,7 +1345,6 @@ class Engine:
         # so the tail has nothing to consume; the worker re-drives the step.
         if batch.admit_error is None:
             self.postprocess_batch(batch, outputs)
-            # not on a refused step, whose push-back probes these again
             for rid in batch.cached_rids:
                 self._runner.complete_cached_walk(rid, batch.node_name, batch.graph_walk)
         return outputs

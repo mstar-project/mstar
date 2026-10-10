@@ -115,26 +115,27 @@ class PrefixChain:
     """The keys that name a stream's pages, and how far the index holds them."""
     # one key per page of this stream's prompt, from the preprocess worker
     keys: list[bytes]
-    # ids not yet keyed: those on the prompt's partial page, then sampled ids, until a page fills
+    # tokens not yet keyed: the prompt tail, then sampled ids, until a page fills
     unkeyed: list[int] | None
     # keys naming a whole page; the prompt's last key names a partial one until generation fills it
     keyed_pages: int
-    # slots the chain accounts for: its prompt, and every token sampled since
+    # tokens the chain accounts for: its prompt, and every token sampled since
     covered_len: int
-    # the prompt's layout, one span per write
+    # The prompt's layout, and how far the stream is through it.
+    # `spans` has one span per write.
+    # `unkeyed_items` are the items on the page `unkeyed` fills.
+    # `done` counts the spans the stream holds, whether written, read in or served from the cache.
+    # `consumed` counts the tokens of those spans.
+    # `probed` is the span the latest probe answered for.
     spans: list[PrefixSpan]
-    # the items on the page `unkeyed` fills, keyed with its ids
     unkeyed_items: list[PageItem]
-    # how much of the layout the stream holds: spans written, read in or
-    # served whole by the cache, and their slots
     done: int = 0
     consumed: int = 0
-    # the span the latest probe answered for
     probed: int | None = None
-    # the prompt's keys under the root: hashed by the first probe and kept, since one that
-    # misses is asked again and no key changes before the stream writes
+    # The prompt's keys hashed under the root, kept from the first probe so a repeated probe hashes nothing.
+    # `rooted` has one key per page.
+    # `rooted_ends` has one key per image that ends inside a page, with the token the image ends at.
     rooted: list[bytes] | None = None
-    # each image end's key under the root with the slot it ends at, hashed and kept with `rooted`
     rooted_ends: list[tuple[int, bytes]] | None = None
     # how many of this stream's pages the index already holds
     cursor: int = 0
@@ -157,7 +158,7 @@ class PrefixChain:
     def extend(self, tokens: list[int], page_size: int) -> None:
         self.unkeyed.extend(tokens)
         self.covered_len += len(tokens)
-        # the prompt's items all end on its partial page, each holding its last length - offset slots
+        # Every item on the prompt's partial page ends there, so it takes length - offset of the page's tokens.
         room = page_size - sum(item.length - item.offset for item in self.unkeyed_items)
         while len(self.unkeyed) >= room:
             whole = self.keyed_pages
@@ -203,9 +204,9 @@ class CacheStream:
     # None while the stream is unkeyed, and once its keys stop describing it
     chain: PrefixChain | None = None
     # pages the index matched for this stream and is holding for it, from the
-    # probe until `admit` converts them onto `page_indices`; an image's end until `plan` copies it
+    # probe until `admit` converts them onto `page_indices`. A cached image end
+    # stays leased until `plan` copies it. `lease_len` counts the tokens the lease holds.
     lease: list[int] | None = None
-    # slots the lease holds: its whole pages, then an image's end if the index had it
     lease_len: int = 0
     # set at conversion, cleared at `commit`, so a refused admit's re-probe answers the same
     converted: bool = False
@@ -403,7 +404,7 @@ class KVManager(AttentionResource):
         self._keyed_walks: dict[str, frozenset[str]] = {}
         # nodes already warned that a declared stream reached them unkeyed
         self._warned_unkeyed: set[str] = set()
-        # streams whose lease still holds an image end for `plan` to copy, so a step with none looks at nothing
+        # streams whose lease still holds a cached image end for `plan` to copy
         self._image_ends: list[CacheStream] = []
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
@@ -502,12 +503,12 @@ class KVManager(AttentionResource):
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
     ) -> CachedPrefix | None:
-        """Answer this walk from one lease on the whole layout, held for every walk.
+        """Match this request's prefix against the index and hold what matched.
 
-        A stream holding a lease, whoever took it, answers from it past the spans
-        already consumed. A probe is repeated whenever a step is prepared again,
-        so nothing it answers from moves until the walk commits or the cache
-        serves it, and one reference is taken however often it is asked.
+        The first probe takes one lease for the whole layout, and each walk's
+        probe answers its own share of it. A probe is repeated whenever a step
+        is prepared again, so it answers the same every time it is asked and
+        takes one reference however often that is.
         """
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
@@ -548,13 +549,13 @@ class KVManager(AttentionResource):
                 return None
             chain.rooted = rooted
             chain.rooted_ends = ends
-            # a lease another thread took while this one hashed is the one to answer from
+            # The lock was dropped to hash, so another thread's probe may have taken the lease already.
             if stream.lease is None:
-                # one key short, so a fully cached prompt still leaves a token to run
+                # Matching the whole prompt would leave the walk an empty input, since it skips every matched page.
                 matched = self._index.lookup(rooted)[:len(rooted) - 1]
                 held = len(matched) * self.config.page_size
                 self._arena.retain(matched)
-                # an image ending on the next page: its cached end, then this request's own page for it
+                # If an image ends inside the next page, look up its cached partial page.
                 for end, key in reversed(ends):
                     if not held < end < min(held + self.config.page_size, total):
                         continue
@@ -582,15 +583,15 @@ class KVManager(AttentionResource):
 
     @staticmethod
     def _answer(label: str, chain: PrefixChain, present: int) -> CachedPrefix:
-        """Of ``present`` slots held, this walk's share and the position past it,
-        recording that the probe answered span ``chain.done``."""
+        """This walk's share of the ``present`` tokens the stream holds, with the
+        position past that share. Records the span as the one the probe answered for."""
         span = chain.spans[chain.done]
         tokens = min(max(present - chain.consumed, 0), span.length)
         position = sum(earlier.advance for earlier in chain.spans[:chain.done])
         if span.digest is None:
             position += tokens
         elif tokens == span.length:
-            # an item's advance is the block's, applied once it is whole
+            # A partly held item doesn't move the position. Its walk still runs and advances it.
             position += span.advance
         chain.probed = chain.done
         return CachedPrefix(label, tokens, position)
@@ -598,13 +599,13 @@ class KVManager(AttentionResource):
     def _drop_layout(
         self, rid: str, label: str, stream: CacheStream, disagreement: str,
     ) -> None:
-        """End the chain of a stream its layout does not describe.
+        """End the chain of a stream whose walks disagree with its layout.
 
-        A walk the cache served never admits, so until a walk that runs converts
-        the lease, the served walks' KV lives only in it: releasing it would have
-        the next walk write from slot 0 with them missing. The served part is
-        kept when it ends on a page boundary; otherwise nothing can keep it, and
-        the request fails.
+        The KV of the walks already served from the cache lives only in the lease,
+        because a served walk never admits. Releasing the lease would have the next
+        walk write from token 0 with that KV missing. So the served part is kept
+        when it ends on a page boundary. When it ends inside a page the request
+        fails, because that page is shared and this stream may not write on it.
         """
         logger.warning(
             "KV %s: %s/%s %s; its chain ends here", self.name, rid, label, disagreement,
@@ -613,7 +614,6 @@ class KVManager(AttentionResource):
         if chain.done and stream.lease is not None:
             keep, partial = divmod(chain.consumed, self.config.page_size)
             if partial:
-                # a served walk never runs again, and its last slots sit on a shared page this stream may not write
                 raise RuntimeError(
                     f"KV {self.name}: {rid}/{label}: the walks the cache served end "
                     f"inside a page ({chain.consumed} slots), so their KV cannot be kept"
@@ -629,18 +629,18 @@ class KVManager(AttentionResource):
         self, rid: str, node_name: str, graph_walk: str, inputs,
         prefix: CachedPrefix | None,
     ) -> None:
-        """Cut the lease to the agreed prefix, unless the cache serves this walk whole.
+        """Cut this stream's lease down to the agreed prefix.
 
-        A served walk leaves the lease whole, since the walks after it read the
-        rest. With no answer, a walk the engine would not probe is about to
-        write whole over what the lease holds, so the layout ends here.
+        A walk the cache serves whole leaves the lease alone, since the walks
+        after it use the rest. A walk that arrives with no prefix was not probed
+        and is about to write over what the lease holds, so its layout is dropped.
         """
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
             if label is None:
                 return
             if prefix is None:
-                # a walk the engine would not probe never met the check in resolve
+                # an unprobed walk never reached the position check in `resolve_cached_prefix`
                 chain = self._ensure_label(rid, label).chain
                 if chain is not None and chain.done < len(chain.spans):
                     self._check_positions(chain.spans[chain.done], graph_walk, inputs)
@@ -698,12 +698,11 @@ class KVManager(AttentionResource):
         if stream.released or stream.stored_len - segment.span > chain.covered_len:
             stream.chain = None
             return
-        # a span that ends before this write starts was read in, matched or
-        # served; only one this write reaches has to be the walk's own
         start = stream.stored_len - segment.span
         ended = None
         while chain.done < len(chain.spans):
             end = chain.consumed + chain.spans[chain.done].length
+            # Checking every span would end the chain at the first one the cache filled rather than this walk.
             if chain.consumed < stream.stored_len and end > start and (
                 chain.spans[chain.done].walk != ctx.graph_walk
             ):
@@ -740,19 +739,20 @@ class KVManager(AttentionResource):
             self._cache_image_end(stream, chain, *ended)
 
     def _cache_image_end(self, stream: CacheStream, chain: PrefixChain, end: int, key: bytes) -> None:
-        """Index a copy of the page an image ends inside, cut at its end, for repeats with other text after it."""
+        """Cache the page up to the image's end. When the text after the image changes,
+        a repeat can still reuse it instead of running the walk again."""
         page = end // self.config.page_size
         rooted = fingerprint(self._prefix_root, key)
         parent = self._index.page_for(fingerprint(self._prefix_root, chain.keys[page - 1])) if page else None
         if (page and parent is None) or self._index.page_for(rooted) is not None:
             return
-        # only from free pages: evicting a whole page to keep part of one is a bad trade
+        # only from free pages. A partial copy isn't worth evicting a full cached page for.
         copy = self._arena.acquire(1)
         if copy is None:
             return
         self.kv_cache.copy_slots(stream.page_indices[page], copy[0], end % self.config.page_size)
         self._index.insert(rooted, copy[0], parent)
-        # the index is left its one owner, so it is evicted like any cached page
+        # drop our reference, so the index is the page's one owner and can evict it
         self._arena.release(copy)
 
     def _report_admission(self, segment: Segment, stream: CacheStream) -> None:
@@ -790,7 +790,7 @@ class KVManager(AttentionResource):
             or stream.stored_len
             or stream.offloaded
             or stream.chain is None
-            # a live lease is the probe's, for walks not yet admitted; its own admit converts it
+            # the probe's lease is adopted at its walk's admit
             or stream.lease is not None
         ):
             return
@@ -889,7 +889,7 @@ class KVManager(AttentionResource):
     def _adopt(self, stream: CacheStream, pages: list[int]) -> None:
         """Make ``pages`` the whole of a stream that has written nothing yet.
 
-        Any pages it already holds are empty ones a refused admit left, and go back.
+        Any pages the stream already holds are empty ones a refused admit left, so they are released.
         """
         self._arena.release(stream.page_indices)
         stream.page_indices = list(pages)
@@ -1089,7 +1089,7 @@ class KVManager(AttentionResource):
                     stream.stored_len = stream.lease_len
                     # they came out of the index, so they are already in it
                     stream.chain.cursor = whole
-                    # an image's cached end stays held until `plan` copies it, on the stream the step runs on
+                    # A cached image end stays leased until `plan` copies it on the step's stream.
                     stream.lease = stream.lease[whole:whole + 1] or None
                     if stream.lease is not None:
                         self._image_ends.append(stream)
@@ -1389,13 +1389,13 @@ class KVManager(AttentionResource):
                 self._apply_fork(rid, from_label, to_label)
 
     def _copy_image_ends(self) -> None:
-        """Copy each image end a converted lease still holds onto the page its request writes next."""
+        """Copy each cached image end still under lease onto the page its stream writes next."""
         if not self._image_ends:
             return
         with self._lock:
             ends, self._image_ends = self._image_ends, []
             for stream in ends:
-                # a reset or a remove has since released it, unless it still holds slots under a lease
+                # skip a stream that was reset or removed after its admit, which already released the lease
                 if stream.lease is not None and stream.stored_len:
                     whole, end = divmod(stream.stored_len, self.config.page_size)
                     self.kv_cache.copy_slots(stream.lease[0], stream.page_indices[whole], end)

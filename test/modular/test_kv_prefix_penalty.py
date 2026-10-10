@@ -166,7 +166,7 @@ def test_removing_the_request_drops_what_was_kept_for_it():
 
 
 def test_a_token_the_model_throws_away_is_not_seen(monkeypatch):
-    # the kernel needs a device; which token it picks is not what this is about
+    # The sampling kernel needs a device, and this test doesn't depend on which token it picks.
     monkeypatch.setattr(sampler_utils, "sample_tokens", lambda **kwargs: torch.tensor([200]))
     resource = _sampler()
 

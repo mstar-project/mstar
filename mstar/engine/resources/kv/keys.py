@@ -1,9 +1,9 @@
 """Page keys for cross-request prefix reuse.
 
 A key commits to the whole prefix below it: the previous key, this page's token
-ids, and where each input on the page that is not a token sits, with its digest.
-One match confirms every page under it, and a new root leaves every old key
-unreachable.
+ids, and for each input on the page that is not a token, its digest and where
+it sits. One match confirms every page under it, and a new root leaves every
+old key unreachable.
 
 The encoding is canonical because one process builds these keys and another
 matches them: fixed-width little-endian ints, and a length prefix on every
@@ -25,12 +25,13 @@ def _field(payload: bytes) -> bytes:
 
 
 class PageItem(NamedTuple):
-    """An input that is not a token, as much of it as one page holds."""
-    # its first slot on this page
+    """An input that is not a token, as it sits on one page.
+
+    ``start`` is its first slot on this page, ``offset`` counts its slots on
+    earlier pages, and ``length`` counts all of its slots.
+    """
     start: int
-    # its slots on earlier pages
     offset: int
-    # its slots in all
     length: int
     digest: bytes
 
@@ -57,12 +58,12 @@ def fingerprint(*fields: object) -> bytes:
 def page_key(
     prev: bytes, tokens: Sequence[int], items: Sequence[PageItem] = (),
 ) -> bytes:
-    """Key one page from its parent, its ids and its items.
+    """Hash a page's parent key, its token ids and its items into the page's key.
 
-    The ids fill every slot the items leave, in order, so an item's ``start``
-    is what tells ``[t1 t2 IMG]`` from ``[t1 IMG t2]``. Its whole ``length``
-    and ``digest`` sit on every page it touches, because attention inside the
-    item is not causal: a page's KV depends on the item's slots after it too.
+    The ids fill the slots the items leave, in order, so an item's ``start`` is
+    what tells ``[t1 t2 IMG]`` from ``[t1 IMG t2]``. Every page an item touches
+    carries the item's whole ``length`` and ``digest``, because attention inside
+    an item is not causal and a page's KV depends on the item's later slots too.
     """
     hasher = hashlib.sha256()
     hasher.update(_field(prev))
@@ -84,11 +85,11 @@ def end_key(
 def page_items(
     spans: Iterable[tuple[int, bytes | None]], page_size: int,
 ) -> dict[int, list[PageItem]]:
-    """Each page's items, from every span's length and its digest, None for ids.
+    """Each page's items, given every span's length and digest (None for ids).
 
-    The one reading of a layout: the preprocess worker keys a prompt's pages by
-    it and the engine keys the page generation fills by it, and two readings
-    that differed would give that page a key nothing matches.
+    The preprocess worker keys a prompt's pages with this, and the engine keys
+    the page that generation fills after the prompt. If the two worked out the
+    items differently, that page's key would never match.
     """
     items: dict[int, list[PageItem]] = {}
     at = 0

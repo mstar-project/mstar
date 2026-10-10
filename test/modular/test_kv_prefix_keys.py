@@ -76,7 +76,7 @@ def test_a_digest_is_not_a_token_that_encodes_the_same_bytes():
 
 def test_two_digests_are_not_one_digest_of_their_bytes():
     two = [PageItem(0, 0, 1, b"ab"), PageItem(1, 0, 1, b"c")]
-    # the bytes the two encode to without the digests' length prefixes, as one digest
+    # one digest holding the bytes the two items encode to, without their digests' length prefixes
     one = [PageItem(0, 0, 1, b"ab" + b"".join(n.to_bytes(4, "little") for n in (1, 0, 1)) + b"c")]
     assert page_key(b"", [], two) != page_key(b"", [], one), (
         "the split between two digests is not in the key"

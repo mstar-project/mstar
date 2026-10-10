@@ -94,12 +94,13 @@ def _refuse_unknown_walks(model: Model) -> None:
 
 
 def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> None:
-    """Refuse a walk of a laid-out stream that the cache could not serve whole:
-    one where its keyed node feeds another node, or where none of them runs.
+    """Refuse a stream with layout walks if the cache could not serve one of its
+    walks whole: a walk where a keyed node feeds another node, or where no
+    keyed node runs.
 
     A walk the cache serves whole completes with no outputs, so a node that
-    reads it would get nothing. Only a stream with layout walks has walks the
-    cache can serve whole: a single span always runs its last token.
+    reads them would get nothing. Only a stream with layout walks is checked,
+    because a stream with one span always runs its last token.
     """
     graphs = model.get_graph_walk_graphs()
     by_key = {spec.resource_key: spec for spec in specs}
@@ -109,7 +110,6 @@ def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> Non
                 continue
             keyed_nodes = by_key[key].nodes
             for walk in (stream.walk, *stream.layout_walks):
-                # per walk: a node the resource also serves elsewhere need not run here
                 nodes = graphs[walk].get_nodes()
                 ran = sorted(keyed_nodes & set(nodes))
                 if not ran:

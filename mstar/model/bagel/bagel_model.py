@@ -645,12 +645,11 @@ class BagelModel(Model):
                     spans,
                     len(segments),
                 )
-                # not for an edit: its image is resized below, before the ViT
-                # sees it, and the file's digest cannot know that
+                # An edit gets no layout. Its image is resized below before the ViT
+                # sees it, and the file's digest doesn't cover that resize.
                 if is_understanding and "image" not in output_modalities and tensors is not None:
                     layout = self._prefix_layout(
                         parts, segments, tensors["image_inputs"],
-                        # the ViT's own name for it, so names it resizes alike key alike
                         vit_preprocess(kwargs.get("image_preprocess")),
                     )
                 if think_mode and not is_understanding:
@@ -773,7 +772,7 @@ class BagelModel(Model):
         )
 
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
-        """The text walks key by their ids, and an understood image by its file.
+        """Text is keyed by its ids, and an image in an understanding prompt by its file.
 
         An edit's VAE walk writes this stream too, over positions no layout
         describes, so it is not named. Generated pages are not keyed: the chat

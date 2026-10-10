@@ -461,9 +461,8 @@ class PreprocessWorkerThread:
 
                 for filepath in input.file_paths[modality]:
                     if self._prefix_streams:
-                        # before the load, and compared once the file is hashed:
-                        # a file that changed between would file its KV under
-                        # bytes nobody decoded
+                        # Record the file's state before loading it. If the file changes before it
+                        # is hashed, its KV would be keyed by bytes we never decoded.
                         file_states.setdefault(modality, []).append(_file_state(filepath))
                     # ---- Image ----
                     if modality == "image":
@@ -509,8 +508,6 @@ class PreprocessWorkerThread:
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
-            # popped, not carried: a Span pickles every kwarg it rides with, so
-            # only the plain form `_prefix_keys` builds goes on
             layouts = model_kwargs.pop("prefix_layout", {})
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
@@ -570,14 +567,13 @@ class PreprocessWorkerThread:
         self, tensors: dict, layouts: dict, file_paths: dict | None,
         file_states: dict[str, list[tuple[int, int, int]]],
     ) -> dict:
-        """Key each page of every declared stream, as the kwargs that carry it.
+        """Key each page of every declared stream, by resource and label.
 
-        By resource and label: one unrooted key a page, the ids on the prompt's
-        partial last page, the layout as ``[length, advance, walk, digest, end_key]``,
-        and the output tensor the stream's sampled ids arrive in.
+        Returns the kwargs that carry the keys, the prompt tail past the last whole
+        page, each stream's layout as ``[length, advance, walk, digest, end_key]``
+        rows, and the output tensor each stream's sampled ids arrive in. The keys
+        are unrooted.
         """
-        # before any check: a worker built without a config keys nothing, and
-        # a model's layout is then dropped with the rest
         if not self._prefix_streams:
             return {}
         for resource_key, by_label in layouts.items():
@@ -645,7 +641,7 @@ class PreprocessWorkerThread:
         self, stream: PrefixStream, layout: list[Span],
         digests: list[bytes | None], tensors: dict, page_size: int,
     ) -> tuple[list[list[int]], dict[int, list[PageItem]]]:
-        """Each page's ids and items, in slot order."""
+        """Check the layout's spans and return each page's ids and items."""
         walks = {stream.walk, *stream.layout_walks}
         entries: dict[str, int] = {}
         total = sum(span.length for span in layout)
@@ -657,8 +653,7 @@ class PreprocessWorkerThread:
                 f"a {span.kind} span names walk {span.walk!r}, which the "
                 f"stream does not declare; it declares {sorted(walks)}"
             )
-            # exactly int: a numpy one would have page_key fail, or pickle the kwargs
-            assert type(span.length) is int and type(span.advance) is int, (
+            assert isinstance(span.length, int) and isinstance(span.advance, int), (
                 f"a {span.kind} span's length and advance are "
                 f"{type(span.length).__name__} and {type(span.advance).__name__}"
             )
@@ -690,10 +685,10 @@ class PreprocessWorkerThread:
         self, span: Span, file_paths: dict | None,
         file_states: dict[str, list[tuple[int, int, int]]],
     ) -> bytes:
-        """Hash the file a digest span names, whole, with all else that decides its KV.
+        """Hash the whole file a digest span names, with everything else that decides its KV.
 
-        Never cut short and never turned into an id: that is how two images
-        come to share a key and one request is served another's KV.
+        The digest is never cut short or turned into an id. Either would let two
+        images share a key, and one request would be served another's KV.
         """
         assert type(span.params) is tuple and all(
             type(param) in (type(None), bool, int, float, str, bytes)
@@ -712,7 +707,7 @@ class PreprocessWorkerThread:
         )
         return fingerprint(
             raw, modality, self.model.preprocess_fingerprint(), span.advance,
-            # repr, not str: True and "True" can preprocess differently
+            # Use repr, not str. True and "True" can preprocess differently
             *(repr(param) for param in span.params),
         )
 

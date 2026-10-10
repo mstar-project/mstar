@@ -358,18 +358,18 @@ def test_a_modality_the_tokenizer_cannot_place_is_left_out():
     assert set(Qwen3OmniModel._placeholder_specs(model)) == {"image"}
 
 
-# ── the layout Bagel keys an understood prompt's KV by ──────────────────
-# It has to match the walks exactly: the order the prefill schedule runs them
-# in, and each image's own file over the slots its ViT walk writes. An image
-# keyed by another's file is served the other's KV.
+# ── the layout Bagel keys an understanding prompt's KV by ───────────────
+# The layout has to match the walks exactly: the order the prefill schedule
+# runs them in, and each image's own file over the slots its ViT walk writes.
+# An image keyed by another image's file would be served that image's KV.
 
 PATCH_SIZE, MAX_PATCHES_PER_SIDE = 14, 70
-# two images of different sizes, so a span sized or keyed by the wrong one shows
+# Two images of different sizes, so a span sized or keyed by the wrong image fails the test.
 SIZES = [(480, 640), (1200, 1600)]
 
 
 def _laid_out(bagel, modalities: list[str], output_modalities=("text",), tensors=True, **kwargs):
-    """Bagel's output for text and images in ``modalities``, and the images."""
+    """Return what Bagel's `process_prompt` gives for the text and images in ``modalities``, with the images."""
     bagel.config.vit_config = SimpleNamespace(patch_size=PATCH_SIZE)
     bagel.config.vit_max_num_patch_per_side = MAX_PATCHES_PER_SIDE
     texts = iter(["what is", "in this picture", "and in this one"])
@@ -388,7 +388,7 @@ def _laid_out(bagel, modalities: list[str], output_modalities=("text",), tensors
 
 
 def _vit_slots(image: torch.Tensor, image_preprocess: str) -> int:
-    """What the ViT walk writes for ``image``: its patches, and the two sentinels."""
+    """How many slots the ViT walk writes for ``image``: its patches and the two sentinels."""
     from mstar.model.bagel.submodules import IMAGE_SENTINELS, ViTEncoderSubmodule
 
     vit = ViTEncoderSubmodule(None, None, None, PATCH_SIZE, MAX_PATCHES_PER_SIDE)
@@ -437,11 +437,11 @@ def test_bagel_lays_out_only_the_understood_prompts_it_has_images_for(bagel):
         "text only": (["text"], ("text",), True),
         "generation": (interleaved, ("image",), True),
         "understood without tensors": (interleaved, ("text",), False),
-        # text first, so understood, but an image out too, so its input is resized first
+        # Text comes first, so the prompt is understood, but it also outputs an image, so its input is resized first.
         "understood and edited": (interleaved, ("text", "image"), True),
     }
 
-    # a prompt with no layout comes back as its tensors alone, a dict
+    # A prompt with no layout comes back as a plain dict of its tensors.
     laid_out = {name: not isinstance(_laid_out(bagel, *case)[0], dict) for name, case in cases.items()}
 
     assert laid_out == {name: name == "understood with its image" for name in cases}, (
