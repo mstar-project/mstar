@@ -74,7 +74,8 @@ _STRIP_KEYS = {
     # OpenAI-standard, no M* mapping today
     "min_tokens", "eos_token_ids",
     "stream_options", "frequency_penalty", "presence_penalty", "logit_bias",
-    "logprobs", "top_logprobs", "tools", "tool_choice", "parallel_tool_calls",
+    # not tools or tool_choice: the adapter refuses a chat that asks for a tool call
+    "logprobs", "top_logprobs", "parallel_tool_calls",
     "response_format", "user", "store", "metadata", "service_tier",
 }
 
@@ -144,6 +145,21 @@ def _speech_body(request: dict) -> dict:
     return body
 
 
+class _BadRequestError(ValueError):
+    """A 400 whose message reaches the client as written.
+
+    Dynamo's worker reads ``code`` and ``message`` off any exception the
+    handler raises; a bare ``ValueError`` is a 400 too, but reaches the client
+    as ``ValueError: <message>``.
+    """
+
+    code = 400
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 class RequestBridge:
     """Translate one endpoint's requests for a single embedded server."""
 
@@ -186,7 +202,10 @@ class RequestBridge:
             )
             body["modalities"] = ["text"]
         req = ChatCompletionRequest.model_validate(body)
-        args = self.adapter.chat_to_request(req, self.server.upload_dir)
+        try:
+            args = self.adapter.chat_to_request(req, self.server.upload_dir)
+        except ValueError as exc:
+            raise _BadRequestError(str(exc)) from exc
         rid = self._submit(args, prefix="chatcmpl")
         created = int(time.time())
 
