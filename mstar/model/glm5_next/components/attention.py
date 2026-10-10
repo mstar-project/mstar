@@ -1,6 +1,8 @@
 """GLM-5.3-Flash attention modules: NoPE MLA + TP-sharded, loader-aware KDA."""
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -221,18 +223,22 @@ class Glm5NextMLAAttention(nn.Module):
         index_rows: tuple[torch.Tensor, torch.Tensor], ctx: dsa.Glm5NextDsaContext,
     ) -> torch.Tensor:
         """The draft row's slots under dsa_long_context: its index key joins the block's rows
-        so far, then every block row selects (only ``row`` has a query; the rest go unused)."""
+        so far, then the row selects, and the block's other rows (no query, output unused)
+        attend what it does."""
         keys, gates = index_rows
         n, block = keys.shape[:2]
         keys[:, row], gates[:, row] = self.indexer.keys_and_gate(hidden_states)
         dsa.write_index(self.kv, self.index_plane, LABEL, keys.view(n * block, -1),
                         gates.view(n * block, -1), self.indexer.index_kpool_compress_ape, ctx)
         q, w = self.indexer.query_and_weights(q_c, hidden_states)
-        qs = q.new_zeros(n, block, *q.shape[1:])
-        ws = w.new_zeros(n, block, w.shape[-1])
-        qs[:, row], ws[:, row] = q, w
-        return dsa.select(qs.view(n * block, *q.shape[1:]), ws.view(n * block, -1),
-                          self.kv.layer_view(self.index_plane), ctx, self.dsa_group)
+        at_row = dataclasses.replace(
+            ctx, pos=ctx.pos.view(n, block)[:, row].contiguous(),
+            row_req=ctx.row_req.view(n, block)[:, row].contiguous(), spans=None,
+            host_pos=None if ctx.host_pos is None else ctx.host_pos[row::block])
+        slots = dsa.select(q, w, self.kv.layer_view(self.index_plane), at_row, self.dsa_group)
+        # the other rows keep their own lengths, one entry past the draft row's after it:
+        # a real slot there rather than -1
+        return slots.repeat_interleave(block, 0).clamp_min_(0)
 
     def _out(self, attn_latent: torch.Tensor) -> torch.Tensor:
         num_tokens, h = attn_latent.shape[:2]
