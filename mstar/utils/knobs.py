@@ -47,3 +47,55 @@ def tp_early_spec() -> bool:
     (27B TP4 c8 674 vs 1009 tok/s with it off), and the TP cells are GPU-bound
     anyway. TP1 nodes build early regardless (``MSTAR_EARLY_SPEC``)."""
     return os.environ.get("MSTAR_TP_EARLY_SPEC", "0") == "1"
+
+
+def ingraph_decode_tokens() -> bool:
+    """``MSTAR_INGRAPH_DECODE_TOKENS`` (default 0): a captured decode step
+    gathers its input ids off the sampler's slot master inside the graph
+    instead of staging a gathered tensor before the replay. Experiment knob:
+    the combined form of this and ``ingraph_decode_rope`` produced wrong
+    outputs once; each half is gated on its own."""
+    return os.environ.get("MSTAR_INGRAPH_DECODE_TOKENS", "0") == "1"
+
+
+def ingraph_decode_rope() -> bool:
+    """``MSTAR_INGRAPH_DECODE_ROPE`` (default 0): a captured decode step
+    builds its rotary tables inside the graph from the position resource's
+    planned positions instead of staging them before the replay."""
+    return os.environ.get("MSTAR_INGRAPH_DECODE_ROPE", "0") == "1"
+
+
+def kv_chain_lazy_steps() -> int:
+    """``MSTAR_KV_CHAIN_LAZY_STEPS`` (default 16): how many decode steps of
+    sampled tokens the KV manager batches before extending the requests'
+    prefix chains, one extend per request per batch instead of one per step
+    (the per-row Python of that extension was 0.3-0.4 ms a step at 128
+    rows). A page key then appears up to that many steps late, and a later
+    commit indexes it, which the single-request path already allows for.
+    ``1`` (the default) extends every step: 16 measured as noise at c64/c128
+    on 0.8B (the extension is a small part of the stop check's tail)."""
+    return max(1, int(os.environ.get("MSTAR_KV_CHAIN_LAZY_STEPS", "1")))
+
+
+def kv_plan_cache() -> int:
+    """``MSTAR_KV_PLAN_CACHE`` (default 1): the KV manager plans a leased
+    decode step from the previous step's plan when the batch is the same
+    rows in the same order and nothing but that step's commit touched the
+    streams: lengths advance by one, pages change only where a row crossed
+    a page boundary, and the five index arrays come from numpy instead of a
+    per-row Python pass. ``0`` (the default until the reworked path is
+    measured) plans every step from the streams; ``2`` does both and logs any
+    difference (a correctness check for runs)."""
+    return int(os.environ.get("MSTAR_KV_PLAN_CACHE", "0"))
+
+
+def kv_pinned_indptrs() -> bool:
+    """``MSTAR_KV_PINNED_INDPTRS`` (default 1): the KV plan writes FlashInfer's
+    index arrays (qo_indptr, kv_indptr, kv_indices, last_page_len) into a
+    ring of page-locked host buffers, and the decode wrapper copies the
+    indices straight into its captured device buffer from there. The copies
+    are then really asynchronous; from pageable memory the driver stages each
+    one, and FlashInfer makes the indices copy blocking. Off by default: the
+    event bookkeeping per take cost about what the staged copies did at
+    c32-c128 on 0.8B (measured neutral to slightly negative)."""
+    return os.environ.get("MSTAR_KV_PINNED_INDPTRS", "0") == "1"

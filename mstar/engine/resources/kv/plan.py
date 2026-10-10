@@ -7,7 +7,6 @@ consumer depends on the contract rather than on the cache.
 """
 
 import itertools
-from dataclasses import dataclass
 from typing import NamedTuple
 
 import numpy as np
@@ -102,6 +101,7 @@ class PagedIndptrs(NamedTuple):
 def build_paged_indptrs(
     segments: list[SequenceView],
     page_size: int,
+    ring: "PinnedIndexRing | None" = None,
 ) -> PagedIndptrs:
     # Most of this is the five list-to-tensor conversions; they go through
     # numpy, which builds an int32 array from a list of ints in about half
@@ -123,17 +123,81 @@ def build_paged_indptrs(
         last_page_lens.append(last)
         # FlashInfer's `get_seq_lens`, on the ints already here
         kv_lens.append(max(num_pages - 1, 0) * page_size + last)
+    make = ring.take if ring is not None else _int32_tensor
     return PagedIndptrs(
-        qo_indptr=_int32_tensor(qo_indptr),
-        paged_kv_indptr=_int32_tensor(kv_indptr),
-        paged_kv_indices=_int32_tensor(all_pages),
-        paged_kv_last_page_len=_int32_tensor(last_page_lens),
+        qo_indptr=make(qo_indptr),
+        paged_kv_indptr=make(kv_indptr),
+        paged_kv_indices=make(all_pages),
+        paged_kv_last_page_len=make(last_page_lens),
         kv_lens=_host_lens(kv_lens),
     )
 
 
 def _int32_tensor(values: list[int]) -> torch.Tensor:
     return torch.from_numpy(np.array(values, dtype=np.int32))
+
+
+class PinnedIndexRing:
+    """A ring of page-locked int32 host buffers for the index arrays a plan
+    hands FlashInfer, so its ``copy_(non_blocking=True)`` calls are really
+    asynchronous (from pageable memory the driver stages each one).
+
+    ``take`` fills the next buffer and returns a view of it. A buffer is
+    rewritten only after the copies out of it have completed: the stream a
+    plan ran on records an event when the next ``take`` happens on that
+    stream (by then the plan's copies were issued), and a slot waits on its
+    event before reuse. Plans do not overlap, so one pending slot suffices.
+    Without CUDA the buffers are plain tensors and nothing is recorded.
+    """
+
+    def __init__(self, numel: int = 4096, depth: int = 8):
+        self._depth = depth
+        self._numel = 0
+        self._pinned = torch.cuda.is_available()
+        self._bufs: list[torch.Tensor] = []
+        self._events: list = [None] * depth
+        self._streams: list = [None] * depth
+        self._next = 0
+        self._last: int | None = None
+        self._grow(numel)
+
+    def _grow(self, numel: int) -> None:
+        numel = max(numel, self._numel * 2, 256)
+        self._bufs = [
+            torch.empty(numel, dtype=torch.int32, pin_memory=self._pinned)
+            for _ in range(self._depth)
+        ]
+        self._numel = numel
+
+    def take(self, values) -> torch.Tensor:
+        n = len(values)
+        if n > self._numel:
+            self._grow(n)
+        if self._pinned:
+            stream = torch.cuda.current_stream()
+            if self._last is not None and self._streams[self._last] is not stream:
+                # the previous plan's copies were issued on another stream
+                # (an inline plan on the gpu thread after a pre-plan): record
+                # there, where they are
+                ev = self._events[self._last] or torch.cuda.Event()
+                self._events[self._last] = ev
+                ev.record(self._streams[self._last])
+            elif self._last is not None:
+                ev = self._events[self._last] or torch.cuda.Event()
+                self._events[self._last] = ev
+                ev.record(stream)
+            i = self._next
+            ev = self._events[i]
+            if ev is not None:
+                ev.synchronize()
+            self._streams[i] = stream
+        else:
+            i = self._next
+        self._next = (i + 1) % self._depth
+        self._last = i
+        out = self._bufs[i][:n]
+        out.numpy()[:] = values
+        return out
 
 
 class HostLens(torch.Tensor):
@@ -156,23 +220,52 @@ def _host_lens(values: list[int]) -> torch.Tensor:
     return _int32_tensor(values).as_subclass(HostLens)
 
 
-@dataclass
 class KVPlanOutput:
     """
     Output of KVManager.plan for a single label
     """
-    cpu_indptrs: PagedIndptrs
-    # packing in plan order w/h 1 view per segment covered by plan
-    views: list[SequenceView]
-    # only the packed write addressing needs these on device, and only the
-    # resource that builds them reads them; see KVManager._setup_plan_states
-    cuda_indptrs: PagedIndptrs | None = None
+
+    __slots__ = ("cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets", "rows")
+
+    def __init__(
+        self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
+        cuda_indptrs: "PagedIndptrs | None" = None, decode_pages=None, decode_offsets=None,
+        rows=None, view_builder=None,
+    ):
+        self.cpu_indptrs = cpu_indptrs
+        # packing in plan order w/h 1 view per segment covered by plan; a plan
+        # off the KV manager's cache hands a builder instead and the views are
+        # made on first use (the FlashInfer path never asks for them)
+        self._views = views
+        self._view_builder = view_builder
+        # only the packed write addressing needs these on device, and only the
+        # resource that builds them reads them; see KVManager._setup_plan_states
+        self.cuda_indptrs = cuda_indptrs
+        # a decode step planned off the previous one (KVManager's plan cache):
+        # each row's write page and offset in it, so staging need not walk the views
+        self.decode_pages = decode_pages
+        self.decode_offsets = decode_offsets
+        # (request_id, label, to_compute) per view, for consumers that need no
+        # pages or lengths (the position resource); None means read the views
+        self.rows = rows
+
+    @property
+    def views(self) -> "list[SequenceView]":
+        if self._views is None:
+            self._views = self._view_builder()
+        return self._views
+
+    @views.setter
+    def views(self, value):
+        self._views = value
 
     def get_total_len(self):
         return int(self.cpu_indptrs.qo_indptr[-1])
 
     @property
     def is_decode(self) -> bool:
+        if self.decode_pages is not None:
+            return True
         return all(view.to_compute == 1 for view in self.views)
 
 

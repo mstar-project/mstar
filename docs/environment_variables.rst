@@ -349,6 +349,40 @@ Worker scheduling
        prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
        spends 78 ms of wall time on 36 ms of kernels. The default now reaches
        8192; narrow it to save graph memory and capture time, or extend it.
+   * - ``MSTAR_KV_CHAIN_LAZY_STEPS``
+     - ``1``
+     - How many decode steps of sampled ids the KV manager holds back before
+       it extends the requests' prefix chains (the per-page keys the prefix
+       cache is indexed by), one extend per request per batch of steps instead
+       of one per step. The per-request Python of that extension was 0.3 to
+       0.4 ms a step at 128 rows. A page key then appears up to that many
+       steps late and a later commit indexes it, as the single-request path
+       already allows; a request that finishes in between may leave its last
+       page unindexed. The default ``1`` extends on every step: ``16``
+       measured as noise at c64/c128 on 0.8B (the extension is a small part
+       of the stop check's tail).
+   * - ``MSTAR_KV_PINNED_INDPTRS``
+     - ``0``
+     - The KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,
+       kv_indices, last_page_len) into a ring of page-locked host buffers and
+       the decode wrapper copies the indices straight into its captured
+       device buffer from there, so the copies FlashInfer's ``plan`` issues
+       are really asynchronous. From pageable memory the driver stages each
+       one and FlashInfer makes the indices copy blocking. Measured neutral
+       to slightly negative at c32-c128 on 0.8B (the event bookkeeping per
+       take costs about what it saves), so it is off by default.
+   * - ``MSTAR_KV_PLAN_CACHE``
+     - ``0``
+     - The KV manager plans a captured decode step off the previous step's
+       plan when the batch is the same rows in the same order and nothing
+       but that step's commit touched the streams: every length is one
+       more, pages change only where a row crossed a page boundary, and the
+       five FlashInfer index arrays come from numpy instead of a per-row
+       Python pass. The first version measured a loss at c64/c128 on 0.8B
+       (batches change every step or two there, and a hit still rebuilt the
+       views); the reworked path keeps the views lazy and is off by default
+       until measured. ``0`` plans every step from the streams. ``2`` runs
+       both and logs a difference, for checking a run.
    * - ``MSTAR_GC_FREEZE``
      - ``1``
      - Once a process has finished its set-up (the API server and the
@@ -364,9 +398,23 @@ Worker scheduling
        the sampler writes each request's last token to a slot-addressed
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
-       cleanup per step). Only nodes that opt in (Qwen3.5 decode) and only
-       when the sampler has graph buffers; ``0`` keeps every node on the
-       per-request tensor path.
+       cleanup per step). Only nodes that declare the read
+       (``reads_device_loopback``: Qwen3.5 decode) and only when the sampler
+       has graph buffers; the sampler keeps the masters for those nodes
+       alone, so a node that takes its tokens on the host (Whisper's
+       decoder) no longer pays the eager-step master write, a small
+       synchronous host-to-device copy per step. ``0`` keeps every node on
+       the per-request tensor path.
+   * - ``MSTAR_INGRAPH_DECODE_TOKENS``
+     - ``0``
+     - A captured decode step gathers its input ids off the sampler's slot
+       master inside the graph instead of staging them before the replay.
+       Experiment knob, measured and gated on its own.
+   * - ``MSTAR_INGRAPH_DECODE_ROPE``
+     - ``0``
+     - A captured decode step builds its rotary tables inside the graph from
+       the position resource's planned positions instead of staging them.
+       Experiment knob, measured and gated on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - ``0``
      - The captured sampler gathers its RNG offsets from the slot masters
