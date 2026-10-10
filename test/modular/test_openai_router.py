@@ -126,7 +126,7 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
         },
     )
     assert r.status_code == 400
-    assert r.json()["error"]["type"] == "server_error"
+    assert r.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_chat_audio_output(client_and_stub):
