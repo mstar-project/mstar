@@ -105,8 +105,8 @@ def _prefill_scores_kernel(q, w, plane, pages, start, pos, out, R, max_pools, sp
 def _expand_slots_kernel(first, pos, row_req, pages, page_start, out, K, W,
                          KP: tl.constexpr, PAGE: tl.constexpr, BLOCK: tl.constexpr):
     """Program per row: the members of its selected pools (``first`` holds each pool's first
-    slot, -1 past the selection), then its tail ``[KP * pools, pos]``, packed from entry 0;
-    -1 after."""
+    slot over KP, -1 past the selection), then its tail ``[KP * pools, pos]``, packed from
+    entry 0; -1 after."""
     r = tl.program_id(0)
     p = tl.load(pos + r)
     pools = (p + 1) // KP
@@ -119,7 +119,7 @@ def _expand_slots_kernel(first, pos, row_req, pages, page_start, out, K, W,
         t = pools * KP + (e - n)                                    # tail position
         in_tail = (e >= n) & (t <= p)
         page = tl.load(pages + start + t // PAGE, mask=in_tail, other=0)
-        val = tl.where(in_pool, f + e % KP, tl.where(in_tail, page * PAGE + t % PAGE, -1))
+        val = tl.where(in_pool, f * KP + e % KP, tl.where(in_tail, page * PAGE + t % PAGE, -1))
         tl.store(out + r.to(tl.int64) * W + e, val, mask=e < W)
 
 

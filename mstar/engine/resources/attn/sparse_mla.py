@@ -11,6 +11,14 @@ from collections.abc import Callable
 
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:  # CPU-only installs
+    _HAS_TRITON = False
+
 # FlashInfer's kernel over one-token pages faults past ~16k rows, so an eager plan attends in
 # chunks of this many rows.
 MAX_ROWS = 8192
@@ -59,11 +67,39 @@ def _lens(lens: list[int], width: int) -> list[int]:
     return [min(n, width) for n in lens]
 
 
+if _HAS_TRITON:
+
+    @triton.jit
+    def _pack_kernel(slots, valid, indptr, lens, dst, W, pad_slot,
+                     HAS_VALID: tl.constexpr, BLOCK: tl.constexpr):
+        """Program per row: its first ``lens`` slots to ``dst[indptr[r]:]``, the ones past
+        ``valid`` (a plan made for longer rows) as ``pad_slot``."""
+        r = tl.program_id(0)
+        n = tl.load(lens + r)
+        base = tl.load(indptr + r)
+        for e0 in range(0, W, BLOCK):
+            e = e0 + tl.arange(0, BLOCK)
+            keep = e < n
+            s = tl.load(slots + r.to(tl.int64) * W + e, mask=keep, other=0)
+            if HAS_VALID:
+                s = tl.where(e < tl.load(valid + r), s, pad_slot)
+            tl.store(dst + base + e, s.to(dst.dtype.element_ty), mask=keep)
+
+
 def _pack(dst: torch.Tensor, slots: torch.Tensor, indptr: torch.Tensor,
-          lens: torch.Tensor) -> None:
+          lens: torch.Tensor, valid: torch.Tensor | None = None, pad_slot: int = 0) -> None:
     """``slots [rows, width]`` into ``dst`` as the plan's CSR: row r's first ``lens[r]`` at
-    ``dst[indptr[r]:]``, the rest to ``dst``'s spare last entry. Fixed shapes, so it captures."""
+    ``dst[indptr[r]:]``, and with ``valid`` (per row) its entries past it as ``pad_slot``. Fixed
+    shapes, so it captures: one kernel on a GPU, else the rest go to ``dst``'s spare last entry."""
     rows, width = slots.shape
+    if slots.is_cuda and _HAS_TRITON:
+        _pack_kernel[(rows,)](slots.contiguous(), lens if valid is None else valid, indptr, lens,
+                              dst, width, int(pad_slot), HAS_VALID=valid is not None,
+                              BLOCK=1024, num_warps=4)
+        return
+    if valid is not None:
+        j = torch.arange(width, dtype=valid.dtype, device=slots.device)
+        slots = torch.where(j < valid[:, None], slots, pad_slot)
     j = torch.arange(width, dtype=torch.int32, device=slots.device)
     pos = torch.where(j < lens[:rows, None], indptr[:rows, None] + j, dst.numel() - 1)
     dst.scatter_(0, pos.reshape(-1).long(), slots.reshape(-1).to(dst.dtype))
@@ -124,10 +160,7 @@ class SparseGraphPlan:
         """``valid`` (device, per row): a plan made for longer rows than the step has; each
         row's slots past its own length go to ``pad_slot``, a row the caller masks."""
         # the plan's offsets and lengths are in the wrapper's device buffers by now
-        if valid is not None:
-            j = torch.arange(slots.shape[1], dtype=valid.dtype, device=slots.device)
-            slots = torch.where(j < valid[:, None], slots, pad_slot)
-        _pack(self.indices, slots, self._kv, self._lens)
+        _pack(self.indices, slots, self._kv, self._lens, valid, pad_slot or 0)
         return self.wrapper.run(*_split(q_nope, q_pe, latent))
 
 
