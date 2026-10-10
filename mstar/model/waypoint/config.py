@@ -146,7 +146,7 @@ class WaypointConfig:
     base_fps: int = 15  # fps the RoPE time axis was trained against
     inference_fps: int = 60  # raw video fps
     temporal_compression: int = 4  # raw frames per latent frame (TAEHV)
-    max_frames: int = 512  # training-time rollout ceiling; not enforced here
+    max_frames: int = 512  # training-time rollout ceiling; the largest num_steps a request may ask
 
     # VAE
     taehv_ae: bool = True

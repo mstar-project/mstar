@@ -417,3 +417,44 @@ def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
 
     # Unknown keys are dropped
     assert remap("totally.unknown.key") is None
+
+
+# ----------------------------------------------------------------------
+# generation-input contract
+# ----------------------------------------------------------------------
+
+
+def test_pi05_request_kwargs_are_only_the_robot_state():
+    model = _make_model()
+    # flow steps are deployment YAML; a client num_steps is reported as ignored
+    assert model.request_kwargs() == {"robot_state"}
+
+
+@pytest.mark.parametrize("state", [
+    "0.1 0.2",
+    [0.1, "0.2"],
+    [True, 0.0],
+    [[0.1, 0.2]],
+    [],
+    [0.0] * 33,
+    [float("nan")],
+    {"a": 1},
+])
+def test_pi05_bad_robot_state_is_a_400(state):
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    with pytest.raises(ValueError, match="robot_state"):
+        model.process_prompt(
+            prompt="pick", input_modalities=["image", "text"], output_modalities=["action"], robot_state=state,
+        )
+
+
+def test_pi05_out_of_range_state_saturates_as_the_model_normalizes():
+    model = _make_model()
+    stub = _StubTokenizer()
+    model.tokenizer = stub
+    model.process_prompt(
+        prompt="pick", input_modalities=["image", "text"], output_modalities=["action"],
+        robot_state=[-5.0, 0, 5.0] + [0.5] * 29,
+    )
+    assert stub.last_prompt.split("State: ", 1)[1].startswith("0 128 255 191 ")
