@@ -500,8 +500,11 @@ class Glm5NextModel(Model):
     def max_decode_steps(self) -> int:
         """Decode iterations a one-token prompt can run before its context
         reaches the context limit or its cache rows reach kv_rows (an MTP step
-        stores k + 1); check_stop stops every request before either."""
+        with holes stores k + 1; under mtp_trims the rows follow the context);
+        check_stop stops every request before either."""
         cfg = self.config
+        if cfg.mtp_trims:
+            return cfg.context_limit - 1
         return min(cfg.context_limit - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
 
     def stop_token_ids(self) -> frozenset[int]:

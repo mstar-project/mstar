@@ -316,7 +316,8 @@ def test_decode_stops_while_the_next_block_fits():
     engine.remove_request("r")
 
 
-def _stop_after(prompt_len, max_tokens, per_step, k=3, index_topk=2048, kv_rows=4096):
+def _stop_after(prompt_len, max_tokens, per_step, k=3, index_topk=2048, kv_rows=4096,
+                trims=False):
     """(verify steps, tokens emitted) when _mtp_check_stop ends a request that emits
     ``per_step`` tokens per step, ignore_eos."""
     from mstar.model.submodule_base import PerRequestState
@@ -326,7 +327,7 @@ def _stop_after(prompt_len, max_tokens, per_step, k=3, index_topk=2048, kv_rows=
     sub = types.SimpleNamespace(
         request_state=lambda rid: state, mtp_block=k + 1,
         config=types.SimpleNamespace(eos_token_ids=(), context_limit=index_topk, kv_rows=kv_rows,
-                                     mtp_trims=False),
+                                     mtp_trims=trims),
     )
     sampler = {SAMPLER: types.SimpleNamespace(ignore_eos=True)}
 
@@ -351,6 +352,14 @@ def _stop_after(prompt_len, max_tokens, per_step, k=3, index_topk=2048, kv_rows=
 def test_rejected_drafts_do_not_cut_the_output_short(per_step):
     # 1024 in / 512 out: every token arrives however few drafts are accepted
     assert _stop_after(1024, 512, per_step)[1] >= 512
+
+
+def test_under_trims_rejected_drafts_stop_at_the_context_alone():
+    # the cache keeps the context and two blocks: no draft accepted runs the context out,
+    # where with holes it stopped at a quarter of the cache's rows (below)
+    steps, generated = _stop_after(16, 100_000, 1, kv_rows=2048, trims=True)
+    assert 16 + generated - 1 + 3 * 4 <= 2048 < 16 + generated + 3 * 4
+    assert steps == generated - 1
 
 
 def test_rejected_drafts_stop_at_the_cache_rows():
@@ -530,13 +539,15 @@ LONG_MAX_TOKENS = 30
 
 
 def _generate_long(engine, sub, prompts, max_tokens):
-    """``_generate`` with the cache checked after each step: the host's cache counts every
-    verify step's whole block, whatever it accepted (so it moves the same on every rank), and
-    the device's length is the rows of the input and the accepted drafts, nothing else (the
-    token after them is the next input)."""
+    """``_generate`` with the cache checked after each step: the host's cache counts each
+    verify step's whole block until two steps on, when its rejected rows go back (the same
+    steps on every rank, without waiting for a verdict), and the device's length is the rows
+    of the input and the accepted drafts, nothing else (the token after them is the next
+    input)."""
     kv, pool = engine._resources[KV_CACHE], engine._resources[KDA_STATE]
     rows = {rid: len(ids) for rid, ids in prompts.items()}
     host = dict(rows)
+    rejected: dict[str, list[int]] = {rid: [] for rid in prompts}
     for rid in prompts:
         engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
     out, stops = _step(engine, "prefill", prompts, max_tokens)
@@ -551,10 +562,14 @@ def _generate_long(engine, sub, prompts, max_tokens):
             seqs[rid] += out[rid]["new_token"][0].tolist()
             nxt[rid] = out[rid]["text_inputs"][0]
             if sub.mtp_k:
-                rows[rid] += sub._read_verdicts([rid])[0][1] + 1
-                host[rid] += sub.mtp_block
+                accepted = sub._read_verdicts([rid])[0][1]
+                rows[rid] += accepted + 1
+                rejected[rid].append(sub.mtp_k - accepted)
+                # this step's block, less the rejected rows of the step two back
+                host[rid] += sub.mtp_block - (rejected[rid][-3] if len(rejected[rid]) > 2 else 0)
                 assert kv._streams[rid]["main"].stored_len == host[rid], (rid, step)
-                assert sub.request_state(rid).get("context") == host[rid], (rid, step)
+                state = sub.request_state(rid)
+                assert state.get("context") - state.get("mtp_trimmed") == host[rid], (rid, step)
                 slot = pool._slots[rid]["main"].index
                 assert int(sub._mtp_len[slot]) == rows[rid], (rid, step)
         live = [rid for rid in live if not stops.get(rid)]
@@ -583,6 +598,35 @@ def test_long_context_mtp_output_equals_greedy_without_mtp(long_reference, k, dr
     assert got == long_reference
 
 
+@pytest.mark.parametrize("slack", range(4))
+def test_long_context_mtp_runs_the_step_scheduled_when_it_stops(slack):
+    """Drafts never right, a prompt near the window: the request stops at its context, and the
+    step already scheduled when the stop lands still fits the cache though it is prepared
+    before its trim (the inline path)."""
+    k = 3
+    engine, sub, cfg = _build_engine(k, long_context=True)
+    wrong = cfg.vocab_size - 1
+    sub._draft_tokens = lambda hidden, prev: torch.full(
+        (hidden.shape[0],), wrong, dtype=torch.long)
+    limit, block = cfg.context_limit, k + 1
+    prompt = (torch.arange(limit - 2 * block - 40 - slack) * 37 + 11) % 240
+    engine.add_request("r", {SAMPLER: SamplingReqConfig(temperature=0.0, ignore_eos=True)})
+    out, stops = _step(engine, "prefill", {"r": prompt}, 10 * limit, ignore_eos=True)
+    step = 0
+    while not stops.get("r"):
+        out, stops = _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit,
+                           step, ignore_eos=True)
+        step += 1
+    # at the context, not at the cache rows the rejected drafts would have taken
+    assert len(prompt) + sub.request_state("r").get("mtp_generated") + 3 * block > limit
+    _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit, step,
+          ignore_eos=True)
+    assert engine._resources[KV_CACHE]._streams["r"]["main"].stored_len <= cfg.kv_rows
+    slot = engine._resources[KDA_STATE]._slots["r"]["main"].index
+    assert int(sub._mtp_len[slot]) <= limit
+    engine.remove_request("r")
+
+
 def test_long_context_mtp_layer_selects_with_its_own_indexer():
     """Under dsa_long_context the MTP layer keeps an index plane, as a trunk layer does, and
     the prompt's MTP pass writes every prompt row's key there: its drafts select over the whole
@@ -600,32 +644,6 @@ def test_long_context_mtp_layer_selects_with_its_own_indexer():
     keys = torch.stack([plane[pages[p // size], p % size, :d] for p in range(len(prompt["a"]))])
     assert bool(keys.abs().sum(-1).gt(0).all())
     engine.remove_request("a")
-
-
-def test_long_context_decode_stops_while_the_next_block_fits():
-    """Under trims the host counts every verify step's whole block against kv_rows (here
-    max_seq_len): decode stops while the step that may already be scheduled still fits, and
-    that step runs."""
-    k = 3
-    engine, sub, cfg = _build_engine(k, long_context=True)
-    block, limit = k + 1, cfg.max_seq_len
-    assert cfg.mtp_trims and cfg.kv_rows == cfg.context_limit == limit
-    prompt = (torch.arange(limit - 2 * block - 9) * 37 + 11) % 240
-    engine.add_request("r", {SAMPLER: SamplingReqConfig(temperature=0.0)})
-    out, stops = _step(engine, "prefill", {"r": prompt}, 10 * limit, ignore_eos=True)
-    step = 0
-    while not stops.get("r"):
-        out, stops = _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit,
-                           step, ignore_eos=True)
-        step += 1
-    rows = len(prompt) + step * block
-    assert rows + block <= limit < rows + 2 * block
-    _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit, step,
-          ignore_eos=True)
-    assert sub.request_state("r").get("context") <= limit
-    slot = engine._resources[KDA_STATE]._slots["r"]["main"].index
-    assert int(sub._mtp_len[slot]) <= limit
-    engine.remove_request("r")
 
 
 # -- a stop on the prefill walk -----------------------------------------------

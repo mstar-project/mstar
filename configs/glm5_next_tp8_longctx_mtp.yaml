@@ -17,8 +17,8 @@ model_kwargs:
   dsa_long_context: true
   # each rank selects a block of a long prompt's rows (the indexer grows as the prompt squared)
   dsa_shard_prefill: true
-  # Rows a request may hold, prompt and output together. Each verify step takes a whole
-  # block of them, so at 3 tokens a step three quarters of the room past a prompt is output.
+  # Tokens a request may hold, prompt and output together (a verify step's rejected rows
+  # come back two steps later).
   max_seq_len: 1048576
   # Prompts up to the largest captured bucket (4096 tokens) prefill captured, several to a
   # step; a longer prompt takes a step of its own and runs eager, 8192 tokens at a time.

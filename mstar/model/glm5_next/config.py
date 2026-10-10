@@ -403,8 +403,8 @@ class Glm5NextModelConfig:
         """MTP under dsa_long_context: the next step's block overwrites a verify step's
         rejected rows instead of leaving them as holes, which the k-pool indexer would pool
         as tokens. The host plans each block after the last one's whole block, before that
-        one's verdict exists, and never takes rows back; the device moves the block to the
-        request's true rows (Glm5NextLLMSubmodule._trim_on_device)."""
+        one's verdict exists, and takes the rejected rows back two steps on; the device moves
+        the block to the request's true rows (Glm5NextLLMSubmodule._trim_on_device)."""
         return self.mtp_num_draft_tokens > 0 and self.dsa_long_context
 
     @property
@@ -413,9 +413,9 @@ class Glm5NextModelConfig:
         max_seq_len; under MTP each verify step also leaves its rejected drafts
         as holes, and twice the rows keeps those from binding first until
         acceptance falls below about (k + 1) / 2 tokens per step. Under
-        mtp_trims the host counts a step's whole block the same way, though
-        the device rewrites the rejected rows, within max_seq_len rows: a
-        decode score as wide as twice the window costs its memory twice."""
+        mtp_trims the cache holds the context and its two newest blocks,
+        within max_seq_len rows: a decode score as wide as twice the window
+        costs its memory twice."""
         holes = self.mtp_num_draft_tokens > 0 and not self.mtp_trims
         return self.max_seq_len * (2 if holes else 1)
 

@@ -374,7 +374,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         limit = self.config.context_limit
         # the handle, which the batch, check_stop and cleanup_request key by
         state = self.request_state(fwd_info.rid_handle)
-        committed = state.get("context", 0)
+        # cache rows: the context, less what _trim took back (its own counter: the GPU thread
+        # adds to the context while the plan thread trims)
+        committed = state.get("context", 0) - state.get("mtp_trimmed", 0)
         real = committed
         if self.mtp_k > 0 and graph_walk == "decode":
             # holes are cache rows, not context: the model sees the prompt and the
@@ -394,6 +396,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             state.add("prompt_len", committed + seq_len)
             if self.mtp_k > 0:
                 state.add_all(mtp_generated=1, mtp_pending=None)
+                if self.config.mtp_trims:
+                    # mutated in place from here on: the plan thread trims while the GPU thread
+                    # records the next verdict (_trim, _read_verdicts)
+                    state.add_all(mtp_untrimmed=[], mtp_accepted={}, mtp_trimmed=0)
         # a sampled request's verify step runs the sampled capture (`cg_key_info`)
         return ARNodeInputs(input_ids=text_inputs, input_seq_len=seq_len,
                             resource_step_info=SAMPLED if sampled and graph_walk == "decode"
@@ -448,6 +454,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             else:
                 del steps[SAMPLER]
             steps[KDA] = LinearAttnStep(speculative=True)
+            if self.config.mtp_trims:
+                self._trim(request_ids)
         if self.config.dsa_long_context:
             # every MLA layer attends sparse (dsa.py): no dense plan over the whole context
             del steps[ATTN]
@@ -663,8 +671,35 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             real = set(ctx.request_ids if ctx is not None else engine_inputs.per_request_info)
             for row, rid in enumerate(engine_inputs.request_ids):
                 if rid in real:
-                    self.request_state(rid).add("mtp_pending", (seq, key, row))
+                    state = self.request_state(rid)
+                    state.add("mtp_pending", (seq, key, row))
+                    untrimmed = state.get("mtp_untrimmed")
+                    if untrimmed is not None:
+                        # its rejected rows go back once a later step is declared (_trim)
+                        untrimmed.append(seq)
         return to_device_async([seq], torch.long, self.lm_head.weight.device)
+
+    def _trim(self, request_ids: list[str]) -> None:
+        """mtp_trims: take back the rejected rows of every verify step older than the newest,
+        before this step is admitted. Every rank declares this step after the newest one was
+        preprocessed, and that one only after the GPU thread had read the verdicts before it,
+        so each rank trims the same steps at the same point, without waiting; the newest
+        step's verdict may not exist yet. The device already writes each block at the true
+        rows (_trim_on_device), so this moves the host's count only: its cache length and
+        context."""
+        kv = self.node_resources[KV_CACHE]
+        for rid in request_ids:
+            state = self.request_state(rid)
+            untrimmed = state.get("mtp_untrimmed")
+            if untrimmed is None or len(untrimmed) < 2:
+                continue
+            older = untrimmed[:-1]
+            accepted = state.get("mtp_accepted")
+            drop = sum(self.mtp_k - accepted.pop(seq) for seq in older)
+            del untrimmed[:len(older)]
+            if drop:
+                kv.correct_len(rid, LABEL, -drop)
+                state.add("mtp_trimmed", state.get("mtp_trimmed", 0) + drop)
 
     def _last_rows(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """Each row's last token, which a captured prefill reads at a fixed
@@ -837,8 +872,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     def _trim_on_device(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
         """mtp_trims: move this verify step's block to each request's true rows. The host
-        plans every block after the last one's whole block, as with holes, and never takes
-        rows back, so its cache, and every rank's, moves the same whatever was accepted;
+        plans every block after the last one's whole block, as with holes, before that one's
+        verdict exists (it takes the rows back two steps on, _trim);
         ``_mtp_len`` (each slot's tokens in cache, advanced by every verify on device) gives
         the true rows, and the rows' positions and the cache slots their latents and index
         keys go to follow them. A captured step keeps its plan, made for the longest rows, and
@@ -1050,6 +1085,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         out = [(table[p[2]][:k1], table[p[2]][k1]) for p in pending]
         for st, verdict in zip(states, out, strict=True):
             st.add("mtp_verdict", (seq, *verdict))
+            accepted = st.get("mtp_accepted")
+            if accepted is not None:
+                accepted[seq] = verdict[1]
         return out
 
     def unpack_packed_outputs(
@@ -1172,10 +1210,14 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         steps = request_info.dynamic_loop_iter_counts.get("decode_loop", 0)
         if request_info.graph_walk == "decode":
             steps += 1
-        # every verify step's block stays in the host's cache, holes or rows the device rewrote
-        prompt, room = state.get("prompt_len", 0), 2 * self.mtp_block
+        # Holes keep every verify step's block in the cache. Under mtp_trims it holds the
+        # context and the newest blocks: two, and a third while a step prepared inline has not
+        # been trimmed yet (prepare_inputs runs before declare_step there)
+        prompt = state.get("prompt_len", 0)
+        room = (3 if self.config.mtp_trims else 2) * self.mtp_block
         full = (prompt + generated + room > self.config.context_limit
-                or prompt + steps * self.mtp_block + room > self.config.kv_rows)
+                or (not self.config.mtp_trims
+                    and prompt + steps * self.mtp_block + room > self.config.kv_rows))
         if is_eos or generated >= request_info.max_tokens or full:
             return {"decode_loop"}
         return set()
