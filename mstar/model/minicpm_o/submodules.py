@@ -708,22 +708,20 @@ class Token2WavSubmodule(NodeSubmodule):
     silence codes first, 28-code windows advancing by 25, a last flush).
 
     The windows are the ``LeftContextChunkPolicy(25, 3)`` stream from the TTS;
-    the first window gets the silence prepended here. A request's caches live
-    in its slot of the ``T2W_STATE`` pool (``RecurrentStatePool``), which this
-    node uses as its backend: it works on the slot's own views, initialised from
-    the voice's prepared state on the first window. Their host-side lengths ride
-    in the request's state.
+    the first window gets the silence prepended here. A request's attention caches
+    are on the ``T2W_KV`` bounded KV resources, which start from its voice's
+    prepared caches; its conv caches and HiFT tails are its slot of ``T2W_STATE``
+    (``RecurrentStatePool``). Its stream position (tokens written) rides in the
+    request's state.
 
-    Float32, batched straight on the pool. A voice's full non-last windows enter
-    the caches at one of three lengths (the first window, the second, and every
-    later one), so rows of one (voice, phase) batch and replay a piecewise
-    capture (``t2w/<voice>/<phase>``), bucketed by batch size; the inverse STFT
-    and cross-fade stay eager. A last window after the steady phase has one
-    of 25 lengths, each its own one-row capture (``t2w/<voice>/last<n>``);
-    other last windows (replies under three windows) run eagerly, batched by
-    length. The per-request ``Token2Wav.stream`` path is bit-exact against
-    the reference at full fp32; this batched path attends the DiT's cache
-    in another order and runs its blocks on fused TF32 kernels.
+    Float32. Each window runs in two stages (``forward_batched``), each a piecewise
+    capture bucketed by batch size: the flow (``t2w/<voice>/flow28``), for windows
+    at any position, and HiFT, separately for a request's first window, whose
+    input is shorter. A last window has one of a few lengths, each a one-row
+    capture; other shapes run eagerly. The inverse STFT and cross-fade stay eager.
+    The per-request ``Token2Wav.stream`` path is bit-exact against the reference at
+    full fp32; this one attends the DiT's cache in another order and runs on fused
+    TF32 kernels.
     """
 
     WINDOW_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
@@ -948,7 +946,7 @@ class Token2WavSubmodule(NodeSubmodule):
         """Each window in two stages: the flow, batched over every row of one voice and
         window length whatever its position, then HiFT, batched over rows that are all
         or none their request's first window."""
-        from mstar.model.minicpm_o.components.token2wav import lengths_after, state_lengths, window_tokens
+        from mstar.model.minicpm_o.components.token2wav import window_tokens
 
         pool = engine_inputs.resources[T2W_STATE]
         blocks = {name: pool.block(name, 0) for name in pool.config.blocks}
@@ -956,10 +954,9 @@ class Token2WavSubmodule(NodeSubmodule):
         node_plans = {name: engine_inputs.resources[key].current for name, key in T2W_KV.items()}
         node_rows = {rid: i for i, rid in enumerate(engine_inputs.request_ids)}
 
-        lengths, num_tokens, flows = {}, {}, {}
+        first, num_tokens, flows = {}, {}, {}
         for rid, (codes, last, voice_name) in zip(engine_inputs.request_ids, rows, strict=True):
-            req = self.request_state(rid)
-            lengths[rid] = req["lengths"] if "lengths" in req else state_lengths(self.voices[voice_name].initial)
+            first[rid] = not self.request_state(rid).get("started", False)
             num_tokens[rid] = codes.shape[1]
             flows.setdefault((voice_name, codes.shape[1], last), []).append((rid, codes))
 
@@ -971,16 +968,15 @@ class Token2WavSubmodule(NodeSubmodule):
                 tokens = torch.cat([codes for _, codes in chunk])
                 mel = self._run_flow(
                     engine_inputs, pool, blocks, node_plans, node_rows, voice_name, region, rids, tokens,
-                    [lengths[rid]["calls"] == 0 for rid in rids], last,
+                    [first[rid] for rid in rids], last,
                 )
                 for i, rid in enumerate(rids):
                     mels[rid] = mel[i]
-                    first = lengths[rid]["calls"] == 0
-                    hifts.setdefault((first, mel.shape[-1], last), []).append(rid)
+                    hifts.setdefault((first[rid], mel.shape[-1], last), []).append(rid)
 
         out = {}
-        for (first, frames, last), rids in hifts.items():
-            region = self.hift_region(first, frames, last)
+        for (is_first, frames, last), rids in hifts.items():
+            region = self.hift_region(is_first, frames, last)
             for chunk in self._chunks(engine_inputs, region, rids, last):
                 mel = torch.stack([mels[rid] for rid in chunk])
                 slots = self._slots(pool, chunk, mel.device)
@@ -989,12 +985,11 @@ class Token2WavSubmodule(NodeSubmodule):
                     spectrum = runner.run(static_inputs={"mel": mel}, request_ids=chunk, real_bs=len(chunk))
                     magnitude, phase = spectrum.get_view("magnitude"), spectrum.get_view("phase")
                 else:
-                    spectrum = self.model.window_vocode(blocks, slots, mel, first, last)
+                    spectrum = self.model.window_vocode(blocks, slots, mel, is_first, last)
                     magnitude, phase = spectrum["magnitude"], spectrum["phase"]
-                wav = self.model.window_finish(blocks, slots, magnitude, phase, first, last)
+                wav = self.model.window_finish(blocks, slots, magnitude, phase, is_first, last)
                 for i, rid in enumerate(chunk):
                     req = self.request_state(rid)
-                    req.add("lengths", lengths_after(lengths[rid], num_tokens[rid], last))
                     # the attention caches' stream position (``_cache_steps``)
                     req.add("written", req.get("written", 0) + window_tokens(num_tokens[rid], last))
                     req.add("started", True)

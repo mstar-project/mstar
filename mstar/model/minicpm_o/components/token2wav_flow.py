@@ -42,33 +42,22 @@ N_TIMESTEPS = 10
 NOISE_FRAMES = 50 * 600
 
 
-class KVCache:
-    """One attention layer's keys|values (``[..., 2 * head_dim]``) between windows."""
-
-    length: int  # valid entries before this window
-
-    def read(self) -> torch.Tensor | None:
-        """The valid entries ``[N, H, length, 2d]``, or None when there are none."""
-        raise NotImplementedError
-
-    def write(self, k: torch.Tensor, v: torch.Tensor, new_first: bool) -> None:
-        """Persist after attention; ``k``/``v`` ``[N, H, length + T, d]`` are what the layer
-        attended to, this window's entries first (``new_first``) or last."""
-        raise NotImplementedError
-
-
-class DenseKV(KVCache):
-    """A request's own cache tensor ``[N, H, capacity, 2d]`` holding ``length`` entries;
-    afterwards it holds ``length + T`` in attention order (the caller truncates)."""
+class DenseKV:
+    """One layer's keys|values in a request's own cache tensor ``[N, H, capacity, 2d]``
+    holding ``length`` entries; afterwards it holds ``length + T`` in attention order (the
+    caller truncates). The reference path and voice preparation use it."""
 
     def __init__(self, buf: torch.Tensor, length: int):
         self.buf = buf
         self.length = length
 
     def read(self) -> torch.Tensor | None:
+        """The valid entries ``[N, H, length, 2d]``, or None when there are none."""
         return self.buf[:, :, : self.length] if self.length > 0 else None
 
     def write(self, k: torch.Tensor, v: torch.Tensor, new_first: bool) -> None:
+        """Persist ``k``/``v`` ``[N, H, length + T, d]``, what the layer attended to, this
+        window's entries first (``new_first``) or last."""
         if new_first:
             self.buf[:, :, : k.shape[2]] = torch.cat([k, v], dim=3)
         else:
@@ -76,8 +65,8 @@ class DenseKV(KVCache):
             self.buf[:, :, n:k.shape[2]] = torch.cat((k[:, :, n:], v[:, :, n:]), dim=-1)
 
 
-class BoundedLayerKV(KVCache):
-    """A DiT layer's cache on the engine's bounded KV resource: ``plan`` is this
+class BoundedLayerKV:
+    """One layer's cache on the engine's bounded KV resource: ``plan`` is this
     batch's rows of the step's layout, ``source [rows, H, L, 2d]`` the layer's voice
     in stream order (``token2wav.CACHE_FAMILIES``). Rows may be at different positions."""
 
@@ -99,6 +88,10 @@ class BoundedLayerKV(KVCache):
     ) -> torch.Tensor:
         """``q, k, v [N, H, T, d]`` -> ``[N, T, H, d]``."""
         return self.resource.attend(self.layer_idx, q, k, v, self.source, self.plan, rel_bias)
+
+
+# what an attention layer is handed
+KVCache = DenseKV | BoundedLayerKV
 
 
 def rel_position_table(d_model: int, max_len: int = 5000) -> torch.Tensor:

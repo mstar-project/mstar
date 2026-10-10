@@ -60,7 +60,6 @@ from mstar.model.minicpm_o.components.token2wav_flow import (
     UP_RATE,
     BoundedLayerKV,
     DenseKV,
-    KVCache,
     Token2WavFlow,
 )
 from mstar.model.minicpm_o.components.voice_prompt import (
@@ -140,9 +139,11 @@ class CacheCapacity:
 
 @dataclass(slots=True)
 class Token2WavState:
-    """Everything one request carries between ``stream`` calls (batch dims of 1 kept so the
-    tensors feed the modules as they are). With ``C1 = P + 77`` and ``C2 = 2P + 154`` for a
-    ``P``-token voice prompt (``CacheCapacity``), float32:
+    """Everything one request carries between ``stream`` calls on the per-request path (the
+    reference, and how a voice's caches are prepared); the batched path keeps the attention
+    caches on bounded KV resources and the rest in a slot (``slot_layout``). Batch dims of 1
+    are kept so the tensors feed the modules as they are. With ``C1 = P + 77`` and
+    ``C2 = 2P + 154`` for a ``P``-token voice prompt (``CacheCapacity``), float32:
 
     - ``enc_cnn [1, 512, 6]``: the lookahead conv's and the upsampler's left context;
     - ``enc_kv1 [6, 1, 8, C1, 128]`` / ``enc_kv2 [4, 1, 8, C2, 128]``: the 25 Hz / 50 Hz
@@ -195,7 +196,7 @@ class Token2WavState:
             else:
                 setattr(self, f.name, src)
 
-    def kv_caches(self) -> tuple[list[KVCache], list[KVCache], list[list[KVCache]]]:
+    def kv_caches(self) -> tuple[list[DenseKV], list[DenseKV], list[list[DenseKV]]]:
         """The attention caches as the flow takes them: 25 Hz and 50 Hz conformer layers, and
         per Euler step per DiT block."""
         return (
@@ -325,23 +326,6 @@ CACHE_FAMILIES = {
     "dit": CacheFamily(N_TIMESTEPS * DIT_DEPTH, 2, DIT_HEADS, DIT_HEAD_DIM, UP_RATE, _dit_retention,
                        _dit_source, reverse_step_order=True),
 }
-
-
-def state_from_slot(blocks: dict[str, torch.Tensor], lengths: dict[str, int]) -> Token2WavState:
-    """A ``Token2WavState`` over one slot's block views, so every in-place update lands in
-    the slot; ``lengths`` holds the host-side fields (``prompt_frames``, ``enc_len1``, ...)."""
-    tensors = {
-        name: view.unsqueeze(_BATCH_AXIS[name]) if name in _BATCH_AXIS else view
-        for name, view in blocks.items()
-    }
-    return Token2WavState(**tensors, **lengths)
-
-
-def state_lengths(state: Token2WavState) -> dict[str, int]:
-    return {
-        f.name: getattr(state, f.name) for f in fields(state)
-        if not isinstance(getattr(state, f.name), torch.Tensor)
-    }
 
 
 class AttentionCache(NamedTuple):
@@ -677,19 +661,6 @@ class Token2Wav(nn.Module):
 # The token counts a last window after a full one can have: the left context plus 0 to
 # HOP - 1 new codes (a full window's worth would have made a full window).
 LAST_WINDOW_TOKENS = range(WINDOW - HOP, WINDOW)
-
-
-def lengths_after(lengths: dict[str, int], num_tokens: int, last: bool) -> dict[str, int]:
-    """The host lengths after a window, truncation included (``Token2WavState.truncate``)."""
-    p2 = lengths["prompt_frames"]
-    t = window_frames(num_tokens, last) // UP_RATE
-    out = {**lengths, "calls": lengths["calls"] + 1, "enc_len1": lengths["enc_len1"] + t,
-           "enc_len2": lengths["enc_len2"] + UP_RATE * t, "dit_len": lengths["dit_len"] + UP_RATE * t}
-    limit = p2 + KEEP_RECENT
-    out["dit_len"] = min(out["dit_len"], limit)
-    if out["enc_len2"] > limit:
-        out["enc_len2"], out["enc_len1"] = limit, limit // UP_RATE
-    return out
 
 
 def voice_blocks(voice: Token2WavVoice) -> dict[str, torch.Tensor]:

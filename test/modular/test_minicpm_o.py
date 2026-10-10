@@ -186,5 +186,5 @@ def test_every_node_gets_only_its_resources(model):
         "vision_encoder": {"vision_attn", "resampler_attn"},
         "audio_encoder": {"audio_attn"},
         "TTS": {"tts_kv", "tts_attn", "tts_pos", "tts_sampler"},
-        "Token2Wav": {"t2w_state", "t2w_dit_kv"},
+        "Token2Wav": {"t2w_state", "t2w_enc1_kv", "t2w_enc2_kv", "t2w_dit_kv"},
     }

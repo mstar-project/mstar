@@ -23,11 +23,8 @@ from mstar.model.minicpm_o.components.token2wav import (
     Token2Wav,
     Token2WavState,
     fade_in_out,
-    lengths_after,
     num_windows,
     slot_layout,
-    state_from_slot,
-    state_lengths,
     stream_windows,
     window_frames,
     window_samples,
@@ -256,29 +253,6 @@ def test_stream_shapes_and_capacity_independence(random_token2wav):
     assert torch.equal(outs[0], outs[1])
 
 
-def test_lengths_after():
-    p2 = 302
-    lengths = {"prompt_frames": p2, "enc_len1": 151, "enc_len2": 302, "dit_len": 302, "calls": 0}
-    for _ in range(5):
-        lengths = lengths_after(lengths, 28, False)
-    assert lengths == {"prompt_frames": p2, "enc_len1": 201, "enc_len2": 402, "dit_len": 402, "calls": 5}
-
-
-def test_lengths_after_matches_state(random_token2wav):
-    """The host bookkeeping agrees with what ``flow_chunk`` leaves in a state."""
-    model = random_token2wav
-    p = 50
-    voice = model.prepare_voice(VoicePrompt(
-        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32), spk_emb=torch.randn(1, 192),
-        mel=torch.randn(1, 2 * p, 80),
-    ))
-    st = model.new_state(voice)
-    for win, last in list(stream_windows(list(range(80))))[:3]:
-        want = lengths_after(state_lengths(st), len(win), last)
-        model.stream(st, voice, win, last)
-        assert state_lengths(st) == want
-
-
 def _assert_same_frames(a: torch.Tensor, b: torch.Tensor, tol: float = 1e-2) -> None:
     """``[..., L, 2d]`` caches holding the same L frames in any order: every frame of each
     has a match in the other (frames are ~10 apart; tol is summation-order drift)."""
@@ -328,29 +302,25 @@ def test_batched_windows_on_pool(random_token2wav, device):
     def check_slot(slot, st):
         from mstar.model.minicpm_o.components.token2wav_flow import DIT_DEPTH, N_TIMESTEPS
 
-        fields_ = {n: t[slot] for n, t in blocks.items()}
-        view = state_from_slot(
-            {**fields_, "enc_kv1": st.enc_kv1, "enc_kv2": st.enc_kv2, "dit_kv": st.dit_kv}, state_lengths(st))
         # the conformer attends its caches in order; the DiT's only as a set
         torch.testing.assert_close(kv_steps.retained("enc1", "r0"), st.enc_kv1[..., :st.enc_len1, :], **tol)
         torch.testing.assert_close(kv_steps.retained("enc2", "r0"), st.enc_kv2[..., :st.enc_len2, :], **tol)
         _assert_same_frames(kv_steps.retained("dit", "r0").unflatten(0, (N_TIMESTEPS, DIT_DEPTH)),
                             st.dit_kv[..., :st.dit_len, :], tol=1e-2 if device == "cpu" else 0.5)
-        for name in fields_:
-            a, b = getattr(view, name), getattr(st, name)
-            torch.testing.assert_close(a, b, **tol, msg=name)
+        # the slot holds the rest without the state's batch axes
+        for name, t in blocks.items():
+            torch.testing.assert_close(t[slot], getattr(st, name).reshape(t[slot].shape), **tol, msg=name)
 
     ref = model.new_state(voice)
-    lengths = state_lengths(voice.initial)
     mels, noises = [], []
-    for win, last in wins[0]:
-        nz = noise(2, lengths["calls"], win, last)
+    for i, (win, last) in enumerate(wins[0]):
+        first = i == 0
+        nz = noise(2, 0 if first else 1, win, last)
         row0 = HiFTNoise(phase=nz.phase[:1], harmonic=nz.harmonic[:1])
         mel = model.flow_chunk(ref, voice, torch.tensor([win], dtype=torch.int32, device=device), last)
         want = model.vocode_chunk(ref, mel, last, noise=row0)
         tokens = torch.tensor([win], dtype=torch.int32, device=device)
         kv, commit = kv_steps.window(["r0"], len(win), last)
-        first = lengths["calls"] == 0
         out = model.window_spectrum(blocks, one, voice, first, tokens, kv, last, row0)
         commit()
         got = model.window_finish(blocks, one, out["magnitude"], out["phase"], first, last)
@@ -358,7 +328,6 @@ def test_batched_windows_on_pool(random_token2wav, device):
         torch.testing.assert_close(got, want, **tol)
         if not last:
             check_slot(1, ref)
-        lengths = lengths_after(lengths, len(win), last)
         mels.append(mel)
         noises.append(nz)
 
