@@ -50,6 +50,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import load_generation_defaults
 from mstar.model.whisper.config import (
     ATTN,
     CONTEXT_LABEL,
@@ -62,6 +63,20 @@ from mstar.model.whisper.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# model_kwargs forwarded to the engine sampler when the request sets them
+SAMPLING_KEYS = (
+    "temperature", "top_p", "top_k", "min_p",
+    "repetition_penalty", "penalize_prompt", "ignore_eos",
+)
+# greedy, as openai-whisper decodes; the checkpoint's generation_config.json overrides
+DEFAULT_SAMPLING = {"temperature": 0.0, "top_p": 1.0}
+
+
+def sampling_defaults(checkpoint_dir) -> dict:
+    """``DEFAULT_SAMPLING`` under the knobs the checkpoint's generation_config.json sets."""
+    checkpoint = load_generation_defaults(checkpoint_dir)
+    return {**DEFAULT_SAMPLING, **{k: v for k, v in checkpoint.items() if k in SAMPLING_KEYS}}
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -97,6 +112,7 @@ class WhisperModel(Model):
 
         self.local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
         self.config = WhisperModelConfig.from_pretrained(self.local_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir)
 
         from transformers import AutoFeatureExtractor, AutoTokenizer
 
@@ -186,8 +202,10 @@ class WhisperModel(Model):
             SamplerSpec(
                 resource_key=SAMPLER, nodes={"decoder"},
                 vocab_size=self.config.vocab_size,
-                # ASR transcription decodes greedily; no seen-token buffers.
-                enable_repetion_penalty=False,
+                # ASR decodes greedily; without the capability a request
+                # penalty or min_p is refused at admission.
+                enable_repetion_penalty=self.sampling_defaults.get("repetition_penalty", 1) != 1,
+                enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
         ]
 
@@ -197,14 +215,15 @@ class WhisperModel(Model):
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args
         model_kwargs = model_kwargs or {}
-        return {
-            SAMPLER: SamplingReqConfig(
-                # ASR default is greedy (temperature 0 -> argmax).
-                temperature=model_kwargs.get("temperature", 0.0),
-                top_p=model_kwargs.get("top_p", 1.0),
-                ignore_eos=model_kwargs.get("ignore_eos", False),
-            )
+        sampling = {
+            **self.sampling_defaults,
+            **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs},
         }
+        return {SAMPLER: SamplingReqConfig(**sampling)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        # ``initial_prompt`` and ``timestamps`` from the transcription adapter are not read
+        return frozenset({"language", "task", "max_output_tokens", *SAMPLING_KEYS})
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a request cap the decoder caches cannot hold.
@@ -253,8 +272,8 @@ class WhisperModel(Model):
     def get_max_output_tokens(self, **model_kwargs):
         # The learned position table caps prompt + generated tokens at
         # max_target_positions (448); the forced decoder prompt takes 4.
-        limit = self.config.max_target_positions - 4
-        return min(model_kwargs.get("max_output_tokens", limit), limit)
+        # A larger request is refused by the conductor, not clamped.
+        return model_kwargs.get("max_output_tokens", self.config.max_target_positions - 4)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = Sequential([
@@ -390,6 +409,11 @@ class WhisperModel(Model):
         forced token sequence (language / task / timestamps), which is
         controlled by ``language`` and ``task`` in model kwargs.
         """
+        language = kwargs.get("language", "en")
+        task = kwargs.get("task", "transcribe")
+        for name, value in (("language", language), ("task", task)):
+            if not isinstance(value, str):
+                raise ValueError(f"{name} must be a string; got {value!r}")
         raw_audio_inputs = (tensors or {}).get("audio_inputs", [])
         if len(raw_audio_inputs) != 1:
             raise ValueError(
@@ -406,10 +430,7 @@ class WhisperModel(Model):
         )
         audio_features = feat["input_features"][0]  # (num_mel_bins, 3000)
 
-        prompt_ids = self.config.decoder_prompt_ids(
-            language=kwargs.get("language", "en"),
-            task=kwargs.get("task", "transcribe"),
-        )
+        prompt_ids = self.config.decoder_prompt_ids(language=language, task=task)
 
         # the encoder takes the padded window whole, so its context is always this long
         context = self.config.max_source_positions

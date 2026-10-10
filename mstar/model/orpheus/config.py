@@ -68,12 +68,14 @@ class OrpheusModelConfig:
     snac_left_context_frames: int = 3
     snac_right_context_frames: int = 2
 
-    # Generation defaults
+    # Sampling defaults; the checkpoint's generation_config.json overrides them
     temperature: float = 0.6
     top_p: float = 0.8
+    top_k: int = 0
+    min_p: float = 0.0
     repetition_penalty: float = 1.3
+    penalize_prompt: bool = True
     ignore_eos: bool = False  # benchmark parity: decode to max_tokens regardless of EOS
-    max_new_tokens: int = 4096
 
     # Available voices
     available_voices: list[str] = field(
