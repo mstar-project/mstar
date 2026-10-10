@@ -451,7 +451,8 @@ class Token2Wav(nn.Module):
     @torch.inference_mode()
     def prepare_voice(self, prompt: VoicePrompt) -> Token2WavVoice:
         """``set_stream_cache``: the flow over the prompt tokens + 3 silence tokens with the
-        prompt mel as condition, keeping only the caches."""
+        prompt mel as condition, keeping only the caches. Runs once per bundled voice at
+        load, on ``DenseKV`` (see there for why that is not a resource)."""
         device = self.speech_window.device
         tokens = prompt.tokens.to(device)
         p = tokens.shape[1]

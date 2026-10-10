@@ -45,7 +45,12 @@ NOISE_FRAMES = 50 * 600
 class DenseKV:
     """One layer's keys|values in a request's own cache tensor ``[N, H, capacity, 2d]``
     holding ``length`` entries; afterwards it holds ``length + T`` in attention order (the
-    caller truncates). The reference path and voice preparation use it."""
+    caller truncates). The reference path and voice preparation use it.
+
+    Not an engine resource because serving only uses it to prepare the bundled voices at
+    load, outside any request. Per-request voices would make voice caches per-request
+    state with limited capacity; they should then live in the bounded KV resource (as
+    refcounted sources, filled by a preparation step), leaving this to the reference."""
 
     def __init__(self, buf: torch.Tensor, length: int):
         self.buf = buf
