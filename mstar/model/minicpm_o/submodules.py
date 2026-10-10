@@ -43,6 +43,7 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
+from mstar.model.minicpm_o.components.token2wav_flow import UP_RATE as UP_RATE_T2W
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
@@ -53,7 +54,7 @@ from mstar.model.minicpm_o.config import (
     PATCHES,
     QUERIES,
     RESAMPLER_ATTN,
-    T2W_DIT_KV,
+    T2W_KV,
     T2W_STATE,
     TTS_ATTN,
     TTS_KV,
@@ -736,34 +737,51 @@ class Token2WavSubmodule(NodeSubmodule):
         self.model = model
         self.voices = voices
         self.eos_code = eos_code
-        self._dit_sources: dict[str, torch.Tensor] = {}
+        # (family, voice) -> the voice's cache in that family's stream order
+        self._sources: dict[tuple[str, str], torch.Tensor] = {}
 
-    def _dit(self, resource, voice_name: str, plan):
-        from mstar.model.minicpm_o.components.token2wav import BoundedDiT, dit_source
+    def _caches(self, resources: Mapping, voice_name: str, plans: Mapping[str, Any]):
+        """A batch of one voice's ``WindowCaches``, on these plans of the cache resources."""
+        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES, AttentionCache, WindowCaches
 
-        source = self._dit_sources.get(voice_name)
-        if source is None:
-            source = self._dit_sources[voice_name] = dit_source(self.voices[voice_name])
-        return BoundedDiT(resource, source, plan)
+        caches = {}
+        for name, family in CACHE_FAMILIES.items():
+            source = self._sources.get((name, voice_name))
+            if source is None:
+                source = self._sources[(name, voice_name)] = family.source(self.voices[voice_name])
+            caches[name] = AttentionCache(resources[T2W_KV[name]], source, plans[name])
+        return WindowCaches(**caches)
 
-    def _dit_step(self, request_ids: list[str], voices: list[str], spans: list[int]) -> BoundedKVStep:
-        """Each row's DiT stream position (its voice's frames, then 50 a full window)
-        and the frames this window adds to it."""
-        from mstar.model.minicpm_o.components.token2wav import PRE_LOOKAHEAD, UP_RATE, WINDOW, state_lengths
+    def _cache_steps(
+        self, request_ids: list[str], voices: list[str], num_tokens: list[int], lasts: list[bool],
+    ) -> dict[str, BoundedKVStep]:
+        """Each cache resource's step: every row's stream position and what its window adds."""
+        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES, state_lengths
 
-        positions = {}
+        lengths = []
         for rid, voice in zip(request_ids, voices, strict=True):
             req = self.request_states.get(rid)
-            if voice is None or voice not in self.voices:
-                continue
-            lengths = req["lengths"] if req is not None and "lengths" in req else state_lengths(
-                self.voices[voice].initial)
-            positions[rid] = StreamPosition(
-                lengths["prompt_frames"], UP_RATE * (WINDOW - PRE_LOOKAHEAD) * lengths["calls"])
-        return BoundedKVStep(
-            segments=[Segment(request_id=rid, label="main", span=s) for rid, s in zip(request_ids, spans, strict=True)],
-            positions=positions,
-        )
+            if req is not None and "lengths" in req:
+                lengths.append(req["lengths"])
+            elif voice in self.voices:
+                lengths.append(state_lengths(self.voices[voice].initial))
+            else:
+                # a capture's dummy row: the resource plans it as padding
+                lengths.append(None)
+        steps = {}
+        for name, family in CACHE_FAMILIES.items():
+            positions = {
+                rid: StreamPosition(*family.position(ln["prompt_frames"] // UP_RATE_T2W, ln["calls"]))
+                for rid, ln in zip(request_ids, lengths, strict=True) if ln is not None
+            }
+            steps[T2W_KV[name]] = BoundedKVStep(
+                segments=[
+                    Segment(request_id=rid, label="main", span=family.span(n, last))
+                    for rid, n, last in zip(request_ids, num_tokens, lasts, strict=True)
+                ],
+                positions=positions,
+            )
+        return steps
 
     def prepare_inputs(
         self,
@@ -793,17 +811,15 @@ class Token2WavSubmodule(NodeSubmodule):
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
     ) -> SubmoduleStep:
-        from mstar.model.minicpm_o.components.token2wav import window_frames
-
-        spans = [
-            0 if inp.kwargs["last"] else window_frames(inp.tensor_inputs["codes"].shape[1], False)
-            for inp in inputs
-        ]
         return SubmoduleStep(
             segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
             steps={
                 T2W_STATE: RecurrentStep(),
-                T2W_DIT_KV: self._dit_step(request_ids, [inp.kwargs["voice"] for inp in inputs], spans),
+                **self._cache_steps(
+                    request_ids, [inp.kwargs["voice"] for inp in inputs],
+                    [inp.tensor_inputs["codes"].shape[1] for inp in inputs],
+                    [inp.kwargs["last"] for inp in inputs],
+                ),
             },
         )
 
@@ -825,7 +841,6 @@ class Token2WavSubmodule(NodeSubmodule):
             PHASE_STEADY,
             WINDOW,
             phase_lengths,
-            window_frames,
         )
 
         def static_inputs(num_tokens: int):
@@ -834,15 +849,13 @@ class Token2WavSubmodule(NodeSubmodule):
             return make
 
         def declare_step_for(voice_name: str, last: bool):
-            span = 0 if last else window_frames(WINDOW, False)
-
             def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
+                n = len(request_ids)
                 return SubmoduleStep(
                     segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
                     steps={
                         T2W_STATE: RecurrentStep(),
-                        T2W_DIT_KV: self._dit_step(
-                            request_ids, [voice_name] * len(request_ids), [span] * len(request_ids)),
+                        **self._cache_steps(request_ids, [voice_name] * n, list(seq_lens), [last] * n),
                     },
                 )
             return declare_step
@@ -852,12 +865,12 @@ class Token2WavSubmodule(NodeSubmodule):
 
             def capture(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
                 pool = call.resources[T2W_STATE]
-                dit_kv = call.resources[T2W_DIT_KV]
                 tokens = call.static_inputs["tokens"]
+                plans = {name: call.resources[key].current for name, key in T2W_KV.items()}
                 return self.model.window_spectrum(
                     {name: pool.block(name, 0) for name in pool.config.blocks},
                     pool.addressing("main").slot_indices[: tokens.shape[0]],
-                    voice, lengths, tokens, self._dit(dit_kv, voice_name, dit_kv.current), last,
+                    voice, lengths, tokens, self._caches(call.resources, voice_name, plans), last,
                 )
             return capture
 
@@ -916,9 +929,8 @@ class Token2WavSubmodule(NodeSubmodule):
             key = (voice_name, *window_batch_key(lengths, codes.shape[1], last))
             groups.setdefault(key, []).append((rid, codes, lengths))
         pool = engine_inputs.resources[T2W_STATE]
-        # the node step's layout, before a captured region plans its own
-        dit_kv = engine_inputs.resources[T2W_DIT_KV]
-        self._node_dit_plan = dit_kv.current
+        # the node step's layouts, before a captured region plans its own
+        self._node_plans = {name: engine_inputs.resources[key].current for name, key in T2W_KV.items()}
         self._node_rows = {rid: i for i, rid in enumerate(engine_inputs.request_ids)}
         out = {}
         for key, group in groups.items():
@@ -950,9 +962,10 @@ class Token2WavSubmodule(NodeSubmodule):
                 blocks, slots, spectrum.get_view("magnitude"), spectrum.get_view("phase"), lengths, last,
             )
         else:
-            plan = self._node_dit_plan.select([self._node_rows[rid] for rid in rids])
-            dit = self._dit(engine_inputs.resources[T2W_DIT_KV], voice_name, plan)
-            wav = self.model.stream_batched(blocks, slots, voice, lengths, tokens, dit, last)
+            rows = [self._node_rows[rid] for rid in rids]
+            plans = {name: plan.select(rows) for name, plan in self._node_plans.items()}
+            caches = self._caches(engine_inputs.resources, voice_name, plans)
+            wav = self.model.stream_batched(blocks, slots, voice, lengths, tokens, caches, last)
         out = {}
         for i, (rid, _, row_lengths) in enumerate(group):
             req = self.request_state(rid)

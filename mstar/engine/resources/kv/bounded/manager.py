@@ -93,25 +93,27 @@ class BoundedKVManager(Resource):
         v: torch.Tensor,
         source: torch.Tensor | None = None,
         plan: BoundedPlan | None = None,
+        rel_bias: torch.Tensor | None = None,
         ieee: bool = False,
     ) -> torch.Tensor:
         """Attention for ``q, k, v [B * rows, H, T, D]`` over each row's retained
         keys (``source [rows, H, L, 2D]`` is this layer's source prefix) and this
         step's own, then this step's keys into the slots. ``[B * rows, T, H, D]``.
         ``plan`` defaults to the step's; a forward running a subset of its rows
-        passes ``select`` of it."""
+        passes ``select`` of it. ``rel_bias`` is a per-distance score term
+        (``kernels.bounded_attention``), for relative-position attention."""
         plan = plan or self.current
         cache = self._cache[layer_idx]
         if not q.is_cuda:
-            return self._attend_torch(q, k, v, cache, source, plan)
+            return self._attend_torch(q, k, v, cache, source, plan, rel_bias)
         from mstar.engine.resources.kv.bounded.kernels import bounded_attention, bounded_store
 
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        out = bounded_attention(q, k, v, cache, source, plan.table, ieee)
+        out = bounded_attention(q, k, v, cache, source, plan.table, rel_bias, ieee)
         bounded_store(k, v, cache, plan.table, self.config.reverse_step_order)
         return out
 
-    def _attend_torch(self, q, k, v, cache, source, plan: BoundedPlan) -> torch.Tensor:
+    def _attend_torch(self, q, k, v, cache, source, plan: BoundedPlan, rel_bias=None) -> torch.Tensor:
         """The kernels' semantics row by row, from the host layouts (CPU)."""
         n, h, t, d = q.shape
         rows = self.config.rows_per_request
@@ -119,15 +121,22 @@ class BoundedKVManager(Resource):
         for i in range(n):
             b, c = divmod(i, rows)
             slot, layout = plan.rows[b]
-            keys, values = [k[i]], [v[i]]
+            keys, values = [], []
             for from_source, (start, count) in zip(READ_FROM_SOURCE, layout.reads, strict=True):
                 if count == 0 or (from_source and source is None):
                     continue
                 kv = (source[c] if from_source else cache[slot, c])[:, start:start + count]
                 keys.append(kv[..., :d])
                 values.append(kv[..., d:])
-            att = torch.softmax(q[i] @ torch.cat(keys, 1).transpose(-1, -2) * d ** -0.5, dim=-1)
-            out[i] = (att @ torch.cat(values, 1)).transpose(0, 1)
+            keys, values = torch.cat([*keys, k[i]], 1), torch.cat([*values, v[i]], 1)
+            scores = q[i] @ keys.transpose(-1, -2)
+            if rel_bias is not None:
+                total = keys.shape[1] - t
+                # query i sits at total + i, key j at j
+                rel = total + torch.arange(t)[:, None] - torch.arange(keys.shape[1])[None, :] + t - 1
+                scores = scores + rel_bias[i].gather(-1, rel.to(q.device).expand(h, -1, -1))
+            att = torch.softmax(scores * d ** -0.5, dim=-1)
+            out[i] = (att @ values).transpose(0, 1)
         for i in range(n):
             b, c = divmod(i, rows)
             slot, layout = plan.rows[b]

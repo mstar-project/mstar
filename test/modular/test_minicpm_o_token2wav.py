@@ -40,62 +40,67 @@ from mstar.model.minicpm_o.components.token2wav import (
 from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt, _module_path
 
 
-def _dit_resource(p2: int, slots: int, device):
-    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
-    from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
-    from mstar.model.minicpm_o.components.token2wav import dit_retention
-    from mstar.model.minicpm_o.components.token2wav_flow import DIT_DEPTH, DIT_HEAD_DIM, DIT_HEADS, N_TIMESTEPS
+class _CacheSteps:
+    """Token2wav's three attention-cache resources for one voice, driven through admit /
+    plan / commit one window at a time, as the engine does."""
 
-    return BoundedKVManager(BoundedKVConfig(
-        num_layers=N_TIMESTEPS * DIT_DEPTH, num_heads=DIT_HEADS, head_dim=DIT_HEAD_DIM, rows_per_request=2,
-        max_source_len=p2, retention=dit_retention, max_slots=slots, reverse_step_order=True,
-    ), device)
+    def __init__(self, voice, slots: int, device):
+        from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
+        from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
+        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES
 
+        self.p = voice.initial.prompt_frames // 2
+        self.families = CACHE_FAMILIES
+        self.sources = {name: f.source(voice) for name, f in CACHE_FAMILIES.items()}
+        self.resources = {
+            name: BoundedKVManager(BoundedKVConfig(
+                num_layers=f.num_layers, num_heads=f.num_heads, head_dim=f.head_dim, rows_per_request=f.rows,
+                max_source_len=f.rate * self.p, retention=f.retention, max_slots=slots,
+                reverse_step_order=f.reverse_step_order,
+            ), device)
+            for name, f in CACHE_FAMILIES.items()
+        }
+        self.calls: dict[str, int] = {}
 
-class _DiTSteps:
-    """Drives the DiT's bounded KV through admit / plan / commit, one window at a time."""
-
-    def __init__(self, resource, voice):
-        from mstar.model.minicpm_o.components.token2wav import dit_source
-
-        self.resource = resource
-        self.source = dit_source(voice)
-        self.p2 = voice.initial.prompt_frames
-        self.written: dict[str, int] = {}
-
-    def window(self, rids, span):
+    def window(self, rids, num_tokens: int, last: bool):
         from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
         from mstar.engine.resources.step import Segment, StepContext
-        from mstar.model.minicpm_o.components.token2wav import BoundedDiT
+        from mstar.model.minicpm_o.components.token2wav import AttentionCache, WindowCaches
 
-        step = BoundedKVStep(
-            segments=[Segment(request_id=r, label="main", span=span) for r in rids],
-            positions={r: StreamPosition(self.p2, self.written.get(r, 0)) for r in rids},
-        )
         ctx = StepContext(request_ids=list(rids), graph_walk="t2w", slot=0, capture=False)
-        assert self.resource.admit(step, ctx).ok
-        plan = self.resource.plan(step, ctx)
-        return BoundedDiT(self.resource, self.source, plan), lambda: self._commit(step, ctx, rids, span)
+        caches, steps = {}, {}
+        for name, family in self.families.items():
+            step = steps[name] = BoundedKVStep(
+                segments=[Segment(request_id=r, label="main", span=family.span(num_tokens, last)) for r in rids],
+                positions={r: StreamPosition(*family.position(self.p, self.calls.get(r, 0))) for r in rids},
+            )
+            resource = self.resources[name]
+            assert resource.admit(step, ctx).ok
+            caches[name] = AttentionCache(resource, self.sources[name], resource.plan(step, ctx))
 
-    def _commit(self, step, ctx, rids, span):
-        self.resource.commit(step, ctx)
-        for r in rids:
-            self.written[r] = self.written.get(r, 0) + span
+        def commit():
+            for name, step in steps.items():
+                self.resources[name].commit(step, ctx)
+            if not last:
+                for r in rids:
+                    self.calls[r] = self.calls.get(r, 0) + 1
+        return WindowCaches(**caches), commit
 
-    def retained(self, rid) -> torch.Tensor:
-        """The DiT keys|values ``rid`` would attend next, ``[steps, depth, 2, H, n, 2d]``."""
+    def retained(self, name: str, rid) -> torch.Tensor:
+        """The keys|values ``rid`` would attend next in ``name``'s caches, ``[layers, rows, H, n, 2d]``."""
         from mstar.engine.resources.kv.bounded.layout import READ_FROM_SOURCE, row_layout
-        from mstar.model.minicpm_o.components.token2wav import dit_retention
-        from mstar.model.minicpm_o.components.token2wav_flow import DIT_DEPTH, N_TIMESTEPS
 
-        cfg = self.resource.config
-        layout = row_layout(self.p2, self.written[rid], 0, dit_retention(self.p2), cfg.sink_capacity, True)
-        slot = self.resource._requests[rid].slot
+        family, resource = self.families[name], self.resources[name]
+        source_len, written = family.position(self.p, self.calls.get(rid, 0))
+        layout = row_layout(source_len, written, 0, family.retention(source_len),
+                            resource.config.sink_capacity, family.reverse_step_order)
+        slot = resource._requests[rid].slot
         parts = []
         for from_source, (start, count) in zip(READ_FROM_SOURCE, layout.reads, strict=True):
-            buf = self.source if from_source else self.resource._cache[:, slot]
+            buf = self.sources[name] if from_source else resource._cache[:, slot]
             parts.append(buf[..., start:start + count, :])
-        return torch.cat(parts, dim=-2).unflatten(0, (N_TIMESTEPS, DIT_DEPTH))
+        return torch.cat(parts, dim=-2)
+
 
 CKPT = os.environ.get("MINICPM_O_CKPT")
 needs_ckpt = pytest.mark.skipif(not CKPT, reason="set MINICPM_O_CKPT to a MiniCPM-o 4.5 snapshot")
@@ -332,7 +337,7 @@ def test_batched_windows_on_pool(random_token2wav, device):
         spk_emb=torch.randn(1, 192).to(device), mel=torch.randn(1, 2 * p, 80).to(device),
     ))
     one, two = torch.tensor([1], device=device), torch.tensor([1, 2], device=device)
-    dit = _DiTSteps(_dit_resource(2 * p, 3, device), voice)
+    kv_steps = _CacheSteps(voice, 3, device)
     layout = slot_layout(CacheCapacity(p))
     blocks = {name: torch.zeros((3, *blk.shape), dtype=blk.dtype, device=device) for name, blk in layout.items()}
     codes = [torch.randint(0, 6561, (215,)).tolist() for _ in range(2)]
@@ -345,15 +350,18 @@ def test_batched_windows_on_pool(random_token2wav, device):
         return HiFTNoise(phase=nz.phase.to(device), harmonic=nz.harmonic.to(device))
 
     def check_slot(slot, st):
+        from mstar.model.minicpm_o.components.token2wav_flow import DIT_DEPTH, N_TIMESTEPS
+
         fields_ = {n: t[slot] for n, t in blocks.items()}
-        view = state_from_slot({**fields_, "dit_kv": st.dit_kv}, state_lengths(st))
-        _assert_same_frames(dit.retained("r0"), st.dit_kv[..., :st.dit_len, :],
-                            tol=1e-2 if device == "cpu" else 0.5)
+        view = state_from_slot(
+            {**fields_, "enc_kv1": st.enc_kv1, "enc_kv2": st.enc_kv2, "dit_kv": st.dit_kv}, state_lengths(st))
+        # the conformer attends its caches in order; the DiT's only as a set
+        torch.testing.assert_close(kv_steps.retained("enc1", "r0"), st.enc_kv1[..., :st.enc_len1, :], **tol)
+        torch.testing.assert_close(kv_steps.retained("enc2", "r0"), st.enc_kv2[..., :st.enc_len2, :], **tol)
+        _assert_same_frames(kv_steps.retained("dit", "r0").unflatten(0, (N_TIMESTEPS, DIT_DEPTH)),
+                            st.dit_kv[..., :st.dit_len, :], tol=1e-2 if device == "cpu" else 0.5)
         for name in fields_:
             a, b = getattr(view, name), getattr(st, name)
-            n = {"enc_kv1": st.enc_len1, "enc_kv2": st.enc_len2}.get(name)
-            if n is not None:
-                a, b = a[..., :n, :], b[..., :n, :]
             torch.testing.assert_close(a, b, **tol, msg=name)
 
     ref = model.new_state(voice)
@@ -365,7 +373,7 @@ def test_batched_windows_on_pool(random_token2wav, device):
         mel = model.flow_chunk(ref, voice, torch.tensor([win], dtype=torch.int32, device=device), last)
         want = model.vocode_chunk(ref, mel, last, noise=row0)
         tokens = torch.tensor([win], dtype=torch.int32, device=device)
-        kv, commit = dit.window(["r0"], 0 if last else window_frames(len(win), False))
+        kv, commit = kv_steps.window(["r0"], len(win), last)
         out = model.window_spectrum(blocks, one, voice, lengths, tokens, kv, last, row0)
         commit()
         got = model.window_finish(blocks, one, out["magnitude"], out["phase"], lengths, last)
@@ -379,11 +387,11 @@ def test_batched_windows_on_pool(random_token2wav, device):
 
     for t in blocks.values():
         t.zero_()
-    dit = _DiTSteps(_dit_resource(2 * p, 3, device), voice)
+    kv_steps = _CacheSteps(voice, 3, device)
     lengths = state_lengths(voice.initial)
     for k, ((w0, last), (w1, _)) in enumerate(zip(wins[0], wins[1], strict=True)):
         tokens = torch.tensor([w0, w1], dtype=torch.int32, device=device)
-        kv, commit = dit.window(["a", "b"], 0 if last else window_frames(len(w0), False))
+        kv, commit = kv_steps.window(["a", "b"], len(w0), last)
         out = model.window_spectrum(blocks, two, voice, lengths, tokens, kv, last, noises[k])
         commit()
         torch.testing.assert_close(out["mel"][:1], mels[k], **tol)

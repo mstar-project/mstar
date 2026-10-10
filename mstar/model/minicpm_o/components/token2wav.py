@@ -32,7 +32,7 @@ generator or the draws themselves.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, fields
 from typing import NamedTuple
 
@@ -61,7 +61,6 @@ from mstar.model.minicpm_o.components.token2wav_flow import (
     BoundedLayerKV,
     DenseKV,
     KVCache,
-    PoolKV,
     Token2WavFlow,
 )
 from mstar.model.minicpm_o.components.voice_prompt import (
@@ -240,13 +239,13 @@ class SlotBlock(NamedTuple):
 
 def slot_layout(capacity: CacheCapacity) -> dict[str, SlotBlock]:
     """Per-request slot of the batched path, for voices of up to ``capacity.prompt_tokens``
-    tokens: ``Token2WavState``'s tensors without their batch axes, except the DiT's
-    attention caches, which live in the bounded KV resource (``dit_retention``)."""
+    tokens: ``Token2WavState``'s tensors without their batch axes, except the attention
+    caches, which live in bounded KV resources (``CACHE_FAMILIES``)."""
     meta = Token2WavState.allocate(capacity, "meta")
     layout = {}
     for f in fields(Token2WavState):
         t = getattr(meta, f.name)
-        if isinstance(t, torch.Tensor) and f.name != "dit_kv":
+        if isinstance(t, torch.Tensor) and f.name not in ("enc_kv1", "enc_kv2", "dit_kv"):
             shape = list(t.shape)
             if f.name in _BATCH_AXIS:
                 del shape[_BATCH_AXIS[f.name]]
@@ -254,21 +253,72 @@ def slot_layout(capacity: CacheCapacity) -> dict[str, SlotBlock]:
     return layout
 
 
-def dit_retention(source_len: int) -> SinkWindow:
-    """What the DiT's caches keep, over a stream of ``dit_source`` and then each window
-    last-first: upstream keeps the first ``2P`` of ``[newest window, ..., voice]`` and
-    the voice's last 100 frames."""
+# Each attention cache keeps a sink and a window of a stream that starts with the voice's
+# own cache (its source) and continues with the request's windows, as upstream's
+# truncation does (``Token2WavState.truncate``): past ``2P + 100`` frames the 50 Hz caches
+# keep their first ``2P`` entries and their last 100, and the 25 Hz one its first
+# ``P + 50``. The DiT attends ``[newest window, ..., voice]`` without positions, so its
+# stream is the voice reordered and each window last-first, which makes upstream's
+# "first 2P" a window.
+
+
+def _enc1_retention(source_len: int) -> SinkWindow:
+    return SinkWindow(source_len + KEEP_RECENT // UP_RATE, 0)
+
+
+def _enc2_retention(source_len: int) -> SinkWindow:
+    return SinkWindow(source_len, KEEP_RECENT)
+
+
+def _dit_retention(source_len: int) -> SinkWindow:
     return SinkWindow(KEEP_RECENT, source_len)
 
 
-def dit_source(voice: "Token2WavVoice") -> torch.Tensor:
-    """The voice's DiT caches as the stream ``dit_retention`` starts from, per layer
-    (Euler step x block): ``[steps * depth, 2, H, 2P, 2d]``, its last 100 frames first,
-    then the rest last-first. Attention over them is order-free."""
+def _enc1_source(voice: Token2WavVoice) -> torch.Tensor:
+    return voice.initial.enc_kv1[..., : voice.initial.enc_len1, :].contiguous()
+
+
+def _enc2_source(voice: Token2WavVoice) -> torch.Tensor:
+    return voice.initial.enc_kv2[..., : voice.initial.enc_len2, :].contiguous()
+
+
+def _dit_source(voice: Token2WavVoice) -> torch.Tensor:
+    """Its last 100 frames, then the rest last-first, per Euler step x block."""
     p2 = voice.initial.prompt_frames
     kv = voice.initial.dit_kv[..., :p2, :]
     out = torch.cat([kv[..., p2 - KEEP_RECENT:, :], kv[..., :p2 - KEEP_RECENT, :].flip(-2)], dim=-2)
     return out.flatten(0, 1).contiguous()
+
+
+class CacheFamily(NamedTuple):
+    """One kind of token2wav attention cache, as a bounded KV resource declares it."""
+
+    num_layers: int
+    rows: int  # 2 for the DiT's guidance rows
+    num_heads: int
+    head_dim: int
+    # stream entries per token: 1 at 25 Hz, 2 at 50 Hz
+    rate: int
+    retention: Callable[[int], SinkWindow]
+    # the voice's cache in stream order, ``[layers, rows, H, L, 2d]``
+    source: Callable[[Token2WavVoice], torch.Tensor]
+    reverse_step_order: bool = False
+
+    def position(self, voice_tokens: int, calls: int) -> tuple[int, int]:
+        """``(source_len, written)`` before a request's next window, after ``calls`` full ones."""
+        return self.rate * voice_tokens, self.rate * (WINDOW - PRE_LOOKAHEAD) * calls
+
+    def span(self, num_tokens: int, last: bool) -> int:
+        """Stream entries a window adds: none for a last window, which writes no caches."""
+        return 0 if last else self.rate * (num_tokens - PRE_LOOKAHEAD)
+
+
+CACHE_FAMILIES = {
+    "enc1": CacheFamily(ENC_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, 1, _enc1_retention, _enc1_source),
+    "enc2": CacheFamily(ENC_UP_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, UP_RATE, _enc2_retention, _enc2_source),
+    "dit": CacheFamily(N_TIMESTEPS * DIT_DEPTH, 2, DIT_HEADS, DIT_HEAD_DIM, UP_RATE, _dit_retention,
+                       _dit_source, reverse_step_order=True),
+}
 
 
 def state_from_slot(blocks: dict[str, torch.Tensor], lengths: dict[str, int]) -> Token2WavState:
@@ -288,13 +338,22 @@ def state_lengths(state: Token2WavState) -> dict[str, int]:
     }
 
 
-class BoundedDiT(NamedTuple):
-    """Where a batch's DiT caches are: the bounded KV resource, the voice's
-    ``dit_source`` and the batch's rows of the step's plan."""
+class AttentionCache(NamedTuple):
+    """Where a batch's caches of one family are: the bounded KV resource, the voice's
+    source and the batch's rows of the step's plan."""
 
     resource: object
     source: torch.Tensor
     plan: object
+
+    def layer(self, idx: int, length: int) -> BoundedLayerKV:
+        return BoundedLayerKV(self.resource, idx, self.source[idx], self.plan, length)
+
+
+class WindowCaches(NamedTuple):
+    enc1: AttentionCache
+    enc2: AttentionCache
+    dit: AttentionCache
 
 
 class Token2WavVoice(NamedTuple):
@@ -492,7 +551,7 @@ class Token2Wav(nn.Module):
         voice: Token2WavVoice,
         lengths: dict[str, int],
         tokens: torch.Tensor,
-        dit: BoundedDiT,
+        caches: WindowCaches,
         last: bool = False,
         noise: HiFTNoise | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -515,21 +574,13 @@ class Token2Wav(nn.Module):
         fresh = lengths["calls"] == 0
         src = voice_blocks(voice) if fresh else blocks
         src_slots = torch.zeros_like(slots) if fresh else slots
-        plan = cache_writes(lengths, n_tok, last)
         enc_cnn = src["enc_cnn"].index_select(0, src_slots)
         # guidance rows of a request side by side, as the flow runs them
         dit_cnn = src["dit_cnn"].index_select(0, src_slots).permute(1, 2, 0, 3, 4, 5).contiguous().flatten(2, 3)
-
-        def kv(name, index, length, writes):
-            return PoolKV(blocks[name][(slice(None), *index)], slots, length, writes,
-                          src[name][(slice(None), *index)], src_slots)
-
-        kv1 = [kv("enc_kv1", (i,), lengths["enc_len1"], plan.enc_kv1) for i in range(ENC_BLOCKS)]
-        kv2 = [kv("enc_kv2", (i,), lengths["enc_len2"], plan.enc_kv2) for i in range(ENC_UP_BLOCKS)]
+        kv1 = [caches.enc1.layer(i, lengths["enc_len1"]) for i in range(ENC_BLOCKS)]
+        kv2 = [caches.enc2.layer(i, lengths["enc_len2"]) for i in range(ENC_UP_BLOCKS)]
         dit_kv = [
-            [BoundedLayerKV(dit.resource, step * DIT_DEPTH + i, dit.source[step * DIT_DEPTH + i], dit.plan,
-                            lengths["dit_len"])
-             for i in range(DIT_DEPTH)]
+            [caches.dit.layer(step * DIT_DEPTH + i, lengths["dit_len"]) for i in range(DIT_DEPTH)]
             for step in range(N_TIMESTEPS)
         ]
         mel = self.flow(tokens, voice.spk.expand(b, -1), None, last, enc_cnn, kv1, kv2, dit_cnn, dit_kv)
@@ -581,12 +632,12 @@ class Token2Wav(nn.Module):
         voice: Token2WavVoice,
         lengths: dict[str, int],
         tokens: torch.Tensor,
-        dit: BoundedDiT,
+        caches: WindowCaches,
         last: bool = False,
         noise: HiFTNoise | None = None,
     ) -> torch.Tensor:
         """``B`` ``stream`` calls of one voice entering at the same lengths, eagerly."""
-        out = self.window_spectrum(blocks, slots, voice, lengths, tokens, dit, last, noise)
+        out = self.window_spectrum(blocks, slots, voice, lengths, tokens, caches, last, noise)
         return self.window_finish(blocks, slots, out["magnitude"], out["phase"], lengths, last)
 
 
@@ -652,47 +703,6 @@ def lengths_after(lengths: dict[str, int], num_tokens: int, last: bool) -> dict[
     if out["enc_len2"] > limit:
         out["enc_len2"], out["enc_len1"] = limit, limit // UP_RATE
     return out
-
-
-class CacheWrites(NamedTuple):
-    """Per attention cache, the ``(keep, dst)`` scatters a window's write-back is."""
-
-    enc_kv1: list[tuple[slice, int]]
-    enc_kv2: list[tuple[slice, int]]
-    dit_kv: list[tuple[slice, int]]
-
-
-def cache_writes(lengths: dict[str, int], num_tokens: int, last: bool) -> CacheWrites:
-    """What a window writes back so the slot ends as ``Token2WavState.truncate`` leaves it.
-    The conformer's attended entries are ``[old, new]``, the DiT's ``[new, old]``; a fresh
-    request (``calls == 0``) read the voice, so its slot gets everything; a last window
-    writes nothing. Truncation keeps the first ``2P`` and the last 100 of ``[old, new]``
-    (the 25 Hz cache only its head, which needs the voice to have >= 50 tokens)."""
-    if last:
-        return CacheWrites([], [], [])
-    p2, limit = lengths["prompt_frames"], lengths["prompt_frames"] + KEEP_RECENT
-    after = lengths_after(lengths, num_tokens, last)
-    fresh = lengths["calls"] == 0
-    n1, n2, nd = lengths["enc_len1"], lengths["enc_len2"], lengths["dit_len"]
-    t2 = window_frames(num_tokens, last)
-    truncated = n2 + t2 > limit
-    if truncated and p2 < KEEP_RECENT:
-        raise ValueError("batched windows need a voice prompt of at least 50 tokens once the caches truncate")
-
-    start1 = 0 if fresh else n1
-    enc1 = [(slice(start1, after["enc_len1"]), start1)] if after["enc_len1"] > start1 else []
-    start2 = 0 if fresh else n2
-    if truncated:
-        enc2 = ([(slice(0, p2), 0)] if fresh else []) + [(slice(n2 + t2 - KEEP_RECENT, n2 + t2), p2)]
-    else:
-        enc2 = [(slice(start2, n2 + t2), start2)]
-    if nd + t2 > limit:
-        # the last 100 already sit at [2P, 2P + 100) when the cache entered at its bound
-        tail = [] if (not fresh and nd == limit) else [(slice(nd + t2 - KEEP_RECENT, nd + t2), p2)]
-        dit = [(slice(0, p2), 0)] + tail
-    else:
-        dit = [(slice(0, nd + t2), 0)]
-    return CacheWrites(enc1, enc2, dit)
 
 
 def voice_blocks(voice: Token2WavVoice) -> dict[str, torch.Tensor]:

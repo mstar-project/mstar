@@ -66,7 +66,7 @@ from mstar.model.minicpm_o.config import (
     LLM_POS,
     LLM_SAMPLER,
     RESAMPLER_ATTN,
-    T2W_DIT_KV,
+    T2W_KV,
     T2W_STATE,
     TTS_ATTN,
     TTS_KV,
@@ -274,7 +274,7 @@ class MiniCPMOModel(Model):
                     max_slots=T2W_DEFAULT_SLOTS,
                 ),
             ),
-            self._t2w_dit_kv(),
+            *self._t2w_kv(),
         ]
 
     def _t2w_capacity(self):
@@ -294,30 +294,27 @@ class MiniCPMOModel(Model):
 
         return slot_layout(self._t2w_capacity())
 
-    def _t2w_dit_kv(self) -> BoundedKVSpec:
-        from mstar.model.minicpm_o.components.token2wav import dit_retention
-        from mstar.model.minicpm_o.components.token2wav_flow import (
-            DIT_DEPTH,
-            DIT_HEAD_DIM,
-            DIT_HEADS,
-            N_TIMESTEPS,
-            UP_RATE,
-        )
+    def _t2w_kv(self) -> list[BoundedKVSpec]:
+        """Token2wav's attention caches, sized for the longest bundled voice."""
+        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES
 
-        return BoundedKVSpec(
-            resource_key=T2W_DIT_KV, nodes={TOKEN2WAV},
-            config=BoundedKVConfig(
-                num_layers=N_TIMESTEPS * DIT_DEPTH,
-                num_heads=DIT_HEADS,
-                head_dim=DIT_HEAD_DIM,
-                # the two guidance rows
-                rows_per_request=2,
-                max_source_len=UP_RATE * self._t2w_capacity().prompt_tokens,
-                retention=dit_retention,
-                max_slots=T2W_DEFAULT_SLOTS - 1,
-                reverse_step_order=True,
-            ),
-        )
+        voice_tokens = self._t2w_capacity().prompt_tokens
+        return [
+            BoundedKVSpec(
+                resource_key=T2W_KV[name], nodes={TOKEN2WAV},
+                config=BoundedKVConfig(
+                    num_layers=family.num_layers,
+                    num_heads=family.num_heads,
+                    head_dim=family.head_dim,
+                    rows_per_request=family.rows,
+                    max_source_len=family.rate * voice_tokens,
+                    retention=family.retention,
+                    max_slots=T2W_DEFAULT_SLOTS - 1,
+                    reverse_step_order=family.reverse_step_order,
+                ),
+            )
+            for name, family in CACHE_FAMILIES.items()
+        ]
 
     def _tts_resources(self) -> list[NodeResourceSpec]:
         tts = self.tts_config

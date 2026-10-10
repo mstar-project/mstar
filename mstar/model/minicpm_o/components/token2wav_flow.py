@@ -77,135 +77,6 @@ class DenseKV(KVCache):
             self.buf[:, :, n:k.shape[2]] = torch.cat((k[:, :, n:], v[:, :, n:]), dim=-1)
 
 
-class PoolKV(KVCache):
-    """Rows of slot-major pool views ``[slots, *rows, H, capacity, 2d]``. Reads gather
-    ``[:length]`` of ``src`` at ``src_slots`` (a voice's initial state as a one-slot pool, say),
-    flattening ``rows`` per slot into the batch (``[B * prod(rows), H, length, 2d]``). After
-    attention each ``(keep, dst)`` in ``writes`` scatters the attended entries ``keep`` to
-    ``[dst, dst + len(keep))`` of ``view`` at ``slots``: that is how a fixed-length window
-    lands its cache, truncation included, without a separate pass."""
-
-    def __init__(
-        self,
-        view: torch.Tensor,
-        slots: torch.Tensor,
-        length: int,
-        writes: list[tuple[slice, int]],
-        src: torch.Tensor | None = None,
-        src_slots: torch.Tensor | None = None,
-    ):
-        self.view = view
-        self.slots = slots
-        self.length = length
-        self.writes = writes
-        self.src = view if src is None else src
-        self.src_slots = slots if src_slots is None else src_slots
-
-    def read(self) -> torch.Tensor | None:
-        if self.length == 0:
-            return None
-        rows = self.src[..., : self.length, :].index_select(0, self.src_slots)
-        return rows.flatten(0, rows.dim() - 4)
-
-    def write(self, k: torch.Tensor, v: torch.Tensor, new_first: bool) -> None:
-        del new_first
-        rows = (self.slots.shape[0], *self.view.shape[1:-3])
-        d = k.shape[-1]
-        for keep, dst in self.writes:
-            # keys and values straight into their halves of the slot, without a joined copy
-            for half, part in ((slice(0, d), k), (slice(d, 2 * d), v)):
-                part = part[:, :, keep].unflatten(0, rows)
-                self.view[..., dst:dst + part.shape[-2], half].index_copy_(0, self.slots, part)
-
-
-class RingKV(KVCache):
-    """A DiT layer's cache for a batch of windows on the slot pool, in place.
-
-    The reference attends ``[new, old]`` and then keeps the first ``2P`` entries and a fixed
-    ``2P..2P+100`` tail. Followed through the windows, the head is the newest generated
-    frames then a shrinking prefix of the voice prompt's, dropping from its end, and the rest
-    is always a slice of the voice's own cache: ``voice[2P - n : 2P]`` with ``n = length -
-    2P`` (0, 50, then 100). DiT attention has no mask and no positions, so only that multiset
-    matters, not its order: the head lives in a ring of ``2P`` frames per slot (``view [S, 2,
-    H, >= 2P, 2d]``) whose newest chunk starts at the slot's ``head`` index, and the tail is
-    read from the voice (``voice [2, H, >= 2P, 2d]``). A window writes only its own frames, at
-    ``[head - T, head)`` mod ``2P``, which is exactly what the reference drops; the caller
-    moves ``head`` once per window (``advance_heads``). A request's first window reads the
-    voice as its ring (``fresh``) and copies it into the slot before writing."""
-
-    def __init__(
-        self,
-        view: torch.Tensor,
-        heads: torch.Tensor,
-        slots: torch.Tensor,
-        voice: torch.Tensor,
-        prompt_frames: int,
-        length: int,
-        fresh: bool,
-        write: bool,
-    ):
-        self.view = view
-        self.heads = heads
-        self.slots = slots
-        self.voice = voice
-        self.p2 = prompt_frames
-        self.length = length
-        self.fresh = fresh
-        self.write_back = write
-
-    def keys_values(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """The cached entries ``[2B, H, 2P + n, 2d]``: the ring (or the voice, fresh) then the
-        voice's tail."""
-        b, p2 = self.slots.shape[0], self.p2
-        if self.fresh:
-            ring = self.voice[None, :, :, :p2].expand(b, -1, -1, -1, -1)
-        else:
-            ring = self.view[:, :, :, :p2].index_select(0, self.slots)
-        tail = self.voice[None, :, :, p2 - (self.length - p2):p2].expand(b, -1, -1, -1, -1)
-        return torch.cat([ring, tail], dim=3).flatten(0, 1).chunk(2, dim=-1)
-
-    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """The CUDA path: attention straight over the ring and the voice (Triton), then this
-        window's ``k, v`` into the ring. Returns ``[2B, T, H, d]``."""
-        from mstar.model.minicpm_o.components.token2wav_kernels import ring_attention, ring_store
-
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        out = ring_attention(q, k, v, self.view, self.slots, self.voice, self.p2,
-                             self.length - self.p2, self.fresh)
-        if self.write_back:
-            if self.fresh:
-                b = self.slots.shape[0]
-                self.view[:, :, :, :self.p2].index_copy_(
-                    0, self.slots, self.voice[None, :, :, :self.p2].expand(b, -1, -1, -1, -1))
-            ring_store(k, v, self.view, self.slots, self.heads, self.p2, self.fresh)
-        return out
-
-    def ring_positions(self, frames: int) -> torch.Tensor:
-        """``[B, frames]`` ring indices this window's frames go to."""
-        head = torch.zeros_like(self.slots) if self.fresh else self.heads.index_select(0, self.slots).long()
-        offsets = torch.arange(frames, device=self.slots.device) - frames
-        return (head[:, None] + offsets[None, :]) % self.p2
-
-    def store(self, k: torch.Tensor, v: torch.Tensor) -> None:
-        """This window's ``k, v [2B, H, T, d]`` into the ring."""
-        if not self.write_back:
-            return
-        b = self.slots.shape[0]
-        if self.fresh:
-            self.view[:, :, :, :self.p2].index_copy_(
-                0, self.slots, self.voice[None, :, :, :self.p2].expand(b, -1, -1, -1, -1))
-        new = torch.cat([k, v], dim=-1).unflatten(0, (b, 2))  # [B, 2, H, T, 2d]
-        pos = self.ring_positions(new.shape[3])
-        self.view[self.slots[:, None], :, :, pos] = new.permute(0, 3, 1, 2, 4)
-
-    @staticmethod
-    def advance_heads(heads: torch.Tensor, slots: torch.Tensor, frames: int, prompt_frames: int,
-                      fresh: bool) -> None:
-        """After a window's last layer: the newest chunk now starts ``frames`` earlier."""
-        head = torch.zeros_like(slots) if fresh else heads.index_select(0, slots).long()
-        heads.index_copy_(0, slots, ((head - frames) % prompt_frames).to(heads.dtype))
-
-
 class BoundedLayerKV(KVCache):
     """A DiT layer's cache on the engine's bounded KV resource: ``plan`` is this
     batch's rows of the step's layout, ``source [2, H, 2P, 2d]`` the layer's voice in
@@ -219,8 +90,18 @@ class BoundedLayerKV(KVCache):
         self.source = source
         self.plan = plan
 
-    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        return self.resource.attend(self.layer_idx, q, k, v, self.source, self.plan)
+    @property
+    def max_keys(self) -> int:
+        """The most keys a row retains (before this step's own)."""
+        config = self.resource.config
+        policy = config.retention(config.max_source_len)
+        return policy.sink + policy.window
+
+    def attend(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``q, k, v [N, H, T, d]`` -> ``[N, T, H, d]``."""
+        return self.resource.attend(self.layer_idx, q, k, v, self.source, self.plan, rel_bias)
 
 
 def rel_position_table(d_model: int, max_len: int = 5000) -> torch.Tensor:
@@ -269,6 +150,8 @@ class RelPositionAttention(nn.Module):
         self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
         self.pos_bias_u = nn.Parameter(torch.zeros(n_head, self.d_k))
         self.pos_bias_v = nn.Parameter(torch.zeros(n_head, self.d_k))
+        # (queries, band width) -> projected position rows, built on first use
+        self._bands: dict[tuple[int, int], torch.Tensor] = {}
 
     @staticmethod
     def rel_shift(x: torch.Tensor) -> torch.Tensor:
@@ -276,12 +159,34 @@ class RelPositionAttention(nn.Module):
         x_padded = torch.cat([zero_pad, x], dim=-1).view(x.size(0), x.size(1), x.size(3) + 1, x.size(2))
         return x_padded[:, :, 1:].view_as(x)[:, :, :, : x.size(-1) // 2 + 1]
 
+    def _band(self, pe: torch.Tensor, t: int, width: int) -> torch.Tensor:
+        """``linear_pos`` of the relative positions ``t - 1 - r`` for ``r < width``,
+        ``[H, d_k, width]``: entry ``(n + i) - j + t - 1`` is query ``i``'s term for key
+        ``j`` of a row retaining ``n``, as ``rel_shift`` lines them up."""
+        band = self._bands.get((t, width))
+        if band is None:
+            center = pe.size(1) // 2  # relative position 0
+            index = center - (t - 1) + torch.arange(width, device=pe.device)
+            band = self.linear_pos(pe[0, index]).view(width, self.h, self.d_k).permute(1, 2, 0).contiguous()
+            self._bands[(t, width)] = band
+        return band
+
+    def _attend_bounded(self, q, k, v, pe: torch.Tensor, kv: BoundedLayerKV) -> torch.Tensor:
+        b, t = q.shape[:2]
+        band = self._band(pe, t, kv.max_keys + 2 * t - 1)
+        bd = torch.matmul((q + self.pos_bias_v).transpose(1, 2), band)  # [B, H, T, width]
+        out = kv.attend((q + self.pos_bias_u).transpose(1, 2), k, v, rel_bias=bd)
+        return self.linear_out(out.reshape(b, t, self.h * self.d_k))
+
     def forward(self, x: torch.Tensor, pos_emb: torch.Tensor, kv: KVCache) -> torch.Tensor:
-        """``x [B, T, D]``; this chunk's keys/values go after the cached ones."""
+        """``x [B, T, D]``; this chunk's keys/values go after the cached ones. On a
+        ``BoundedLayerKV`` ``pos_emb`` is the whole table (``StreamingTokenEncoder.pe``)."""
         b, t, _ = x.shape
         q = self.linear_q(x).view(b, -1, self.h, self.d_k)
         k = self.linear_k(x).view(b, -1, self.h, self.d_k).transpose(1, 2)
         v = self.linear_v(x).view(b, -1, self.h, self.d_k).transpose(1, 2)
+        if isinstance(kv, BoundedLayerKV):
+            return self._attend_bounded(q, k, v, pos_emb, kv)
         cached = kv.read()
         if cached is not None:
             key_cache, value_cache = torch.split(cached, self.d_k, dim=-1)
@@ -397,17 +302,19 @@ class StreamingTokenEncoder(nn.Module):
         stage at ``len2 // 2``, which equals ``len1`` because ``len2 == 2 * len1`` on entry."""
         len1, len2 = kv1[0].length, kv2[0].length
         assert len2 == UP_RATE * len1, (len1, len2)
+        # on bounded caches each row's positions come from its own plan
+        bounded = isinstance(kv1[0], BoundedLayerKV)
         xs = self.embed(xs)
         if last_chunk:
             xs = F.pad(xs, (0, 0, 0, PRE_LOOKAHEAD))
         xs = self.pre_lookahead_layer(xs, cnn_cache[:, :, :2])
-        pos_emb = self.position_encoding(len1 + xs.shape[1])
+        pos_emb = self.pe if bounded else self.position_encoding(len1 + xs.shape[1])
         for idx, layer in enumerate(self.encoders):
             xs = layer(xs, pos_emb, kv1[idx])
 
         xs = self.up_layer(xs.transpose(1, 2).contiguous(), cnn_cache[:, :, 2:]).transpose(1, 2).contiguous()
         xs = self.up_embed(xs)
-        pos_emb = self.position_encoding(len1 * UP_RATE + xs.shape[1])
+        pos_emb = self.pe if bounded else self.position_encoding(len1 * UP_RATE + xs.shape[1])
         for idx, layer in enumerate(self.up_encoders):
             xs = layer(xs, pos_emb, kv2[idx])
         return self.after_norm(xs)
@@ -466,14 +373,6 @@ class DiTAttention(nn.Module):
         v = self._heads(self.to_v(x))
         if isinstance(kv, BoundedLayerKV):
             return self.proj(kv.attend(q, k, v).reshape(b, t, -1))
-        if isinstance(kv, RingKV):
-            if q.is_cuda:
-                x = kv.attend(q, k, v)  # [b, t, H, d]
-                return self.proj(x.reshape(b, t, -1))
-            k_cache, v_cache = kv.keys_values()
-            x = F.scaled_dot_product_attention(q, torch.cat([k, k_cache], dim=2), torch.cat([v, v_cache], dim=2))
-            kv.store(k, v)
-            return self.proj(x.transpose(1, 2).reshape(b, t, -1))
         cached = kv.read()
         if cached is not None:
             k_cache, v_cache = cached.chunk(2, dim=3)
@@ -593,7 +492,7 @@ class DiT(nn.Module):
         """``x, mu, cond [N, 80, T]``, ``spks [N, 80]``; ``mods [depth, 9, r, 1, 512]`` /
         ``final_mod [2, r, 1, 512]`` the step's time modulations (``ChunkCFM.constants``),
         ``cnn_cache [depth, N, 1024, 2]`` and ``kv`` (one per block) its caches."""
-        if x.is_cuda and kv and isinstance(kv[0], (RingKV, BoundedLayerKV)):
+        if x.is_cuda and kv and isinstance(kv[0], BoundedLayerKV):
             from mstar.model.minicpm_o.components.token2wav_kernels import dit_forward
 
             return dit_forward(self, x, mu, mods, final_mod, spks, cond, cnn_cache, kv)

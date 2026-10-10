@@ -16,14 +16,24 @@ from mstar.engine.resources.kv.bounded.layout import NUM_READS, NUM_WRITES, ROW_
 
 
 @triton.jit
+def _scores(q, k, bias_rows, rel, valid, sm_scale, HAS_BIAS: tl.constexpr, PRECISION: tl.constexpr):
+    """``q . k`` plus, with a bias, each pair's entry ``rel`` of its query's band row."""
+    s = tl.dot(q, tl.trans(k), input_precision=PRECISION)
+    if HAS_BIAS:
+        s += tl.load(bias_rows + rel, mask=valid, other=0.0)
+    return tl.where(valid, s * sm_scale, float("-inf"))
+
+
+@triton.jit
 def _bounded_attention_kernel(
-    q_ptr, k_ptr, v_ptr, o_ptr, cache_ptr, source_ptr, table_ptr,
+    q_ptr, k_ptr, v_ptr, o_ptr, cache_ptr, source_ptr, table_ptr, bias_ptr,
     T, H, sm_scale,
     s_qn, s_qh, s_qt,
     s_cs, s_cr, s_ch, s_cp,
     s_sr, s_sh, s_sp,
     s_on, s_ot, s_oh,
-    ROWS: tl.constexpr, HAS_SOURCE: tl.constexpr, ROW_INTS: tl.constexpr,
+    s_bn, s_bh, s_bt,
+    ROWS: tl.constexpr, HAS_SOURCE: tl.constexpr, HAS_BIAS: tl.constexpr, ROW_INTS: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr, PRECISION: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -37,33 +47,16 @@ def _bounded_attention_kernel(
     mask_m = offs_m < T
     q = tl.load(q_ptr + n * s_qn + h * s_qh + offs_m[:, None] * s_qt + offs_d[None, :],
                 mask=mask_m[:, None], other=0.0)
-
-    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
-    l_i = tl.zeros([BLOCK_M], tl.float32)
-    acc = tl.zeros([BLOCK_M, D], tl.float32)
-
-    # this step's own tokens (separate k and v tensors, laid out like q)
-    for j0 in range(0, T, BLOCK_N):
-        offs_n = j0 + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < T
-        kv_off = n * s_qn + h * s_qh + offs_n[:, None] * s_qt + offs_d[None, :]
-        k = tl.load(k_ptr + kv_off, mask=mask_n[:, None], other=0.0)
-        v = tl.load(v_ptr + kv_off, mask=mask_n[:, None], other=0.0)
-        s = tl.dot(q, tl.trans(k), input_precision=PRECISION) * sm_scale
-        s = tl.where(mask_n[None, :], s, float("-inf"))
-        m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(s - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=PRECISION)
-        m_i = m_new
+    bias_rows = bias_ptr + n * s_bn + h * s_bh + offs_m[:, None] * s_bt
 
     row = table_ptr + b * ROW_INTS
     slot = tl.load(row).to(tl.int64)
     slot_base = cache_ptr + slot * s_cs + c * s_cr + h * s_ch
     source_base = source_ptr + c * s_sr + h * s_sh
-    # The five ranges (source, slot, source, slot, slot: layout.READ_FROM_SOURCE)
-    # tiled as one sequence, so short ranges do not each pay a masked tile.
+    # The five ranges (source, slot, source, slot, slot: layout.READ_FROM_SOURCE),
+    # in stream order: key j of them is at stream position j, this step's own at
+    # ``total + t``. Tiled as one sequence, so short ranges do not each pay a
+    # masked tile.
     s0 = tl.load(row + 1)
     e1 = tl.load(row + 2)
     s1 = tl.load(row + 3)
@@ -74,6 +67,28 @@ def _bounded_attention_kernel(
     e4 = e3 + tl.load(row + 8)
     s4 = tl.load(row + 9)
     total = e4 + tl.load(row + 10)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, D], tl.float32)
+
+    # this step's own tokens (separate k and v tensors, laid out like q); a pair's
+    # band entry is its query position minus its key position, plus T - 1
+    for j0 in range(0, T, BLOCK_N):
+        offs_n = j0 + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < T
+        kv_off = n * s_qn + h * s_qh + offs_n[:, None] * s_qt + offs_d[None, :]
+        k = tl.load(k_ptr + kv_off, mask=mask_n[:, None], other=0.0)
+        v = tl.load(v_ptr + kv_off, mask=mask_n[:, None], other=0.0)
+        rel = offs_m[:, None] - offs_n[None, :] + T - 1
+        s = _scores(q, k, bias_rows, rel, mask_m[:, None] & mask_n[None, :], sm_scale, HAS_BIAS, PRECISION)
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=PRECISION)
+        m_i = m_new
+
     for j0 in range(0, total, BLOCK_N):
         j = j0 + tl.arange(0, BLOCK_N)
         valid = j < total
@@ -88,8 +103,8 @@ def _bounded_attention_kernel(
             ptrs = tl.where(in_source[:, None], source_ptrs, ptrs)
         k = tl.load(ptrs, mask=valid[:, None], other=0.0)
         v = tl.load(ptrs + D, mask=valid[:, None], other=0.0)
-        s = tl.dot(q, tl.trans(k), input_precision=PRECISION) * sm_scale
-        s = tl.where(valid[None, :], s, float("-inf"))
+        rel = total + offs_m[:, None] - j[None, :] + T - 1
+        s = _scores(q, k, bias_rows, rel, mask_m[:, None] & valid[None, :], sm_scale, HAS_BIAS, PRECISION)
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(s - m_new[:, None])
@@ -143,11 +158,15 @@ def bounded_attention(
     cache: torch.Tensor,
     source: torch.Tensor | None,
     table: torch.Tensor,
+    rel_bias: torch.Tensor | None = None,
     ieee: bool = False,
 ) -> torch.Tensor:
     """``q, k, v [B * rows, H, T, D]`` (contiguous) over their retained ranges:
     ``cache [slots, rows, H, cap, 2D]`` and ``source [rows, H, L, 2D]`` per
-    ``table [>= B, ROW_INTS]``. Returns ``[B * rows, T, H, D]``."""
+    ``table [>= B, ROW_INTS]``. ``rel_bias [B * rows, H, T, R]`` adds to the
+    score of query ``i`` and stream key ``j`` its entry ``(n + i) - j + T - 1``,
+    ``n`` being the row's retained count (Transformer-XL's position term, which
+    depends on the distance alone). Returns ``[B * rows, T, H, D]``."""
     n, h, t, d = q.shape
     rows = cache.shape[1]
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
@@ -159,17 +178,24 @@ def bounded_attention(
     else:
         assert source.stride(-1) == 1
         s_src = (source.stride(0), source.stride(1), source.stride(2))
+    has_bias = rel_bias is not None
+    if has_bias:
+        assert rel_bias.shape[:3] == (n, h, t) and rel_bias.stride(-1) == 1
+        s_bias = (rel_bias.stride(0), rel_bias.stride(1), rel_bias.stride(2))
+    else:
+        rel_bias, s_bias = q, (0, 0, 0)
     out = torch.empty(n, t, h, d, device=q.device, dtype=q.dtype)
     block_m = 16 if n * h < 128 else 64
     grid = (triton.cdiv(t, block_m), n * h)
     _bounded_attention_kernel[grid](
-        q, k, v, out, cache, source, table,
+        q, k, v, out, cache, source, table, rel_bias,
         t, h, d ** -0.5,
         q.stride(0), q.stride(1), q.stride(2),
         cache.stride(0), cache.stride(1), cache.stride(2), cache.stride(3),
         *s_src,
         out.stride(0), out.stride(1), out.stride(2),
-        ROWS=rows, HAS_SOURCE=has_source, ROW_INTS=ROW_INTS,
+        *s_bias,
+        ROWS=rows, HAS_SOURCE=has_source, HAS_BIAS=has_bias, ROW_INTS=ROW_INTS,
         BLOCK_M=block_m, BLOCK_N=64, D=d, PRECISION="ieee" if ieee else "tf32",
     )
     return out
