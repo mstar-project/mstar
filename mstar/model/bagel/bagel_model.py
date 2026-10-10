@@ -74,12 +74,15 @@ from mstar.model.bagel.components.tokenization import BagelTokenizer, add_specia
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN, BagelVisionModel
 from mstar.model.bagel.config import load_bagel_config
 from mstar.model.bagel.submodules import (
+    IMAGE_ADVANCE,
+    IMAGE_SENTINELS,
     CombineCFGSubmodule,
     LLMSubmodule,
     VAEDecoderSubmodule,
     VAEEncoderSubmodule,
     ViTEncoderSubmodule,
-    vit_image_slots,
+    vit_patches,
+    vit_preprocess,
 )
 from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream, ProcessPromptOutput, Span
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
@@ -647,9 +650,8 @@ class BagelModel(Model):
                 if is_understanding and "image" not in output_modalities and tensors is not None:
                     layout = self._prefix_layout(
                         parts, segments, tensors["image_inputs"],
-                        # folded, not passed through: the ViT resizes any name but
-                        # "vllm" as "default", so both key alike
-                        "vllm" if kwargs.get("image_preprocess") == "vllm" else "default",
+                        # the ViT's own name for it, so names it resizes alike key alike
+                        vit_preprocess(kwargs.get("image_preprocess")),
                     )
                 if think_mode and not is_understanding:
                     # Not part of the request layout: tokenized on its own and
@@ -694,12 +696,13 @@ class BagelModel(Model):
                 spans.append(Span("ids", "prefill_text", length, length, "text_inputs"))
                 continue
             _, height, width = images[step.index].shape
-            slots = vit_image_slots(
+            patches = vit_patches(
                 height, width, image_preprocess,
                 self.config.vit_config.patch_size, self.config.vit_max_num_patch_per_side,
             )
             spans.append(Span(
-                "digest", "prefill_vit", slots, 1, ("image", step.index), (image_preprocess,),
+                "digest", "prefill_vit", patches + IMAGE_SENTINELS, IMAGE_ADVANCE,
+                ("image", step.index), (image_preprocess,),
             ))
         return spans
 
