@@ -173,7 +173,7 @@ def _down_kernel(
     tl.store(out + t * H + n, tl.sum(acc, 1).to(out.dtype.element_ty))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _router_logits_kernel(x, w, part, T, E: tl.constexpr, H: tl.constexpr, TB: tl.constexpr,
                           BE: tl.constexpr, S: tl.constexpr, BK: tl.constexpr,
                           IEEE: tl.constexpr, PDL: tl.constexpr):

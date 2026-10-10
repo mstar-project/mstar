@@ -140,14 +140,49 @@ def test_prefill_scores_compile_once_whatever_the_split():
     view = _write_pools(plane, tables, lens, ape, DEV)
     ctx = _ctx(tables, [0], [0], DEV)
     before = _compiled(_prefill_scores_kernel)
-    # rows and pools all multiples of 16 (one integer specialization), splits 25, 50, 16, 4
-    for rows, pools in [(16, 1600), (64, 3200), (256, 6400), (1024, 16000)]:
-        pos = torch.arange(pools * KP - rows, pools * KP, dtype=torch.int32, device=DEV)
+    # rows and pools of any count, splits 26, 50, 16, 4; the request's pages at any start in
+    # the step's list, its positions a slice at any offset
+    for i, (rows, pools) in enumerate([(17, 1601), (64, 3200), (250, 6399), (1024, 16000)]):
+        pages = torch.cat([torch.zeros(i * 3, dtype=torch.int32, device=DEV), ctx.pages])
+        full = torch.arange(pools * KP - rows - i, pools * KP, dtype=torch.int32, device=DEV)
+        pos = full[i:]
         q = torch.randn(rows, NH, D, device=DEV).bfloat16()
         w = torch.randn(rows, NH, device=DEV)
-        prefill_scores(q, w, view, ctx.pages, 0, pos, pools, KP)
+        prefill_scores(q, w, view, pages, i * 3, pos, pools, KP)
     torch.cuda.synchronize()
     assert _compiled(_prefill_scores_kernel) - before <= 1
+
+
+def test_metadata_slices_compile_each_kernel_once():
+    """A window's pos and row_req are slices of the step's, at any offset: the kernels that read
+    per-row metadata compile once whatever its alignment and the counts."""
+    from mstar.model.glm5_next import dsa_kernels as k
+
+    lens = [3000, 2000]
+    plane, tables, ape = _store(lens, seed=10)
+    view = _write_pools(plane, tables, lens, ape, DEV)
+    ctx = _ctx(tables, [0, 1], [2999, 1999], DEV)
+    kernels = (k._pool_keys_kernel, k._decode_scores_kernel, k._expand_slots_kernel)
+    first = None
+    for i, off in enumerate((0, 1, 2, 3)):
+        rows = 5 + off
+
+        def meta(t, n=rows, off=off):  # n values at a 4-byte offset into a larger tensor
+            big = torch.zeros(n + 4, dtype=torch.int32, device=DEV)
+            big[off:off + n] = t[:n] if t.numel() >= n else t.repeat(n)[:n]
+            return big[off:off + n]
+
+        pos, row_req = meta(ctx.pos.repeat(rows)), meta(ctx.row_req.repeat(rows))
+        k.pool_keys(view, ctx.pages, ctx.page_start, row_req, pos, ape.to(DEV), D)
+        q = torch.randn(rows, NH, D, device=DEV).bfloat16()
+        w = torch.randn(rows, NH, device=DEV)
+        k.decode_scores(q, w, view, ctx.pages, ctx.page_start, row_req, pos, 751 + off, KP)
+        pools = torch.full((rows, TOPK // KP), -1, dtype=torch.int32, device=DEV)
+        k.expand_slots(pools, pos, row_req, ctx.pages, ctx.page_start, KP, PAGE, TOPK)
+        torch.cuda.synchronize()
+        if i == 0:
+            first = [_compiled(fn) for fn in kernels]
+    assert [_compiled(fn) for fn in kernels] == first
 
 
 def test_expand_slots_kernel_matches_torch():
