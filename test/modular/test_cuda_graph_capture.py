@@ -13,6 +13,7 @@ on whether a capture succeeded.
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -21,6 +22,7 @@ import pytest
 import torch
 
 from mstar.engine.cuda_graph_runner import (
+    CaptureCost,
     CudaGraphRunner,
     capture_into_graph,
     fail_if_graphs_required,
@@ -67,9 +69,8 @@ class _Group:
 
 
 class _FakeRunner:
-    """`warmup_and_capture` and `_register_slot` bound onto stubs."""
+    """`warmup_and_capture`, with every bucket planned, and `_register_slot` bound onto stubs."""
 
-    warmup_and_capture = CudaGraphRunner.warmup_and_capture
     _register_slot = CudaGraphRunner._register_slot
     _buckets_captured_everywhere = CudaGraphRunner._buckets_captured_everywhere
     _report_dropped = CudaGraphRunner._report_dropped
@@ -84,6 +85,8 @@ class _FakeRunner:
         self._num_slots = num_slots
         self._specs = specs
         self._fail = fail
+        # every bucket alike, so capture keeps the specs' order
+        self._capture_costs = {spec.bucket: CaptureCost(0, 0, 0, num_slots) for spec in specs}
         self._buckets = {}
         self._memory_pool = None
         self.barrier = _Group(peer_flags)
@@ -98,6 +101,9 @@ class _FakeRunner:
 
     def prepare_for_capture(self):
         return self._specs
+
+    def warmup_and_capture(self):
+        CudaGraphRunner.warmup_and_capture(self, {spec.bucket for spec in self._specs})
 
     def _capture_one(self, spec):
         if (spec.bucket.graph_walk, spec.slot) in self._fail:
@@ -372,6 +378,29 @@ def test_a_failed_capture_leaves_the_pool_and_stream_usable():
     graph.replay()
     torch.cuda.synchronize()
     assert out.tolist() == [2.0] * 8
+
+
+@requires_cuda
+@pytest.mark.parametrize("fails", [False, True], ids=["captured", "failed"])
+def test_benchmark_is_off_inside_the_capture_and_restored_after(monkeypatch, fails):
+    """Qwen3-Omni turns cuDNN's benchmark mode on for Code2Wav's warm-up.
+    Inside a capture its search fails the capture, which cost Code2Wav its
+    bs=32 graph and kept that graph's pool."""
+    device = torch.device("cuda")
+    x = torch.ones(8, device=device)
+    seen = []
+
+    def run():
+        seen.append(torch.backends.cudnn.benchmark)
+        # a pageable host-to-device copy is not permitted while capturing
+        return x + torch.tensor([1.0], device=device) if fails else x * 2
+
+    for benchmark in (True, False):
+        monkeypatch.setattr(torch.backends.cudnn, "benchmark", benchmark)
+        with pytest.raises(RuntimeError) if fails else nullcontext():
+            capture_into_graph(run, torch.cuda.graph_pool_handle(), device, None)
+        assert torch.backends.cudnn.benchmark is benchmark, "the caller's setting must come back"
+    assert seen == [False, False], "cuDNN must not search inside the capture"
 
 
 def test_required_graphs_turn_a_dropped_bucket_into_a_startup_failure(monkeypatch):
