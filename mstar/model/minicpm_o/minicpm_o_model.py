@@ -67,6 +67,7 @@ from mstar.model.minicpm_o.components.token2wav import (
     CacheCapacity,
     load_token2wav,
     slot_layout,
+    voice_layout,
 )
 from mstar.model.minicpm_o.components.tts import MiniCPMTTS, TTSConfig
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision
@@ -79,6 +80,8 @@ from mstar.model.minicpm_o.config import (
     RESAMPLER_ATTN,
     T2W_KV,
     T2W_STATE,
+    T2W_VOICE,
+    T2W_VOICES,
     TTS_ATTN,
     TTS_KV,
     TTS_POS,
@@ -124,6 +127,8 @@ TTS_SAMPLING = TTSSampling()
 VOICES = {"default": "HT_ref_audio.wav"}
 DEFAULT_VOICE = "default"
 T2W_DEFAULT_SLOTS = 9
+# the longest custom voice prompt; it sizes the vocoder's caches when custom voices are on
+CUSTOM_VOICE_SECONDS = 10.0
 
 # Upstream's `get_sys_prompt(mode="audio_assistant", language="en")`, around
 # the voice's reference audio.
@@ -191,7 +196,12 @@ def _bound_positions(bounds: torch.Tensor) -> torch.Tensor:
 class MiniCPMOModel(Model):
     PREPROCESS_TORCH_THREADS = 4
 
-    def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any):
+    def __init__(
+        self, model_path_hf: str, cache_dir: str | None = None, custom_voices: int = 0, **kwargs: Any,
+    ):
+        """``custom_voices``: how many custom voices the vocoder holds at once (a pool it
+        allocates only for requests that bring one); 0 keeps to the bundled voices."""
+        self.custom_voices = custom_voices
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.local_dir = _resolve_metadata(model_path_hf, cache_dir)
@@ -293,15 +303,33 @@ class MiniCPMOModel(Model):
                 ),
             ),
             *self._t2w_kv(),
+            *self._t2w_voices(),
         ]
 
+    def _t2w_voices(self) -> list[NodeResourceSpec]:
+        if not self.custom_voices:
+            return []
+        return [RecurrentStateSpec(
+            resource_key=T2W_VOICES, nodes={TOKEN2WAV},
+            config=RecurrentStateConfig(
+                num_layers=1,
+                blocks={
+                    name: RecurrentBlockConfig(shape=block.shape, dtype=block.dtype)
+                    for name, block in voice_layout(self._t2w_capacity()).items()
+                },
+                max_slots=self.custom_voices + 1,
+            ),
+        )]
+
     def _t2w_capacity(self):
-        """Token2wav's caches sized for the longest bundled voice."""
+        """Token2wav's caches sized for the longest voice: bundled, or custom when allowed."""
         import soundfile as sf
 
         seconds = max(
             sf.info(str(Path(self.local_dir) / "assets" / f)).duration for f in VOICES.values()
         )
+        if self.custom_voices:
+            seconds = max(seconds, CUSTOM_VOICE_SECONDS)
         # the s3 tokenizer runs at 25 Hz; one token of slack for rounding
         return CacheCapacity(int(seconds * 25) + 1)
 
@@ -309,7 +337,7 @@ class MiniCPMOModel(Model):
         return slot_layout(self._t2w_capacity())
 
     def _t2w_kv(self) -> list[BoundedKVSpec]:
-        """Token2wav's attention caches, sized for the longest bundled voice."""
+        """Token2wav's attention caches, sized for the longest voice."""
         voice_tokens = self._t2w_capacity().prompt_tokens
         return [
             BoundedKVSpec(
@@ -457,14 +485,16 @@ class MiniCPMOModel(Model):
                 name=TOKEN2WAV, input_names=["tts_code"],
                 outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
             ),
+            T2W_VOICE: GraphNode(name=TOKEN2WAV, input_names=["voice_audio"], outputs=[]),
         }
 
     def get_partitions(self) -> list[PartitionDefinition]:
-        main = set(self.get_graph_walk_graphs()) - {T2W_CHUNK}
+        main = set(self.get_graph_walk_graphs()) - {T2W_CHUNK, T2W_VOICE}
         return [
             PartitionDefinition(name=MAIN, graph_walks=main, initial_walk=None, producer_partitions=[]),
             PartitionDefinition(
-                name=TOKEN2WAV, graph_walks={T2W_CHUNK}, initial_walk=T2W_CHUNK, producer_partitions=[MAIN],
+                name=TOKEN2WAV, graph_walks={T2W_VOICE, T2W_CHUNK}, initial_walk=T2W_CHUNK,
+                producer_partitions=[MAIN],
             ),
         ]
 
@@ -685,15 +715,23 @@ class MiniCPMOModel(Model):
         model_kwargs = model_kwargs or {}
         speech = "audio" in output_modalities
         if partition_name == TOKEN2WAV:
-            # self-triggered by its stream; idle unless the reply is spoken
+            # self-triggered by its stream; idle unless the reply is spoken. A custom
+            # voice is prepared first, while the LLM and TTS run; the stream buffers.
+            voice = model_kwargs.get("voice") or DEFAULT_VOICE
+            custom = bool(self.custom_voices and input_signals.get("voice_audio"))
             metadata = CurrentForwardConductorMetadata(
                 input_modalities=input_modalities, output_modalities=output_modalities,
-                graph_walk=T2W_CHUNK, is_prefill=False,
-                kwargs={"voice": model_kwargs.get("voice") or DEFAULT_VOICE},
+                graph_walk=T2W_VOICE if custom else T2W_CHUNK, is_prefill=False, kwargs={"voice": voice},
             )
+            inputs = []
+            if custom:
+                edge = GraphEdge(next_node=TOKEN2WAV, name="voice_audio")
+                edge.tensor_info = list(input_signals["voice_audio"])
+                inputs.append(edge)
             return ForwardPassArgs(
-                full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=not speech,
-                step_metadata={"voice": metadata.kwargs["voice"]},
+                full_metadata=metadata, inputs=inputs, request_done=not speech,
+                unpersist_tensors=sum((e.tensor_info for e in inputs), start=[]),
+                step_metadata={"voice": voice},
             )
         walk = self._prefill_walk(input_signals)
         metadata = CurrentForwardConductorMetadata(
@@ -741,10 +779,13 @@ class MiniCPMOModel(Model):
         one means it finished."""
         metadata = partition_metadata
         if partition_name == TOKEN2WAV:
-            # The stream buffer decides when it is done (after flushing the last
-            # window); nothing here predicts it from counts.
+            # The stream buffer decides when the chunks are done (after flushing the last
+            # window); nothing here predicts it. After the voice walk, an empty edge
+            # tells the worker the chunk walk has started.
+            inputs = [GraphEdge(next_node=TOKEN2WAV, name="t2w_trigger")] if metadata.graph_walk == T2W_VOICE else []
+            metadata.graph_walk = T2W_CHUNK
             return ForwardPassArgs(
-                full_metadata=metadata, inputs=[], unpersist_tensors=[],
+                full_metadata=metadata, inputs=inputs, unpersist_tensors=[],
                 step_metadata={"voice": metadata.kwargs["voice"]},
             )
         walk = metadata.graph_walk
@@ -802,7 +843,8 @@ class MiniCPMOModel(Model):
             for name in VOICES
         }
         logger.info("Loaded MiniCPM-o token2wav with voices %s onto %s", sorted(voices), device)
-        return Token2WavSubmodule(t2w.requires_grad_(False), voices, self.tts_config.eos_code)
+        return Token2WavSubmodule(
+            t2w.requires_grad_(False), voices, self.tts_config.eos_code, custom_voices=bool(self.custom_voices))
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:

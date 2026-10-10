@@ -76,11 +76,12 @@ class BoundedLayerKV:
     batch's rows of the step's layout, ``source [rows, H, L, 2d]`` the layer's voice
     in stream order (``token2wav.CACHE_FAMILIES``). Rows may be at different positions."""
 
-    def __init__(self, resource, layer_idx: int, source: torch.Tensor, plan):
+    def __init__(self, resource, layer_idx: int, source: torch.Tensor, plan, row_source=None):
         self.resource = resource
         self.layer_idx = layer_idx
         self.source = source
         self.plan = plan
+        self.row_source = row_source
 
     @property
     def max_keys(self) -> int:
@@ -93,7 +94,8 @@ class BoundedLayerKV:
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``q, k, v [N, H, T, d]`` -> ``[N, T, H, d]``."""
-        return self.resource.attend(self.layer_idx, q, k, v, self.source, self.plan, rel_bias)
+        return self.resource.attend(
+            self.layer_idx, q, k, v, self.source, self.plan, rel_bias, row_source=self.row_source)
 
 
 # what an attention layer is handed

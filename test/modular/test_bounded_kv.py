@@ -125,7 +125,7 @@ def test_token2wav_caches_are_sink_window():
                 assert got == want, (w, name)
 
 
-def _reference(q, k, v, cache, source, rows_layout, slots, sources, rel_bias=None):
+def _reference(q, k, v, cache, source, rows_layout, slots, sources, rel_bias=None, row_source=None):
     """Torch: attention over each row's ranges (in stream order) and its own keys,
     plus each pair's position term; then the writes."""
     n, h, t, d = q.shape
@@ -137,7 +137,12 @@ def _reference(q, k, v, cache, source, rows_layout, slots, sources, rel_bias=Non
         layout, slot = rows_layout[b], slots[b]
         parts = []
         for from_source, (start, count) in zip(READ_FROM_SOURCE, layout.reads, strict=True):
-            buf = source[sources[b], c] if from_source else cache[slot, c]
+            if not from_source:
+                buf = cache[slot, c]
+            elif sources[b] < 0:
+                buf = row_source[0][row_source[1][b], c]
+            else:
+                buf = source[sources[b], c]
             parts.append(buf[:, start:start + count])
         kv = torch.cat(parts, dim=1)
         total = kv.shape[1]
@@ -157,9 +162,10 @@ def _reference(q, k, v, cache, source, rows_layout, slots, sources, rel_bias=Non
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels need CUDA")
+@pytest.mark.parametrize("with_row_source", [False, True])
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("with_source", [True, False])
-def test_kernels_match_torch(with_source, with_bias):
+def test_kernels_match_torch(with_source, with_bias, with_row_source):
     from mstar.engine.resources.kv.bounded.kernels import bounded_attention, bounded_store
 
     torch.manual_seed(0)
@@ -178,6 +184,12 @@ def test_kernels_match_torch(with_source, with_bias):
     spans = [t, t, t, t, 0]
     slots = [3, 0, 5, 1, 2]
     sources = [2, 0, 1, 2, 0] if with_source else [0] * 5
+    row_source = None
+    if with_row_source and with_source:
+        # rows 1 and 3 read their own entry of a second, per-row source
+        sources = [2, -1, 1, -1, 0]
+        row_source = (torch.randn(4, rows, h, source_len + 7, 2 * d, device=dev),
+                      torch.tensor([0, 3, 0, 1, 0], dtype=torch.int32, device=dev))
     layouts = [row_layout(source_len, w, s, policy, sink_capacity) for w, s in zip(written, spans, strict=True)]
     table = torch.tensor([flatten_row(s, lay, src) for s, lay, src in zip(slots, layouts, sources, strict=True)],
                          dtype=torch.int32, device=dev)
@@ -187,10 +199,11 @@ def test_kernels_match_torch(with_source, with_bias):
     longest = max(sum(c for _, c in lay.reads) for lay in layouts)
     bias = torch.randn(b * rows, h, t, longest + 2 * t - 1, device=dev) * 4 if with_bias else None
     # float64, so the reference is not itself TF32
+    ref_rows = None if row_source is None else (row_source[0].double(), row_source[1].tolist())
     want, want_cache = _reference(q.double(), k.double(), v.double(), cache.double(), src.double(),
-                                  layouts, slots, sources, None if bias is None else bias.double())
+                                  layouts, slots, sources, None if bias is None else bias.double(), ref_rows)
     want, want_cache = want.float(), want_cache.float()
-    got = bounded_attention(q, k, v, cache, source, table, bias, ieee=True)
+    got = bounded_attention(q, k, v, cache, source, table, bias, ieee=True, row_source=row_source)
     bounded_store(k, v, cache, table)
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(cache, want_cache, rtol=0, atol=0)

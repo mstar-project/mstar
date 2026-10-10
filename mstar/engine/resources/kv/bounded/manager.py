@@ -101,6 +101,7 @@ class BoundedKVManager(Resource):
         plan: BoundedPlan | None = None,
         rel_bias: torch.Tensor | None = None,
         ieee: bool = False,
+        row_source: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Attention for ``q, k, v [B * rows, H, T, D]`` over each row's retained
         keys (``source [sources, rows, H, L, 2D]`` is this layer's source prefixes,
@@ -108,31 +109,37 @@ class BoundedKVManager(Resource):
         step's own, then this step's keys into the slots. ``[B * rows, T, H, D]``.
         ``plan`` defaults to the step's; a forward running a subset of its rows
         passes ``select`` of it. ``rel_bias`` is a per-distance score term
-        (``kernels.bounded_attention``), for relative-position attention."""
+        (``kernels.bounded_attention``), for relative-position attention. Rows whose
+        source is -1 read theirs from ``row_source = (storage [slots, rows, H, L, 2D],
+        slots [>= B])``, e.g. another resource's per-request entries."""
         plan = plan or self.current
         cache = self._cache[layer_idx]
         if not q.is_cuda:
-            return self._attend_torch(q, k, v, cache, source, plan, rel_bias)
+            return self._attend_torch(q, k, v, cache, source, plan, rel_bias, row_source)
         from mstar.engine.resources.kv.bounded.kernels import bounded_attention, bounded_store
 
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        out = bounded_attention(q, k, v, cache, source, plan.table, rel_bias, ieee)
+        out = bounded_attention(q, k, v, cache, source, plan.table, rel_bias, ieee, row_source)
         bounded_store(k, v, cache, plan.table, self.config.reverse_step_order)
         return out
 
-    def _attend_torch(self, q, k, v, cache, source, plan: BoundedPlan, rel_bias=None) -> torch.Tensor:
+    def _attend_torch(
+        self, q, k, v, cache, source, plan: BoundedPlan, rel_bias=None, row_source=None,
+    ) -> torch.Tensor:
         """The kernels' semantics row by row, from the host layouts (CPU)."""
         n, h, t, d = q.shape
         rows = self.config.rows_per_request
         out = q.new_empty(n, t, h, d)
+        own = row_source[1].tolist() if row_source is not None else None
         for i in range(n):
             b, c = divmod(i, rows)
             slot, layout, src = plan.rows[b]
+            row_src = row_source[0][own[b], c] if src < 0 else (None if source is None else source[src, c])
             keys, values = [], []
             for from_source, (start, count) in zip(READ_FROM_SOURCE, layout.reads, strict=True):
-                if count == 0 or (from_source and source is None):
+                if count == 0 or (from_source and row_src is None):
                     continue
-                kv = (source[src, c] if from_source else cache[slot, c])[:, start:start + count]
+                kv = (row_src if from_source else cache[slot, c])[:, start:start + count]
                 keys.append(kv[..., :d])
                 values.append(kv[..., d:])
             keys, values = torch.cat([*keys, k[i]], 1), torch.cat([*values, v[i]], 1)

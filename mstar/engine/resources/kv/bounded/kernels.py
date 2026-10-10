@@ -26,15 +26,16 @@ def _scores(q, k, bias_rows, rel, valid, sm_scale, HAS_BIAS: tl.constexpr, PRECI
 
 @triton.jit
 def _bounded_attention_kernel(
-    q_ptr, k_ptr, v_ptr, o_ptr, cache_ptr, source_ptr, table_ptr, bias_ptr,
+    q_ptr, k_ptr, v_ptr, o_ptr, cache_ptr, source_ptr, row_source_ptr, row_slots_ptr, table_ptr, bias_ptr,
     T, H, sm_scale,
     s_qn, s_qh, s_qt,
     s_cs, s_cr, s_ch, s_cp,
     s_sv, s_sr, s_sh, s_sp,
+    s_rv, s_rr, s_rh, s_rp,
     s_on, s_ot, s_oh,
     s_bn, s_bh, s_bt,
-    ROWS: tl.constexpr, HAS_SOURCE: tl.constexpr, HAS_BIAS: tl.constexpr, ROW_INTS: tl.constexpr,
-    HEAD: tl.constexpr,
+    ROWS: tl.constexpr, HAS_SOURCE: tl.constexpr, HAS_ROW_SOURCE: tl.constexpr, HAS_BIAS: tl.constexpr,
+    ROW_INTS: tl.constexpr, HEAD: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr, PRECISION: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -53,7 +54,15 @@ def _bounded_attention_kernel(
     row = table_ptr + b * ROW_INTS
     slot = tl.load(row).to(tl.int64)
     slot_base = cache_ptr + slot * s_cs + c * s_cr + h * s_ch
-    source_base = source_ptr + tl.load(row + 1).to(tl.int64) * s_sv + c * s_sr + h * s_sh
+    # a row's source: one of the shared ones by index, or (-1) its own slot of the row sources
+    src = tl.load(row + 1).to(tl.int64)
+    source_base = source_ptr + src * s_sv + c * s_sr + h * s_sh
+    s_pos = s_sp
+    if HAS_ROW_SOURCE:
+        if src < 0:
+            own = tl.load(row_slots_ptr + b).to(tl.int64)
+            source_base = row_source_ptr + own * s_rv + c * s_rr + h * s_rh
+            s_pos = s_rp
     # The five ranges (source, slot, source, slot, slot: layout.READ_FROM_SOURCE),
     # in stream order: key j of them is at stream position j, this step's own at
     # ``total + t``. Tiled as one sequence, so short ranges do not each pay a
@@ -100,7 +109,7 @@ def _bounded_attention_kernel(
               tl.where(j < e4, s3 + j - e3, s4 + j - e4))))
         ptrs = slot_base + pos[:, None] * s_cp + offs_d[None, :]
         if HAS_SOURCE:
-            source_ptrs = source_base + pos[:, None] * s_sp + offs_d[None, :]
+            source_ptrs = source_base + pos[:, None] * s_pos + offs_d[None, :]
             ptrs = tl.where(in_source[:, None], source_ptrs, ptrs)
         k = tl.load(ptrs, mask=valid[:, None], other=0.0)
         v = tl.load(ptrs + D, mask=valid[:, None], other=0.0)
@@ -162,10 +171,13 @@ def bounded_attention(
     table: torch.Tensor,
     rel_bias: torch.Tensor | None = None,
     ieee: bool = False,
+    row_source: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """``q, k, v [B * rows, H, T, D]`` (contiguous) over their retained ranges:
     ``cache [slots, rows, H, cap, 2D]`` and ``source [sources, rows, H, L, 2D]`` (each
-    row's own, by the table's index) per ``table [>= B, ROW_INTS]``. ``rel_bias [B * rows, H, T, R]`` adds to the
+    row's own, by the table's index) per ``table [>= B, ROW_INTS]``. A row whose source
+    index is -1 reads ``row_source = (storage [slots, rows, H, L', 2D], slots [>= B])``
+    at its slot instead. ``rel_bias [B * rows, H, T, R]`` adds to the
     score of query ``i`` and stream key ``j`` its entry ``(n + i) - j + T - 1``,
     ``n`` being the row's retained count (Transformer-XL's position term, which
     depends on the distance alone). Returns ``[B * rows, T, H, D]``."""
@@ -173,13 +185,20 @@ def bounded_attention(
     rows = cache.shape[1]
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert cache.stride(-1) == 1 and table.shape[-1] == ROW_INTS
-    has_source = source is not None
-    if not has_source:
+    has_row_source = row_source is not None
+    has_source = source is not None or has_row_source
+    if source is None:
         source = cache
         s_src = (0, 0, 0, 0)
     else:
         assert source.dim() == 5 and source.stride(-1) == 1
         s_src = (source.stride(0), source.stride(1), source.stride(2), source.stride(3))
+    if has_row_source:
+        row_storage, row_slots = row_source
+        assert row_storage.dim() == 5 and row_storage.stride(-1) == 1
+        s_row = (row_storage.stride(0), row_storage.stride(1), row_storage.stride(2), row_storage.stride(3))
+    else:
+        row_storage, row_slots, s_row = cache, table, (0, 0, 0, 0)
     has_bias = rel_bias is not None
     if has_bias:
         assert rel_bias.shape[:3] == (n, h, t) and rel_bias.stride(-1) == 1
@@ -190,14 +209,16 @@ def bounded_attention(
     block_m = 16 if n * h < 128 else 64
     grid = (triton.cdiv(t, block_m), n * h)
     _bounded_attention_kernel[grid](
-        q, k, v, out, cache, source, table, rel_bias,
+        q, k, v, out, cache, source, row_storage, row_slots, table, rel_bias,
         t, h, d ** -0.5,
         q.stride(0), q.stride(1), q.stride(2),
         cache.stride(0), cache.stride(1), cache.stride(2), cache.stride(3),
         *s_src,
+        *s_row,
         out.stride(0), out.stride(1), out.stride(2),
         *s_bias,
-        ROWS=rows, HAS_SOURCE=has_source, HAS_BIAS=has_bias, ROW_INTS=ROW_INTS, HEAD=ROW_HEAD,
+        ROWS=rows, HAS_SOURCE=has_source, HAS_ROW_SOURCE=has_row_source, HAS_BIAS=has_bias,
+        ROW_INTS=ROW_INTS, HEAD=ROW_HEAD,
         BLOCK_M=block_m, BLOCK_N=64, D=d, PRECISION="ieee" if ieee else "tf32",
     )
     return out

@@ -26,6 +26,10 @@ TTS_ATTN = "tts_attn"
 TTS_POS = "tts_pos"
 TTS_SAMPLER = "tts_sampler"
 T2W_STATE = "t2w_state"
+# prepared custom voices (only with the ``custom_voices`` model kwarg)
+T2W_VOICES = "t2w_voices"
+# the vocoder walk that prepares a request's custom voice into it, before its first chunk
+T2W_VOICE = "t2w_voice"
 # token2wav attention caches, one resource per ``token2wav.CACHE_FAMILIES`` entry
 T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}
 
