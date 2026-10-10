@@ -50,6 +50,10 @@ from mstar.model.utils import sampling_kwargs
 
 logger = logging.getLogger(__name__)
 
+# the one-shot all-reduce's workspace: messages up to this size take it, a full decode
+# batch of verify blocks among them (FlashInfer picks one- or two-shot by size)
+AR_ONESHOT_MAX_BYTES = 2 << 20
+
 
 def process_weights_after_loading(root: torch.nn.Module, device: torch.device) -> None:
     """Finalize kernel layouts across a freshly-loaded module tree."""
@@ -117,6 +121,8 @@ class Glm5NextModel(Model):
             self.config = Glm5NextModelConfig()
         if "moe_quant_kernel" in kwargs:
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
+        if "allreduce_oneshot" in kwargs:
+            self.config.allreduce_oneshot = bool(kwargs["allreduce_oneshot"])
         if "mtp_num_draft_tokens" in kwargs:
             self.config.mtp_num_draft_tokens = int(kwargs["mtp_num_draft_tokens"])
         if "prefill_graphs" in kwargs:
@@ -606,6 +612,13 @@ class Glm5NextModel(Model):
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
+        if self.config.allreduce_oneshot and tp_group is not None and tp_group.world_size > 1:
+            # collective over the TP group; every rank builds the LLM here
+            dtype = language_model.model.norm.weight.dtype
+            hidden = self.config.hidden_size
+            tp_group.init_allreduce_fusion(
+                hidden, dtype, max_tokens=AR_ONESHOT_MAX_BYTES // (hidden * dtype.itemsize),
+                all_reduce=True)
         # The declared conv-tail dtype must match the loaded projections.
         self.kda_conv_dtype = language_model.kda_conv_dtype()
 

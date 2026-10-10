@@ -63,6 +63,20 @@ def test_shipped_configs_admit_one_request_per_kda_slot(name):
     assert cfg["max_concurrent_requests"] == cfg["resources"]["kda_state"]["max_slots"] - 1
 
 
+def test_the_oneshot_all_reduce_is_opt_in_and_the_tp8_yamls_take_it():
+    from pathlib import Path
+
+    import yaml
+
+    assert not Glm5NextModel("x", tokenizer_mode="byte").config.allreduce_oneshot
+    m = Glm5NextModel("x", tokenizer_mode="byte", allreduce_oneshot=True)
+    assert m.config.allreduce_oneshot
+    for name in ("glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml", "glm5_next_tp8_longctx.yaml",
+                 "glm5_next_tp8_longctx_mtp.yaml"):
+        path = Path(__file__).resolve().parents[2] / "configs" / name
+        assert yaml.safe_load(path.read_text())["model_kwargs"]["allreduce_oneshot"] is True, name
+
+
 def test_bucket_overrides_reach_the_config():
     m = Glm5NextModel("x", tokenizer_mode="byte", prefill_token_buckets=[128, 256, 512],
                       prefill_capture_batch_sizes=[1])

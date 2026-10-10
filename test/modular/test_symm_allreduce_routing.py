@@ -515,3 +515,100 @@ def test_single_rank_is_a_no_op(nccl_calls):
     t = torch.zeros(4)
     assert g.all_reduce(t) is t
     assert nccl_calls == []
+
+
+# --- the one-shot kernel: a model opts in with init_allreduce_fusion(all_reduce=True) -------
+
+
+@dataclass
+class _Rows:
+    """A [rows, hidden] CUDA tensor, as ``all_reduce`` inspects it."""
+
+    shape: tuple
+    dtype: torch.dtype = torch.bfloat16
+    is_cuda: bool = True
+
+    def is_contiguous(self):
+        return True
+
+    def numel(self):
+        n = 1
+        for d in self.shape:
+            n *= d
+        return n
+
+    def element_size(self):
+        return self.dtype.itemsize
+
+
+def _oneshot_group(monkeypatch, calls: list, max_tokens: int = 128) -> CommGroup:
+    from mstar.distributed import ar_fusion
+
+    monkeypatch.setattr(ar_fusion, "create_workspace", lambda *a, **k: 0)
+    monkeypatch.setattr(ar_fusion, "allreduce", lambda x, ws: calls.append((x, ws)) or x)
+    g, _ = _symm_group(max_bytes=1 << 20)
+    assert g.init_allreduce_fusion(4096, torch.bfloat16, max_tokens, all_reduce=True)
+    return g
+
+
+@pytest.mark.parametrize("shape, dtype, oneshot", [
+    ((4, 4096), torch.bfloat16, True),
+    ((128, 4096), torch.bfloat16, True),  # the workspace's rows
+    ((129, 4096), torch.bfloat16, False),
+    ((4, 2048), torch.bfloat16, False),  # another width
+    ((4, 4096), torch.float16, False),  # another dtype
+    ((4, 2, 4096), torch.bfloat16, False),
+])
+def test_the_oneshot_kernel_takes_rows_of_its_shape(monkeypatch, nccl_calls, shape, dtype,
+                                                     oneshot):
+    calls: list = []
+    g = _oneshot_group(monkeypatch, calls)
+    t = _Rows(shape, dtype)
+    g.all_reduce(t)
+    assert calls == ([(t, 0)] if oneshot else [])
+
+
+def test_the_fused_norm_alone_leaves_all_reduce_as_it_was(monkeypatch):
+    from mstar.distributed import ar_fusion
+
+    monkeypatch.setattr(ar_fusion, "create_workspace", lambda *a, **k: 0)
+    g = _group()
+    assert g.init_allreduce_fusion(4096, torch.bfloat16, 128)
+    assert g._ar_oneshot is None
+    # a second caller opts in on the same workspace
+    assert g.init_allreduce_fusion(4096, torch.bfloat16, 128, all_reduce=True)
+    assert g._ar_oneshot == (4096, torch.bfloat16) and g._ar_fusion_ws == 0
+
+
+def test_the_all_reduce_buffer_is_a_new_tensor_for_the_oneshot_kernel(monkeypatch,
+                                                                      fake_symm_mem):
+    g = _multimem_group(monkeypatch, fake_symm_mem, [])
+    from mstar.distributed import ar_fusion
+
+    monkeypatch.setattr(ar_fusion, "create_workspace", lambda *a, **k: 0)
+    g.init_allreduce_fusion(4096, torch.bfloat16, 128, all_reduce=True)
+    buf = g.all_reduce_buffer((8, 4096), torch.bfloat16, torch.device("cpu"))
+    assert buf.data_ptr() != g._symm_ar._buf.data_ptr()
+
+
+def test_a_peer_without_a_workspace_keeps_every_rank_off_it(monkeypatch, caplog):
+    from mstar.distributed import ar_fusion
+
+    monkeypatch.setattr(ar_fusion, "create_workspace", lambda *a, **k: 0)
+    monkeypatch.setattr(comm, "_all_ranks_agree", lambda flag, cpu_group: False)
+    g = _group()
+    with caplog.at_level(logging.WARNING):
+        assert not g.init_allreduce_fusion(4096, torch.bfloat16, 128, all_reduce=True)
+    assert g._ar_fusion_ws is None and g._ar_oneshot is None
+    assert any("another rank" in r.getMessage() for r in caplog.records)
+
+
+def test_a_workspace_of_another_shape_takes_no_all_reduce(monkeypatch):
+    from mstar.distributed import ar_fusion
+
+    monkeypatch.setattr(ar_fusion, "create_workspace", lambda *a, **k: 0)
+    g = _group()
+    assert g.init_allreduce_fusion(2048, torch.bfloat16, 128)
+    g.init_allreduce_fusion(4096, torch.bfloat16, 128, all_reduce=True)
+    assert g._ar_oneshot is None
+

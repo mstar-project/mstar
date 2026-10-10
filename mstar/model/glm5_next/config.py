@@ -213,6 +213,10 @@ class Glm5NextModelConfig:
     # dominate the 306 GB checkpoint.
     moe_fp8_resident: bool = True
     moe_quant_kernel: str = "reference"
+    # Under TP, small all-reduces take FlashInfer's one-shot kernel (CommGroup.all_reduce),
+    # which needs P2P to every peer; the hyper-connections leave no residual add and norm to
+    # fuse it with. The TP8 yamls turn it on.
+    allreduce_oneshot: bool = False
 
     # Capture the prefill per (rows, token bucket); off keeps it eager. The
     # two lists override the submodule's default buckets.
