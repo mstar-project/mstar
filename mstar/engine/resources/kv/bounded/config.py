@@ -98,6 +98,8 @@ class StreamPosition(NamedTuple):
     source_len: int
     # tokens the request has written before this step
     written: int
+    # which of the sources ``attend`` is given this request's starts with
+    source: int = 0
 
 
 @dataclass(frozen=True)

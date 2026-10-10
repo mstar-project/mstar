@@ -125,7 +125,7 @@ def test_token2wav_caches_are_sink_window():
                 assert got == want, (w, name)
 
 
-def _reference(q, k, v, cache, source, rows_layout, slots, rel_bias=None):
+def _reference(q, k, v, cache, source, rows_layout, slots, sources, rel_bias=None):
     """Torch: attention over each row's ranges (in stream order) and its own keys,
     plus each pair's position term; then the writes."""
     n, h, t, d = q.shape
@@ -137,7 +137,7 @@ def _reference(q, k, v, cache, source, rows_layout, slots, rel_bias=None):
         layout, slot = rows_layout[b], slots[b]
         parts = []
         for from_source, (start, count) in zip(READ_FROM_SOURCE, layout.reads, strict=True):
-            buf = source[c] if from_source else cache[slot, c]
+            buf = source[sources[b], c] if from_source else cache[slot, c]
             parts.append(buf[:, start:start + count])
         kv = torch.cat(parts, dim=1)
         total = kv.shape[1]
@@ -171,22 +171,24 @@ def test_kernels_match_torch(with_source, with_bias):
     sink_capacity = max(0, policy.sink - source_len)
     slots_n = 6
     cache = torch.randn(slots_n, rows, h, sink_capacity + policy.window, 2 * d, device=dev)
-    source = torch.randn(rows, h, max(source_len, 1), 2 * d, device=dev) if with_source else None
+    # three sources (voices, say), each row starting from its own
+    source = torch.randn(3, rows, h, max(source_len, 1), 2 * d, device=dev) if with_source else None
     # rows at different positions, including a read-only one
     written = [0, 50, 100, 170, 260]
     spans = [t, t, t, t, 0]
     slots = [3, 0, 5, 1, 2]
+    sources = [2, 0, 1, 2, 0] if with_source else [0] * 5
     layouts = [row_layout(source_len, w, s, policy, sink_capacity) for w, s in zip(written, spans, strict=True)]
-    table = torch.tensor([flatten_row(s, lay) for s, lay in zip(slots, layouts, strict=True)],
+    table = torch.tensor([flatten_row(s, lay, src) for s, lay, src in zip(slots, layouts, sources, strict=True)],
                          dtype=torch.int32, device=dev)
     b = len(slots)
     q, k, v = (torch.randn(b * rows, h, t, d, device=dev) for _ in range(3))
-    src = source if with_source else torch.zeros(rows, h, 1, 2 * d, device=dev)
+    src = source if with_source else torch.zeros(1, rows, h, 1, 2 * d, device=dev)
     longest = max(sum(c for _, c in lay.reads) for lay in layouts)
     bias = torch.randn(b * rows, h, t, longest + 2 * t - 1, device=dev) * 4 if with_bias else None
     # float64, so the reference is not itself TF32
     want, want_cache = _reference(q.double(), k.double(), v.double(), cache.double(), src.double(),
-                                  layouts, slots, None if bias is None else bias.double())
+                                  layouts, slots, sources, None if bias is None else bias.double())
     want, want_cache = want.float(), want_cache.float()
     got = bounded_attention(q, k, v, cache, source, table, bias, ieee=True)
     bounded_store(k, v, cache, table)

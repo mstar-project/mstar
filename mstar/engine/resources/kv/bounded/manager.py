@@ -19,6 +19,7 @@ from mstar.engine.resources.kv.bounded.layout import (
     EMPTY_ROW,
     NUM_READS,
     READ_FROM_SOURCE,
+    ROW_HEAD,
     ROW_INTS,
     RowLayout,
     flatten_row,
@@ -31,12 +32,12 @@ from mstar.utils.h2d import PinnedStager
 
 class BoundedPlan(NamedTuple):
     table: torch.Tensor  # [>= rows, ROW_INTS] int32
-    # (slot, layout) per row, padding included; what the table holds
-    rows: tuple[tuple[int, RowLayout], ...]
+    # (slot, layout, source) per row, padding included; what the table holds
+    rows: tuple[tuple[int, RowLayout, int], ...]
 
     def retained(self) -> torch.Tensor:
         """Each row's retained keys before its step, ``[rows]`` int32 on the device."""
-        return self.table[: len(self.rows), 2:2 + 2 * NUM_READS:2].sum(1)
+        return self.table[: len(self.rows), ROW_HEAD + 1:ROW_HEAD + 2 * NUM_READS:2].sum(1)
 
     def select(self, rows: list[int]) -> "BoundedPlan":
         """These rows of the plan, for a forward that runs a subset of its batch."""
@@ -102,7 +103,8 @@ class BoundedKVManager(Resource):
         ieee: bool = False,
     ) -> torch.Tensor:
         """Attention for ``q, k, v [B * rows, H, T, D]`` over each row's retained
-        keys (``source [rows, H, L, 2D]`` is this layer's source prefix) and this
+        keys (``source [sources, rows, H, L, 2D]`` is this layer's source prefixes,
+        each row's picked by its ``StreamPosition.source``) and this
         step's own, then this step's keys into the slots. ``[B * rows, T, H, D]``.
         ``plan`` defaults to the step's; a forward running a subset of its rows
         passes ``select`` of it. ``rel_bias`` is a per-distance score term
@@ -125,12 +127,12 @@ class BoundedKVManager(Resource):
         out = q.new_empty(n, t, h, d)
         for i in range(n):
             b, c = divmod(i, rows)
-            slot, layout = plan.rows[b]
+            slot, layout, src = plan.rows[b]
             keys, values = [], []
             for from_source, (start, count) in zip(READ_FROM_SOURCE, layout.reads, strict=True):
                 if count == 0 or (from_source and source is None):
                     continue
-                kv = (source[c] if from_source else cache[slot, c])[:, start:start + count]
+                kv = (source[src, c] if from_source else cache[slot, c])[:, start:start + count]
                 keys.append(kv[..., :d])
                 values.append(kv[..., d:])
             keys, values = torch.cat([*keys, k[i]], 1), torch.cat([*values, v[i]], 1)
@@ -144,7 +146,7 @@ class BoundedKVManager(Resource):
             out[i] = (att @ values).transpose(0, 1)
         for i in range(n):
             b, c = divmod(i, rows)
-            slot, layout = plan.rows[b]
+            slot, layout, _ = plan.rows[b]
             for offset, start, count in layout.writes:
                 if count == 0:
                     continue
@@ -214,12 +216,12 @@ class BoundedKVManager(Resource):
             req = None if ctx.capture or ctx.is_padding_row(seg.request_id) else self._requests.get(seg.request_id)
             if req is None:
                 # padding rows read and write nothing
-                rows.append((0, EMPTY_ROW))
+                rows.append((0, EMPTY_ROW, 0))
             else:
                 pos = step.positions[seg.request_id]
                 rows.append((req.slot, row_layout(pos.source_len, pos.written, seg.span,
                                                   c.retention(pos.source_len), c.sink_capacity,
-                                                  c.reverse_step_order)))
+                                                  c.reverse_step_order), pos.source))
             values += flatten_row(*rows[-1])
         table = self._table(ctx, len(rows))
         self._stager.copy_(table, values, pad_value=0)

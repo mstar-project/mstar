@@ -327,16 +327,51 @@ class SlotRows(NamedTuple):
         return ~self.rows.has_state[: self.rows.num_rows]
 
 
+class VoiceBank(NamedTuple):
+    """The model's fixed voices, stacked so that rows of a batch can each have their own
+    and one captured graph serves them all. Each row's voice is an index into it."""
+
+    names: tuple[str, ...]
+    prompt_tokens: tuple[int, ...]
+    # per cache family, each voice's caches in stream order, ``[voices, layers, rows, H, L, 2d]``
+    # (zero past a shorter voice's length)
+    sources: dict[str, torch.Tensor]
+    spk: torch.Tensor      # [voices, 80], projected speaker embeddings
+    enc_cnn: torch.Tensor  # [voices, *slot_layout] initial conv state
+    dit_cnn: torch.Tensor
+
+    @classmethod
+    def build(cls, voices: dict[str, Token2WavVoice]) -> VoiceBank:
+        names = tuple(voices)
+
+        def stack(tensors: list[torch.Tensor]) -> torch.Tensor:
+            longest = max(t.shape[-2] for t in tensors)
+            return torch.stack([F.pad(t, (0, 0, 0, longest - t.shape[-2])) for t in tensors])
+
+        init = [voice_blocks(voices[n]) for n in names]
+        return cls(
+            names=names,
+            prompt_tokens=tuple(voices[n].prompt.tokens.shape[1] for n in names),
+            sources={f: stack([fam.source(voices[n]) for n in names]) for f, fam in CACHE_FAMILIES.items()},
+            spk=torch.cat([voices[n].spk for n in names]),
+            enc_cnn=torch.cat([i["enc_cnn"] for i in init]),
+            dit_cnn=torch.cat([i["dit_cnn"] for i in init]),
+        )
+
+    def index(self, name: str) -> int:
+        return self.names.index(name)
+
+
 class AttentionCache(NamedTuple):
-    """Where a batch's caches of one family are: the bounded KV resource, the voice's
-    source and the batch's rows of the step's plan."""
+    """Where a batch's caches of one family are: the bounded KV resource, the voices'
+    sources (``VoiceBank.sources``) and the batch's rows of the step's plan."""
 
     resource: object
-    source: torch.Tensor
+    sources: torch.Tensor
     plan: object
 
     def layer(self, idx: int) -> BoundedLayerKV:
-        return BoundedLayerKV(self.resource, idx, self.source[idx], self.plan)
+        return BoundedLayerKV(self.resource, idx, self.sources[:, idx], self.plan)
 
 
 class WindowCaches(NamedTuple):
@@ -542,27 +577,30 @@ class Token2Wav(nn.Module):
     def window_flow(
         self,
         state: SlotRows,
-        voice: Token2WavVoice,
+        bank: VoiceBank,
+        voices: torch.Tensor,
         tokens: torch.Tensor,
         caches: WindowCaches,
         last: bool = False,
     ) -> torch.Tensor:
-        """The flow for ``B`` windows of one voice at any positions: ``tokens [B, n]`` -> mel
-        ``[B, 80, frames]``. ``caches`` know each row's position; rows on their first window
-        (``state.fresh``) read the voice's conv caches rather than their slot's. A last
-        window writes no caches. Capturable."""
+        """The flow for ``B`` windows at any positions, each in its own voice (``voices [B]``,
+        indices into ``bank``): ``tokens [B, n]`` -> mel ``[B, 80, frames]``. ``caches`` know
+        each row's position; rows on their first window (``state.fresh``) read their
+        voice's conv state rather than their slot's. A last window writes no caches.
+        Capturable."""
         b = tokens.shape[0]
-        init = voice_blocks(voice)
         fresh = state.fresh
 
-        def conv_cache(name):
+        def conv_cache(name, init):
             current = state.get(name)
-            return torch.where(fresh.view(-1, *([1] * (current.dim() - 1))), init[name], current)
+            mask = fresh.view(-1, *([1] * (current.dim() - 1)))
+            return torch.where(mask, init.index_select(0, voices), current)
 
-        enc_cnn = conv_cache("enc_cnn")
+        enc_cnn = conv_cache("enc_cnn", bank.enc_cnn)
         # guidance rows of a request side by side, as the flow runs them
-        dit_cnn = conv_cache("dit_cnn").permute(1, 2, 0, 3, 4, 5).contiguous().flatten(2, 3)
-        mel = self.flow(tokens, voice.spk.expand(b, -1), None, last, enc_cnn, dit_cnn, caches.flow_kv())
+        dit_cnn = conv_cache("dit_cnn", bank.dit_cnn).permute(1, 2, 0, 3, 4, 5).contiguous().flatten(2, 3)
+        spk = bank.spk.index_select(0, voices)
+        mel = self.flow(tokens, spk, None, last, enc_cnn, dit_cnn, caches.flow_kv())
         if not last:
             state.set("enc_cnn", enc_cnn)
             state.set("dit_cnn", dit_cnn.unflatten(2, (b, 2)).permute(2, 0, 1, 3, 4, 5))
@@ -597,7 +635,8 @@ class Token2Wav(nn.Module):
     def window_spectrum(
         self,
         state: SlotRows,
-        voice: Token2WavVoice,
+        bank: VoiceBank,
+        voices: torch.Tensor,
         first: bool,
         tokens: torch.Tensor,
         caches: WindowCaches,
@@ -606,7 +645,7 @@ class Token2Wav(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """``window_flow`` and ``window_vocode`` for ``B`` windows that are all, or all not,
         their request's ``first``."""
-        mel = self.window_flow(state, voice, tokens, caches, last)
+        mel = self.window_flow(state, bank, voices, tokens, caches, last)
         return {"mel": mel, **self.window_vocode(state, mel, first, last, noise)}
 
     @torch.inference_mode()
@@ -634,7 +673,8 @@ class Token2Wav(nn.Module):
     def stream_batched(
         self,
         state: SlotRows,
-        voice: Token2WavVoice,
+        bank: VoiceBank,
+        voices: torch.Tensor,
         first: bool,
         tokens: torch.Tensor,
         caches: WindowCaches,
@@ -642,7 +682,7 @@ class Token2Wav(nn.Module):
         noise: HiFTNoise | None = None,
     ) -> torch.Tensor:
         """``B`` ``stream`` calls of one voice, all or none of them ``first``, eagerly."""
-        out = self.window_spectrum(state, voice, first, tokens, caches, last, noise)
+        out = self.window_spectrum(state, bank, voices, first, tokens, caches, last, noise)
         return self.window_finish(state, out["magnitude"], out["phase"], first, last)
 
 

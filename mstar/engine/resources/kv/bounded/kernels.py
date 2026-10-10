@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-from mstar.engine.resources.kv.bounded.layout import NUM_READS, NUM_WRITES, ROW_INTS
+from mstar.engine.resources.kv.bounded.layout import NUM_READS, NUM_WRITES, ROW_HEAD, ROW_INTS
 
 
 @triton.jit
@@ -30,10 +30,11 @@ def _bounded_attention_kernel(
     T, H, sm_scale,
     s_qn, s_qh, s_qt,
     s_cs, s_cr, s_ch, s_cp,
-    s_sr, s_sh, s_sp,
+    s_sv, s_sr, s_sh, s_sp,
     s_on, s_ot, s_oh,
     s_bn, s_bh, s_bt,
     ROWS: tl.constexpr, HAS_SOURCE: tl.constexpr, HAS_BIAS: tl.constexpr, ROW_INTS: tl.constexpr,
+    HEAD: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr, PRECISION: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -52,21 +53,21 @@ def _bounded_attention_kernel(
     row = table_ptr + b * ROW_INTS
     slot = tl.load(row).to(tl.int64)
     slot_base = cache_ptr + slot * s_cs + c * s_cr + h * s_ch
-    source_base = source_ptr + c * s_sr + h * s_sh
+    source_base = source_ptr + tl.load(row + 1).to(tl.int64) * s_sv + c * s_sr + h * s_sh
     # The five ranges (source, slot, source, slot, slot: layout.READ_FROM_SOURCE),
     # in stream order: key j of them is at stream position j, this step's own at
     # ``total + t``. Tiled as one sequence, so short ranges do not each pay a
     # masked tile.
-    s0 = tl.load(row + 1)
-    e1 = tl.load(row + 2)
-    s1 = tl.load(row + 3)
-    e2 = e1 + tl.load(row + 4)
-    s2 = tl.load(row + 5)
-    e3 = e2 + tl.load(row + 6)
-    s3 = tl.load(row + 7)
-    e4 = e3 + tl.load(row + 8)
-    s4 = tl.load(row + 9)
-    total = e4 + tl.load(row + 10)
+    s0 = tl.load(row + HEAD + 0)
+    e1 = tl.load(row + HEAD + 1)
+    s1 = tl.load(row + HEAD + 2)
+    e2 = e1 + tl.load(row + HEAD + 3)
+    s2 = tl.load(row + HEAD + 4)
+    e3 = e2 + tl.load(row + HEAD + 5)
+    s3 = tl.load(row + HEAD + 6)
+    e4 = e3 + tl.load(row + HEAD + 7)
+    s4 = tl.load(row + HEAD + 8)
+    total = e4 + tl.load(row + HEAD + 9)
 
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
@@ -124,6 +125,7 @@ def _bounded_store_kernel(
     s_kn, s_kh, s_kt,
     s_cs, s_cr, s_ch, s_cp,
     ROWS: tl.constexpr, ROW_INTS: tl.constexpr, NUM_READS: tl.constexpr, REVERSE: tl.constexpr,
+    HEAD: tl.constexpr,
     BLOCK_T: tl.constexpr, D: tl.constexpr,
 ):
     pid_t = tl.program_id(0)
@@ -137,7 +139,7 @@ def _bounded_store_kernel(
     offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     offs_d = tl.arange(0, D)
     for w in tl.static_range(3):
-        base = row + 1 + 2 * NUM_READS + 3 * w
+        base = row + HEAD + 2 * NUM_READS + 3 * w
         offset = tl.load(base)
         start = tl.load(base + 1)
         count = tl.load(base + 2)
@@ -162,8 +164,8 @@ def bounded_attention(
     ieee: bool = False,
 ) -> torch.Tensor:
     """``q, k, v [B * rows, H, T, D]`` (contiguous) over their retained ranges:
-    ``cache [slots, rows, H, cap, 2D]`` and ``source [rows, H, L, 2D]`` per
-    ``table [>= B, ROW_INTS]``. ``rel_bias [B * rows, H, T, R]`` adds to the
+    ``cache [slots, rows, H, cap, 2D]`` and ``source [sources, rows, H, L, 2D]`` (each
+    row's own, by the table's index) per ``table [>= B, ROW_INTS]``. ``rel_bias [B * rows, H, T, R]`` adds to the
     score of query ``i`` and stream key ``j`` its entry ``(n + i) - j + T - 1``,
     ``n`` being the row's retained count (Transformer-XL's position term, which
     depends on the distance alone). Returns ``[B * rows, T, H, D]``."""
@@ -174,10 +176,10 @@ def bounded_attention(
     has_source = source is not None
     if not has_source:
         source = cache
-        s_src = (0, 0, 0)
+        s_src = (0, 0, 0, 0)
     else:
-        assert source.stride(-1) == 1
-        s_src = (source.stride(0), source.stride(1), source.stride(2))
+        assert source.dim() == 5 and source.stride(-1) == 1
+        s_src = (source.stride(0), source.stride(1), source.stride(2), source.stride(3))
     has_bias = rel_bias is not None
     if has_bias:
         assert rel_bias.shape[:3] == (n, h, t) and rel_bias.stride(-1) == 1
@@ -195,7 +197,7 @@ def bounded_attention(
         *s_src,
         out.stride(0), out.stride(1), out.stride(2),
         *s_bias,
-        ROWS=rows, HAS_SOURCE=has_source, HAS_BIAS=has_bias, ROW_INTS=ROW_INTS,
+        ROWS=rows, HAS_SOURCE=has_source, HAS_BIAS=has_bias, ROW_INTS=ROW_INTS, HEAD=ROW_HEAD,
         BLOCK_M=block_m, BLOCK_N=64, D=d, PRECISION="ieee" if ieee else "tf32",
     )
     return out
@@ -214,7 +216,7 @@ def bounded_store(
         k, v, cache, table, h,
         k.stride(0), k.stride(1), k.stride(2),
         cache.stride(0), cache.stride(1), cache.stride(2), cache.stride(3),
-        ROWS=cache.shape[1], ROW_INTS=ROW_INTS, NUM_READS=NUM_READS, REVERSE=reverse,
+        ROWS=cache.shape[1], ROW_INTS=ROW_INTS, NUM_READS=NUM_READS, REVERSE=reverse, HEAD=ROW_HEAD,
         BLOCK_T=block_t, D=d,
     )
 

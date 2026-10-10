@@ -18,8 +18,9 @@ NUM_READS = 5
 READ_FROM_SOURCE = (True, False, True, False, False)
 # writes: (fresh offset of the range's first entry, slot start, len) triples
 NUM_WRITES = 3
-# slot, reads, writes
-ROW_INTS = 1 + 2 * NUM_READS + 3 * NUM_WRITES
+# slot, source, reads, writes
+ROW_HEAD = 2
+ROW_INTS = ROW_HEAD + 2 * NUM_READS + 3 * NUM_WRITES
 
 
 class RowLayout(NamedTuple):
@@ -76,8 +77,8 @@ def row_layout(
 EMPTY_ROW = RowLayout(((0, 0),) * NUM_READS, ((0, 0, 0),) * NUM_WRITES)
 
 
-def flatten_row(slot: int, layout: RowLayout) -> list[int]:
-    out = [slot]
+def flatten_row(slot: int, layout: RowLayout, source: int = 0) -> list[int]:
+    out = [slot, source]
     for start, count in layout.reads:
         out += (start, count)
     for offset, start, count in layout.writes:

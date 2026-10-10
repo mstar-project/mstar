@@ -22,6 +22,7 @@ from mstar.model.minicpm_o.components.token2wav import (
     SineGen2Source,
     Token2Wav,
     Token2WavState,
+    VoiceBank,
     fade_in_out,
     num_windows,
     slot_layout,
@@ -33,60 +34,72 @@ from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt, _module_p
 
 
 class _CacheSteps:
-    """Token2wav's resources for one voice (its state pool and its three attention caches),
-    driven through admit / plan / commit one window at a time, as the engine does."""
+    """Token2wav's resources (its state pool and its three attention caches) for requests
+    in the voices of ``bank``, driven through admit / plan / commit one window at a time,
+    as the engine does."""
 
-    def __init__(self, voice, slots: int, device):
+    def __init__(self, bank, slots: int, device):
         from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
         from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
-        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES
+        from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig
+        from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES, CacheCapacity
 
-        self.p = voice.initial.prompt_frames // 2
+        self.bank = bank
         self.families = CACHE_FAMILIES
-        self.sources = {name: f.source(voice) for name, f in CACHE_FAMILIES.items()}
+        p = max(bank.prompt_tokens)
         self.resources = {
             name: BoundedKVManager(BoundedKVConfig(
                 num_layers=f.num_layers, num_heads=f.num_heads, head_dim=f.head_dim, rows_per_request=f.rows,
-                max_source_len=f.rate * self.p, retention=f.retention, max_slots=slots,
+                max_source_len=f.rate * p, retention=f.retention, max_slots=slots,
                 reverse_step_order=f.reverse_step_order,
             ), device)
             for name, f in CACHE_FAMILIES.items()
         }
-        from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig
-        from mstar.engine.resources.recurrent.pool import RecurrentStatePool
-        from mstar.model.minicpm_o.components.token2wav import CacheCapacity
-
         self.pool = RecurrentStatePool(device, RecurrentStateConfig(
             num_layers=1, max_slots=slots + 1,
             blocks={n: RecurrentBlockConfig(shape=b.shape, dtype=b.dtype)
-                    for n, b in slot_layout(CacheCapacity(self.p)).items()},
+                    for n, b in slot_layout(CacheCapacity(p)).items()},
         ))
         self.written: dict[str, int] = {}
+        self.voice: dict[str, int] = {}
 
     def slot(self, rid) -> dict[str, torch.Tensor]:
         """``rid``'s slot of the state pool, block by block."""
         index = self.pool._slots[rid]["main"].index
         return {name: self.pool.block(name, 0)[index] for name in self.pool.config.blocks}
 
-    def window(self, rids, num_tokens: int, last: bool):
+    def position(self, family, rid):
+        voice = self.voice[rid]
+        return family.position(self.bank.prompt_tokens[voice], self.written.get(rid, 0)), voice
+
+    def window(self, rids, num_tokens: int, last: bool, voices: list[int] | None = None):
+        """The state rows, caches and per-row voice ids for one window of ``rids`` (each in
+        ``voices``, the bank's first by default), and a commit to call after it."""
         from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
         from mstar.engine.resources.recurrent.config import RecurrentStep
         from mstar.engine.resources.step import Segment, StepContext
         from mstar.model.minicpm_o.components.token2wav import AttentionCache, SlotRows, WindowCaches, window_tokens
 
+        for r, v in zip(rids, voices or [0] * len(rids), strict=True):
+            self.voice.setdefault(r, v)
         ctx = StepContext(request_ids=list(rids), graph_walk="t2w", slot=0, capture=False)
         state_step = RecurrentStep(segments=[Segment(request_id=r, label="main", span=1) for r in rids])
         assert self.pool.admit(state_step, ctx).ok
         state = SlotRows(self.pool, self.pool.plan(state_step, ctx)["main"])
         caches, steps = {}, {}
         for name, family in self.families.items():
+            positions = {}
+            for r in rids:
+                (source_len, written), voice = self.position(family, r)
+                positions[r] = StreamPosition(source_len, written, source=voice)
             step = steps[name] = BoundedKVStep(
                 segments=[Segment(request_id=r, label="main", span=family.span(num_tokens, last)) for r in rids],
-                positions={r: StreamPosition(*family.position(self.p, self.written.get(r, 0))) for r in rids},
+                positions=positions,
             )
             resource = self.resources[name]
             assert resource.admit(step, ctx).ok
-            caches[name] = AttentionCache(resource, self.sources[name], resource.plan(step, ctx))
+            caches[name] = AttentionCache(resource, self.bank.sources[name], resource.plan(step, ctx))
 
         def commit():
             self.pool.commit(state_step, ctx)
@@ -94,20 +107,21 @@ class _CacheSteps:
                 self.resources[name].commit(step, ctx)
             for r in rids:
                 self.written[r] = self.written.get(r, 0) + window_tokens(num_tokens, last)
-        return state, WindowCaches(**caches), commit
+        ids = torch.tensor([self.voice[r] for r in rids], device=self.bank.spk.device)
+        return state, WindowCaches(**caches), ids, commit
 
     def retained(self, name: str, rid) -> torch.Tensor:
         """The keys|values ``rid`` would attend next in ``name``'s caches, ``[layers, rows, H, n, 2d]``."""
         from mstar.engine.resources.kv.bounded.layout import READ_FROM_SOURCE, row_layout
 
         family, resource = self.families[name], self.resources[name]
-        source_len, written = family.position(self.p, self.written.get(rid, 0))
+        (source_len, written), voice = self.position(family, rid)
         layout = row_layout(source_len, written, 0, family.retention(source_len),
                             resource.config.sink_capacity, family.reverse_step_order)
         slot = resource._requests[rid].slot
         parts = []
         for from_source, (start, count) in zip(READ_FROM_SOURCE, layout.reads, strict=True):
-            buf = self.sources[name] if from_source else resource._cache[:, slot]
+            buf = self.bank.sources[name][voice] if from_source else resource._cache[:, slot]
             parts.append(buf[..., start:start + count, :])
         return torch.cat(parts, dim=-2)
 
@@ -305,7 +319,8 @@ def test_batched_windows_on_pool(random_token2wav, device):
         tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32).to(device),
         spk_emb=torch.randn(1, 192).to(device), mel=torch.randn(1, 2 * p, 80).to(device),
     ))
-    kv_steps = _CacheSteps(voice, 3, device)
+    bank = VoiceBank.build({"v": voice})
+    kv_steps = _CacheSteps(bank, 3, device)
     codes = [torch.randint(0, 6561, (215,)).tolist() for _ in range(2)]
     wins = [list(stream_windows(c)) for c in codes]  # 9 windows each, the last of 18 tokens
     gen = torch.Generator().manual_seed(9)
@@ -336,8 +351,8 @@ def test_batched_windows_on_pool(random_token2wav, device):
         mel = model.flow_chunk(ref, voice, torch.tensor([win], dtype=torch.int32, device=device), last)
         want = model.vocode_chunk(ref, mel, last, noise=row0)
         tokens = torch.tensor([win], dtype=torch.int32, device=device)
-        state, kv, commit = kv_steps.window(["r0"], len(win), last)
-        out = model.window_spectrum(state, voice, first, tokens, kv, last, row0)
+        state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
+        out = model.window_spectrum(state, bank, ids, first, tokens, kv, last, row0)
         got = model.window_finish(state, out["magnitude"], out["phase"], first, last)
         commit()
         torch.testing.assert_close(out["mel"], mel, **tol)
@@ -350,15 +365,16 @@ def test_batched_windows_on_pool(random_token2wav, device):
     # The same utterance in two rows two windows apart, their full windows' flow in one
     # batch: rows at different positions (a first window beside a later one, then
     # rows on either side of the caches' bound) each match the one-row run.
-    kv_steps = _CacheSteps(voice, 3, device)
+    bank = VoiceBank.build({"v": voice})
+    kv_steps = _CacheSteps(bank, 3, device)
     full = [win for win, last in wins[0] if not last]
     lag = 2
     for k in range(len(full) + lag):
         rows = [(r, k - off) for r, off in (("a", 0), ("b", lag)) if 0 <= k - off < len(full)]
         rids = [r for r, _ in rows]
         tokens = torch.tensor([full[w] for _, w in rows], dtype=torch.int32, device=device)
-        state, kv, commit = kv_steps.window(rids, len(full[0]), False)
-        mel = model.window_flow(state, voice, tokens, kv)
+        state, kv, ids, commit = kv_steps.window(rids, len(full[0]), False)
+        mel = model.window_flow(state, bank, ids, tokens, kv)
         commit()
         for i, (_, w) in enumerate(rows):
             torch.testing.assert_close(mel[i:i + 1], mels[w], **tol)
@@ -408,12 +424,51 @@ def test_window_short_of_its_stop_code(random_token2wav, device):
     ))
     full = [w for w, last in stream_windows(torch.randint(0, 6561, (200,)).tolist()) if not last]
     windows = [(w, False) for w in full[:4]] + [(full[4][:-1], False), (full[4][-4:], True)]
-    kv_steps = _CacheSteps(voice, 2, device)
+    bank = VoiceBank.build({"v": voice})
+    kv_steps = _CacheSteps(bank, 2, device)
     ref = model.new_state(voice)
     for win, last in windows:
         tokens = torch.tensor([win], dtype=torch.int32, device=device)
         mel = model.flow_chunk(ref, voice, tokens, last)
-        state, kv, commit = kv_steps.window(["r0"], len(win), last)
-        got = model.window_flow(state, voice, tokens, kv, last)
+        state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
+        got = model.window_flow(state, bank, ids, tokens, kv, last)
         commit()
         torch.testing.assert_close(got, mel, **tol)
+
+
+@pytest.mark.parametrize("device", [
+    "cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+])
+def test_rows_of_different_voices_share_a_batch(random_token2wav, device):
+    """Two voices with prompts of different lengths, one row of each in every flow batch,
+    a window apart: each row matches its own voice's one-row ``stream``."""
+    import copy
+
+    model = copy.deepcopy(random_token2wav).to(device)
+    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=1e-3)
+    torch.manual_seed(3)
+    voices = {
+        name: model.prepare_voice(VoicePrompt(
+            tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32).to(device),
+            spk_emb=torch.randn(1, 192).to(device), mel=torch.randn(1, 2 * p, 80).to(device),
+        ))
+        for name, p in (("short", 50), ("long", 64))
+    }
+    bank = VoiceBank.build(voices)
+    full = [w for w, last in stream_windows(torch.randint(0, 6561, (180,)).tolist()) if not last]
+    want = {}
+    for name, voice in voices.items():
+        ref = model.new_state(voice)
+        want[name] = [model.flow_chunk(ref, voice, torch.tensor([w], dtype=torch.int32, device=device), False)
+                      for w in full]
+    kv_steps = _CacheSteps(bank, 3, device)
+    lag = 1
+    for k in range(len(full) + lag):
+        rows = [(name, k - off) for name, off in (("short", 0), ("long", lag)) if 0 <= k - off < len(full)]
+        tokens = torch.tensor([full[w] for _, w in rows], dtype=torch.int32, device=device)
+        state, kv, ids, commit = kv_steps.window(
+            [name for name, _ in rows], len(full[0]), False, [bank.index(name) for name, _ in rows])
+        mel = model.window_flow(state, bank, ids, tokens, kv)
+        commit()
+        for i, (name, w) in enumerate(rows):
+            torch.testing.assert_close(mel[i:i + 1], want[name][w], **tol)

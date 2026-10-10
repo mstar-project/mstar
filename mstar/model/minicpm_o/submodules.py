@@ -52,12 +52,12 @@ from mstar.model.minicpm_o.components.token2wav import (
     WINDOW,
     AttentionCache,
     SlotRows,
+    VoiceBank,
     WindowCaches,
     window_frames,
     window_tokens,
 )
 from mstar.model.minicpm_o.components.token2wav_flow import MEL_BINS as MEL_BINS_T2W
-from mstar.model.minicpm_o.components.token2wav_flow import UP_RATE as UP_RATE_T2W
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
@@ -750,35 +750,35 @@ class Token2WavSubmodule(NodeSubmodule):
     def __init__(self, model, voices: dict, eos_code: int):
         super().__init__()
         self.model = model
-        self.voices = voices
         self.eos_code = eos_code
-        # (family, voice) -> the voice's cache in that family's stream order
-        self._sources: dict[tuple[str, str], torch.Tensor] = {}
+        self.bank = VoiceBank.build(voices)
         self._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
 
-    def _caches(self, resources: Mapping, voice_name: str, plans: Mapping[str, Any]):
-        """A batch of one voice's ``WindowCaches``, on these plans of the cache resources."""
-        caches = {}
-        for name, family in CACHE_FAMILIES.items():
-            source = self._sources.get((name, voice_name))
-            if source is None:
-                source = self._sources[(name, voice_name)] = family.source(self.voices[voice_name])
-            caches[name] = AttentionCache(resources[T2W_KV[name]], source, plans[name])
-        return WindowCaches(**caches)
+    def _caches(self, resources: Mapping, plans: Mapping[str, Any]) -> WindowCaches:
+        """A batch's ``WindowCaches``, on these plans of the cache resources."""
+        return WindowCaches(**{
+            name: AttentionCache(resources[T2W_KV[name]], self.bank.sources[name], plans[name])
+            for name in CACHE_FAMILIES
+        })
+
+    def _voice_ids(self, rids: list[str], device: torch.device) -> torch.Tensor:
+        """``[B]`` each request's voice, as an index into ``bank``."""
+        return torch.tensor([self.bank.index(self.request_state(r)["voice"]) for r in rids], device=device)
 
     def _cache_steps(
-        self, request_ids: list[str], voices: list[str], num_tokens: list[int], lasts: list[bool],
+        self, request_ids: list[str], num_tokens: list[int], lasts: list[bool],
     ) -> dict[str, BoundedKVStep]:
-        """Each cache resource's step: every row's stream position and what its window adds."""
+        """Each cache resource's step: every row's stream position (in its voice's stream)
+        and what its window adds."""
         positions = []
-        for rid, voice in zip(request_ids, voices, strict=True):
+        for rid in request_ids:
             req = self.request_states.get(rid)
-            if voice not in self.voices:
+            if req is None or "voice" not in req:
                 # a capture's dummy row: the resource plans it as padding
                 positions.append(None)
             else:
-                written = 0 if req is None else req.get("written", 0)
-                positions.append((self.voices[voice].initial.prompt_frames // UP_RATE_T2W, written))
+                voice = self.bank.index(req["voice"])
+                positions.append((self.bank.prompt_tokens[voice], req.get("written", 0), voice))
         steps = {}
         for name, family in CACHE_FAMILIES.items():
             steps[T2W_KV[name]] = BoundedKVStep(
@@ -787,8 +787,10 @@ class Token2WavSubmodule(NodeSubmodule):
                     for rid, n, last in zip(request_ids, num_tokens, lasts, strict=True)
                 ],
                 positions={
-                    rid: StreamPosition(*family.position(*pos))
-                    for rid, pos in zip(request_ids, positions, strict=True) if pos is not None
+                    rid: StreamPosition(*family.position(tokens, written), source=voice)
+                    for rid, (tokens, written, voice) in (
+                        (r, p) for r, p in zip(request_ids, positions, strict=True) if p is not None
+                    )
                 },
             )
         return steps
@@ -817,10 +819,8 @@ class Token2WavSubmodule(NodeSubmodule):
         state = self.request_state(fwd_info.rid_handle)
         if not state.get("started", False):
             codes = torch.cat([self._lead_silence, codes])
-        return NodeInputs(
-            tensor_inputs={"codes": codes[None]},
-            kwargs={"last": is_final_stream_chunk, "voice": fwd_info.step_metadata.get("voice")},
-        )
+            state.add("voice", fwd_info.step_metadata.get("voice"))
+        return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": is_final_stream_chunk})
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
@@ -830,16 +830,15 @@ class Token2WavSubmodule(NodeSubmodule):
             steps={
                 T2W_STATE: RecurrentStep(),
                 **self._cache_steps(
-                    request_ids, [inp.kwargs["voice"] for inp in inputs],
-                    [inp.tensor_inputs["codes"].shape[1] for inp in inputs],
+                    request_ids, [inp.tensor_inputs["codes"].shape[1] for inp in inputs],
                     [inp.kwargs["last"] for inp in inputs],
                 ),
             },
         )
 
     @staticmethod
-    def flow_region(voice: str, num_tokens: int, last: bool) -> str:
-        return f"t2w/{voice}/flow{'_last' if last else ''}{num_tokens}"
+    def flow_region(num_tokens: int, last: bool) -> str:
+        return f"t2w/flow{'_last' if last else ''}{num_tokens}"
 
     @staticmethod
     def hift_region(first: bool, frames: int, last: bool) -> str:
@@ -850,7 +849,11 @@ class Token2WavSubmodule(NodeSubmodule):
     ) -> dict[str, PiecewiseCudaGraphConfig]:
         def static_tokens(num_tokens: int):
             def make(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
-                return {"tokens": torch.zeros(shape.bs, num_tokens, dtype=torch.int32, device=device)}
+                return {
+                    "tokens": torch.zeros(shape.bs, num_tokens, dtype=torch.int32, device=device),
+                    # each row's voice, an index into ``bank``
+                    "voices": torch.zeros(shape.bs, dtype=torch.long, device=device),
+                }
             return make
 
         def static_mel(frames: int):
@@ -858,14 +861,13 @@ class Token2WavSubmodule(NodeSubmodule):
                 return {"mel": torch.zeros(shape.bs, MEL_BINS_T2W, frames, device=device)}
             return make
 
-        def declare_flow(voice_name: str, last: bool):
+        def declare_flow(last: bool):
             def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
-                n = len(request_ids)
                 return SubmoduleStep(
                     segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
                     steps={
                         T2W_STATE: RecurrentStep(),
-                        **self._cache_steps(request_ids, [voice_name] * n, list(seq_lens), [last] * n),
+                        **self._cache_steps(request_ids, list(seq_lens), [last] * len(request_ids)),
                     },
                 )
             return declare_step
@@ -876,15 +878,13 @@ class Token2WavSubmodule(NodeSubmodule):
                 steps={T2W_STATE: RecurrentStep()},
             )
 
-        def flow(voice_name: str, last: bool):
-            voice = self.voices[voice_name]
-
+        def flow(last: bool):
             def capture(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
                 pool = call.resources[T2W_STATE]
                 plans = {name: call.resources[key].current for name, key in T2W_KV.items()}
                 return {"mel": self.model.window_flow(
-                    SlotRows(pool, pool.addressing("main")), voice, call.static_inputs["tokens"],
-                    self._caches(call.resources, voice_name, plans), last,
+                    SlotRows(pool, pool.addressing("main")), self.bank, call.static_inputs["voices"],
+                    call.static_inputs["tokens"], self._caches(call.resources, plans), last,
                 )}
             return capture
 
@@ -898,33 +898,31 @@ class Token2WavSubmodule(NodeSubmodule):
 
         # Full windows at any position share one graph per batch size. A last window has
         # one of HOP lengths and rarely meets another of its length, so each length is
-        # a one-row graph: 50 of this node's ~65 graphs, most of its ~25 s of capture
+        # a one-row graph: 50 of this node's 65 graphs, most of its ~25 s of capture
         # and ~1 GiB. Padding last windows to one length would batch them and cut that
         # (the flow's time barely depends on length), but needs the padded tokens
         # masked out of attention; HiFT's convs are not causal, so its graphs stay per
         # length.
         #
-        # The flow is captured per voice: its speaker embedding, caches and initial
-        # conv state are baked into the graph. Per-request voices would make them
-        # per-row inputs (the caches as the bounded KV's sources), so one graph serves
-        # every voice.
-        configs = {}
-        for name in self.voices:
-            configs[self.flow_region(name, WINDOW, False)] = PiecewiseBatchedConfig(
-                capture_fn=flow(name, last=False),
+        # Each row's voice is an input (an index into ``bank``), so one graph serves every
+        # voice and rows of different voices share a batch.
+        configs = {
+            self.flow_region(WINDOW, False): PiecewiseBatchedConfig(
+                capture_fn=flow(last=False),
                 make_static_inputs=static_tokens(WINDOW),
-                declare_step=declare_flow(name, last=False),
+                declare_step=declare_flow(last=False),
                 seq_len=WINDOW,
                 capture_batch_sizes=self.WINDOW_CAPTURE_BATCH_SIZES,
+            ),
+        }
+        for n in LAST_WINDOW_TOKENS:
+            configs[self.flow_region(n, True)] = PiecewiseBatchedConfig(
+                capture_fn=flow(last=True),
+                make_static_inputs=static_tokens(n),
+                declare_step=declare_flow(last=True),
+                seq_len=n,
+                capture_batch_sizes=self.LAST_CAPTURE_BATCH_SIZES,
             )
-            for n in LAST_WINDOW_TOKENS:
-                configs[self.flow_region(name, n, True)] = PiecewiseBatchedConfig(
-                    capture_fn=flow(name, last=True),
-                    make_static_inputs=static_tokens(n),
-                    declare_step=declare_flow(name, last=True),
-                    seq_len=n,
-                    capture_batch_sizes=self.LAST_CAPTURE_BATCH_SIZES,
-                )
         full = window_frames(WINDOW, False)
         for first in (True, False):
             configs[self.hift_region(first, full, False)] = PiecewiseBatchedConfig(
@@ -955,16 +953,14 @@ class Token2WavSubmodule(NodeSubmodule):
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs],
     ) -> dict[str, Any]:
         device = self.get_device()
-        return {"rows": [
-            (inp.tensor_inputs["codes"].to(device), inp.kwargs["last"], inp.kwargs["voice"]) for inp in inputs
-        ]}
+        return {"rows": [(inp.tensor_inputs["codes"].to(device), inp.kwargs["last"]) for inp in inputs]}
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, rows: list, **kwargs,
     ) -> dict[str, NameToTensorList]:
-        """Each window in two stages: the flow, batched over every row of one voice and
-        window length whatever its position, then HiFT, batched over rows that are all
-        or none their request's first window."""
+        """Each window in two stages: the flow, batched over every row of one window length
+        whatever its voice and position, then HiFT, batched over rows that are all or none
+        their request's first window."""
         pool = engine_inputs.resources[T2W_STATE]
         step = _NodeStep(
             engine_inputs=engine_inputs,
@@ -973,18 +969,18 @@ class Token2WavSubmodule(NodeSubmodule):
             rows={rid: i for i, rid in enumerate(engine_inputs.request_ids)},
         )
         first, num_tokens, flows = {}, {}, {}
-        for rid, (codes, last, voice_name) in zip(engine_inputs.request_ids, rows, strict=True):
+        for rid, (codes, last) in zip(engine_inputs.request_ids, rows, strict=True):
             first[rid] = not self.request_state(rid).get("started", False)
             num_tokens[rid] = codes.shape[1]
-            flows.setdefault((voice_name, codes.shape[1], last), []).append((rid, codes))
+            flows.setdefault((codes.shape[1], last), []).append((rid, codes))
 
         mels, hifts = {}, {}
-        for (voice_name, n, last), group in flows.items():
-            region = self.flow_region(voice_name, n, last)
+        for (n, last), group in flows.items():
+            region = self.flow_region(n, last)
             for chunk in self._chunks(step, region, group, last):
                 rids = [rid for rid, _ in chunk]
                 tokens = torch.cat([codes for _, codes in chunk])
-                mel = self._run_flow(step, region, voice_name, rids, tokens, last)
+                mel = self._run_flow(step, region, rids, tokens, last)
                 for i, rid in enumerate(rids):
                     mels[rid] = mel[i]
                     hifts.setdefault((first[rid], mel.shape[-1], last), []).append(rid)
@@ -1015,21 +1011,20 @@ class Token2WavSubmodule(NodeSubmodule):
         self,
         step: _NodeStep,
         region: str,
-        voice_name: str,
         rids: list[str],
         tokens: torch.Tensor,
         last: bool,
     ) -> torch.Tensor:
         """``window_flow`` for these rows: the captured region when it fits, else eagerly."""
+        voices = self._voice_ids(rids, tokens.device)
         runner = step.runner(region)
         if runner is not None and runner.can_run(len(rids)):
-            out = runner.run(static_inputs={"tokens": tokens}, request_ids=rids, real_bs=len(rids))
+            out = runner.run(static_inputs={"tokens": tokens, "voices": voices}, request_ids=rids, real_bs=len(rids))
             # copied out: the next replay of this region reuses the buffer
             return out.get_view("mel").clone()
         plans = {name: plan.select(step.select(rids)) for name, plan in step.plans.items()}
         return self.model.window_flow(
-            step.state_of(rids), self.voices[voice_name], tokens,
-            self._caches(step.engine_inputs.resources, voice_name, plans), last,
+            step.state_of(rids), self.bank, voices, tokens, self._caches(step.engine_inputs.resources, plans), last,
         )
 
     @torch.compiler.disable
