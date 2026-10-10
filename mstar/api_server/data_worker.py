@@ -54,6 +54,11 @@ def _sha256(path: str) -> bytes:
         return hashlib.file_digest(file, "sha256").digest()
 
 
+def _file_state(path: str) -> tuple[int, int, int]:
+    stat = os.stat(path)
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
 def _video_frame_metadata(
     tensor: torch.Tensor,
     *,
@@ -442,7 +447,7 @@ class PreprocessWorkerThread:
     ):
         tensors: NameToTensorList = {}
         input_metadata = {}
-        file_digests: dict[str, list[bytes]] = {}
+        file_states: dict[str, list[tuple[int, int, int]]] = {}
         self.in_flight_requests.add(input.request_id)
 
         # First, load raw modality tensors from file_paths (images, audio, video)
@@ -456,10 +461,10 @@ class PreprocessWorkerThread:
 
                 for filepath in input.file_paths[modality]:
                     if self._prefix_streams:
-                        # before the load, and checked again when keyed: a file
-                        # that changed between would file its KV under bytes
-                        # nobody decoded
-                        file_digests.setdefault(modality, []).append(_sha256(filepath))
+                        # before the load, and compared once the file is hashed:
+                        # a file that changed between would file its KV under
+                        # bytes nobody decoded
+                        file_states.setdefault(modality, []).append(_file_state(filepath))
                     # ---- Image ----
                     if modality == "image":
                         out = self.model.load_image(filepath, self.device)
@@ -510,7 +515,7 @@ class PreprocessWorkerThread:
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
             model_kwargs.update(self._prefix_keys(
-                tensors, layouts, input.file_paths, file_digests,
+                tensors, layouts, input.file_paths, file_states,
             ))
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
@@ -563,7 +568,7 @@ class PreprocessWorkerThread:
 
     def _prefix_keys(
         self, tensors: dict, layouts: dict, file_paths: dict | None,
-        file_digests: dict[str, list[bytes]],
+        file_states: dict[str, list[tuple[int, int, int]]],
     ) -> dict:
         """Key each page of every declared stream, as the kwargs that carry it.
 
@@ -604,7 +609,7 @@ class PreprocessWorkerThread:
                         "layout_walks"
                     )
                 digests = [
-                    self._digest(span, file_paths, file_digests)
+                    self._digest(span, file_paths, file_states)
                     if span.kind == "digest" else None
                     for span in layout
                 ]
@@ -683,7 +688,7 @@ class PreprocessWorkerThread:
 
     def _digest(
         self, span: Span, file_paths: dict | None,
-        file_digests: dict[str, list[bytes]],
+        file_states: dict[str, list[tuple[int, int, int]]],
     ) -> bytes:
         """Hash the file a digest span names, whole, with all else that decides its KV.
 
@@ -701,7 +706,7 @@ class PreprocessWorkerThread:
             f"{len(paths)}"
         )
         raw = _sha256(paths[index])
-        assert raw == file_digests[modality][index], (
+        assert _file_state(paths[index]) == file_states[modality][index], (
             f"{paths[index]} changed while it was loaded, so no key can name "
             "the bytes its tensors came from"
         )
