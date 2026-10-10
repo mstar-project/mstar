@@ -1,5 +1,6 @@
 """Glm5NextModel: Model implementation for GLM-5.3-Flash (text generation)."""
 
+import json
 import logging
 from pathlib import Path
 
@@ -180,6 +181,14 @@ class Glm5NextModel(Model):
         template = snap / "chat_template.jinja"
         if template.is_file():
             tokenizer.chat_template = template.read_text()
+        # the turn markers (<|user|>, <|observation|>) are listed only here; not
+        # registered as special, the detokenizer prints them into the reply
+        config = snap / "tokenizer_config.json"
+        if config.is_file():
+            cfg = json.loads(config.read_text())
+            special = {k: cfg[k] for k in ("eos_token", "pad_token") if cfg.get(k)}
+            tokenizer.add_special_tokens(
+                {**special, "additional_special_tokens": list(cfg.get("extra_special_tokens") or [])})
         return tokenizer
 
     # -------------------------------------------------------------------
@@ -429,15 +438,24 @@ class Glm5NextModel(Model):
             vocab = self.config.vocab_size
             byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
             input_ids = torch.tensor(byte_ids, dtype=torch.long)
-        # The checkpoint's chat template: [gMASK]<sop> + assistant turn.
+        # The checkpoint's chat template over the chat API's messages, tools and
+        # template switches (GlmChatAdapter); a bare prompt is one user turn.
         elif getattr(self.tokenizer, "chat_template", None):
+            messages = kwargs.get("messages") or [{"role": "user", "content": prompt}]
+            if not isinstance(messages, list):
+                raise ValueError("messages must be a list of chat messages")
+            # the template's switches only: others collide with apply_chat_template's own
+            switches = {k: v for k, v in (kwargs.get("chat_template_kwargs") or {}).items()
+                        if k in ("enable_thinking", "reasoning_effort", "clear_thinking")}
             input_ids = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
+                messages,
+                tools=kwargs.get("tools"),
                 add_generation_prompt=True,
                 return_tensors="pt",
                 # transformers 5.x defaults return_dict=True (a BatchEncoding);
                 # keep the bare-tensor return so [0] selects the row
                 return_dict=False,
+                **switches,
             )[0]
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
@@ -460,6 +478,9 @@ class Glm5NextModel(Model):
         stores k + 1); check_stop stops every request before either."""
         cfg = self.config
         return min(cfg.context_limit - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
+
+    def stop_token_ids(self) -> frozenset[int]:
+        return frozenset(self.config.eos_token_ids)
 
     def get_max_output_tokens(self, **model_kwargs):
         # held to the window: a one-token prompt emits at most context_limit tokens
