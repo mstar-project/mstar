@@ -530,6 +530,13 @@ class Engine:
                 resources=resources
             )
             submodule.bind_node_resources(resources)
+            if getattr(submodule, "reads_device_loopback", False):
+                # the sampler keeps its slot masters only for a node that
+                # reads them back on the device (see NodeSubmodule)
+                for resource in resources.values():
+                    enable = getattr(resource, "enable_device_loopback_reader", None)
+                    if enable is not None:
+                        enable()
 
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
