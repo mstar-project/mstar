@@ -44,13 +44,13 @@ def row_layout(
     entries and gains ``span`` this step. Slot offsets put the sink's written
     part at ``[0, sink_capacity)`` and the ring after it. With ``reverse`` a
     step's tokens join the stream last-first (see ``BoundedKVConfig``)."""
-    sink, window = policy
+    sink, window, includes_step = policy
     n = source_len + written
     ring = sink_capacity
 
     reads: list[tuple[int, int]] = [(0, min(sink, source_len))]
     reads.append((0, max(0, min(sink, n) - source_len)))
-    lo = max(sink, n - window)
+    lo = max(sink, n - (window - span if includes_step else window))
     reads.append((lo, max(0, source_len - lo)))
     first = max(lo, source_len)
     wrapped = _ring_ranges(first - sink, n - first, window)

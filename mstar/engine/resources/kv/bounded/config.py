@@ -23,10 +23,13 @@ if TYPE_CHECKING:
 
 
 class SinkWindow(NamedTuple):
-    """Keep the stream's first ``sink`` and last ``window`` entries."""
+    """Keep the stream's first ``sink`` and last ``window`` entries. With
+    ``window_includes_step`` the window counts the step's own tokens, so a step
+    that writes ``span`` attends only the last ``window - span`` retained ones."""
 
     sink: int
     window: int
+    window_includes_step: bool = False
 
 
 @dataclass

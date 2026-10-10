@@ -182,3 +182,30 @@ def test_kernels_match_torch(with_source):
     bounded_store(k, v, cache, table)
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(cache, want_cache, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ring_buckets,dilation", [(4, 1), (6, 1), (3, 4), (5, 8)])
+def test_waypoint_ring_is_sink_window(ring_buckets, dilation):
+    """Waypoint's ring (``RingKVManager`` + flex visibility) as a sink + window: no
+    sink, a window of ``ring_buckets`` frames that counts the current one, over a
+    stream that only every ``dilation``-th frame writes to (the others attend
+    without writing). Compared slot set by slot set against its block tables."""
+    from types import SimpleNamespace
+
+    from mstar.engine.resources.attn.flex import FlexAttentionManager
+
+    tokens = 128
+    manager = SimpleNamespace(_kv_config=SimpleNamespace(tokens_per_frame=tokens))
+    geometry = (ring_buckets, ring_buckets, dilation)
+    policy = SinkWindow(0, ring_buckets * tokens, window_includes_step=True)
+    written = 0
+    for frame in range(4 * ring_buckets * dilation):
+        visible = FlexAttentionManager._visible_blocks_for(manager, geometry, session_idx=0, frame_pos=frame)
+        # their ring slots, without the scratch frame the current one sits in
+        want = sorted({b // (tokens // 128) for b in visible} - {ring_buckets})
+        span = tokens if frame % dilation == 0 else 0
+        layout = row_layout(0, written, span, policy, 0)
+        got = sorted({pos // tokens for start, count in layout.reads[3:] for pos in range(start, start + count)})
+        assert got == want, (frame, got, want)
+        assert sum(c for _, c in layout.reads[:3]) == 0
+        written += span
