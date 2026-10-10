@@ -94,9 +94,9 @@ def _routed_gate_up(x, ids, w13, s13, act, limit, q, stride_we, stride_se,
 
 
 @triton.jit
-def _shared_gate_up(x, sw13, act, limit, T, q,
+def _shared_gate_up(x, sw13, act, limit, T, q, NTB,
                     K: tl.constexpr, I: tl.constexpr, H: tl.constexpr, TB: tl.constexpr,
-                    NTB: tl.constexpr, BJ: tl.constexpr, BK: tl.constexpr, CLAMP: tl.constexpr):
+                    BJ: tl.constexpr, BK: tl.constexpr, CLAMP: tl.constexpr):
     """Program ``q``: BJ columns of the bf16 shared expert for token block ``q % NTB`` (TB
     tokens). The programs of one column block are adjacent, so its weights come from HBM
     about once."""
@@ -132,7 +132,7 @@ def _gate_up_kernel(
         gdc_launch_dependents()
     pid = tl.program_id(0)
     if pid < NS:
-        _shared_gate_up(x, sw13, act, limit, T, pid, K, I, H, TB, 1, BJS, BKS, CLAMP)
+        _shared_gate_up(x, sw13, act, limit, T, pid, 1, K, I, H, TB, BJS, BKS, CLAMP)
     else:
         if PDL:
             gdc_wait()
@@ -250,8 +250,8 @@ def _split_x(x, xq, xs, t, T, H: tl.constexpr, HP: tl.constexpr):
 
 
 @triton.jit
-def _plan(ids, pairs, tiles, TK, E: tl.constexpr, EP: tl.constexpr, NP: tl.constexpr,
-          BM: tl.constexpr, MT: tl.constexpr, NT: tl.constexpr, NTP: tl.constexpr):
+def _plan(ids, pairs, tiles, TK, MT, NT, E: tl.constexpr, EP: tl.constexpr,
+          NP: tl.constexpr, BM: tl.constexpr, NTP: tl.constexpr):
     """Group the TK (token, slot) pairs by expert into tiles of at most BM. ``pairs`` holds
     each expert's pairs in ascending order, experts in order; tile i is
     ``pairs[tiles[1, i]:][:tiles[2, i]]``, all routed to expert ``tiles[0, i]``. Tiles past
@@ -264,7 +264,7 @@ def _plan(ids, pairs, tiles, TK, E: tl.constexpr, EP: tl.constexpr, NP: tl.const
     off = tl.cumsum(c, 0) - c
     te = (c + BM - 1) // BM
     t0 = tl.cumsum(te, 0) - te
-    for mt in tl.static_range(MT):
+    for mt in range(MT):
         live = mt < te
         tl.store(tiles + t0 + mt, ee, mask=live)
         tl.store(tiles + NT + t0 + mt, off + mt * BM, mask=live)
@@ -273,10 +273,12 @@ def _plan(ids, pairs, tiles, TK, E: tl.constexpr, EP: tl.constexpr, NP: tl.const
     tl.store(tiles + 2 * NT + i, 0, mask=(i >= tl.sum(te, 0)) & (i < NT))
 
 
-@triton.jit
-def _plan_kernel(ids, pairs, tiles, x, xq, xs, T, TK, E: tl.constexpr, EP: tl.constexpr,
-                 NP: tl.constexpr, BM: tl.constexpr, MT: tl.constexpr, NT: tl.constexpr,
-                 NTP: tl.constexpr, H: tl.constexpr, HP: tl.constexpr, PDL: tl.constexpr):
+# The sizes that follow the token count are runtime arguments, left unspecialized: as
+# constexprs every new prefill length would compile the grouped kernels mid-request
+@triton.jit(do_not_specialize=["T", "TK", "MT", "NT"])
+def _plan_kernel(ids, pairs, tiles, x, xq, xs, T, TK, MT, NT, E: tl.constexpr,
+                 EP: tl.constexpr, NP: tl.constexpr, BM: tl.constexpr, NTP: tl.constexpr,
+                 H: tl.constexpr, HP: tl.constexpr, PDL: tl.constexpr):
     """Program 0: ``_plan``. Programs 1..T: ``_split_x`` of one token each, for the gate/up;
     they need no routing, so they run beside the plan."""
     if tl.program_id(0) > 0:
@@ -287,13 +289,13 @@ def _plan_kernel(ids, pairs, tiles, x, xq, xs, T, TK, E: tl.constexpr, EP: tl.co
         if PDL:
             gdc_wait()
             gdc_launch_dependents()
-        _plan(ids, pairs, tiles, TK, E, EP, NP, BM, MT, NT, NTP)
+        _plan(ids, pairs, tiles, TK, MT, NT, E, EP, NP, BM, NTP)
 
 
 @triton.jit
-def _grouped_gate_up(xq, xs, pairs, tiles, w13, s13, act, limit, q, T, stride_we, stride_se,
-                     K: tl.constexpr, I: tl.constexpr, H: tl.constexpr, BO: tl.constexpr,
-                     BI: tl.constexpr, BJ: tl.constexpr, BM: tl.constexpr, NT: tl.constexpr,
+def _grouped_gate_up(xq, xs, pairs, tiles, w13, s13, act, limit, q, T, NT, stride_we,
+                     stride_se, K: tl.constexpr, I: tl.constexpr, H: tl.constexpr,
+                     BO: tl.constexpr, BI: tl.constexpr, BJ: tl.constexpr, BM: tl.constexpr,
                      CLAMP: tl.constexpr):
     """BJ gate and up columns of tile ``q // (I // BJ)``'s expert for its pairs (real tiles
     come first, so do their programs), as one fp8 tl.dot with the gate rows stacked on the
@@ -329,32 +331,30 @@ def _grouped_gate_up(xq, xs, pairs, tiles, w13, s13, act, limit, q, T, stride_we
                  mask=live[None, :])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "NT", "NS", "NTB"])
 def _grouped_gate_up_kernel(
-    x, xq, xs, pairs, tiles, w13, s13, sw13, act, limit, T, stride_we, stride_se,
+    x, xq, xs, pairs, tiles, w13, s13, sw13, act, limit, T, NT, NS, NTB, stride_we, stride_se,
     K: tl.constexpr, I: tl.constexpr, H: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
-    BJ: tl.constexpr, BM: tl.constexpr, NT: tl.constexpr, NS: tl.constexpr, TB: tl.constexpr,
-    NTB: tl.constexpr, BJS: tl.constexpr, BKS: tl.constexpr, CLAMP: tl.constexpr,
-    PDL: tl.constexpr,
+    BJ: tl.constexpr, BM: tl.constexpr, TB: tl.constexpr, BJS: tl.constexpr,
+    BKS: tl.constexpr, CLAMP: tl.constexpr, PDL: tl.constexpr,
 ):
     """``_gate_up_kernel`` with the routed rows grouped by expert (same ``act`` layout)."""
     if PDL:
         gdc_launch_dependents()
     pid = tl.program_id(0)
     if pid < NS:
-        _shared_gate_up(x, sw13, act, limit, T, pid, K, I, H, TB, NTB, BJS, BKS, CLAMP)
+        _shared_gate_up(x, sw13, act, limit, T, pid, NTB, K, I, H, TB, BJS, BKS, CLAMP)
     else:
         if PDL:
             gdc_wait()
-        _grouped_gate_up(xq, xs, pairs, tiles, w13, s13, act, limit, pid - NS, T, stride_we,
-                         stride_se, K, I, H, BO, BI, BJ, BM, NT, CLAMP)
+        _grouped_gate_up(xq, xs, pairs, tiles, w13, s13, act, limit, pid - NS, T, NT,
+                         stride_we, stride_se, K, I, H, BO, BI, BJ, BM, CLAMP)
 
 
 @triton.jit
-def _grouped_down(act, pairs, tiles, topk_w, w2, s2, part, q, stride_we, stride_se,
+def _grouped_down(act, pairs, tiles, topk_w, w2, s2, part, q, NT, stride_we, stride_se,
                   I: tl.constexpr, H: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
-                  BN: tl.constexpr, NG: tl.constexpr, BM: tl.constexpr, NT: tl.constexpr,
-                  CLAMP: tl.constexpr):
+                  BN: tl.constexpr, NG: tl.constexpr, BM: tl.constexpr, CLAMP: tl.constexpr):
     """NG blocks of BN hidden rows of tile ``q // (H // (BN * NG))``'s expert: ``part[pair]
     = topk_w * act @ down.T``. The SwiGLU clamp bounds |act| by limit^2, so act can enter
     the dot as fp16 (11-bit mantissa, 3 more than bf16) against fp16 weights (exact for
@@ -414,12 +414,12 @@ def _shared_down(act, sw2, part, T, q, K: tl.constexpr, I: tl.constexpr, H: tl.c
     tl.store(part + (T * K + t[None, :]) * H + n[:, None], acc, mask=live[None, :])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "NT", "NSD"])
 def _grouped_down_kernel(
-    act, pairs, tiles, topk_w, w2, s2, sw2, part, T, stride_we, stride_se,
+    act, pairs, tiles, topk_w, w2, s2, sw2, part, T, NT, NSD, stride_we, stride_se,
     K: tl.constexpr, I: tl.constexpr, H: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
-    BN: tl.constexpr, NG: tl.constexpr, BM: tl.constexpr, NT: tl.constexpr,
-    NSD: tl.constexpr, BNS: tl.constexpr, CLAMP: tl.constexpr, PDL: tl.constexpr,
+    BN: tl.constexpr, NG: tl.constexpr, BM: tl.constexpr, BNS: tl.constexpr,
+    CLAMP: tl.constexpr, PDL: tl.constexpr,
 ):
     """fp32 partials: rows ``[0, T*K)`` of ``part`` per routed pair, ``[T*K, T*K+T)`` the
     shared expert per token; the NSD shared programs come first in the grid."""
@@ -430,8 +430,8 @@ def _grouped_down_kernel(
     if pid < NSD:
         _shared_down(act, sw2, part, T, pid, K, I, H, BI, BNS, BM)
     else:
-        _grouped_down(act, pairs, tiles, topk_w, w2, s2, part, pid - NSD, stride_we,
-                      stride_se, I, H, BO, BI, BN, NG, BM, NT, CLAMP)
+        _grouped_down(act, pairs, tiles, topk_w, w2, s2, part, pid - NSD, NT, stride_we,
+                      stride_se, I, H, BO, BI, BN, NG, BM, CLAMP)
 
 
 @triton.jit
@@ -556,8 +556,8 @@ def _launch_grouped(x, ids, tw, w13, s13, w2, s2, sw13, sw2, buf, block_size, li
     nt = buf["tiles"].shape[1]
     plan = buf["pairs"], buf["tiles"]
     _plan_kernel[(1 + T,)](
-        ids, *plan, x, buf["xq"], buf["xs"], T, T * K, E=E, EP=triton.next_power_of_2(E + 1),
-        NP=buf["pairs"].numel(), BM=bm, MT=triton.cdiv(T, bm), NT=nt,
+        ids, *plan, x, buf["xq"], buf["xs"], T, T * K, triton.cdiv(T, bm), nt, E=E,
+        EP=triton.next_power_of_2(E + 1), NP=buf["pairs"].numel(), BM=bm,
         NTP=triton.next_power_of_2(nt), H=H, HP=triton.next_power_of_2(H), PDL=pdl,
         num_warps=4, launch_pdl=pdl)
     ntb = triton.cdiv(T, t["tbs"])
@@ -565,14 +565,14 @@ def _launch_grouped(x, ids, tw, w13, s13, w2, s2, sw13, sw2, buf, block_size, li
     w13 = w13.view(torch.float8_e4m3fn)
     _grouped_gate_up_kernel[(ns + nt * (I // bj),)](
         x, buf["xq"], buf["xs"], *plan, w13, s13, sw13, buf["act"],
-        0.0 if limit is None else float(limit), T, w13.stride(0), s13.stride(0),
-        K=K, I=I, H=H, BO=bo, BI=bi, BJ=bj, BM=bm, NT=nt, NS=ns, TB=t["tbs"], NTB=ntb,
-        BJS=t["bjs"], BKS=min(t["bks"], H), CLAMP=clamp, PDL=pdl, num_warps=t["gu_warps"],
+        0.0 if limit is None else float(limit), T, nt, ns, ntb, w13.stride(0), s13.stride(0),
+        K=K, I=I, H=H, BO=bo, BI=bi, BJ=bj, BM=bm, TB=t["tbs"], BJS=t["bjs"],
+        BKS=min(t["bks"], H), CLAMP=clamp, PDL=pdl, num_warps=t["gu_warps"],
         num_stages=t["gu_stages"], launch_pdl=pdl)
     nsd = triton.cdiv(T, bm) * (H // bns)
     _grouped_down_kernel[(nsd + nt * (H // (bn * ng)),)](
-        buf["act"], *plan, tw, w2, s2, sw2, buf["part"], T, w2.stride(0), s2.stride(0),
-        K=K, I=I, H=H, BO=bo, BI=bi, BN=bn, NG=ng, BM=bm, NT=nt, NSD=nsd, BNS=bns,
+        buf["act"], *plan, tw, w2, s2, sw2, buf["part"], T, nt, nsd, w2.stride(0),
+        s2.stride(0), K=K, I=I, H=H, BO=bo, BI=bi, BN=bn, NG=ng, BM=bm, BNS=bns,
         CLAMP=clamp, PDL=pdl, num_warps=t["dn_warps"], num_stages=t["dn_stages"],
         launch_pdl=pdl)
     _sum_kernel[(T, H // sum_bn)](
