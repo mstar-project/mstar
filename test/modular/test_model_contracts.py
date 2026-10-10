@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import glob
 import json
+import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 from huggingface_hub.errors import EntryNotFoundError
 
 import mstar.model.bagel.bagel_model as bagel_mod
@@ -240,6 +242,99 @@ def test_higgs_enable_thinking_must_be_a_bool(bad):
 
 
 
+# ── omnivoice ───────────────────────────────────────────────────────────────
+
+sys.path.insert(0, ".")
+
+from mstar.model.omnivoice.config import OmniVoiceConfig  # noqa: E402
+from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel  # noqa: E402
+
+
+def _omnivoice_model() -> OmniVoiceModel:
+    model = object.__new__(OmniVoiceModel)
+    model.config = OmniVoiceConfig()
+    model._submodule_cache = {}
+    model._ensure_data_worker_assets = lambda: None
+    return model
+
+
+def _omnivoice_initial_args(model, **kwargs):
+    signals = {"prefix_ids": ["p"], "prefix_audio_mask": ["m"], "target_len": ["t"]}
+    return model.get_initial_forward_pass_args("default", ["text"], ["audio"], signals, kwargs)
+
+
+def test_omnivoice_request_kwargs_include_the_adapter_alias_and_every_knob():
+    declared = _omnivoice_model().request_kwargs()
+    # the speech adapter maps voice -> instruct; speed is forwarded
+    assert {"instruct", "speed", "language", "ref_text", "duration", "denoise"} <= declared
+    assert {"num_step", "guidance_scale", "t_shift", "class_temperature", "position_temperature"} <= declared
+    assert {"postprocess_output", "pad_duration", "fade_duration", "layer_penalty_factor"} <= declared
+    assert "voice" not in declared and "temperature" not in declared
+    assert _omnivoice_model().get_max_output_tokens_limit() is None
+
+
+def test_omnivoice_defaults_when_absent():
+    meta = _omnivoice_initial_args(_omnivoice_model()).step_metadata
+    gen = OmniVoiceConfig().generation
+    assert meta["num_step"] == gen.num_step and meta["guidance_scale"] == gen.guidance_scale
+    assert meta["class_temperature"] == 0.0 and meta["postprocess_output"] is True
+    assert meta["pad_duration"] == 0.1 and meta["fade_duration"] == 0.1
+
+
+def test_omnivoice_valid_knobs_pass_through():
+    meta = _omnivoice_initial_args(
+        _omnivoice_model(), num_step=64, guidance_scale=0, class_temperature=0, t_shift=0.5, postprocess_output=False
+    ).step_metadata
+    assert meta["num_step"] == 64 and meta["guidance_scale"] == 0.0 and meta["t_shift"] == 0.5
+    assert meta["postprocess_output"] is False
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"num_step": 0}, r"num_step must be an integer in \[1, 64\]"),
+        ({"num_step": 65}, r"num_step must be an integer in \[1, 64\]"),
+        ({"num_step": 16.0}, "num_step must be an integer"),
+        ({"num_step": "16"}, "num_step must be an integer"),
+        ({"guidance_scale": "2"}, "guidance_scale must be a finite number"),
+        ({"guidance_scale": float("nan")}, "guidance_scale must be a finite number"),
+        ({"t_shift": 0}, "t_shift must be > 0"),
+        ({"class_temperature": -1.0}, "class_temperature must be >= 0"),
+        ({"position_temperature": True}, "position_temperature must be a finite number"),
+        ({"postprocess_output": "false"}, "postprocess_output must be true or false"),
+        ({"postprocess_output": 0}, "postprocess_output must be true or false"),
+        ({"pad_duration": -0.1}, "pad_duration must be >= 0"),
+    ],
+)
+def test_omnivoice_bad_step_knobs_are_400s_at_both_seams(kwargs, match):
+    model = _omnivoice_model()
+    with pytest.raises(ValueError, match=match):
+        _omnivoice_initial_args(model, **kwargs)
+    with pytest.raises(ValueError, match=match):
+        model.process_prompt("Hello", ["text"], ["audio"], **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"speed": 0}, "speed must be > 0"),
+        ({"speed": -1.0}, "speed must be > 0"),
+        ({"speed": "1.2"}, "speed must be a finite number"),
+        ({"duration": 0}, "duration must be > 0"),
+        ({"duration": -2.0}, "duration must be > 0"),
+        ({"duration": 0.001}, "shorter than one codec frame"),
+        ({"denoise": "false"}, "denoise must be true or false"),
+        ({"instruct": ""}, "instruct must be a non-empty string"),
+        ({"language": 3}, "language must be a non-empty string"),
+        ({"ref_text": ""}, "ref_text must be a non-empty string"),
+    ],
+)
+def test_omnivoice_bad_prompt_knobs_are_400s(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _omnivoice_model().process_prompt("Hello", ["text"], ["audio"], **kwargs)
+
+
+
 # ── qwen3_5 ─────────────────────────────────────────────────────────────────
 
 QWEN3_5_27B = {
@@ -459,6 +554,96 @@ def test_qwen3_omni_request_kwargs_spot_checks(omni_released):
         assert key in declared, key
     assert "do_sample" not in declared
     assert "subtalker_temperature" not in declared
+
+
+
+# ── vjepa2 ──────────────────────────────────────────────────────────────────
+
+sys.path.insert(0, ".")
+
+from mstar.model.vjepa2.vjepa2_model import VJepa2Model  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def vjepa2_masked():
+    return VJepa2Model(
+        model_path_hf="facebook/vjepa2-vitl-fpc64-256", skip_weight_loading=True, predictor_kind="vjepa2_masked"
+    )
+
+
+@pytest.fixture(scope="module")
+def vjepa2_ac_model():
+    return VJepa2Model(model_path_hf="facebook/vjepa2-ac-vitg", skip_weight_loading=True, predictor_kind="ac")
+
+
+def _vjepa2_video(frames: int) -> dict:
+    return {"video_inputs": [torch.rand(frames, 3, 32, 40)]}
+
+
+def test_vjepa2_request_kwargs_and_no_token_limit(vjepa2_masked):
+    declared = vjepa2_masked.request_kwargs()
+    assert {"num_frames", "rollout_horizon", "stream_rollout", "skip_predictor", "mpc"} <= declared
+    assert {"actions", "states", "extrinsics", "goal_hidden", "goal_hidden_fill"} <= declared
+    assert {"context_mask", "target_mask"} <= declared
+    assert vjepa2_masked.get_max_output_tokens_limit() is None
+
+
+@pytest.mark.parametrize("horizon", [-1, 17, 2.0, "4", True])
+def test_vjepa2_bad_rollout_horizon_is_a_400(vjepa2_masked, horizon):
+    limit = vjepa2_masked.config.max_rollout_horizon
+    with pytest.raises(ValueError, match=rf"rollout_horizon must be an integer in \[0, {limit}\]"):
+        vjepa2_masked._initial_walk({"rollout_horizon": horizon})
+    with pytest.raises(ValueError, match="rollout_horizon"):
+        vjepa2_masked.process_prompt(None, ["video"], ["video"], tensors=_vjepa2_video(4), rollout_horizon=horizon)
+
+
+def test_vjepa2_rollout_horizon_range_is_honored_not_clamped(vjepa2_masked):
+    assert vjepa2_masked._initial_walk({"rollout_horizon": 0}) == VJepa2Model.PREFILL_VIDEO
+    assert vjepa2_masked._initial_walk({"rollout_horizon": 1}) == VJepa2Model.PREFILL_VIDEO
+    limit = vjepa2_masked.config.max_rollout_horizon
+    args = vjepa2_masked.get_initial_forward_pass_args(
+        "default", ["video"], ["video"], {}, {"rollout_horizon": limit}
+    )
+    assert args.full_metadata.graph_walk == VJepa2Model.PREFILL_VIDEO_ROLLOUT
+    assert args.step_metadata["rollout_horizon"] == limit
+
+
+@pytest.mark.parametrize("flag", ["stream_rollout", "skip_predictor", "mpc"])
+@pytest.mark.parametrize("value", ["false", 0, 1])
+def test_vjepa2_flags_must_be_bools(vjepa2_masked, flag, value):
+    with pytest.raises(ValueError, match=f"{flag} must be true or false"):
+        vjepa2_masked._initial_walk({flag: value, "rollout_horizon": 4})
+    with pytest.raises(ValueError, match=f"{flag} must be true or false"):
+        vjepa2_masked.process_prompt(None, ["video"], ["video"], tensors=_vjepa2_video(4), **{flag: value})
+
+
+@pytest.mark.parametrize("num_frames", [0, -2, 9, 4.0, "4"])
+def test_vjepa2_num_frames_outside_the_decoded_clip_is_a_400(vjepa2_masked, num_frames):
+    with pytest.raises(ValueError, match=r"num_frames must be an integer in \[1, 8\]"):
+        vjepa2_masked.process_prompt(None, ["video"], ["video"], tensors=_vjepa2_video(8), num_frames=num_frames)
+
+
+def test_vjepa2_num_frames_default_and_explicit(vjepa2_masked):
+    crop = vjepa2_masked.config.crop_size
+    out = vjepa2_masked.process_prompt(None, ["video"], ["video"], tensors=_vjepa2_video(8))
+    assert tuple(out["video_frames"][0].shape) == (8, 3, crop, crop)
+    out = vjepa2_masked.process_prompt(None, ["video"], ["video"], tensors=_vjepa2_video(8), num_frames=4)
+    assert out["video_frames"][0].shape[0] == 4
+
+
+def test_vjepa2_ac_inputs_must_be_numeric(vjepa2_ac_model):
+    good = {"actions": [[0.0] * 7] * 4, "states": [[0.0] * 7] * 4}
+    with pytest.raises(ValueError, match="actions must be a numeric array"):
+        vjepa2_ac_model.process_prompt(None, ["video"], ["video"], **{**good, "actions": [["a"] * 7] * 4})
+    with pytest.raises(ValueError, match="states must be a numeric array"):
+        vjepa2_ac_model.process_prompt(None, ["video"], ["video"], **{**good, "states": [[0.0] * 7, [0.0] * 3]})
+    with pytest.raises(ValueError, match="goal_hidden_fill must be a number"):
+        vjepa2_ac_model.process_prompt(None, ["video"], ["video"], mpc=True, goal_hidden_fill="1", **good)
+    # the trajectory check uses the validated horizon: 5 needs 1 + 5 - 1 = 5 steps
+    with pytest.raises(ValueError, match="trajectory length >= .* = 5; got 4"):
+        vjepa2_ac_model.process_prompt(None, ["video"], ["video"], rollout_horizon=5, **good)
+    out = vjepa2_ac_model.process_prompt(None, ["video"], ["video"], rollout_horizon=4, **good)
+    assert out["actions"][0].shape == (4, 7)
 
 
 

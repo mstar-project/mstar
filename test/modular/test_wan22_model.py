@@ -318,14 +318,8 @@ def test_wan22_rejects_promptless_request():
         )
 
 
-@pytest.mark.parametrize("requested,expected", [
-    (1, 1),
-    (50, 50),
-    (100, 100),   # exactly the ceiling
-    (10_000, 100),  # clamped to max_denoise_steps
-    (0, 1),       # floored at one step
-])
-def test_wan22_num_inference_steps_clamped(requested, expected):
+@pytest.mark.parametrize("requested", [1, 50, 100])  # 100 is exactly the ceiling
+def test_wan22_num_inference_steps_in_range_are_honored(requested):
     model = _make_model()
     assert model.config.max_denoise_steps == 100
     args = model.get_initial_forward_pass_args(
@@ -335,7 +329,58 @@ def test_wan22_num_inference_steps_clamped(requested, expected):
         input_signals={"text_inputs": [_tensor_info("text")]},
         model_kwargs={"num_inference_steps": requested},
     )
-    assert args.step_metadata["num_inference_steps"] == expected
+    assert args.step_metadata["num_inference_steps"] == requested
+
+
+@pytest.mark.parametrize("requested", [0, -1, 101, 10_000, 50.0, "50", True])
+def test_wan22_num_inference_steps_out_of_range_is_a_400(requested):
+    model = _make_model()
+    with pytest.raises(ValueError, match=r"num_inference_steps must be an integer in \[1, 100\]"):
+        model.get_initial_forward_pass_args(
+            partition_name="default",
+            input_modalities=["text"],
+            output_modalities=["video"],
+            input_signals={"text_inputs": [_tensor_info("text")]},
+            model_kwargs={"num_inference_steps": requested},
+        )
+    with pytest.raises(ValueError, match="num_inference_steps"):
+        model.process_prompt(
+            prompt="a cat surfing", input_modalities=["text"], output_modalities=["video"],
+            num_inference_steps=requested,
+        )
+
+
+@pytest.mark.parametrize("kwargs,fragment", [
+    ({"guidance_scale": "5"}, "guidance_scale must be a finite number"),
+    ({"guidance_scale": float("inf")}, "guidance_scale must be a finite number"),
+    ({"guidance_scale": False}, "guidance_scale must be a finite number"),
+    ({"negative_prompt": 3}, "negative_prompt must be a string"),
+])
+def test_wan22_bad_denoise_knobs_are_400s(kwargs, fragment):
+    model = _make_model()
+    with pytest.raises(ValueError, match=fragment):
+        model.process_prompt(
+            prompt="a cat surfing", input_modalities=["text"], output_modalities=["video"], **kwargs,
+        )
+
+
+def test_wan22_null_knobs_mean_default_and_request_kwargs_are_declared():
+    model = _make_model()
+    args = model.get_initial_forward_pass_args(
+        partition_name="default",
+        input_modalities=["text"],
+        output_modalities=["video"],
+        input_signals={"text_inputs": [_tensor_info("text")]},
+        model_kwargs={"guidance_scale": None, "num_inference_steps": None, "width": None},
+    )
+    meta = args.step_metadata
+    assert meta["guidance_scale"] == model.config.guidance_scale
+    assert meta["num_inference_steps"] == model.config.default_num_inference_steps
+    assert meta["width"] == model.config.default_width
+    # the video adapter maps size -> height/width and forwards num_frames/fps
+    assert {"height", "width", "num_frames", "fps"} <= model.request_kwargs()
+    assert {"guidance_scale", "num_inference_steps", "negative_prompt"} <= model.request_kwargs()
+    assert model.get_max_output_tokens_limit() is None
 
 
 def _step(model, metadata, persist_signals):
@@ -645,7 +690,8 @@ def test_wan22_process_prompt_rejects_unaligned_sizes(height, width, bad_axis, n
     ({"height": 0}, "must be positive"),
     ({"width": -32}, "must be positive"),
     ({"height": "tall"}, "must be an integer"),
-    ({"width": None}, "must be an integer"),
+    ({"height": "480"}, "must be an integer"),
+    ({"width": 832.0}, "must be an integer"),
 ])
 def test_wan22_process_prompt_rejects_malformed_sizes(kwargs, fragment):
     model = _make_model()
@@ -701,6 +747,7 @@ def test_wan22_process_prompt_rejects_unaligned_num_frames(frames, nearest):
     (0, "must be positive"),
     (-4, "must be positive"),      # would have crashed the worker on a negative dim
     ("many", "must be an integer"),
+    (33.0, "must be an integer"),
 ])
 def test_wan22_process_prompt_rejects_malformed_num_frames(frames, fragment):
     model = _make_model()
@@ -731,6 +778,7 @@ def test_wan22_process_prompt_accepts_valid_fps(fps):
     (0, "must be positive"),
     (-1, "must be positive"),
     ("fast", "must be a number"),
+    ("24", "must be a number"),
 ])
 def test_wan22_process_prompt_rejects_bad_fps(fps, fragment):
     model = _make_model()
@@ -840,7 +888,7 @@ def test_wan22_config_echo_logs_resolved_settings(caplog):
 
 def test_wan22_config_echo_marks_absent_negative_and_auto_seed(caplog):
     # No seed and an empty negative prompt: seed reads "auto", negative "absent",
-    # and steps reflect the clamped/defaulted value.
+    # and steps echo the requested value.
     model = _make_model()
     with caplog.at_level(logging.INFO, logger="mstar.model.wan22.wan22_model"):
         model.get_initial_forward_pass_args(
@@ -848,7 +896,7 @@ def test_wan22_config_echo_marks_absent_negative_and_auto_seed(caplog):
             input_modalities=["text"],
             output_modalities=["video"],
             input_signals={"text_inputs": [_tensor_info("text")]},
-            model_kwargs={"num_inference_steps": 10_000},  # clamps to max_denoise_steps
+            model_kwargs={"num_inference_steps": 100},  # the max_denoise_steps ceiling
         )
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
     assert "seed=auto" in line

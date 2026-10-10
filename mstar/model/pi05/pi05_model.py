@@ -134,6 +134,15 @@ def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
                 )
 
 
+def _flat(value):
+    """Leaves of a nested list/tuple."""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _flat(item)
+    else:
+        yield value
+
+
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
 
@@ -502,6 +511,7 @@ class Pi05Model(Model):
         here so the resulting ``text_inputs`` stream matches the production
         format.
         """
+        robot_state = self._robot_state(kwargs.get("robot_state"))
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             if prompt is not None:
@@ -514,14 +524,11 @@ class Pi05Model(Model):
 
         cleaned = (prompt or "").strip().replace("_", " ").replace("\n", " ")
 
-        robot_state = kwargs.get("robot_state")
         if robot_state is not None:
-            if not isinstance(robot_state, torch.Tensor):
-                robot_state = torch.tensor(robot_state, dtype=torch.float32)
             from mstar.model.pi05.components.flow_matching import discretize_state
 
             bins = discretize_state(
-                robot_state.to(torch.float32),
+                robot_state,
                 num_bins=self.config.state_token_bins,
             ).tolist()
             state_str = " ".join(str(b) for b in bins)
@@ -531,6 +538,34 @@ class Pi05Model(Model):
 
         text_ids = self.tokenizer.encode_prompt(full_prompt)
         return {"text_inputs": [text_ids]}
+
+    def _robot_state(self, raw) -> torch.Tensor | None:
+        """The client's ``robot_state`` as a float32 vector of at most ``state_dim``
+        finite values; anything else is a ``ValueError``. Values outside [-1, 1]
+        saturate in ``discretize_state``, the model's normalization."""
+        if raw is None:
+            return None
+        limit = self.config.state_dim
+        if isinstance(raw, torch.Tensor):
+            state = raw.to(torch.float32)
+        else:
+            if isinstance(raw, (str, bytes)) or any(isinstance(v, (bool, str, bytes)) for v in _flat(raw)):
+                raise ValueError(f"robot_state must be a list of at most {limit} numbers; got {raw!r}")
+            try:
+                state = torch.tensor(raw, dtype=torch.float32)
+            except (TypeError, ValueError, RuntimeError):
+                raise ValueError(f"robot_state must be a list of at most {limit} numbers; got {raw!r}") from None
+        if state.dim() != 1 or not 1 <= state.numel() <= limit:
+            raise ValueError(
+                f"robot_state must be a list of 1 to {limit} numbers; got shape {tuple(state.shape)}"
+            )
+        if not torch.isfinite(state).all():
+            raise ValueError("robot_state values must be finite")
+        return state
+
+    def request_kwargs(self) -> frozenset[str]:
+        # flow steps and the rest come from the deployment YAML, not the request
+        return frozenset({"robot_state"})
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "action":

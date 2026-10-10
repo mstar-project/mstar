@@ -63,6 +63,17 @@ else:
     step_logger.setLevel(logging.WARNING)
 
 PCM16_SCALE = 32767
+_MASK64 = (1 << 64) - 1
+
+
+def noise_key(seed: int, chunk: int) -> torch.Tensor:
+    """int64 ``[2]`` key for one chunk's source noise: splitmix64 of the request
+    seed and chunk index, as two 32-bit words."""
+    z = (seed + (chunk + 1) * 0x9E3779B97F4A7C15) & _MASK64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+    z ^= z >> 31
+    return torch.tensor([z & 0xFFFFFFFF, z >> 32], dtype=torch.long)
 
 
 def text_region(bucket: int) -> str:
@@ -155,6 +166,7 @@ class KokoroSynthSubmodule(NodeSubmodule):
                 "input_ids": inputs[PHONEME_IDS][0][iteration, :length],
                 "style": inputs[REF_STYLE][0][iteration],
                 "speed": inputs[SPEED][0].reshape(()),
+                "noise_key": noise_key(fwd_info.random_seed, iteration),
             },
             input_seq_len=length,
         )
@@ -195,6 +207,7 @@ class KokoroSynthSubmodule(NodeSubmodule):
             "lengths": torch.tensor([inp.input_seq_len for inp in inputs], dtype=torch.long, device=device),
             "style": torch.stack([inp.tensor_inputs["style"].to(device) for inp in inputs]),
             "speed": torch.stack([inp.tensor_inputs["speed"].to(device) for inp in inputs]),
+            "noise_key": torch.stack([inp.tensor_inputs["noise_key"] for inp in inputs]).to(device),
         }
 
     def forward(
@@ -205,10 +218,12 @@ class KokoroSynthSubmodule(NodeSubmodule):
         lengths: torch.Tensor,
         style: torch.Tensor,
         speed: torch.Tensor,
+        noise_key: torch.Tensor,
         **kwargs: Any,
     ) -> NameToTensorList:
         del graph_walk, kwargs
-        return {AUDIO_CHUNK: [self._synthesize(input_ids, lengths, style, speed, engine_inputs.piecewise_runners)[0]]}
+        runners = engine_inputs.piecewise_runners
+        return {AUDIO_CHUNK: [self._synthesize(input_ids, lengths, style, speed, noise_key, runners)[0]]}
 
     def forward_batched(
         self,
@@ -218,10 +233,11 @@ class KokoroSynthSubmodule(NodeSubmodule):
         lengths: torch.Tensor,
         style: torch.Tensor,
         speed: torch.Tensor,
+        noise_key: torch.Tensor,
         **kwargs: Any,
     ) -> dict[str, NameToTensorList]:
         del graph_walk, kwargs
-        chunks = self._synthesize(input_ids, lengths, style, speed, engine_inputs.piecewise_runners)
+        chunks = self._synthesize(input_ids, lengths, style, speed, noise_key, engine_inputs.piecewise_runners)
         return {rid: {AUDIO_CHUNK: [pcm]} for rid, pcm in zip(engine_inputs.request_ids, chunks, strict=True)}
 
     # -- the two halves, captured or eager -------------------------------------
@@ -232,9 +248,10 @@ class KokoroSynthSubmodule(NodeSubmodule):
         lengths: torch.Tensor,
         style: torch.Tensor,
         speed: torch.Tensor,
+        noise_key: torch.Tensor,
         runners: dict[str, Any],
     ) -> list[torch.Tensor]:
-        """One PCM16 chunk per row, sliced to its own length."""
+        """One PCM16 chunk per row, sliced to its own length; ``noise_key`` ``[B, 2]`` seeds each row's noise."""
         logging_step = step_logger.isEnabledFor(logging.INFO)
         if logging_step:
             if input_ids.is_cuda:
@@ -252,13 +269,19 @@ class KokoroSynthSubmodule(NodeSubmodule):
             if runner is not None and runner.can_run(len(rows)):
                 en, asr, group_lengths = self.model.align(d[index], t_en[index], pred_dur[index], bucket)
                 audio = runner.run(
-                    static_inputs={"en": en, "asr": asr, "frame_lengths": group_lengths, "style": style[index]},
+                    static_inputs={
+                        "en": en,
+                        "asr": asr,
+                        "frame_lengths": group_lengths,
+                        "style": style[index],
+                        "noise_key": noise_key[index],
+                    },
                     real_bs=len(rows),
                 )["audio"]
             else:
                 num_frames = max(sizes[r] for r in rows)
                 audio, _ = self.model.synthesize_frames(
-                    d[index], t_en[index], pred_dur[index], style[index], num_frames
+                    d[index], t_en[index], pred_dur[index], style[index], num_frames, noise_key[index]
                 )
             audio = (audio.clamp(-1, 1) * PCM16_SCALE).to(torch.int16)
             for i, row in enumerate(rows):
@@ -356,7 +379,10 @@ class KokoroSynthSubmodule(NodeSubmodule):
 
     def _frames_capture(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         si = inp.static_inputs
-        return {"audio": self.model.decode_frames(si["en"], si["asr"], si["frame_lengths"].clamp(min=1), si["style"])}
+        audio = self.model.decode_frames(
+            si["en"], si["asr"], si["frame_lengths"].clamp(min=1), si["style"], si["noise_key"]
+        )
+        return {"audio": audio}
 
     def _text_static_inputs(self, shape: PiecewiseCaptureShape, bucket: int, device) -> dict[str, torch.Tensor]:
         return {
@@ -373,6 +399,7 @@ class KokoroSynthSubmodule(NodeSubmodule):
             "asr": torch.zeros(shape.bs, cfg.hidden_dim, bucket, dtype=torch.float32, device=device),
             "frame_lengths": torch.zeros(shape.bs, dtype=torch.long, device=device),
             "style": torch.zeros(shape.bs, cfg.style_vector_dim, dtype=torch.float32, device=device),
+            "noise_key": torch.zeros(shape.bs, 2, dtype=torch.long, device=device),
         }
 
     def get_piecewise_cuda_graph_configs(

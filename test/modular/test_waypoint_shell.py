@@ -1674,3 +1674,12 @@ def test_postprocess_emits_the_step_s_frames_as_raw_rgb_bytes(model, config):
         model.postprocess(frames.float(), "video_frame")
     with pytest.raises(ValueError, match="modality"):
         model.postprocess(frames, "image")
+
+
+def test_request_kwargs_are_num_steps_and_actions_and_num_steps_is_bounded(model, config):
+    assert model.request_kwargs() == {"num_steps", "actions"}
+    assert model.get_max_output_tokens_limit() is None
+    assert model._resolve_num_steps({"num_steps": config.max_frames}) == config.max_frames
+    for bad in (0, config.max_frames + 1, 2.0, True):
+        with pytest.raises(ValueError, match="num_steps"):
+            model._resolve_num_steps({"num_steps": bad})

@@ -515,6 +515,9 @@ class WaypointModel(Model):
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
 
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"num_steps", "actions"})
+
     def _resolve_num_steps(self, model_kwargs: dict | None) -> int:
         """Validate the generated-latent count against the trained horizon."""
         model_kwargs = model_kwargs or {}
@@ -554,9 +557,8 @@ class WaypointModel(Model):
                 "Waypoint requires exactly one output modality, 'video_frame'; "
                 f"got {output_modalities!r}."
             )
-        # Backstop: process_prompt already rejects a malformed request (400).
-        # A raise here runs at the conductor, whose main loop swallows it, so
-        # the client would hang instead.
+        # Backstop: process_prompt already rejects a malformed request; a
+        # ValueError here is a 400 too.
         for name in _CONTROLLER_STREAMS:
             if not input_signals.get(name):
                 raise ValueError(

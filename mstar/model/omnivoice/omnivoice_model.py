@@ -20,6 +20,7 @@ same batch.  A fixed-pipeline port has to pick one value for the whole server.
 """
 
 import logging
+import math
 import os
 
 import numpy as np
@@ -61,6 +62,66 @@ from mstar.model.omnivoice.submodules import (
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
+
+# Every model_kwargs key a request may carry. The speech adapter maps the
+# OpenAI ``voice`` onto ``instruct``.
+REQUEST_KWARGS = frozenset({
+    "num_step", "guidance_scale", "t_shift", "layer_penalty_factor", "position_temperature",
+    "class_temperature", "postprocess_output", "pad_duration", "fade_duration",
+    "speed", "duration", "language", "instruct", "ref_text", "denoise",
+})
+
+
+def _number(kwargs: dict, key: str, default: float, rule: str = "", ok=None) -> float:
+    """``kwargs[key]`` as a finite JSON number satisfying ``ok``; ``default`` when absent."""
+    value = kwargs.get(key)
+    if value is None:
+        return float(default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{key} must be a finite number{' ' + rule if rule else ''}; got {value!r}")
+    if ok is not None and not ok(value):
+        raise ValueError(f"{key} must be {rule}; got {value!r}")
+    return float(value)
+
+
+def _flag(kwargs: dict, key: str, default: bool) -> bool:
+    value = kwargs.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false; got {value!r}")
+    return value
+
+
+def _text(kwargs: dict, key: str) -> str | None:
+    value = kwargs.get(key)
+    if value is not None and (not isinstance(value, str) or not value.strip()):
+        raise ValueError(f"{key} must be a non-empty string; got {value!r}")
+    return value
+
+
+def resolve_step_knobs(kwargs: dict, defaults) -> dict:
+    """The per-request unmask and output knobs, validated; ValueError names the bad one."""
+    num_step = kwargs.get("num_step", defaults.num_step)
+    if isinstance(num_step, bool) or not isinstance(num_step, int) or not 1 <= num_step <= defaults.max_num_step:
+        raise ValueError(f"num_step must be an integer in [1, {defaults.max_num_step}]; got {num_step!r}")
+    return {
+        "num_step": num_step,
+        # 0 disables CFG
+        "guidance_scale": _number(kwargs, "guidance_scale", defaults.guidance_scale),
+        "t_shift": _number(kwargs, "t_shift", defaults.t_shift, "> 0", lambda v: v > 0),
+        "layer_penalty_factor": _number(kwargs, "layer_penalty_factor", defaults.layer_penalty_factor),
+        # 0 is argmax / no Gumbel noise
+        "position_temperature": _number(
+            kwargs, "position_temperature", defaults.position_temperature, ">= 0", lambda v: v >= 0
+        ),
+        "class_temperature": _number(
+            kwargs, "class_temperature", defaults.class_temperature, ">= 0", lambda v: v >= 0
+        ),
+        "postprocess_output": _flag(kwargs, "postprocess_output", True),
+        "pad_duration": _number(kwargs, "pad_duration", 0.1, ">= 0", lambda v: v >= 0),
+        "fade_duration": _number(kwargs, "fade_duration", 0.1, ">= 0", lambda v: v >= 0),
+    }
 
 
 class OmniVoiceModel(Model):
@@ -283,7 +344,7 @@ class OmniVoiceModel(Model):
         est = self._duration_estimator.estimate_duration(
             text, ref_text, num_ref_audio_tokens
         )
-        if speed > 0 and speed != 1.0:
+        if speed != 1.0:
             est = est / speed
         return max(1, int(est))
 
@@ -297,9 +358,9 @@ class OmniVoiceModel(Model):
     ) -> NameToTensorList:
         """Validate, then build the canvas prefix on the data worker.
 
-        Every malformed-request check lives here rather than in
-        ``get_initial_forward_pass_args``: a ValueError here becomes a 400,
-        while the same raise at the conductor is swallowed and the client hangs.
+        Every malformed-request check runs here, before the tokenizer, so a
+        bad knob is a 400 without any work; ``get_initial_forward_pass_args``
+        repeats only the cheap step-knob checks.
 
         The prefix is built once and shipped, not rebuilt per iteration —
         tokenizing the text 32 times would be the dominant cost for a short
@@ -309,6 +370,14 @@ class OmniVoiceModel(Model):
             raise ValueError("OmniVoice requires a non-empty text prompt")
         if set(output_modalities) != {"audio"}:
             raise ValueError("OmniVoice generates audio only")
+        resolve_step_knobs(kwargs, self.config.generation)
+        speed = _number(kwargs, "speed", 1.0, "> 0", lambda v: v > 0)
+        duration = None
+        if kwargs.get("duration") is not None:
+            duration = _number(kwargs, "duration", 0.0, "> 0 (seconds)", lambda v: v > 0)
+        language = _text(kwargs, "language")
+        instruct = _text(kwargs, "instruct")
+        denoise = _flag(kwargs, "denoise", self.config.generation.denoise)
 
         self._ensure_data_worker_assets()
 
@@ -316,7 +385,7 @@ class OmniVoiceModel(Model):
         # arrives as "audio_inputs". It is re-emitted under the graph's own
         # edge name below so the node contract does not depend on that.
         ref_audio = (tensors or {}).get("audio_inputs")
-        ref_text = kwargs.get("ref_text")
+        ref_text = _text(kwargs, "ref_text")
         if ref_audio and not ref_text:
             # The reference auto-transcribes with Whisper when ref_text is
             # missing. That is a second model on the serving path and a second
@@ -345,10 +414,12 @@ class OmniVoiceModel(Model):
                     f"Reference audio is shorter than one codec hop ({hop} samples)"
                 )
 
-        speed = float(kwargs.get("speed") or 1.0)
-        duration = kwargs.get("duration")
         if duration is not None:
-            target_len = self.config.target_tokens_for_seconds(float(duration))
+            target_len = self.config.target_tokens_for_seconds(duration)
+            if target_len < 1:
+                raise ValueError(
+                    f"duration {duration}s is shorter than one codec frame ({1 / self.config.frame_rate:.3f}s)"
+                )
         else:
             target_len = self._estimate_target_tokens(
                 prompt, ref_text, num_ref_tokens, speed
@@ -369,8 +440,8 @@ class OmniVoiceModel(Model):
             tokenizer=self.tokenizer,
             text=prompt,
             num_audio_codebook=self.config.num_audio_codebook,
-            language=resolve_language(kwargs.get("language")),
-            instruct=resolve_instruct(kwargs.get("instruct"), prompt),
+            language=resolve_language(language),
+            instruct=resolve_instruct(instruct, prompt),
             ref_text=ref_text,
             # The reference tokens are not available on the data worker; the
             # ref_encoder walk supplies them, and get_initial_forward_pass_args
@@ -378,7 +449,7 @@ class OmniVoiceModel(Model):
             # span still has to know a reference is coming, hence the flag.
             ref_audio_tokens=None,
             has_reference=bool(ref_audio),
-            denoise=bool(kwargs.get("denoise", self.config.generation.denoise)),
+            denoise=denoise,
         )
 
         out: NameToTensorList = {
@@ -463,9 +534,8 @@ class OmniVoiceModel(Model):
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         model_kwargs = model_kwargs or {}
-        # Backstops. process_prompt already rejected each of these on the data
-        # worker where a ValueError becomes a 400; a raise here runs at the
-        # conductor, whose loop swallows it and leaves the client hanging.
+        # Backstops; process_prompt already rejected each of these. A
+        # ValueError here is a 400 too.
         if not input_signals.get("prefix_ids"):
             raise ValueError("OmniVoice requires a processed prompt (prefix_ids)")
         target_output = output_modalities[0] if output_modalities else "audio"
@@ -482,38 +552,13 @@ class OmniVoiceModel(Model):
             self.SPEECH_GEN_CLONE_WALK if is_clone else self.SPEECH_GEN_WALK
         )
 
-        defaults = self.config.generation
-        requested_steps = int(model_kwargs.get("num_step", defaults.num_step))
-        num_step = max(1, min(requested_steps, defaults.max_num_step))
-        if num_step != requested_steps:
-            logger.info(
-                "Clamped num_step from %d to %d (max_num_step=%d)",
-                requested_steps, num_step, defaults.max_num_step,
-            )
-
         kwargs = {
             "walk_schedule": schedule,
             "walk_step": 0,
             # target_len is NOT here: it is computed on the data worker (it
             # needs the tokenizer and the duration estimator) and rides an edge
             # to the backbone, rather than being re-derived at the conductor.
-            "num_step": num_step,
-            "guidance_scale": float(
-                model_kwargs.get("guidance_scale", defaults.guidance_scale)
-            ),
-            "t_shift": float(model_kwargs.get("t_shift", defaults.t_shift)),
-            "layer_penalty_factor": float(
-                model_kwargs.get("layer_penalty_factor", defaults.layer_penalty_factor)
-            ),
-            "position_temperature": float(
-                model_kwargs.get("position_temperature", defaults.position_temperature)
-            ),
-            "class_temperature": float(
-                model_kwargs.get("class_temperature", defaults.class_temperature)
-            ),
-            "postprocess_output": bool(model_kwargs.get("postprocess_output", True)),
-            "pad_duration": float(model_kwargs.get("pad_duration", 0.1)),
-            "fade_duration": float(model_kwargs.get("fade_duration", 0.1)),
+            **resolve_step_knobs(model_kwargs, self.config.generation),
         }
 
         full_metadata = CurrentForwardConductorMetadata(
@@ -626,6 +671,9 @@ class OmniVoiceModel(Model):
         numerics equal to the reference pipeline.
         """
         return None
+
+    def request_kwargs(self) -> frozenset[str]:
+        return REQUEST_KWARGS
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate

@@ -43,7 +43,7 @@ from mstar.model.kokoro.config import (  # noqa: E402
 )
 from mstar.model.kokoro.g2p import Chunk, G2PFrontend  # noqa: E402
 from mstar.model.kokoro.kokoro_model import KokoroModel  # noqa: E402
-from mstar.model.kokoro.submodules import KokoroSynthSubmodule  # noqa: E402
+from mstar.model.kokoro.submodules import KokoroSynthSubmodule, noise_key  # noqa: E402
 from mstar.model.kokoro.voices import VoiceRegistry  # noqa: E402
 from mstar.model.kokoro.weight_loader import fold_weight_norm, remap_name  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
@@ -500,7 +500,7 @@ def test_process_prompt_validation(voices_dir):
         model.process_prompt("many", ["text"], ["audio"])
     # a chunk past the PL-BERT window never reaches the worker, whatever the G2P did
     model.g2p = _StubG2P([Chunk("", "a" * (model.config.max_phonemes + 1))])
-    with pytest.raises(RuntimeError, match="window"):
+    with pytest.raises(ValueError, match="window"):
         model.process_prompt("long", ["text"], ["audio"])
 
 
@@ -573,8 +573,12 @@ def test_state_machine_and_postprocess(voices_dir):
 # --------------------------------------------------------------------------
 
 
-def _fwd_info(rid: str, iteration: int) -> CurrentForwardPassInfo:
-    info = CurrentForwardPassInfo(request_id=rid, graph_walk=SYNTH_WALK, fwd_index=0, random_seed=0, max_tokens=0)
+def _keys(n: int, seed: int = 0) -> torch.Tensor:
+    return torch.stack([noise_key(seed, i) for i in range(n)])
+
+
+def _fwd_info(rid: str, iteration: int, seed: int = 0) -> CurrentForwardPassInfo:
+    info = CurrentForwardPassInfo(request_id=rid, graph_walk=SYNTH_WALK, fwd_index=0, random_seed=seed, max_tokens=0)
     info.dynamic_loop_iter_counts[CHUNK_LOOP] = iteration
     return info
 
@@ -723,13 +727,17 @@ def test_piecewise_regions_match_the_eager_halves():
         num_frames = int(dur_ref[1].sum())
         assert num_frames <= 32
         en, asr, frame_lengths = submodule.model.align(d_ref[1:2], t_ref[1:2], dur_ref[1:2], 32)
-        audio_ref, _ = submodule.model.synthesize_frames(d_ref[1:2], t_ref[1:2], dur_ref[1:2], style[1:2], num_frames)
+        key = _keys(1)
+        audio_ref, _ = submodule.model.synthesize_frames(
+            d_ref[1:2], t_ref[1:2], dur_ref[1:2], style[1:2], num_frames, key
+        )
         shape = PiecewiseCaptureShape(bs=2, seq_lens=[32, 32], total_tokens=64)
         static = regions[frame_region(32)].make_static_inputs(shape)
         static["en"][:1] = en
         static["asr"][:1] = asr
         static["frame_lengths"][:1] = frame_lengths
         static["style"][:1] = style[1:2]
+        static["noise_key"][:1] = key
         call = PiecewiseCallInputs(static_inputs=static, engine_inputs=engine_inputs)
         out = regions[frame_region(32)].capture_fn(call)
         n = num_frames * config.samples_per_frame
@@ -777,8 +785,8 @@ def test_synthesize_uses_runners_when_they_fit():
     style = torch.randn(3, 16)
     speed = torch.tensor([1.0, 1.0, 1.0])
     with torch.no_grad():
-        eager = submodule._synthesize(padded, lengths, style, speed, {})
-        captured = submodule._synthesize(padded, lengths, style, speed, runners)
+        eager = submodule._synthesize(padded, lengths, style, speed, _keys(3), {})
+        captured = submodule._synthesize(padded, lengths, style, speed, _keys(3), runners)
     assert runners[text_region(8)].calls == [(8, 3)]
     frame_calls = [c for name, r in runners.items() if name.startswith("frames") for c in r.calls]
     assert sum(bs for _, bs in frame_calls) == 3  # every row went through exactly one frame bucket
@@ -814,7 +822,7 @@ def _recording_submodule():
     model, text_calls, frame_calls = submodule.model, [], []
     encode, synth = model.encode_text, model.synthesize_frames
     model.encode_text = lambda ids, *a: text_calls.append(ids.shape[0]) or encode(ids, *a)
-    model.synthesize_frames = lambda d, *a: frame_calls.append((d.shape[0], a[-1])) or synth(d, *a)
+    model.synthesize_frames = lambda d, *a: frame_calls.append((d.shape[0], a[3])) or synth(d, *a)
     return submodule, text_calls, frame_calls
 
 
@@ -832,9 +840,9 @@ def test_oversized_batch_is_sliced_and_matches_one_pass():
     padded, lengths, style = _random_batch(3, (7, 4, 9, 5, 8))
     speed = torch.tensor([1.0, 0.5, 0.8, 1.2, 0.6])
     with torch.no_grad():
-        sliced = submodule._synthesize(padded, lengths, style, speed, {})
+        sliced = submodule._synthesize(padded, lengths, style, speed, _keys(5), {})
         text_calls.clear()
-        audio, frame_lengths, _ = submodule.model(padded, lengths, style, speed)
+        audio, frame_lengths, _ = submodule.model(padded, lengths, style, speed, _keys(5))
     assert text_calls == [5]  # the reference really is one pass
     for row, pcm in enumerate(sliced):
         n = int(frame_lengths[row]) * submodule.config.samples_per_frame
@@ -847,9 +855,106 @@ def test_oversized_batch_calls_stay_bounded():
     padded, lengths, style = _random_batch(4, (7, 4, 9, 5, 8, 6, 9))
     with torch.no_grad():
         # speed 0.3 pushes four rows past the 64-frame bucket, onto the eager path
-        pcm = submodule._synthesize(padded, lengths, style, torch.full((7,), 0.3), {})
+        pcm = submodule._synthesize(padded, lengths, style, torch.full((7,), 0.3), _keys(7), {})
     assert len(pcm) == 7 and all(p.numel() > 0 for p in pcm)
     assert text_calls == [2, 2, 2, 1]
     assert sum(bs for bs, _ in frame_calls) == 7
     assert any(frames > 64 for _, frames in frame_calls)
     assert all(bs * frames <= submodule.config.max_batch_frames or bs == 1 for bs, frames in frame_calls)
+
+
+# --------------------------------------------------------------------------
+# generation-input contract
+# --------------------------------------------------------------------------
+
+
+def test_request_kwargs_cover_the_adapter_and_the_prompt(voices_dir):
+    model = make_model(voices_dir)
+    assert model.request_kwargs() == {"voice", "speed", "lang_code", "language", "phonemes"}
+    assert model.get_max_output_tokens_limit() is None  # the loop is bounded by max_chunks, not tokens
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"speed": 0}, "speed must be within"),
+        ({"speed": -1.0}, "speed must be within"),
+        ({"speed": "1.0"}, "speed must be a number"),
+        ({"speed": True}, "speed must be a number"),
+        ({"voice": ""}, "voice must be a non-empty name"),
+        ({"voice": 3}, "voice must be a non-empty name"),
+        ({"lang_code": ""}, "lang_code must be a non-empty string"),
+        ({"language": "  "}, "language must be a non-empty string"),
+        ({"phonemes": ""}, "phonemes must be a non-empty string"),
+    ],
+)
+def test_bad_request_values_are_400s(voices_dir, kwargs, match):
+    model = make_model(voices_dir)
+    with pytest.raises(ValueError, match=match):
+        model.process_prompt("Hi", ["text"], ["audio"], **kwargs)
+
+
+def test_absent_knobs_take_the_defaults(voices_dir):
+    model = make_model(voices_dir)
+    out = model.process_prompt("Hi", ["text"], ["audio"])
+    assert out[SPEED][0].tolist() == [model.config.default_speed]
+    assert torch.equal(out[REF_STYLE][0][0], model.voices.style(model.config.default_voice, 6))
+    assert model.process_prompt("Hi", ["text"], ["audio"], speed=2)[SPEED][0].tolist() == [2.0]
+
+
+def test_keyed_noise_is_standard_normal_and_batch_independent():
+    from mstar.model.kokoro.components.decoder import keyed_normal
+
+    keys = _keys(3, seed=7)
+    a = keyed_normal(keys, 4000, 9)
+    assert a.shape == (3, 4000, 9)
+    assert abs(a.mean().item()) < 0.02 and abs(a.std().item() - 1) < 0.02
+    # a row is a function of its key and position only: no batch, no padding
+    assert torch.equal(keyed_normal(keys[1:2], 100, 9)[0], a[1, :100])
+    assert not torch.equal(a[0], a[1])
+    assert not torch.equal(keyed_normal(_keys(1, seed=8), 100, 9), keyed_normal(_keys(1, seed=7), 100, 9))
+    assert torch.equal(noise_key(-1, 0), noise_key(2**64 - 1, 0))  # a negative int64 seed is its unsigned bits
+
+
+def _synth_one(submodule, requests, rids, seeds):
+    prepared = [
+        submodule.prepare_inputs(SYNTH_WALK, _fwd_info(rid, 0, seed), requests[rid])
+        for rid, seed in zip(rids, seeds, strict=True)
+    ]
+    engine_inputs = ModelInputsFromEngine(request_ids=list(rids), per_request_info={})
+    batch = submodule.preprocess(SYNTH_WALK, engine_inputs, prepared)
+    with torch.no_grad():
+        out = submodule.forward_batched(SYNTH_WALK, engine_inputs, **batch)
+    for rid in rids:
+        submodule.cleanup_request(rid)
+    return {rid: out[rid][AUDIO_CHUNK][0] for rid in rids}
+
+
+def test_source_noise_follows_the_request_seed_not_the_global_rng():
+    model = tiny_model()
+    model.decoder.generator.m_source.deterministic = False
+    submodule = KokoroSynthSubmodule(model, tiny_config())
+    torch.manual_seed(0)
+    requests = {
+        "a": {PHONEME_IDS: [torch.tensor([[0, 1, 2, 3, 0]])], PHONEME_LENS: [torch.tensor([5])],
+              REF_STYLE: [torch.randn(1, 16)], SPEED: [torch.tensor([1.0])]},
+        "b": {PHONEME_IDS: [torch.tensor([[0, 7, 4, 5, 6, 8, 0]])], PHONEME_LENS: [torch.tensor([7])],
+              REF_STYLE: [torch.randn(1, 16)], SPEED: [torch.tensor([0.8])]},
+    }
+    state = torch.get_rng_state()
+    first = _synth_one(submodule, requests, ["a"], [11])["a"]
+    assert torch.equal(torch.get_rng_state(), state)  # the global RNG is never drawn
+    torch.manual_seed(123)
+    again = _synth_one(submodule, requests, ["a"], [11])["a"]
+    assert torch.equal(first, again)
+    assert not torch.equal(first, _synth_one(submodule, requests, ["a"], [12])["a"])
+    # beside another request, the same seed drives the same excitation; the
+    # STFT phase of the noise floor amplifies padding rounding, so compare there
+    sources = []
+    hook = model.decoder.generator.m_source.register_forward_hook(lambda m, i, o: sources.append(o))
+    _synth_one(submodule, requests, ["a"], [11])
+    _synth_one(submodule, requests, ["b", "a"], [99, 11])
+    hook.remove()
+    alone, batched = sources
+    assert (batched[1, : alone.shape[1]] - alone[0]).abs().max() < 1e-6
+    assert batched[1, alone.shape[1] :].abs().sum() == 0
