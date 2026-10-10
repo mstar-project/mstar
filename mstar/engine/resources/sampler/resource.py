@@ -76,8 +76,9 @@ class SamplerResource(Resource):
         # (cg slot, padded bs) of the step planned last, for the last-token
         # read in ``loopback_tokens``; None on an eager step
         self._step_slot: tuple[int, int] | None = None
-        # whether the last sampled token is persisted by slot at all
-        self._keep_last_token = device_loopback_enabled()
+        # whether the last sampled token is persisted by slot at all: off until
+        # a node that reads the masters registers (``enable_device_loopback_reader``)
+        self._keep_last_token = False
         # rid -> the prompt tokens a cache hit kept out of this step's inputs
         self._cached_prefix: dict[str, torch.Tensor] = {}
 
@@ -378,6 +379,14 @@ class SamplerResource(Resource):
         ):
             bufs.write_last_tokens(request_ids, tokens)
         return tokens
+
+    def enable_device_loopback_reader(self) -> None:
+        """A node of this sampler declares it reads its last sampled tokens
+        back on the device (``NodeSubmodule.reads_device_loopback``). Only then
+        are the slot masters kept: the eager-step write behind them is a small
+        synchronous host-to-device copy per step, and a node that takes its
+        tokens on the host would pay it for nothing. Honours the knob."""
+        self._keep_last_token = device_loopback_enabled()
 
     @property
     def has_slot_masters(self) -> bool:
