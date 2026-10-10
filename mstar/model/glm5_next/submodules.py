@@ -134,6 +134,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # CUDA graphs one sparse-attention plan per (capture slot, rows)
         self._dsa = DsaState()
         self._sparse_plans: dict[tuple[str, int, int], sparse_mla.SparseGraphPlan] = {}
+        # the first MLA attention, whose heads and scale every sparse plan takes
+        self._mla_attn: Glm5NextMLAAttention | None = None
         # per (walk, capture slot): the workspace and index buffer its plans share
         self._sparse_buffers: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         if config.dsa_long_context:
@@ -601,8 +603,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                         torch.zeros(rows * width + 1, dtype=torch.int32, device=device))
                 sparse_plan = self._sparse_plans[key] = sparse_mla.SparseGraphPlan(
                     rows, width, buffers[0], buffers[1])
-            attn = next(m for m in self.language_model.modules()
-                        if isinstance(m, Glm5NextMLAAttention))
+            attn = self._mla_attn
+            if attn is None:
+                attn = self._mla_attn = next(m for m in self.language_model.modules()
+                                             if isinstance(m, Glm5NextMLAAttention))
             sparse_plan.plan(lens, attn.num_heads, cfg.kv_lora_rank, cfg.mla_cache_kpe,
                              attn.softmax_scale)
         return {
