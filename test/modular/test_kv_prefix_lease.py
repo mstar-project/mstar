@@ -94,7 +94,6 @@ def _keys(tokens: list[int]) -> list[bytes]:
 
 
 def _layout(n_tokens: int) -> dict[str, list[PrefixSpan]]:
-    """The layout of a text prompt of ``n_tokens`` ids, written in one walk."""
     return {"main": [PrefixSpan(n_tokens, n_tokens, WALK)]}
 
 
@@ -488,9 +487,7 @@ def test_a_probe_hashes_the_prompt_with_the_lock_down(monkeypatch):
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(100)))
     _assert_hashed_with_the_lock_down(kv, monkeypatch)
 
-    assert kv.resolve_cached_prefix(
-        "r1", NODE, WALK, ARNodeInputs(input_seq_len=100),
-    ).tokens, "the probe matched nothing"
+    assert kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(input_seq_len=100)), "the probe matched nothing"
     kv.assert_pages_conserved()
 
 

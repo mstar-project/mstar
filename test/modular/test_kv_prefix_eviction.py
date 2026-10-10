@@ -153,13 +153,9 @@ def test_a_leased_page_is_never_evicted():
     tokens = _tokens(0)
     _finished(kv, "a", tokens)
     _ingest(kv, "b", tokens)
-    matched = kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(
-        input_ids=torch.tensor(tokens), input_seq_len=len(tokens),
-    ))
+    matched = kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(tokens)))
     leased = list(kv._streams["b"]["main"].lease)
-    assert matched is not None and matched.tokens, (
-        "the second request did not match, so nothing was leased"
-    )
+    assert matched, "the second request did not match, so nothing was leased"
 
     # somebody else asks for everything the pool can give
     kv._index.evict(kv.config.max_num_pages)

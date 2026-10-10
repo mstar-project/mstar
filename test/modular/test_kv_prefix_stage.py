@@ -34,7 +34,6 @@ RID = "r0"
 NODE = "LLM"
 OTHER = "Talker"
 WALK = "prefill"
-LABEL = "main"
 PROMPT = 100
 
 
@@ -52,15 +51,10 @@ class _Answering(Resource):
 
     def resolve_cached_prefix(self, rid, node_name, graph_walk, inputs):
         self.resolved += 1
-        if self._matched is None:
-            return None
-        # a text-only walk: its position is its token count
-        return CachedPrefix(LABEL, self._matched, self._matched)
+        return None if self._matched is None else CachedPrefix("main", self._matched, self._matched)
 
     def apply_cached_prefix(self, rid, node_name, graph_walk, inputs, prefix):
-        self.applied.append(
-            (inputs.input_seq_len, prefix.tokens if prefix is not None else None),
-        )
+        self.applied.append((inputs.input_seq_len, prefix and prefix.tokens))
 
 
 class _Submodule:

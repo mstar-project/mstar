@@ -24,6 +24,7 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from test_kv_prefix_layout_lease import _config
 
 from mstar.engine.resources import (
     PagedKVConfig,
@@ -40,7 +41,7 @@ from mstar.engine.resources.attn.config import (
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PrefixSpan
-from mstar.engine.resources.kv.keys import PageItem, chain
+from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.position.manager import RopeManager
@@ -56,7 +57,6 @@ ROOT = b"a root"
 NODE = "LLM"
 WALK = "prefill_text"
 IMAGE_WALK = "prefill_vit"
-DIGEST = bytes(range(32))
 # what this repo accepts between two bf16 paths; see the module docstring
 ATOL = RTOL = 5e-2
 DTYPE = torch.bfloat16
@@ -128,10 +128,7 @@ def _initialise(llm: torch.nn.Module) -> None:
 class _Node:
     """Bagel's language model over the real resources, at a small random init."""
 
-    def __init__(
-        self, device: torch.device, cached: bool,
-        walks: dict[str, tuple[str | None, ...]] | None = None,
-    ):
+    def __init__(self, device: torch.device, cached: bool, walks: dict | None = None):
         from mstar.model.bagel.components.language_model import BagelForCausalLM
 
         self.device = device
@@ -193,11 +190,8 @@ class _Node:
             prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
         )})
 
-    def resolve(self, rid: str, tokens: list[int]) -> int:
-        inputs = ARNodeInputs(
-            input_ids=torch.tensor(tokens, dtype=torch.long, device=self.device),
-            input_seq_len=len(tokens),
-        )
+    def resolve(self, rid: str) -> int:
+        inputs = ARNodeInputs(input_seq_len=self.kv._overrides[rid].prefix_layout["main"][0].length)
         prefix = self.runner.resolve_cached_prefix(rid, NODE, WALK, inputs)
         self.runner.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
         return prefix.tokens if prefix is not None else 0
@@ -239,29 +233,9 @@ class _Node:
 
     def ingest_layout(self, rid: str, parts: list) -> None:
         """What the preprocess worker sends for ``parts``: ids, or an image's embeds."""
-        total = sum(len(part) for part in parts)
-        pages: list[list[int]] = [[] for _ in range(-(-total // PAGE_SIZE))]
-        items: dict[int, list[PageItem]] = {}
-        spans = []
-        at = 0
-        for part in parts:
-            if isinstance(part, list):
-                for slot, token in enumerate(part, start=at):
-                    pages[slot // PAGE_SIZE].append(token)
-                spans.append(PrefixSpan(len(part), len(part), WALK))
-            else:
-                for page in range(at // PAGE_SIZE, -(-(at + len(part)) // PAGE_SIZE)):
-                    first = max(at, page * PAGE_SIZE)
-                    items.setdefault(page, []).append(
-                        PageItem(first - page * PAGE_SIZE, first - at, len(part), DIGEST)
-                    )
-                spans.append(PrefixSpan(len(part), 1, IMAGE_WALK, DIGEST))
-            at += len(part)
-        self.runner.ingest_request(rid, {"kv": KVReqConfig(
-            prefix_keys={"main": chain(pages, items)},
-            prefix_tail={"main": pages[-1] if total % PAGE_SIZE else []},
-            prefix_layout={"main": spans},
-        )})
+        # paged by the lease test's PAGE_SIZE, which is this file's
+        slots = [part if isinstance(part, list) else len(part) for part in parts]
+        self.runner.ingest_request(rid, {"kv": _config(slots, WALK, IMAGE_WALK)})
 
     def run_layout(self, rid: str, parts: list) -> tuple[list[int], torch.Tensor]:
         """Probe, serve or run each walk of ``parts``; what each was served, and the
@@ -270,10 +244,7 @@ class _Node:
         for part in parts:
             image = not isinstance(part, list)
             walk = IMAGE_WALK if image else WALK
-            inputs = ARNodeInputs(
-                input_ids=None if image else torch.tensor(part, device=self.device),
-                input_seq_len=len(part),
-            )
+            inputs = ARNodeInputs(input_seq_len=len(part))
             prefix = self.runner.resolve_cached_prefix(rid, NODE, walk, inputs)
             self.runner.apply_cached_prefix(rid, NODE, walk, inputs, prefix)
             held = prefix.tokens if prefix is not None else 0
@@ -297,18 +268,18 @@ def test_a_consumed_prefix_lands_within_the_repos_parity_tolerance(capsys):
 
     warm = _Node(device, cached=True)
     warm.ingest("seed", prompt)
-    warm.resolve("seed", prompt)
+    warm.resolve("seed")
     warm.prefill("seed", prompt)
     warm.kv.remove_request("seed")
 
     warm.ingest("cached", prompt + tail)
-    matched = warm.resolve("cached", prompt + tail)
+    matched = warm.resolve("cached")
     assert matched, "nothing matched, so this would compare two fresh runs"
     from_cache = warm.prefill("cached", (prompt + tail)[matched:])
 
     cold = _Node(device, cached=False)
     cold.ingest("fresh", prompt + tail)
-    assert cold.resolve("fresh", prompt + tail) == 0, (
+    assert cold.resolve("fresh") == 0, (
         "the fresh node matched something, so it is not the uncached side"
     )
     whole = cold.prefill("fresh", prompt + tail)
@@ -338,7 +309,7 @@ def test_a_consumed_prefix_lands_within_the_repos_parity_tolerance(capsys):
 
 
 @requires_cuda
-def test_a_prompt_served_past_its_image_lands_within_the_repos_parity_tolerance(capsys):
+def test_a_prompt_served_past_its_image_lands_within_the_repos_parity_tolerance():
     device = torch.device("cuda:0")
     walks = {"main": (WALK, "decode", IMAGE_WALK)}
     generator = torch.Generator().manual_seed(20260930)
@@ -369,13 +340,10 @@ def test_a_prompt_served_past_its_image_lands_within_the_repos_parity_tolerance(
     assert all(hidden.isfinite().all() and hidden.abs().max() > 1e-2 for hidden in (from_cache, fresh)), (
         "a run produced non-finite or near-zero hidden states, which any two runs agree on"
     )
-    deviation = (from_cache - fresh).abs().max().item()
-    with capsys.disabled():
-        print(f"\n  served {served} slots of three walks; deviation {deviation:.3e}")
     torch.testing.assert_close(
         from_cache, fresh, atol=ATOL, rtol=RTOL,
         msg=lambda default: (
-            f"a prompt served past its image moved the forward by {deviation:.3e}, "
+            f"a prompt served past its image moved the forward by {(from_cache - fresh).abs().max().item():.3e}, "
             f"past the {ATOL:.0e} this repo accepts between a cached path and an "
             f"uncached one\n{default}"
         ),

@@ -8,7 +8,12 @@ conductor's REMOVE_REQUEST. No read may start for a draining request.
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from mstar.communication.tensors import StoredOutputs
+from mstar.engine.engine import ExecutingBatch
+from mstar.engine.resources import StepContext
+from mstar.graph.runtime.base import FreedTensors, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.ipc_format import (
     ConductorMessageType,
@@ -127,6 +132,52 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     assert pending.batch.request_to_worker_graph == {}
     assert ranges == []
     assert markers == (["push", "pop", "push", "pop"] if enable_nvtx else [])
+
+
+def test_a_walk_the_cache_served_whole_is_still_routed():
+    """A served walk runs no forward, but the conductor moves a request to its
+    next walk only once every worker graph reports its node done."""
+    w = _worker()
+    routed = []
+    runtime, tensors = w._graph_runtime, w.tensor_manager
+    runtime.cleanup_consumed_inputs = lambda *args: FreedTensors.none()
+    runtime.clear_pending_loop_stops = lambda: None
+    runtime.get_dynamic_loop_iters = lambda rids, partition: []
+    runtime.send_outputs = lambda send_input: []
+    runtime.complete_and_route_batch = lambda route_input: routed.append(route_input) or RouteOutput(
+        completion_id=0, register_uuids=[], register_rids=[], new_token_output_idxs=[], local_streaming_by_signal={},
+    )
+    tensors.cleanup_collectable = lambda *freed: None
+    tensors.increment_ref_batch_uniform = tensors.dereference_batch_uniform = lambda *args: None
+    # counts each rid's outputs and stores none of them
+    tensors.store_and_return_tensor_info_batch = lambda rids, outputs, signals, **kwargs: StoredOutputs(
+        flat_uuids=[], flat_rids=[], signal_idxs=[],
+        num_tensors=[len((outputs.get(rid) or {}).get(signal, ())) for rid in rids for signal in signals],
+    )
+    w.engine_manager.get_engine = lambda node: SimpleNamespace(
+        check_stop_for_batch=lambda batch, outputs, **kwargs: {}, extend_prefix_chains=lambda batch, outputs: None,
+    )
+    w.request_state.get_fwd_info = lambda rid, partition: None
+    w.request_state.get_pending_publish_info = lambda rid, partition: {}
+    w.device = torch.device("cpu")
+    w.enable_nvtx = w.enable_prof = False
+    w._innermost_loop_by_node = {}
+    pending = SimpleNamespace(
+        batch=SimpleNamespace(request_to_worker_graph={7: 0}, node_name="LLM", output_signals=["new_token"]),
+        node_batch=ExecutingBatch(
+            node_name="LLM", per_request_info={}, cached_rids={7},
+            step_context=StepContext(request_ids=(), graph_walk="prefill", slot=0, capture=False),
+        ),
+        node_name="LLM", partition="default", graph_walk="prefill", loop_name=None, speculative_new_iter=False,
+    )
+
+    Worker._postprocess_batch(w, pending, BatchedModelOutput())
+
+    assert routed and list(routed[0].wg_ids.keys) == [7], (
+        "a walk the cache served was never routed, so its node never "
+        "completes and the request never reaches its next walk"
+    )
+    assert routed[0].num_tensors == [0], "a served walk routed tensors it never produced"
 
 
 def test_draining_and_pending_removal_rids_are_not_published():

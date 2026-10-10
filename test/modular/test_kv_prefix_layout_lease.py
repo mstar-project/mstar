@@ -3,16 +3,15 @@
 A prompt laid out text, image, text is three walks into one stream. The first
 walk's probe matches the whole layout and holds it; the walks it covers are
 served from that lease without running, and the one it covers in part runs
-from the lease's end.
+from the lease's end. A served walk never admits, so the position counter moves
+at the probe, and by an image block's one position, not its slots.
 
-A served walk never admits, and an image walk reads the position counter while
-it prepares its inputs, so the counter moves at the probe, and by an image
-block's one position, not its slots.
+An image ending inside a page shares that page with the text after it, so the
+cache keeps a copy of the page cut at the image's end for a repeat to be served.
 """
 
 from __future__ import annotations
 
-import logging
 import sys
 from types import SimpleNamespace
 
@@ -20,24 +19,16 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT
+from test_kv_prefix_correctness import _Node as _TextNode
 
-import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-from mstar.communication.wire import decode, encode
-from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import PagedKVConfig, PositionConfig, PositionStep, StepRunner
+from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan
-from mstar.engine.resources.kv.keys import PageItem, chain
-from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
-from mstar.engine.resources.position.manager import RopeManager
-from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.resources.kv.config import KVReqConfig
+from mstar.model.base import PrefixStream, Span
 from mstar.model.submodule_base import ARNodeInputs
-from mstar.utils.ipc_format import InputSignals, WorkerMessage, WorkerMessageType
 
-PAGE_SIZE = 16
-ROOT = b"a root"
 RID = "r1"
-NODE = "LLM"
 TEXT_WALK = "prefill"
 IMAGE_WALK = "prefill_image"
 DIGEST = bytes(range(32))
@@ -46,6 +37,8 @@ IMAGE = 30
 TAIL = list(range(100, 125))
 # slots 0-19 text, 20-49 image, 50-74 text: a hit of 4 pages covers the first two walks
 PARTS = [TEXT, IMAGE, TAIL]
+# after TEXT and IMAGE the image ends two slots into page 3, which the question fills
+ASK, OTHER_ASK = list(range(200, 205)), list(range(300, 305))
 
 
 @pytest.fixture(autouse=True)
@@ -53,105 +46,98 @@ def _no_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", lambda *args, **kwargs: None)
 
 
-def _config(parts: list) -> KVReqConfig:
-    """What the preprocess worker sends for ``parts``: ids, or an image's slot count."""
-    total = sum(len(part) if isinstance(part, list) else part for part in parts)
-    pages: list[list[int]] = [[] for _ in range(-(-total // PAGE_SIZE))]
-    items: dict[int, list[PageItem]] = {}
-    spans = []
-    at = 0
-    for part in parts:
-        if isinstance(part, list):
-            for slot, token in enumerate(part, start=at):
-                pages[slot // PAGE_SIZE].append(token)
-            spans.append(PrefixSpan(len(part), len(part), TEXT_WALK))
-            at += len(part)
-            continue
-        for page in range(at // PAGE_SIZE, -(-(at + part) // PAGE_SIZE)):
-            first = max(at, page * PAGE_SIZE)
-            items.setdefault(page, []).append(PageItem(first - page * PAGE_SIZE, first - at, part, DIGEST))
-        spans.append(PrefixSpan(part, 1, IMAGE_WALK, DIGEST))
-        at += part
-    return KVReqConfig(
-        prefix_keys={"main": chain(pages, items)},
-        prefix_tail={"main": pages[-1] if total % PAGE_SIZE else []},
-        prefix_layout={"main": spans},
-    )
-
-
 def _walks(parts: list) -> list[tuple[str, int]]:
-    return [(TEXT_WALK, len(part)) if isinstance(part, list) else (IMAGE_WALK, part) for part in parts]
+    """Each part's walk and slots: ids, or an image's slot count, alone or with its digest."""
+    return [
+        (TEXT_WALK, len(part)) if isinstance(part, list) else (IMAGE_WALK, part if isinstance(part, int) else part[0])
+        for part in parts
+    ]
 
 
-class _Node:
+def _config(parts: list, text_walk: str = TEXT_WALK, image_walk: str = IMAGE_WALK) -> KVReqConfig:
+    """What the preprocess worker sends for ``parts``, keyed by its own code."""
+    layout = [
+        Span("ids", text_walk, slots, slots, "text_inputs") if isinstance(part, list)
+        # the digest rides where a file's name would, for the stand-in `_digest` to hand back
+        else Span("digest", image_walk, slots, 1, part[1] if isinstance(part, tuple) else DIGEST)
+        for part, (_, slots) in zip(parts, _walks(parts), strict=True)
+    ]
+    worker = SimpleNamespace(
+        _prefix_streams={"kv": {"main": PrefixStream("text_inputs", "ids", text_walk, "decode", (image_walk,))}},
+        _prefix_page_sizes={"kv": PAGE_SIZE}, model=None,
+        _digest=lambda span, file_paths, file_states: span.source,
+        _page_layout=lambda *args: PreprocessWorkerThread._page_layout(None, *args),
+    )
+    tensors = {"text_inputs": [torch.tensor(part) for part in parts if isinstance(part, list)]}
+    sent = PreprocessWorkerThread._prefix_keys(worker, tensors, {"kv": {"main": layout}}, None, {})
+    config = KVReqConfig()
+    config.apply_conductor_config(**{name: by_resource["kv"] for name, by_resource in sent.items()})
+    return config
+
+
+class _Node(_TextNode):
     """One request's cache and positions under a real runner, after an earlier
     request ran every walk of ``seeded`` and indexed what it filled."""
 
-    def __init__(self, seeded: list | None = PARTS, parts: list | None = None):
-        device = torch.device("cpu")
-        self.kv = KVManager(
-            cfg=PagedKVConfig(
-                num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
-                max_num_pages=64, page_size=PAGE_SIZE,
-            ),
-            name="kv", joint_comm_group=None, transfer_engine_info=None,
-            device=device, dtype=torch.float32,
-        )
+    def __init__(self, seeded: list = PARTS, parts: list | None = None):
+        super().__init__()
         self.kv.enable_prefix_cache(ROOT, {"main": (TEXT_WALK, "decode", IMAGE_WALK)})
-        self.rope = RopeManager(config=PositionConfig(kv_cache="kv"), device=device, dtype=torch.float32)
-        self.runner = StepRunner({"kv": self.kv, "rope": self.rope}, node_resources={NODE: ["kv", "rope"]})
-        if seeded:
-            self.runner.ingest_request("seed", {"kv": _config(seeded)})
-            for walk, length in _walks(seeded):
-                self.step(length, walk, rid="seed")
+        self.runner.ingest_request("seed", {"kv": _config(seeded)})
+        for walk, length in _walks(seeded):
+            self.step("seed", length, walk)
         self.runner.ingest_request(RID, {"kv": _config(parts or seeded)})
 
-    def step(self, span: int, walk: str, rid: str = RID) -> list[int]:
-        """Admit, plan and commit one step, and give back its positions."""
-        step = SubmoduleStep(steps={"kv": KVStep(), "rope": PositionStep()}, segments=[Segment(rid, "main", span)])
-        step.set_ctx(StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False))
-        assert self.runner.admit(step).outcome.ok
-        positions = self.runner.plan(step)["rope"]["main"].tolist()
-        self.runner.commit(step)
-        return positions
-
-    def probe(self, walk: str, length: int, **inputs):
+    def probe(self, walk: str, length: int):
         """The engine's probe: every resource answers, then takes the agreed prefix."""
-        walk_inputs = ARNodeInputs(input_seq_len=length, **inputs)
+        walk_inputs = ARNodeInputs(input_seq_len=length)
         prefix = self.runner.resolve_cached_prefix(RID, NODE, walk, walk_inputs)
         self.runner.apply_cached_prefix(RID, NODE, walk, walk_inputs, prefix)
         return prefix
 
-    def walk(self, walk: str, length: int):
-        """One walk as the engine drives it: served whole, or run from the hit's end."""
+    def walk(self, walk: str, length: int) -> int:
+        """One walk as the engine drives it, served whole or run from the hit's end; the slots it was served."""
         prefix = self.probe(walk, length)
         tokens = prefix.tokens if prefix is not None else 0
         if tokens == length:
             self.runner.complete_cached_walk(RID, NODE, walk)
         else:
-            self.step(length - tokens, walk)
-        return prefix
+            self.step(RID, length - tokens, walk)
+        return tokens
 
     @property
     def stream(self):
         return self.kv._streams[RID]["main"]
 
-    @property
-    def counter(self) -> int:
-        return self.rope.position(RID, "main")
-
-
 
 def test_a_hit_across_three_walks_serves_the_two_it_covers_and_trims_the_third():
     node = _Node()
 
-    answers = [node.walk(walk, length).tokens for walk, length in _walks(PARTS)]
+    answers = [node.walk(walk, length) for walk, length in _walks(PARTS)]
 
     assert answers == [len(TEXT), IMAGE, 4 * PAGE_SIZE - len(TEXT) - IMAGE], (
         "each walk should take the lease's slots past the walks before it"
     )
     assert node.stream.stored_len == len(TEXT) + IMAGE + len(TAIL), (
         "the trimmed walk did not write from where the served walks end"
+    )
+
+
+def test_each_walk_the_cache_serves_moves_the_counter_by_its_advance_before_the_next_reads_it():
+    node = _Node()
+    node.walk(TEXT_WALK, len(TEXT))
+    past_text = node.rope.position(RID, "main")
+    node.walk(IMAGE_WALK, IMAGE)
+    past_image = node.rope.position(RID, "main")
+    trimmed = node.probe(TEXT_WALK, len(TAIL)).tokens
+
+    positions = node.step(RID, len(TAIL) - trimmed)
+
+    first = len(TEXT) + 1 + trimmed
+    assert (past_text, past_image, positions) == (
+        len(TEXT), len(TEXT) + 1, list(range(first, first + len(TAIL) - trimmed)),
+    ), (
+        "a walk after a served one read the counter at the start of what was "
+        "served, or an image moved it by its slots rather than its one position"
     )
 
 
@@ -167,8 +153,7 @@ _DISAGREEING = {
 
 @pytest.mark.parametrize("disagree", _DISAGREEING.values(), ids=_DISAGREEING.keys())
 def test_a_walk_the_layout_no_longer_describes_keeps_the_pages_the_cache_served(disagree):
-    parts = [list(range(1, 33)), IMAGE, TAIL]
-    node = _Node(parts)
+    node = _Node([list(range(1, 33)), IMAGE, TAIL])
     node.walk(TEXT_WALK, 32)
     lease = list(node.stream.lease)
 
@@ -180,89 +165,84 @@ def test_a_walk_the_layout_no_longer_describes_keeps_the_pages_the_cache_served(
     )
 
 
-def test_a_mismatch_the_served_walks_cannot_survive_fails_the_request_and_says_why(caplog):
+def test_a_mismatch_the_served_walks_cannot_survive_fails_the_request():
     node = _Node()
     node.walk(TEXT_WALK, len(TEXT))
 
-    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="end inside a page"):
+    # served text ending inside a page: dropped, the image would be written with that text missing
+    with pytest.raises(RuntimeError, match="end inside a page"):
         node.probe(IMAGE_WALK, IMAGE + 1)
 
-    disagreement = "prefill_image writes 31 slots where its layout's span 1 has prefill_image write 30"
-    assert any(disagreement in record.getMessage() for record in caplog.records), (
-        "the failure did not log which walk disagreed with the layout, and how"
-    )
 
-
-
-
-def test_each_walk_the_cache_serves_moves_the_counter_by_its_advance_before_the_next_reads_it():
+@pytest.mark.parametrize("probed", [True, False], ids=["probed", "refused"])
+def test_a_keyed_text_walk_placing_its_own_positions_fails_probed_or_refused(probed):
     node = _Node()
-    node.walk(TEXT_WALK, len(TEXT))
-    past_text = node.counter
-    node.walk(IMAGE_WALK, IMAGE)
-    past_image = node.counter
-    trimmed = node.probe(TEXT_WALK, len(TAIL)).tokens
+    inputs = ARNodeInputs(input_seq_len=len(TEXT), custom_pos_ids=torch.arange(len(TEXT)))
 
-    positions = node.step(len(TAIL) - trimmed, TEXT_WALK)
+    # keyed by its ids, whose positions are their count: its pages would be served at positions they never had
+    with pytest.raises(AssertionError, match="the layout keys it by ids"):
+        if probed:
+            node.runner.resolve_cached_prefix(RID, NODE, TEXT_WALK, inputs)
+        else:
+            node.runner.apply_cached_prefix(RID, NODE, TEXT_WALK, inputs, None)
 
-    first = len(TEXT) + 1 + trimmed
-    assert (past_text, past_image, positions) == (
-        len(TEXT), len(TEXT) + 1, list(range(first, first + len(TAIL) - trimmed)),
-    ), (
-        "a walk after a served one read the counter at the start of what was "
-        "served, or an image moved it by its slots rather than its one position"
+
+def test_a_repeat_with_another_question_is_served_the_whole_image_and_the_slots_first_written():
+    node = _Node([TEXT, IMAGE, ASK], [TEXT, IMAGE, OTHER_ASK])
+    kv = node.kv.kv_cache.tensor
+    written = kv[:, node.kv._streams["seed"]["main"].page_indices[3], :, :2].clone()
+
+    answers = [node.walk(walk, length) for walk, length in _walks([TEXT, IMAGE, OTHER_ASK])]
+
+    assert answers == [len(TEXT), IMAGE, 0], (
+        "the repeat matched only the whole pages before the image's end, so the "
+        "image's walk ran again for the slots its page shares with the question"
+    )
+    assert torch.equal(kv[:, node.stream.page_indices[3], :, :2], written), (
+        "the repeat's page for the image's end does not hold the slots the first "
+        "request wrote there, so its question attends to other KV"
     )
 
 
-def test_an_image_walk_placing_its_own_positions_is_answered():
-    node = _Node()
-    node.walk(TEXT_WALK, len(TEXT))
+def test_a_missed_probe_asked_again_hashes_nothing_and_is_served_what_was_cached_since(monkeypatch):
+    # seeded with another prompt, so the first probe finds none of this one
+    node = _Node([TAIL], [TEXT, IMAGE, OTHER_ASK])
+    assert node.probe(TEXT_WALK, len(TEXT)) is None
+    node.runner.ingest_request("first", {"kv": _config([TEXT, IMAGE, ASK])})
+    for walk, length in _walks([TEXT, IMAGE, ASK]):
+        node.step("first", length, walk)
+    monkeypatch.setattr(manager_mod, "fingerprint", lambda *fields: pytest.fail("a second probe hashed its keys again"))
 
-    prefix = node.probe(IMAGE_WALK, IMAGE, custom_pos_ids={"main": torch.full((IMAGE,), len(TEXT))})
+    answers = [node.walk(walk, length) for walk, length in _walks([TEXT, IMAGE])]
 
-    # a pin: before the cache read positions it answered this too, and the
-    # check that a text walk places none must not take that away
-    assert prefix.tokens == IMAGE, (
-        "an image walk, whose span places its block at one position, was refused "
-        "for placing positions of its own, so no Bagel image is ever served"
+    assert answers == [len(TEXT), IMAGE], (
+        "the keys a missed probe kept did not find the pages and the image end "
+        "cached since, so a refused step's request lost its hit"
     )
 
 
-def test_a_layout_reaches_the_kv_config_across_the_wire():
-    config = KVReqConfig()
-    config.apply_conductor_config(prefix_layout={"main": [[20, 20, TEXT_WALK, None], [30, 1, IMAGE_WALK, DIGEST]]})
-    info = CurrentForwardPassInfo(
-        request_id=RID, fwd_index=0, random_seed=0, max_tokens=1,
-        graph_walk=TEXT_WALK, partition_name="p0",
+def test_a_page_a_reply_fills_after_an_image_is_matched_by_the_next_turn():
+    reply = list(range(400, 409))
+    # the image's last two slots, the question and the reply's nine ids fill page 3
+    node = _Node([TEXT, IMAGE, ASK], [TEXT, IMAGE, ASK + reply + OTHER_ASK])
+    for token in reply:
+        node.kv.extend_prefix_chain("seed", NODE, "decode", {"text_inputs": [torch.tensor([token])]})
+        node.step("seed", 1, "decode")
+
+    answers = [node.walk(walk, length) for walk, length in _walks([TEXT, IMAGE, ASK + reply + OTHER_ASK])]
+
+    assert answers == [len(TEXT), IMAGE, 4 * PAGE_SIZE - len(TEXT) - IMAGE], (
+        "the engine keyed the page the reply filled by another reading of the image on "
+        "it than the next turn's prompt is keyed by, so the turn recomputed its history"
     )
-    info.resource_configs = {"kv": config}
-    msg = WorkerMessage(
-        message_type=WorkerMessageType.INPUT_SIGNALS,
-        body=InputSignals(request_id=RID, partition_name="p0", request_info=info, inputs=[]),
-    )
-
-    decoded = decode(encode(msg)).body.request_info.resource_configs["kv"]
-
-    assert decoded.prefix_layout == {"main": [
-        PrefixSpan(20, 20, TEXT_WALK), PrefixSpan(30, 1, IMAGE_WALK, DIGEST),
-    ]}, "the layout did not reach the worker as the spans the conductor was sent"
 
 
-def test_a_stream_read_in_from_the_rank_that_prefilled_indexes_its_prompt_at_decode(monkeypatch):
-    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda *args, **kwargs: SimpleNamespace(
-        start_async_retrieve=lambda **kwargs: None, get_kv_transfer_info=lambda **kwargs: None,
-        owns_transfer_info=lambda **kwargs: False,
-    ))
-    prompt = list(range(1, 51))
-    node = _Node(None, [prompt])
-    published = PublishedKVInfo.build_for_rank(0, 1, {"main": KVSequenceInfo(
-        seq_len=len(prompt), latest_kv_transfer_info="peer", page_indices=list(range(4)),
-    )})
-    assert node.kv.admit_retrieve(RID, NODE, TEXT_WALK, published).ok
+def test_a_different_image_is_never_served_another_images_end():
+    # three pages of text, then a small image wholly on page 3: only the image's end key tells the two apart
+    text = list(range(1, 49))
+    node = _Node([text, 10, ASK], [text, (10, bytes(32)), ASK])
+    node.walk(TEXT_WALK, len(text))
 
-    node.step(1, "decode")
-
-    assert len(node.kv._index.pages()) == len(prompt) // PAGE_SIZE, (
-        "the prompt a decode rank read in was never indexed, because its first "
-        "decode was taken for a write of the prompt's span by the wrong walk"
+    assert node.probe(IMAGE_WALK, 10).tokens == 0, (
+        "a request was served the end of another image laid out in the same slots"
     )

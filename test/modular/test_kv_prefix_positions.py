@@ -46,12 +46,6 @@ ROPE = "rope"
 RID = "r0"
 NODE = "LLM"
 WALK = "prefill"
-LABEL = "main"
-
-
-def _hit(tokens: int) -> CachedPrefix:
-    """What the cache agreed to skip of a text-only walk, so position == tokens."""
-    return CachedPrefix(LABEL, tokens, tokens)
 
 
 class _StubTransfer:
@@ -131,7 +125,7 @@ class _Node:
 def test_the_step_after_a_hit_is_placed_past_the_matched_prefix():
     node = _Node()
 
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, _hit(96))
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 96, 96))
 
     assert node.step(4) == [96, 97, 98, 99], (
         "the step was placed on top of the prefix the cache matched"
@@ -148,7 +142,7 @@ def test_a_request_that_matched_nothing_still_starts_at_zero():
 
 def test_the_counter_is_seeded_once_and_then_advances_on_its_own():
     node = _Node()
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, _hit(96))
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 96, 96))
 
     first = node.step(4)
     second = node.step(2)
@@ -159,17 +153,17 @@ def test_the_counter_is_seeded_once_and_then_advances_on_its_own():
 
 def test_a_shorter_match_never_rewinds_the_counter():
     node = _Node()
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, _hit(96))
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 96, 96))
     node.step(4)
 
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, _hit(32))
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 32, 32))
 
     assert node.step(1) == [100], "a stale match pulled the counter backwards"
 
 
 def test_a_label_the_request_writes_after_its_hit_starts_at_zero():
     node = _Node()
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, _hit(96))
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 96, 96))
     node.step(4)
 
     assert node.step(2, label="cfg_text") == [0, 1], (
@@ -180,7 +174,7 @@ def test_a_label_the_request_writes_after_its_hit_starts_at_zero():
 
 def test_a_reset_forgets_what_the_cache_matched():
     node = _Node()
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, _hit(96))
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 96, 96))
 
     node.reset()
 

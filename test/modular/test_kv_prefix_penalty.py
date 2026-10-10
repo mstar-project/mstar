@@ -18,6 +18,7 @@ sys.path.insert(0, ".")
 import torch
 
 from mstar.engine.resources.base import CachedPrefix
+from mstar.engine.resources.sampler import utils as sampler_utils
 from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import StepContext
@@ -26,11 +27,9 @@ from mstar.model.submodule_base import ARNodeInputs
 RID = "r0"
 NODE = "LLM"
 WALK = "prefill"
-LABEL = "main"
 PROMPT = torch.arange(100)
 MATCHED = 96
-# a text-only walk: its position is its token count
-HIT = CachedPrefix(LABEL, MATCHED, MATCHED)
+HIT = CachedPrefix("main", MATCHED, MATCHED)
 
 
 def _sampler(penalty: float = 1.2) -> SamplerResource:
@@ -163,4 +162,18 @@ def test_removing_the_request_drops_what_was_kept_for_it():
 
     assert RID not in resource._cached_prefix, (
         "the skipped prompt outlived the request it was kept for"
+    )
+
+
+def test_a_token_the_model_throws_away_is_not_seen(monkeypatch):
+    # the kernel needs a device; which token it picks is not what this is about
+    monkeypatch.setattr(sampler_utils, "sample_tokens", lambda **kwargs: torch.tensor([200]))
+    resource = _sampler()
+
+    resource.plan(SamplerStep(prefill_tracked_tokens={RID: PROMPT[:4]}, discarded=frozenset({RID})), _ctx())
+    resource.sample([RID], torch.zeros(1, 256))
+
+    assert _seen(resource) == PROMPT[:4].tolist(), (
+        "a walk the cache serves never samples this token, so a request that "
+        "ran the walk is penalized for a token the served one is not"
     )

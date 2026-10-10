@@ -91,8 +91,6 @@ class _Node:
         self.runner = StepRunner(
             {KV: self.kv, ROPE: self.rope}, node_resources={NODE: [KV, ROPE]},
         )
-        # each request's untrimmed walk inputs, which a probe checks against its layout
-        self._inputs: dict[str, ARNodeInputs] = {}
 
     def ingest(self, rid: str, tokens: list[int]) -> None:
         whole = len(tokens) // PAGE_SIZE
@@ -104,26 +102,23 @@ class _Node:
             prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
             prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
         )})
-        self._inputs[rid] = ARNodeInputs(
-            input_ids=torch.tensor(tokens), input_seq_len=len(tokens),
-        )
 
     def resolve(self, rid: str) -> int:
         """Both halves, in the order the engine runs them: every resource has
         to be told the length before any of them is asked to act on it."""
-        inputs = self._inputs[rid]
+        inputs = ARNodeInputs(input_seq_len=self.kv._overrides[rid].prefix_layout["main"][0].length)
         prefix = self.runner.resolve_cached_prefix(rid, NODE, WALK, inputs)
         self.runner.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
         return prefix.tokens if prefix is not None else 0
 
-    def step(self, rid: str, span: int) -> list[int]:
+    def step(self, rid: str, span: int, walk: str = WALK) -> list[int]:
         """Admit, plan, write the slots this step owns, commit."""
         step = SubmoduleStep(
             steps={KV: KVStep(), ROPE: PositionStep()},
             segments=[Segment(rid, "main", span)],
         )
         ctx = StepContext(
-            request_ids=(rid,), graph_walk=WALK, slot=0, capture=False,
+            request_ids=(rid,), graph_walk=walk, slot=0, capture=False,
         )
         step.set_ctx(ctx)
         assert self.runner.admit(step).outcome.ok
@@ -277,7 +272,4 @@ def test_bagel_declares_the_tensor_its_text_walk_prefills_from():
 
     assert declared == {
         "kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text", None, ("prefill_vit",))}
-    }, (
-        "the text walk's prompt does not arrive under the name it keys, or the "
-        "image walk is not named beside it"
-    )
+    }, "the text walk's prompt does not arrive under the name it keys"

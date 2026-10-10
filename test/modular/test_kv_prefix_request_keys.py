@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
@@ -24,7 +25,7 @@ from mstar.conductor.conductor import Conductor
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
-from mstar.model.base import PrefixStream, ProcessPromptOutput
+from mstar.model.base import PrefixStream, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 
@@ -378,3 +379,76 @@ def test_orpheus_is_handed_a_config_for_the_stream_it_declares():
         "orpheus returns a sampler config alone, so the resource it declared "
         "a stream for had nothing to carry its chain"
     )
+
+
+# ── a stream an image walk writes too ───────────────────────────────────
+# An image's pages carry the whole SHA-256 of the file as sent, with how it was
+# read and preprocessed. A digest cut short, or folded into an id, is how
+# LMCache and SGLang served one request another image's KV.
+
+
+class _LaidOut(_Model):
+    """Lays its stream out as its text, then one image that a walk of its own writes."""
+
+    def __init__(self, image: Span, rewrites: bytes | None = None):
+        text = Span("ids", "prefill", len(PROMPT), len(PROMPT), "text_inputs")
+        super().__init__(metadata={"prefix_layout": {"kv": {"main": [text, image]}}})
+        self._rewrites = rewrites
+
+    def prefix_key_streams(self):
+        return {"kv": {"main": PrefixStream("text_inputs", "ids", "prefill", None, ("prefill_image",))}}
+
+    def preprocess_fingerprint(self):
+        return "stub"
+
+    def load_image(self, filepath, device):
+        if self._rewrites is not None:
+            with open(filepath, "wb") as file:
+                file.write(self._rewrites)
+        return TensorAndMetadata(torch.zeros(3, 2, 2))
+
+    load_video = load_image
+
+
+def _image(params=("default",), modality="image") -> Span:
+    return Span("digest", "prefill_image", 30, 1, (modality, 0), params)
+
+
+def _laid_out_keys(tmp_path, content: bytes, image: Span, rewrites: bytes | None = None) -> list[bytes]:
+    """Preprocess one request showing a file of ``content`` and return the keys the conductor was sent."""
+    path = tmp_path / "file0"
+    path.write_bytes(content)
+    modality = image.source[0]
+    worker = _worker(_LaidOut(image, rewrites), _deployment())
+    worker._process_input(PreprocessInput(
+        request_id="r0", text="hello", file_paths={modality: [str(path)]},
+        input_modalities=["text", modality], output_modalities=["text"], model_kwargs={},
+    ))
+    return worker.communicator.sent[-1].body.model_kwargs["prefix_keys"]["kv"]["main"]
+
+
+_LARGE = b"\x89PNG" + bytes(range(256)) * 512
+# two runs of one layout over something that changes what the image's walk writes
+_APART = {
+    "content": ((b"\x89PNG one", _image()), (b"\x89PNG two", _image())),
+    "a large file's last byte": ((_LARGE + b"\x00", _image()), (_LARGE + b"\x01", _image())),
+    "preprocessing": ((b"\x89PNG same", _image()), (b"\x89PNG same", _image(params=("vllm",)))),
+    "a parameter's type": ((b"\x89PNG same", _image(params=(True,))), (b"\x89PNG same", _image(params=("True",)))),
+    "modality": ((b"GIF89a same", _image()), (b"GIF89a same", _image(modality="video"))),
+}
+
+
+@pytest.mark.parametrize(("one", "other"), _APART.values(), ids=_APART.keys())
+def test_images_that_write_different_kv_key_apart_from_their_first_page(tmp_path, one, other):
+    keys = [_laid_out_keys(tmp_path, content, image) for content, image in (one, other)]
+
+    differs = [page for page, (a, b) in enumerate(zip(*keys, strict=True)) if a != b]
+    assert differs[:1] == [len(PROMPT) // PAGE_SIZE], (
+        "two images whose walks write different KV share keys past the text "
+        "before them, so one is served the other's"
+    )
+
+
+def test_a_file_rewritten_while_it_was_loaded_is_not_keyed(tmp_path):
+    with pytest.raises(AssertionError, match="changed while it was loaded"):
+        _laid_out_keys(tmp_path, b"\x89PNG one", _image(), rewrites=b"\x89PNG another")

@@ -171,10 +171,8 @@ def test_a_generated_page_is_matched_by_the_request_that_asks_for_it_next():
     next_prompt = prompt + generated + list(range(200, 260))
     _ingest(kv, "r1", next_prompt)
 
-    matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(
-        input_ids=torch.tensor(next_prompt), input_seq_len=len(next_prompt),
-    ))
-    assert matched is not None and matched.tokens == PAGE_SIZE, (
+    inputs = ARNodeInputs(input_seq_len=len(next_prompt))
+    assert kv.resolve_cached_prefix("r1", NODE, WALK, inputs).tokens == PAGE_SIZE, (
         "the page the first turn generated was not there for the second"
     )
     kv.assert_pages_conserved()
