@@ -190,3 +190,29 @@ def test_forward_in_graph_knobs_read_the_slot_buffers_at_capture(monkeypatch):
     # no lease (an eager step): the knobs do not apply, the inputs are used
     c = run(None)
     assert c["ids"] == [9, 9] and c["cos"] is static_cos and "built" not in c
+
+
+def test_sampler_keeps_slot_masters_only_for_a_node_that_reads_them(monkeypatch):
+    # Whisper's decoder takes its tokens on the host, so the sampler must not
+    # pay the eager-step master write for it; the Qwen3.5 LLM node declares
+    # the read and the engine enables the masters for its sampler.
+    from mstar.engine.resources.sampler.resource import SamplerResource
+
+    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
+    res = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"))
+    assert res._keep_last_token is False
+    assert res.has_slot_masters is False
+    res.enable_device_loopback_reader()
+    assert res._keep_last_token is True
+
+    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
+    off = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"))
+    off.enable_device_loopback_reader()
+    assert off._keep_last_token is False
+
+
+def test_the_loop_back_read_is_declared_per_submodule():
+    from mstar.model.submodule_base import NodeSubmodule
+
+    assert LLMSubmodule.reads_device_loopback is True
+    assert NodeSubmodule.reads_device_loopback is False
