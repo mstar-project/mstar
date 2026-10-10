@@ -120,7 +120,7 @@ class CommandAPlusModel(Model):
                 rope_theta=config.rope_theta,
             )),
             SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
-                        enable_repetion_penalty=True),
+                        enable_repetition_penalty=True),
         ]
 
     def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):

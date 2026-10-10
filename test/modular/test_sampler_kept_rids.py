@@ -44,7 +44,7 @@ def buffer_device(request):
 
 def _resource(graph: bool, device: torch.device) -> SamplerResource:
     res = SamplerResource(
-        vocab_size=V, enable_repetion_penalty=True, device=device,
+        vocab_size=V, enable_repetition_penalty=True, device=device,
     )
     if graph:
         res.build_accelerator_graph_buffers(

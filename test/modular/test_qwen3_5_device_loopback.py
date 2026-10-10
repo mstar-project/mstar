@@ -217,14 +217,14 @@ def test_sampler_keeps_slot_masters_only_for_a_node_that_reads_them(monkeypatch)
     from mstar.engine.resources.sampler.resource import SamplerResource
 
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
-    res = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"))
+    res = SamplerResource(vocab_size=None, enable_repetition_penalty=False, device=torch.device("cpu"))
     assert res._keep_last_token is False
     assert res.has_slot_masters is False
     res.enable_device_loopback_reader()
     assert res._keep_last_token is True
 
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
-    off = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"))
+    off = SamplerResource(vocab_size=None, enable_repetition_penalty=False, device=torch.device("cpu"))
     off.enable_device_loopback_reader()
     assert off._keep_last_token is False
 

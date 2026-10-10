@@ -499,13 +499,13 @@ class Qwen3TTSModel(Model):
             SamplerSpec(
                 resource_key=TALKER_SAMPLER, nodes={"Talker"},
                 vocab_size=talker.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
                 enable_min_p=bool(defaults.get("min_p")),
             ),
             SamplerSpec(
                 resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
                 vocab_size=cp.vocab_size,
-                enable_repetion_penalty=False,
+                enable_repetition_penalty=False,
                 enable_min_p=bool(defaults.get("code_predictor_min_p")),
             ),
         ]
