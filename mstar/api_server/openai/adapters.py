@@ -171,11 +171,18 @@ def _refuse_tool_calls(req) -> None:
     No adapter here parses a tool call out of a reply, so a client sent plain
     text takes it for the model declining every tool. An empty ``tools`` and a
     ``tool_choice`` of ``none`` or ``auto`` ask for no call; clients send them
-    by default.
+    by default. Their older names, ``functions`` and ``function_call``, follow
+    the same rules.
     """
     extra = req.model_extra or {}
     choice = extra.get("tool_choice")
-    if extra.get("tools") not in (None, []) or choice == "required" or isinstance(choice, dict):
+    if (
+        extra.get("tools") not in (None, [])
+        or extra.get("functions") not in (None, [])
+        or choice == "required"
+        or isinstance(choice, dict)
+        or extra.get("function_call") not in (None, "none", "auto")
+    ):
         raise ValueError("tool calling is not supported for this model")
 
 

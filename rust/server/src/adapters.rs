@@ -582,7 +582,7 @@ impl Adapter {
 /// Refuse a chat that asks the model to call a tool. The rules are
 /// `_refuse_tool_calls` in `api_server/openai/adapters.py`.
 fn refuse_tool_calls(req: &ChatCompletionRequest) -> Result<(), String> {
-    let tools = match req.extra.get("tools") {
+    let listed = |field: &str| match req.extra.get(field) {
         None | Some(Value::Null) => false,
         Some(Value::Array(t)) => !t.is_empty(),
         Some(_) => true,
@@ -592,7 +592,12 @@ fn refuse_tool_calls(req: &ChatCompletionRequest) -> Result<(), String> {
         Some(Value::Object(_)) => true,
         _ => false,
     };
-    if tools || choice {
+    let function_call = match req.extra.get("function_call") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(c)) => c != "none" && c != "auto",
+        Some(_) => true,
+    };
+    if listed("tools") || listed("functions") || choice || function_call {
         return Err("tool calling is not supported for this model".to_string());
     }
     Ok(())
