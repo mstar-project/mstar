@@ -561,7 +561,11 @@ def kda_prefill(proj, conv_pool, conv_w, f_b, g_b, dt_bias, a_log, norm_w, state
     return out
 
 
-BV_VERIFY = 32  # value columns per verify program
+def _verify_bv(requests: int, head_dim: int) -> int:
+    """Value columns per verify program: few requests want more programs (a TP8 rank's 8
+    heads at batch 1 fill 32 programs of 32 columns), many want fewer, wider ones."""
+    bv = 8 if requests <= 2 else 16 if requests <= 8 else 32 if requests <= 32 else 64
+    return min(bv, head_dim)
 
 
 if _HAS_TRITON:
@@ -716,13 +720,14 @@ def kda_verify(proj, gpre, conv_pool, conv_w, g_b, dt_bias, a_log, norm_w, state
     assert rows % block == 0 and block <= kmax, (rows, block, kmax)
     assert conv_pool.shape[-1] == 3 and conv_w.shape[-1] == 4, "width-4 conv only"
     assert state_pool.is_contiguous() and conv_pool.is_contiguous() and proj.stride(1) == 1
-    assert all(t.is_contiguous() for t in spec) and D % BV_VERIFY == 0
+    bv = _verify_bv(rows // block, D)
+    assert all(t.is_contiguous() for t in spec) and D % bv == 0
     assert spec.conv.dtype == conv_pool.dtype == spec.g.dtype == torch.bfloat16
     o = torch.empty(rows, H * D, dtype=proj.dtype, device=proj.device)
     out = torch.empty_like(o)
     if rows:
         assert gpre.shape == (rows, H * D) and gpre.stride(1) == 1 and gpre.dtype == torch.bfloat16
-        _kda_verify_kernel[(rows // block, H, D // BV_VERIFY)](
+        _kda_verify_kernel[(rows // block, H, D // bv)](
             proj, proj.stride(0), gpre, gpre.stride(0),
             spec.prefix, *spec.prefix.stride()[:3], spec.g, *spec.g.stride()[:3],
             spec.beta, *spec.beta.stride()[:3], spec.conv, *spec.conv.stride()[:2],
@@ -730,7 +735,7 @@ def kda_verify(proj, gpre, conv_pool, conv_w, g_b, dt_bias, a_log, norm_w, state
             conv_pool, conv_pool.stride(0), conv_w, dt_bias, a_log,
             state_pool, state_pool.stride(0), slot_ids, o, o.stride(0),
             float(lower_bound), float(scale),
-            T=block, KMAX=kmax, H=H, D=D, BV=BV_VERIFY, num_warps=4,
+            T=block, KMAX=kmax, H=H, D=D, BV=bv, num_warps=4,
         )
         _kda_out_norm_kernel[(triton.cdiv(rows, 64), H)](
             o, proj, proj.stride(0), g_b, norm_w, out, rows, float(norm_eps),
