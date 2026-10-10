@@ -217,10 +217,10 @@ def _stop_recording_to_pool(device, pool) -> None:
 
 
 class CaptureCost(NamedTuple):
-    """What one bucket costs on the device, from its warm-up and a capture thrown away."""
+    """What one bucket costs on the device: its warm-up, and a capture thrown away, its own or its walk's largest."""
     # bytes the eager forward allocated at its peak, above what was live
     peak: int
-    # bytes one slot's graph holds, in its pool and out; None if it can't be captured
+    # bytes one slot's graph holds at most, in its pool and out; None if it can't be captured
     graph: int | None
     # what of ``graph`` no later graph in the pool reuses: outputs, and a region's inputs
     kept: int
@@ -245,9 +245,9 @@ def _tensor_bytes(value: Any) -> int:
     return sum(storages.values())
 
 
-def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> tuple[int | None, int]:
+def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> int | None:
     """Run ``capture`` into a pool of its own and hand it all back: what the
-    pool took (None if it failed), and what ``capture`` returned.
+    pool took, None if it failed.
 
     A capture records kernels and collectives without running them, so a rank
     short of memory fails its own capture here and no other rank waits on it.
@@ -264,13 +264,47 @@ def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> 
     taken = None if graph is None else sum(
         segment["total_size"] for segment in torch.cuda.memory_snapshot(pool, include_traces=False)
     )
-    returned = _tensor_bytes(outputs)
     del graph, outputs
     if taken is None:
         # a capture that never ended keeps its stream's cuBLAS workspace in the pool; no real graph uses it yet
         torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
-    return taken, returned
+    return taken
+
+
+def _size_in_walk(
+    captured: list[CaptureCost], cost: CaptureCost, kept_in_pool: bool,
+    capture: Callable[..., tuple[Any, Any]], what: str,
+) -> tuple[CaptureCost, bool]:
+    """Return ``cost`` with its graph's size, and whether that size came from
+    another bucket's capture: the bucket is captured, thrown away, unless two
+    of its walk already were and they show it fits in the larger's scratch.
+
+    The lender is the bucket with the largest eager peak of those ``captured``
+    in the walk so far. A bucket that peaks no higher takes the lender's
+    scratch and adds its own kept bytes: a walk runs one forward at every
+    shape, and a smaller shape allocates no more at any step, so its graph
+    fits in the scratch a larger one leaves free.
+
+    That holds only while no captured bucket took more scratch than the
+    lender. Where one did, a lender tells nothing of this walk, and every
+    bucket of it is captured: Chatterbox's CFG decode takes 24 MiB at 32 rows
+    and 56 MiB at 16.
+    """
+    def scratch(bucket: CaptureCost) -> int:
+        return -(-(bucket.graph - bucket.kept) // _SEGMENT)
+
+    lender = max(captured, key=lambda bucket: bucket.peak, default=None)
+    if (
+        len(captured) > 1 and cost.peak <= lender.peak
+        and all(scratch(bucket) <= scratch(lender) for bucket in captured)
+    ):
+        return cost._replace(graph=lender.graph - lender.kept + cost.kept), True
+    taken = _capture_thrown_away(capture, what)
+    if taken is not None:
+        cost = cost._replace(graph=taken if kept_in_pool else taken + cost.kept)
+        captured.append(cost)
+    return cost, False
 
 
 #: the caching allocator's smallest segment: what a graph's kept tensors are counted in
@@ -409,6 +443,8 @@ class WarmedSpec(NamedTuple):
     dummy_metadata: dict[int, CurrentForwardPassInfo]
     # bytes the last warm-up forward allocated at its peak, above what was live
     peak: int
+    # bytes of what it returned
+    returned: int
 
 
 class CudaGraphRunner:
@@ -454,6 +490,8 @@ class CudaGraphRunner:
         self._prepared_slot_specs: list[CGSlotSpec] | None = None
         # bucket -> what it costs, from size_captures
         self._capture_costs: dict[BucketKey, CaptureCost] = {}
+        # the buckets of them sized by a lender's capture, not their own
+        self._lent: set[BucketKey] = set()
 
         # (config_idx, tensor_key) → max-bucket static buffer. Lazily populated
         # by _intern_static_buffer on the first capture. Smaller-bucket captures
@@ -553,16 +591,18 @@ class CudaGraphRunner:
         return self._prepared_slot_specs
 
     def size_captures(self) -> dict[BucketKey, CaptureCost]:
-        """Warm every spec up, and capture each bucket's first slot once, thrown
-        away, before any runner captures for real.
+        """Warm every spec up, and capture each walk's largest buckets once,
+        thrown away, before any runner captures for real.
 
-        Every bucket rather than the first in capture order: that order leads
-        with batch size, so it can open on a decode bucket while a one-row
-        prefill of thousands of tokens peaks far higher. And every slot: a
+        Every bucket is warmed rather than the first in capture order: that
+        order leads with batch size, so it can open on a decode bucket while a
+        one-row prefill of thousands of tokens peaks far higher. And every slot: a
         slot's first plan builds state of its own (FlashInfer's graph wrappers
         and their workspace, 750 MiB for the Talker's second slot), which has
         to be spent before free memory is read.
         """
+        # walk -> the buckets of it captured so far
+        captured: dict[tuple, list[CaptureCost]] = {}
         for spec in self.prepare_for_capture():
             # the warm-up may hold collectives; every rank sizes these specs, in
             # config order, as it does the captures
@@ -571,22 +611,55 @@ class CudaGraphRunner:
             try:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
                     if spec.slot == 0:
-                        graph, kept = _capture_thrown_away(
+                        self._capture_costs[spec.bucket], lent = _size_in_walk(
+                            captured.setdefault((spec.bucket.graph_walk, spec.bucket.cg_key_info), []),
+                            CaptureCost(warmed.peak, None, warmed.returned, self._num_slots), True,
                             partial(
                                 capture_into_graph, warmed.run, device=self._device,
                                 autocast_dtype=self._autocast_dtype,
                             ),
                             f"{self._submodule_name} {spec}",
                         )
-                        self._capture_costs[spec.bucket] = CaptureCost(warmed.peak, graph, kept, self._num_slots)
+                        if lent:
+                            self._lent.add(spec.bucket)
             except Exception:
                 # a slot that can't run can't be captured, and neither can its bucket
+                self._lent.discard(spec.bucket)
                 if (cost := self._capture_costs.get(spec.bucket)) is not None:
                     self._capture_costs[spec.bucket] = cost._replace(graph=None)
                 logger.warning(
                     "CudaGraphRunner[%s]: could not run %s eagerly to size its "
                     "capture", self._submodule_name, spec, exc_info=True,
                 )
+        return self._capture_costs
+
+    def size_lent_captures(self) -> dict[BucketKey, CaptureCost]:
+        """Capture every bucket a lender sized, thrown away: a plan that leaves
+        graphs out needs what each takes, not what its walk's largest does.
+
+        With no forward and no barrier: sizing ran the forwards, and a capture
+        runs no collective, so each rank does this or not by its own plan.
+        """
+        for spec in self.prepare_for_capture():
+            if spec.slot != 0 or spec.bucket not in self._lent:
+                continue
+            self._lent.discard(spec.bucket)
+            cost = self._capture_costs[spec.bucket]._replace(graph=None)
+            try:
+                with self._warmed(spec, forwards=0) as warmed:
+                    cost = cost._replace(graph=_capture_thrown_away(
+                        partial(
+                            capture_into_graph, warmed.run, device=self._device,
+                            autocast_dtype=self._autocast_dtype,
+                        ),
+                        f"{self._submodule_name} {spec}",
+                    ))
+            except Exception:
+                logger.warning(
+                    "CudaGraphRunner[%s]: could not prepare %s to size its capture",
+                    self._submodule_name, spec, exc_info=True,
+                )
+            self._capture_costs[spec.bucket] = cost
         return self._capture_costs
 
     def warmup_and_capture(self, planned: Collection[BucketKey]):
@@ -826,13 +899,13 @@ class CudaGraphRunner:
 
             torch.cuda.set_device(self._device)
             torch.cuda.synchronize()
-            peak = 0
+            peak = returned = 0
             for _ in range(forwards):
                 # the last forward's peak, not the first's: that one may compile and autotune
                 live = torch.cuda.memory_allocated(self._device)
                 torch.cuda.reset_peak_memory_stats(self._device)
                 with autocast_scope(self._autocast_dtype):
-                    run_forward()
+                    returned = _tensor_bytes(run_forward())
                 peak = torch.cuda.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the same shapes the first prepare did
@@ -847,6 +920,7 @@ class CudaGraphRunner:
                 dummy_rids=dummy_rids,
                 dummy_metadata=engine_inputs.per_request_info,
                 peak=peak,
+                returned=returned,
             )
         finally:
             # Capture ran the dummy rows as real requests; free their storage
@@ -1338,6 +1412,8 @@ class PiecewiseCudaGraphRunner:
         self.dropped_shapes: list[tuple[int, int]] = []
         # bucket -> what it costs, from size_captures
         self._capture_costs: dict[BucketKey, CaptureCost] = {}
+        # the buckets of them sized by a lender's capture, not their own
+        self._lent: set[BucketKey] = set()
         # bucket -> the shape, dtype and device of each output of its warm-up
         self._output_likes: dict[BucketKey, dict[str, tuple]] = {}
         self._dummy_rows = DummyRowPool(
@@ -1415,12 +1491,14 @@ class PiecewiseCudaGraphRunner:
         return self._prepared_shapes
 
     def size_captures(self) -> dict[BucketKey, CaptureCost]:
-        """Warm every shape up and capture it once, thrown away; see
+        """Warm every shape up and capture the largest once, thrown away; see
         `CudaGraphRunner.size_captures`."""
         torch.cuda.set_device(self._device)
         shapes = sorted(
             self.prepare_for_capture(), key=lambda s: (s.bs, s.total_tokens), reverse=True,
         )
+        # the region is one walk
+        captured: list[CaptureCost] = []
         for shape in shapes:
             for slot in range(self._num_slots):
                 if self._comm_group is not None:
@@ -1433,20 +1511,21 @@ class PiecewiseCudaGraphRunner:
                             for name, value in warmed.warm_outputs.items()
                         }
                         if slot == 0:
-                            graph, kept = _capture_thrown_away(
+                            # a region's outputs and inputs live outside the pool, a set per graph
+                            kept = _tensor_bytes(warmed.warm_outputs) + _tensor_bytes(warmed.static_inputs)
+                            self._capture_costs[self._bucket(shape)], lent = _size_in_walk(
+                                captured, CaptureCost(warmed.peak, None, kept, self._num_slots), False,
                                 partial(
                                     capture_with_static_outputs, warmed.run, warmed.warm_outputs,
                                     device=self._device, autocast_dtype=self._autocast_dtype,
                                 ),
                                 f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}",
                             )
-                            # a region's outputs and inputs live outside the pool, a set per graph
-                            kept += _tensor_bytes(warmed.static_inputs)
-                            self._capture_costs[self._bucket(shape)] = CaptureCost(
-                                warmed.peak, None if graph is None else graph + kept, kept, self._num_slots,
-                            )
+                            if lent:
+                                self._lent.add(self._bucket(shape))
                 except Exception:
                     # as in `CudaGraphRunner.size_captures`
+                    self._lent.discard(self._bucket(shape))
                     if (cost := self._capture_costs.get(self._bucket(shape))) is not None:
                         self._capture_costs[self._bucket(shape)] = cost._replace(graph=None)
                     logger.warning(
@@ -1456,6 +1535,35 @@ class PiecewiseCudaGraphRunner:
                     )
         # hand the pages back: held through the captures, they would shift every
         # admit after them on a node that shares the resource
+        self._dummy_rows.release_all()
+        return self._capture_costs
+
+    def size_lent_captures(self) -> dict[BucketKey, CaptureCost]:
+        """Capture every shape a lender sized, thrown away; see
+        `CudaGraphRunner.size_lent_captures`."""
+        for shape in self.prepare_for_capture():
+            bucket = self._bucket(shape)
+            if bucket not in self._lent:
+                continue
+            self._lent.discard(bucket)
+            cost = self._capture_costs[bucket]._replace(graph=None)
+            try:
+                with self._warmed(shape, 0, forwards=0) as warmed:
+                    taken = _capture_thrown_away(
+                        partial(
+                            capture_with_static_outputs, warmed.run, self._outputs_like(bucket),
+                            device=self._device, autocast_dtype=self._autocast_dtype,
+                        ),
+                        f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}",
+                    )
+                if taken is not None:
+                    cost = cost._replace(graph=taken + cost.kept)
+            except Exception:
+                logger.warning(
+                    "PiecewiseCudaGraphRunner[%s]: could not prepare bs=%d total_tokens=%d "
+                    "to size its capture", self._label, shape.bs, shape.total_tokens, exc_info=True,
+                )
+            self._capture_costs[bucket] = cost
         self._dummy_rows.release_all()
         return self._capture_costs
 

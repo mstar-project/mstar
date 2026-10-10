@@ -43,6 +43,7 @@ class _StubMeasuredRunner:
     """`size_captures` over stub warm-ups of ``steps``, two slots each, in capture order."""
 
     size_captures = CudaGraphRunner.size_captures
+    size_lent_captures = CudaGraphRunner.size_lent_captures
     NUM_WARMUP = CudaGraphRunner.NUM_WARMUP
 
     def __init__(self, device: torch.device, steps: dict[BucketKey, CaptureCost]):
@@ -52,6 +53,7 @@ class _StubMeasuredRunner:
         self._submodule_name = "Thinker"
         self._num_slots = 2
         self._capture_costs = {}
+        self._lent = set()
         group = SimpleNamespace(world_size=1, barrier=lambda: None)
         self._comm_group = SimpleNamespace(tp_group=group, sp_group=group)
         self.warmed: list[tuple[BucketKey, int]] = []
@@ -68,7 +70,7 @@ class _StubMeasuredRunner:
         step = self._steps[spec.bucket]
         yield WarmedSpec(
             run=lambda: step, static_inputs={}, static_input_keys=(), dummy_rids=[], dummy_metadata={},
-            peak=step.peak,
+            peak=step.peak, returned=step.kept,
         )
 
 
@@ -80,7 +82,7 @@ def measured(monkeypatch):
     def capture(capture, what):
         _, cost = capture(pool=None)
         runs.append(cost)
-        return cost.graph, cost.kept
+        return cost.graph
 
     monkeypatch.setattr(cuda_graph_runner, "_capture_thrown_away", capture)
     monkeypatch.setattr(
@@ -175,7 +177,7 @@ def test_a_throwaway_capture_frees_its_memory_pass_or_fail(forward, monkeypatch)
     torch.cuda.empty_cache()
     reserved = torch.cuda.memory_reserved(device)
 
-    taken, _ = cuda_graph_runner._capture_thrown_away(
+    taken = cuda_graph_runner._capture_thrown_away(
         partial(cuda_graph_runner.capture_into_graph, lambda: forward(x), device=device, autocast_dtype=None),
         forward.__name__,
     )
@@ -331,7 +333,7 @@ def test_the_cap_bounds_the_plan(monkeypatch, fraction, reserved, planned):
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: reserved * _GIB)
     # graphs that share no scratch, so each takes its full GiB
     costs = {bs: CaptureCost(peak=2 * _GIB, graph=_GIB, kept=_GIB, slots=1) for bs in range(8)}
-    talker = SimpleNamespace(size_captures=lambda: costs)
+    talker = SimpleNamespace(size_captures=lambda: costs, size_lent_captures=lambda: costs)
     engine = SimpleNamespace(
         _device=torch.device("cuda", 0), _submodules={"Talker": None}, _gpu_memory_fraction=fraction,
     )

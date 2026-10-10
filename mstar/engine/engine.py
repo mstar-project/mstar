@@ -628,22 +628,33 @@ class Engine:
         """
         if self._device is None or self._device.type != "cuda":
             return None
-        pools: dict[str, dict] = {}
-        for node_name in self._submodules:
-            pools[node_name] = cg_runners[node_name].size_captures()
-            # one pool for all of a node's regions (see `_build_piecewise_runners`)
-            pools[f"{node_name} piecewise"] = {
-                (label, bucket): cost
-                for label, runner in piecewise[node_name].items()
-                for bucket, cost in runner.size_captures().items()
-            }
-        torch.cuda.empty_cache()
-        free, total = torch.cuda.mem_get_info(self._device)
-        if self._gpu_memory_fraction is not None:
-            # shortcut: counts this worker's PyTorch allocations, not its CUDA
-            # context or NCCL buffers; add those if a capped worker still crowds another
-            free = min(free, int(self._gpu_memory_fraction * total) - torch.cuda.memory_reserved(self._device))
-        plan = plan_captures(pools, free)
+        def planned(size: Callable[[Any], dict]) -> tuple[dict[str, dict], int, CapturePlan]:
+            """A plan over what ``size`` says each runner's buckets cost."""
+            pools: dict[str, dict] = {}
+            for node_name in self._submodules:
+                pools[node_name] = size(cg_runners[node_name])
+                # one pool for all of a node's regions (see `_build_piecewise_runners`)
+                pools[f"{node_name} piecewise"] = {
+                    (label, bucket): cost
+                    for label, runner in piecewise[node_name].items()
+                    for bucket, cost in size(runner).items()
+                }
+            torch.cuda.empty_cache()
+            free, total = torch.cuda.mem_get_info(self._device)
+            if self._gpu_memory_fraction is not None:
+                # shortcut: counts this worker's PyTorch allocations, not its CUDA
+                # context or NCCL buffers; add those if a capped worker still crowds another
+                free = min(free, int(self._gpu_memory_fraction * total) - torch.cuda.memory_reserved(self._device))
+            return pools, free, plan_captures(pools, free)
+
+        pools, free, plan = planned(lambda runner: runner.size_captures())
+        if any(
+            cost.graph is not None and bucket not in plan.buckets[pool]
+            for pool, costs in pools.items() for bucket, cost in costs.items()
+        ):
+            # a walk's smaller buckets were sized by its largest, which is enough
+            # while every graph fits. Here one doesn't, so each is sized by its own capture
+            pools, free, plan = planned(lambda runner: runner.size_lent_captures())
         logger.info(
             "CapturePlan[%s]: %.0f MiB free, %.0f for the largest eager step",
             self._device, free / 2**20, plan.floor / 2**20,
