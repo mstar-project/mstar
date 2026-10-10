@@ -303,6 +303,7 @@ impl Adapter {
         upload_dir: &Path,
         allow_remote: bool,
     ) -> Result<SubmitArgs, String> {
+        refuse_tool_calls(req)?;
         match self {
             Adapter::Bagel => {
                 let (text, file_paths, in_mods, parts) =
@@ -576,6 +577,25 @@ impl Adapter {
             _ => Err("image editing is not supported by this model".to_string()),
         }
     }
+}
+
+/// Refuse a chat that asks the model to call a tool. The rules are
+/// `_refuse_tool_calls` in `api_server/openai/adapters.py`.
+fn refuse_tool_calls(req: &ChatCompletionRequest) -> Result<(), String> {
+    let tools = match req.extra.get("tools") {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(t)) => !t.is_empty(),
+        Some(_) => true,
+    };
+    let choice = match req.extra.get("tool_choice") {
+        Some(Value::String(c)) => c == "required",
+        Some(Value::Object(_)) => true,
+        _ => false,
+    };
+    if tools || choice {
+        return Err("tool calling is not supported for this model".to_string());
+    }
+    Ok(())
 }
 
 /// Chat `audio.voice` wins over a top-level `voice` (Qwen3-Omni).

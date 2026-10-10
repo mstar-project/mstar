@@ -165,6 +165,20 @@ def _passthrough(req) -> dict:
     return dict(extra)
 
 
+def _refuse_tool_calls(req) -> None:
+    """Refuse a chat that asks the model to call a tool.
+
+    No adapter here parses a tool call out of a reply, so a client sent plain
+    text takes it for the model declining every tool. An empty ``tools`` and a
+    ``tool_choice`` of ``none`` or ``auto`` ask for no call; clients send them
+    by default.
+    """
+    extra = req.model_extra or {}
+    choice = extra.get("tool_choice")
+    if extra.get("tools") not in (None, []) or choice == "required" or isinstance(choice, dict):
+        raise ValueError("tool calling is not supported for this model")
+
+
 def _apply_sampling(
     req,
     mk: dict,
@@ -303,6 +317,7 @@ class BagelAdapter(OpenAIAdapter):
     supports_images = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -360,6 +375,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         return getattr(req, "voice", None)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         # Speech output also emits text, so request both modalities when audio is asked for.
@@ -410,6 +426,7 @@ class Qwen3_5Adapter(OpenAIAdapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -721,6 +738,7 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
