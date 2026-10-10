@@ -32,10 +32,12 @@ processed causally, then each image is processed bidirectionally.
 import io
 import json
 import logging
+import math
 from pathlib import Path
 
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub.errors import EntryNotFoundError
 from PIL import Image
 from torch import nn
 
@@ -94,6 +96,7 @@ from mstar.model.multimodal import (
     split_around_spans,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import load_generation_defaults
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +113,79 @@ GEN_THINK_SYSTEM_PROMPT = (
     "You should first think about the planning process in the mind "
     "and then generate the image."
 )
+
+
+# ---------------------------------------------------------------------------
+# Request knobs
+# ---------------------------------------------------------------------------
+
+# sampling knobs a request may set; unset ones take the checkpoint's value
+SAMPLING_KEYS = (
+    "temperature", "top_k", "top_p", "min_p", "repetition_penalty",
+    "ignore_eos", "penalize_prompt",
+)
+CFG_RENORM_TYPES = ("global", "channel", "text_channel")
+IMAGE_PREPROCESS_MODES = ("default", "vllm")
+# latent grid is at most 64 patches of 16 px per side
+MAX_IMAGE_SIDE = 1024
+IMAGE_SIDE_STRIDE = 16
+
+
+def _is_real(value) -> bool:
+    return (
+        not isinstance(value, bool) and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
+def check_request_kwargs(model_kwargs: dict | None) -> None:
+    """Raise ``ValueError`` on a BAGEL-specific knob outside its allowed values.
+
+    Sampling knobs are checked at the API boundary and by the sampler.
+    """
+    mk = model_kwargs or {}
+    for key in ("cfg_text_scale", "cfg_img_scale"):
+        if key in mk and not _is_real(mk[key]):
+            raise ValueError(f"{key} must be a finite number (<= 1 disables it); got {mk[key]!r}")
+    if "cfg_interval" in mk:
+        interval = mk["cfg_interval"]
+        if not (
+            isinstance(interval, (list, tuple)) and len(interval) == 2
+            and all(_is_real(v) for v in interval)
+            and 0 <= interval[0] <= interval[1] <= 1
+        ):
+            raise ValueError(
+                f"cfg_interval must be [lo, hi] with 0 <= lo <= hi <= 1; got {interval!r}"
+            )
+    if "cfg_renorm_type" in mk and mk["cfg_renorm_type"] not in CFG_RENORM_TYPES:
+        raise ValueError(
+            f"cfg_renorm_type must be one of {list(CFG_RENORM_TYPES)}; "
+            f"got {mk['cfg_renorm_type']!r}"
+        )
+    if "cfg_renorm_min" in mk and not (
+        _is_real(mk["cfg_renorm_min"]) and 0 <= mk["cfg_renorm_min"] <= 1
+    ):
+        raise ValueError(f"cfg_renorm_min must be a number in [0, 1]; got {mk['cfg_renorm_min']!r}")
+    if "think_mode" in mk and not isinstance(mk["think_mode"], bool):
+        raise ValueError(f"think_mode must be true or false; got {mk['think_mode']!r}")
+    if "image_preprocess" in mk and mk["image_preprocess"] not in IMAGE_PREPROCESS_MODES:
+        raise ValueError(
+            f"image_preprocess must be one of {list(IMAGE_PREPROCESS_MODES)}; "
+            f"got {mk['image_preprocess']!r}"
+        )
+    for key in ("width", "height"):
+        if key not in mk:
+            continue
+        value = mk[key]
+        if (
+            isinstance(value, bool) or not isinstance(value, int)
+            or not IMAGE_SIDE_STRIDE <= value <= MAX_IMAGE_SIDE
+            or value % IMAGE_SIDE_STRIDE
+        ):
+            raise ValueError(
+                f"{key} must be an integer multiple of {IMAGE_SIDE_STRIDE} in "
+                f"[{IMAGE_SIDE_STRIDE}, {MAX_IMAGE_SIDE}]; got {value!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +346,7 @@ class BagelModel(Model):
         )
         with open(config_path) as f:
             self.config = load_bagel_config(json.load(f))
+        self.sampling_defaults = self._load_sampling_defaults(model_path_hf, cache_dir)
 
         self.model_path_hf = model_path_hf
 
@@ -307,6 +384,19 @@ class BagelModel(Model):
         # The separate image-generation placement needs serial denoising
         # until its published KV handoff and speculative scheduling agree.
         self._image_gen_remote_handoff = False
+
+    def _load_sampling_defaults(self, repo_id: str, cache_dir: str | None) -> dict:
+        """Config values, overridden by the checkpoint's ``generation_config.json``."""
+        defaults = {k: getattr(self.config, k) for k in SAMPLING_KEYS if hasattr(self.config, k)}
+        try:
+            path = hf_hub_download(
+                repo_id=repo_id, filename="generation_config.json", cache_dir=cache_dir,
+            )
+        except EntryNotFoundError:
+            return defaults
+        checkpoint = load_generation_defaults(Path(path).parent)
+        defaults.update({k: v for k, v in checkpoint.items() if k in SAMPLING_KEYS})
+        return defaults
 
     @property
     def _image_gen_walk(self) -> str:
@@ -591,6 +681,7 @@ class BagelModel(Model):
         Bagel doesn't need the raw multimodal tensors here; images are loaded
         as ``image_inputs`` by the data worker.
         """
+        check_request_kwargs(kwargs)
         result: NameToTensorList = {}
 
         if prompt is not None:
@@ -745,6 +836,17 @@ class BagelModel(Model):
         """
         return {"kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text")}}
 
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({
+            *SAMPLING_KEYS, "max_output_tokens", "think_mode", "width", "height",
+            "cfg_text_scale", "cfg_img_scale", "cfg_interval", "cfg_renorm_type",
+            "cfg_renorm_min", "image_preprocess",
+        })
+
+    def get_max_output_tokens_limit(self) -> int:
+        # the decode Loop's max_iters
+        return self.get_max_output_tokens()
+
     def checkpoint_path(self) -> str:
         return snapshot_download(
             repo_id=self.model_path_hf, cache_dir=self.cache_dir,
@@ -858,6 +960,8 @@ class BagelModel(Model):
                 top_p=sampling.top_p,
                 ignore_eos=sampling.ignore_eos,
                 repetition_penalty=sampling.repetition_penalty,
+                min_p=sampling.min_p,
+                penalize_prompt=sampling.penalize_prompt,
             ),
         }
 
@@ -1132,16 +1236,11 @@ class BagelModel(Model):
         for step in plan:
             pool = texts if step.modality == "text" else images
             if step.index >= len(pool):
-                # ``check_plan`` already failed a mismatch at intake, where a
-                # 400 can still be returned. This runs in the conductor, whose
-                # loop only logs — raising here orphans the request and hangs
-                # the client instead. Same choice as Qwen3-Omni's builder.
-                logger.warning(
-                    "BAGEL prefill plan wants a %s span at index %d but the "
-                    "prompt produced %d; skipping it",
-                    step.modality, step.index, len(pool),
+                # ``check_plan`` fails this at intake; a ValueError here is a 400 too
+                raise ValueError(
+                    f"BAGEL prefill plan wants a {step.modality} span at index "
+                    f"{step.index} but the prompt produced {len(pool)}"
                 )
-                continue
             if step.modality == "text":
                 schedule.append(("prefill_text", texts[step.index]))
             else:
@@ -1273,6 +1372,7 @@ class BagelModel(Model):
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         target_output = output_modalities[0]  # "text" or "image"
+        check_request_kwargs(model_kwargs)
 
         # Per-request overrides with config defaults
         overridable_keys = [
@@ -1295,6 +1395,7 @@ class BagelModel(Model):
                 if key in model_kwargs:
                     params[key] = model_kwargs[key]
 
+        # edit: width/height bound the output via process_prompt's resize of the input
         if "image" in output_modalities and input_signals.get("image_inputs"):
             image = input_signals["image_inputs"][0]
             params["height"] = image.dims[1]
@@ -1316,6 +1417,7 @@ class BagelModel(Model):
             "target_output": target_output,
             "num_timesteps": self.config.num_timesteps,
             "think_mode": think_mode,
+            "max_output_tokens": self.get_max_output_tokens(**(model_kwargs or {})),
             **params,  # CFG params  + gen width / height
         }
         kwargs["requires_cfg"] = self._requires_cfg(**kwargs)
@@ -1388,7 +1490,14 @@ class BagelModel(Model):
                 # All prefill done -- transition based on target_output
                 metadata.is_prefill = False
                 target = metadata.kwargs["target_output"]
-                if target == "text":
+                # the prefill already sampled the only token asked for
+                budget_spent = has_text_output and metadata.kwargs.get("max_output_tokens") == 1
+                if budget_spent and target == "text":
+                    metadata.graph_walk = DECODE
+                    request_done = True
+                elif budget_spent:
+                    metadata.graph_walk = self._image_gen_walk
+                elif target == "text":
                     metadata.graph_walk = DECODE
                 elif target == "image":
                     if metadata.kwargs.get("think_mode", False):
@@ -1430,13 +1539,9 @@ class BagelModel(Model):
         self, node_name: str,
         model_kwargs: dict | None = None,
     )  -> SamplingConfig | None:
-        keys = [
-            "temperature", "top_k", "top_p", "repetition_penalty",
-            "ignore_eos"
-        ]
-        params = {k: getattr(self.config, k) for k in keys}
+        params = dict(self.sampling_defaults)
         if model_kwargs:
-            for key in keys:
+            for key in SAMPLING_KEYS:
                 if key in model_kwargs:
                     params[key] = model_kwargs[key]
         return SamplingConfig(

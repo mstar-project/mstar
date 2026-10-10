@@ -1217,10 +1217,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Codec hidden: [codec_embed(nothink, think_bos, think_eos,
         #                speaker, pad, bos)] (9 tokens)
         tc = self.config.talker
-        speaker_id = tc.speaker_id.get(speaker.lower())
-        if speaker_id is None:
-            logger.warning(f"Speaker {speaker} not implemented")
-            speaker_id = tc.codec_pad_id
+        # checked at admission (Qwen3OmniModel._resolve_voice)
+        speaker_id = tc.speaker_id[speaker.lower()]
 
         # Codec part of assistant prefix
         return self.talker_code_emb(torch.tensor([

@@ -48,6 +48,10 @@ def _bare_model() -> BagelModel:
         ignore_eos=False,
         vocab_size=32,
     )
+    model.sampling_defaults = {
+        "temperature": 1.0, "top_k": 0, "top_p": 1.0,
+        "repetition_penalty": 1.0, "ignore_eos": False,
+    }
     model._has_cfg_parallel = True
     model._has_llm_disaggregation = False
     model._image_gen_remote_handoff = False

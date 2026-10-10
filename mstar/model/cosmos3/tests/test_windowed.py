@@ -638,13 +638,17 @@ def test_session_gen_params() -> None:
         )
     # An id on a non-windowed request is simply not a session.
     assert "session_id" not in model._resolve_gen_params({"num_frames": 189, "session_id": "s"}, [], ["video"])
-    # end_session and the timeout ride along; the timeout is capped and validated.
+    # end_session and the timeout ride along; the timeout is validated against its maximum.
     assert p["end_session"] is False and "session_timeout_s" not in p
     e = model._resolve_gen_params(
-        {"window_mode": "kv", "num_frames": 189, "session_id": "s", "end_session": True, "session_timeout_s": 1e6},
+        {"window_mode": "kv", "num_frames": 189, "session_id": "s", "end_session": True, "session_timeout_s": 3600},
         [], ["video"],
     )
     assert e["end_session"] is True and e["session_timeout_s"] == 3600.0
+    with pytest.raises(ValueError, match=r"session_timeout_s must be in \(0, 3600\]"):
+        model._resolve_gen_params(
+            {"window_mode": "kv", "num_frames": 189, "session_id": "s", "session_timeout_s": 1e6}, [], ["video"],
+        )
     with pytest.raises(ValueError, match="end_session requires"):
         model._resolve_gen_params({"window_mode": "kv", "num_frames": 189, "end_session": True}, [], ["video"])
     with pytest.raises(ValueError, match="session_timeout_s"):

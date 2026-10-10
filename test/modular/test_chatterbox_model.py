@@ -19,7 +19,7 @@ from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec
 from mstar.engine.resources.position.config import PositionSpec
-from mstar.engine.resources.sampler.config import SamplerSpec
+from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.model.chatterbox.chatterbox_model import (
     PREV_TOKEN,
     REF_AUDIO,
@@ -408,10 +408,9 @@ def test_generation_kwargs_defaults_and_turbo_guards():
     assert knobs["cfg_weight"] == 0.5 and knobs["exaggeration"] == 0.5
     assert knobs["min_p"] == 0.05 and knobs["repetition_penalty"] == 1.2
     assert knobs["max_new_tokens"] == 1000 and knobs["n_cfm_timesteps"] == 10
-    assert model.resolve_generation_kwargs({"do_sample": False})["temperature"] == 0.0
-    assert model.get_max_output_tokens(max_new_tokens=42) == 42
-    with pytest.raises(ValueError, match=r"max_new_tokens=5000 is outside \[1, 4096\]"):
-        model.resolve_generation_kwargs({"max_new_tokens": 5000})
+    assert model.get_max_output_tokens(max_output_tokens=42) == 42
+    with pytest.raises(ValueError, match=r"max_output_tokens=5000 is outside \[1, 4096\]"):
+        model.resolve_generation_kwargs({"max_output_tokens": 5000})
 
     configs = model.get_request_resource_configs({}, {"cfg_weight": 0.3, "temperature": 0.5, "seed": 1})
     assert configs[T3_SAMPLER].temperature == 0.5
@@ -421,8 +420,11 @@ def test_generation_kwargs_defaults_and_turbo_guards():
     assert model.get_request_resource_configs({}, {"cfg_weight": 0})[T3_KV].needed_labels == [COND_LABEL]
 
     turbo = _make_model("turbo")
-    knobs = turbo.resolve_generation_kwargs({"cfg_weight": 0.5, "exaggeration": 0.7, "min_p": 0.1})
+    knobs = turbo.resolve_generation_kwargs({"cfg_weight": 0, "exaggeration": 0.0, "min_p": 0})
     assert knobs["cfg_weight"] == 0.0 and knobs["exaggeration"] == 0.0 and knobs["min_p"] == 0.0
+    for name, value in (("cfg_weight", 0.5), ("exaggeration", 0.7), ("min_p", 0.1)):
+        with pytest.raises(ValueError, match=f"Chatterbox-Turbo has no {name}"):
+            turbo.resolve_generation_kwargs({name: value})
     assert knobs["top_k"] == 1000 and knobs["top_p"] == 0.95
     assert turbo.get_request_resource_configs({}, {})[T3_KV].needed_labels == [COND_LABEL]
 
@@ -430,12 +432,16 @@ def test_generation_kwargs_defaults_and_turbo_guards():
 # Each of these hung a request for 600 s, failed its whole batch, or was
 # served as a 200 with the wrong audio before the knobs were checked
 @pytest.mark.parametrize("knobs,message", [
-    ({"max_new_tokens": 0}, r"max_new_tokens=0 is outside"),
-    ({"max_new_tokens": -5}, r"max_new_tokens=-5 is outside"),
-    ({"max_new_tokens": 4097}, r"max_new_tokens=4097 is outside"),
-    ({"max_new_tokens": "abc"}, "max_new_tokens must be an integer"),
-    ({"max_new_tokens": 12.7}, "max_new_tokens must be an integer"),
-    ({"max_output_tokens": 0}, r"max_new_tokens=0 is outside"),
+    ({"max_output_tokens": 0}, r"max_output_tokens=0 is outside"),
+    ({"max_output_tokens": -5}, r"max_output_tokens=-5 is outside"),
+    ({"max_output_tokens": 4097}, r"max_output_tokens=4097 is outside"),
+    ({"max_output_tokens": "abc"}, "max_output_tokens must be an integer"),
+    ({"max_output_tokens": 12.7}, "max_output_tokens must be an integer"),
+    ({"max_output_tokens": 2.0}, "max_output_tokens must be an integer"),
+    ({"top_k": 50.0}, "top_k must be an integer"),
+    ({"n_cfm_timesteps": 10.0}, "n_cfm_timesteps must be an integer"),
+    ({"top_p": 0}, r"top_p must be in \(0, 1\]"),
+    ({"penalize_prompt": "no"}, "penalize_prompt must be true or false"),
     ({"temperature": -1}, r"temperature=-1.0 is outside"),
     ({"temperature": float("nan")}, "temperature must be a finite number"),
     ({"cfg_weight": 10**400}, "cfg_weight must be a finite number"),  # past float64: not an OverflowError
@@ -460,10 +466,10 @@ def test_generation_kwargs_defaults_and_turbo_guards():
     ({"n_cfm_timesteps": -2}, r"n_cfm_timesteps=-2 is outside"),
     ({"n_cfm_timesteps": 101}, r"n_cfm_timesteps=101 is outside \[1, 100\]"),
     ({"watermark": "false"}, "watermark must be true or false"),
-    ({"do_sample": "false"}, "do_sample must be true or false"),
     ({"ignore_eos": 1}, "ignore_eos must be true or false"),
     ({"seed": 2**63}, "seed=.* is outside"),
-    ({"seed": -1}, "seed=-1 is outside"),
+    ({"seed": -(2**63) - 1}, "seed=.* is outside"),
+    ({"seed": 3.0}, "seed must be an integer"),
     ({"seed": True}, "seed must be an integer"),
     ({"temperature": True}, "temperature must be a finite number"),
 ])
@@ -479,27 +485,29 @@ def test_generation_kwargs_reject_bad_values(knobs, message):
 def test_generation_kwargs_accept_boundary_values():
     model = _make_model()
     knobs = model.resolve_generation_kwargs({
-        "max_new_tokens": 1.0, "temperature": 0, "top_p": 1, "top_k": 0, "min_p": 1,
+        "max_output_tokens": 1, "temperature": 0, "top_p": 1, "top_k": 0, "min_p": 1,
         "cfg_weight": 0, "exaggeration": 0, "n_cfm_timesteps": 100, "seed": 0,
-        "watermark": False, "do_sample": True, "ignore_eos": True,
+        "watermark": False, "ignore_eos": True,
     })
     assert knobs["max_new_tokens"] == 1 and isinstance(knobs["max_new_tokens"], int)
     assert knobs["temperature"] == 0.0 and knobs["n_cfm_timesteps"] == 100
     assert knobs["watermark"] is False and knobs["ignore_eos"] is True
-    assert model.resolve_generation_kwargs({"max_new_tokens": 4096})["max_new_tokens"] == 4096
+    assert model.resolve_generation_kwargs({"max_output_tokens": 4096})["max_new_tokens"] == 4096
     top = model.resolve_generation_kwargs({
         "temperature": 5, "repetition_penalty": 2, "cfg_weight": 1, "exaggeration": 2,
         "top_k": model.config.t3.speech_vocab_size,
     })
     assert (top["temperature"], top["repetition_penalty"]) == (5.0, 2.0)
     assert (top["cfg_weight"], top["exaggeration"]) == (1.0, 2.0)
-    # the conductor's seed is an int64
-    model.resolve_generation_kwargs({"seed": 2**63 - 1})
-    # a vanishing temperature samples greedily; a top_k past the vocab keeps the whole vocab
-    assert model.resolve_generation_kwargs({"temperature": 1e-39})["temperature"] == 0.0
+    # the conductor's seed is any int64
+    for seed in (2**63 - 1, -1, -(2**63)):
+        model.resolve_generation_kwargs({"seed": seed})
+    # a vanishing temperature reaches the engine, which samples it greedily
+    assert model.resolve_generation_kwargs({"temperature": 1e-39})["temperature"] == 1e-39
+    # a top_k of the whole vocab or more is off, the same as 0
     vocab = model.config.t3.speech_vocab_size
     top_ks = [model.resolve_generation_kwargs({"top_k": k})["top_k"] for k in (vocab - 1, vocab, 2**31)]
-    assert top_ks == [vocab - 1, vocab, vocab]
+    assert top_ks == [vocab - 1, 0, 0]
     # other request fields ride along in the same kwargs and are left alone
     out = model.process_prompt("hello", ["text"], ["audio"], voice="default", language_id=None, seed=7)
     assert set(out) == {TEXT_INPUTS}
@@ -508,11 +516,12 @@ def test_generation_kwargs_accept_boundary_values():
 def test_max_new_tokens_limit_bounds_requests_and_the_default():
     model = _make_model()
     model.config.max_new_tokens_limit = 1000
-    assert model.resolve_generation_kwargs({"max_new_tokens": 1000})["max_new_tokens"] == 1000
+    assert model.get_max_output_tokens_limit() == 1000
+    assert model.resolve_generation_kwargs({"max_output_tokens": 1000})["max_new_tokens"] == 1000
     with pytest.raises(ValueError, match="over this deployment's limit of 1000"):
-        model.resolve_generation_kwargs({"max_new_tokens": 1001})
+        model.resolve_generation_kwargs({"max_output_tokens": 1001})
     with pytest.raises(ValueError, match="over this deployment's limit"):
-        model.process_prompt("hello", ["text"], ["audio"], max_new_tokens=4096)
+        model.process_prompt("hello", ["text"], ["audio"], max_output_tokens=4096)
     # a limit under the default lowers the default instead of refusing every request
     model.config.max_new_tokens_limit = 300
     assert model.resolve_generation_kwargs({})["max_new_tokens"] == 300
@@ -853,7 +862,9 @@ def test_sampler_min_p_goes_through_the_resource():
     assert model.get_request_resource_configs({}, {"seed": 1})[T3_SAMPLER].min_p == 0.05
     assert _sampler_spec(model).enable_min_p is True
     turbo = _make_model("turbo")
-    assert turbo.get_request_resource_configs({}, {"min_p": 0.1, "seed": 1})[T3_SAMPLER].min_p == 0.0
+    assert turbo.get_request_resource_configs({}, {"seed": 1})[T3_SAMPLER].min_p == 0.0
+    with pytest.raises(ValueError, match="Chatterbox-Turbo has no min_p"):
+        turbo.get_request_resource_configs({}, {"min_p": 0.1, "seed": 1})
     assert _sampler_spec(turbo).enable_min_p is False
 
 
@@ -1503,7 +1514,7 @@ def test_registry_kwargs_build_the_multilingual_model():
     assert ChatterboxModel(**model_init_kwargs("chatterbox_multilingual")).config.is_multilingual
 
 
-def test_language_id_reaches_the_multilingual_tokenizer_only(caplog):
+def test_language_id_reaches_the_multilingual_tokenizer_only():
     model = _make_model()
     model.config = ChatterboxConfig.multilingual()
     seen = []
@@ -1518,9 +1529,9 @@ def test_language_id_reaches_the_multilingual_tokenizer_only(caplog):
     ChatterboxModel._tokenize(model, "Hello", None)  # falls back to the deployment default
     assert seen == ["de", "en"]
     english = _make_model()
-    with caplog.at_level("WARNING"):
-        assert ChatterboxModel._tokenize(english, "Hello", "de").tolist() == english.tokenizer("Hello").tolist()
-    assert "ignored" in caplog.text
+    assert ChatterboxModel._tokenize(english, "Hello", "de").tolist() == english.tokenizer("Hello").tolist()
+    # undeclared there, so the server reports it as ignored
+    assert "language_id" not in english.request_kwargs()
 
 
 def test_multilingual_text_preprocessing_steps(tmp_path):
@@ -1614,3 +1625,72 @@ def test_s3gen_keeps_the_reference_for_chunks_without_the_clip():
     # another request without any clip still gets the built-in voice
     c = sub.prepare_inputs("s3gen_chunk", _s3_info(rid="other"), {SPEECH_TOKENS: [torch.tensor([7])]})
     assert c.kwargs["ref"] == "builtin"
+
+
+
+# ── generation-input contract ───────────────────────────────────────────────
+
+@pytest.mark.parametrize("variant", ["chatterbox", "multilingual", "turbo"])
+def test_request_kwargs_cover_every_knob_read(variant):
+    model = _make_model(variant)
+    keys = model.request_kwargs()
+    knobs = set(model.resolve_generation_kwargs({})) - {"max_new_tokens"}
+    assert knobs | {"max_output_tokens", "seed", "voice"} <= keys
+    # folded into max_output_tokens at the API; never read here
+    assert not keys & {"max_new_tokens", "max_tokens", "do_sample", "speed", "ref_audio"}
+    assert ("language_id" in keys) == (variant == "multilingual")
+
+
+def test_max_output_tokens_limit_is_the_deployment_cap():
+    model = _make_model()
+    assert model.get_max_output_tokens_limit() == model.config.t3.max_speech_tokens
+    model.config.max_new_tokens_limit = 500
+    assert model.get_max_output_tokens_limit() == 500
+    assert model.get_max_output_tokens(max_output_tokens=500) == 500
+    with pytest.raises(ValueError, match="limit of 500"):
+        model.get_max_output_tokens(max_output_tokens=501)
+    # the alias is folded at the API; the model reads max_output_tokens only
+    assert model.get_max_output_tokens(max_new_tokens=7) == 500
+
+
+def test_do_sample_is_not_a_greedy_switch():
+    model = _make_model()
+    assert model.resolve_generation_kwargs({"do_sample": False})["temperature"] == 0.8
+    assert model.resolve_generation_kwargs({"temperature": 0})["temperature"] == 0.0
+
+
+def test_null_is_the_default():
+    model = _make_model()
+    assert model.resolve_generation_kwargs({"temperature": None, "seed": None}) == (
+        model.resolve_generation_kwargs({})
+    )
+
+
+@pytest.mark.parametrize("voice", ["", "   ", 3, True])
+def test_bad_voice_is_a_client_error(voice):
+    with pytest.raises(ValueError, match="voice must be a non-empty name"):
+        _make_model().process_prompt("hello", ["text"], ["audio"], voice=voice)
+
+
+def test_penalize_prompt_reaches_the_sampler():
+    model = _make_model()
+    cfg = model.get_request_resource_configs({}, {})[T3_SAMPLER]
+    assert isinstance(cfg, SamplingReqConfig) and cfg.penalize_prompt is True
+    cfg = model.get_request_resource_configs({}, {"penalize_prompt": False})[T3_SAMPLER]
+    assert cfg.penalize_prompt is False
+
+
+def test_turbo_defaults_pass_and_absent_keys_take_them():
+    turbo = _make_model("turbo")
+    knobs = turbo.resolve_generation_kwargs({})
+    assert (knobs["cfg_weight"], knobs["exaggeration"], knobs["min_p"]) == (0.0, 0.0, 0.0)
+    with pytest.raises(ValueError, match="Chatterbox-Turbo has no min_p; send 0.0"):
+        turbo.resolve_generation_kwargs({"min_p": 0.05})
+
+
+def test_language_id_only_reaches_the_multilingual_tokenizer():
+    seen = []
+    model = _make_model()
+    model.tokenizer = lambda text, **kwargs: seen.append(kwargs) or torch.arange(1, 6)
+    model.process_prompt("hello", ["text"], ["audio"], language_id="fr")
+    assert seen == [{}]

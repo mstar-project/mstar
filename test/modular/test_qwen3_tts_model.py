@@ -21,6 +21,7 @@ from mstar.engine.resources.attn.wrappers import (
 )
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.sampler.config import SamplerSpec
+from mstar.model.qwen3_tts import qwen3_tts_model
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,
@@ -642,7 +643,7 @@ def test_qwen3_tts_initial_partition_args_route_expected_inputs():
         input_modalities=["text"],
         output_modalities=["audio"],
         input_signals=pointers,
-        model_kwargs={"max_new_tokens": 12, "subtalker_top_k": 7},
+        model_kwargs={"max_output_tokens": 12, "code_predictor_top_k": 7},
     )
     assert talker.full_metadata.graph_walk == "talker_prefill"
     assert [edge.name for edge in talker.inputs] == list(pointers)
@@ -650,7 +651,7 @@ def test_qwen3_tts_initial_partition_args_route_expected_inputs():
     # Residual-group sampling rides the code predictor's own per-request
     # sampler config, not step metadata.
     assert "subtalker_sampling" not in talker.step_metadata
-    configs = model.get_request_resource_configs({}, {"subtalker_top_k": 7})
+    configs = model.get_request_resource_configs({}, {"code_predictor_top_k": 7})
     assert configs[CODE_PRED_SAMPLER].top_k == 7
 
     codec = model.get_initial_forward_pass_args(
@@ -1294,15 +1295,16 @@ def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
 
     overridden = model.get_request_resource_configs(
         {},
-        {"subtalker_temperature": 0.5, "subtalker_top_k": 3, "subtalker_top_p": 0.25},
+        {"code_predictor_temperature": 0.5, "code_predictor_top_k": 3, "code_predictor_top_p": 0.25},
     )[CODE_PRED_SAMPLER]
     assert (overridden.temperature, overridden.top_k, overridden.top_p) == (0.5, 3, 0.25)
 
-    # do_sample=False is expressed as temperature 0 (encoded as greedy downstream).
+    # Greedy is temperature 0; a client do_sample switch is not read.
     greedy = model.get_request_resource_configs(
-        {}, {"subtalker_dosample": False}
-    )[CODE_PRED_SAMPLER]
-    assert greedy.temperature == 0.0
+        {}, {"code_predictor_temperature": 0.0, "subtalker_dosample": False, "do_sample": False}
+    )
+    assert greedy[CODE_PRED_SAMPLER].temperature == 0.0
+    assert greedy[TALKER_SAMPLER].temperature == generation.temperature
 
     # Two samplers, one per head; only the Talker's carries a vocab for the
     # repetition penalty (see get_node_resources).
@@ -1893,3 +1895,137 @@ def test_qwen3_tts_codec_dtype_option():
     assert codec_dtype(torch.float16) is torch.float16
     with pytest.raises(ValueError, match="codec_dtype"):
         codec_dtype("int8")
+
+
+
+# ── generation-input contract ───────────────────────────────────────────────
+
+CONTRACT_GENERATION_CONFIG = {
+    "do_sample": True, "repetition_penalty": 1.05, "temperature": 0.9, "top_p": 1.0,
+    "top_k": 50, "subtalker_dosample": True, "subtalker_temperature": 0.9,
+    "subtalker_top_p": 1.0, "subtalker_top_k": 50, "max_new_tokens": 8192,
+}
+
+
+def _contract_model(local_dir=None) -> Qwen3TTSModel:
+    model = object.__new__(Qwen3TTSModel)
+    model.config = Qwen3TTSModelConfig()
+    model.local_dir = str(local_dir) if local_dir is not None else None
+    model._submodule_cache = {}
+    return model
+
+
+def _contract_with_generation_config(tmp_path, **overrides) -> Qwen3TTSModel:
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({**CONTRACT_GENERATION_CONFIG, **overrides})
+    )
+    model = _contract_model(tmp_path)
+    # as __init__ does; the other checkpoint files are optional
+    model.config = Qwen3TTSModelConfig.from_pretrained(tmp_path)
+    return model
+
+
+def test_released_defaults():
+    configs = _contract_model().get_request_resource_configs({}, {})
+    talker, code_pred = configs[TALKER_SAMPLER], configs[CODE_PRED_SAMPLER]
+    assert (talker.temperature, talker.top_k, talker.top_p, talker.repetition_penalty) == (
+        0.9, 50, 1.0, 1.05,
+    )
+    assert (code_pred.temperature, code_pred.top_k, code_pred.top_p) == (0.9, 50, 1.0)
+    assert code_pred.repetition_penalty == 1
+
+
+def test_checkpoint_do_sample_false_is_a_temperature_zero_default(tmp_path):
+    model = _contract_with_generation_config(
+        tmp_path, do_sample=False, subtalker_dosample=False, top_k=20, max_new_tokens=100,
+    )
+    configs = model.get_request_resource_configs({}, {})
+    assert configs[TALKER_SAMPLER].temperature == 0.0
+    assert configs[TALKER_SAMPLER].top_k == 20
+    assert configs[CODE_PRED_SAMPLER].temperature == 0.0
+    assert model.get_max_output_tokens() == 100
+    # a request still samples by naming a temperature
+    configs = model.get_request_resource_configs({}, {"temperature": 0.5, "code_predictor_temperature": 0.6})
+    assert configs[TALKER_SAMPLER].temperature == 0.5
+    assert configs[CODE_PRED_SAMPLER].temperature == 0.6
+
+
+def test_client_do_sample_switches_are_not_read():
+    model = _contract_model()
+    configs = model.get_request_resource_configs({}, {"do_sample": False, "subtalker_dosample": False})
+    assert configs[TALKER_SAMPLER].temperature == 0.9
+    assert configs[CODE_PRED_SAMPLER].temperature == 0.9
+    assert "do_sample" not in model.request_kwargs()
+    assert "subtalker_dosample" not in model.request_kwargs()
+
+
+def test_stage_prefixed_key_wins_over_plain():
+    configs = _contract_model().get_request_resource_configs({}, {
+        "temperature": 0.3, "talker_temperature": 0.4, "top_k": 9, "penalize_prompt": False,
+    })
+    talker = configs[TALKER_SAMPLER]
+    assert (talker.temperature, talker.top_k, talker.penalize_prompt) == (0.4, 9, False)
+    # plain keys stay on the Talker
+    assert configs[CODE_PRED_SAMPLER].top_k == 50
+
+
+def test_subtalker_is_a_deprecated_alias(caplog, monkeypatch):
+    monkeypatch.setattr(qwen3_tts_model, "_warned_deprecated", set())
+    model = _contract_model()
+    with caplog.at_level(logging.WARNING, logger=qwen3_tts_model.__name__):
+        old = model.get_request_resource_configs({}, {"subtalker_top_k": 7})
+        model.get_request_resource_configs({}, {"subtalker_top_k": 7})
+    assert old[CODE_PRED_SAMPLER].top_k == 7
+    assert sum("deprecated" in r.message for r in caplog.records) == 1
+    both = model.get_request_resource_configs({}, {"subtalker_top_k": 7, "code_predictor_top_k": 3})
+    assert both[CODE_PRED_SAMPLER].top_k == 3
+
+
+def test_frame_limit_matches_the_decode_loop():
+    model = _contract_model()
+    walks = model.get_graph_walk_graphs()
+    assert walks["talker_decode"].max_iters == model.get_max_output_tokens_limit() == 8192
+    assert model.get_max_output_tokens(max_output_tokens=12) == 12
+    # the API folds max_new_tokens into max_output_tokens; the model reads only the latter
+    assert model.get_max_output_tokens(max_new_tokens=12) == 8192
+
+
+@pytest.mark.parametrize("voice", ["", 3])
+@pytest.mark.parametrize("key", ["voice", "speaker"])
+def test_empty_or_non_string_voice_is_a_400(key, voice):
+    with pytest.raises(ValueError, match="voice must be a non-empty name"):
+        _contract_model()._resolve_speaker({key: voice})
+
+
+def test_absent_voice_is_the_default_and_unknown_is_a_400():
+    model = _contract_model()
+    assert model._resolve_speaker({})[0] == model.config.default_speaker
+    with pytest.raises(ValueError, match="Unsupported Qwen3-TTS speaker"):
+        model._resolve_speaker({"voice": "alloy"})
+
+
+@pytest.mark.parametrize("key", ["non_streaming_mode", "x_vector_only_mode"])
+def test_boolean_knobs_are_strict(key):
+    with pytest.raises(ValueError, match=key):
+        qwen3_tts_model._flag({key: "false"}, key, False)
+    assert qwen3_tts_model._flag({key: True}, key, False) is True
+    assert qwen3_tts_model._flag({}, key, False) is False
+
+
+@pytest.mark.parametrize("key", ["language", "instruct", "ref_text"])
+def test_string_knobs_are_strict(key):
+    with pytest.raises(ValueError, match=key):
+        qwen3_tts_model._text({key: 5}, key, "")
+
+
+def test_request_kwargs_spot_checks():
+    declared = _contract_model().request_kwargs()
+    for key in (
+        "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "penalize_prompt",
+        "talker_temperature", "code_predictor_temperature", "code_predictor_top_k",
+        "subtalker_top_p", "ignore_eos", "max_output_tokens", "seed", "voice", "speaker",
+        "language", "instruct", "instructions", "non_streaming_mode", "ref_text",
+        "x_vector_only_mode",
+    ):
+        assert key in declared, key
+    assert "max_new_tokens" not in declared

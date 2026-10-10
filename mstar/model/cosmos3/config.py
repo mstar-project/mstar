@@ -345,7 +345,7 @@ class Cosmos3Config:
     # never evicted, and a second request on it is refused.
     session_store_size: int = 8
     # Idle sessions expire after this many seconds unless the request set
-    # ``session_timeout_s`` (capped at the max); ``end_session`` drops one early.
+    # ``session_timeout_s`` (at most the max); ``end_session`` drops one early.
     session_timeout_s: float = 600.0
     session_timeout_max_s: float = 3600.0
     video_temporal_causal: bool = False
@@ -355,7 +355,7 @@ class Cosmos3Config:
     # Number of denoise model evaluations. The per-mode cookbook defaults are
     # t2i 50, t2v/i2v 35, action fd/id 30, DROID policy ~4. ``num_inference_steps``
     # is the image default; ``num_inference_steps_video`` is the video default.
-    # A request may override either; the value is clamped to ``max_inference_steps``.
+    # A request may override either; a value above ``max_inference_steps`` is a 400.
     num_inference_steps: int = 50
     num_inference_steps_video: int = 35
     # Upper bound on the denoise loop's iteration count. The loop is built with
