@@ -398,9 +398,13 @@ Worker scheduling
        the sampler writes each request's last token to a slot-addressed
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
-       cleanup per step). Only nodes that opt in (Qwen3.5 decode) and only
-       when the sampler has graph buffers; ``0`` keeps every node on the
-       per-request tensor path.
+       cleanup per step). Only nodes that declare the read
+       (``reads_device_loopback``: Qwen3.5 decode) and only when the sampler
+       has graph buffers; the sampler keeps the masters for those nodes
+       alone, so a node that takes its tokens on the host (Whisper's
+       decoder) no longer pays the eager-step master write, a small
+       synchronous host-to-device copy per step. ``0`` keeps every node on
+       the per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_TOKENS``
      - ``0``
      - A captured decode step gathers its input ids off the sampler's slot
