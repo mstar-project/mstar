@@ -79,6 +79,9 @@ logger = logging.getLogger(__name__)
 
 
 class LLMSubmodule(ARNodeSubmodule):
+    # the decode walk reads its input ids off the sampler's slot masters
+    reads_device_loopback = True
+
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
     # an eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
