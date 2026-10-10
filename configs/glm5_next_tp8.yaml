@@ -17,7 +17,7 @@ model_kwargs:
   # "auto" takes the fused fp8 MoE kernel when one is available, which is
   # what lets decode capture; "reference" is an eager, uncapturable fallback.
   moe_quant_kernel: "auto"
-  # Drafts per step from the layer-45 MTP module (greedy requests only);
+  # Drafts per step from the layer-45 MTP module;
   # glm5_next_tp8_mtp.yaml turns it on.
   mtp_num_draft_tokens: 0
   # Capture the prefill per (rows, token bucket); an uncaptured shape runs

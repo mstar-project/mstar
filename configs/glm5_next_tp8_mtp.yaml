@@ -18,8 +18,8 @@ model_kwargs:
   # "auto" takes the fused fp8 MoE kernel when one is available, which is
   # what lets decode capture; "reference" is an eager, uncapturable fallback.
   moe_quant_kernel: "auto"
-  # Drafts per step from the layer-45 MTP module. Greedy requests only: a
-  # temperature > 0 or a repetition penalty is refused.
+  # Drafts per step from the layer-45 MTP module. A request with a temperature is
+  # verified by speculative sampling; a repetition penalty or min_p is refused.
   mtp_num_draft_tokens: 3
   # Capture the prefill per (rows, token bucket); an uncaptured shape runs
   # eager. Adds ~40 s of capture at startup.

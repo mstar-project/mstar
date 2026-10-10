@@ -1,6 +1,6 @@
 model: "glm5_next"
-# glm5_next_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-45 MTP module (greedy
-# requests only). A verify step's next block overwrites its rejected rows, and the MTP layer
+# glm5_next_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-45 MTP module (no
+# repetition penalty). A verify step's next block overwrites its rejected rows, and the MTP layer
 # selects its tokens with its own indexer, as the trunk's layers do.
 max_seq_len: 1048576
 # One request per KDA slot below, as glm5_next_tp8_longctx.yaml. The KV pool admits by prompt: when

@@ -300,9 +300,7 @@ class Glm5NextModel(Model):
         if "top_k" in model_kwargs:
             params["top_k"] = int(model_kwargs["top_k"])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
-            # MTP drafting is greedy-only: greedy is the DECLARED default
-            # on MTP configs so a bare request serves coherently; an EXPLICIT
-            # temperature > 0 still reaches the refusal.
+            # greedy is the declared default on MTP configs; a request asks for a temperature
             params["temperature"] = 0.0
         return {SAMPLER: SamplingReqConfig(**params)}
 
@@ -449,14 +447,15 @@ class Glm5NextModel(Model):
             raise ValueError(f"GLM-5.3 is served without min_p (min_p={kwargs['min_p']}); send none")
 
         if self.config.mtp_num_draft_tokens > 0:
-            # MTP verifies by argmax. Refused here it is the client's 400; the worker's
-            # refusal was a 500, after the request had reached every rank
-            temperature = float(kwargs.get("temperature", 0.0))
+            # MTP's verify samples speculatively but tracks no seen tokens. Refused here it is
+            # the client's 400; the worker's refusal was a 500, after the request had reached
+            # every rank
             penalty = float(kwargs.get("repetition_penalty", self.config.repetition_penalty))
-            if temperature > 0.0 or penalty != 1.0:
+            min_p = float(kwargs.get("min_p") or 0.0)
+            if penalty != 1.0 or min_p > 0.0:
                 raise ValueError(
-                    f"MTP drafting is greedy only (temperature={temperature}, "
-                    f"repetition_penalty={penalty}); serve with mtp_num_draft_tokens: 0"
+                    f"MTP takes no repetition_penalty or min_p (repetition_penalty={penalty}, "
+                    f"min_p={min_p}); serve with mtp_num_draft_tokens: 0"
                 )
 
         if self._tokenizer_mode == "byte":

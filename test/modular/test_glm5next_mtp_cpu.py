@@ -85,7 +85,7 @@ def _stubs(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
-def _build_engine(k: int, seed: int = 0, long_context: bool = False):
+def _build_engine(k: int, seed: int = 0, long_context: bool = False, real_sampler: bool = False):
     torch.manual_seed(seed)
     cfg = (Glm5NextModelConfig.reduced_long_context() if long_context
            else Glm5NextModelConfig.reduced())
@@ -116,10 +116,11 @@ def _build_engine(k: int, seed: int = 0, long_context: bool = False):
         ),
         kv_cache_type=torch.float32,
     )
-    greedy = _GreedySampler()
-    engine._resources[SAMPLER] = greedy
-    engine._submodules["LLM"].resources[SAMPLER] = greedy
-    sub.node_resources[SAMPLER] = greedy
+    if not real_sampler:
+        greedy = _GreedySampler()
+        engine._resources[SAMPLER] = greedy
+        engine._submodules["LLM"].resources[SAMPLER] = greedy
+        sub.node_resources[SAMPLER] = greedy
     engine.warmup()
     return engine, sub, cfg
 
@@ -368,21 +369,70 @@ def test_acceptance_is_logged(caplog):
     assert any("drafts accepted per step" in r.getMessage() for r in caplog.records)
 
 
-def test_temperature_is_refused_under_mtp():
+def test_a_repetition_penalty_is_refused_under_mtp():
     engine, _, _ = _build_engine(2)
-    engine.add_request("t", {SAMPLER: SamplingReqConfig(temperature=0.7)})
+    config = SamplingReqConfig(temperature=0.7, repetition_penalty=1.1)
+    engine.add_request("t", {SAMPLER: config})
     batch = _batch(
         node_name="LLM",
         per_request_info={"t": CurrentForwardPassInfo(
             request_id="wire-t", rid_handle="t", graph_walk="prefill", fwd_index=0, random_seed=0,
-            max_tokens=4,
-            resource_configs={SAMPLER: SamplingReqConfig(temperature=0.7)})},
+            max_tokens=4, resource_configs={SAMPLER: config})},
         per_request_input_tensors={"t": {"text_inputs": [PROMPTS["b"]]}},
         step_context=StepContext(request_ids=("t",), graph_walk="prefill", slot=0,
                                  capture=False),
     )
     engine.prepare_inputs(batch)
-    assert "greedy only" in str(batch.failed_requests.get("t"))
+    assert "repetition_penalty" in str(batch.failed_requests.get("t"))
+
+
+def test_a_sampled_request_is_served_beside_a_greedy_one():
+    """temperature > 0 under MTP: its verify steps sample speculatively, and a greedy request
+    in the same steps still generates exactly greedy's tokens."""
+    configs = {"g": SamplingReqConfig(temperature=0.0, ignore_eos=True),
+               "s": SamplingReqConfig(temperature=0.8, top_p=0.9, ignore_eos=True)}
+    want = _generate(_build_engine(2)[0], {"g": PROMPTS["a"]}, MAX_TOKENS)["g"]
+    engine, sub, _ = _build_engine(2, real_sampler=True)
+    # the real sampler's own sample() runs on a GPU only; a prefill's first token is argmax here,
+    # and every verify step goes through speculative_sample's torch rule
+    engine._resources[SAMPLER].sample = lambda request_ids, logits, **kw: logits.argmax(-1)
+    prompts = {"g": PROMPTS["a"], "s": PROMPTS["b"]}
+
+    def step(walk, inputs, decode_iter=0):
+        batch = _batch(
+            node_name="LLM",
+            per_request_info={rid: CurrentForwardPassInfo(
+                request_id=f"wire-{rid}", rid_handle=rid, graph_walk=walk, fwd_index=0,
+                random_seed=0, max_tokens=MAX_TOKENS, resource_configs={SAMPLER: configs[rid]},
+                dynamic_loop_iter_counts={"decode_loop": decode_iter}) for rid in inputs},
+            per_request_input_tensors={rid: {"text_inputs": [ids]} for rid, ids in inputs.items()},
+            step_context=StepContext(request_ids=tuple(inputs), graph_walk=walk, slot=0,
+                                     capture=False),
+        )
+        engine.prepare_inputs(batch)
+        assert not batch.failed_requests, batch.failed_requests
+        if walk == "decode":
+            assert engine._submodules["LLM"].submodule.cg_key_info(
+                walk, batch.per_request_info) == "sampled"
+        outputs = engine.exec_and_postprocess(batch)
+        engine.finalize_batch(batch)
+        return outputs.per_rid_outputs, engine.check_stop_for_batch(batch, outputs)
+
+    for rid in prompts:
+        engine.add_request(rid, {SAMPLER: configs[rid]})
+    out, stops = step("prefill", prompts)
+    seqs = {rid: out[rid]["new_token"][0].tolist() for rid in prompts}
+    nxt = {rid: out[rid]["text_inputs"][0] for rid in prompts}
+    live, i = [rid for rid in prompts if not stops.get(rid)], 0
+    while live:
+        out, stops = step("decode", {rid: nxt[rid] for rid in live}, i)
+        i += 1
+        for rid in live:
+            seqs[rid] += out[rid]["new_token"][0].tolist()
+            nxt[rid] = out[rid]["text_inputs"][0]
+        live = [rid for rid in live if not stops.get(rid)]
+    assert seqs["g"][:MAX_TOKENS] == want
+    assert len(seqs["s"]) >= MAX_TOKENS and all(0 <= t < sub.config.vocab_size for t in seqs["s"])
 
 
 def test_prompts_leave_two_blocks_of_index_topk():

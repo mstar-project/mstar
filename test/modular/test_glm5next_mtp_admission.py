@@ -1,5 +1,6 @@
-"""MTP is greedy only: a sampling request is refused as a 400 by process_prompt,
-not as a 500 by the worker after it reached every rank."""
+"""MTP takes no repetition penalty or min_p: such a request is refused as a 400 by
+process_prompt, not as a 500 by the worker after it reached every rank. A temperature is
+served, by speculative sampling."""
 from types import SimpleNamespace
 
 import pytest
@@ -14,17 +15,18 @@ def _mtp_model() -> Glm5NextModel:
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"temperature": 0.7}, {"repetition_penalty": 1.1}, {"repetition_penalty": 0.9},
+    {"repetition_penalty": 1.1}, {"repetition_penalty": 0.9}, {"min_p": 0.1},
 ])
-def test_process_prompt_refuses_sampling_under_mtp(kwargs):
-    with pytest.raises(ValueError, match="greedy only"):
+def test_process_prompt_refuses_a_penalty_under_mtp(kwargs):
+    with pytest.raises(ValueError, match="repetition_penalty"):
         _mtp_model().process_prompt("hi", ["text"], ["text"], **kwargs)
 
 
-def test_process_prompt_takes_greedy_under_mtp():
+def test_process_prompt_takes_greedy_and_sampled_requests_under_mtp():
     m = _mtp_model()
     assert m.process_prompt("hi", ["text"], ["text"])["text_inputs"][0].tolist() == [104, 105]
     m.process_prompt("hi", ["text"], ["text"], temperature=0.0, repetition_penalty=1.0)
+    m.process_prompt("hi", ["text"], ["text"], temperature=0.7, top_p=0.9)
 
 
 def test_the_worker_refuses_an_explicit_zero_penalty():
@@ -32,7 +34,7 @@ def test_the_worker_refuses_an_explicit_zero_penalty():
     sub = object.__new__(Glm5NextLLMSubmodule)
     info = SimpleNamespace(request_id="r", resource_configs={
         SAMPLER: SimpleNamespace(temperature=0.0, repetition_penalty=0.0)})
-    with pytest.raises(RuntimeError, match="greedy only"):
+    with pytest.raises(RuntimeError, match="repetition_penalty"):
         sub._check_mtp_sampling(info)
 
 

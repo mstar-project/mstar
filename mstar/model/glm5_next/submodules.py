@@ -63,6 +63,8 @@ logger = logging.getLogger(__name__)
 
 # Captured prefill shapes when the config names none (prefill_graphs on). Buckets start
 # above the MoE decode path's 64 tokens: the fused runner routes padding rows safely.
+# the verify step that samples speculatively (a request with temperature > 0)
+SAMPLED = "sampled"
 # 128-token steps to 1024, then 64 up to one request's max, so a long prompt replays at most
 # 63 padding tokens; then 256 to 4096, so a step of several prompts pads at most 255.
 PREFILL_TOKEN_BUCKETS = (*range(128, 1024, 128), *range(1024, 2049, 64), *range(2304, 4097, 256))
@@ -294,6 +296,18 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 compile=False,
             ),
         ]
+        if self.mtp_k > 0:
+            # a verify step with a sampled request in it: speculative sampling
+            configs.append(BatchedCudaGraphConfig(
+                capture_graph_walk="decode",
+                additional_key_info=SAMPLED,
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                    input_seq_len=self.mtp_block, resource_step_info=SAMPLED,
+                ),
+                capture_batch_sizes=batch_sizes,
+                compile=False,
+            ))
         if self.config.prefill_graphs and not _fused_kda(self.config):
             # The reference KDA prefill loops over spans on the host, so a
             # captured replay would run the capture's dummy spans.
@@ -346,8 +360,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         text_inputs = inputs["text_inputs"][0]
         seq_len = text_inputs.shape[0]
+        sampled = False
         if self.mtp_k > 0:
-            self._check_mtp_sampling(fwd_info)
+            sampled = self._check_mtp_sampling(fwd_info)
             if graph_walk == "decode":
                 # one id in, the last emitted token: the step verifies it and k drafts
                 seq_len = self.mtp_block
@@ -379,23 +394,26 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             state.add("prompt_len", committed + seq_len)
             if self.mtp_k > 0:
                 state.add_all(mtp_generated=1, mtp_pending=None)
-        return ARNodeInputs(input_ids=text_inputs, input_seq_len=seq_len)
+        # a sampled request's verify step runs the sampled capture (`cg_key_info`)
+        return ARNodeInputs(input_ids=text_inputs, input_seq_len=seq_len,
+                            resource_step_info=SAMPLED if sampled and graph_walk == "decode"
+                            else None)
 
-    def _check_mtp_sampling(self, fwd_info: CurrentForwardPassInfo) -> None:
-        """MTP verifies by argmax: refuse what it would silently ignore."""
+    def _check_mtp_sampling(self, fwd_info: CurrentForwardPassInfo) -> bool:
+        """Whether this request samples (temperature > 0), which a verify step does by
+        speculative sampling; refuse what MTP would silently ignore."""
         cfg = fwd_info.resource_configs.get(SAMPLER) if fwd_info.resource_configs else None
         if cfg is None:
-            return
+            return False
         # not `or`: an explicit repetition_penalty of 0 must not read as unset
-        temperature = 0.0 if cfg.temperature is None else cfg.temperature
         penalty = 1.0 if cfg.repetition_penalty is None else cfg.repetition_penalty
-        if temperature > 0.0 or penalty != 1.0:
+        if penalty != 1.0 or (getattr(cfg, "min_p", None) or 0.0) > 0.0:
             raise RuntimeError(
-                f"request {fwd_info.request_id}: MTP drafting is greedy only "
-                f"(temperature={cfg.temperature}, "
-                f"repetition_penalty={cfg.repetition_penalty}); serve it with "
-                "mtp_num_draft_tokens: 0"
+                f"request {fwd_info.request_id}: MTP takes no repetition_penalty or min_p "
+                f"(repetition_penalty={cfg.repetition_penalty}, "
+                f"min_p={getattr(cfg, 'min_p', None)}); serve it with mtp_num_draft_tokens: 0"
             )
+        return (cfg.temperature or 0.0) > 0.0
 
     def declare_step(
         self,
@@ -420,10 +438,15 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             KDA_STATE: RecurrentStep(),
             KDA: LinearAttnStep(),
         }
+        sampled = any(inp.resource_step_info == SAMPLED for inp in inputs)
         if self.mtp_k > 0 and graph_walk == "decode":
-            # the verify and the drafts are argmaxes in the forward; the KDA layers first
-            # replay what the last step accepted
-            del steps[SAMPLER]
+            # the drafts are argmaxes in the forward, and so is a greedy step's verify; a
+            # sampled one samples speculatively with the sampler's per-request settings. The
+            # KDA layers first replay what the last step accepted
+            if sampled:
+                steps[SAMPLER] = SamplerStep(apply_penalty=False)
+            else:
+                del steps[SAMPLER]
             steps[KDA] = LinearAttnStep(speculative=True)
         if self.config.dsa_long_context:
             # every MLA layer attends sparse (dsa.py): no dense plan over the whole context
@@ -437,7 +460,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
             steps=steps,
-            cg_key_info=self._cg_key(graph_walk, request_ids),
+            cg_key_info=SAMPLED if sampled else self._cg_key(graph_walk, request_ids),
         )
 
     def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
@@ -448,6 +471,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     def cg_key_info(self, graph_walk: str, per_request_info: dict,
                     per_request_input_metadata=None, **kwargs) -> str | None:
+        if self.mtp_k > 0 and graph_walk == "decode" and any(
+                (getattr(info.resource_configs.get(SAMPLER), "temperature", 0) or 0) > 0
+                for info in per_request_info.values() if info.resource_configs):
+            return SAMPLED
         return self._cg_key(graph_walk, per_request_info)
 
     def _cg_key(self, graph_walk: str, rids) -> str | None:
@@ -880,11 +907,17 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             drafts.append(self._draft_tokens(h, drafts[-1]))
         drafts = self._broadcast(torch.stack(drafts, 1))
 
-        # Verify: greedy, the longest prefix of drafts the target agrees with.
+        # Verify: the longest prefix of drafts the target agrees with, or a sampled step's
+        # speculative sampling.
         ids = torch.cat([input_ids.view(n, 1), drafts], 1).view(-1)
         hidden = lm.model(ids)
-        target = self._argmax(hidden).view(n, block)
-        accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
+        step = getattr(engine_inputs, "step", None)
+        if step is not None and step.cg_key_info == SAMPLED:
+            target, accepted = engine_inputs.resources[SAMPLER].speculative_sample(
+                engine_inputs.request_ids, self.lm_head(hidden).view(n, block, -1), drafts)
+        else:
+            target = self._argmax(hidden).view(n, block)
+            accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
         verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
         target, accepted = verdict[:, :block], verdict[:, block]
         kda.set_prefix_len(SpecBlocks.of(pool, 0), accepted)
