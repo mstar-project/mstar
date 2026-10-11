@@ -988,7 +988,7 @@ class LLMSubmodule(ARNodeSubmodule):
         kept_rids = frozenset(
             rid for rid in request_ids
             if rid in info and info[rid].step_metadata.get("sample_prefill_token", False)
-        )
+        ) if graph_walk in {"prefill_text", "prefill_vit"} else None
         if graph_walk == "prefill_text":
             # The prompt's tokens enter the repetition-penalty mask here; the
             # sampler resource adds them at plan time. Only prefill carries
