@@ -188,23 +188,21 @@ def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[
 
 
 def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False) -> tuple[str, str]:
-    """Resolve a media reference (data URL, http(s) URL, or local path).
+    """Resolve a media reference from a request: a data URL, or an http(s) URL
+    when remote fetch is allowed. Returns ``(modality, path)``.
 
-    Returns ``(modality, path)``. Local paths are passed through unchanged
-    (modality inferred from extension).
+    A request cannot name a file on the server, not even one under
+    ``upload_dir``: plain paths and other URL schemes are refused without
+    touching the filesystem, so a caller can neither read files nor probe for them.
     """
     if ref.startswith("data:"):
         return save_data_url(ref, upload_dir)
-    scheme = urlparse(ref).scheme.lower()
-    if scheme in ("http", "https"):
+    if urlparse(ref).scheme.lower() in ("http", "https"):
         allow_remote = allow_remote or os.getenv("MSTAR_ALLOW_REMOTE", "0") == "1"
         if not allow_remote:
             raise ValueError("Remote media fetch is disabled on this server")
         return save_remote_url(ref, upload_dir)
-    # Treat as a local filesystem path.
-    suffix = Path(ref).suffix.lower()
-    rev = {v: k for k, v in _MIME_TO_EXT.items()}
-    return modality_from_mime(rev.get(suffix, "")), ref
+    raise ValueError("server file paths are refused; send media as a data URL or a file upload")
 
 
 # ---------------------------------------------------------------------------

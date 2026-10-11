@@ -189,10 +189,11 @@ fn save_remote_url(url: &str, upload_dir: &Path) -> Result<(String, String), Str
     save_bytes(&raw, &mime, upload_dir).map_err(|e| e.to_string())
 }
 
-/// Resolve a media reference (data URL, `http(s)` URL, or local path).
-/// Returns `(modality, path)`. Local paths pass through unchanged (modality
-/// from extension). `http(s)` is refused unless `allow_remote` is set — remote
-/// fetch is SSRF surface, off by default, matching mstar's `allow_remote` gate.
+/// Resolve a media reference from a request: a data URL, or an `http(s)` URL
+/// when `allow_remote` is set (remote fetch is SSRF surface, off by default).
+/// Returns `(modality, path)`. A request cannot name a file on the server, not
+/// even one under `upload_dir`: plain paths and other URL schemes are refused
+/// without touching the filesystem.
 pub fn resolve_media_ref(
     reference: &str,
     upload_dir: &Path,
@@ -208,12 +209,7 @@ pub fn resolve_media_ref(
         }
         return save_remote_url(reference, upload_dir);
     }
-    // Treat as a local filesystem path.
-    let suffix = PathBuf::from(reference)
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    Ok((modality_from_ext(&suffix).to_string(), reference.to_string()))
+    Err("server file paths are refused; send media as a data URL or a file upload".to_string())
 }
 
 // ---------------------------------------------------------------------------
