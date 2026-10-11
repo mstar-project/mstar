@@ -75,6 +75,8 @@ class PageArena:
     allocator: PageAllocator
     num_owners: list[int] = field(init=False, repr=False)
     sealed: list[bool] = field(init=False, repr=False)
+    # None unless `_DEBUG_ASSERTS` is on for a pool with prefix_cache_tp on. See `Resource.page_trail`.
+    trail: tuple[int, int] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.num_owners = [0] * self.allocator.max_num_pages
@@ -85,6 +87,8 @@ class PageArena:
         if pages is not None:
             for page in pages:
                 self.num_owners[page] = 1
+            if self.trail is not None:
+                self.trail = (self.trail[0] + 1, hash((self.trail, *pages)))
         return pages
 
     def retain(self, pages: list[int]) -> None:
@@ -422,6 +426,7 @@ class KVManager(AttentionResource):
         needs_remote_transfer: bool = False,
     ):
         self.config = cfg
+        tp_cache = False
         if joint_comm_group is not None:
             # before the cache is allocated: it is sized off the head counts
             cfg.shard(joint_comm_group.world_size)
@@ -495,6 +500,8 @@ class KVManager(AttentionResource):
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
+        if _DEBUG_ASSERTS and tp_cache:
+            self._arena.trail = (0, 0)
         self._device = device
         self._lock = threading.RLock()
 
@@ -755,6 +762,10 @@ class KVManager(AttentionResource):
             self._arena.retain(matched)
             stream.lease, stream.lease_len = matched, len(matched) * self.config.page_size
             return True
+
+    def page_trail(self) -> tuple[int, int] | None:
+        with self._lock:
+            return self._arena.trail
 
     def _check_positions(self, span: PrefixSpan, graph_walk: str, inputs) -> None:
         assert span.digest is not None or inputs.custom_pos_ids is None, (

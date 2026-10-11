@@ -169,6 +169,11 @@ class Resource(ABC):
         """On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too."""
         return True
 
+    def page_trail(self) -> tuple[int, int] | None:
+        """How many page allocations this resource has made and a hash of their pages in
+        order, for a TP follower to check against rank 0's. None where it keeps no trail."""
+        return None
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 

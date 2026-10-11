@@ -417,11 +417,13 @@ class MicroScheduler:
             return True
         if not self._apply_delta_from_message(head):
             return False
-        # Rank 0's prefix-cache leases too. A step built without them would run tokens rank 0 skips.
-        if not head.prefix_hits:
+        if not head.prefix_hits and not head.page_trails:
             return True
         engine = self.engine_manager.get_engine(head.node_name)
         try:
+            # Check the trails first. A rank whose pages differ may never hold rank 0's leases, so
+            # adopting them would poll for ever.
+            engine.check_page_trails(head.node_name, head.graph_walk, head.spec_seq, head.page_trails)
             return engine.adopt_cached_prefix(head)
         except RuntimeError as exc:
             # A divergence never heals, and failing this step's requests would leave the other ranks

@@ -100,6 +100,12 @@ class StepRunner:
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
+        # Likewise the page trails. Only a resource under debug asserts keeps one, so otherwise
+        # this sweep is empty.
+        self._trail_order = [
+            key for key in self._order if self._resources[key].page_trail() is not None
+        ]
+        self._node_trail_order = self._per_node(node_resources, self._trail_order)
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
@@ -156,6 +162,13 @@ class StepRunner:
         for key, pages in leases.items():
             ready &= self._resources[key].adopt_cached_prefix(rid, node_name, graph_walk, pages)
         return ready
+
+    def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
+        """Each resource's trail of page allocations, by resource key."""
+        return {
+            key: self._resources[key].page_trail()
+            for key in self._sweep(self._node_trail_order, self._trail_order, node_name)
+        }
 
     def prefix_chain_keys(self, node_name: str | None) -> list[str]:
         """The node's resources with a prefix cache open right now. Empty in

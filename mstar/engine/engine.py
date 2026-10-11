@@ -1118,6 +1118,23 @@ class Engine:
             ready &= self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases)
         return ready
 
+    def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
+        """Rank 0's trail of page allocations per resource, to send with a step."""
+        return self._runner.page_trails(node_name)
+
+    def check_page_trails(
+        self, node_name: str, graph_walk: str, tp_seq: int, trails: dict[str, tuple[int, int]],
+    ) -> None:
+        """On a TP follower, raise if a resource's page allocations differ from rank 0's when it
+        sent this step. Page ids would differ from here on, and a sharded prefill gathers
+        cache slots across ranks."""
+        for pool, mine in self._runner.page_trails(node_name).items():
+            if trails.get(pool, mine) != mine:
+                raise RuntimeError(
+                    f"KV {pool}: this rank's page allocations {mine} (count, hash) differ from "
+                    f"rank 0's {trails[pool]} before {node_name}/{graph_walk}, tp seq {tp_seq}"
+                )
+
     def _skip_cached_prefix(
         self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,
     ) -> NodeInputs | None:

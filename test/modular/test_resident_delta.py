@@ -195,6 +195,9 @@ class _Engine:
     def decide_cached_prefix(self, batch):
         return {}
 
+    def page_trails(self, node_name):
+        return {}
+
     def __init__(self, role: str = "leader"):
         """``role`` is this rank's part for ``"node"``: ``leader`` (rank 0 of a
         sharded node — decides and journals), ``follower`` (another rank of one —

@@ -1610,6 +1610,7 @@ class Worker:
         resident_delta = engine.take_resident_delta(node_batch.node_name)
         # rank 0's prefix-cache leases: the followers take the same pages before they build it
         prefix_hits = engine.decide_cached_prefix(node_batch)
+        page_trails = engine.page_trails(node_batch.node_name)
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
@@ -1639,6 +1640,7 @@ class Worker:
                         walks=walks,
                         walk_idx=walk_idx,
                         prefix_hits=prefix_hits,
+                        page_trails=page_trails,
                     )
                 )
             )
