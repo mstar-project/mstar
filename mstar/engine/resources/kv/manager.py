@@ -425,6 +425,21 @@ class KVManager(AttentionResource):
         if joint_comm_group is not None:
             # before the cache is allocated: it is sized off the head counts
             cfg.shard(joint_comm_group.world_size)
+            tp_cache = joint_comm_group.world_size > 1 and cfg.prefix_cache and cfg.prefix_cache_tp
+            if tp_cache and cfg.cpu_offload_pages > 0:
+                raise ValueError(
+                    f"KV {name}: prefix_cache_tp can't be combined with cpu_offload_pages="
+                    f"{cfg.cpu_offload_pages}. Every rank has to take and evict pages in rank 0's "
+                    "order, and a reload isn't ordered against cache hits. Set cpu_offload_pages "
+                    "to 0 or prefix_cache_tp to false."
+                )
+            if tp_cache and needs_remote_transfer:
+                raise ValueError(
+                    f"KV {name}: prefix_cache_tp needs this pool's nodes on one TP group. With more "
+                    "than one (replicas, or walks placed on other ranks) the pool counts as shared, "
+                    "and a read from another group would take pages outside rank 0's order. Serve "
+                    "the nodes from one group or set prefix_cache_tp to false."
+                )
         self.kv_cache = KVCache(
             cfg, device, dtype
         )
