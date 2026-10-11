@@ -1372,7 +1372,9 @@ class KVManager(AttentionResource):
         overrides = self._overrides[rid]
         needed_labels = overrides.get_labels(node_name, graph_walk)
         rooted: dict[str, list[bytes]] = {}
-        if self._index is not None and overrides.prefix_cache:
+        # At one rank only. Above one rank a readiness check runs at a different step on each rank,
+        # so the check must neither stamp nor take cached pages.
+        if self._index is not None and overrides.prefix_cache and self._world_size == 1:
             # hashed here, as `resolve_cached_prefix` hashes outside its lock
             for label, keys in (overrides.prefix_keys or {}).items():
                 if label in needed_labels and keys:
