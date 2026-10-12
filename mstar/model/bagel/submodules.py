@@ -750,7 +750,7 @@ class LLMSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BatchedAcceleratorGraphConfig | PackedAcceleratorGraphConfig]:
-        """Declare the existing CUDA decode and text-prefill captures.
+        """Declare matching CUDA/XPU decode and text-prefill captures.
 
         cfg-on prefill_text is intentionally NOT captured. BAGEL's cfg-on
         prefill_text declares a pre-forward fork of the main stream
@@ -762,7 +762,7 @@ class LLMSubmodule(ARNodeSubmodule):
         unaffected (they don't depend on this capture's snapshot
         semantics).
         """
-        if not self.config.accelerator_graph or device.type != "cuda":
+        if not self.config.accelerator_graph or device.type not in {"cuda", "xpu"}:
             return []
 
         # cfg-on and cfg-off decode declare different capture buckets.

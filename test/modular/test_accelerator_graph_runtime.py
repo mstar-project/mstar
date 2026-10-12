@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from mstar.engine.engine import Engine
-from mstar.engine.resources.sampler.utils import sample_cuda_graphable_gpu
+from mstar.engine.resources.sampler.utils import sample_accelerator_graphable_gpu
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.worker import Worker
 
@@ -77,8 +77,8 @@ def test_engine_compile_checks_its_own_device(monkeypatch, device_type, availabl
     assert compile_fn.call_count == (2 if compiled else 0)
 
 
-def test_xpu_graph_sampler_does_not_enter_cuda_backend(monkeypatch):
+def test_cpu_graph_sampler_does_not_enter_cuda_backend(monkeypatch):
     monkeypatch.setattr(torch.cuda, "device", Mock(side_effect=AssertionError("CUDA entered")))
-    logits = SimpleNamespace(device=torch.device("xpu"))
-    with pytest.raises(NotImplementedError, match="use eager sampling on xpu"):
-        sample_cuda_graphable_gpu(logits, None, None, None, None, None)
+    logits = SimpleNamespace(device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="unsupported on 'cpu'"):
+        sample_accelerator_graphable_gpu(logits, None, None, None, None, None)

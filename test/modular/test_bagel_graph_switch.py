@@ -72,7 +72,8 @@ def test_disabled_llm_capture_skips_template_allocation(device_type, node_name):
     assert module.get_accelerator_graph_configs(torch.device(device_type)) == []
 
 
-def test_enabled_cuda_capture_keeps_existing_recipes(monkeypatch):
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
+def test_enabled_capture_keeps_existing_recipes(monkeypatch, device_type):
     module = LLMSubmodule.__new__(LLMSubmodule)
     nn.Module.__init__(module)
     module.config = load_bagel_config({"accelerator_graph": True})
@@ -81,19 +82,14 @@ def test_enabled_cuda_capture_keeps_existing_recipes(monkeypatch):
         torch, "zeros",
         lambda *args, **kwargs: zeros(*args, **{**kwargs, "device": "cpu"}),
     )
-    configs = module.get_accelerator_graph_configs(torch.device("cuda"))
+    configs = module.get_accelerator_graph_configs(torch.device(device_type))
     assert [config.capture_graph_walk for config in configs] == [
         "decode", "decode", "prefill_text",
     ]
-
-
-@pytest.mark.parametrize("node_name", ["LLM", "LLM_cfg_text", "LLM_cfg_img"])
-def test_enabled_xpu_llm_stays_eager(node_name):
-    module = LLMSubmodule.__new__(LLMSubmodule)
-    nn.Module.__init__(module)
-    module.config = load_bagel_config({"accelerator_graph": True})
-    module.node_name = node_name
-    assert module.get_accelerator_graph_configs(torch.device("xpu")) == []
+    assert [config.additional_key_info for config in configs] == [False, True, False]
+    assert all(config.compile for config in configs)
+    assert [config.capture_batch_sizes for config in configs] == [None, None, [1, 2, 4]]
+    assert configs[2].capture_token_lengths == [128, 256, 512, 1024, 2048]
 
 
 @pytest.mark.parametrize("graph_walk", ["image_gen", "image_gen_cfg"])

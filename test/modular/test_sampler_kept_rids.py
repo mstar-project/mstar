@@ -58,8 +58,6 @@ def _resource(graph: bool, device: torch.device) -> SamplerResource:
 
 
 def _step(res: SamplerResource, step: SamplerStep, graph: bool) -> torch.Tensor:
-    if graph and res._device.type != "cuda":
-        pytest.skip("the resource's captured sampling kernel requires CUDA FlashInfer")
     ctx = StepContext(
         request_ids=(KEPT, DROPPED), graph_walk="prefill", slot=0, capture=False,
         slot_lease=SlotLease(slot=0, bucket=SimpleNamespace(bs=2)) if graph else None,

@@ -30,13 +30,13 @@ VOCAB = 64
 
 
 class _RecordingSampler:
-    """Stands in for the CudaGraphableSampler a plan hands back."""
+    """Stands in for the AcceleratorGraphableSampler a plan hands back."""
 
     def __init__(self):
         self.synced = 0
         self.sampled_with: list[bool] = []
 
-    def sync_seen_token_masks(self, seen_masks):
+    def sync_seen_token_masks(self, seen_masks, keep=None):
         self.synced += 1
 
     def sample(self, request_ids, logits, apply_penalty=False):
@@ -67,7 +67,7 @@ class _RecordingBuffers:
     def sampler_for(self, padded_bs, cg_slot):
         return self.sampler
 
-    def scatter_offset(self, cg_slot=0):
+    def scatter_offset(self, cg_slot=0, keep=None):
         self.offset_scatters += 1
 
     def register_request(self, rid, sampling_config):

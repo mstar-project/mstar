@@ -11,7 +11,7 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
-from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
+from mstar.engine.resources.sampler.utils import AcceleratorGraphableSampler, Sampler, SamplerBuffers
 from mstar.engine.resources.step import SlotLease, StepContext
 
 
@@ -65,9 +65,9 @@ class SamplerResource(Resource):
         self._cg_slots = 1
 
         # This is set during plan for a captured step
-        self._cg_sampler: CudaGraphableSampler | None = None
+        self._cg_sampler: AcceleratorGraphableSampler | None = None
         # pre-planned a step ahead, promoted by the next non-preplan plan
-        self._preplan_cg_sampler: CudaGraphableSampler | None = None
+        self._preplan_cg_sampler: AcceleratorGraphableSampler | None = None
         self._preplan_key = None
         self._preplanned = False
         # rid -> the prompt tokens a cache hit kept out of this step's inputs

@@ -940,14 +940,14 @@ def _to_tensor(
 # ---------------------------------------------------------------------------
 #
 # Reads top_k / top_p / temperature from preallocated device tensors so the
-# call can sit inside a CUDA graph capture region without allocating, syncing,
+# call can sit inside an accelerator graph capture region without syncing
 # or branching on CPU-side values. The full ``Sampler`` class is *not* graph
 # capturable (repetition-penalty state, ``@torch.compiler.disable``, the
 # device-context switch inside ``sample_tokens``), so the unrolled MTP loop uses
 # this narrower path. ``deterministic=True`` disables the CPU-RNG-seeded path that
 # FlashInfer would otherwise take.
 
-def sample_cuda_graphable_gpu(
+def sample_accelerator_graphable_gpu(
     logits: torch.Tensor,
     temperature: torch.Tensor,
     top_k: torch.Tensor,
@@ -961,7 +961,8 @@ def sample_cuda_graphable_gpu(
 ) -> torch.Tensor:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
-    Routes through the fused Triton prep kernel (``fused_temperature_softmax``)
+    XPU uses the released per-row device RNG API in ``vllm-xpu-kernels``.
+    CUDA routes through the fused Triton prep kernel (``fused_temperature_softmax``)
     so the CUDA-graph path can apply the same vLLM-style repetition penalty as
     the regular ``Sampler``, then samples with
     ``flashinfer.sampling.top_k_top_p_sampling_from_probs`` (``deterministic=True``
@@ -994,10 +995,22 @@ def sample_cuda_graphable_gpu(
         output is int32; we cast to int64 so the caller can index
         ``nn.Embedding`` modules (which require int64 indices) directly.
     """
+    if logits.device.type == "xpu":
+        with torch.xpu.device(logits.device):
+            return _sample_xpu(
+                logits, temperature, top_k, top_p,
+                rep_penalty if apply_penalty else 1.0,
+                seen_tokens if apply_penalty else None,
+                run_greedy=True,
+                top_k_zero_count=None,
+                seed=seed,
+                rand_offset=offset,
+                min_p=min_p,
+            )
     if logits.device.type != "cuda":
-        raise NotImplementedError(
-            "Graph-captured token sampling requires the CUDA FlashInfer backend; "
-            f"use eager sampling on {logits.device.type}"
+        raise ValueError(
+            f"Graph-captured sampling is unsupported on {logits.device.type!r}; "
+            "expected 'cuda' or 'xpu'."
         )
     import flashinfer
 
@@ -1025,13 +1038,13 @@ def sample_cuda_graphable_gpu(
 
 
 @dataclass
-class CudaGraphableSampler(BaseSampler):
+class AcceleratorGraphableSampler(BaseSampler):
     temperature_buf: torch.Tensor
     top_k_buf: torch.Tensor
     top_p_buf: torch.Tensor
     seed_buf: torch.Tensor
     offset_buf: torch.Tensor
-    # Repetition-penalty state for the CUDA-graph path. ``None`` for submodules
+    # Repetition-penalty state for the graph path. ``None`` for submodules
     # that don't opt into seen-token tracking (then ``apply_penalty`` is a no-op).
     rep_penalty_buf: torch.Tensor | None = None
     seen_tokens_buf: torch.Tensor | None = None  # [bs, V] bool
@@ -1048,7 +1061,7 @@ class CudaGraphableSampler(BaseSampler):
         self, request_ids: list[str], logits: torch.Tensor,
         apply_penalty: bool = False,
     ):
-        codes = sample_cuda_graphable_gpu(
+        codes = sample_accelerator_graphable_gpu(
             logits, self.temperature_buf,
             self.top_k_buf, self.top_p_buf,
             self.seed_buf, self.offset_buf,
@@ -1057,13 +1070,13 @@ class CudaGraphableSampler(BaseSampler):
             seen_tokens=self.seen_tokens_buf,
             min_p=self.min_p_buf,
         )
-        self.offset_buf += 1
+        self.offset_buf.add_(_rng_offset_stride(logits.device.type, logits.shape[-1]))
         codes = self._broadcast_tokens(codes)
         if apply_penalty and self.seen_tokens_buf is not None:
             self.applied_penalty_in_graph = True
             # Record the (broadcast, TP-agreed) token in the seen-token buffer so
             # the next step penalises it. ``scatter_`` with a scalar value is
-            # CUDA-graph capturable; advanced-index assignment
+            # graph capturable; advanced-index assignment
             # (``buf[rows, codes] = True``) is not — it trips "operation not
             # permitted when stream is capturing".
             self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
@@ -1104,7 +1117,7 @@ class Buffer:
     """Three-tier storage for one per-request scalar sampling parameter.
 
     - ``buf``     ``[max_bs]``   per-step tensor, sliced to ``padded_bs`` and read
-      by ``CudaGraphableSampler`` (its address must stay stable across replays).
+      by ``AcceleratorGraphableSampler`` (its address must stay stable across replays).
     - ``master``  ``[capacity]`` slot-indexed cache, one row per active request.
     """
     # ``[cg_slots, max_bs]``: one per-step row per double-buffer slot, so a
@@ -1268,7 +1281,7 @@ class SamplerBuffers:
     repetition_penalty) is a ``Buffer`` owning a per-step slice and a slot-indexed
     master cache. The RNG ``offset`` is also a ``Buffer``
     but round-trips on the GPU with no CPU middleman: gathered from its slot
-    master before sampling, advanced in graph (``offset_buf += 1`` per sample),
+    master before sampling, advanced in graph by the backend's Philox stride,
     then scattered back to the master after replay — so a request's RNG stream
     follows its slot (batch-position invariant) and reproduces under a fixed
     seed. The optional ``seen_tokens`` ``MaskBuffer`` (allocated only when
@@ -1291,7 +1304,7 @@ class SamplerBuffers:
     offset: Buffer
 
     # TP communicator for the submodule that owns these buffers. Passed
-    # through ``slice_for_bs`` into every per-step ``CudaGraphableSampler``
+    # through ``slice_for_bs`` into every per-step ``AcceleratorGraphableSampler``
     # so its ``_broadcast_tokens`` aligns the sampled token across ranks.
     # Without this, ``sample`` would build a
     # sampler with ``tp_group=None``, the broadcast would silently no-op,
@@ -1301,7 +1314,7 @@ class SamplerBuffers:
     tp_group: "CommGroup | None" = None  # noqa: F821
     # Per-request seen-token mask buffer for the repetition penalty. Present
     # only for submodules that opt in by declaring a vocab size (e.g. the
-    # Qwen3-Omni Talker). ``None`` => the CUDA-graph path applies no penalty.
+    # Qwen3-Omni Talker). ``None`` => the graph path applies no penalty.
     seen_tokens: "MaskBuffer | None" = None
     # Per-request min-p; allocated only for submodules whose spec enables it,
     # so every other node's captured sampler is unchanged.
@@ -1451,7 +1464,7 @@ class SamplerBuffers:
         else:
             # Greedy: temperature 0 -> the fused prep kernel emits a one-hot at
             # argmax (first index on ties), which from_probs returns for any
-            # seed. See ``sample_cuda_graphable_gpu``.
+            # seed. See ``sample_accelerator_graphable_gpu``.
             t, k, p = 0.0, 0, 1.0
         self.temperature.write_master_row(slot, t)
         self.top_k.write_master_row(slot, k)
@@ -1669,10 +1682,10 @@ class SamplerBuffers:
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
 
-    def sampler_for(self, padded_bs: int, cg_slot: int) -> "CudaGraphableSampler":
+    def sampler_for(self, padded_bs: int, cg_slot: int) -> "AcceleratorGraphableSampler":
         """A sampler bound to ``cg_slot``'s per-step buffer views (zero-copy).
         Valid regardless of when the buffers are (re)gathered into."""
-        return CudaGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
+        return AcceleratorGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
 
     def scatter_offset(
         self, cg_slot: int = 0, keep: list[bool] | None = None,
