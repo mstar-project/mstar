@@ -911,6 +911,11 @@ methods are:
    ``declare_step`` needs a value that ``forward`` does not use, put that value in
    ``resource_step_info``.
 
+``get_input_sequence_len(self, graph_walk, fwd_info, inputs, **kwargs) -> InputSeqLenInfo | None`` (optional)
+   Return the length of the row's whole input, before any cached prefix is cut, or
+   ``None`` when an input is missing. The scheduler uses it to leave out a row whose KV
+   doesn't fit.
+
 ``declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None, **kwargs) -> SubmoduleStep | None``
    Declare what this batch's step does to the node's resources. See
    `Step 4a — Declare the step`_ below.
