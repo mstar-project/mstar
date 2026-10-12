@@ -750,7 +750,7 @@ class LLMSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BatchedAcceleratorGraphConfig | PackedAcceleratorGraphConfig]:
-        """Declare CUDA decode/prefill captures and the XPU ``image_gen_cfg`` capture.
+        """Declare the existing CUDA decode and text-prefill captures.
 
         cfg-on prefill_text is intentionally NOT captured. BAGEL's cfg-on
         prefill_text declares a pre-forward fork of the main stream
@@ -762,23 +762,20 @@ class LLMSubmodule(ARNodeSubmodule):
         unaffected (they don't depend on this capture's snapshot
         semantics).
         """
-        if not self.config.accelerator_graph:
+        if not self.config.accelerator_graph or device.type != "cuda":
             return []
 
-        configs: list[BatchedAcceleratorGraphConfig | PackedAcceleratorGraphConfig] = []
-        if device.type == "cuda":
-            # `additional_key_info` carries what `requires_cfg` / `labels`
-            # used to: cfg-on and cfg-off decode are distinct buckets.
-            configs.extend([
-                BatchedAcceleratorGraphConfig(
+        # cfg-on and cfg-off decode declare different capture buckets.
+        return [
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 additional_key_info=False,
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
                     input_seq_len=1
                 ),
-                ),
-                BatchedAcceleratorGraphConfig(
+            ),
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 additional_key_info=True,
                 single_request_inputs=ARNodeInputs(
@@ -786,8 +783,8 @@ class LLMSubmodule(ARNodeSubmodule):
                     input_seq_len=1,
                     resource_step_info=True, # requires cfg
                 ),
-                ),
-                PackedAcceleratorGraphConfig(
+            ),
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 replay_graph_walks=["prefill_text"],
                 capture_token_lengths=list(self.PREFILL_TEXT_TOKEN_BUCKETS),
@@ -798,56 +795,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 additional_key_info=False,
                 compile=True,
                 capture_batch_sizes=self.PREFILL_TEXT_CAPTURE_BATCH_SIZES,
-                ),
-            ])
-
-        if device.type == "xpu":
-            latents, time_index = _init_latents_and_time_index(
-                self.config, device, seed=0, H=1024, W=1024
-            )
-            empty_combined_emb = self._wrap_with_boi_eoi(
-                torch.empty(
-                    (latents.shape[0], self.config.hidden_size),
-                    dtype=latents.dtype,
-                    device=device,
-                )
-            )
-            seq_len = empty_combined_emb.shape[0]
-            label = self._NODE_TO_CFG_LABEL.get(self.node_name, "main")
-            vae_position_ids = get_flattened_position_ids_extrapolate(
-                1024,
-                1024,
-                self.config.latent_downsample,
-                max_num_patches_per_side=self.config.max_latent_size,
-            )
-            configs.append(
-                BatchedAcceleratorGraphConfig(
-                    capture_graph_walk="image_gen_cfg",
-                    additional_key_info=True,
-                    single_request_inputs=ARNodeInputs(
-                        input_embeds=latents,
-                        input_seq_len=seq_len,
-                        custom_pos_ids={
-                            label: torch.zeros(
-                                seq_len, dtype=torch.int32, device=device
-                            )
-                        },
-                        resource_step_info=True,
-                        tensor_inputs={
-                            "vae_position_ids": vae_position_ids,
-                            "vae_pos_embed": self.latent_pos_embed(
-                                vae_position_ids
-                            ),
-                            "time_index": time_index,
-                            "empty_combined_emb": empty_combined_emb,
-                            **self._get_text_vae_idxs(seq_len, device),
-                        },
-                    ),
-                    compile=False,
-                    capture_batch_sizes=[1],
-                )
-            )
-        return configs
+            ),
+        ]
 
     def _get_active_labels(self, graph_walk: str, cfg: bool):
         return active_labels(graph_walk, cfg, self.node_name)
@@ -914,9 +863,6 @@ class LLMSubmodule(ARNodeSubmodule):
                 H, W,
                 self.config.latent_downsample,
                 max_num_patches_per_side=self.config.max_latent_size
-            )
-            tensor_inputs["vae_pos_embed"] = self.latent_pos_embed(
-                tensor_inputs["vae_position_ids"]
             )
             if "latents" not in inputs or len(inputs["latents"]) == 0:
                 node_inputs.input_embeds, tensor_inputs["time_index"] = _init_latents_and_time_index(
@@ -1296,7 +1242,6 @@ class LLMSubmodule(ARNodeSubmodule):
         vae_token_indexes: torch.Tensor,
         text_mask: torch.Tensor,
         time_index: torch.Tensor,
-        vae_pos_embed: torch.Tensor | None = None,
         requires_cfg: bool = True,
         **kwargs,
     ) -> NameToTensorList:
@@ -1341,11 +1286,7 @@ class LLMSubmodule(ARNodeSubmodule):
         timestep_next = self._apply_timestep_shift(t=t_uniform_next, shift=shift)
         dt = (timestep - timestep_next)[0]  # positive step size
 
-        pos_embed = (
-            vae_pos_embed
-            if vae_pos_embed is not None
-            else self.latent_pos_embed(vae_position_ids)
-        )
+        pos_embed = self.latent_pos_embed(vae_position_ids)
         timestep_embeds = self.time_embedder(timestep)
         latents_ = self.vae2llm(latents) + timestep_embeds \
             + pos_embed
@@ -1459,7 +1400,6 @@ class LLMSubmodule(ARNodeSubmodule):
         vae_token_indexes: torch.Tensor,
         text_mask: torch.Tensor,
         time_index: torch.Tensor,
-        vae_pos_embed: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
         """Single-branch LLM forward for parallel CFG (image_gen_cfg walk).
@@ -1487,11 +1427,7 @@ class LLMSubmodule(ARNodeSubmodule):
         torch._check(time_index.shape[0] == n_latent)
         torch._check(empty_combined_emb.shape[0] == n_latent + 2)
 
-        pos_embed = (
-            vae_pos_embed
-            if vae_pos_embed is not None
-            else self.latent_pos_embed(vae_position_ids)
-        )
+        pos_embed = self.latent_pos_embed(vae_position_ids)
 
         N = self.config.num_timesteps
         shift = self.config.timestep_shift
@@ -1570,17 +1506,6 @@ class LLMSubmodule(ARNodeSubmodule):
                 sample_prefill_token=sample_token,
                 **kwargs
             )
-        elif graph_walk == "image_gen_cfg":
-            if len(request_ids) != 1:
-                raise ValueError(
-                    "image_gen_cfg accelerator graph requires batch size 1"
-                )
-            return {
-                request_ids[0]: self._forward_image_gen_single_branch(
-                    input_embeds=input_embeds,
-                    **kwargs,
-                )
-            }
         else:
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
 
@@ -1639,16 +1564,12 @@ class LLMSubmodule(ARNodeSubmodule):
     def max_batch_size(self, graph_walk: str):
         if graph_walk == "prefill_vit":
             return 2
-        if graph_walk == "image_gen_cfg":
-            return 1
         return None
 
     def can_batch(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ):
-        return batch.graph_walk in [
-            "decode", "prefill_text", "prefill_vit", "image_gen_cfg"
-        ]
+        return batch.graph_walk in ["decode", "prefill_text", "prefill_vit"]
 
     def postprocess(
         self, request_id: str,

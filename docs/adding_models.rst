@@ -982,8 +982,8 @@ To add another backend, implement the interface and register its device type
 in ``_GRAPH_BACKENDS``; the runners use that registry to check capture support.
 Declare configs only for devices whose kernels and resources support capture.
 The graph-captured token sampler currently uses FlashInfer on CUDA; XPU forwards
-that sample tokens use the eager path. BAGEL's XPU ``image_gen_cfg`` capture does not
-sample tokens.
+that sample tokens use the eager path. BAGEL's LLM capture recipes cover CUDA
+decode and text prefill; its XPU LLM runs eagerly.
 
 For each config, the engine first runs ``torch.compile``, controlled by the config's
 ``compile`` flag, which defaults to ``True``. It then records an accelerator graph and
@@ -1071,7 +1071,7 @@ BAGEL's CUDA configs show the case of two captures for one walk. They capture ``
 twice, once with ``additional_key_info=False`` and once with ``additional_key_info=True``.
 A decode step with guidance enabled and a decode step with guidance disabled declare
 different segments over the same token count. BAGEL's ``cg_key_info`` reports which of
-the two a batch is. Its XPU config captures ``image_gen_cfg`` at batch size 1.
+the two a batch is.
 
 Piecewise accelerator graphs (capturing an inner loop)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

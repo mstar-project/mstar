@@ -87,6 +87,23 @@ def test_enabled_cuda_capture_keeps_existing_recipes(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("node_name", ["LLM", "LLM_cfg_text", "LLM_cfg_img"])
+def test_enabled_xpu_llm_stays_eager(node_name):
+    module = LLMSubmodule.__new__(LLMSubmodule)
+    nn.Module.__init__(module)
+    module.config = load_bagel_config({"accelerator_graph": True})
+    module.node_name = node_name
+    assert module.get_accelerator_graph_configs(torch.device("xpu")) == []
+
+
+@pytest.mark.parametrize("graph_walk", ["image_gen", "image_gen_cfg"])
+def test_image_generation_uses_the_single_request_forward(graph_walk):
+    module = LLMSubmodule.__new__(LLMSubmodule)
+    nn.Module.__init__(module)
+    assert not module.can_batch(SimpleNamespace(graph_walk=graph_walk), [])
+    assert module.max_batch_size(graph_walk) is None
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("vit_enabled", [False, True])
 @pytest.mark.parametrize("batching", [False, True])

@@ -134,6 +134,9 @@ this deployment option:
    model_kwargs:
      accelerator_graph: true
 
+BAGEL's LLM capture recipes cover CUDA decode and text prefill. Its XPU LLM
+runs eagerly, including parallel CFG image generation.
+
 Waypoint and Cosmos3 enable their supported accelerator graph captures by
 default. To disable capture for these models, set this deployment option:
 

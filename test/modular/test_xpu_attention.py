@@ -151,7 +151,7 @@ def test_xpu_graph_plan_keeps_addresses_stable_across_replans():
     manager = _manager()
     lease = SlotLease(
         slot=0,
-        bucket=BucketKey(graph_walk="image_gen_cfg", bs=1, num_tokens=1),
+        bucket=BucketKey(graph_walk="decode", bs=1, num_tokens=1),
     )
     manager.plan(
         AttentionStep(causal=False),
@@ -199,7 +199,7 @@ def test_xpu_graph_plan_supports_context_past_text_sequence_limit():
     )
     lease = SlotLease(
         slot=0,
-        bucket=BucketKey(graph_walk="image_gen_cfg", bs=1, num_tokens=1),
+        bucket=BucketKey(graph_walk="decode", bs=1, num_tokens=1),
     )
     manager.plan(
         AttentionStep(causal=False),
