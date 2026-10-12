@@ -545,7 +545,9 @@ class MicroScheduler:
         if target is not None and self._room_left(
             target, pre_existing_walk, pre_existing_batch_size,
         ) == 0:
-            return None  # the caller is full: nothing to scan for
+            # the caller is full; only another walk's rows are worth popping
+            self._park_other_walks(request_state, target, pre_existing_walk)
+            return None
         # scanned only once a step could take fresh rows
         ready: dict[tuple[str, str], list[ReadyNodeEntry]] | None = None
 
@@ -580,6 +582,27 @@ class MicroScheduler:
         if rr_key is None or rr_key in keys:
             return None
         return schedule(rr_key, ready.get(rr_key, []))
+
+    def _park_other_walks(
+        self, request_state: RequestStateManager,
+        key: tuple[str, str], own_walk: str | None,
+    ) -> None:
+        """Backlog ``key``'s ready rows of walks other than ``own_walk``.
+
+        A chain at its walk's cap never yields for these (``has_ready_excluding``
+        sees one key), so parked, ``room_for_continuing`` gives them first claim.
+        """
+        if key not in self._walks_of_key:
+            return
+        entries = [
+            entry for entry in self._scan_ready(request_state, key, None).get(key, [])
+            if entry.graph_walk != own_walk
+        ]
+        if not entries:
+            return
+        parked = self._assemble_batch(request_state, *key, entries)
+        if parked:
+            self._backlog(key, parked)
 
     def _scan_ready(
         self, request_state: RequestStateManager,
@@ -927,7 +950,8 @@ class MicroScheduler:
 
     def _walk_set_cap(self, key: tuple[str, str], walks: set[str]) -> int | None:
         """The cap of a ``key`` step holding ``walks``: one walk's own, or for
-        a mixed step the smallest of its walks' and the combined walk's."""
+        a mixed step the smallest of the combined walk's and the caps of the
+        walks present, not of every walk the combined walk could hold."""
         caps = [self._max_batch_size(key[0], walk) for walk in walks]
         if len(walks) > 1:
             caps.append(self._max_batch_size(*key))
@@ -1046,6 +1070,10 @@ class MicroScheduler:
         when they were assembled, so the scan below cannot see them. A chunk
         under `exclude_target` is left out like any other — the speculative
         merge takes that one before its own rids, so it needs no yield.
+
+        `exclude_target` is mapped to its scheduling key, so a ready row of
+        another walk under the same combined walk does not count either; a
+        merge with no room left parks it (`_park_other_walks`) instead.
         """
         exclude_target = None if exclude_target is None else self._key(*exclude_target)
         if self._backlog_has_schedulable(exclude_target):

@@ -1315,6 +1315,23 @@ def test_a_merge_counts_the_continuing_rows_walk():
     assert sched.room_for_continuing((NODE, WALK)) == 3
 
 
+def test_a_merge_at_its_walks_cap_parks_another_walks_rows():
+    """Continuing decode rows at the decode cap: the chain never yields for a
+    prompt of the same combined walk, so the merge parks it, and the next
+    merge's room leaves it a place."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}))
+    manager = _Manager(["p0", "d9"], walks={"p0": "prefill"})
+
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=8,
+    )
+
+    assert merged is None
+    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p0"]
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"d9"}
+    assert sched.room_for_continuing((NODE, WALK)) == 7
+
+
 
 def test_a_relabelled_step_routes_with_its_own_walks_outputs():
     """The merged batch keeps its first walk's output names; a step that turns
