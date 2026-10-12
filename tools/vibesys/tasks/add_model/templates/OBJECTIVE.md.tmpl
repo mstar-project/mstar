@@ -1,0 +1,110 @@
+# Objective - implement `${model}` natively in mstar
+
+Add support for `${hf_id}` by implementing an eager, correctness-validated
+model port on MStar's current Walk Graph and engine-resource contracts. The
+benchmark records a baseline after correctness; it is not an optimization
+objective for this task.
+
+## Client contract
+
+`./run.sh <port>` starts `mstar-serve --config configs/${model}.yaml`, answers
+`/health` with 200, and serves `${endpoint}`:
+
+- input modalities: ${input_modalities}
+- output modalities: ${output_modalities}
+
+The served output, native implementation, and required evidence are graded.
+The exact graph decomposition is your design decision.
+
+## Verify the checked-out contract first
+
+Before designing the port, read `docs/adding_models.rst` and inspect the
+checked-out definitions of `Model`, `NodeSubmodule`, and
+`mstar/engine/resources`. Repository code is authoritative over remembered or
+historical APIs.
+
+Complete `progress-artifacts/evidence/model-port-report.md` before implementation
+with one row per node:
+
+```text
+node | walks | inputs/outputs | persistent state | resource keys | dependencies | resident capacity | eager validation
+```
+
+Keep the report current with resources reused or added, evidence for each
+requested direction, and deferred performance opportunities.
+
+Maintain `progress-artifacts/evidence/model-port-decisions.jsonl` as an
+append-only decision log using the schema in the add-model skill. Before
+implementation, append a `shape_classification` event whose decision is exactly
+`matched`, `composed`, or `unmatched-derived`. Append `reference_assessment`
+events for references seriously considered and `resource_mapping` events for
+persistent-state choices. Every event records concrete evidence and whether the
+skill guidance was `covered`, `ambiguous`, `missing`, or `misleading`. Record
+decision outcomes and concise engineering rationale, not private chain-of-thought
+or routine command logs.
+
+## Native port requirements
+
+${reference_guidance}
+
+Then:
+
+1. Implement the compute under `mstar/model/${model}/` as `NodeSubmodule` or
+   `ARNodeSubmodule` nodes and declare the Walks with `get_graph_walk_graphs()`.
+2. Declare engine-owned resources with `get_node_resources()`. Use
+   `get_request_resource_configs()`, `declare_step()`, and
+   `engine_inputs.resources` where the checked-out resource contract requires
+   them.
+3. Reuse existing KV, attention, cross-attention, ragged-attention, position,
+   and sampler resources when they match. Pooling, allocation, resident
+   capacity, stable storage, dependency ordering, and cleanup belong to an
+   engine-owned resource.
+4. Load weights through MStar's loader and assert that checkpoint tensors and
+   model parameters are fully matched. Register the model, add
+   `configs/${model}.yaml`, wire its API adapter, and declare its `${model}` pip
+   extra.
+
+Graph-routed tensors and engine-provided per-request state are valid for normal
+walk data and request-local metadata. They must not create a second pool,
+allocator, capacity limit, or cleanup lifecycle beside the engine.
+
+A genuinely new resource kind may add a focused package under
+`mstar/engine/resources/<kind>/`, its declaration types, manager, exports, and
+tests. Fit unmatched state through an existing resource or this extension path
+while preserving engine lifecycle invariants. Never use model-owned allocation,
+pooling, capacity, stable storage, dependency ordering, or cleanup as a
+fallback, temporary prototype, or response to a missing example.
+
+Record a direction as `evidence-blocked` only after documenting the attempted
+engine mapping and the exact required operation missing from the generic
+resource extension interfaces. No matching reference, implementation effort,
+or loss of a preferred optimization is not a blocker. A blocker does not permit
+moving resource ownership into the model. Do not change
+`mstar/engine/engine.py`, `mstar/engine/resources/base.py`, `runner.py`,
+`step.py`, or their scheduling and lifecycle semantics.
+
+Do not import or serve the upstream package or pipeline as the implementation.
+Use the upstream implementation only as an independent correctness oracle.
+
+## Correctness gate
+
+`vibeval/checker.py` compares the client response with the independent reference
+using `${compare}` at tolerance `${tol}`. Use deterministic inputs and realistic
+requests. Do not weaken the framework-owned checker or reference.
+
+For diffusion or flow models, accept the strict checker's optional base64
+`.npy` `init_latents` and use it verbatim as the starting latent. When absent,
+sample normally from the request seed.
+
+Validate in this order: component numerics, a standalone eager oracle, direct
+node forwards, CPU graph/resource structure, then live serving. Eager execution
+is the MVP default. Do not add whole-forward or piecewise CUDA-graph configs in
+this task.
+
+## Observational benchmark
+
+After correctness, run `vibeval/benchmark.py` and retain its existing
+`${headline_metric}` result in `result.json` via `${result_arg}`. Record latency
+and resource observations in the port report, but do not change implementation
+decisions to improve them. Capture, compilation tuning, placement tuning, and
+other performance work are deferred to a separate optimization task.

@@ -29,3 +29,7 @@ mstar/worker/ASYNC_REDESIGN.md
 # local AI-assistant context (kept local, not published — cf. vllm-omni)
 CLAUDE.md
 AGENTS.md
+
+# mstar-vibesys runtime store: generated bundles, seed clones, exp_env runs,
+# weight cache, logs. Tool source lives in tools/vibesys/ and IS tracked.
+/.vibesys/

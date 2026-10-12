@@ -1,0 +1,15 @@
+# VibeSys agent config for mstar-vibesys runs. Passed via --config; CLI flags
+# (--cli-provider / --backend) still override.
+[model]
+name = "gpt-5.5"          # matches the codex CLI's configured model; openai provider auto-detected
+
+[agent]
+backend = "cli"
+cli_provider = "codex"
+cli_timeout = 3600
+
+[backend]
+name = "cuda"
+
+[repository]
+visibility = "private"

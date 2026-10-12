@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Candidate launch contract used by the VibeSys evaluator: start mstar serving
+# ${model} on the given port and block until /health is green.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT="${1:-${port}}"
+cd "$HERE"
+
+# `uv run` builds a self-contained env from THIS workspace's pyproject/uv.lock
+# (editable mstar + the candidate's deps + torch/CUDA pins) and provides the
+# mstar-serve entry point, with its own Python stdlib (no sandbox "encodings"
+# breakage). `mstar-serve` defaults --tensor-comm-protocol to RDMA (needs the
+# optional mooncake-transfer-engine); SHM is the safe single-node default that
+# `mstar serve` already uses — pin it so startup never depends on mooncake.
+exec uv run mstar-serve --config "configs/${model}.yaml" --port "$PORT" --tensor-comm-protocol SHM
