@@ -72,6 +72,8 @@ class SamplerResource(Resource):
         self._preplanned = False
         # rid -> the prompt tokens a cache hit kept out of this step's inputs
         self._cached_prefix: dict[str, torch.Tensor] = {}
+        # this step's `SamplerStep.kept_rids`, for the eager draw
+        self._kept_rids: frozenset[int] | None = None
 
     @property
     def _penalty_live(self) -> bool:
@@ -232,6 +234,8 @@ class SamplerResource(Resource):
 
     def plan(self, step: SamplerStep, ctx: StepContext):
         self._set_penalty_flags(step, ctx)
+        if not ctx.is_preplan:
+            self._kept_rids = step.kept_rids
         if not ctx.is_preplan and self._penalty_live:
             for rid, tokens in step.prefill_tracked_tokens.items():
                 self._sampler.get_token_mask(rid).add_tokens(tokens)
@@ -310,13 +314,16 @@ class SamplerResource(Resource):
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return
-        self._cg_buffers.scatter_offset(ctx.slot_lease.slot)
+        kept = step.kept_rids
+        keep = None if kept is None else [rid in kept for rid in ctx.request_ids]
+        self._cg_buffers.scatter_offset(ctx.slot_lease.slot, keep=keep)
         # Skipped when nothing read the mask this step: there is then nothing to
         # copy back, and the rows go stale only for requests at penalty 1.0,
         # which never read them. See `_penalty_live` for why that stays sound.
         if self._penalty_needed_this_step:
             self._cg_sampler.sync_seen_token_masks(
-                [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
+                [self._sampler.get_token_mask(rid) for rid in ctx.request_ids],
+                keep=keep,
             )
 
     ### Submodule-level functionality
@@ -341,4 +348,4 @@ class SamplerResource(Resource):
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step
             )
-        return self._sampler.sample(request_ids, logits)
+        return self._sampler.sample(request_ids, logits, kept_rids=self._kept_rids)
