@@ -12,6 +12,9 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 sys.path.insert(0, ".")
 
 from mstar.distributed.communication import (
@@ -168,3 +171,66 @@ def test_global_config_exposes_remote_replica_shapes_to_every_worker():
     assert not worker_view.all_have_compatible_parallel_shape(
         {"llm", "llm_cfg"}
     )
+
+
+@pytest.mark.parametrize(
+    ("device_type", "device_backend", "expected_backend"),
+    [
+        ("cpu", "gloo", "gloo"),
+        ("cuda", "nccl", "cpu:gloo,cuda:nccl"),
+        ("xpu", "xccl", "cpu:gloo,xpu:xccl"),
+    ],
+)
+def test_init_dist_shares_cpu_and_device_groups(
+    monkeypatch, device_type, device_backend, expected_backend,
+):
+    from mstar.distributed import communication
+
+    groups = WorkerParallelGroups(
+        num_workers=4, global_rank=0, any_parallelism=True,
+        world_parallel_groups=[(0, 1), (2, 3)],
+    )
+    tp = _tp([0, 1])
+    sp = _tp([0, 1])
+    groups.add("llm", tp)
+    groups.add("llm_cfg", tp)
+    groups.add_sp("llm", sp)
+    singleton = CommGroup.trivial()
+    groups.add("codec", singleton)
+    calls = []
+    handles = {}
+    devices = []
+    monkeypatch.setattr(torch.accelerator, "set_device_index", devices.append)
+    monkeypatch.setattr(
+        communication.dist, "get_default_backend_for_device", lambda device: device_backend,
+    )
+    monkeypatch.setattr(
+        communication.dist, "init_process_group", lambda **kwargs: calls.append(kwargs),
+    )
+
+    def new_group(ranks):
+        # Every rank creates even the subgroups it does not belong to.
+        # CPU-only twins would add calls or unexpected backend arguments.
+        calls.append(tuple(ranks))
+        handles[tuple(ranks)] = object()
+        return handles[tuple(ranks)]
+
+    monkeypatch.setattr(communication.dist, "new_group", new_group)
+    device = torch.device(device_type, 0) if device_type != "cpu" else torch.device("cpu")
+    groups.init_dist(init_method="test://world", device=device)
+
+    assert calls == [
+        {
+            "backend": expected_backend, "init_method": "test://world",
+            "world_size": 4, "rank": 0,
+            "device_id": device if device_type != "cpu" else None,
+        },
+        (0, 1), (2, 3),
+    ]
+    assert devices == ([] if device_type == "cpu" else [device])
+    for group in (tp, sp):
+        assert group.initialized
+        assert group.device_group is handles[(0, 1)]
+        assert group.cpu_group is group.device_group
+    assert singleton.initialized
+    assert singleton.device_group is None

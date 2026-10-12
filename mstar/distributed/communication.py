@@ -48,8 +48,8 @@ class CommGroup:
         self.group_members = group_members
         self.world_size = len(group_members)
         self.device_group = None
-        # gloo twin of ``device_group``, for object collectives (workspace
-        # rendezvous) that should not go through NCCL
+        # CPU object collectives (workspace rendezvous) use the same mixed
+        # process group as device tensors, routed through its Gloo backend.
         self.cpu_group = None
         self.initialized = False
         # see ``init_allreduce_fusion``
@@ -333,7 +333,7 @@ class WorkerParallelGroups:
         self, init_method="tcp://127.0.0.1:29500",
         device: torch.device | None = None,
     ):
-        """Initialize the NCCL world group and per-node parallel subgroups.
+        """Initialize mixed CPU/accelerator groups for the world and each node.
 
         Every worker calls ``dist.init_process_group`` when *any* worker
         in the run participates in TP or SP (``self.any_parallelism``) —
@@ -355,13 +355,15 @@ class WorkerParallelGroups:
         backend = dist.get_default_backend_for_device(device.type)
         if not self.any_parallelism:
             return
+        if device.type != "cpu":
+            backend = f"cpu:gloo,{device.type}:{backend}"
 
         dist.init_process_group(
             backend=backend,
             init_method=init_method,
             world_size=self.num_workers,
             rank=self.global_rank,
-            device_id=device,
+            device_id=device if device.type != "cpu" else None,
         )
 
         # One subgroup per distinct rank tuple across BOTH mesh axes —
@@ -370,16 +372,10 @@ class WorkerParallelGroups:
         # tag-ordered (see the field comment). A tuple shared by a TP and
         # an SP group (degenerate meshes) maps to one subgroup.
         rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
-        rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
+            # Inherit both CPU and accelerator backends, so an inherited
+            # accelerator device binding always has a matching backend.
             rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
-            # Members only: with the default group bound to a device, a
-            # non-member's subgroup creation joins an ncclCommSplit that
-            # members never call for a gloo group, and blocks forever.
-            rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
-                ranks=list(rank_tuple), backend="gloo",
-                use_local_synchronization=True,
-            )
 
         seen: set[int] = set()
         for comm_group in (
@@ -392,7 +388,7 @@ class WorkerParallelGroups:
                 comm_group.initialized = True
                 continue
             comm_group.device_group = rank_tuple_to_pg[tuple(comm_group.group_members)]
-            comm_group.cpu_group = rank_tuple_to_cpu_pg[tuple(comm_group.group_members)]
+            comm_group.cpu_group = comm_group.device_group
             comm_group.initialized = True
 
     def get_tp_config_for_node(self, node: str) -> CommGroup:

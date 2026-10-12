@@ -2,7 +2,6 @@
 
 import sys
 import time
-from datetime import timedelta
 
 import pytest
 import torch
@@ -11,22 +10,30 @@ import torch.multiprocessing as mp
 
 sys.path.insert(0, ".")
 
-from mstar.distributed.communication import CommGroup
+from mstar.distributed.communication import CommGroup, WorkerParallelGroups
 
 
 def _capture_collectives(rank, rendezvous):
-    torch.xpu.set_device(rank)
-    dist.init_process_group(
-        "xccl",
-        init_method=rendezvous,
-        rank=rank,
-        world_size=2,
-        device_id=torch.device("xpu", rank),
-        timeout=timedelta(seconds=60),
+    parallel = WorkerParallelGroups(
+        num_workers=3, global_rank=rank, any_parallelism=True,
+        world_parallel_groups=[(0, 1)],
     )
+    group = CommGroup(rank, rank, [0, 1]) if rank < 2 else CommGroup.trivial()
+    parallel.add("llm", group)
+    parallel.init_dist(init_method=rendezvous, device=torch.device("xpu", rank))
     try:
-        group = CommGroup(rank, rank, [0, 1])
-        group.device_group = dist.group.WORLD
+        if rank == 2:
+            # A worker with no local TP still joins subgroup creation, then
+            # waits while the two TP members exercise their mixed subgroup.
+            dist.barrier()
+            return
+        assert group.device_group is group.cpu_group
+        payloads = [None, None]
+        dist.all_gather_object(payloads, {"rank": rank}, group=group.cpu_group)
+        assert payloads == [{"rank": 0}, {"rank": 1}]
+        cpu_values = torch.tensor([rank + 1.0])
+        dist.all_reduce(cpu_values, group=group.cpu_group)
+        torch.testing.assert_close(cpu_values, torch.tensor([3.0]))
 
         def forward(x):
             reduced = group.all_reduce(x.sin())
@@ -44,12 +51,12 @@ def _capture_collectives(rank, rendezvous):
             for _ in range(3):
                 compiled(inputs)
             torch.xpu.synchronize()
-            dist.barrier()
+            group.barrier()
             graph = torch.xpu.XPUGraph()
             with torch.xpu.graph(graph):
                 output, gathered = compiled(inputs)
             torch.xpu.synchronize()
-            dist.barrier()
+            group.barrier()
             graphs.append((graph, inputs, output, gathered))
         for graph, inputs, output, gathered in graphs:
             for step in range(3):
@@ -67,21 +74,22 @@ def _capture_collectives(rank, rendezvous):
                     dim=-1,
                 )
                 torch.testing.assert_close(gathered, expected_gather, atol=0, rtol=0)
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.skipif(
     not torch.xpu.is_available()
-    or torch.xpu.device_count() < 2
+    or torch.xpu.device_count() < 3
     or not dist.is_xccl_available(),
-    reason="requires two XPUs and XCCL",
+    reason="requires three XPUs and XCCL",
 )
 def test_compiled_tp_collectives_capture_and_replay(tmp_path):
     workers = mp.spawn(
         _capture_collectives,
         args=((tmp_path / "rendezvous").as_uri(),),
-        nprocs=2,
+        nprocs=3,
         join=False,
     )
     try:
