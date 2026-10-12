@@ -1931,6 +1931,17 @@ class Worker:
                 self.worker_id, pending.node_name, pending.graph_walk,
             )
 
+    def _drop_rows_whose_loop_stopped(self, pending: PendingBatch) -> None:
+        """Take a refused speculative step's rows whose loop stopped at N out
+        of its batch. Postprocess drops them on a step that runs; pushed back,
+        their emptied node would pop with no inputs."""
+        if not pending.speculative_new_iter:
+            return
+        for rid in self._graph_runtime.pending_loop_stop_rids(
+            list(pending.batch.rids_by_walk()), pending.loop_name,
+        ):
+            pending.batch.discard_rid(rid)
+
     def _handle_admit_failure(
         self, batch: ScheduledBatch, node_batch: ExecutingBatch,
         referenced_rids: frozenset[str] = frozenset(),
@@ -3999,6 +4010,7 @@ class Worker:
                         # a refusal, so in practice there is nothing to clear.
                         self._clear_in_flight_flag(pending.batch)
                         _maybe_clear_spec()
+                        self._drop_rows_whose_loop_stopped(pending)
                         self._handle_admit_failure(
                             pending.batch, pending.node_batch,
                             referenced_rids=frozenset(
