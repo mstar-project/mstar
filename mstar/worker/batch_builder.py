@@ -123,7 +123,8 @@ class FIFOBatchBuilder(BaseBatchBuilder):
     capture group per step. Everything past the cap stays in the backlog.
 
     Under a combined walk a step of one walk takes that walk's cap and a mixed
-    step the smallest of its walks' and the combined walk's. Rows join in
+    step the smallest of the combined walk's and the caps of the walks present
+    in it; a walk with no row in the step does not cap it. Rows join in
     order; one whose walk would cap the step at or below the rows already in
     it is left out, and is first in line next step.
     """
