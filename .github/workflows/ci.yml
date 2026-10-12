@@ -120,6 +120,8 @@ jobs:
           maturin build --release
           pip install target/wheels/*.whl
       - name: Interop tests (transport + arena + frontend)
+        env:
+          LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: |
           # pyyaml: the runtime tests reach mstar.model.base, which imports it
           pip install pytest pyzmq msgpack numpy pyyaml
