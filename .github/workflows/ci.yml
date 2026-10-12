@@ -18,6 +18,8 @@ jobs:
       - name: Run Ruff
         # Use GitHub’s annotation format so lint errors show inline
         run: ruff check --output-format=github .
+      - name: Test the optional Mac runner
+        run: python -m unittest discover -s test/ci -v
   # The CPU-only engine/resource suite is listed in test/cpu-core.txt; other
   # modular tests import GPU backends during collection.
   cpu-core:
