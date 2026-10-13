@@ -27,7 +27,9 @@ class BudgetSplit(Enum):
     ``FIT_FIRST`` and ``ARRIVAL`` take the rows that cannot be cut first, then
     the rows partway through their prefill, then the rest, each in arrival
     order. They cut one row a step, to ``MIN_CHUNK`` tokens or more even over
-    budget.
+    budget, and keep one prompt of a node partway through at a time. Until
+    that prompt finishes, ``FIT_FIRST`` starts only prompts that fit whole and
+    ``ARRIVAL`` starts none.
     """
     # an equal share each: rows under it go in whole and the rest split what is left
     MAX_MIN = "max_min"
@@ -66,8 +68,9 @@ class BatchBuildRequest:
     max_batch_tokens: int | None = None
     row_tokens: dict[int, int] = field(default_factory=dict)
     chunkable: set[int] = field(default_factory=set)
-    # How the budget is split. Every split but max-min also reads the rows
-    # partway through their prefill and each row's place in arrival order.
+    # How the budget is split. Every split but max-min also reads the node's
+    # rows partway through their prefill, in this step or not, and each row's
+    # place in arrival order.
     budget_split: BudgetSplit = BudgetSplit.MAX_MIN
     partial_rids: set[int] = field(default_factory=set)
     arrival: dict[int, int] = field(default_factory=dict)
@@ -181,8 +184,10 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         scheduled, remainder = batch.split_off_first(max_bs, exclude_rids=exclude)
         if scheduled is None or request.max_batch_tokens is None:
             return BatchBuildResult(scheduled, backlog=remainder)
-        if sum(request.row_tokens.values()) <= request.max_batch_tokens:
-            # Every measured row fits, so the split takes each row whole.
+        if sum(request.row_tokens.values()) <= request.max_batch_tokens and (
+            request.budget_split is not BudgetSplit.ARRIVAL or not request.chunkable
+        ):
+            # Every measured row fits, so the split takes each row whole. Only `ARRIVAL` can hold back one that fits.
             return BatchBuildResult(scheduled, backlog=remainder, chunk_tokens={})
 
         rids = list(scheduled.request_to_worker_graph)
@@ -218,8 +223,9 @@ def fill_token_budget(
     """Max-min fair share of ``budget`` over ``rids``: rows under an equal share
     go in whole, the rest split what is left (chunkable rows) or sit out.
     Any other ``split`` shares it as described on ``BudgetSplit``, and ``partial``
-    is the rows partway through their prefill.
-    Never empty while a row exists: the first row runs over budget if it must.
+    is the node's rows partway through their prefill.
+    Empty only when every row is a prompt that waits for the one partway
+    through. Otherwise the first row runs over budget if it must.
     Returns (rid -> tokens taken, rids left out)."""
     if split is not BudgetSplit.MAX_MIN:
         return _fill_in_order(rids, tokens, chunkable, budget, split, partial)
@@ -258,8 +264,13 @@ def _fill_in_order(
     ordered = (
         [rid for rid in rids if rid not in chunkable]
         + [rid for rid in rids if rid in chunkable and rid in partial]
-        + [rid for rid in rids if rid in chunkable and rid not in partial]
     )
+    # While a prompt partway through is not in this step, no other prompt is cut, and under ARRIVAL none
+    # starts. On a tight pool, prompts started that way each hold pages the others need to finish.
+    rid_set = set(rids)
+    waiting = not partial <= rid_set
+    if split is BudgetSplit.FIT_FIRST or not waiting:
+        ordered += [rid for rid in rids if rid in chunkable and rid not in partial]
     take: dict[int, int] = {}
     left = budget
     cut = None
@@ -268,15 +279,15 @@ def _fill_in_order(
         if need <= left:
             take[rid] = need
             left -= need
-        elif cut is None and rid in chunkable:
+        elif cut is None and rid in chunkable and (rid in partial or not waiting):
             cut = rid
             if split is BudgetSplit.ARRIVAL:
                 break
     if cut is not None:
         take[cut] = min(tokens[cut], max(left, MIN_CHUNK))
-    elif not take and ordered:
+    elif not take and ordered and ordered[0] not in chunkable:
         take[ordered[0]] = tokens.get(ordered[0], 0)
-    return take, set(rids) - take.keys()
+    return take, rid_set - take.keys()
 
 
 def _single_walk(batch: "ScheduledBatch", request: BatchBuildRequest) -> str | None:

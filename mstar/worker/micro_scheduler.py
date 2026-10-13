@@ -806,7 +806,12 @@ class MicroScheduler:
             return None
         partial = set()
         if split is not BudgetSplit.MAX_MIN:
-            partial = {rid for rid in row_tokens if (rid, node_walk[0]) in self.chunk_progress}
+            # a row whose last chunk is scheduled no longer holds the others back
+            partial = {
+                rid for (rid, node), progress in self.chunk_progress.items()
+                if node == node_walk[0] and progress.scheduled < progress.total
+                and rid not in self.failed_rids
+            }
         return self._build_and_schedule(request_state, BatchBuildRequest(
             node_name=node_walk[0], graph_walk=node_walk[1],
             backlog=backlogged, fresh=fresh or None, blocked_rids=blocked,

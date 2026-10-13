@@ -252,9 +252,11 @@ if the model sets no budget for that walk.
 
 ``budget_split`` sets how a step's budget is shared among its rows. ``max_min``, the default,
 gives every row an equal share. ``fit_first`` runs every row that fits whole and gives what is
-left to one longer prompt, and ``arrival`` serves prompts in the order they arrived. Under those
-two a chunk is at least 128 tokens, which can take a step over its budget. Loading fails on any
-other value.
+left to one longer prompt, and ``arrival`` serves prompts in the order they arrived. Under
+``fit_first`` and ``arrival`` only one prompt of a node is partway through its prefill at a time.
+Until it finishes, ``fit_first`` starts only prompts that fit whole and ``arrival`` starts none.
+Under both, a chunk is at least 128 tokens, which can take a step over its budget. Loading fails
+on any other value.
 
 **Single GPU.** Everything on rank 0:
 
