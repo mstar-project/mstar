@@ -78,10 +78,6 @@ class DrainRequest(MessageBody):
     # Hard cleanup (RemoveRequest) follows once every reader has ACKed via READS_DONE.
     request_id: str
     source: int = MessageSource.CONDUCTOR
-    # As on RemoveRequest: rank 0 stamps the last step it broadcast, so a
-    # follower stops reading at the same point in the sequence it did. A drain
-    # that jumped ahead would gate a rid the follower has not reached yet.
-    after_tp_seq: int = -1
 
 
 @dataclass

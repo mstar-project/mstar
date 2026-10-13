@@ -849,7 +849,6 @@ class _RemoveRank:
         self.scheduler = SimpleNamespace(last_consumed_tp_seq=consumed)
         self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
         self._teardowns_awaiting_step: dict = {}
-        self._drains_awaiting_step: dict = {}
         self.applied: list[str] = []
 
     def _remove_request(self, body):
@@ -932,7 +931,6 @@ class _ForwardingLeader:
         # a handle is recycled and would reattach to the next request to get it
         self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
         self._teardowns_awaiting_step: dict = {}
-        self._drains_awaiting_step: dict = {}
         self._draining_rids: set[str] = set()
         self._pending_drains: set[str] = set()
         self._reads_done_sent: set[str] = set()

@@ -60,7 +60,6 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
     w._session_idle_seq = 0
     w._removes_awaiting_step = {}
     w._teardowns_awaiting_step = {}
-    w._drains_awaiting_step = {}
     w._tp_broadcast_seq = 0
     w._last_active = {}
     w._unprocessed_messages = {}
@@ -596,52 +595,6 @@ def test_a_request_drained_while_awaiting_its_session_is_not_admitted():
     Worker._remove_request(w, RemoveRequest(request_id="Y"))
 
     assert w._handles_awaiting_admit == set()
-
-
-def test_a_followers_drain_waits_for_the_step_rank_0_stopped_at():
-    # The deadlock this prevents: rank 0 admits a resume and broadcasts a batch
-    # naming it while this rank is still waiting on the session. If the drain
-    # applied now, the rid would be gated (tp_rids -> REMOVED_RID) and the FIFO
-    # could never reach the step that lifts the gate -- and the forwarded
-    # REMOVE, stamped at that step, is what would have lifted it. So the drain
-    # waits, the request is admitted normally, and the gate comes off.
-    w = _worker(known_rids=("X",), sessions={"s": {"X"}}, is_follower=True)
-    w.scheduler.last_consumed_tp_seq = 3
-    Worker._add_new_request(w, _new_request(session_id="s"))  # Y, waiting
-    assert w._handles_awaiting_admit == {"Y"}
-
-    Worker._drain_request(w, DrainRequest(
-        request_id="Y", source=MessageSource.TP_RANK_0, after_tp_seq=7,
-    ))
-
-    assert w._drains_awaiting_step.keys() == {7}
-    assert "Y" not in w._draining_rids, "gating it now would freeze the FIFO"
-
-    # X leaves and Y is admitted, so the gate comes off and the FIFO can reach 7
-    Worker._remove_request(w, RemoveRequest(
-        request_id="X", source=MessageSource.TP_RANK_0,
-    ))
-    Worker._apply_pending_sessions(w)
-    assert w._handles_awaiting_admit == set()
-    assert w.admitted == ["Y"]
-
-    w.scheduler.last_consumed_tp_seq = 7
-    Worker._apply_removes_whose_step_landed(w)
-
-    assert w._drains_awaiting_step == {}
-    assert "Y" in w._draining_rids
-    assert _reads_done(w) == ["Y"]
-
-
-def test_an_unstamped_drain_is_not_ordered_against_anything():
-    # the conductor's own copy on a leader, and the SELF replay
-    w = _worker(known_rids=("X",))
-    w.scheduler.last_consumed_tp_seq = 0
-
-    Worker._drain_request(w, DrainRequest(request_id="X"))
-
-    assert w._drains_awaiting_step == {}
-    assert "X" in w._draining_rids
 
 
 def test_a_drain_for_a_request_this_worker_never_saw_is_unchanged():
