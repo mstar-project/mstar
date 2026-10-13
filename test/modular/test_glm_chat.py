@@ -200,8 +200,16 @@ def test_template_keys_it_does_not_read_are_dropped(tmp_path):
 
 
 def test_glm53_always_reasons(tmp_path):
-    p = adapters.get_adapter("glm5_next").make_output_parser(_chat(enable_thinking=False))
-    assert p.message("hmm</think>Hi")["reasoning_content"] == "hmm"
+    adapter = adapters.get_adapter("glm5_next")
+    assert adapter.make_output_parser(_chat()).message("hmm</think>Hi")["reasoning_content"] == "hmm"
+    assert "chat_template_kwargs" in adapter.chat_to_request(_chat(enable_thinking=True), tmp_path).model_kwargs
+
+
+@pytest.mark.parametrize("value", [False, 0, ""])
+def test_glm53_refuses_thinking_off(value, tmp_path):
+    req = _chat(chat_template_kwargs={"enable_thinking": value})
+    with pytest.raises(ValueError, match="enable_thinking"):
+        adapters.get_adapter("glm5_next").chat_to_request(req, tmp_path)
 
 
 def test_tool_choice_none_leaves_the_tools_out(tmp_path):

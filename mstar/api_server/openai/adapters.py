@@ -1094,9 +1094,10 @@ class GlmChatAdapter(TextChatAdapter):
     ``tool_choice`` is ``"auto"`` (default) or ``"none"``, which leaves the tools
     out of the prompt; ``"required"`` and a named function need constrained
     decoding and are refused. ``enable_thinking`` (GLM-5.2 only: GLM-5.3 always
-    reasons), ``reasoning_effort`` and ``clear_thinking`` reach the template,
-    flat in ``extra_body`` or under ``chat_template_kwargs``; other template keys
-    are dropped, as vLLM drops the ones a template does not read.
+    reasons, and turning it off is a 400), ``reasoning_effort`` and
+    ``clear_thinking`` reach the template, flat in ``extra_body`` or under
+    ``chat_template_kwargs``; other template keys are dropped, as vLLM drops the
+    ones a template does not read.
     """
 
     def __init__(self, *, always_thinks: bool):
@@ -1106,6 +1107,10 @@ class GlmChatAdapter(TextChatAdapter):
         args = super().chat_to_request(req, upload_dir)
         mk = args.model_kwargs
         tools, template_kwargs = self._options(mk)
+        thinking = template_kwargs.get("enable_thinking")
+        if self.always_thinks and thinking is not None and not thinking:
+            # the template has no switch, so off would still reason
+            raise ValueError("this model always reasons; enable_thinking cannot turn it off")
         mk["messages"] = glm_chat.template_messages(req.messages)
         if tools:
             mk["tools"] = tools
