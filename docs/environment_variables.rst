@@ -317,7 +317,7 @@ Worker scheduling
    * - ``MSTAR_TP_ASYNC_SCHED``
      - config's ``tp_async_sched``, else ``0``
      - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
-       deployment config's ``tp_async_sched``. ``1``: the
+       deployment config's ``tp_async_sched``. ``1`` (or ``true``): the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
        opened) and broadcasts it at once as a speculative
@@ -328,7 +328,7 @@ Worker scheduling
        continuing request without loop-back output) are derived by each
        rank from replicated state, never signalled. A comma-separated
        list of node names (``thinker,talker``) enables it for those
-       parallel nodes only. ``0``: the serial path — leader schedules
+       parallel nodes only. ``0`` (or ``false``): the serial path — leader schedules
        after N, followers rebuild after the broadcast. Set it identically
        on every rank of an instance: the workers compare it at startup and
        refuse to start on a mismatch. Leave ``MSTAR_ENGINE_STEP_SYNC`` at

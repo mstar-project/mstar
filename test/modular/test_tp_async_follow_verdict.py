@@ -196,6 +196,19 @@ def test_config_key_and_env_override(env, config, want):
     assert _tp_async_sched_setting(env, config) == want
 
 
+@pytest.mark.parametrize("env, config, want", [
+    # a quoted yaml boolean is a string, not a node named "true"
+    (None, "true", (True, None)),
+    (None, "yes", (True, None)),
+    (None, "false", (False, None)),
+    (None, "No", (False, None)),
+    ("off", True, (False, None)),
+    ("True", None, (True, None)),
+])
+def test_boolean_words_are_the_switch_not_node_names(env, config, want):
+    assert _tp_async_sched_setting(env, config) == want
+
+
 def test_node_list_narrows_which_parallel_nodes_take_part():
     """Per-node control: a rank whose list excludes NODE behaves exactly as
     with the flag off for NODE — leader owes no marker, follower records

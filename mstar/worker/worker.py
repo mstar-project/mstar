@@ -139,12 +139,14 @@ def _make_graph_runtime(
 
 
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
-    """``MSTAR_TP_ASYNC_SCHED``: ``0``/empty off, ``1`` every parallel node,
-    or a comma-separated node list. Returns ``(enabled, nodes_or_None)``."""
+    """``MSTAR_TP_ASYNC_SCHED``: ``0``/``false``/empty off, ``1``/``true`` every
+    parallel node, or a comma-separated node list. Returns ``(enabled, nodes_or_None)``."""
     raw = raw.strip()
-    if raw in ("", "0"):
+    # a quoted yaml boolean arrives as a string; it is the switch, not a node name
+    word = raw.lower()
+    if word in ("", "0", "false", "no", "off"):
         return False, None
-    if raw == "1":
+    if word in ("1", "true", "yes", "on"):
         return True, None
     return True, frozenset(n.strip() for n in raw.split(",") if n.strip())
 
