@@ -146,6 +146,8 @@ class RecurrentStatePool(Resource):
         self._keyed: dict[str, frozenset[str]] = {}
         # rid -> label -> the prompt's page keys, unrooted
         self._prefix_keys: dict[str, dict[str, list[bytes]]] = {}
+        # rid -> label -> the first of them rooted, hashed once for a TP follower's adopt polls
+        self._prefix_rooted: dict[str, dict[str, list[bytes]]] = {}
         # under TP rank 0 decides each hit (`adopt_cached_prefix`)
         self._follower = (
             comm_group is not None and comm_group.world_size > 1
@@ -218,6 +220,7 @@ class RecurrentStatePool(Resource):
         with self._lock:
             self._slots.pop(rid, None)
             self._prefix_keys.pop(rid, None)
+            self._prefix_rooted.pop(rid, None)
             self._drop_lease(rid)
             for key in [k for k in self._restores if k[0] == rid]:
                 self._unref(self._restores.pop(key)[0])
@@ -648,9 +651,16 @@ class RecurrentStatePool(Resource):
                 raise RuntimeError(
                     f"recurrent state: rank 0 restored {matched_len} tokens for {rid}, but "
                     "this rank keeps no snapshots")
-            keys = list(self._prefix_keys[rid][label][:matched_len // self.config.prefix_page_size])
-        rooted = self._rooted(keys)
+            need = matched_len // self.config.prefix_page_size
+            rooted = self._prefix_rooted.get(rid, {}).get(label, [])
+            # polled until this rank's commit catches up: hash the keys once
+            keys = None if len(rooted) >= need else list(self._prefix_keys[rid][label][:need])
+        if keys is not None:
+            rooted = self._rooted(keys)
         with self._lock:
+            if rid in self._prefix_keys:
+                self._prefix_rooted.setdefault(rid, {})[label] = rooted
+            rooted = rooted[:need]
             snap = self._snap_by_key.get(rooted[-1]) if rooted else None
             if snap is None or self._snap_meta[snap][1] != matched_len:
                 return False

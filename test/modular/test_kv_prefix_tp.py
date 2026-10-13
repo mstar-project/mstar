@@ -208,6 +208,33 @@ def test_a_follower_waits_until_its_own_commit_indexes_the_pages():
     assert follower.resolve_cached_prefix("b", NODE, WALK) == matched
 
 
+def test_a_waiting_follower_hashes_the_prompt_once(monkeypatch):
+    """The follower polls its adopt until its own commit catches up; a long prompt is
+    thousands of keys, rooted on the first poll only."""
+    leader, follower = _manager(0), _manager(1)
+    shared = _tokens(4 * PAGE_SIZE + 5, seed=2)
+    steps = {}
+    for kv in (leader, follower):
+        _ingest(kv, "a", shared)
+        steps[kv] = _admit(kv, "a", len(shared))
+    leader.commit(steps[leader], _ctx("a"))
+    for kv in (leader, follower):
+        _ingest(kv, "b", shared[:4 * PAGE_SIZE] + _tokens(9, seed=3))
+    matched = leader.resolve_cached_prefix("b", NODE, WALK)
+    pages = leader.cached_prefix_pages("b", NODE, WALK, matched)
+
+    hashed = []
+    real = manager_mod.fingerprint
+    monkeypatch.setattr(manager_mod, "fingerprint", lambda *f: hashed.append(f) or real(*f))
+    for _ in range(3):
+        assert not follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
+    assert len(hashed) == 4
+    follower.commit(steps[follower], _ctx("a"))
+    hashed.clear()
+    assert follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
+    assert hashed == []
+
+
 def test_pages_that_differ_from_rank_0s_are_a_loud_error():
     leader, follower = _manager(0), _manager(1)
     shared = _tokens(3 * PAGE_SIZE + 1, seed=4)

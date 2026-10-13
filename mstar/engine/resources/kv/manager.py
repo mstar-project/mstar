@@ -135,6 +135,8 @@ class PrefixChain:
     # set once this stream has been reported, so a request that is admitted
     # again (a refused admit, a second partition) is still one line
     reported: bool = False
+    # the first keys under the cache's root, hashed once for a TP follower's adopt polls
+    rooted: list[bytes] = field(default_factory=list)
 
     @classmethod
     def seed(cls, keys: list[bytes], tail: list[int], page_size: int) -> "PrefixChain":
@@ -648,12 +650,17 @@ class KVManager(AttentionResource):
                 raise RuntimeError(
                     f"KV {self.name}: rank 0 hit {matched_len} cached tokens for "
                     f"{rid}/{label}, whose stream here already holds tokens")
-            keys = list(stream.chain.keys)[:need]
-        rooted = [fingerprint(self._prefix_root, key) for key in keys]
+            chain = stream.chain
+            rooted = chain.rooted
+            # polled until this rank's commit catches up: hash the keys once
+            keys = None if len(rooted) >= need else list(chain.keys)[:need]
+        if keys is not None:
+            rooted = [fingerprint(self._prefix_root, key) for key in keys]
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return True
-            matched = self._index.lookup(rooted, stamp=False)
+            chain.rooted = rooted
+            matched = self._index.lookup(rooted[:need], stamp=False)
             if len(matched) < need:
                 return False
             if pages is not None and matched != list(pages):

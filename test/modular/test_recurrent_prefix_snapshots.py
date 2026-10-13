@@ -20,6 +20,7 @@ import torch
 from mstar.engine.resources import AdmitOutcome, AllocationFailed, Resource, StepRunner, SubmoduleStep
 from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.keys import chain
+from mstar.engine.resources.recurrent import pool as pool_mod
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
     RecurrentStateConfig,
@@ -208,6 +209,39 @@ def test_a_follower_adopts_rank_0s_snapshot_once_its_own_commit_saved_it():
         follower.adopt_cached_prefix("b", NODE, WALK, matched, [pages[0] + 1])
     assert follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
     assert follower.resolve_cached_prefix("b", NODE, WALK) == 16
+
+
+def test_a_waiting_follower_hashes_the_prompt_once(monkeypatch):
+    """The follower polls its adopt until its own commit saves the snapshot; the prompt's
+    keys are rooted on the first poll only, and dropped with the request."""
+    ranks = leader, follower = _pool(rank=0, world=2), _pool(rank=1, world=2)
+    runs = {pool: _runner(pool) for pool in ranks}
+    a = list(range(20))
+    steps = {}
+    for pool in ranks:
+        _ingest(runs[pool], "a", a)
+        steps[pool] = _step("a", 20, [("a", "main", 16)])
+        assert runs[pool].admit(steps[pool]).ok
+        runs[pool].plan(steps[pool])
+        pool.write_snapshot("a", "main", 16)
+    runs[leader].commit(steps[leader])
+    for pool in ranks:
+        _ingest(runs[pool], "b", a[:16] + [99] * 5)
+    matched = leader.resolve_cached_prefix("b", NODE, WALK)
+    pages = leader.cached_prefix_pages("b", NODE, WALK, matched)
+
+    hashed = []
+    real = pool_mod.fingerprint
+    monkeypatch.setattr(pool_mod, "fingerprint", lambda *f: hashed.append(f) or real(*f))
+    for _ in range(3):
+        assert not follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
+    assert len(hashed) == matched // PAGE
+    runs[follower].commit(steps[follower])
+    hashed.clear()
+    assert follower.adopt_cached_prefix("b", NODE, WALK, matched, pages)
+    assert hashed == []
+    runs[follower].remove_request("b")
+    assert "b" not in follower._prefix_rooted
 
 
 def test_a_request_removed_before_its_step_commits_gives_its_snapshot_slots_back():
