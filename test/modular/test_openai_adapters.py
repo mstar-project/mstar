@@ -283,6 +283,7 @@ def test_text_chat_coerces_numeric_extra_body(tmp_path):
 @pytest.mark.parametrize("field", [
     {"n": 2}, {"stop": "\n"}, {"stop": ["END"]}, {"logprobs": True}, {"top_logprobs": 5},
     {"logit_bias": {"100": -100}}, {"presence_penalty": 1.5}, {"frequency_penalty": 0.5},
+    {"best_of": 2}, {"response_format": {"type": "json_object"}}, {"stop_token_ids": [2]},
 ])
 def test_text_chat_refuses_what_it_would_ignore(field, tmp_path):
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **field)
@@ -294,5 +295,6 @@ def test_text_chat_passes_those_fields_off(tmp_path):
     req = ChatCompletionRequest(
         messages=[{"role": "user", "content": "hi"}], n=1, stop=[], logprobs=False,
         top_logprobs=0, logit_bias={}, presence_penalty=0, frequency_penalty=0.0,
+        best_of=1, response_format={"type": "text"}, stop_token_ids=[],
     )
     assert adapters.TextChatAdapter().chat_to_request(req, tmp_path).model_kwargs == {}

@@ -1056,10 +1056,15 @@ class TextChatAdapter(OpenAIAdapter):
         if req.stop:
             raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
         mk = _passthrough(req)
-        for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty"):
+        for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
+                     "stop_token_ids"):
             if mk.get(name):
                 raise ValueError(f"{name} is not supported; got {mk[name]!r}")
             mk.pop(name, None)
+        if mk.pop("best_of", None) not in (None, 1):
+            raise ValueError("best_of is not supported; this model returns one choice")
+        if mk.pop("response_format", None) not in (None, {"type": "text"}):
+            raise ValueError("response_format needs constrained decoding; only {'type': 'text'} is served")
         _apply_sampling(req, mk)
         # extra_body can override max_tokens with anything; a string reached the
         # conductor's min() and took its whole message batch down
