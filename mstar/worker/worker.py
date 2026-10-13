@@ -1021,10 +1021,13 @@ class Worker:
             handle = body.request_info.rid_handle
             if body.request_id in self._draining_rids:
                 # Drained while it waited: open no engine state, and leave the
-                # handle gated until its REMOVE. failed_rids does not gate the
-                # TP-follow path, so tp_rids answering REMOVED_RID is the only
-                # thing stopping a batch naming it from running against state
-                # that was never ingested.
+                # handle gated until its REMOVE clears it rather than resolving
+                # it here. failed_rids does not gate the TP-follow path, so
+                # tp_rids answering REMOVED_RID is what keeps a batch naming it
+                # off engine state that was never ingested -- though rank 0
+                # cannot have one in flight either, since it defers the drain
+                # while the rid is in _in_flight_rids and a step only retires
+                # once every rank has run it.
                 continue
             if self._sessions.hold_if_not_ready(body, handle):
                 continue  # another of its session's requests is still leaving
