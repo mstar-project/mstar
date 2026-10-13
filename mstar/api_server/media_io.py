@@ -168,6 +168,34 @@ def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tup
     return modality_hint, str(path)
 
 
+def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
+    """Persist bare base64 that ``decoder`` opens as audio; return its path, or
+    None (leaving nothing behind) when it is not base64 or not loadable audio.
+
+    ``decoder`` is the library the model's ``load_audio`` uses, ``"soundfile"``
+    or ``"torchcodec"``, and it opens the saved file the way the model will
+    (container header only). A path such as ``/etc/passwd`` is valid base64
+    too, so the alphabet cannot tell them apart; the decoder can.
+    """
+    try:
+        _, path = save_base64(b64, "wav", "audio", upload_dir)
+    except ValueError:
+        return None
+    try:
+        if decoder == "torchcodec":
+            from torchcodec.decoders import AudioDecoder
+
+            AudioDecoder(path)
+        else:
+            import soundfile
+
+            soundfile.info(path)
+    except Exception:  # noqa: BLE001 — not loadable here, so the model cannot load it either
+        Path(path).unlink(missing_ok=True)
+        return None
+    return path
+
+
 def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[str, str]:
     """Download an ``http(s)`` URL into ``upload_dir``. Returns (modality, path).
 
@@ -193,7 +221,8 @@ def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False)
 
     A request cannot name a file on the server, not even one under
     ``upload_dir``: plain paths and other URL schemes are refused without
-    touching the filesystem, so a caller can neither read files nor probe for them.
+    accessing client-named server files, so a caller can neither read files nor
+    probe for them.
     """
     if ref.startswith("data:"):
         return save_data_url(ref, upload_dir)

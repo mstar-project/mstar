@@ -76,7 +76,7 @@ class Transcript:
 
 
 def flatten_messages(
-    messages: list, upload_dir: Path, allow_remote: bool = True
+    messages: list, upload_dir: Path, allow_remote: bool = False
 ) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
     """Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities, parts).
 
@@ -471,7 +471,7 @@ class OmniVoiceAdapter(OpenAIAdapter):
         ref_audio = mk.pop("ref_audio", None)
         input_modalities = ["text"]
         if ref_audio:
-            path = _resolve_ref_audio(ref_audio, upload_dir)
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="torchcodec")
             # Keyed by modality: the data worker iterates the dict and
             # loads each group through the matching loader.
             file_paths = {"audio": [path]}
@@ -522,7 +522,7 @@ class Qwen3TTSAdapter(OpenAIAdapter):
         # voices come with the shared voice registry (engine/voice-registry).
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            path = _resolve_ref_audio(ref_audio, upload_dir)
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")
             return SubmitArgs(
                 text=req.input,
                 file_paths={"audio": [path]},
@@ -567,14 +567,21 @@ class KokoroAdapter(OpenAIAdapter):
         )
 
 
-def _resolve_ref_audio(ref: str, upload_dir: Path) -> str:
+def _resolve_ref_audio(ref: str, upload_dir: Path, decoder: str) -> str:
     """A reference voice clip from the request: a data URL, an http(s) URL (only
-    when the server allows remote fetch), or bare base64. Returns its path."""
+    when the server allows remote fetch), or bare base64 that ``decoder`` (the
+    model's audio loader) can open. Returns its path."""
     if not isinstance(ref, str):
         raise ValueError(f"ref_audio must be a data URL or base64 string, got {type(ref).__name__}")
-    if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https") or Path(ref).suffix:
+    if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
         return media_io.resolve_media_ref(ref, upload_dir)[1]
-    return media_io.save_base64(ref, "wav", "audio", upload_dir)[1]
+    path = media_io.save_base64_audio(ref, upload_dir, decoder)
+    if path:
+        return path
+    raise ValueError(
+        "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
+        "or base64 audio the model can decode"
+    )
 
 
 class ChatterboxAdapter(OpenAIAdapter):

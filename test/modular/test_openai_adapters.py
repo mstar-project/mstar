@@ -111,9 +111,7 @@ def test_qwen3_tts_speech_reference_audio_becomes_audio_input(tmp_path):
     assert sa.model_kwargs["ref_text"] == "reference words"
     assert sa.model_kwargs["x_vector_only_mode"] is False
 
-    # Bare base64 (vLLM-Omni style) is accepted too.
-    sa = adapters.Qwen3TTSAdapter().speech_to_request(SpeechRequest(input="x", ref_audio=wav), tmp_path)
-    assert sa.input_modalities == ["audio", "text"] and sa.file_paths["audio"]
+    # Bare base64 (vLLM-Omni style) is covered with real clips in test_media_paths.py.
     # No reference -> plain text request.
     sa = adapters.Qwen3TTSAdapter().speech_to_request(SpeechRequest(input="x", voice="vivian"), tmp_path)
     assert sa.input_modalities == ["text"] and sa.file_paths is None

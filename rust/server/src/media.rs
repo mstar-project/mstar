@@ -5,7 +5,8 @@
 //!    URLs or base64 blobs) into files under the server's `upload_dir`, so the
 //!    Python data-worker can read them by path (the same contract `/generate`
 //!    uses for multipart uploads). `http(s)` fetch is SSRF surface and is gated
-//!    off by default here (data-URL / base64 / local path only).
+//!    off by default here (data-URL / base64 only). Paths on the server are
+//!    refused.
 //!  * **Outbound** — wrap raw model audio output (16-bit PCM, no header) into a
 //!    real container (WAV by default) and encode PNG image bytes as a `data:`
 //!    URL for OpenAI chat image output.
@@ -193,7 +194,7 @@ fn save_remote_url(url: &str, upload_dir: &Path) -> Result<(String, String), Str
 /// when `allow_remote` is set (remote fetch is SSRF surface, off by default).
 /// Returns `(modality, path)`. A request cannot name a file on the server, not
 /// even one under `upload_dir`: plain paths and other URL schemes are refused
-/// without touching the filesystem.
+/// without accessing client-named server files.
 pub fn resolve_media_ref(
     reference: &str,
     upload_dir: &Path,

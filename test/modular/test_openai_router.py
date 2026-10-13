@@ -156,6 +156,18 @@ def test_chat_refuses_server_paths_uniformly(client_and_stub, tmp_path):
     assert stub.last_submit is None
 
 
+@pytest.mark.parametrize("model", ["qwen3_tts_base", "omnivoice"])
+def test_voice_clone_refuses_server_paths_uniformly(client_and_stub, model):
+    client, stub = client_and_stub
+    stub.model_name = model
+    # the suffix-less ones are valid base64; "//..." even decodes to an MPEG frame sync
+    for ref in ("/etc/passwd", "//etc/passwd", "//etc/shadow", "secret", "///x", "/etc/hostname.wav"):
+        r = client.post("/v1/audio/speech", json={"model": model, "input": "hi", "ref_audio": ref, "ref_text": "hi"})
+        assert r.status_code == 400, (ref, r.text)
+        assert r.json()["error"]["message"].startswith("server file paths are refused")
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
 def test_chat_audio_output(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "qwen3_omni"
