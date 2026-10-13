@@ -4,6 +4,7 @@ the conductor reads it and any rank runs the request."""
 
 import pytest
 
+from mstar.engine.resources import SamplerSpec
 from mstar.model.glm5_next.config import SAMPLER
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
 
@@ -38,3 +39,14 @@ def test_a_null_temperature_under_mtp_is_greedy():
 def test_a_kwarg_it_cannot_read_is_refused_in_process_prompt(kwargs):
     with pytest.raises(ValueError, match=next(iter(kwargs))):
         _model().process_prompt("Hi", ["text"], ["text"], **kwargs)
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_min_p_is_refused_in_process_prompt(k):
+    m = _model(mtp_num_draft_tokens=k)
+    # the sampler that would read it is built without it; it was dropped (0.2 ran as 0)
+    [spec] = [s for s in m.get_node_resources() if isinstance(s, SamplerSpec)]
+    assert not spec.enable_min_p
+    with pytest.raises(ValueError, match="min_p"):
+        m.process_prompt("Hi", ["text"], ["text"], min_p=0.2)
+    assert m.process_prompt("Hi", ["text"], ["text"], min_p=0)["text_inputs"][0].numel() == 2

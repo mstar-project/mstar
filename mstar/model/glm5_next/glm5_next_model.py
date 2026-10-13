@@ -427,6 +427,9 @@ class Glm5NextModel(Model):
         kwargs = sampling_kwargs(kwargs)
         self.get_request_resource_configs({}, kwargs)
         self.get_max_output_tokens(**kwargs)
+        if kwargs.get("min_p", 0) > 0:
+            # the node's sampler is built without min-p, and the request configs do not pass it on
+            raise ValueError(f"GLM-5.3 is served without min_p (min_p={kwargs['min_p']}); send none")
 
         if self.config.mtp_num_draft_tokens > 0:
             # MTP verifies by argmax. Refused here it is the client's 400; the worker's
