@@ -213,14 +213,6 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        releases the id. Above the conductor's own barrier TTL
        (``MSTAR_DRAIN_TTL_S``, 120s), which force-finalizes first. See
        :doc:`sessions`.
-   * - ``MSTAR_HELD_DRAIN_WAIT_S``
-     - ``5``
-     - How long a worker holds the teardown drain of a request it has not
-       admitted yet, waiting for the admission that mints its handle. Only the
-       handle names the TP followers the drain has to be fanned to, so draining
-       without one would leave their ``READS_DONE`` unsent. Past this the rank
-       drains and ACKs on its own, which is correct but un-fanned, so keep it
-       well under the conductor's barrier TTL (``MSTAR_DRAIN_TTL_S``, 120s).
 
 Serving (Rust frontend)
 -----------------------
