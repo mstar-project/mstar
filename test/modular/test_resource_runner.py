@@ -10,6 +10,7 @@ narrows) cannot quietly acquire a special case in the runner.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 
@@ -28,6 +29,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
     topo_sort,
 )
+from mstar.engine.resources import runner as runner_mod
 
 
 class _Stub(Resource):
@@ -321,6 +323,28 @@ def test_admit_is_ready_when_every_resource_is():
     runner = StepRunner({"kv": _Stub("kv"), "sampler": _Stub("sampler")})
     outcome = runner.admit(_step(["kv", "sampler"]))
     assert (outcome.ok, outcome.ready) == (True, True)
+
+
+def test_a_hundred_refusals_log_two_lines_and_count_the_rest(monkeypatch, caplog):
+    """A request waiting for pages is retried every hold backoff. A line per
+    refusal is what wrote 300k lines in nine minutes of one stall."""
+    reason = AllocationFailed(
+        message="Not enough free pages", pages_short=1, label="main", request_id="r1",
+    )
+    kv = _Stub("kv", admit_outcome=AdmitOutcome(ok=False, reason=reason))
+    runner = StepRunner({"kv": kv})
+    step = runner_mod._REFUSAL_LOG_INTERVAL / 50
+
+    with caplog.at_level(logging.WARNING, logger=runner_mod.__name__):
+        # a refusal every fiftieth of the interval, across two intervals
+        for tick in range(100):
+            monkeypatch.setattr(runner_mod, "monotonic", lambda t=tick: t * step)
+            runner.admit(_step(["kv"]))
+
+    lines = [r.getMessage() for r in caplog.records if "failed with error" in r.getMessage()]
+    assert len(lines) == 2, f"a hundred refusals logged {len(lines)} lines"
+    assert "(0 earlier refusals not logged)" in lines[0], lines[0]
+    assert "(49 earlier refusals not logged)" in lines[1], lines[1]
 
 
 # --- commit / publish ------------------------------------------------------

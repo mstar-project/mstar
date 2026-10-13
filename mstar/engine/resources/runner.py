@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Collection, Mapping
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any
 
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
@@ -23,6 +23,10 @@ from mstar.engine.resources.step import (
 from mstar.utils.profiler import PHASE_PERIOD, phase_record, range_pop, range_push
 
 logger = logging.getLogger(__name__)
+
+# seconds between refusal lines for one resource: a request waiting for pages is
+# retried every hold backoff, and a line per retry buries the rest of the log
+_REFUSAL_LOG_INTERVAL = 5.0
 
 
 def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
@@ -106,6 +110,8 @@ class StepRunner:
         # the step whose pre-plan is staged across the pre-planning resources,
         # as `_step_key` describes it; None when nothing is staged
         self._staged: tuple | None = None
+        # (line, resource) -> when it was last logged, and the refusals since
+        self._refusal_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
@@ -377,9 +383,9 @@ class StepRunner:
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
-                logger.warning(
+                self._log_refusal(
                     "Admit for resource %s failed with error: %s",
-                    key, outcome.reason.message
+                    key, outcome.reason.message,
                 )
                 for done in reversed([*admitted, key]):
                     self._resources[done].rollback_admit(
@@ -434,9 +440,9 @@ class StepRunner:
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
-                logger.warning(
+                self._log_refusal(
                     "Admit for pre-planning resource %s failed with error: %s",
-                    key, outcome.reason.message
+                    key, outcome.reason.message,
                 )
                 for done in reversed([*admitted, key]):
                     self._resources[done].rollback_admit(
@@ -446,6 +452,18 @@ class StepRunner:
             admitted.append(key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
+
+    def _log_refusal(self, line: str, key: str, message: str) -> None:
+        """One ``line`` per resource every few seconds, counting the rest."""
+        now = monotonic()
+        last, unlogged = self._refusal_logged.get((line, key), (None, 0))
+        if last is not None and now - last < _REFUSAL_LOG_INTERVAL:
+            self._refusal_logged[(line, key)] = (last, unlogged + 1)
+            return
+        self._refusal_logged[(line, key)] = (now, 0)
+        logger.warning(
+            line + " (%d earlier refusals not logged)", key, message, unlogged,
+        )
 
     def pre_plan(self, step: SubmoduleStep) -> dict[str, Any]:
         """plan the pre-planning subset, a step ahead
