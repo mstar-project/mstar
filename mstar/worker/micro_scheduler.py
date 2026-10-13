@@ -218,8 +218,10 @@ class PopReadyResult(NamedTuple):
 
 @dataclass(slots=True)
 class ChunkProgress:
-    """A row mid-prefill: tokens whose chunks have landed, and its total."""
+    """A row mid-prefill: tokens whose chunks have landed, the end of its last
+    scheduled chunk, and its total."""
     done: int
+    scheduled: int
     total: int
 
 
@@ -546,6 +548,7 @@ class MicroScheduler:
         pre_existing_batch_size: int=0,
         capture_group_of: int | None = None,
         pre_existing_seq_lens: Collection[int] = (),
+        mid_prefill: Collection[ReadyNodeEntry] = (),
     ) -> ScheduledBatch | None:
         """
         One step's worth: a pending TP follow batch if there is one, else
@@ -564,6 +567,9 @@ class MicroScheduler:
             capture_group_of: If set, the rid whose capture group the batch
                 must share; the speculation merge passes a continuing rid.
                 Otherwise the batch's first rid sets the group.
+            mid_prefill: With ``target``, the caller's rows partway through a
+                chunked prefill whose chunk is in flight. The ones the step
+                takes come back in the batch with their next chunk.
         """
         # Expire stale hold entries; done before any early returns
         now = time.monotonic()
@@ -610,6 +616,7 @@ class MicroScheduler:
                 capture_group_of=capture_group_of,
                 pre_existing_walk=pre_existing_walk,
                 pre_existing_seq_lens=pre_existing_seq_lens,
+                mid_prefill=mid_prefill,
             )
 
         # A backlogged key goes first, oldest first, so a split set drains
@@ -632,6 +639,8 @@ class MicroScheduler:
         if ready is None:
             ready = self._scan_ready(request_state, target, exclude_target)
         rr_key = self._select_node_rr(ready)
+        if rr_key is None and mid_prefill:
+            rr_key = target  # nothing is ready, but the rows mid-prefill still take a chunk
         if rr_key is None or rr_key in keys:
             return None
         return schedule(rr_key, ready.get(rr_key, []))
@@ -721,9 +730,11 @@ class MicroScheduler:
         capture_group_of: int | None,
         pre_existing_walk: str | None = None,
         pre_existing_seq_lens: Collection[int] = (),
+        mid_prefill: Collection[ReadyNodeEntry] = (),
     ) -> ScheduledBatch | None:
-        """One step for ``node_walk`` out of its backlog and its ready
-        ``entries``, composed by the batch builder."""
+        """One step for ``node_walk`` out of its backlog, its ready
+        ``entries`` and the caller's ``mid_prefill`` rows, composed by the
+        batch builder."""
         remaining = self._room_left(node_walk, pre_existing_walk, pre_existing_batch_size)
         if remaining == 0:
             # The caller already holds a full batch. Assembling would pop these
@@ -765,11 +776,21 @@ class MicroScheduler:
                     left.node_name, list(left.request_to_worker_graph),
                     list(left.request_to_worker_graph.values()),
                 )
-        if backlogged is None and not fresh:
+        continuing = None
+        if mid_prefill:
+            continuing = self._in_flight_rows(*node_walk, mid_prefill)
+            infos, tokens, chunks = self._measure_rows(
+                request_state, continuing, max_tokens=max_tokens,
+            )
+            blocked |= self._rows_without_room(request_state, continuing, infos)
+            row_tokens.update(tokens)
+            chunkable |= chunks
+        if backlogged is None and not fresh and continuing is None:
             return None
         return self._build_and_schedule(request_state, BatchBuildRequest(
             node_name=node_walk[0], graph_walk=node_walk[1],
             backlog=backlogged, fresh=fresh or None, blocked_rids=blocked,
+            continuing=continuing,
             capture_group_of=capture_group_of,
             walk_caps=walk_caps,
             pre_existing_batch_size=pre_existing_batch_size,
@@ -777,7 +798,20 @@ class MicroScheduler:
             max_batch_tokens=max_tokens if row_tokens else None,
             row_tokens=row_tokens,
             chunkable=chunkable,
-        ))
+        ), in_flight={entry.request_id for entry in mid_prefill} if mid_prefill else ())
+
+    def _in_flight_rows(
+        self, node_name: str, graph_walk: str, entries: Collection[ReadyNodeEntry],
+    ) -> ScheduledBatch:
+        """``entries`` as a batch, for rows whose nodes are in flight and so
+        cannot be popped."""
+        batch = ScheduledBatch(
+            node_name=node_name, graph_walk=graph_walk,
+            request_to_worker_graph={entry.request_id: entry.worker_graph_id for entry in entries},
+        )
+        if (node_name, graph_walk) in self._walks_of_key:
+            batch.request_walks = {entry.request_id: entry.graph_walk for entry in entries}
+        return batch
 
     def _room_left(
         self, node_walk: tuple[str, str], pre_existing_walk: str | None,
@@ -889,7 +923,7 @@ class MicroScheduler:
             walk = batch.walk_of(rid)
             progress = self.chunk_progress.get((rid, node))
             if progress is not None:
-                info = InputSeqLenInfo(progress.total - progress.done)
+                info = InputSeqLenInfo(progress.total - progress.scheduled)
             else:
                 info = lens[rid]
                 if info is None:
@@ -901,6 +935,9 @@ class MicroScheduler:
                 chunkable.add(rid)
                 if max_tokens is not None and info.seq_len > max_tokens:
                     info = InputSeqLenInfo(max(max_tokens, 1))
+                if progress is not None and progress.scheduled > progress.done:
+                    # The room check counts from the tokens stored, and the chunk in flight may not be stored yet.
+                    info = InputSeqLenInfo(info.seq_len + progress.scheduled - progress.done)
             infos[rid] = info
         return infos, tokens, chunkable
 
@@ -959,6 +996,7 @@ class MicroScheduler:
 
     def _build_and_schedule(
         self, request_state: RequestStateManager, request: BatchBuildRequest,
+        in_flight: Collection[int] = (),
     ) -> ScheduledBatch | None:
         """Have the batch builder compose one step for ``request``'s (node,
         walk), and carry out its verdict.
@@ -973,15 +1011,21 @@ class MicroScheduler:
             self._capture_group, request_state, *node_walk,
         )
         result: BatchBuildResult = self.batch_builder.build_batch(request)
+        backlog, returned = result.backlog, result.returned
+        if in_flight:
+            # An `in_flight` row left out of the step is neither parked nor pushed
+            # back, because its node returns to its queue when its chunk lands.
+            if backlog is not None:
+                backlog, _ = backlog.split_off_first(None, exclude_rids=in_flight)
+            returned = {rid: wg_id for rid, wg_id in (returned or {}).items() if rid not in in_flight}
         # Whatever was popped past this step has to be remembered here, or it
         # would never run.
-        if result.backlog is not None:
-            self._backlog(node_walk, result.backlog)
-        if result.returned:
-            self._set_in_flight(request.node_name, result.returned, False)
+        if backlog is not None:
+            self._backlog(node_walk, backlog)
+        if returned:
+            self._set_in_flight(request.node_name, returned, False)
             self.runtime.push_back_node(
-                request.node_name, list(result.returned),
-                list(result.returned.values()),
+                request.node_name, list(returned), list(returned.values()),
             )
         if result.scheduled is not None:
             self._mark_scheduled(*node_walk, len(result.scheduled))
@@ -1002,22 +1046,35 @@ class MicroScheduler:
                 cached = self.cached_prefix.pop(key, 0)
                 if rid not in chunk_tokens:
                     continue
-                progress = self.chunk_progress[key] = ChunkProgress(cached, cached + row_tokens[rid])
-            start, total = progress.done, progress.total
-            end = start + chunk_tokens.get(rid, total - start)
+                progress = self.chunk_progress[key] = ChunkProgress(cached, cached, cached + row_tokens[rid])
+            start, total = progress.scheduled, progress.total
+            end = progress.scheduled = start + chunk_tokens.get(rid, total - start)
             batch.chunk_ranges[rid] = (start, end)
             if end < total:
                 batch.incomplete_node_rids.add(rid)
 
-    def advance_chunk(self, rid: int, node_name: str, end: int) -> None:
-        """A chunk ending at ``end`` landed; the last one ends the row's progress."""
+    def advance_chunk(self, rid: int, node_name: str, end: int) -> bool:
+        """A chunk ending at ``end`` landed; the last one ends the row's progress.
+        True when the row's next chunk is already scheduled."""
         progress = self.chunk_progress.get((rid, node_name))
         if progress is None:
-            return
+            return False
         if end >= progress.total:
             del self.chunk_progress[(rid, node_name)]
-        else:
-            progress.done = end
+            return False
+        progress.done = end
+        if progress.scheduled > end:
+            return True
+        progress.scheduled = end  # rewound while this chunk was in flight
+        return False
+
+    def rewind_chunks(self, batch: ScheduledBatch) -> None:
+        """Called when ``batch``'s step will not run. Each of its chunked rows is
+        scheduled next from the end of the chunks that landed."""
+        for rid in batch.chunk_ranges:
+            progress = self.chunk_progress.get((rid, batch.node_name))
+            if progress is not None:
+                progress.scheduled = progress.done
 
     def _backlog(self, node_walk: tuple[str, str], batch: ScheduledBatch) -> None:
         """Park ``batch``, folding it into whatever already waits under this key.

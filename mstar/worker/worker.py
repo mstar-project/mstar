@@ -75,7 +75,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import MicroScheduler, ReadyNodeEntry, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 
 logger = logging.getLogger(__name__)
@@ -2284,6 +2284,10 @@ class Worker:
             usual tensor_manager path (same as ``_build_executing_batch``).
             Without this merge, new rids have to wait for the entire
             current speculation chain to drain before they can be scheduled.
+          * **mid-prefill** rids — rows of batch_N whose chunked prefill needs
+            another chunk. They take it in this step, so a prompt beside
+            decode rows runs a chunk every step. The scheduler sizes the chunk
+            beside the fresh rids.
         """
         batch_N = pending.batch
 
@@ -2321,7 +2325,7 @@ class Worker:
 
         # Removes, aborts and failures are filtered here; prep_spec_rids
         # assumes that.
-        # a row mid-prefill takes its next chunk after this one lands, never speculatively
+        # A row mid-prefill does not loop back on N's outputs, so it is left out of the rids prepped here.
         candidates = [
             r for r in groups[graph_walk]
             if not self._is_tearing_down(r) and r not in batch_N.incomplete_node_rids
@@ -2375,6 +2379,19 @@ class Worker:
             return None
         spec_walks = dict.fromkeys(prep.ready_rids, graph_walk)
 
+        # Under TP the rows mid-prefill wait for their chunk to land, because a
+        # follower would prep such a row as a continuing rid.
+        mid_prefill = []
+        incomplete = batch_N.incomplete_node_rids
+        if incomplete and speculating_same_node and spec_node_name not in self.parallel_nodes:
+            key = self.scheduler._key
+            mid_prefill = [
+                ReadyNodeEntry(r, wg_id, batch_N.walk_of(r))
+                for r, wg_id in batch_N.request_to_worker_graph.items()
+                if r in incomplete and not self._is_tearing_down(r)
+                and key(spec_node_name, batch_N.walk_of(r)) == key(*spec_target)
+            ]
+
         # Merge in fresh rids whose spec-target node is ready right now
         # Speculation only consumes work compatible with the spec target. In
         # partitioned models, unrelated ready work stays queued for
@@ -2389,6 +2406,7 @@ class Worker:
                 pending.node_batch.seq_len_of(r) if speculating_same_node else -1
                 for r in continuing
             ],
+            mid_prefill=mid_prefill,
         )
 
         if fresh_batch is not None:
@@ -2424,7 +2442,7 @@ class Worker:
                 spec_walks[rid] = fresh_batch.walk_of(rid)
 
         logger.debug("Speculating: %s %s", spec_node_name, continuing)
-        return self._assemble_speculation(
+        speculation = self._assemble_speculation(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, continuing,
@@ -2433,6 +2451,14 @@ class Worker:
             chunk_ranges=None if fresh_batch is None else fresh_batch.chunk_ranges,
             incomplete_node_rids=None if fresh_batch is None else fresh_batch.incomplete_node_rids,
         )
+        if mid_prefill:
+            # A cleared speculation pushes back its fresh rids. These rows are
+            # N's, and go back to their queue when their chunk lands.
+            speculation.continuing_rids.update(
+                entry.request_id for entry in mid_prefill
+                if entry.request_id in new_request_to_worker_graph
+            )
+        return speculation
 
     def _thread_outputs_to_speculative(
         self, speculation: Speculation,
@@ -2446,9 +2472,14 @@ class Worker:
         """
         threaded_continuing: set[int] = set()
         dropped: set[int] = set()
+        chunk_ranges = speculation.scheduled_batch.chunk_ranges
         for rid in list(speculation.node_batch.request_ids):
             if rid not in speculation.continuing_rids:
                 continue  # fresh rid — inputs already gathered.
+            if chunk_ranges and rid in chunk_ranges:
+                # a row mid-prefill reads the input the engine holds for it, not N's outputs
+                threaded_continuing.add(rid)
+                continue
             rid_outputs = outputs_N.get(rid, {})
             ok = True
             for input_name, _ in speculation.consumed_edges:
@@ -3025,7 +3056,8 @@ class Worker:
         self, batch_N: PendingBatch, step_outputs: BatchedModelOutput,
     ) -> bool:
         """Hold back a row whose node needs more chunks: its outputs wait in
-        the accumulator and its node goes back to the ready queue. The streamed
+        the accumulator and its node goes back to the ready queue, unless the
+        speculative step already runs its next chunk. The streamed
         outputs a consumer opted to take partially stay to be routed now; a row
         with none is dropped from the batch. A final chunk takes the held
         outputs back. False when no row is left to route."""
@@ -3035,7 +3067,7 @@ class Worker:
         for rid, (_, end) in batch.chunk_ranges.items():
             if rid not in batch.request_to_worker_graph:
                 continue
-            self.scheduler.advance_chunk(rid, node, end)
+            continued = self.scheduler.advance_chunk(rid, node, end)
             if rid in batch.incomplete_node_rids:
                 policies = self.engine_manager.get_engine(node).chunked_prefill_output_policies(
                     node, batch.walk_of(rid),
@@ -3053,7 +3085,8 @@ class Worker:
                     partial_rids.add(rid)
                 else:
                     batch.discard_rid(rid)
-                self._graph_runtime.push_back_node(node, [rid], [wg_id])
+                if not continued:
+                    self._graph_runtime.push_back_node(node, [rid], [wg_id])
             else:
                 engine = self.engine_manager.get_engine(node)
                 engine.release_chunk_inputs(rid, node)
@@ -3952,9 +3985,10 @@ class Worker:
                                 # The step will not run at all: un-ingest every
                                 # staged chunk and hand them all back.
                                 self._settle_speculation(speculation, success=False)
+                                sb = speculation.scheduled_batch
+                                self.scheduler.rewind_chunks(sb)
                                 # Fresh rids are not re-readied by N's routing
                                 # the way continuing rids are: give them back.
-                                sb = speculation.scheduled_batch
                                 fresh = [
                                     rid for rid in sb.request_to_worker_graph
                                     if rid not in speculation.continuing_rids
@@ -3976,6 +4010,7 @@ class Worker:
                         # a refusal, so in practice there is nothing to clear.
                         self._clear_in_flight_flag(pending.batch)
                         _maybe_clear_spec()
+                        self.scheduler.rewind_chunks(pending.batch)
                         self._drop_rows_whose_loop_stopped(pending)
                         self._handle_admit_failure(
                             pending.batch, pending.node_batch,
@@ -4153,6 +4188,9 @@ class Worker:
                     _phase_flush()
             except Exception as e:
                 self._handle_main_loop_error(e, (pending, spec_pending), batch, speculation)
+                if speculation is not None and spec_pending is None:
+                    # the speculation's fresh rids survive this error, and the chunks scheduled for them never ran
+                    self.scheduler.rewind_chunks(speculation.scheduled_batch)
                 # Follower: a head from a step that raised must not sit at the
                 # FIFO front with failed rids.
                 if pending is not None and self._is_tp_follow_pending(pending):
