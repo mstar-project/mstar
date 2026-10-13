@@ -35,6 +35,13 @@ High-level components
   transport over RDMA or TCP.
 - **Streaming** (``mstar/streaming/``): streaming output with configurable chunking
   policies and async partition topology.
+- **Sessions** (``mstar/model/sessions.py`` declares them,
+  ``mstar/api_server/sessions.py`` and ``mstar/worker/sessions.py`` track them):
+  a named context whose resource state outlives the request that built it. The
+  API server owns the registry (validation, TTL, the teardown tombstone), the
+  conductor pins the session's worker placement, and the resources a model named
+  hand their state to the session at removal instead of freeing it. See
+  :doc:`sessions`.
 
 Process failures
 ----------------

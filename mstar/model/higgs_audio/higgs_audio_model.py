@@ -279,6 +279,7 @@ class HiggsAudioModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         schedule = self._build_prefill_schedule(input_signals)
         if not schedule:

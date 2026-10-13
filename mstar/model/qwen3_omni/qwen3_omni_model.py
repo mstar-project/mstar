@@ -584,6 +584,7 @@ class Qwen3OmniModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         audio_output = "audio" in output_modalities
 

@@ -19,6 +19,8 @@ from starlette.websockets import WebSocketDisconnect
 
 from mstar.api_server import entrypoint
 from mstar.api_server.request_types import ResultChunk
+from mstar.api_server.sessions import SessionRegistry
+from mstar.model.sessions import SessionsConfig
 
 
 class _FakeServer:
@@ -39,6 +41,23 @@ class _FakeServer:
         return rid
 
     async def iter_result_chunks(self, request_id):
+        # the real ``submit_request`` queues a started or resumed session's
+        # frame ahead of any output
+        session = next(
+            (sub.get("session") for sub in self.submitted
+             if sub["request_id"] == request_id),
+            None,
+        )
+        if session is not None and session.session_id is not None:
+            yield ResultChunk(
+                request_id=request_id, modality="session",
+                data=session.session_id.encode("utf-8"),
+                metadata={
+                    "session_id": session.session_id,
+                    "created": session.created,
+                    "end_session": session.end_session,
+                },
+            )
         for i in range(self.chunks_per_request):
             yield ResultChunk(
                 request_id=request_id, modality="action",
@@ -243,3 +262,96 @@ def test_uploads_are_cleaned_up(monkeypatch, tmp_path):
     assert scheduled == [fake.submitted[0]["file_paths"]]
     saved = sorted(f.name.split("_", 1)[1] for f in tmp_path.iterdir())
     assert saved == ["a.png", "b.wav"], saved
+
+
+# ── sessions over the socket ────────────────────────────────────────────────
+#
+# The control loop is the surface that most wants them: a step continues from
+# the state the previous one left. The fields are the form route's, so a client
+# moves between the two without changing what it sends.
+
+def _session_server(tmp_path, **config):
+    fake = _FakeServer(tmp_path, chunks_per_request=1)
+    fake.torn_down = []
+    fake.sessions = SessionRegistry(
+        SessionsConfig(**config), teardown=fake.torn_down.append,
+    )
+    return fake
+
+
+def test_a_message_can_start_and_then_resume_a_session(monkeypatch, tmp_path):
+    fake = _session_server(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({
+            "text": "step", "request_id": "r1", "start_session": True,
+        }))
+        first = _recv_until_finish(ws, binary=False)
+        # the session is the first frame back, before any output
+        assert first[0]["modality"] == "session"
+        session_id = first[0]["metadata"]["session_id"]
+        assert first[0]["metadata"]["created"] is True
+        fake.sessions.finish_request("r1")
+
+        ws.send_text(json.dumps({
+            "text": "step", "request_id": "r2",
+            "resume_session": True, "session_id": session_id,
+        }))
+        second = _recv_until_finish(ws, binary=False)
+
+    assert second[0]["metadata"]["session_id"] == session_id
+    assert [sub["session"].resumed for sub in fake.submitted] == [False, True]
+
+
+def test_a_refused_session_names_the_status_the_form_route_would_give(
+    monkeypatch, tmp_path,
+):
+    fake = _session_server(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({
+            "text": "step", "request_id": "r1",
+            "resume_session": True, "session_id": "no-such-session",
+        }))
+        [reply] = _recv_until_finish(ws, binary=False)
+        # the socket survives it, like any other rejected message
+        ws.send_text(json.dumps({"text": "step", "request_id": "r2"}))
+        assert _recv_until_finish(ws, binary=False)[-1]["finish"] is True
+
+    assert reply["status"] == 404
+    assert "unknown session" in reply["error"]
+    assert fake.submitted[0]["request_id"] == "r2"
+
+
+def test_a_message_with_no_session_fields_never_touches_the_registry(
+    monkeypatch, tmp_path,
+):
+    fake = _FakeServer(tmp_path, chunks_per_request=1)  # no .sessions at all
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"text": "step", "request_id": "r1"}))
+        msgs = _recv_until_finish(ws, binary=False)
+
+    assert msgs[-1] == {"request_id": "r1", "finish": True}
+    assert fake.submitted[0]["session"].session_id is None
+
+
+def test_a_message_that_dies_after_claiming_a_session_releases_it(
+    monkeypatch, tmp_path,
+):
+    fake = _session_server(tmp_path)
+    fake.fail_for.add("r1")
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({
+            "text": "step", "request_id": "r1", "start_session": True,
+        }))
+        msgs = _recv_until_finish(ws, binary=False)
+
+    assert msgs[-1]["error"] == "bad request"
+    # the session it claimed went with it, rather than staying busy forever
+    assert len(fake.torn_down) == 1

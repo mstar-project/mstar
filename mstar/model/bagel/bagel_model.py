@@ -256,6 +256,10 @@ class BagelModel(Model):
     through interleaved text and image inputs.
     """
 
+    # The LLM nodes' submodule; a subclass serving the same LLM differently
+    # (``TextSessionModel``) swaps it here.
+    LLM_SUBMODULE_CLS: type[LLMSubmodule] = LLMSubmodule
+
     def __init__(
         self,
         model_path_hf: str,
@@ -432,7 +436,7 @@ class BagelModel(Model):
             self._init_language_model_components(
                 device, autocast_dtype=autocast_dtype, tp_group=tp_group,
             )
-            return LLMSubmodule(
+            return self.LLM_SUBMODULE_CLS(
                 language_model=self.language_model,
                 llm2vae=self.llm2vae,
                 vae2llm=self.vae2llm,
@@ -1271,6 +1275,7 @@ class BagelModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         target_output = output_modalities[0]  # "text" or "image"
 

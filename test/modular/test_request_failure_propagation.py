@@ -31,6 +31,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
 )
+from mstar.api_server.sessions import SessionRegistry
 from mstar.profile.format import RequestProfile, RequestTiming
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
@@ -87,6 +88,13 @@ def test_fail_requests_reports_per_rid_errors_once():
     assert msg.message_type == ConductorMessageType.FAIL_REQUESTS
     assert msg.body == FailRequests(errors={"r1": "boom", "r2": "bang"})
     assert w.scheduler.failed_rids == {"r1", "r2"}
+
+
+def test_fail_requests_carries_a_status_only_for_rids_it_reports():
+    w = _worker(known_rids=("r1",))
+    w._fail_requests({"r1": "cleared", "gone": "boom"}, {"r1": 410, "gone": 410})
+    [(_, msg)] = w.sent
+    assert msg.body == FailRequests(errors={"r1": "cleared"}, statuses={"r1": 410})
 
 
 def test_fail_requests_ignores_rids_the_worker_already_dropped():
@@ -186,6 +194,9 @@ def _api_server(messages):
     s.running = True
     s.conductor_proc = None
     s._liveness_interval_s = 0.5
+    s.sessions = SessionRegistry(None, teardown=lambda _sid: None)
+    s._next_session_sweep = 0.0
+    s._session_sweep_interval_s = 1.0
     s.log_stats = False
     s.cleaned = []
     s.communicator = SimpleNamespace(

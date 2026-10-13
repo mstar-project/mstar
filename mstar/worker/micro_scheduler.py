@@ -185,9 +185,12 @@ class MicroScheduler:
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
-        # Rids with a deferred remove; stop initiating new work for them.
-        # Shared by reference with Worker._pending_removes.
+        # Worker-owned, adopted by share_worker_rid_sets; empty until then.
+        # Rids with a deferred remove.
         self.pending_removes: set[int] = set()
+        # Handles minted for requests whose session has not handed its state
+        # over yet, so the engine has no state for them.
+        self.handles_awaiting_admit: set[int] = set()
 
         # WIRE STRING -> number of committed (ZMQ received) tp follow batches
         # still queued. On the fail/abort path we drain these before ACKing
@@ -237,12 +240,47 @@ class MicroScheduler:
         for rid in request_ids:
             self.held_until[rid] = deadline
 
+    def share_worker_rid_sets(
+        self, *,
+        pending_removes: set[int],
+        handles_awaiting_admit: set[int],
+    ) -> None:
+        """Adopt the worker's rid sets by reference, so what it adds takes
+        effect the same iteration. All of them gate new work; see
+        ``unschedulable_rids``.
+
+        Keyword-only: they are all ``set[int]``, so a positional call could
+        transpose two and nothing would complain.
+        """
+        self.pending_removes = pending_removes
+        self.handles_awaiting_admit = handles_awaiting_admit
+
+    @property
+    def unschedulable_rids(self) -> set[int]:
+        """Rids no new work may be initiated for: removed between scheduling
+        cycles, remove deferred for in-flight safety, in OOM backoff, recently
+        failed, or still waiting on their session to hand its state over."""
+        return (
+            self.pending_removes | set(self.held_until) | self.failed_rids
+            | self.handles_awaiting_admit
+        )
+
     def tp_rids(self, message: ScheduleTPNode) -> list[int]:
         """``ScheduleTPNode`` crosses the wire, so its rids are strings; these
         are this rank's handles for them, in the leader's order. A rid this rank
-        does not know maps to ``REMOVED_RID``."""
+        does not know maps to ``REMOVED_RID``.
+
+        So does one whose handle exists but whose session has not handed its
+        state over here yet: the engine has nothing for it, and ``check_ready``
+        would answer ``ADMIT_OK`` for an untransferred request rather than
+        refuse, so the batch has to defer on the sentinel instead. The ranks
+        can differ on this -- each waits for its own previous request to leave.
+        """
         return [
-            REMOVED_RID if (handle := self.rid_of(r)) is None else handle
+            REMOVED_RID
+            if (handle := self.rid_of(r)) is None
+            or handle in self.handles_awaiting_admit
+            else handle
             for r in message.request_ids
         ]
 
@@ -471,12 +509,9 @@ class MicroScheduler:
             self.num_consec_tp_follower_batches += 1
             return tp_follow_batch
 
-        # Do not schedule a request that was removed between scheduling
-        # cycles, has its remove deferred for in-flight safety, is in OOM
-        # backoff, or recently failed.
-        exclude = self.pending_removes | set(self.held_until) | self.failed_rids
         for spec in self.runtime.get_ready_nodes(
-            exclude, target=target, exclude_target=exclude_target,
+            self.unschedulable_rids, target=target,
+            exclude_target=exclude_target,
         ):
             if spec.node_name not in self.parallel_leader_nodes:
                 continue  # only rank 0 can initiate scheduling!

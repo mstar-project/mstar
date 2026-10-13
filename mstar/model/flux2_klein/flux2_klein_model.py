@@ -347,6 +347,7 @@ class Flux2KleinModel(Model):
     def get_initial_forward_pass_args(
         self, partition_name: str, input_modalities: list[str], output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         model_kwargs = model_kwargs or {}
         if not input_signals.get(TEXT_INPUTS):

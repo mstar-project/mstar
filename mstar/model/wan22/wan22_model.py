@@ -495,6 +495,7 @@ class Wan22Model(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         model_kwargs = model_kwargs or {}
         # These are backstops, not the primary guard. ``process_prompt`` already

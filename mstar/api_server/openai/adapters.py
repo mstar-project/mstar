@@ -999,6 +999,10 @@ class HiggsAudioAdapter(OpenAIAdapter):
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "bagel": BagelAdapter(),
+    # BAGEL's LLM, text only: the same chat request, and the deployment
+    # sessions are exercised against (see docs/sessions.rst).
+    "test_text_session": BagelAdapter(),
+    "test_text_session_qwen3_5": Qwen3_5Adapter(),
     "chatterbox": ChatterboxAdapter(),
     "chatterbox_multilingual": ChatterboxAdapter(),
     "chatterbox_turbo": ChatterboxAdapter(),

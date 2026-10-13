@@ -50,6 +50,8 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
     "wan22": "wan22.yaml",
+    # BAGEL's LLM, text only, with persistent sessions on its KV.
+    "test_text_session": "test_text_session.yaml",
     "waypoint": "waypoint.yaml",
     "flux2_klein": "flux2_klein.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",

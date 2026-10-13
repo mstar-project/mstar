@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping
 
 import torch
 
@@ -42,13 +42,16 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
 )
 from mstar.graph.runtime.base import GraphRuntime
+from mstar.model.sessions import RequestSession, SessionResourceConfig
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
+    OVERSHOT_LAST_ITER,
     ARNodeInputs,
     BatchedModelOutput,
     HostRows,
     InputMetadata,
     LazyRequestStates,
+    LazySessionStates,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -66,6 +69,7 @@ from mstar.utils.profiler import (
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
+    from mstar.model.sessions import SessionsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -382,6 +386,8 @@ class Engine:
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
+        # rid -> the session it belongs to, for the resources that hold state
+        self._request_sessions: dict[str, str] = {}
 
         # node -> (offloaded, reloaded) since the last ``take_resident_delta``.
         # Only a TP leader drains this, to replicate its resident set onto the
@@ -405,6 +411,7 @@ class Engine:
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
         model: "Model | None" = None,
+        sessions_config: "SessionsConfig | None" = None,
     ):
         self._device = device
         self._enable_nvtx = nvtx_enabled(self._enable_nvtx, device)
@@ -473,6 +480,7 @@ class Engine:
         )
 
         self._open_prefix_caches(specs_by_key, model)
+        self._open_session_state(specs_by_key, sessions_config)
 
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and
@@ -629,6 +637,123 @@ class Engine:
             )
             runners[label] = runner
         return runners
+
+    def _open_session_state(self, specs_by_key, sessions_config) -> None:
+        """Mark the resources whose state lives for a session, not a request.
+
+        A resource built against one of them (the position counters over a KV
+        cache) is marked too: its state addresses the state that is being kept,
+        so leaving it behind would put the next request's positions at 0 over
+        pages the session still holds.
+        """
+        if sessions_config is None:
+            return
+        unknown = sorted(sessions_config.resources.keys() - specs_by_key.keys())
+        if unknown:
+            raise ValueError(
+                f"sessions config holds state for resource(s) {unknown}, "
+                f"which this model does not declare; it declares "
+                f"{sorted(specs_by_key)}"
+            )
+        derived: dict[str, "SessionResourceConfig"] = {}
+        for key, resource in self._resources.items():
+            cfg = sessions_config.resources.get(key)
+            if cfg is None:
+                continue
+            if type(resource).retain_session_state is Resource.retain_session_state:
+                # it would inherit the no-op hooks and silently hold nothing
+                raise ValueError(
+                    f"resource {key!r} is named in the sessions config but "
+                    f"{type(resource).__name__} does not implement the session "
+                    "hooks, so it would hold nothing across a session"
+                )
+            resource.session_config = cfg
+        # one pass is enough: a dependency chain deeper than resource ->
+        # dependent (positions over KV) does not exist today
+        for key, resource in self._resources.items():
+            if resource.session_config is not None:
+                continue
+            if type(resource).retain_session_state is Resource.retain_session_state:
+                # nothing durable to hold (attention plans per step), so it
+                # keeps its ordinary per-request teardown
+                continue
+            if any(
+                self._resources.get(dep) is not None
+                and self._resources[dep].session_config is not None
+                for dep in resource.depends_on()
+            ):
+                derived[key] = SessionResourceConfig()
+                resource.session_config = derived[key]
+        self._refuse_partial_session_state(specs_by_key)
+        self._refuse_undersized_session_pools(sessions_config)
+        logger.info(
+            "Session state held by %s%s", self._runner.session_resource_keys(),
+            f" (derived from a dependency: {sorted(derived)})" if derived else "",
+        )
+
+    def _refuse_partial_session_state(self, specs_by_key) -> None:
+        """Every resource on a node that holds session state must hold it.
+
+        One that could (it implements the hooks) but is left out keeps its
+        per-request teardown, so a resumed request would continue the held
+        state and start the other from zero: a hybrid model's KV carried
+        across turns with its recurrent state silently reset.
+        """
+        held_nodes: dict[str, set[str]] = {}
+        for key, resource in self._resources.items():
+            if resource.session_config is not None:
+                for node in specs_by_key[key].nodes:
+                    held_nodes.setdefault(node, set()).add(key)
+        for key, resource in self._resources.items():
+            if resource.session_config is not None:
+                continue
+            if type(resource).retain_session_state is Resource.retain_session_state:
+                continue
+            for node in sorted(specs_by_key[key].nodes & held_nodes.keys()):
+                raise ValueError(
+                    f"the sessions config holds {sorted(held_nodes[node])} on "
+                    f"node {node!r} but not {key!r}, which keeps state there "
+                    "too: a resumed request would continue the one and start "
+                    f"{key!r} from zero. Name {key!r} in the sessions config "
+                    "as well."
+                )
+
+    def _refuse_undersized_session_pools(self, sessions_config) -> None:
+        """A pool that cannot move parked state aside must fit every session's.
+
+        Recurrent state has no host offload, so a parked session holds its slots
+        out of circulation until it ends. A pool one slot short of what the cap
+        allows does not fail at load today -- it turns into requests waiting at
+        admission for sessions to end, which reads as a hang rather than a
+        misconfiguration.
+
+        A lower bound, so it never refuses a pool that would have worked:
+        running requests need slots of their own on top of this, but
+        ``max_concurrent_requests`` is usually unset, and a session with no
+        ``max_state`` still holds at least one slot.
+        """
+        sessions = sessions_config.max_concurrent_sessions
+        if not sessions:
+            return
+        for key, resource in sorted(self._resources.items()):
+            cfg = resource.session_config
+            capacity = resource.session_capacity()
+            if cfg is None or capacity is None:
+                continue
+            needed = sessions * (cfg.max_state or 1)
+            if needed > capacity:
+                raise ValueError(
+                    f"resource {key!r} holds {capacity} units of state but "
+                    f"max_concurrent_sessions={sessions} parked sessions need "
+                    f"at least {needed} of them"
+                    + (
+                        f" ({sessions} x max_state={cfg.max_state})"
+                        if cfg.max_state else ""
+                    )
+                    + ", and running requests need their own on top. Parked "
+                    f"{key!r} cannot be offloaded, so raise its pool or lower "
+                    "max_concurrent_sessions."
+                )
 
     def _open_prefix_caches(self, specs_by_key, model) -> None:
         """Root each resource's cache in the weights, the preprocessing, and the
@@ -1174,6 +1299,9 @@ class Engine:
             # padding rows get their own states, like their cache streams:
             # the submodule indexes this by step id, not by real rid
             per_request_states=LazyRequestStates(submodule, rids),
+            per_session_states=LazySessionStates(
+                submodule, rids, self._request_sessions,
+            ),
             captured=lease is not None,
             step=step,
             per_request_input_metadata=batch.per_request_input_metadata,
@@ -1991,13 +2119,86 @@ class Engine:
     def add_request(
         self, request_id: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
+        session: RequestSession | None = None,
     ) -> None:
-        self._runner.ingest_request(request_id, overrides)
+        if session is not None:
+            session_id = session.session_id
+            # First ingest only: a request with two partitions here arrives
+            # twice, and the first may already have written session state.
+            if (
+                not session.resumed
+                and request_id not in self._request_sessions
+                and self._session_holds_state(session_id)
+            ):
+                # The API server only reuses an id once its last teardown was
+                # confirmed (or forced), so this is a leftover. Continuing from
+                # it would serve the new session someone else's context.
+                logger.warning(
+                    "Session %s is starting but state is still parked under "
+                    "its id; dropping it", session_id,
+                )
+                self.remove_session(session_id)
+            self._request_sessions[request_id] = session_id
+        self._runner.ingest_request(request_id, overrides, session=session)
 
-    def remove_request(self, request_id: str) -> None:
-        self._runner.remove_request(request_id)
+    def _session_holds_state(self, session_id: str) -> bool:
+        return self._runner.session_holds_state(session_id) or any(
+            session_id in submodule_mgmt.submodule.session_states
+            for submodule_mgmt in self._submodules.values()
+        )
+
+    def remove_request(
+        self, request_id: str, overshot_nodes: Collection[str] = (),
+        session_idle_seq: int = -1,
+    ) -> None:
+        """Drop the request. Its session keeps whatever it built; ending the
+        session is ``remove_session``, which the worker calls on its own
+        TEARDOWN_SESSION.
+
+        ``overshot_nodes`` are the nodes whose loop ran one speculative step past
+        its stop for this request; a continuing session is told so per node
+        (``OVERSHOT_LAST_ITER``), since that step wrote the stopping token.
+
+        ``session_idle_seq`` is the TP leader's stamp for the session going
+        idle, which orders it against the others parked here when a resource
+        has to reclaim one of them.
+
+        A rid that was never admitted is a no-op, not an error: the worker mints
+        a handle before a resumed request's session has handed its state over,
+        so a removal can arrive for one this engine never saw. Keep it that way
+        — index resources with ``get``/``pop``, never ``[rid]``.
+        """
+        session_id = self._request_sessions.pop(request_id, None)
+        self._runner.remove_request(
+            request_id, session_id=session_id, idle_seq=session_idle_seq,
+        )
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
+        if session_id is None:
+            return
+        for node_name, submodule_mgmt in self._submodules.items():
+            submodule = submodule_mgmt.submodule
+            if node_name in overshot_nodes:
+                submodule.session_state(session_id).add(OVERSHOT_LAST_ITER, True)
+            elif session_id in submodule.session_states:
+                # this turn stopped exactly on its token; a flag an earlier
+                # turn left must not speak for it
+                submodule.session_states[session_id].kwargs.pop(
+                    OVERSHOT_LAST_ITER, None,
+                )
+
+    def remove_session(self, session_id: str) -> None:
+        """Free everything the session holds, resources and submodules alike."""
+        for rid, sid in list(self._request_sessions.items()):
+            if sid == session_id:
+                self._request_sessions.pop(rid, None)
+        self._runner.remove_session(session_id)
+        for submodule_mgmt in self._submodules.values():
+            submodule_mgmt.submodule.cleanup_session(session_id)
+
+    def take_session_error(self, session_id: str) -> str | None:
+        """The budget overflow this session owes its next request, if any."""
+        return self._runner.take_session_error(session_id)
 
     def shutdown(self):
         for resource in self._resources.values():

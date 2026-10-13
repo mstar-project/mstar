@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 from mstar.engine.resources import PublishedInfo, ResourceReqConfig
+from mstar.model.sessions import RequestSession
 
 
 @dataclass
@@ -38,6 +39,10 @@ class CurrentForwardPassInfo:
     # conductor and api server never set it, and a peer overwrites whatever
     # arrives with its own.
     rid_handle: int = -1
+
+    # The persistent session this request belongs to, if any. Stamped by the
+    # conductor on every forward pass, so a submodule reads it off the step.
+    session: RequestSession | None = None
 
     # resource label -> the config this request's resources were opened
     # with. Sampling params, whether it needs CFG, retention: a request's

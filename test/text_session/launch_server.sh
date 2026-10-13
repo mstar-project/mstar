@@ -1,0 +1,38 @@
+#!/bin/bash
+# BAGEL's LLM, text only, with persistent sessions on its KV. One GPU.
+#
+#   CUDA_VISIBLE_DEVICES=0 bash test/text_session/launch_server.sh
+#
+# Then drive a session with:  python test/text_session/session_request.py
+set -euo pipefail
+
+PORT=${PORT:-8000}
+# $CONFIG so the session-matrix job can point one launcher at each corner of the
+# session config; see configs/text_session/.
+CONFIG=${CONFIG:-configs/test_text_session.yaml}
+WHO=${WHO:-$(whoami)}
+DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+# A prefix of its own: --port alone does not isolate the ZMQ IPC sockets, so two
+# servers on one host steal each other's handshake.
+PREFIX=${SOCKET_PREFIX:-/tmp/mstar_${WHO}_session/}
+
+# $PYTHON so a shell without the venv activated does not fall back to a system
+# interpreter that has none of the dependencies.
+PYTHON=${PYTHON:-${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}}
+PYTHON=${PYTHON:-$([ -x .venv/bin/python ] && echo .venv/bin/python || echo python)}
+
+# FlashInfer JITs kernels with ninja, which ships in the venv's bin, so the
+# interpreter's directory goes on PATH too -- without it the worker fails every
+# request with FileNotFoundError: 'ninja'.
+PATH="$(cd "$(dirname "$PYTHON")" && pwd):$PATH"
+export PATH
+
+# exec, so this script's pid *is* the server's: bash does not forward the
+# SIGINT that shuts the deployment down to a child.
+exec env CUDA_VISIBLE_DEVICES=$DEVICES "$PYTHON" -m mstar.api_server.entrypoint \
+    --config "$CONFIG" \
+    --port "$PORT" \
+    --socket-path-prefix "$PREFIX" \
+    --upload-dir "/tmp/mstar_uploads_${WHO}/" \
+    --tensor-comm-protocol SHM \
+    "$@"

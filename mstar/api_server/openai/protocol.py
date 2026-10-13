@@ -41,6 +41,16 @@ class ChatCompletionRequest(BaseModel):
     modalities: list[str] | None = None
     audio: dict[str, Any] | None = None  # {"voice": ..., "format": "wav"}
 
+    # Persistent sessions (an mstar extension; OpenAI has no equivalent). The
+    # server keeps the state this turn builds for the next turn naming the same
+    # session, so a client sends one turn rather than the whole transcript. See
+    # docs/sessions.rst; the fields mirror ``POST /generate``'s.
+    start_session: bool | None = False
+    resume_session: bool | None = False
+    end_session: bool | None = False
+    session_id: str | None = None
+    session_timeout_s: float | None = None
+
 
 class SpeechRequest(BaseModel):
     """OpenAI ``/v1/audio/speech`` (text-to-speech)."""

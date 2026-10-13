@@ -199,6 +199,7 @@ class KokoroModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        **kwargs,
     ) -> ForwardPassArgs:
         del partition_name, model_kwargs
         metadata = CurrentForwardConductorMetadata(

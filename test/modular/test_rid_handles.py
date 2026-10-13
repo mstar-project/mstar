@@ -17,6 +17,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker.micro_scheduler import REMOVED_RID, MicroScheduler
 from mstar.worker.rid_table import RidTable
+from mstar.worker.sessions import WorkerSessionManager
 from mstar.worker.worker import Worker
 
 # ── the table ──────────────────────────────────────────────────────────────
@@ -96,6 +97,34 @@ def test_tp_rid_this_rank_does_not_know_is_the_removed_sentinel():
     assert _scheduler(t).tp_rids(_follow("a", "gone")) == [a, REMOVED_RID]
 
 
+def test_tp_rid_awaiting_its_session_is_the_removed_sentinel_too():
+    """The handle exists but the engine has no state for it yet.
+
+    ``check_ready`` would answer ADMIT_OK for it rather than refuse (nothing is
+    published, so there is nothing to wait on), and the batch would then be
+    planned against resources that were never opened. The ranks differ on this
+    -- each waits for its own previous request to leave -- so the follower has
+    to defer on the sentinel, exactly as it does for a rid it never knew.
+    """
+    t = RidTable()
+    a, waiting = t.intern("a"), t.intern("waiting")
+    s = _scheduler(t)
+    s.handles_awaiting_admit.add(waiting)
+
+    assert s.tp_rids(_follow("a", "waiting")) == [a, REMOVED_RID]
+
+
+def test_a_rid_awaiting_its_session_is_never_scheduled():
+    # the set the scheduling loop passes to get_ready_nodes
+    t = RidTable()
+    ok, waiting = t.intern("ok"), t.intern("waiting")
+    s = _scheduler(t)
+    s.handles_awaiting_admit.add(waiting)
+
+    assert waiting in s.unschedulable_rids
+    assert ok not in s.unschedulable_rids
+
+
 def test_follow_refcount_counts_rids_this_rank_cannot_resolve():
     """Counted by WIRE STRING, so a rid whose NEW_REQUEST has not landed yet
     still gates the drain. Resolving to handles here would drop it, and the
@@ -143,6 +172,8 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
         per_request_info={h: SimpleNamespace() for h in handles},
         remove_request=lambda h: w.request_state.per_request_info.pop(h),  # noqa: PLW0108
     )
+    w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
+    w._handles_awaiting_admit = set()
     return w, t
 
 
@@ -162,10 +193,16 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     a, b = t.handle("req-a"), t.handle("req-b")
     w._in_flight_rids = set()
     w._pending_removes = set()
+    w._deferred_idle_seq = {}
+    w._session_idle_seq = 0
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
+    w._handles_awaiting_admit = set()
     w._last_active = {}
     w.streaming_buffers = {a: {}}
-    w.engine_manager = SimpleNamespace(remove_request=lambda h: None, evictable_nodes=lambda: [])
+    w.engine_manager = SimpleNamespace(
+        remove_request=lambda h, **kw: None,
+        evictable_nodes=lambda: [],
+    )
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
     w.profile_info = SimpleNamespace(pop_request=lambda h: None)
     w.scheduler.held_until[a] = float("inf")
@@ -238,7 +275,9 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
         lambda request_id, request_info: got.__setitem__("state", request_id)
     )
     w.engine_manager = SimpleNamespace(
-        add_request=lambda rid, cfgs: got.__setitem__("engine", rid),
+        add_request=lambda rid, cfgs, session=None: got.__setitem__(
+            "engine", rid,
+        ),
         evictable_nodes=lambda: [],
     )
     w.tensor_manager = SimpleNamespace(
@@ -246,13 +285,14 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
         start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
     w._draining_rids = set()
+    w._handles_awaiting_admit = set()
     w._last_active = {}
     w._my_consumer_connections = []
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._unprocessed_messages = {}
     info = SimpleNamespace(
         rid_handle=-1, resource_configs={}, graph_walk="decode",
-        partition_name="p",
+        partition_name="p", session=None,
     )
     body = SimpleNamespace(
         request_id="wire-1", request_info=info,
@@ -283,11 +323,12 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     req = SimpleNamespace(stream_buffers={}, stream_buffers_by_consumer={})
     w.request_state.add_request = lambda request_id, request_info: None
     w.request_state.per_request_info = collections.defaultdict(lambda: req)
-    w.engine_manager = SimpleNamespace(add_request=lambda rid, cfgs: None, evictable_nodes=lambda: [])
+    w.engine_manager = SimpleNamespace(add_request=lambda rid, cfgs, session=None: None, evictable_nodes=lambda: [])
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
     w._draining_rids, w._last_active, w._unprocessed_messages = set(), {}, {}
+    w._handles_awaiting_admit = set()
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._consumer_node_cache = {"codec_tokens": "Codec"}
     w._my_consumer_connections = [Connection(
@@ -298,7 +339,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     def new(partition, lead):
         info = SimpleNamespace(
             rid_handle=-1, resource_configs={}, graph_walk="w", partition_name=partition,
-            stream_lead_items=lead,
+            stream_lead_items=lead, session=None,
         )
         body = SimpleNamespace(
             request_id="wire-1", request_info=info, partition_worker_graph_ids={},

@@ -34,6 +34,7 @@ from mstar.client.types import (
     AudioChunk,
     GenerateResult,
     ImageChunk,
+    SessionInfo,
     StreamEvent,
     TextChunk,
     VideoFrameChunk,
@@ -100,6 +101,11 @@ class MStarClient:
         input_modalities=None,
         stream: bool = False,
         request_id: str | None = None,
+        start_session: bool = False,
+        resume_session: bool = False,
+        end_session: bool = False,
+        session_id: str | None = None,
+        session_timeout_s: float | None = None,
         **model_kwargs,
     ):
         """Submit a multimodal generation request.
@@ -111,9 +117,17 @@ class MStarClient:
         ``temperature=0.7``, ``max_output_tokens=256``); ``None`` values are
         dropped so server-side defaults apply.
 
+        ``start_session`` / ``resume_session`` / ``end_session`` (with
+        ``session_id``) run the request in a persistent session, so the server
+        keeps the state it builds for the next request in that session. A
+        started session with no id reports the one the server minted: as a
+        :class:`SessionInfo` first event when streaming, and as
+        ``GenerateResult.session_id`` otherwise.
+
         Returns a :class:`GenerateResult` when ``stream=False``, or an iterator
-        of :class:`StreamEvent` when ``stream=True``. Raw ``video_frame`` output
-        is streaming-only and yields :class:`VideoFrameChunk` objects.
+        of :class:`StreamEvent` when ``stream=True``; a session request yields
+        a :class:`SessionInfo` first, and raw ``video_frame`` output is
+        streaming-only and yields :class:`VideoFrameChunk` objects.
         """
         if "video_frame" in output_modalities and not stream:
             raise ValueError(
@@ -131,6 +145,17 @@ class MStarClient:
             data["input_modalities"] = ",".join(input_modalities)
         if request_id is not None:
             data["request_id"] = request_id
+        for name, flag in (
+            ("start_session", start_session),
+            ("resume_session", resume_session),
+            ("end_session", end_session),
+        ):
+            if flag:
+                data[name] = "true"
+        if session_id is not None:
+            data["session_id"] = session_id
+        if session_timeout_s is not None:
+            data["session_timeout_s"] = str(session_timeout_s)
         mk = {k: v for k, v in model_kwargs.items() if v is not None}
         if mk:
             data["model_kwargs"] = json.dumps(mk)
@@ -238,6 +263,38 @@ class MStarClient:
         if res.text is None:
             raise RuntimeError("Server returned no transcript")
         return res.text
+
+    # ------------------------------------------------------------------
+    # Sessions
+    # ------------------------------------------------------------------
+
+    def end_session(self, session_id: str) -> dict:
+        """Tear a session down without sending a request through it."""
+        resp = self._session.delete(
+            f"{self.base_url}/sessions/{session_id}", timeout=self.timeout
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def session_counts(self) -> dict:
+        """How many sessions the server holds: ``live``, ``closing`` and
+        ``max_concurrent_sessions``. The server does not list ids."""
+        resp = self._session.get(
+            f"{self.base_url}/sessions", timeout=self.timeout
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def session(self, session_id: str) -> dict | None:
+        """One session's state (``closing``, ``expires_in_s``,
+        ``active_request_ids``, ...), or None once the server has released it."""
+        resp = self._session.get(
+            f"{self.base_url}/sessions/{session_id}", timeout=self.timeout
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
 
     def voices(self) -> list[str]:
         """The ``voice`` ids the served speech model accepts (``GET /v1/audio/voices``)."""
@@ -406,6 +463,14 @@ class MStarClient:
                 f"Server stream failed{status_suffix}: "
                 f"{raw.decode('utf-8', 'replace')}"
             )
+        if modality == "session":
+            return SessionInfo(
+                session_id=meta.get("session_id")
+                or raw.decode("utf-8", "replace"),
+                created=bool(meta.get("created")),
+                end_session=bool(meta.get("end_session")),
+                metadata=meta,
+            )
         if modality == "text":
             return TextChunk(raw.decode("utf-8", "replace"), meta)
         if modality == "image":
@@ -441,6 +506,7 @@ class MStarClient:
         audio = AudioBuffer(b"".join(audio_pcm), sample_rate) if audio_pcm else None
         return GenerateResult(
             request_id=payload.get("request_id"),
+            session_id=payload.get("session_id"),
             text="".join(text_parts) if text_parts else None,
             images=images,
             audio=audio,

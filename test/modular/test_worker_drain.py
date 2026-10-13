@@ -18,6 +18,7 @@ from mstar.utils.ipc_format import (
     RemoveRequest,
 )
 from mstar.worker.rid_table import RidTable
+from mstar.worker.sessions import WorkerSessionManager
 from mstar.worker.worker import Worker
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -40,6 +41,9 @@ def _worker(
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
     w._pending_removes = set()
+    w._handles_awaiting_admit = set()
+    w._deferred_idle_seq = {}
+    w._session_idle_seq = 0
     # Identity interning: these tests use the rid string as its own handle, so
     # the string/handle split is exercised without a real runtime.
     w._graph_runtime = SimpleNamespace(
@@ -52,6 +56,7 @@ def _worker(
             SimpleNamespace(groups=[]) if r in known_rids else None
         ),
     )
+    w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
     w._last_active = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
@@ -69,7 +74,8 @@ def _worker(
         remove_request=lambda rid: None,
     )
     w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid: None, evictable_nodes=lambda: [],
+        remove_request=lambda rid, **kw: None,
+        evictable_nodes=lambda: [],
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.tensor_manager = SimpleNamespace(
@@ -294,6 +300,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
     w._draining_rids = set()
+    w._handles_awaiting_admit = set()
     w._unprocessed_messages = {}
     w._my_consumer_connections = []
     w._last_active = {}
@@ -315,16 +322,21 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w.request_state = SimpleNamespace(
         per_request_info={}, add_request=_state_add,
     )
+    w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: ["n"],
-        add_request=lambda rid, cfgs: seen.setdefault("engine", rid),
+        add_request=lambda rid, cfgs, session=None: seen.setdefault(
+            "engine", rid,
+        ),
     )
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, cfg: seen.setdefault("tensors", rid),
         start_read_tensors=lambda rid, inputs, graph_walk: [],
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
+    info = SimpleNamespace(
+        resource_configs={}, graph_walk="g", partition_name="p", session=None,
+    )
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={},

@@ -108,12 +108,25 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``Tongyi-MAI/Z-Image-Turbo``
      - Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
        encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.
+   * - ``test_text_session``
+     - ``ByteDance-Seed/BAGEL-7B-MoT``
+     - BAGEL's LLM on its own, text in and text out, holding its KV across a
+       persistent session. The deployment that exercises :doc:`sessions`.
+   * - ``test_text_session_qwen3_5``
+     - ``Qwen/Qwen3.5-4B``
+     - Qwen3.5's LLM, text in and text out, holding both its KV pages and its
+       GDN recurrent state across a persistent session. The hybrid-attention
+       counterpart to ``test_text_session``; thinking is forced off.
 
 Notes
 -----
 
 - Models marked *(Beta)* are functionally supported but not yet
   performance-optimized; treat their throughput/latency as provisional.
+- ``test_text_session`` and ``test_text_session_qwen3_5`` are narrowed views of
+  existing checkpoints rather than models of their own; they are there to
+  exercise persistent sessions end to end, over a pure-attention KV and over a
+  hybrid's KV plus recurrent state respectively.
 - The IDs above are representative. You may use local paths or compatible variants.
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.

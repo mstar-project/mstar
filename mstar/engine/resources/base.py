@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         PiecewiseCudaGraphConfig,
     )
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.model.sessions import SessionResourceConfig
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,59 @@ class Resource(ABC):
 
     def remove_request(self, rid: str):
         return
+
+    # Session lifecycle
+
+    # set by the engine at load; None means this resource is cleared with the request
+    session_config: "SessionResourceConfig | None" = None
+
+    def adopt_session_state(self, rid: str, session_id: str) -> None:
+        """Hand the session's held state to ``rid``, if the session holds any.
+
+        Called at ingest, after ``ingest_request``, so the request starts where
+        the session's last request left off.
+        """
+        return
+
+    def retain_session_state(
+        self, rid: str, session_id: str, idle_seq: int = -1,
+    ) -> None:
+        """Take ``rid``'s state back into the session instead of freeing it.
+
+        Called in place of ``remove_request`` when the request belonged to a
+        live session.
+
+        ``idle_seq`` is the TP leader's stamp for when the session went idle
+        (``RemoveRequest.session_idle_seq``), increasing with each session that
+        parks its state. A resource that reclaims parked state orders its
+        victims by it, so every rank picks the same ones in the same order
+        without a journal entry per move; one that never reclaims ignores it.
+        """
+        return
+
+    def remove_session(self, session_id: str) -> None:
+        """Free everything the session holds. The session is over."""
+        return
+
+    def session_capacity(self) -> int | None:
+        """How much parked session state this resource can hold at once, in its
+        own units, or ``None`` when nothing fixed bounds it.
+
+        Only a resource that cannot move parked state out of the way answers:
+        its pool has to fit every session at once, which the engine checks
+        against the sessions config at load. One that can offload (a KV cache
+        with a host pool) returns ``None`` -- a pool too small for the parked
+        state costs it page moves, not a refusal.
+        """
+        return None
+
+    def session_state_size(self, session_id: str) -> int:
+        """What the session holds, in this resource's own units."""
+        return 0
+
+    def clear_session_state(self, session_id: str) -> None:
+        """Drop the session's state but keep the session itself alive."""
+        self.remove_session(session_id)
 
     def admit_retrieve(
         self, rid: str,
