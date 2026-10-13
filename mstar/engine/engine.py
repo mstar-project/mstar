@@ -62,6 +62,7 @@ from mstar.utils.profiler import PHASE_PERIOD, mark, phase_record, range_pop, ra
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
+    from mstar.worker.batch_builder import BudgetSplit
 
 logger = logging.getLogger(__name__)
 
@@ -419,6 +420,8 @@ class Engine:
         self._chunking_policies: dict[tuple[str, str], ChunkingPolicy] = {}
         # the serving config's max_batch_tokens: node -> budget, (node, walk) -> budget; None is off
         self._token_budget_overrides: dict[str | tuple[str, str], int | None] = {}
+        # the serving config's budget_split, which the scheduler reads; None is max-min
+        self.budget_split: BudgetSplit | None = None
 
     def load_model(
         self,

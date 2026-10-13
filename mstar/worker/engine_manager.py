@@ -17,6 +17,7 @@ from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.streams import reset_device_scheduling
+from mstar.worker.batch_builder import BudgetSplit
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,15 @@ def refuse_combined_walks_across_tp_groups(
                 f"spans TP groups (walk -> TP size: {sizes}); its walks must "
                 "share one group or all have world size 1"
             )
+
+
+def _budget_split(model_config: dict) -> BudgetSplit:
+    """The serving config's ``budget_split``, max-min when it sets none."""
+    name = model_config.get("budget_split") or BudgetSplit.MAX_MIN.value
+    names = [split.value for split in BudgetSplit]
+    if name not in names:
+        raise ValueError(f"budget_split {name!r} is not one of {names}")
+    return BudgetSplit(name)
 
 
 def _refuse_unknown_walks(model: Model) -> None:
@@ -279,6 +289,7 @@ class EngineManager:
         if unknown:
             raise ValueError(f"max_batch_tokens names nodes {unknown} that no node group serves")
         engine.set_token_budgets(budgets, set(model.get_graph_walk_graphs()))
+        engine.budget_split = _budget_split(model_config)
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
         return cls(engine=engine, node_names=set(node_names))

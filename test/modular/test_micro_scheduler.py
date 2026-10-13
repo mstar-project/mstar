@@ -212,6 +212,8 @@ class _Manager:
 
 
 class _Engine:
+    budget_split = None
+
     def __init__(
         self, max_bs=None, not_ready=frozenset(), unservable=frozenset(),
         groups=None,

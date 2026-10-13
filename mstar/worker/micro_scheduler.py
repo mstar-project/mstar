@@ -693,7 +693,7 @@ class MicroScheduler:
                 spec.node_name, spec.graph_walk,
             )
             # max-min never reads the arrival order
-            split = getattr(self.engine_manager.get_engine(spec.node_name), "budget_split", None)
+            split = self.engine_manager.get_engine(spec.node_name).budget_split
             ordered = split is not None and split is not BudgetSplit.MAX_MIN
             entries = None
             for rid in spec.rids:
@@ -756,7 +756,7 @@ class MicroScheduler:
         max_tokens = engine.get_max_batch_tokens(*node_walk)
         if max_tokens is not None:
             max_tokens -= _pre_existing_tokens(pre_existing_seq_lens, pre_existing_batch_size)
-        split = getattr(engine, "budget_split", None) or BudgetSplit.MAX_MIN
+        split = engine.budget_split or BudgetSplit.MAX_MIN
         # A chunk is MIN_CHUNK tokens even with less budget left, so a row needs room for that many.
         chunk_room = max_tokens
         if max_tokens is not None and split is not BudgetSplit.MAX_MIN:

@@ -273,7 +273,7 @@ class ChunkingPolicy:
     """How a walk's prefill may be split across steps; the default is not at all."""
     # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
     chunkable: bool = False
-    # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
+    # the token budget of a step of this walk; a combined walk that carries chunks sets one too
     max_batch_tokens: int | None = None
     # output edge -> how its chunks are joined; unlisted edges CONCAT on dim 0
     output_policies: Mapping[str, ChunkedPrefillOutputPolicy] = field(default_factory=dict)
