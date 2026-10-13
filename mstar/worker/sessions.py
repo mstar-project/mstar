@@ -215,30 +215,32 @@ class WorkerSessionManager:
             if not self.requests_still_leaving(session_id)
         ]
 
-    def forget_session(self, session_id: str) -> None:
+    def forget_session(self, session_id: str) -> list[NewRequest]:
         """Drop every trace of the session; its state is being freed.
 
-        Including any NEW_REQUEST still held for it: the state it is waiting to
-        adopt is going, and ``_apply_pending_sessions`` admits held ingests
-        first, so leaving it behind would admit a request nobody will schedule
-        and block every later teardown of the same id on this worker.
+        Returns any request still waiting on it, for the caller to fail: the
+        state it was waiting to adopt is going, and
+        ``_apply_pending_sessions`` finishes admitting waiters first, so one
+        left behind would be admitted into a session that no longer exists and
+        would block every later teardown of the same id on this worker.
         """
         self._pending_session_teardowns.discard(session_id)
         self._session_followers.pop(session_id, None)
         for rid in self._session_rids.pop(session_id, set()):
             self._rid_session.pop(rid, None)
             self._overshot.pop(rid, None)
-        dropped = [
-            held for held in self._pending_session_ingests
-            if _session_id_of(held) == session_id
-        ]
+        dropped, kept = [], []
+        for held in self._pending_session_ingests:
+            (dropped if _session_id_of(held) == session_id else kept).append(held)
         if dropped:
-            self._pending_session_ingests = [
-                held for held in self._pending_session_ingests
-                if _session_id_of(held) != session_id
-            ]
+            self._pending_session_ingests = kept
             logger.info(
-                "Dropped %d request(s) held for session %s; it is being torn "
+                "Dropped %d request(s) waiting on session %s; it is being torn "
                 "down: %s", len(dropped), session_id,
                 [held.request_id for held in dropped],
             )
+        # Returned, not just dropped: the caller still has to clear their
+        # handles and fail them, exactly as it does for ``take_held_ingests``'s
+        # dropped list. Letting them go silently leaves the handle in
+        # ``_handles_awaiting_admit``, where nothing would ever take it out.
+        return dropped

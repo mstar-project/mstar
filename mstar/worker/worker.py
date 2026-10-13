@@ -91,6 +91,16 @@ _HOLD_LOG_INTERVAL = 5.0
 _ADMIT_FENCE_TIMEOUT_S = 10.0
 
 
+def _by_session(bodies: "list[NewRequest]") -> "dict[str, list[NewRequest]]":
+    """Group requests by the session they were waiting on."""
+    out: dict[str, list[NewRequest]] = {}
+    for body in bodies:
+        session = body.request_info.session
+        if session is not None:
+            out.setdefault(session.session_id, []).append(body)
+    return out
+
+
 def _make_graph_runtime(
     communicator,
     tensor_manager,
@@ -968,9 +978,32 @@ class Worker:
                     ),
                 ),
             )
-        self._sessions.forget_session(session_id)
+        self._fail_requests_awaiting_session(
+            self._sessions.forget_session(session_id), session_id,
+        )
         self.engine_manager.remove_session(session_id)
         self._ack_session_torn_down(session_id)
+
+    def _fail_requests_awaiting_session(
+        self, bodies: list[NewRequest], session_id: str,
+    ) -> None:
+        """Fail requests that were waiting on a session that has now gone.
+
+        Admitting one would resume it from an empty context, which is worse
+        than an error; 410 is what the route promises for state that is gone.
+        One message for all of them, so a request with several partitions here
+        -- which appears once per partition -- is reported once.
+        """
+        errors, statuses = {}, {}
+        for body in bodies:
+            handle = body.request_info.rid_handle
+            self._handles_awaiting_admit.discard(handle)
+            errors[handle] = (
+                f"session {session_id} was torn down before this request ran"
+            )
+            statuses[handle] = 410
+        if errors:
+            self._fail_requests(errors, statuses)
 
     def _rid_is_leaving(self, rid: int) -> bool:
         """Whether this rid handle is still on its way out: held by an
@@ -990,17 +1023,8 @@ class Worker:
         longer exists.
         """
         ready, dropped = self._sessions.take_held_ingests()
-        for body in dropped:
-            # Its session went while it waited. Fail it rather than admit it
-            # into nothing: a resumed request that silently started from an
-            # empty context is worse than an error, and 410 is what the route
-            # promises for state that is gone.
-            handle = body.request_info.rid_handle
-            self._handles_awaiting_admit.discard(handle)
-            self._fail_requests(
-                {handle: "its session was torn down before this request ran"},
-                {handle: 410},
-            )
+        for session_id, waiters in _by_session(dropped).items():
+            self._fail_requests_awaiting_session(waiters, session_id)
         for body in ready:
             handle = body.request_info.rid_handle
             if body.request_id in self._draining_rids:

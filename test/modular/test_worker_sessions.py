@@ -421,6 +421,30 @@ def test_a_request_awaiting_its_session_opens_no_engine_state():
     assert w._sessions.session_of("Y") == "s"
 
 
+def test_a_teardown_that_runs_at_once_still_fails_the_waiter():
+    # The other order: nothing of the session's is leaving, so the teardown
+    # runs immediately and takes the waiter out via forget_session rather than
+    # take_held_ingests. Both have to clear the handle and fail the request --
+    # dropping the body alone leaves the handle in _handles_awaiting_admit,
+    # where nothing ever takes it out and the scheduler excludes it forever.
+    w = _worker(known_rids=("X",), sessions={"s": {"X"}})
+    failed = []
+    w._fail_requests = lambda errors, statuses=None: failed.append((errors, statuses))
+    Worker._add_new_request(w, _new_request(session_id="s"))
+    assert w._handles_awaiting_admit == {"Y"}
+
+    # X leaves first, so requests_still_leaving is false and the teardown does
+    # not have to wait
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    _deliver(w, TeardownSession(session_id="s"))
+
+    assert w.removed_sessions == ["s"]
+    assert w._handles_awaiting_admit == set(), "the handle would be stranded"
+    [(errors, statuses)] = failed
+    assert list(errors) == ["Y"] and statuses == {"Y": 410}
+    assert w._sessions.has_pending is False
+
+
 def test_a_request_whose_session_dies_while_it_waits_is_failed_410():
     # admitting it would resume from an empty context, which is worse than an
     # error; 410 is what the route promises for state that is gone
