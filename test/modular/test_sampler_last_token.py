@@ -2,10 +2,13 @@
 captured sample writes a per-step row, commit scatters it to the slot master,
 the next step gathers its input ids by slot; an eager step writes and reads
 the master by request."""
+import threading
+
+import numpy as np
 import pytest
 import torch
 
-from mstar.engine.resources.sampler.utils import SamplerBuffers
+from mstar.engine.resources.sampler.utils import HostBuffer, SamplerBuffers, SamplingConfig
 
 
 def _buffers(max_bs=4, cg_slots=2):
@@ -81,6 +84,37 @@ def test_registration_growth_leaves_the_device_masters_to_the_gpu_thread():
     bufs.gather_dynamic(["a", "b"], 2, 0)
     assert bufs.last_token.master.shape[0] >= 3 and bufs.offset.master.shape[0] >= 3
     assert bufs.gather_last_tokens(0, 2).tolist() == [5, 6]
+
+
+def test_plan_thread_row_init_survives_a_concurrent_host_regrow(monkeypatch):
+    """A plan-thread ``_init_slot`` between the regrow's copy and swap must still land."""
+    bufs = _buffers(max_bs=2, cg_slots=1)
+    copied, written = threading.Event(), threading.Event()
+    paused = []
+
+    def grow_master(self, new_capacity):
+        new = np.full(new_capacity, self.default, dtype=self.master.dtype)
+        new[: self.master.shape[0]] = self.master
+        if not paused:
+            paused.append(self)
+            copied.set()
+            written.wait(timeout=0.3)  # times out once the write waits on the lock
+        self.master = new
+
+    monkeypatch.setattr(HostBuffer, "grow_master", grow_master)
+    bufs.register_request("a", SamplingConfig(temperature=0.0))
+    bufs.register_request("b")
+
+    def plan():
+        copied.wait()
+        bufs.gather_static(["a"], 1, 0)  # inits a's row on the plan thread
+        written.set()
+
+    t = threading.Thread(target=plan)
+    t.start()
+    bufs.register_request("c")  # grows the host masters on the main thread
+    t.join()
+    assert bufs.temperature.master[bufs._rid_to_slot["a"]] == 0.0
 
 
 def _ingraph(max_bs=4, cg_slots=2, slots=8):

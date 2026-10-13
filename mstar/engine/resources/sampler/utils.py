@@ -1376,6 +1376,8 @@ class SamplerBuffers:
     # thread, default stream) drains it.
     _pending_offset_reset: set[int] = field(default_factory=set, repr=False)
     _offset_reset_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Host master-row writes vs their regrow; a plan-thread write between copy and swap was lost.
+    _host_master_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Last-known config per rid — change-detect for ``update_request_config``
     # so steady-state per-step calls do zero GPU work (for the scalar rows).
     _cached_config: dict[str, SamplingConfig] = field(default_factory=dict, repr=False)
@@ -1509,13 +1511,16 @@ class SamplerBuffers:
             # argmax (first index on ties), which from_probs returns for any
             # seed. See ``sample_cuda_graphable_gpu``.
             t, k, p = 0.0, 0, 1.0
-        self.temperature.write_master_row(slot, t)
-        self.top_k.write_master_row(slot, k)
-        self.top_p.write_master_row(slot, p)
-        self.seed.write_master_row(slot, cfg.seed)
-        self.rep_penalty.write_master_row(slot, float(cfg.repetition_penalty))
-        if self.min_p is not None:
-            self.min_p.write_master_row(slot, float(cfg.min_p) if cfg.temperature > 0 else 0.0)
+        with self._host_master_lock:
+            self.temperature.write_master_row(slot, t)
+            self.top_k.write_master_row(slot, k)
+            self.top_p.write_master_row(slot, p)
+            self.seed.write_master_row(slot, cfg.seed)
+            self.rep_penalty.write_master_row(slot, float(cfg.repetition_penalty))
+            if self.min_p is not None:
+                self.min_p.write_master_row(
+                    slot, float(cfg.min_p) if cfg.temperature > 0 else 0.0
+                )
         self._config_version += 1
 
     def _grow_master(self, new_capacity: int) -> None:
@@ -1525,7 +1530,8 @@ class SamplerBuffers:
         master capacity. Per-step buffers (sized to the cuda-graph max_bs) are
         NOT resized — the gather only reads ``padded_bs`` rows from master.
 
-        Host rows only; the device masters grow on the gpu thread (``_sync_device_capacity``).
+        Host rows only, under the lock ``_write_master_row`` takes, so a plan-thread
+        ``_init_slot`` cannot land in the old array; device masters grow on the gpu thread.
         """
         if self.ingraph_scatter:
             raise RuntimeError(
@@ -1533,8 +1539,9 @@ class SamplerBuffers:
                 "sampler with the in-graph scatter on; raise MSTAR_SAMPLER_SLOTS "
                 "or set MSTAR_SAMPLER_INGRAPH_SCATTER=0"
             )
-        for buf in self._scalar_buffers():
-            buf.grow_master(new_capacity)
+        with self._host_master_lock:
+            for buf in self._scalar_buffers():
+                buf.grow_master(new_capacity)
         old_capacity = self._master_capacity
         self._master_capacity = new_capacity
         self._free_slots.extend(range(old_capacity, new_capacity))
