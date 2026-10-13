@@ -19,7 +19,8 @@ def reset_device_scheduling(device) -> None:
     """
     import ctypes
 
-    if not torch.cuda.is_available():
+    # goes through the CUDA driver API, which ROCm builds don't have
+    if not torch.cuda.is_available() or torch.version.hip is not None:
         return
     dev = torch.device(device)
     if dev.type != "cuda":
