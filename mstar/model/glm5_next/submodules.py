@@ -500,22 +500,27 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs],
         slot_lease: SlotLease | None,
     ) -> tuple[tuple[tuple[str, str, int], ...], tuple[tuple[str, str, int], ...]]:
-        """Where an eager long prefill saves its request's KDA state for a later prompt that
+        """Where an eager long prefill saves each request's KDA state for a later prompt that
         shares it, kept and spare: its last whole page, which a next turn extending the prompt
         needs, then as spares its windows' ends from the newest, where pages end. A spare takes
-        only a free slot, so it never evicts another session's last page."""
+        only a free slot, so it never evicts another session's last page. A captured prefill
+        saves nothing: its graph cannot stop at a request's page."""
         if (self._snapshot_page is None or graph_walk != "prefill" or slot_lease is not None
-                or len(request_ids) != 1 or not self.config.dsa_long_context):
+                or not self.config.dsa_long_context):
             return (), ()
-        rid, n = request_ids[0], inputs[0].input_seq_len
-        state = self.request_states.get(rid)
-        start = state.get("cached_prefix", 0) if state is not None else 0
         page, size = self._snapshot_page, self.config.prefill_window_tokens
-        last = (start + n) // page * page
-        ends = sorted({start + k * size for k in range(1, -(-n // size))} - {last}, reverse=True)
-        kept = [(rid, LABEL, last)] if start < last else []
-        spares = [(rid, LABEL, p) for p in ends if p % page == 0]
-        return tuple(kept), tuple(spares[:_SNAPSHOTS_PER_PROMPT - len(kept)])
+        kept, spares = [], []
+        for rid, inp in zip(request_ids, inputs, strict=True):
+            state, n = self.request_states.get(rid), inp.input_seq_len
+            start = state.get("cached_prefix", 0) if state is not None else 0
+            last = (start + n) // page * page
+            ends = sorted({start + k * size for k in range(1, -(-n // size))} - {last},
+                          reverse=True)
+            mine = [(rid, LABEL, last)] if start < last else []
+            room = _SNAPSHOTS_PER_PROMPT - len(mine)
+            kept += mine
+            spares += [(rid, LABEL, p) for p in ends if p % page == 0][:room]
+        return tuple(kept), tuple(spares)
 
     def preprocess(
         self,
@@ -826,14 +831,17 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     @staticmethod
     def _snapshot_cuts(engine_inputs: ModelInputsFromEngine, ctx) -> dict[int, tuple]:
-        """The step's KDA snapshots by the row they follow: one request, from its first row."""
+        """The step's KDA snapshots by the row they follow, each from its request's first row."""
         step = getattr(engine_inputs, "step", None)
         rec = step.steps.get(KDA_STATE) if step is not None else None
         snaps = (*getattr(rec, "snapshots", ()), *getattr(rec, "spare_snapshots", ()))
         if not snaps:
             return {}
-        first = ctx.host_pos[0]
-        return {tokens - first: (rid, label, tokens) for rid, label, tokens in snaps}
+        # each request's first row and that row's position
+        first = {engine_inputs.request_ids[req]: (r0, ctx.host_pos[r0])
+                 for r0, n, req in ctx.spans if n}
+        return {first[rid][0] + tokens - first[rid][1]: (rid, label, tokens)
+                for rid, label, tokens in snaps}
 
     # -- MTP device side ---------------------------------------------------
 

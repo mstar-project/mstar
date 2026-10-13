@@ -167,7 +167,7 @@ def _kda_state(engine, rid: str) -> list[torch.Tensor]:
             for layer in range(pool.config.num_layers)]
 
 
-def _generate(engine, rid: str, prompt: list[int], keyed: bool = True, decode: bool = True):
+def _configs(prompt: list[int], keyed: bool = True) -> dict:
     configs = {SAMPLER: SamplingReqConfig(temperature=0.0, ignore_eos=True)}
     if keyed:
         whole = len(prompt) // PAGE
@@ -175,7 +175,11 @@ def _generate(engine, rid: str, prompt: list[int], keyed: bool = True, decode: b
         tail = {"main": prompt[whole * PAGE:]}
         configs[KV_CACHE] = KVReqConfig(prefix_keys=keys, prefix_tail=tail)
         configs[KDA_STATE] = KVReqConfig(prefix_keys=keys, prefix_tail=tail)
-    engine.add_request(rid, configs)
+    return configs
+
+
+def _generate(engine, rid: str, prompt: list[int], keyed: bool = True, decode: bool = True):
+    engine.add_request(rid, _configs(prompt, keyed))
     out, stops = _step(engine, "prefill", {rid: torch.tensor(prompt)})
     state = _kda_state(engine, rid)
     seq = out[rid]["new_token"][0].tolist()
@@ -217,6 +221,30 @@ def test_a_prompt_past_a_cached_prefix_generates_what_a_fresh_prefill_does(k, tm
         # random model's tokens barely move without it, so the state itself is compared
         for have, ref in zip(state, want_state, strict=True):
             assert torch.equal(have, ref), rid
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_prompts_prefilled_in_one_step_each_save_their_state(k, tmp_path):
+    """a and o share a prefill step; each saves its state where its own pages end, so a next
+    turn of either skips its first 144 tokens and lands where a fresh prefill does."""
+    firsts = {"a": _prompt(150, seed=1), "o": _prompt(150, seed=7)}
+    engine, hits = _build_engine(k, tmp_path)
+    for rid, prompt in firsts.items():
+        engine.add_request(rid, _configs(prompt))
+    _step(engine, "prefill", {rid: torch.tensor(prompt) for rid, prompt in firsts.items()})
+    for rid in firsts:
+        engine.remove_request(rid)
+    for rid, prompt in firsts.items():
+        hits.clear()
+        nxt = prompt[:144] + _prompt(30, seed=2)
+        got, state = _generate(engine, f"{rid}2", nxt, decode=False)
+        assert hits and hits[0] == 144, (rid, hits)
+        want, want_state = _generate(_build_engine(k, tmp_path)[0], f"{rid}2", nxt, keyed=False,
+                                     decode=False)
+        assert got == want, rid
+        # o's windows also end where a's do, so its state matches to rounding
+        for have, ref in zip(state, want_state, strict=True):
+            torch.testing.assert_close(have, ref, rtol=0, atol=1e-6, msg=rid)
 
 
 def test_a_prefix_no_snapshot_reaches_is_served_whole(tmp_path):
