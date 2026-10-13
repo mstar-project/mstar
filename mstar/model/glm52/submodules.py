@@ -859,11 +859,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     ):
         if "new_token" not in outputs:
             return
-        if "text_inputs" in outputs:
-            # MTP verify step: the forward returned the next input (the token after the
-            # accepted drafts); new_token is the host's cut of the verdict
-            return
-        outputs["text_inputs"] = outputs["new_token"]
+        # an MTP verify step's forward returned the next input (the token after the
+        # accepted drafts); new_token is the host's cut of the verdict
+        outputs.setdefault("text_inputs", outputs["new_token"])
         if request_id in self._ended_at_prefill:
             # the reply already ended: this step only closes the decode loop
             del outputs["new_token"]
@@ -889,20 +887,18 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             is_eos = last in self.config.eos_token_ids
             generated = self._mtp_checked.get(request_id, 0) + tokens.numel()
             self._mtp_checked[request_id] = generated
-            if (not ignore_eos and is_eos) or generated >= budget:
-                return {"decode_loop"}
-            return set()
-        token = outputs["new_token"][0].item()
-        is_eos = token in self.config.eos_token_ids
+        else:
+            token = outputs["new_token"][0].item()
+            is_eos = token in self.config.eos_token_ids
+            # max_tokens counts the token the prefill emits, so the total is
+            # 1 + (iters + 1) decode tokens
+            generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
         if request_info.graph_walk == "prefill":
             # no decode_loop on this walk to stop: a stop token ends the reply at the first
             # decode step, and the conductor ends a max_tokens of 1 here
             if not ignore_eos and is_eos:
                 self._ended_at_prefill.add(request_id)
             return set()
-        # max_tokens counts the token the prefill emits, so the total is
-        # 1 + (iters + 1) decode tokens
-        generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
         if (not ignore_eos and is_eos) or generated >= budget:
             return {"decode_loop"}
         return set()
