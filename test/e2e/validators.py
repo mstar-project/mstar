@@ -6,6 +6,7 @@ import functools
 import hashlib
 import io
 import json
+import re
 import wave
 
 import numpy as np
@@ -20,7 +21,7 @@ class Expect:
     frames, audio or float32; ``modality`` is the ``/generate`` response key."""
     kind: str
     modality: str | None = None
-    contains_any: tuple[str, ...] = ()  # text: one of these as a whole word
+    contains_any: tuple[str, ...] = ()  # text: one of these as a whole word; "not red" passes "red"
     color: str | None = None            # image: "red" or "blue" dominates
     size: tuple[int, int] | None = None  # image, video, frames: (width, height)
     frames: int | None = None            # video, frames: exact frame count
@@ -64,7 +65,8 @@ def _keeps(suffix):
 
 
 def _words(text: str) -> list[str]:
-    return "".join(c if c.isalnum() else " " for c in text.lower()).split()
+    """Lowercase words; a decimal ("4.5", "1,000") is one word, so it does not match "4"."""
+    return re.findall(r"\d+(?:[.,]\d+)+|[^\W_]+", text.lower())
 
 
 def check_text(text: str, expect: Expect) -> Verdict:

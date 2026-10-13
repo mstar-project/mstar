@@ -30,6 +30,7 @@ from cases import MODELS, SENTENCE, Case, ModelSpec  # noqa: E402
 from matrix import (  # noqa: E402
     VRAM_HEADROOM,
     VramSampler,
+    cases_without_inputs,
     config_gpus,
     gap_report,
     gpu_inventory,
@@ -115,15 +116,18 @@ def server_env(args) -> dict[str, str]:
     return env
 
 
-def run_model(spec: ModelSpec, cases: tuple[Case, ...], source: Path, config: Path, out: Path, args, gpus) -> dict:
+def run_model(spec: ModelSpec, cases: tuple[Case, ...], source: Path, config: Path, out: Path, args, gpus,
+              result: dict) -> None:
+    """Fill ``result`` as cases complete, so an interrupted run keeps them."""
     env = server_env(args)
-    result = dict(config=str(config), config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+    result.update(config=str(config), config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
                   model_kwargs=(yaml.safe_load(config.read_text()) or {}).get("model_kwargs", {}), cases={})
     log = out / "server.log"
     server = Server(source, config, log, port=args.port, env=env, startup_timeout=args.startup_timeout,
                     tensor_comm_protocol=args.tensor_comm_protocol)
     sampler = VramSampler([g.index for g in gpus[:config_gpus(config)]])
     try:
+        server.choose_port()  # before the sampler's thread starts forking nvidia-smi
         with sampler, server as url:
             result["startup_seconds"] = round(server.startup_seconds, 1)
             for case in cases:
@@ -139,6 +143,8 @@ def run_model(spec: ModelSpec, cases: tuple[Case, ...], source: Path, config: Pa
                     path.write_bytes(data)
                     result["cases"][case.name]["artifact"] = str(path)
                 _print_case(spec.name, case.name, verdict)
+                if server.poll() is not None:
+                    raise ServerError(f"server exited with code {server.exit_code} during {case.name}; see {log}")
             for a, b in spec.must_differ:
                 if a not in result["cases"] or b not in result["cases"]:
                     continue
@@ -154,6 +160,7 @@ def run_model(spec: ModelSpec, cases: tuple[Case, ...], source: Path, config: Pa
         if isinstance(exc, KeyboardInterrupt):
             raise
     finally:
+        _server_facts(server, result)
         result["peak_vram_gb"] = round(sampler.peak, 1)
         _await_release(spec.name, sampler, result)
     text = log.read_text(errors="replace") if log.exists() else ""
@@ -161,7 +168,15 @@ def run_model(spec: ModelSpec, cases: tuple[Case, ...], source: Path, config: Pa
         result["out_of_memory"] = True
     if spec.peak_vram_gb and sampler.peak > spec.peak_vram_gb * VRAM_HEADROOM:
         result["vram_warning"] = f"peak {sampler.peak:.1f} GB exceeds the recorded {spec.peak_vram_gb} GB"
-    return result
+
+
+def _server_facts(server: Server, result: dict) -> None:
+    if server.exit_code is not None:
+        result["server_exit_code"] = server.exit_code
+    if server.restarts:
+        result["server_restarts"] = server.restarts  # port taken while the model loaded
+    if server.survivors:
+        result["server_survivors"] = server.survivors  # pids alive after SIGKILL
 
 
 def _await_release(name: str, sampler: VramSampler, result: dict) -> None:
@@ -198,6 +213,7 @@ def transcribe_speech(report: dict, args, sources: dict, out: Path, gpus) -> Non
     sampler = VramSampler([g.index for g in gpus[:config_gpus(config)]])
     result = report["speech_round_trip"] = dict(config=str(config), clips=len(clips))
     try:
+        server.choose_port()  # before the sampler's thread starts forking nvidia-smi
         with sampler, server as url:
             for name, label, case_name, path in clips:
                 try:
@@ -211,10 +227,13 @@ def transcribe_speech(report: dict, args, sources: dict, out: Path, gpus) -> Non
                 entry[label]["cases"][f"{case_name}__says_sentence"] = dict(_verdict_dict(verdict), seconds=0)
                 entry["status"] = model_status(entry)
                 _print_case(name, f"{case_name} says the sentence", verdict)
+                if server.poll() is not None:
+                    raise ServerError(f"server exited with code {server.exit_code}; see {server.log_path}")
     except ServerError as exc:
         result["server_error"] = str(exc)
         print(f"speech round trip: SERVER FAIL {exc}", flush=True)
     finally:
+        _server_facts(server, result)
         _await_release(spec.name, sampler, result)
 
 
@@ -247,7 +266,9 @@ def main() -> int:
     p.add_argument("--config", action="append", default=[], metavar="MODEL=PATH", help="override a model's config")
     p.add_argument("--out", type=Path, default=Path(tempfile.gettempdir()) / "mstar-e2e",
                    help="report and server logs (default: %(default)s)")
-    p.add_argument("--port", type=int, help="fixed server port (default: a free one)")
+    p.add_argument("--port", type=int,
+                   help="fixed server port; a profile fails if another process holds it (default: a free port "
+                        "picked at launch, retried once if taken while the model loads)")
     p.add_argument("--offline", action="store_true",
                    help="use only the local Hugging Face cache, for weights and fixtures (HF_HUB_OFFLINE=1)")
     p.add_argument("--eager", action="store_true", help="TORCH_COMPILE_DISABLE=1 for every server (implied by smoke)")
@@ -269,10 +290,9 @@ def main() -> int:
     if args.compare_source:
         sources["compare"] = args.compare_source.resolve()
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out = (args.out / stamp).resolve()
+    out = (args.out / f"{stamp}-{os.getpid()}").resolve()
     report = dict(started=stamp, argv=sys.argv, tier=args.tier, models={})
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, _interrupt)
+    install_interrupt_handlers()
     try:
         _execute(args, overrides, sources, out, report)
     except KeyboardInterrupt:
@@ -293,7 +313,7 @@ def main() -> int:
     if args.list and "error" not in report:
         return 0
     failed = [n for n, e in report["models"].items() if e["status"] == "failed"]
-    not_run = [n for n, e in report["models"].items() if e["status"] == "not run"]
+    not_run = [n for n, e in report["models"].items() if e["status"] in ("not run", "interrupted")]
     print(f"\n{'no failures' if not failed else 'failed: ' + ', '.join(failed)}")
     if not_run:
         print(f"not run{' (interrupted)' if report.get('interrupted') else ''}: {', '.join(not_run)}")
@@ -321,6 +341,13 @@ def _interrupt(signum, frame):
     raise KeyboardInterrupt(f"signal {signum}")
 
 
+def install_interrupt_handlers() -> None:
+    """SIGTERM and SIGHUP stop the run like Ctrl-C, unless inherited ignored (nohup)."""
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) != signal.SIG_IGN:
+            signal.signal(sig, _interrupt)
+
+
 def _execute(args, overrides: dict, sources: dict, out: Path, report: dict) -> None:
     gpus = gpu_inventory()
     report.update(environment=environment(gpus), sources={k: git_info(v) for k, v in sources.items()},
@@ -336,9 +363,23 @@ def _execute(args, overrides: dict, sources: dict, out: Path, report: dict) -> N
         config = Path(overrides.get(name, sources["source"] / spec.config)).resolve()
         if not config.is_file():
             raise FileNotFoundError(f"{name}: config {config} does not exist")
-        reason = plan(spec, config, gpus, args.offline)
+        notes = []
+        reason = plan(spec, config, gpus, args.offline, notes)
         report["models"][name] = dict(family=spec.family, config=str(config), gpus=config_gpus(config),
                                       recorded_peak_vram_gb=spec.peak_vram_gb)
+        if notes and not reason:
+            report["models"][name]["warnings"] = notes
+            for note in notes:
+                print(f"  {name:24} {spec.family:9} WARN  {note}", flush=True)
+        unbuildable = cases_without_inputs(cases)
+        if unbuildable:
+            report["models"][name]["skipped_cases"] = unbuildable
+            cases = tuple(c for c in cases if c.name not in unbuildable)
+            if not cases:
+                reason = reason or "; ".join(dict.fromkeys(unbuildable.values()))
+            elif not reason:
+                for case_name, why in unbuildable.items():
+                    print(f"  {name:24} {spec.family:9} skip case {case_name}: {why}", flush=True)
         if reason:
             report["models"][name]["skipped"] = reason
         else:
@@ -351,7 +392,12 @@ def _execute(args, overrides: dict, sources: dict, out: Path, report: dict) -> N
         entry = report["models"][spec.name]
         for label, src in sources.items():
             cfg = config if label == "source" else Path(overrides.get(spec.name, src / spec.config)).resolve()
-            entry[label] = run_model(spec, cases, src, cfg, out / spec.name / label, args, gpus)
+            entry[label] = {}
+            try:
+                run_model(spec, cases, src, cfg, out / spec.name / label, args, gpus, entry[label])
+            except KeyboardInterrupt:
+                entry["status"] = "interrupted"
+                raise
         if "compare" in entry:
             for name, case in entry["source"]["cases"].items():
                 other = entry["compare"]["cases"].get(name, {})

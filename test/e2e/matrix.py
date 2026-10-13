@@ -1,5 +1,6 @@
 """Which profiles fit this machine, and which configs and models have no case."""
 import dataclasses
+import importlib.util
 import os
 import subprocess
 import sys
@@ -50,9 +51,11 @@ def gpu_inventory() -> list[Gpu]:
 
 
 def config_gpus(config: Path) -> int:
+    """Distinct GPUs the config's ranks run on; ``rank_devices`` can put several ranks on one."""
     data = yaml.safe_load(config.read_text()) or {}
     ranks = {r for group in data.get("node_groups") or [] for r in group.get("ranks") or []}
-    return max(len(ranks), 1)
+    placement = {int(r): int(d) for r, d in (data.get("rank_devices") or {}).items()}
+    return max(len({placement.get(r, r) for r in ranks}), 1)
 
 
 def missing_modules(modules: tuple[str, ...], python: str = sys.executable) -> list[str]:
@@ -65,20 +68,35 @@ def missing_modules(modules: tuple[str, ...], python: str = sys.executable) -> l
     return missing
 
 
-def inaccessible_repos(repos: tuple[str, ...]) -> list[str]:
-    from huggingface_hub import auth_check
+def cases_without_inputs(cases) -> dict[str, str]:
+    """Cases whose inputs need a module the runner cannot import, with the reason."""
+    unbuildable = {}
+    for case in cases:
+        missing = [m for m in case.requires if importlib.util.find_spec(m) is None]
+        if missing:
+            unbuildable[case.name] = f"its input needs missing package(s): {', '.join(missing)}"
+    return unbuildable
 
-    blocked = []
+
+def inaccessible_repos(repos: tuple[str, ...]) -> tuple[list[str], dict[str, str]]:
+    """Repos the account cannot download, and repos whose access could not be checked (with why)."""
+    from huggingface_hub import auth_check
+    from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+
+    blocked, unknown = [], {}
     for repo in repos:
         try:
             auth_check(repo)
-        except Exception:  # noqa: BLE001
+        except (GatedRepoError, RepositoryNotFoundError):
             blocked.append(repo)
-    return blocked
+        except Exception as exc:  # noqa: BLE001
+            unknown[repo] = f"{type(exc).__name__}: {exc}"[:200]
+    return blocked, unknown
 
 
-def plan(spec: ModelSpec, config: Path, gpus: list[Gpu], offline: bool) -> str | None:
-    """None if the profile can run here, else the reason it is skipped."""
+def plan(spec: ModelSpec, config: Path, gpus: list[Gpu], offline: bool, notes: list[str] | None = None) -> str | None:
+    """None if the profile can run here, else the reason it is skipped. Caveats
+    that do not skip it, such as an access check that failed, go to ``notes``."""
     if not gpus:
         return "no CUDA GPU visible"
     needed = config_gpus(config)
@@ -92,10 +110,13 @@ def plan(spec: ModelSpec, config: Path, gpus: list[Gpu], offline: bool) -> str |
     if missing:
         return f"missing package(s): {', '.join(missing)}"
     if spec.gated and not offline:
-        blocked = inaccessible_repos(spec.gated)
+        blocked, unknown = inaccessible_repos(spec.gated)
         if blocked:
             links = ", ".join(f"https://huggingface.co/{r}" for r in blocked)
             return f"gated checkpoint: accept the license at {links}"
+        if unknown and notes is not None:
+            # Offline or no network: cached weights may still load, so run and let the load decide.
+            notes.extend(f"could not check access: {r} ({why}); running anyway" for r, why in unknown.items())
     return None
 
 

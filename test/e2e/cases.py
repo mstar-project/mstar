@@ -17,6 +17,7 @@ class Case:
     build: Callable[[], dict]         # JSON body, or form fields plus optional "files"
     expect: Expect
     smoke: bool = False
+    requires: tuple[str, ...] = ()    # modules the runner needs to build the input
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,6 +82,7 @@ def moving_square_mp4(frames: int = 16, size: int = 256, fps: int = 8) -> bytes:
 
 
 SPEECH_DATASET = ("hf-internal-testing/librispeech_asr_dummy", "clean/validation-00000-of-00001.parquet")
+SPEECH_FIXTURE = ("pyarrow", "soundfile")  # what speech_sample() imports
 OFFLINE = False  # set by --offline: fixtures come from the local Hugging Face cache
 
 
@@ -264,7 +266,8 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
     ), "speech", requires=("qwen_tts",), peak_vram_gb=52.2),
     ModelSpec("qwen3tts_base", "configs/qwen3tts_base.yaml", (
         Case("voice_clone", "speech", speech(language="English", ref_text=speech_transcript,
-                                             ref_audio=lambda: data_url(speech_wav(), "audio/wav")), SPEECH),
+                                             ref_audio=lambda: data_url(speech_wav(), "audio/wav")), SPEECH,
+             requires=SPEECH_FIXTURE),
     ), "speech", requires=("qwen_tts",), peak_vram_gb=51.7),
     ModelSpec("qwen3tts_voicedesign", "configs/qwen3tts_voicedesign.yaml", (
         Case("voice_design", "speech", speech(instructions="A clear, friendly adult female voice.",
@@ -291,17 +294,21 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
     ), "speech", requires=("omnivoice.models.omnivoice_flashinfer",), peak_vram_gb=3.7),
     ModelSpec("whisper_large", "configs/whisper_large.yaml", (
         Case("speech_to_text", "transcribe", transcribe(),
-             Expect("text", transcript="MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES"), smoke=True),
+             Expect("text", transcript="MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES"), smoke=True,
+             requires=SPEECH_FIXTURE),
     ), "asr", peak_vram_gb=12.6),
     ModelSpec("higgs_audio", "configs/higgs_audio.yaml", (
         Case("speech_to_text", "transcribe", transcribe(model="higgs_audio"),
-             Expect("text", transcript="MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES")),
+             Expect("text", transcript="MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES"),
+             requires=SPEECH_FIXTURE),
     ), "asr", peak_vram_gb=11.5),
     ModelSpec("flux2_klein", "configs/flux2_klein.yaml", image_cases({}, smoke=True), "image", peak_vram_gb=47.3),
     ModelSpec("flux2_klein_9b", "configs/flux2_klein_9b.yaml", image_cases({}), "image",
               gated=("black-forest-labs/FLUX.2-klein-9B",), peak_vram_gb=48.0),
     ModelSpec("z_image_turbo", "configs/z_image_turbo.yaml", image_cases({}, edit=False), "image", peak_vram_gb=40.3),
     ModelSpec("cosmos3", "configs/cosmos3_nano.yaml", (
+        # Cosmos3 images are checked for size and content, not color: two steps
+        # give Edge a pale pink (mean RGB 240, 207, 206) that fails "red dominates".
         Case("text_to_image", "generate", generate(
             "A red square on a white background.", "image", {**SMALL, "num_inference_steps": 2, "guidance_scale": 3}),
             Expect("image", modality="image", size=(256, 256))),

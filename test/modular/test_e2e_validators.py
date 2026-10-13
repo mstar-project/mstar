@@ -3,24 +3,28 @@ import base64
 import io
 import json
 import os
+import re
+import shutil
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import wave
 from pathlib import Path
 
 import numpy as np
 import pytest
+import requests
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "e2e"))
 
-from cases import MODELS, ModelSpec, moving_square_mp4, red_square_png, scene_png  # noqa: E402
-from matrix import Gpu, gap_report, plan  # noqa: E402
-from server import Server, ServerError  # noqa: E402
+from cases import MODELS, Case, ModelSpec, moving_square_mp4, red_square_png, scene_png  # noqa: E402
+from matrix import Gpu, cases_without_inputs, config_gpus, gap_report, plan  # noqa: E402
+from server import Server, ServerError, free_port  # noqa: E402
 from validators import (  # noqa: E402
     Expect,
     check_audio,
@@ -253,6 +257,11 @@ def test_answers_must_match_a_whole_word():
     assert not check_text("14", four).passed
     assert check_text("Red.", red).passed
     assert not check_text("tired", red).passed
+    assert not check_text("4.5", four).passed
+    assert not check_text("1,400", four).passed
+    assert check_text("It is 4.", four).passed
+    assert check_text("4, not 5", four).passed
+    assert check_text("It is not red.", red).passed  # lenient on purpose: negation is not parsed
 
 
 def test_float32_exact_count_rejects_a_partial_tensor():
@@ -267,8 +276,9 @@ def test_setup_errors_are_reported_and_fail_the_run(tmp_path):
          "--config", f"qwen3_5={tmp_path / 'missing.yaml'}", "--out", str(tmp_path)],
         capture_output=True, text=True, cwd=REPO, timeout=300, check=False)
     assert proc.returncode == 1
-    report = json.loads(next(tmp_path.glob("*/report.json")).read_text())
-    assert "does not exist" in report["error"]
+    report_path = next(tmp_path.glob("*/report.json"))
+    assert "does not exist" in json.loads(report_path.read_text())["error"]
+    assert re.fullmatch(r"\d{8}-\d{6}-\d+", report_path.parent.name)  # stamped with the runner's pid
 
 
 FAKE_SERVER = """
@@ -287,13 +297,14 @@ RUNNER = """
 import signal, sys, time
 from pathlib import Path
 sys.path.insert(0, "test/e2e")
-from run import _interrupt
+from run import install_interrupt_handlers
 from server import Server
-signal.signal(signal.SIGTERM, _interrupt)
+install_interrupt_handlers()
 server = Server(Path("."), Path("configs/qwen3_5_0.8b.yaml"), Path(sys.argv[1]),
-                command=[sys.executable, "-c", sys.argv[2], "{port}"], startup_timeout=60)
+                command=[sys.executable, "-c", sys.argv[2], "{port}", *sys.argv[3:]], startup_timeout=60,
+                settle=2)
 with server:
-    print(server._proc.pid, flush=True)
+    print(server._proc.pid, server._scratch, flush=True)
     time.sleep(300)
 """
 
@@ -302,21 +313,352 @@ def test_sigterm_to_the_runner_tears_down_the_server_group(tmp_path):
     runner = subprocess.Popen([sys.executable, "-c", RUNNER, str(tmp_path / "log"), FAKE_SERVER],
                               cwd=REPO, stdout=subprocess.PIPE, text=True)
     try:
-        pgid = int(runner.stdout.readline())
+        pgid = int(runner.stdout.readline().split()[0])
         os.killpg(pgid, 0)  # the server and its child are up
         runner.send_signal(signal.SIGTERM)
         runner.wait(timeout=60)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                os.killpg(pgid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.2)
-        else:
-            pytest.fail(f"process group {pgid} survived SIGTERM to the runner")
+        assert _group_gone(pgid, 10), f"process group {pgid} survived SIGTERM to the runner"
     finally:
         runner.kill()
+
+
+def _group_gone(pgid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+# Ignores SIGINT and SIGTERM, as does its child: a worker stuck in a C call.
+STUCK_SERVER = """
+import http.server, signal, subprocess, sys
+for s in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(s, signal.SIG_IGN)
+subprocess.Popen(["sleep", "300"])
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Health).serve_forever()
+"""
+
+
+def test_a_second_interrupt_during_teardown_still_kills_the_whole_group(tmp_path):
+    runner = subprocess.Popen([sys.executable, "-c", RUNNER, str(tmp_path / "log"), STUCK_SERVER],
+                              cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    pgid = None
+    try:
+        pgid, scratch = runner.stdout.readline().split()
+        pgid = int(pgid)
+        runner.send_signal(signal.SIGTERM)  # teardown starts; the server ignores its SIGINT
+        time.sleep(1)
+        started = time.monotonic()
+        runner.send_signal(signal.SIGTERM)  # the second interrupt goes straight to SIGKILL
+        runner.wait(timeout=20)
+        assert time.monotonic() - started < 15  # well inside the 30 s grace
+        assert _group_gone(pgid, 5), f"process group {pgid} survived a double interrupt"
+        assert not Path(scratch).exists()
+        assert "KeyboardInterrupt" in runner.stderr.read()  # the run still stops
+    finally:
+        runner.kill()
+        _kill_group(pgid if isinstance(pgid, int) else None)
+
+
+def _kill_group(pgid):
+    if pgid:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+NOHUP_PROBE = """
+import os, signal, sys, time
+sys.path.insert(0, "test/e2e")
+from run import install_interrupt_handlers
+install_interrupt_handlers()
+try:
+    os.kill(os.getpid(), signal.SIGHUP)
+    time.sleep(0.5)
+    print("survived")
+except KeyboardInterrupt:
+    print("interrupted")
+"""
+
+
+def test_nohup_keeps_sighup_ignored_and_a_plain_run_stops_on_it():
+    nohup = shutil.which("nohup")
+    if nohup is None:
+        pytest.skip("no nohup")
+
+    def probe(*prefix):
+        return subprocess.run([*prefix, sys.executable, "-c", NOHUP_PROBE], cwd=REPO, capture_output=True,
+                              text=True, timeout=60, check=False).stdout.strip()
+
+    assert probe(nohup) == "survived"
+    assert probe() == "interrupted"
+
+
+# On SIGINT, stops its child (the conductor) with SIGINT, as the entrypoint does.
+GRACEFUL_SERVER = """
+import http.server, signal, subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", sys.argv[2]])
+def stop(signum, frame):
+    child.send_signal(signal.SIGINT)
+    child.wait()
+    sys.exit(0)
+signal.signal(signal.SIGINT, stop)
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Health).serve_forever()
+"""
+CONDUCTOR = """
+import signal, sys, time
+def record(signum, frame):
+    print("conductor got", signal.Signals(signum).name, flush=True)
+    sys.exit(0)
+signal.signal(signal.SIGINT, record)
+signal.signal(signal.SIGTERM, record)
+while True:
+    time.sleep(1)
+"""
+
+
+def test_teardown_stops_the_server_gracefully_before_signalling_the_group(tmp_path):
+    log = tmp_path / "log"
+    server = Server(REPO, REPO / "configs/qwen3_5_0.8b.yaml", log,
+                    command=[sys.executable, "-c", GRACEFUL_SERVER, "{port}", CONDUCTOR], startup_timeout=60)
+    with server:
+        pgid = server._proc.pid
+    assert _group_gone(pgid, 1)
+    assert "conductor got SIGINT" in log.read_text()
+    assert "SIGTERM" not in log.read_text()
+
+
+# Loads for argv[2] seconds, then binds argv[1].
+SLOW_SERVER = """
+import http.server, sys, time
+time.sleep(float(sys.argv[2]))
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Health).serve_forever()
+"""
+
+
+def _slow_server(tmp_path, name, load_seconds, port=None):
+    return Server(REPO, REPO / "configs/qwen3_5_0.8b.yaml", tmp_path / name, port=port, startup_timeout=60,
+                  command=[sys.executable, "-c", SLOW_SERVER, "{port}", str(load_seconds)])
+
+
+def _take_port_soon(port: int) -> socket.socket:
+    thief = socket.socket()
+
+    def take():
+        thief.bind(("127.0.0.1", port))
+        thief.listen()
+    threading.Timer(0.3, take).start()
+    return thief
+
+
+needs_proc = pytest.mark.skipif(not Path("/proc/net/tcp").exists(), reason="port ownership is read from /proc")
+
+
+@needs_proc
+def test_a_port_taken_while_the_model_loads_restarts_the_server_once(tmp_path, monkeypatch):
+    import server as server_module
+
+    taken, pick = [], server_module.free_port
+
+    def free_port():
+        port = pick()
+        if not taken:
+            taken.append((port, _take_port_soon(port)))
+        return port
+
+    monkeypatch.setattr(server_module, "free_port", free_port)
+    server = _slow_server(tmp_path, "log", 2)
+    try:
+        with server as url:
+            assert server.restarts == 1 and server.port != taken[0][0]
+            assert requests.get(url + "/health", timeout=5).status_code == 200
+    finally:
+        taken[0][1].close()
+
+
+@needs_proc
+def test_a_given_port_taken_while_the_model_loads_fails_clearly(tmp_path):
+    port = free_port()
+    thief = _take_port_soon(port)
+    try:
+        with pytest.raises(ServerError, match="another process.*--port"):
+            _slow_server(tmp_path, "log", 2, port=port).__enter__()
+    finally:
+        thief.close()
+
+
+@needs_proc
+def test_two_runners_on_one_port_cannot_both_pass(tmp_path):
+    port = free_port()
+    first, second = _slow_server(tmp_path, "first", 2, port), _slow_server(tmp_path, "second", 60, port)
+    entered = {}
+    thread = threading.Thread(target=lambda: entered.setdefault("url", first.__enter__()))
+    thread.start()
+    try:
+        time.sleep(0.5)  # both launched before the first one binds
+        with pytest.raises(ServerError, match="another process|already in use"):
+            second.__enter__()
+        thread.join(timeout=60)
+        assert requests.get(entered["url"] + "/health", timeout=5).status_code == 200
+    finally:
+        thread.join(timeout=60)
+        first.__exit__(None, None, None)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux only")
+def test_a_killed_runner_takes_the_server_with_it(tmp_path):
+    runner = subprocess.Popen([sys.executable, "-c", RUNNER, str(tmp_path / "log"), SLOW_SERVER, "0"],
+                              cwd=REPO, stdout=subprocess.PIPE, text=True)
+    pgid = scratch = None
+    try:
+        pgid, scratch = runner.stdout.readline().split()
+        pgid = int(pgid)
+        runner.kill()
+        runner.wait(timeout=10)
+        assert _group_gone(pgid, 10), "the server outlived a SIGKILLed runner"
+    finally:
+        runner.kill()
+        _kill_group(pgid)
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)  # a killed runner cannot remove it
+
+
+def _record_launches(monkeypatch, after=None):
+    """Patch Popen to record every server launched; ``after(proc)`` runs right after the spawn."""
+    spawned, real_popen = [], subprocess.Popen
+
+    def popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        if after:
+            after(proc)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    return spawned
+
+
+def _empty_scratch(monkeypatch, tmp_path) -> Path:
+    import server as server_module
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(server_module, "_scratch_parent", lambda: str(scratch))
+    return scratch
+
+
+def test_an_interrupt_right_after_the_spawn_leaves_nothing_behind(tmp_path, monkeypatch):
+    scratch = _empty_scratch(monkeypatch, tmp_path)
+    spawned = _record_launches(monkeypatch, after=lambda proc: os.kill(os.getpid(), signal.SIGINT))
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    server = _slow_server(tmp_path, "log", 30)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            server.__enter__()
+        assert _group_gone(spawned[0].pid, 5), "the server outlived an interrupt right after its spawn"
+        assert server._log is None or server._log.closed
+        assert not any(scratch.iterdir())
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        for proc in spawned:
+            _kill_group(proc.pid)
+
+
+def test_a_failed_launch_releases_the_log_and_scratch_dir(tmp_path, monkeypatch):
+    scratch = _empty_scratch(monkeypatch, tmp_path)
+    server = Server(tmp_path / "missing", REPO / "configs/qwen3_5_0.8b.yaml", tmp_path / "log",
+                    command=[sys.executable, "-c", "pass"])
+    with pytest.raises(FileNotFoundError):
+        server.__enter__()  # the working directory does not exist
+    assert server._log is None or server._log.closed
+    assert not any(scratch.iterdir())
+
+
+@needs_proc
+def test_a_group_that_survives_sigkill_is_not_restarted(tmp_path, monkeypatch):
+    import server as server_module
+
+    taken, pick = [], server_module.free_port
+
+    def free_port():
+        port = pick()
+        if not taken:
+            taken.append(_take_port_soon(port))
+        return port
+
+    monkeypatch.setattr(server_module, "free_port", free_port)
+    monkeypatch.setattr(server_module, "_group_alive", lambda pgid: True)  # nothing dies
+    spawned = _record_launches(monkeypatch)
+    server = Server(REPO, REPO / "configs/qwen3_5_0.8b.yaml", tmp_path / "log", startup_timeout=60,
+                    command=[sys.executable, "-c", SLOW_SERVER, "{port}", "2"],
+                    stop_grace=0.5, settle=0.2, kill_grace=0.5)
+    try:
+        with pytest.raises(ServerError, match="survived SIGKILL") as failure:
+            server.__enter__()
+        assert len(spawned) == 1 and server.restarts == 0
+        assert str(spawned[0].pid) in str(failure.value)
+    finally:
+        taken[0].close()
+        for proc in spawned:
+            _kill_group(proc.pid)
+
+
+def _ipv6_listener(v6only: bool) -> socket.socket:
+    try:
+        listener = socket.socket(socket.AF_INET6)
+        listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, int(v6only))
+        listener.bind(("::", 0))
+    except OSError as exc:
+        pytest.skip(f"no IPv6: {exc}")
+    listener.listen()
+    return listener
+
+
+def test_an_ipv6_only_listener_does_not_block_the_server_but_a_dual_stack_one_does(tmp_path):
+    v6only = _ipv6_listener(True)
+    try:
+        with _slow_server(tmp_path, "v6only", 0.5, port=v6only.getsockname()[1]) as url:
+            assert requests.get(url + "/health", timeout=5).status_code == 200
+    finally:
+        v6only.close()
+    dual = _ipv6_listener(False)
+    try:
+        with pytest.raises(ServerError, match="in use"):
+            _slow_server(tmp_path, "dual", 0.5, port=dual.getsockname()[1]).__enter__()
+    finally:
+        dual.close()
+
+
+def test_scratch_dir_stays_short_enough_for_socket_paths(monkeypatch):
+    import server as server_module
+
+    monkeypatch.setattr(server_module.tempfile, "gettempdir", lambda: "/" + "x" * 60)
+    assert server_module._scratch_parent() == "/tmp"
+    monkeypatch.setattr(server_module.tempfile, "gettempdir", lambda: "/tmp/short")
+    assert server_module._scratch_parent() == "/tmp/short"
 
 
 def test_wait_for_gpu_release_returns_once_memory_is_back(monkeypatch):
@@ -430,3 +772,204 @@ def test_every_family_but_omni_has_a_smoke_case():
     families = {spec.family for spec in MODELS.values()}
     with_smoke = {spec.family for spec in MODELS.values() if any(c.smoke for c in spec.cases)}
     assert families - with_smoke == {"omni"}  # its only profile is a 30B model
+
+
+def test_only_a_gated_or_missing_repo_skips_and_a_failed_check_runs_with_a_note(monkeypatch):
+    import huggingface_hub
+    from huggingface_hub.errors import GatedRepoError, OfflineModeIsEnabled
+
+    class GatedError(GatedRepoError):
+        def __init__(self):
+            Exception.__init__(self, "gated")
+
+    failures = {"org/gated": GatedError(), "org/offline": OfflineModeIsEnabled("offline mode is enabled")}
+
+    def auth_check(repo):
+        raise failures[repo]
+
+    monkeypatch.setattr(huggingface_hub, "auth_check", auth_check)
+    config = REPO / "configs/qwen3_5_0.8b.yaml"
+    notes = []
+    gated = plan(_spec(gated=("org/gated",)), config, H200, offline=False, notes=notes)
+    assert gated == "gated checkpoint: accept the license at https://huggingface.co/org/gated" and not notes
+    assert plan(_spec(gated=("org/offline",)), config, H200, offline=False, notes=notes) is None
+    assert len(notes) == 1
+    assert notes[0].startswith("could not check access: org/offline (OfflineModeIsEnabled")
+    assert notes[0].endswith("; running anyway")
+
+
+def test_ranks_sharing_a_gpu_count_once():
+    assert config_gpus(REPO / "configs/qwen3tts_1p7b_split.yaml") == 1  # rank_devices puts both ranks on GPU 0
+    assert config_gpus(REPO / "configs/bagel.yaml") == 2
+
+
+def test_a_case_whose_input_cannot_be_built_is_skipped_with_a_reason():
+    needs = Case("x", "chat", dict, Expect("text"), requires=("not_a_real_module_e2e",))
+    assert cases_without_inputs((needs, Case("y", "chat", dict, Expect("text")))) == {
+        "x": "its input needs missing package(s): not_a_real_module_e2e"}
+    speech_cases = [c for name in ("whisper_large", "higgs_audio", "qwen3tts_base") for c in MODELS[name].cases]
+    assert all(c.requires == ("pyarrow", "soundfile") for c in speech_cases)
+
+
+class _FakeServer:
+    started = []
+
+    def __init__(self, *args, **kwargs):
+        self.startup_seconds, self.exit_code, self.restarts, self.log_path = 1.0, None, 0, Path("log")
+        self.survivors = []
+        self.started.append(self)
+
+    def choose_port(self):
+        return 0
+
+    def __enter__(self):
+        return "http://fake"
+
+    def __exit__(self, *exc):
+        return False
+
+    def poll(self):
+        return self.exit_code
+
+
+class _FakeSampler:
+    peak = 0.0
+
+    def __init__(self, indices):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _run_model(monkeypatch, tmp_path, run_case, server=_FakeServer):
+    from types import SimpleNamespace
+
+    import run
+
+    _FakeServer.started.clear()
+    monkeypatch.setattr(run, "Server", server)
+    monkeypatch.setattr(run, "VramSampler", _FakeSampler)
+    monkeypatch.setattr(run, "_await_release", lambda *args: None)
+    monkeypatch.setattr(run, "run_case", run_case)
+    spec = MODELS["qwen3_5"]
+    args = SimpleNamespace(port=None, startup_timeout=60, tensor_comm_protocol="SHM", offline=False, eager=True)
+    result = {}
+    return result, lambda: run.run_model(spec, spec.cases, REPO, REPO / spec.config, tmp_path, args, [], result)
+
+
+def test_an_interrupted_model_keeps_its_completed_cases(monkeypatch, tmp_path):
+    from validators import Verdict
+
+    def run_case(url, case):
+        if case.name != "text_to_text":
+            raise KeyboardInterrupt
+        return Verdict(True, "ok")
+
+    result, run_model = _run_model(monkeypatch, tmp_path, run_case)
+    with pytest.raises(KeyboardInterrupt):
+        run_model()
+    assert list(result["cases"]) == ["text_to_text"]
+
+
+def test_a_server_that_dies_mid_run_records_its_exit_code(monkeypatch, tmp_path):
+    from validators import Verdict
+
+    def run_case(url, case):
+        _FakeServer.started[0].exit_code = -9
+        return Verdict(True, "ok")
+
+    result, run_model = _run_model(monkeypatch, tmp_path, run_case)
+    run_model()
+    assert list(result["cases"]) == ["text_to_text"]
+    assert result["server_exit_code"] == -9
+    assert "exited with code -9 during text_to_text" in result["server_error"]
+
+
+def test_a_group_that_survives_sigkill_fails_the_profile_with_its_pids(monkeypatch, tmp_path):
+    from run import model_status
+    from validators import Verdict
+
+    class Stuck(_FakeServer):
+        def __exit__(self, *exc):
+            self.survivors = [4242]
+            raise ServerError("pid(s) 4242 of the server's group survived SIGKILL")
+
+    result, run_model = _run_model(monkeypatch, tmp_path, lambda url, case: Verdict(True, "ok"), server=Stuck)
+    run_model()
+    assert result["server_survivors"] == [4242] and "survived SIGKILL" in result["server_error"]
+    assert model_status({"source": result}) == "failed"
+
+
+def test_the_port_is_picked_before_the_vram_sampler_starts_forking(monkeypatch, tmp_path):
+    import run
+    from validators import Verdict
+
+    order = []
+
+    class Recorded(_FakeServer):
+        def choose_port(self):
+            order.append("port")
+
+    class Sampler(_FakeSampler):
+        def __enter__(self):
+            order.append("sampler")
+            return self
+
+    _, run_model = _run_model(monkeypatch, tmp_path, lambda url, case: Verdict(True, "ok"), server=Recorded)
+    monkeypatch.setattr(run, "VramSampler", Sampler)
+    run_model()
+    assert order == ["port", "sampler"]
+
+
+class _LaunchedError(Exception):
+    pass
+
+
+def _stop_after_the_port_check(self):
+    raise _LaunchedError(self.port)
+
+
+def _spawn_until(stop: threading.Event):
+    while not stop.is_set():
+        subprocess.run(["true"], check=False)
+
+
+def _enter_while_forking(server: Server) -> int:
+    """Enter ``server`` (launch stubbed out) just after a thread starts forking, as
+    the VRAM sampler does; return the port it would have launched on."""
+    stop = threading.Event()
+    spawner = threading.Thread(target=_spawn_until, args=(stop,), daemon=True)
+    spawner.start()
+    try:
+        with pytest.raises(_LaunchedError) as launched:
+            server.__enter__()
+        return launched.value.args[0]
+    finally:
+        stop.set()
+        spawner.join()
+
+
+def test_a_thread_that_forks_never_makes_a_fresh_port_read_as_busy(tmp_path, monkeypatch):
+    monkeypatch.setattr(Server, "_launch", _stop_after_the_port_check)
+    for _ in range(60):  # about one in six picks raced before the retry
+        _enter_while_forking(Server(REPO, REPO / "configs/qwen3_5_0.8b.yaml", tmp_path / "log"))
+
+
+def test_an_explicit_port_is_never_re_picked(tmp_path, monkeypatch):
+    import server as server_module
+
+    port = free_port()
+    monkeypatch.setattr(server_module, "free_port", lambda: pytest.fail("an explicit port was re-picked"))
+    monkeypatch.setattr(Server, "_launch", _stop_after_the_port_check)
+    for _ in range(30):  # the runner never binds an explicit port, so forks cannot make it busy
+        assert _enter_while_forking(Server(REPO, REPO / "configs/qwen3_5_0.8b.yaml", tmp_path / "log",
+                                           port=port)) == port
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", port))
+        holder.listen()
+        with pytest.raises(ServerError, match=f"port {port} is already in use"):
+            Server(REPO, REPO / "configs/qwen3_5_0.8b.yaml", tmp_path / "log", port=port).__enter__()
