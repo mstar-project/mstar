@@ -1325,6 +1325,14 @@ class Conductor:
                 ),
             )
         if end_session:
+            # A request of this session still waiting for capacity has not been
+            # ingested, so it is not in ``session.request_ids`` and the
+            # ``end_session`` test above does not see it. ``_try_admit_waiting``
+            # at the end of this method would dispatch it into a session whose
+            # state the workers are freeing, where it adopts nothing and
+            # silently continues from an empty context. Fail it first, as
+            # ``_teardown_session`` does.
+            self._drop_queued_session_requests(session_id)
             # After the removals: a worker holds the teardown while the request
             # is still on its way out, so the order the two arrive in decides
             # nothing, but the removal going first keeps the common case

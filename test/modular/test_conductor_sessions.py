@@ -332,6 +332,35 @@ def test_teardown_drops_the_session_s_queued_requests():
     assert [m.body.request_id for m in removes] == ["r9"]
 
 
+def test_the_last_requests_teardown_drops_the_session_s_queued_siblings():
+    # A queued request has not been ingested, so it is not in
+    # session.request_ids and the end_session test cannot see it. Without this
+    # the _try_admit_waiting at the end of _finalize_draining dispatches it
+    # into a session whose state the workers are freeing: it would adopt
+    # nothing and continue from an empty context.
+    session = SessionData("s", {"wg": ["w0"]}, request_ids={"r0"}, ending=True)
+    c = _conductor(requests={"r0": _request_data(("w0",))}, sessions=[session])
+    c.request_sessions["r0"] = "s"
+    c.waiting_queue = [_new_request("r9", session_id="s"), _new_request("r8")]
+    c._register_draining(
+        "r0", expected_acks={PREPROCESS}, participants={"w0", PREPROCESS},
+    )
+
+    c._handle_reads_done(ReadsDone("r0", PREPROCESS))
+
+    assert [b.request_id for b in c.waiting_queue] == ["r8"]
+    failed = [
+        m.body for e, m in c.sent
+        if e == "api_server" and m.message_type == "request_failed"
+    ]
+    assert [f.request_id for f in failed] == ["r9"]
+    # and the teardown still goes out
+    assert [
+        m.body.session_id
+        for m in _sent(c, "w0", WorkerMessageType.TEARDOWN_SESSION)
+    ] == ["s"]
+
+
 def test_a_stalled_worker_cannot_hold_the_tombstone_forever():
     c = _conductor(sessions=[SessionData("s", {"wg": ["w0"]})])
     c._teardown_session("s")

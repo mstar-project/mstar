@@ -584,9 +584,17 @@ def test_a_request_drained_while_awaiting_its_session_is_not_admitted():
     Worker._apply_pending_sessions(w)
 
     # its turn came, but it is draining, so it never opened engine state
-    assert w._handles_awaiting_admit == set()
     assert w._sessions.session_of("Y") is None
     assert "Y" not in w.admitted
+    # and the handle stays gated until its REMOVE arrives: failed_rids does
+    # not gate the TP-follow path, so tp_rids answering REMOVED_RID is the
+    # only thing stopping a head that names it from running against engine
+    # state that was never ingested
+    assert w._handles_awaiting_admit == {"Y"}
+
+    Worker._remove_request(w, RemoveRequest(request_id="Y"))
+
+    assert w._handles_awaiting_admit == set()
 
 
 def test_a_drain_for_a_request_this_worker_never_saw_is_unchanged():

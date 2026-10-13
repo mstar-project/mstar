@@ -1028,8 +1028,14 @@ class Worker:
         for body in ready:
             handle = body.request_info.rid_handle
             if body.request_id in self._draining_rids:
-                self._handles_awaiting_admit.discard(handle)
-                continue  # drained while it waited; the REMOVE does the rest
+                # Drained while it waited, so never open its engine state. The
+                # handle stays in _handles_awaiting_admit until the REMOVE
+                # clears it: `failed_rids` does not gate the TP-follow path (a
+                # rid in the head batch is scheduled anyway, micro_scheduler
+                # `_backlog_has_schedulable`), so `tp_rids` answering
+                # REMOVED_RID is the only thing keeping a batch that names it
+                # from running against state that was never ingested.
+                continue
             if self._sessions.hold_if_not_ready(body, handle):
                 continue  # another of its session's requests is still leaving
             self._finish_admission(body, handle)
