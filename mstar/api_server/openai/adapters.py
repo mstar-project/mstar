@@ -1050,7 +1050,16 @@ class TextChatAdapter(OpenAIAdapter):
             value = getattr(req, name, None)
             if value is not None and value < 1:
                 raise ValueError(f"{name} must be at least 1, got {value}")
+        # what the model cannot serve is refused, not dropped: off, a field passes
+        if req.n not in (None, 1):
+            raise ValueError(f"n={req.n}: this model returns one choice")
+        if req.stop:
+            raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
         mk = _passthrough(req)
+        for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty"):
+            if mk.get(name):
+                raise ValueError(f"{name} is not supported; got {mk[name]!r}")
+            mk.pop(name, None)
         _apply_sampling(req, mk)
         # extra_body can override max_tokens with anything; a string reached the
         # conductor's min() and took its whole message batch down

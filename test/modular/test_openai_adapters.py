@@ -278,3 +278,21 @@ def test_text_chat_coerces_numeric_extra_body(tmp_path):
                                 max_output_tokens="256", repetition_penalty="1.1")
     mk = adapters.TextChatAdapter().chat_to_request(req, tmp_path).model_kwargs
     assert mk["max_output_tokens"] == 256 and mk["repetition_penalty"] == 1.1
+
+
+@pytest.mark.parametrize("field", [
+    {"n": 2}, {"stop": "\n"}, {"stop": ["END"]}, {"logprobs": True}, {"top_logprobs": 5},
+    {"logit_bias": {"100": -100}}, {"presence_penalty": 1.5}, {"frequency_penalty": 0.5},
+])
+def test_text_chat_refuses_what_it_would_ignore(field, tmp_path):
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **field)
+    with pytest.raises(ValueError, match=next(iter(field))):
+        adapters.TextChatAdapter().chat_to_request(req, tmp_path)
+
+
+def test_text_chat_passes_those_fields_off(tmp_path):
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hi"}], n=1, stop=[], logprobs=False,
+        top_logprobs=0, logit_bias={}, presence_penalty=0, frequency_penalty=0.0,
+    )
+    assert adapters.TextChatAdapter().chat_to_request(req, tmp_path).model_kwargs == {}
