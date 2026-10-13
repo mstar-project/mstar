@@ -4,6 +4,7 @@ the conductor reads it and any rank runs the request."""
 
 import pytest
 
+from mstar.engine.resources import SamplerSpec
 from mstar.model.glm52.config import SAMPLER_RESOURCE
 from mstar.model.glm52.glm52_model import Glm52Model
 
@@ -40,3 +41,13 @@ def test_numbers_sent_as_strings_are_read_as_numbers():
     sampling = m.get_request_resource_configs({}, {"temperature": "0.7", "top_k": "20"})[SAMPLER_RESOURCE]
     assert sampling.temperature == 0.7 and sampling.top_k == 20
     assert m.get_max_output_tokens(max_output_tokens="64") == 64
+
+
+def test_min_p_is_refused_in_process_prompt():
+    m = _model()
+    # the sampler that would read it is built without it
+    [spec] = [s for s in m.get_node_resources() if isinstance(s, SamplerSpec)]
+    assert not spec.enable_min_p
+    with pytest.raises(ValueError, match="min_p"):
+        m.process_prompt("Hi", ["text"], ["text"], min_p=0.05)
+    assert m.process_prompt("Hi", ["text"], ["text"], min_p=0.0)["text_inputs"][0].numel() == 2

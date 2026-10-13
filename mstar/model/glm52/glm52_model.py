@@ -345,8 +345,11 @@ class Glm52Model(Model):
             return {}
         # the conductor reads these kwargs; read here first, a bad one is the
         # client's 400 before the request reaches any rank
-        self.get_request_resource_configs({}, kwargs)
+        sampling = self.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE]
         self.get_max_output_tokens(**kwargs)
+        if sampling.min_p > 0:
+            # the node's sampler is built without min-p: a 400 here, not the worker's 500
+            raise ValueError(f"GLM-5.2 is served without min_p (min_p={sampling.min_p}); send none")
 
         if self._tokenizer_mode == "byte":
             # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
