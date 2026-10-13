@@ -167,7 +167,7 @@ def _kda_state(engine, rid: str) -> list[torch.Tensor]:
             for layer in range(pool.config.num_layers)]
 
 
-def _generate(engine, rid: str, prompt: list[int], keyed: bool = True):
+def _generate(engine, rid: str, prompt: list[int], keyed: bool = True, decode: bool = True):
     configs = {SAMPLER: SamplingReqConfig(temperature=0.0, ignore_eos=True)}
     if keyed:
         whole = len(prompt) // PAGE
@@ -180,7 +180,7 @@ def _generate(engine, rid: str, prompt: list[int], keyed: bool = True):
     state = _kda_state(engine, rid)
     seq = out[rid]["new_token"][0].tolist()
     nxt, step = out[rid]["text_inputs"][0], 0
-    while not stops.get(rid):
+    while decode and not stops.get(rid):
         out, stops = _step(engine, "decode", {rid: nxt}, step)
         step += 1
         seq += out[rid]["new_token"][0].tolist()
@@ -257,10 +257,26 @@ def test_a_long_prompt_snapshots_its_last_page_first():
         _snapshot_page=PAGE, request_states={},
         config=types.SimpleNamespace(prefill_window_tokens=WINDOW, dsa_long_context=True))
     n = 10 * WINDOW + PAGE + 3
-    points = [p for _, _, p in Glm5NextLLMSubmodule._snapshot_points(
-        sub, "prefill", ["r"], [types.SimpleNamespace(input_seq_len=n)], None)]
+    kept, spares = Glm5NextLLMSubmodule._snapshot_points(
+        sub, "prefill", ["r"], [types.SimpleNamespace(input_seq_len=n)], None)
     newest = [n // PAGE * PAGE] + [w * WINDOW for w in range(10, 0, -1)]
-    assert points == newest[:_SNAPSHOTS_PER_PROMPT]
+    assert [p for _, _, p in kept] == newest[:1]
+    assert [p for _, _, p in spares] == newest[1:_SNAPSHOTS_PER_PROMPT]
+
+
+def test_more_sessions_than_prompts_fill_the_pool_keep_their_next_turn(tmp_path):
+    """Each first turn reserves its last page and three window ends: four fill the 16
+    snapshot slots. A later session's last page takes a window end's slot, so every
+    session's next turn still skips its whole first turn."""
+    engine, hits = _build_engine(0, tmp_path)
+    assert engine._resources[KDA_STATE].config.prefix_slots == 16
+    firsts = [_prompt(250, seed=10 + s) for s in range(8)]
+    for s, prompt in enumerate(firsts):
+        _generate(engine, f"s{s}-t1", prompt, decode=False)
+    for s, prompt in enumerate(firsts):
+        hits.clear()
+        _generate(engine, f"s{s}-t2", prompt[:240] + _prompt(20, seed=99), decode=False)
+        assert hits[0] == 240, (s, hits)
 
 
 def test_a_refused_admits_skipped_prefix_does_not_outlive_it(tmp_path):

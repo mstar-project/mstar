@@ -461,9 +461,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if self.config.dsa_long_context:
             # every MLA layer attends sparse (dsa.py): no dense plan over the whole context
             del steps[ATTN]
-        snapshots = self._snapshot_points(graph_walk, request_ids, inputs, slot_lease)
-        if snapshots:
-            steps[KDA_STATE] = RecurrentStep(snapshots=snapshots)
+        kept, spares = self._snapshot_points(graph_walk, request_ids, inputs, slot_lease)
+        if kept or spares:
+            steps[KDA_STATE] = RecurrentStep(snapshots=kept, spare_snapshots=spares)
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)
@@ -499,21 +499,23 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     def _snapshot_points(
         self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs],
         slot_lease: SlotLease | None,
-    ) -> tuple[tuple[str, str, int], ...]:
+    ) -> tuple[tuple[tuple[str, str, int], ...], tuple[tuple[str, str, int], ...]]:
         """Where an eager long prefill saves its request's KDA state for a later prompt that
-        shares it: its last whole page, which a next turn extending the prompt needs, then
-        its windows' ends from the newest, where pages end. Admit reserves them in order."""
+        shares it, kept and spare: its last whole page, which a next turn extending the prompt
+        needs, then as spares its windows' ends from the newest, where pages end. A spare takes
+        only a free slot, so it never evicts another session's last page."""
         if (self._snapshot_page is None or graph_walk != "prefill" or slot_lease is not None
                 or len(request_ids) != 1 or not self.config.dsa_long_context):
-            return ()
+            return (), ()
         rid, n = request_ids[0], inputs[0].input_seq_len
         state = self.request_states.get(rid)
         start = state.get("cached_prefix", 0) if state is not None else 0
         page, size = self._snapshot_page, self.config.prefill_window_tokens
         last = (start + n) // page * page
         ends = sorted({start + k * size for k in range(1, -(-n // size))} - {last}, reverse=True)
-        points = [p for p in (last, *ends) if start < p and p % page == 0]
-        return tuple((rid, LABEL, p) for p in points[:_SNAPSHOTS_PER_PROMPT])
+        kept = [(rid, LABEL, last)] if start < last else []
+        spares = [(rid, LABEL, p) for p in ends if p % page == 0]
+        return tuple(kept), tuple(spares[:_SNAPSHOTS_PER_PROMPT - len(kept)])
 
     def preprocess(
         self,
@@ -827,7 +829,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         """The step's KDA snapshots by the row they follow: one request, from its first row."""
         step = getattr(engine_inputs, "step", None)
         rec = step.steps.get(KDA_STATE) if step is not None else None
-        snaps = getattr(rec, "snapshots", ())
+        snaps = (*getattr(rec, "snapshots", ()), *getattr(rec, "spare_snapshots", ()))
         if not snaps:
             return {}
         first = ctx.host_pos[0]
