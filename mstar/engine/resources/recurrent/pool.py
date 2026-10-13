@@ -269,7 +269,7 @@ class RecurrentStatePool(Resource):
 
     def _release(self, reserved: list[tuple[str, str, SlotState]]) -> None:
         """Free the slots of ``reserved`` still held as taken, newest first and
-        zeroed: a step can raise after its forward wrote them. Caller holds the lock."""
+        zeroed like every free slot; no forward has run on them. Caller holds the lock."""
         for rid, label, slot in reversed(reserved):
             labels = self._slots.get(rid)
             if labels is None or labels.get(label) is not slot:
