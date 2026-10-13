@@ -1,6 +1,7 @@
 """GLM-5.2 on the resource-pools engine, CPU, reduced config."""
 from __future__ import annotations
 
+import logging
 import sys
 import types
 from pathlib import Path
@@ -37,6 +38,8 @@ def _force_cpu_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
 
 
+from request_walks import run_walks  # noqa: E402
+
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
@@ -45,6 +48,7 @@ from mstar.model.glm52.config import (  # noqa: E402
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
+from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.quantization import process_weights_after_loading  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
@@ -78,6 +82,8 @@ class _Driver:
 
     def step(self, walk: str, batch: dict[str, tuple[SimpleNamespace, torch.Tensor]]):
         rids = list(batch)
+        for info, _ in batch.values():
+            info.graph_walk = walk
         inputs = [
             self.sub.prepare_inputs(walk, info, {"text_inputs": [text]})
             for info, text in batch.values()
@@ -102,19 +108,16 @@ class _Driver:
 
 
 def _drive(driver: _Driver, prompt: torch.Tensor, info, max_steps=64) -> torch.Tensor:
+    """The tokens the request sends the client, its stops going through the graph runtime."""
     rid = info.request_id
-    emitted = []
-    walk, text, decode_step = "prefill", prompt, 0
-    for _ in range(max_steps):
-        out = driver.step(walk, {rid: (info, text)})[rid]
-        emitted.append(out["new_token"][0])
-        if walk == "decode":
-            info.dynamic_loop_iter_counts["decode_loop"] = decode_step
-            decode_step += 1
-        if driver.sub.check_stop(rid, info, out):
-            break
-        walk, text = "decode", out["text_inputs"][0]
-    return torch.cat(emitted)
+
+    def step(walk, inputs, iteration):
+        info.dynamic_loop_iter_counts = {"decode_loop": iteration} if walk == "decode" else {}
+        out = driver.step(walk, {rid: (info, inputs["text_inputs"][0])})[rid]
+        return out, driver.sub.check_stop(rid, info, out)
+
+    model = Glm52Model(model_path_hf="", tokenizer_mode="byte")
+    return torch.tensor(run_walks(model, step, prompt, info.max_tokens, max_steps))
 
 
 def _model(cfg: Glm52ModelConfig, seed: int = 0) -> Glm52ForCausalLM:
@@ -290,3 +293,39 @@ def test_budget_within_the_window_is_untouched():
     stream = _drive(driver, prompt, _fwd_info("r0", 9, True))
     assert sub._token_budget["r0"] == 9
     assert stream.numel() == 9
+
+
+# ── a stop on the prefill walk ──────────────────────────────────────────
+
+
+def _errors(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_a_stop_token_from_the_prefill_ends_the_reply(ignore_eos, caplog):
+    # the prefill walk has no decode_loop: the runtime drops a stop named there
+    cfg = _cfg(True)
+    eos = cfg.eos_token_ids[0]
+    driver = _Driver(Glm52LLMSubmodule(_model(cfg), cfg), cfg, ["r0"])
+    sampler = driver.resources[SAMPLER_RESOURCE]
+    greedy = sampler.sample
+
+    def eos_once(rids, logits, **kw):
+        sampler.sample = greedy
+        return torch.full((logits.shape[0],), eos)
+
+    sampler.sample = eos_once
+    stream = _drive(driver, torch.arange(5, dtype=torch.long) + 3, _fwd_info("r0", 10, ignore_eos))
+    assert stream[0] == eos
+    assert stream.numel() == (10 if ignore_eos else 1)
+    assert _errors(caplog) == []
+
+
+@pytest.mark.parametrize("max_tokens", [1, 2, 3])
+def test_short_budgets_are_exact_and_name_no_missing_loop(max_tokens, caplog):
+    cfg = _cfg(True)
+    driver = _Driver(Glm52LLMSubmodule(_model(cfg), cfg), cfg, ["r0"])
+    stream = _drive(driver, torch.arange(5, dtype=torch.long) + 3, _fwd_info("r0", max_tokens, True))
+    assert stream.numel() == max_tokens
+    assert _errors(caplog) == []

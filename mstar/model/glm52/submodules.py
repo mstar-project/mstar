@@ -78,10 +78,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # per request: max_tokens capped at the context limit (prompt-aware,
         # set by the prefill's preprocess); read by check_stop
         self._token_budget: dict[str, int] = {}
+        # requests whose prefill sampled a stop token: the prefill walk has no loop
+        # to stop, so the first decode step stops decode_loop and emits nothing
+        self._ended_at_prefill: set[str] = set()
 
     def cleanup_request(self, request_id: str):
         self._dsa_k_store.evict(request_id)
         self._token_budget.pop(request_id, None)
+        self._ended_at_prefill.discard(request_id)
         super().cleanup_request(request_id)
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
@@ -426,12 +430,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
+        if request_id in self._ended_at_prefill:
+            # the reply already ended: this step only closes the decode loop
+            del outputs["new_token"]
 
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
+        if request_id in self._ended_at_prefill:
+            return {"decode_loop"}
         if "new_token" not in outputs:
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
@@ -439,6 +448,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         budget = self._token_budget.get(request_id, request_info.max_tokens)
         token = outputs["new_token"][0].item()
         is_eos = token in self.config.eos_token_ids
+        if request_info.graph_walk == "prefill":
+            # no decode_loop on this walk to stop: a stop token ends the reply at the first
+            # decode step, and the conductor ends a max_tokens of 1 here
+            if not ignore_eos and is_eos:
+                self._ended_at_prefill.add(request_id)
+            return set()
         # max_tokens counts the token the prefill emits, so the total is
         # 1 + (iters + 1) decode tokens
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2

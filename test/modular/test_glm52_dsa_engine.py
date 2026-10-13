@@ -100,12 +100,13 @@ def test_kstore_desync_and_overrun_raise():
 def test_cleanup_request_evicts_kstore():
     """Retirement leaves NO per-request growth: the engine's request removal
     calls cleanup_request on every managed submodule, which must drop the
-    k-history and the token budget."""
+    k-history, the token budget and the prefill's stop."""
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = Glm52ModelConfig.reduced()
     sub.request_states = {}
     sub._dsa_k_store = Glm52DsaKStore()
     sub._token_budget = {"r0": 20}
+    sub._ended_at_prefill = {"r0"}
 
     sub._dsa_k_store.append("r0", 0, torch.randn(5, 16), start_pos=0)
     sub.request_state("r0")  # base per-request state exists too
@@ -113,6 +114,7 @@ def test_cleanup_request_evicts_kstore():
     assert sub._dsa_k_store.tracked_requests() == set()
     assert sub.request_states == {}
     assert sub._token_budget == {}
+    assert sub._ended_at_prefill == set()
     sub.cleanup_request("r0")  # idempotent, like the base hook
 
 

@@ -204,6 +204,8 @@ class _Node:
         for it in range(MAX_TOKENS + 2):
             if not live:
                 break
+            for rid in live:
+                infos[rid].graph_walk = "decode"
             outs = self.step("decode", {rid: (infos[rid], texts[rid]) for rid in live})
             for rid in list(live):
                 out = outs[rid]
