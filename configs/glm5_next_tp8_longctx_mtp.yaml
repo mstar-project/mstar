@@ -38,6 +38,9 @@ resources:
     prefix_cache_tp: true
   kda_state:
     max_slots: 65
+    # KDA states kept for prefix reuse, 20.9 MiB a slot per rank: a session's next turn
+    # restores its last turn's, and each session holds about two (restored, then saved)
+    prefix_slots: 32
 # glm5_next_tp8_longctx.yaml's warmups: the eager windowed prefill (with its MTP pass) compiles before
 # the server binds, not on the first long request.
 # Each text is its own, so no warmup hits another's cached prefix and each compiles the long

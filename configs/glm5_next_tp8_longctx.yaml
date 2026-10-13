@@ -35,6 +35,9 @@ resources:
     prefix_cache_tp: true
   kda_state:
     max_slots: 65
+    # KDA states kept for prefix reuse, 17.6 MiB a slot per rank: a session's next turn
+    # restores its last turn's, and each session holds about two (restored, then saved)
+    prefix_slots: 32
 # A prompt past the captured buckets prefills eager, in windows, and its kernels compile on first
 # use. Three lengths (6k, 12.5k and 20k tokens: one to three windows) take those compiles before the
 # server binds, not the first long request.
