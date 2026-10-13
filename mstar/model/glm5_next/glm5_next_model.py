@@ -46,6 +46,7 @@ from mstar.model.glm5_next.config import (
     Glm5NextModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import sampling_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +274,7 @@ class Glm5NextModel(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args
-        model_kwargs = model_kwargs or {}
+        model_kwargs = sampling_kwargs(model_kwargs)
         keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
             k: model_kwargs.get(k, getattr(self.config, k))
@@ -421,6 +422,11 @@ class Glm5NextModel(Model):
     ) -> NameToTensorList:
         if prompt is None:
             return {}
+        # the conductor reads these kwargs; read here first, a bad one is the
+        # client's 400 before the request reaches any rank
+        kwargs = sampling_kwargs(kwargs)
+        self.get_request_resource_configs({}, kwargs)
+        self.get_max_output_tokens(**kwargs)
 
         if self.config.mtp_num_draft_tokens > 0:
             # MTP verifies by argmax. Refused here it is the client's 400; the worker's
@@ -472,7 +478,7 @@ class Glm5NextModel(Model):
 
     def get_max_output_tokens(self, **model_kwargs):
         # held to the window: a one-token prompt emits at most index_topk tokens
-        budget = model_kwargs.get("max_output_tokens", self.config.max_output_tokens)
+        budget = sampling_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
         return min(budget, self.config.index_topk)
 
     # -------------------------------------------------------------------
