@@ -270,7 +270,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             return
         budget = min(int(asked), room)
         if budget < asked:
-            logger.info(
+            # debug: a request that names no max_tokens is capped every time
+            logger.debug(
                 "request %s: max_tokens %d capped to %d by the context limit %d",
                 rid, asked, budget, self._context_limit(),
             )

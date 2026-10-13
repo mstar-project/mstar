@@ -26,9 +26,9 @@ def _guard(cfg: Glm52ModelConfig) -> int:
 
 def test_request_budget_above_the_default_is_honored():
     m = _model()
-    # the default budget is unchanged for requests that name none
-    assert m.config.max_output_tokens == 1024
-    assert m.get_max_output_tokens() == 1024
+    # a request that names none may run to the end of the window
+    assert m.config.max_output_tokens is None
+    assert m.get_max_output_tokens() == _guard(m.config)
     budget = m.get_max_output_tokens(max_output_tokens=2000)
     assert budget == 2000
     decode = m.get_graph_walk_graphs()["decode"]

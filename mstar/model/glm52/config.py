@@ -112,9 +112,9 @@ class Glm52ModelConfig:
     # --- tokens / generation defaults ---
     eos_token_ids: tuple[int, ...] = (154820, 154827, 154829)
     pad_token_id: int = 154820
-    # Kept under the ctx<=2048 exactness regime with room for the prompt; the
-    # checkpoint's own default (8192) belongs with long context.
-    max_output_tokens: int = 1024
+    # None: a request that names no max_tokens may run to the end of the window,
+    # as in vLLM; the submodule caps each request at what its prompt leaves.
+    max_output_tokens: int | None = None
     temperature: float = 1.0
     top_p: float = 0.95
     repetition_penalty: float = 1.0

@@ -412,7 +412,7 @@ class Glm52Model(Model):
         # most ``context_limit`` tokens (the last is never stored), so a larger
         # budget is unreachable and check_stop could never fire on it
         budget = sampling_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
-        return min(budget, self.context_limit())
+        return self.context_limit() if budget is None else min(budget, self.context_limit())
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
