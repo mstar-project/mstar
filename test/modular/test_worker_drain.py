@@ -40,8 +40,8 @@ def _worker(
     w._pending_drains = set(pending_drains)
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
-    w._drains_awaiting_handle = {}
     w._pending_removes = set()
+    w._handles_awaiting_admit = set()
     w._deferred_idle_seq = {}
     w._session_idle_seq = 0
     # Identity interning: these tests use the rid string as its own handle, so
@@ -300,7 +300,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
     w._draining_rids = set()
-    w._drains_awaiting_handle = {}
+    w._handles_awaiting_admit = set()
     w._unprocessed_messages = {}
     w._my_consumer_connections = []
     w._last_active = {}

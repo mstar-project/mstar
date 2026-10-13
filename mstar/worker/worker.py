@@ -90,13 +90,6 @@ _HOLD_LOG_INTERVAL = 5.0
 # releases the event on every exit, so this only fires if that thread died.
 _ADMIT_FENCE_TIMEOUT_S = 10.0
 
-# How long a DRAIN waits for the admission that mints its request's handle (see
-# ``_drain_request``). The wait is normally one iteration; the bound is for a
-# hold that is dropped rather than admitted, and is well under the conductor's
-# own drain TTL (``MSTAR_DRAIN_TTL_S``, 120 s) so the late ACK still lands
-# inside the barrier rather than after it was forced.
-_HELD_DRAIN_WAIT_S = float(os.environ.get("MSTAR_HELD_DRAIN_WAIT_S", "5"))
-
 
 def _make_graph_runtime(
     communicator,
@@ -469,14 +462,18 @@ class Worker:
         self._pending_drains: set[str] = set()
         self._draining_rids: set[str] = set()
         self._reads_done_sent: set[str] = set()
-        # wire string -> deadline, for DRAINs that arrived while their request
-        # was held and so had no handle to fan or gate with. See _drain_request.
-        self._drains_awaiting_handle: dict[str, float] = {}
+        # Handles minted for requests whose session has not handed its state
+        # over yet: everything keyed by a handle can act on them, but nothing
+        # may schedule them. Shared by reference with the scheduler.
+        self._handles_awaiting_admit: set[int] = set()
 
         self._sessions = WorkerSessionManager(is_leaving=self._rid_is_leaving)
         # Let the scheduler see deferred removes so it stops initiating new work
         # for those rids (shared by reference — mutations are visible to both).
         self.scheduler.pending_removes = self._pending_removes
+        # Same: rank 0 must not schedule one, and a follower answers
+        # REMOVED_RID for it so a batch naming it is deferred.
+        self.scheduler.handles_awaiting_admit = self._handles_awaiting_admit
 
         # Side stream for D→H copies in postprocess (check_stop pre-materialize).
         # The default stream has GPU(N+1) queued behind GPU(N)'s outputs after
@@ -626,13 +623,17 @@ class Worker:
         if body.request_id in self._draining_rids:
             # Being torn down (out-of-order NEW after DRAIN); don't start reads.
             return
-        if self._sessions.hold_if_not_ready(body, self._rid(body.request_id)):
-            return
-        session = body.request_info.session
-        session_id = None if session is None else session.session_id
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         # The one place a handle is minted; a request with several partitions
         # on this worker gets the same one for each. Everything below keys on it.
+        #
+        # Before the session hold, deliberately. The handle is what every
+        # message about this request is keyed by -- a REMOVE with no handle is
+        # parked by _process_message_list, and a DRAIN with no handle can
+        # neither gate the scheduler nor name the TP followers to fan to. A
+        # resumed request whose session has not handed its state over yet still
+        # has to answer both, so it gets its handle now and waits for the state
+        # in _handles_awaiting_admit.
         request_id = self._graph_runtime.add_request(
             request_id=body.request_id,
             partition=body.request_info.partition_name,
@@ -641,12 +642,37 @@ class Worker:
             worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
         )
         body.request_info.rid_handle = request_id
+        self.request_state.add_request(request_id, body.request_info)
+        self.tensor_manager.register_request(
+            request_id, self._graph_runtime.get_sharding_config(request_id),
+        )
+        self._open_stream_buffers(body, request_id)
+
+        if self._sessions.hold_if_not_ready(body, request_id):
+            # Nothing may schedule it until its session hands over: rank 0
+            # skips it, and a follower answers REMOVED_RID for it so a batch
+            # naming it is deferred rather than run against engine state that
+            # does not exist yet.
+            self._handles_awaiting_admit.add(request_id)
+            return
+        self._finish_admission(body, request_id)
+
+    def _finish_admission(self, body: NewRequest, request_id: int) -> None:
+        """Open the request's engine state and let it be scheduled.
+
+        Split from ``_add_new_request`` at the engine call: a resumed request
+        takes on the state its session holds, which the session's previous
+        request has to hand back first. Everything before this point is keyed
+        by the handle and safe to do while that is still pending.
+        """
+        session = body.request_info.session
+        session_id = None if session is None else session.session_id
+        self._handles_awaiting_admit.discard(request_id)
 
         now = _time.monotonic()
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active[(request_id, node_name)] = now
 
-        self.request_state.add_request(request_id, body.request_info)
         self._sessions.bind(
             request_id, session_id, tp_followers=self._tp_followers(request_id),
         )
@@ -660,13 +686,36 @@ class Worker:
             error = self.engine_manager.take_session_error(session_id)
             if error is not None:
                 self._fail_requests({request_id: error}, {request_id: 410})
-        self.tensor_manager.register_request(
-            request_id, self._graph_runtime.get_sharding_config(request_id),
-        )
 
-        # Create StreamBuffers for consumer connections on this worker. A request
-        # with several partitions here arrives once per partition: keep the
-        # buffer the first arrival made (it may already hold items).
+        # Start RDMA reads for tensors that have tensor_info
+        futures = self.tensor_manager.start_read_tensors(
+            request_id, body.initial_inputs,
+            graph_walk=body.request_info.graph_walk
+        )
+        self.wakeup_event.register_futures(futures)
+
+        # Signal-only edges (tensor_info is None) can be processed immediately
+        signal_only = [
+            edge for edge in body.initial_inputs if len(edge.tensor_info) == 0
+        ]
+        if signal_only:
+            self._graph_runtime.ingest_inputs_batch(
+                self._one_rids_edges(request_id, signal_only), can_buffer=True,
+            )
+        # process messages that may have came in out-of-order
+        if body.request_id in self._unprocessed_messages:
+            self._process_message_list(self._unprocessed_messages[body.request_id])
+            del self._unprocessed_messages[body.request_id]
+
+    def _open_stream_buffers(self, body: NewRequest, request_id: int) -> None:
+        """The request's consumer-side stream buffers.
+
+        With the handle, not with the engine state: an INPUT_SIGNALS for a
+        streaming edge is no longer parked once the handle exists, and it
+        indexes these directly.
+        """
+        # A request with several partitions here arrives once per partition:
+        # keep the buffer the first arrival made (it may already hold items).
         req_info = self.request_state.per_request_info[request_id]
         for conn in self._my_consumer_connections:
             sbuf = req_info.stream_buffers.get(conn.edge_name)
@@ -684,33 +733,6 @@ class Worker:
                 lead = body.request_info.stream_lead_items.get(conn.edge_name)
                 if lead:
                     sbuf.prime_context(lead)
-
-        # Start RDMA reads for tensors that have tensor_info
-        futures = self.tensor_manager.start_read_tensors(
-            request_id, body.initial_inputs,
-            graph_walk=body.request_info.graph_walk
-        )
-        self.wakeup_event.register_futures(futures)
-
-        # Signal-only edges (tensor_info is None) can be processed immediately
-        signal_only = [
-            edge for edge in body.initial_inputs if len(edge.tensor_info) == 0
-        ]
-        if signal_only:
-            self._graph_runtime.ingest_inputs_batch(
-                self._one_rids_edges(request_id, signal_only), can_buffer=True,
-            )
-        # A DRAIN that arrived while this request was held waited for the handle
-        # it needs to gate the scheduler and to name the TP followers. Before
-        # the out-of-order replay below, so a REMOVE parked behind it finds the
-        # rid already draining.
-        if self._drains_awaiting_handle.pop(body.request_id, None) is not None:
-            self._begin_drain(body.request_id)
-
-        # process messages that may have came in out-of-order
-        if body.request_id in self._unprocessed_messages:
-            self._process_message_list(self._unprocessed_messages[body.request_id])
-            del self._unprocessed_messages[body.request_id]
 
 
     def _remove_request(self, body: RemoveRequest) -> None:
@@ -741,16 +763,6 @@ class Worker:
             # it can be non-empty for a rid that never got a handle, and no
             # later message would ever pop it.
             self.scheduler.clear_wire_rid(body.request_id)
-            # A resumed request held by hold_if_not_ready and drained before
-            # admission: forget the hold, or _apply_pending_sessions would admit
-            # a request nobody will schedule. Unreachable while
-            # _process_message_list parks a REMOVE with no handle; the session's
-            # own teardown drops the hold too (see forget_session).
-            if self._sessions.drop_held(body.request_id):
-                logger.info(
-                    "Dropped held request %s; it was removed before admission",
-                    body.request_id,
-                )
             return
         if request_id in self._in_flight_rids:
             self._pending_removes.add(request_id)
@@ -796,8 +808,12 @@ class Worker:
         # once the api server finished reading the outputs.
         self._draining_rids.discard(body.request_id)
         self._pending_drains.discard(body.request_id)
-        self._drains_awaiting_handle.pop(body.request_id, None)
         self._reads_done_sent.discard(body.request_id)
+        # It may still be waiting on its session: drop the hold, or
+        # _apply_pending_sessions would finish admitting a request whose handle
+        # this removal is about to free.
+        self._handles_awaiting_admit.discard(request_id)
+        self._sessions.drop_held(body.request_id)
         overshot_nodes = self._sessions.take_overshot(request_id)
         # The session keeps what this request built; ending it is a
         # TEARDOWN_SESSION of its own, which the conductor sends behind this
@@ -839,17 +855,10 @@ class Worker:
             self._pending_drains.add(body.request_id)
             return
 
-        if handle is None and self._sessions.is_held(body.request_id):
-            # Draining now would neither gate the scheduler nor reach the TP
-            # followers: both need the handle, which only admission mints. A
-            # follower ignores the conductor's own copy and waits for rank 0's
-            # forward, so fanning nothing here leaves its READS_DONE unsent and
-            # the barrier waiting out its TTL. Wait for the admission instead.
-            self._drains_awaiting_handle.setdefault(
-                body.request_id, _time.monotonic() + _HELD_DRAIN_WAIT_S,
-            )
-            return
-
+        # A request still waiting on its session needs no special case: the
+        # handle was minted before the wait, so the drain below gates the
+        # scheduler and reaches the TP followers exactly as it does for an
+        # admitted one.
         self._begin_drain(body.request_id)
 
     def _begin_drain(self, request_id: str) -> None:
@@ -920,22 +929,6 @@ class Worker:
         ]:
             self._pending_drains.discard(rid)
             self._begin_drain(rid)
-        # Drains waiting on a handle: admission drains them itself, so what is
-        # left here is a hold that was dropped (its session went) or one that
-        # outlasted the wait. Drain locally, so this rank still ACKs.
-        for rid, deadline in list(self._drains_awaiting_handle.items()):
-            if self._rid(rid) is not None:
-                self._drains_awaiting_handle.pop(rid, None)  # admission got it
-            elif (
-                not self._sessions.is_held(rid)
-                or _time.monotonic() >= deadline
-            ):
-                self._drains_awaiting_handle.pop(rid, None)
-                logger.info(
-                    "Draining %s without a handle: it was never admitted here",
-                    rid,
-                )
-                self._begin_drain(rid)
         for rid in list(self._draining_rids):
             self._complete_drain_if_ready(rid)
 
@@ -989,14 +982,33 @@ class Worker:
         )
 
     def _apply_pending_sessions(self) -> None:
-        """Admit held requests, then finish held teardowns whose session is free.
+        """Finish admitting requests whose session has handed over, then run
+        held teardowns whose session is free.
 
-        Ingests first: a teardown that ran ahead of a held request would free
-        the state that request is waiting for and then admit it into a session
-        that no longer exists.
+        Ingests first: a teardown that ran ahead of one would free the state
+        that request is waiting for and then admit it into a session that no
+        longer exists.
         """
-        for body in self._sessions.take_held_ingests():
-            self._add_new_request(body)
+        ready, dropped = self._sessions.take_held_ingests()
+        for body in dropped:
+            # Its session went while it waited. Fail it rather than admit it
+            # into nothing: a resumed request that silently started from an
+            # empty context is worse than an error, and 410 is what the route
+            # promises for state that is gone.
+            handle = body.request_info.rid_handle
+            self._handles_awaiting_admit.discard(handle)
+            self._fail_requests(
+                {handle: "its session was torn down before this request ran"},
+                {handle: 410},
+            )
+        for body in ready:
+            handle = body.request_info.rid_handle
+            if body.request_id in self._draining_rids:
+                self._handles_awaiting_admit.discard(handle)
+                continue  # drained while it waited; the REMOVE does the rest
+            if self._sessions.hold_if_not_ready(body, handle):
+                continue  # another of its session's requests is still leaving
+            self._finish_admission(body, handle)
         for session_id in self._sessions.ready_teardowns():
             # SELF: it already passed the TP checks when it was first held
             self._teardown_session(TeardownSession(

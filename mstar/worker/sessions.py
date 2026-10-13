@@ -115,15 +115,6 @@ class WorkerSessionManager:
         self._pending_session_ingests.append(body)
         return True
 
-    def is_held(self, request_id: str) -> bool:
-        """Whether this wire id is a NEW_REQUEST held here, waiting for its
-        session. It has no handle yet, so a message keyed by one cannot act on
-        it; the worker waits for the admission instead."""
-        return any(
-            held.request_id == request_id
-            for held in self._pending_session_ingests
-        )
-
     def drop_held(self, request_id: str) -> bool:
         """Forget a held request (by its wire id) that was removed before it
         could be admitted. True when one was held."""
@@ -135,30 +126,30 @@ class WorkerSessionManager:
         self._pending_session_ingests = kept
         return dropped
 
-    def take_held_ingests(self) -> list[NewRequest]:
-        """The held requests, for the worker to re-admit. One that is still not
-        ready holds itself again.
+    def take_held_ingests(self) -> tuple[list[NewRequest], list[NewRequest]]:
+        """``(ready, dropped)``: the requests waiting on their session, split by
+        whether that session is still there.
 
-        A request held for a session whose teardown is itself waiting is
-        dropped rather than handed back: admitting it would give that session a
-        live request again, so its teardown would never come ready and every
-        later teardown of the same id here would queue behind it.
+        ``dropped`` is for a session whose teardown is itself waiting. Admitting
+        one would give that session a live request again, so its teardown would
+        never come ready and every later teardown of the same id here would
+        queue behind it. The worker fails those rather than admitting them into
+        a session that is going.
+
+        A ready one that turns out still not to be ready holds itself again, so
+        the caller re-checks rather than trusting this.
         """
         held, self._pending_session_ingests = self._pending_session_ingests, []
-        ready = [
-            body for body in held
-            if _session_id_of(body) not in self._pending_session_teardowns
-        ]
-        if len(ready) != len(held):
-            dropped = [
-                body.request_id for body in held
-                if _session_id_of(body) in self._pending_session_teardowns
-            ]
+        ready, dropped = [], []
+        for body in held:
+            going = _session_id_of(body) in self._pending_session_teardowns
+            (dropped if going else ready).append(body)
+        if dropped:
             logger.info(
-                "Dropped %d request(s) held for a session that is being torn "
-                "down: %s", len(dropped), dropped,
+                "Dropped %d request(s) waiting on a session that is being torn "
+                "down: %s", len(dropped), [b.request_id for b in dropped],
             )
-        return ready
+        return ready, dropped
 
     def bind(
         self, request_id: int, session_id: str | None,

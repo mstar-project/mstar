@@ -42,6 +42,7 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
     w.is_tp_follower = is_follower
     w.sent = []
     w.removed = []
+    w.admitted = []   # rids whose engine state was opened
     w.removed_sessions = []
     w.overshot = []
     w.idle_seqs = []
@@ -53,8 +54,8 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
     w._pending_drains = set()
     w._draining_rids = set()
     w._reads_done_sent = set()
-    w._drains_awaiting_handle = {}
     w._pending_removes = set()
+    w._handles_awaiting_admit = set()
     w._deferred_idle_seq = {}
     w._session_idle_seq = 0
     w._removes_awaiting_step = {}
@@ -111,7 +112,7 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
             w.idle_seqs.append((rid, kw.get("session_idle_seq", -1))),
         ),
         remove_session=w.removed_sessions.append,
-        add_request=lambda rid, cfgs, session=None: None,
+        add_request=lambda rid, cfgs, session=None: w.admitted.append(rid),
         take_session_error=lambda sid: w.session_errors.pop(sid, None),
         evictable_nodes=lambda: [],
     )
@@ -398,6 +399,47 @@ def test_ingest_without_a_session_touches_no_session_state():
     assert w._sessions.session_of("Y") is None
 
 
+def test_a_request_awaiting_its_session_opens_no_engine_state():
+    # the handle and everything keyed by it exist; the engine state does not,
+    # because that is what has to wait for the session's handover
+    w = _worker(known_rids=("X",), sessions={"s": {"X"}})
+
+    Worker._add_new_request(w, _new_request(session_id="s"))
+
+    assert w._handles_awaiting_admit == {"Y"}
+    assert w.admitted == [], "engine state must wait for the handover"
+    assert w._sessions.session_of("Y") is None, "not bound until admitted"
+    # ...and the handle is usable: _rid resolves it, so messages keyed by one
+    # reach it rather than being parked
+    assert Worker._rid(w, "Y") == "Y"
+
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    Worker._apply_pending_sessions(w)
+
+    assert w._handles_awaiting_admit == set()
+    assert w.admitted == ["Y"]
+    assert w._sessions.session_of("Y") == "s"
+
+
+def test_a_request_whose_session_dies_while_it_waits_is_failed_410():
+    # admitting it would resume from an empty context, which is worse than an
+    # error; 410 is what the route promises for state that is gone
+    w = _worker(known_rids=("X",), sessions={"s": {"X"}})
+    failed = []
+    w._fail_requests = lambda errors, statuses=None: failed.append((errors, statuses))
+    Worker._add_new_request(w, _new_request(session_id="s"))
+
+    _deliver(w, TeardownSession(session_id="s"))  # held: X is still leaving
+    _deliver(w, RemoveRequest(request_id="X"))
+    Worker._apply_pending_sessions(w)
+
+    [(errors, statuses)] = failed
+    assert list(errors) == ["Y"] and statuses == {"Y": 410}
+    assert w.admitted == [], "it must not open state in a session that is going"
+    assert w._handles_awaiting_admit == set()
+    assert w.removed_sessions == ["s"]
+
+
 # ── the offload victim order is the leader's ───────────────────────────────
 
 def test_the_leader_numbers_each_session_as_it_parks_its_state():
@@ -490,72 +532,44 @@ def _leads_one_follower(w):
     ])
 
 
-def test_a_drain_for_a_held_request_waits_for_the_handle_then_fans():
-    # the drain cannot gate the scheduler or name the followers without a
-    # handle, and a follower ignores the conductor's copy, so draining here and
-    # fanning nothing would leave the follower's READS_DONE unsent
+def test_a_drain_for_a_request_awaiting_its_session_needs_no_special_case():
+    # The handle is minted before the wait, so the drain gates the scheduler
+    # and reaches the followers exactly as it does for an admitted request.
+    # Without the early handle this fanned nothing, and the follower's
+    # READS_DONE never came.
     w = _worker(known_rids=("X",), sessions={"s": {"X"}})
     _leads_one_follower(w)
-    Worker._add_new_request(w, _new_request(session_id="s"))  # Y, held
+    Worker._add_new_request(w, _new_request(session_id="s"))  # Y, awaiting
+    assert w._handles_awaiting_admit == {"Y"}
 
     Worker._drain_request(w, DrainRequest(request_id="Y"))
 
-    assert w._drains_awaiting_handle.keys() == {"Y"}
-    assert _drains(w) == [], "nothing to fan to yet"
-    assert "Y" not in w._draining_rids
-
-    # X leaves, Y is admitted, and the drain goes with its handle
-    Worker._remove_request(w, RemoveRequest(request_id="X"))
-    Worker._apply_pending_sessions(w)
-
-    assert w._drains_awaiting_handle == {}
     assert "Y" in w._draining_rids
+    assert _reads_done(w) == ["Y"]
     [(to, body)] = _drains(w)
     assert (to, body.request_id) == ("w1", "Y")
     assert body.source == MessageSource.TP_RANK_0
 
 
-def test_a_drain_for_a_hold_that_is_dropped_still_acks():
-    # the session was torn down, so the hold is dropped rather than admitted
-    # and the handle never comes; the rank still owes the barrier its ACK
-    w = _worker(known_rids=("X",), sessions={"s": {"X"}})
-    Worker._add_new_request(w, _new_request(session_id="s"))
-    Worker._drain_request(w, DrainRequest(request_id="Y"))
-    assert w._drains_awaiting_handle.keys() == {"Y"}
-
-    _deliver(w, TeardownSession(session_id="s"), RemoveRequest(request_id="X"))
-    Worker._apply_pending_sessions(w)  # drops the hold with the session
-    Worker._apply_pending_drains(w, set())
-
-    assert w._drains_awaiting_handle == {}
-    assert "Y" in w._draining_rids
-    assert _reads_done(w) == ["Y"]
-
-
-def test_a_drain_for_a_hold_that_outlasts_the_wait_still_acks():
+def test_a_request_drained_while_awaiting_its_session_is_not_admitted():
     w = _worker(known_rids=("X",), sessions={"s": {"X"}})
     Worker._add_new_request(w, _new_request(session_id="s"))
     Worker._drain_request(w, DrainRequest(request_id="Y"))
 
-    # nothing has changed, so it is still waiting
-    Worker._apply_pending_drains(w, set())
-    assert w._drains_awaiting_handle.keys() == {"Y"}
-    assert _reads_done(w) == []
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    Worker._apply_pending_sessions(w)
 
-    w._drains_awaiting_handle["Y"] = 0.0  # the deadline passes
-    Worker._apply_pending_drains(w, set())
-
-    assert w._drains_awaiting_handle == {}
-    assert _reads_done(w) == ["Y"]
+    # its turn came, but it is draining, so it never opened engine state
+    assert w._handles_awaiting_admit == set()
+    assert w._sessions.session_of("Y") is None
+    assert "Y" not in w.admitted
 
 
 def test_a_drain_for_a_request_this_worker_never_saw_is_unchanged():
-    # not held, so nothing is coming: ACK at once, as before
     w = _worker(known_rids=())
 
     Worker._drain_request(w, DrainRequest(request_id="Z"))
 
-    assert w._drains_awaiting_handle == {}
     assert "Z" in w._draining_rids
     assert _reads_done(w) == ["Z"]
 
@@ -563,14 +577,14 @@ def test_a_drain_for_a_request_this_worker_never_saw_is_unchanged():
 # ── a held request removed before it was admitted ──────────────────────────
 
 def test_a_held_request_removed_before_admission_still_ends_its_session():
-    # the previous request is still leaving, so Y is held; the client aborts
-    # Y before it is admitted, and Y was the session's last request. Y has no
-    # handle here, so _process_message_list parks its REMOVE and only an
-    # admission that will never come would replay it -- the teardown is what
-    # has to free the session and ACK.
+    # The previous request is still leaving, so Y waits; the client aborts Y
+    # before it is admitted, and Y was the session's last request. Y's handle
+    # was minted before the wait, so _process_message_list does NOT park its
+    # REMOVE -- it is handled like any other, which is what the early mint is
+    # for. Before it, the REMOVE sat in _unprocessed_messages forever.
     w = _worker(known_rids=("X",), sessions={"s": {"X"}})
     Worker._add_new_request(w, _new_request(session_id="s"))
-    assert w._sessions.has_pending is True
+    assert w._handles_awaiting_admit == {"Y"}
 
     _deliver(
         w,
@@ -579,9 +593,10 @@ def test_a_held_request_removed_before_admission_still_ends_its_session():
         TeardownSession(session_id="s"),
     )
 
-    assert w._unprocessed_messages.get("Y"), "the REMOVE for Y should be parked"
-    # the hold goes with the session, rather than being admitted later into a
-    # session that is gone
+    assert "Y" not in w._unprocessed_messages, "the REMOVE should not be parked"
+    assert "Y" in w.removed, "it should have been torn down, not left waiting"
+    # and it is not left to be admitted into a session that is gone
+    assert w._handles_awaiting_admit == set()
     assert w._sessions.has_pending is False
     assert w.removed_sessions == ["s"]
     assert _acks(w) == ["s"]
@@ -737,8 +752,8 @@ def test_a_follower_frees_the_session_once_it_reaches_rank_0_s_step():
 
 
 def test_a_follower_ends_the_session_of_a_request_it_never_admitted():
-    # rank 0 forwarded the REMOVE and then the teardown; the follower had held
-    # the request, so its REMOVE parks here just as it does on a leader
+    # rank 0 forwarded the REMOVE and then the teardown; this rank was still
+    # waiting on the session, which the early handle makes unremarkable
     w = _worker(known_rids=("X",), sessions={"s": {"X"}}, is_follower=True)
     Worker._add_new_request(w, _new_request(session_id="s"))
 
@@ -749,7 +764,9 @@ def test_a_follower_ends_the_session_of_a_request_it_never_admitted():
         TeardownSession(session_id="s", source=MessageSource.TP_RANK_0),
     )
 
-    assert w._unprocessed_messages.get("Y"), "the REMOVE for Y should be parked"
+    assert "Y" not in w._unprocessed_messages
+    assert "Y" in w.removed
+    assert w._handles_awaiting_admit == set()
     assert w._sessions.has_pending is False
     assert w.removed_sessions == ["s"]
     assert _acks(w) == ["s"]

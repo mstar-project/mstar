@@ -2162,6 +2162,11 @@ class Engine:
         ``session_idle_seq`` is the TP leader's stamp for the session going
         idle, which orders it against the others parked here when a resource
         has to reclaim one of them.
+
+        A rid that was never admitted is a no-op, not an error: the worker mints
+        a handle before a resumed request's session has handed its state over,
+        so a removal can arrive for one this engine never saw. Keep it that way
+        — index resources with ``get``/``pop``, never ``[rid]``.
         """
         session_id = self._request_sessions.pop(request_id, None)
         self._runner.remove_request(

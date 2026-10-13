@@ -97,6 +97,34 @@ def test_tp_rid_this_rank_does_not_know_is_the_removed_sentinel():
     assert _scheduler(t).tp_rids(_follow("a", "gone")) == [a, REMOVED_RID]
 
 
+def test_tp_rid_awaiting_its_session_is_the_removed_sentinel_too():
+    """The handle exists but the engine has no state for it yet.
+
+    ``check_ready`` would answer ADMIT_OK for it rather than refuse (nothing is
+    published, so there is nothing to wait on), and the batch would then be
+    planned against resources that were never opened. The ranks differ on this
+    -- each waits for its own previous request to leave -- so the follower has
+    to defer on the sentinel, exactly as it does for a rid it never knew.
+    """
+    t = RidTable()
+    a, waiting = t.intern("a"), t.intern("waiting")
+    s = _scheduler(t)
+    s.handles_awaiting_admit.add(waiting)
+
+    assert s.tp_rids(_follow("a", "waiting")) == [a, REMOVED_RID]
+
+
+def test_a_rid_awaiting_its_session_is_never_scheduled():
+    # the set the scheduling loop passes to get_ready_nodes
+    t = RidTable()
+    ok, waiting = t.intern("ok"), t.intern("waiting")
+    s = _scheduler(t)
+    s.handles_awaiting_admit.add(waiting)
+
+    assert waiting in s.unschedulable_rids
+    assert ok not in s.unschedulable_rids
+
+
 def test_follow_refcount_counts_rids_this_rank_cannot_resolve():
     """Counted by WIRE STRING, so a rid whose NEW_REQUEST has not landed yet
     still gates the drain. Resolving to handles here would drop it, and the
@@ -145,6 +173,7 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
         remove_request=lambda h: w.request_state.per_request_info.pop(h),  # noqa: PLW0108
     )
     w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
+    w._handles_awaiting_admit = set()
     return w, t
 
 
@@ -167,7 +196,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._deferred_idle_seq = {}
     w._session_idle_seq = 0
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w._drains_awaiting_handle = {}
+    w._handles_awaiting_admit = set()
     w._last_active = {}
     w.streaming_buffers = {a: {}}
     w.engine_manager = SimpleNamespace(
@@ -256,7 +285,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
         start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
     w._draining_rids = set()
-    w._drains_awaiting_handle = {}
+    w._handles_awaiting_admit = set()
     w._last_active = {}
     w._my_consumer_connections = []
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
@@ -299,7 +328,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
         register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
     w._draining_rids, w._last_active, w._unprocessed_messages = set(), {}, {}
-    w._drains_awaiting_handle = {}
+    w._handles_awaiting_admit = set()
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._consumer_node_cache = {"codec_tokens": "Codec"}
     w._my_consumer_connections = [Connection(

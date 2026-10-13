@@ -97,6 +97,7 @@ def _worker():
     w._reads_done_sent = set()
     w._in_flight_rids = set()
     w._pending_removes = set()
+    w._handles_awaiting_admit = set()
     w._deferred_idle_seq = {}
     w._session_idle_seq = 0
     w._last_active = {}

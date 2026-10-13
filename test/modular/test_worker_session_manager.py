@@ -116,8 +116,9 @@ def test_a_resumed_request_is_held_while_the_previous_one_leaves():
 
     leaving.discard("r0")
 
-    held = manager.take_held_ingests()
+    held, dropped = manager.take_held_ingests()
     assert [body.request_id for body in held] == ["r1"]
+    assert dropped == []
     assert manager.has_pending is False
 
 
@@ -149,12 +150,13 @@ def test_a_held_request_that_is_still_not_ready_holds_itself_again():
     manager.bind("r0", "s")
     manager.hold_if_not_ready(_new_request("r1", "s"))
 
-    for body in manager.take_held_ingests():
+    ready, _ = manager.take_held_ingests()
+    for body in ready:
         assert manager.hold_if_not_ready(body) is True
 
     assert manager.has_pending is True
     leaving.discard("r0")
-    assert [b.request_id for b in manager.take_held_ingests()] == ["r1"]
+    assert [b.request_id for b in manager.take_held_ingests()[0]] == ["r1"]
 
 
 # ── removal ─────────────────────────────────────────────────────────────────
@@ -216,7 +218,7 @@ def test_forgetting_a_session_drops_every_trace_of_it():
     assert manager.ready_teardowns() == []
     # the hold goes too: the state it was waiting for is being freed
     leaving.discard("r0")
-    assert manager.take_held_ingests() == []
+    assert manager.take_held_ingests() == ([], [])
     assert manager.has_pending is False
 
 
@@ -231,7 +233,9 @@ def test_a_request_held_for_a_session_being_torn_down_is_not_readmitted():
 
     leaving.discard("r0")
 
-    assert manager.take_held_ingests() == []
+    ready, dropped = manager.take_held_ingests()
+    assert ready == []
+    assert [b.request_id for b in dropped] == ["r1"]
     assert manager.ready_teardowns() == ["s"]
 
 
@@ -245,7 +249,9 @@ def test_a_hold_for_another_session_survives_a_teardown():
 
     leaving.clear()
 
-    assert [b.request_id for b in manager.take_held_ingests()] == ["q1"]
+    ready, dropped = manager.take_held_ingests()
+    assert [b.request_id for b in ready] == ["q1"]
+    assert [b.request_id for b in dropped] == ["r1"]
 
 
 def test_forgetting_a_session_leaves_the_others_alone():

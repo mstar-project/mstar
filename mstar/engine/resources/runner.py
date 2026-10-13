@@ -251,6 +251,8 @@ class StepRunner:
 
         ``idle_seq`` orders the session against the others parked here, for a
         resource that reclaims parked state; see ``retain_session_state``.
+
+        A rid no resource ever ingested is a no-op; see ``Engine.remove_request``.
         """
         for key in self._order:
             resource = self._resources[key]
