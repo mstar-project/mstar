@@ -140,6 +140,8 @@ class RecurrentStatePool(Resource):
         self._snap_meta: dict[int, tuple[bytes, int, int]] = {}
         # snapshot slot -> leases and restores holding it
         self._snap_refs: dict[int, int] = {}
+        # snapshot slots last reserved for a spare (`RecurrentStep.spare_snapshots`)
+        self._snap_spares: set[int] = set()
         self._snap_clock = 0
         self._prefix_root: bytes | None = None
         # label -> the walks its keys describe
@@ -305,14 +307,15 @@ class RecurrentStatePool(Resource):
                     self._restores[key] = lease[1:]
                     self._admit_restores.append(key)
         with self._lock:
-            for rid, label, tokens in step.snapshots:
-                if (ctx.is_padding_row(rid) or self._prefix_root is None
-                        or (rid, label, tokens) in self._snap_writes):  # a step admitted again
-                    continue
-                snap = self._reserve_snapshot()
-                if snap is not None:
-                    self._snap_writes[(rid, label, tokens)] = snap
-                    self._admit_snaps.append((rid, label, tokens))
+            for spare, snaps in ((False, step.snapshots), (True, step.spare_snapshots)):
+                for rid, label, tokens in snaps:
+                    if (ctx.is_padding_row(rid) or self._prefix_root is None
+                            or (rid, label, tokens) in self._snap_writes):  # admitted again
+                        continue
+                    snap = self._reserve_snapshot(spare)
+                    if snap is not None:
+                        self._snap_writes[(rid, label, tokens)] = snap
+                        self._admit_snaps.append((rid, label, tokens))
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
@@ -682,16 +685,24 @@ class RecurrentStatePool(Resource):
             to.copy_(from_)
         self._snap_written.add(snap)
 
-    def _reserve_snapshot(self) -> int | None:
-        """A free snapshot slot, else the oldest nothing holds. Caller holds the lock."""
+    def _reserve_snapshot(self, spare: bool) -> int | None:
+        """A free snapshot slot, or for a kept one the oldest idle spare, then the oldest idle
+        snapshot. Caller holds the lock."""
         if self._snap_free:
-            return self._snap_free.pop()
-        idle = [(meta[2], snap) for snap, meta in self._snap_meta.items()
-                if snap not in self._snap_refs]
-        if not idle:
+            snap = self._snap_free.pop()
+        elif spare:
             return None
-        _, snap = min(idle)
-        del self._snap_by_key[self._snap_meta.pop(snap)[0]]
+        else:
+            idle = [(snap not in self._snap_spares, meta[2], snap)
+                    for snap, meta in self._snap_meta.items() if snap not in self._snap_refs]
+            if not idle:
+                return None
+            *_, snap = min(idle)
+            del self._snap_by_key[self._snap_meta.pop(snap)[0]]
+        if spare:
+            self._snap_spares.add(snap)
+        else:
+            self._snap_spares.discard(snap)
         return snap
 
     def _apply_restores(self, step: RecurrentStep) -> None:
