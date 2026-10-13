@@ -406,6 +406,13 @@ class Glm52Model(Model):
         if sampling.min_p > 0:
             # the node's sampler is built without min-p: a 400 here, not the worker's 500
             raise ValueError(f"GLM-5.2 is served without min_p (min_p={sampling.min_p}); send none")
+        if self.config.mtp_num_draft_tokens > 0 and (
+                sampling.temperature != 0 or sampling.repetition_penalty != 1):
+            # what prepare_inputs refuses, as a 500 once every rank had the request
+            raise ValueError(
+                f"MTP drafting is greedy only (temperature={sampling.temperature}, "
+                f"repetition_penalty={sampling.repetition_penalty}); serve with mtp_num_draft_tokens: 0"
+            )
 
         if self._tokenizer_mode == "byte":
             # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
