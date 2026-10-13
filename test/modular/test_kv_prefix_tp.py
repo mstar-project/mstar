@@ -36,6 +36,7 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerMessage,
     WorkerMessageType,
 )
+from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 
 PAGE_SIZE = 16
 ROOT = b"a root"
@@ -326,3 +327,28 @@ def test_rank_0s_hits_cross_the_wire():
     assert out.prefix_hits == body.prefix_hits
     assert isinstance(out.prefix_hits["r2"], PrefixHit)
     assert ScheduleTPNode("LLM", "decode", ["r1"]).prefix_hits == {}
+
+
+def test_a_diverged_hit_fails_its_requests_once():
+    """A follower that cannot take rank 0's hit never will: the head goes and its
+    requests fail, so the error surfaces once rather than at every poll."""
+    def adopt(node, walk, hits):
+        raise RuntimeError("KV kv: prefix index diverged from rank 0")
+
+    engine = SimpleNamespace(adopt_cached_prefix=adopt)
+    sched = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        parallel_leader_nodes=set(),
+    )
+    sched.register_tp_follow(ScheduleTPNode(
+        NODE, WALK, ["r1", "r2"], spec_seq=3,
+        prefix_hits={"r1": PrefixHit(tokens=64, pages={"kv": [5]})},
+    ))
+
+    with pytest.raises(RuntimeError, match="diverged"):
+        sched.settle_tp_follow_delta()
+    assert sched.peek_tp_follow() is None
+    errors = sched.take_admit_errors()
+    assert set(errors) == {"r1", "r2"} and "diverged" in errors["r1"]
+    assert sched.failed_rids == {"r1", "r2"}
+    assert sched.settle_tp_follow_delta() is True
