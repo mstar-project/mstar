@@ -409,9 +409,11 @@ class LazyRequestStates(Mapping):
 class LazySessionStates(Mapping):
     """The batch's per-session states, by request id, resolved on first read.
 
-    A request with no session, or whose session the submodule has nothing for
-    yet, reads as ``None`` rather than raising: only a submodule that keeps
-    session state looks here at all.
+    A request in no session reads as ``None`` rather than raising: only a
+    submodule that keeps session state looks here at all. A request that *is* in
+    one always reads as a state, created empty on first access — so a submodule
+    telling a session's first turn from a later one checks its own key, not for
+    ``None`` (``Cosmos3VAEDecoderARSubmodule`` reads ``DECODE_TAIL`` that way).
     """
 
     __slots__ = ("_submodule", "_rids", "_sessions", "_members")
