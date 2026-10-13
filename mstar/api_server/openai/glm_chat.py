@@ -120,6 +120,8 @@ def _arg_value(raw: str, schema):
         return raw
     if not _finite(value):
         return raw
+    if "integer" in types and isinstance(value, float) and value.is_integer():
+        value = int(value)  # an integer the model wrote as 3.0 is still one
     if types and _json_type(value) not in types and not (_json_type(value) == "integer" and "number" in types):
         return raw
     return value

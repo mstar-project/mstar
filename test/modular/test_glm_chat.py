@@ -121,6 +121,8 @@ def test_a_reply_cut_off_at_the_call_tag_keeps_it():
     ({"anyOf": [{"type": "integer"}, {"type": "string"}]}, "5", 5),
     ({"type": "number"}, "3", 3),
     ({"type": "integer"}, "3.5", "3.5"),  # off the schema: left as the model wrote it
+    ({"type": "integer"}, "3.0", 3),
+    ({"anyOf": [{"type": "integer"}, {"type": "null"}]}, "2e1", 20),
     ({"type": "number"}, "NaN", "NaN"),  # not JSON: arguments must stay parseable
     ({}, "Infinity", "Infinity"),
     ({"type": "array"}, '["a", 1]', ["a", 1]),
