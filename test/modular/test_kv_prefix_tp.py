@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
@@ -352,3 +353,20 @@ def test_a_diverged_hit_fails_its_requests_once():
     assert set(errors) == {"r1", "r2"} and "diverged" in errors["r1"]
     assert sched.failed_rids == {"r1", "r2"}
     assert sched.settle_tp_follow_delta() is True
+
+
+def test_rank_0s_hit_is_plain_ints_whatever_a_resource_answers():
+    """The wire takes Python ints only, and rank 0 encodes the hit after its leases are
+    taken: a numpy or torch scalar from a resource must not reach it."""
+    engine = Engine.__new__(Engine)
+    engine._keyed_walks = {NODE: {WALK}}
+    engine._graph_runtime = SimpleNamespace(get_rid_string=lambda rid: f"wire-{rid}")
+    engine._runner = SimpleNamespace(
+        resolve_cached_prefix=lambda rid, node, walk: np.int64(2 * PAGE_SIZE),
+        cached_prefix_pages=lambda rid, node, walk, n: {"kv": [torch.tensor(3), np.int64(4)]},
+    )
+    batch = SimpleNamespace(node_name=NODE, graph_walk=WALK, request_ids=("a",), cached_prefix=None)
+
+    body = ScheduleTPNode(NODE, WALK, ["wire-a"], prefix_hits=engine.decide_cached_prefix(batch))
+    out = decode(encode(WorkerMessage(WorkerMessageType.SCHEDULE_TP, body))).body
+    assert out.prefix_hits == {"wire-a": PrefixHit(tokens=2 * PAGE_SIZE, pages={"kv": [3, 4]})}

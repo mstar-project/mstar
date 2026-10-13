@@ -919,11 +919,13 @@ class Engine:
         hits = {}
         batch.cached_prefix = {}
         for rid in batch.request_ids:
-            matched = self._runner.resolve_cached_prefix(rid, node, walk)
+            # plain ints: the wire refuses a numpy or torch scalar, after the leases are taken
+            matched = int(self._runner.resolve_cached_prefix(rid, node, walk))
             batch.cached_prefix[rid] = matched
             if matched > 0:
+                pages = self._runner.cached_prefix_pages(rid, node, walk, matched)
                 hits[self._graph_runtime.get_rid_string(rid)] = PrefixHit(
-                    matched, self._runner.cached_prefix_pages(rid, node, walk, matched))
+                    matched, {key: [int(p) for p in held] for key, held in pages.items()})
         return hits
 
     def adopt_cached_prefix(
