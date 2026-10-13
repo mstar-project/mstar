@@ -76,12 +76,13 @@ Communication
    * - ``MSTAR_DIST_TIMEOUT_S``
      - config's ``dist_timeout_s``
      - Timeout in seconds for the NCCL world group and its parallel
-       subgroups (:func:`mstar.distributed.communication.resolve_dist_timeout`).
+       subgroups during weight load and warmup
+       (:func:`mstar.distributed.communication.resolve_dist_timeout`); once
+       warmup is done, serving collectives go back to PyTorch's default.
        Overrides the deployment config's ``dist_timeout_s``; with neither set,
-       PyTorch's default applies. Raise it only where weight load, JIT or
-       CUDA-graph capture can exceed that default; a hung collective takes
-       correspondingly longer to abort. Must be set before the conductor
-       spawns workers, which inherit it.
+       PyTorch's default applies throughout. Raise it only where weight load,
+       JIT or CUDA-graph capture can exceed that default. Must be set before
+       the conductor spawns workers, which inherit it.
    * - ``MSTAR_TP_ALLREDUCE``
      - config's ``tp_allreduce``, else ``nccl``
      - Backend for small TP all-reduces (``CommGroup.all_reduce``); overrides

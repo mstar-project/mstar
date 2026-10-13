@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed.constants import default_pg_nccl_timeout, default_pg_timeout
+from torch.distributed.distributed_c10d import _set_pg_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -471,7 +473,7 @@ class WorkerParallelGroups:
     _device: torch.device | None = field(default=None, init=False, repr=False)
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
-    # Process-group timeout in seconds from the deployment config's
+    # Process-group timeout in seconds for load and warmup, from the config's
     # ``dist_timeout_s``; ``MSTAR_DIST_TIMEOUT_S`` overrides. None = torch default.
     dist_timeout_s: float | None = None
     # Small-message all-reduce path from the deployment config's
@@ -664,6 +666,19 @@ class WorkerParallelGroups:
         if not self.any_parallelism:
             return
         dist.barrier()
+
+    def restore_default_timeout(self) -> None:
+        """Give every group this rank holds torch's default timeout back."""
+        # the long timeout is for load and warmup; in serving a wedged rank
+        # must abort the others, not leave them waiting for hours
+        if not self.any_parallelism or not resolve_dist_timeout(self.dist_timeout_s):
+            return
+        groups = [dist.group.WORLD]
+        for comm_group in (*self.node_to_tp_group.values(), *self.node_to_sp_group.values()):
+            groups += [comm_group.device_group, comm_group.cpu_group]
+        for pg in {id(g): g for g in groups if g is not None}.values():
+            nccl = dist.get_backend(pg) == dist.Backend.NCCL
+            _set_pg_timeout(default_pg_nccl_timeout if nccl else default_pg_timeout, pg)
 
 
 class GlobalParallelConfig:

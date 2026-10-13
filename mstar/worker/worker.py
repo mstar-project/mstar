@@ -3789,6 +3789,7 @@ class Worker:
         # engine's ``warmup``. The follower can't service the message
         # yet, but the leader will sit on the first NCCL collective.
         self.parallel_groups.barrier_all()
+        self.parallel_groups.restore_default_timeout()
 
         # Everything tracked right now — weights, capture buffers, wrapper
         # state — lives for the process, so gen2 gains nothing by walking it

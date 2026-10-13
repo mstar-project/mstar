@@ -2,20 +2,24 @@
 
 Torch's default (10 min) is shorter than a large checkpoint load at TP8, so a
 deployment opts in via ``dist_timeout_s`` in its config; the env var overrides
-it per process. Unset means ``{}`` — torch's default, untouched.
+it per process. Unset means ``{}`` — torch's default, untouched. Serving
+collectives go back to torch's default once warmup is done.
 """
 
 from __future__ import annotations
 
+import socket
 import sys
 from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed as dist
+from torch.distributed.constants import default_pg_timeout
 
 sys.path.insert(0, ".")
 
+import mstar.distributed.communication as comm_mod
 from mstar.distributed.communication import (
     DIST_TIMEOUT_ENV,
     CommGroup,
@@ -105,3 +109,46 @@ def test_init_dist_without_timeout_leaves_torch_default(monkeypatch):
     _two_tp_groups().init_dist(device=torch.device("cpu"))
 
     assert all("timeout" not in c for c in calls["init"] + calls["new_group"])
+
+
+@pytest.fixture
+def one_rank_gloo_world():
+    """A real one-rank gloo world, made with a long timeout as ``init_dist`` makes it."""
+    assert not dist.is_initialized()
+    long = timedelta(seconds=3600)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    dist.init_process_group(
+        backend="gloo", init_method=f"tcp://127.0.0.1:{port}", world_size=1, rank=0,
+        timeout=long,
+    )
+    sub = dist.new_group(ranks=[0], backend="gloo", timeout=long)
+    yield sub
+    dist.destroy_process_group()
+
+
+def _timeout(pg) -> timedelta:
+    return pg._get_backend(torch.device("cpu")).options._timeout
+
+
+def test_serving_returns_every_group_to_torch_default(one_rank_gloo_world):
+    # load and warmup need the long timeout; a wedged rank in serving must
+    # still abort at torch's default rather than hang for hours
+    sub = one_rank_gloo_world
+    groups = _two_tp_groups()
+    groups.dist_timeout_s = 3600
+    comm = groups.node_to_tp_group["llm"]
+    comm.device_group = comm.cpu_group = sub
+    assert _timeout(dist.group.WORLD) == _timeout(sub) == timedelta(seconds=3600)
+
+    groups.restore_default_timeout()
+
+    assert _timeout(dist.group.WORLD) == _timeout(sub) == default_pg_timeout
+
+
+def test_without_load_timeout_nothing_is_reset(monkeypatch):
+    calls = []
+    monkeypatch.setattr(comm_mod, "_set_pg_timeout", lambda *a: calls.append(a))
+    _two_tp_groups().restore_default_timeout()
+    assert calls == []

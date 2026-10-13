@@ -197,7 +197,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        is logged and skipped.
    * - ``dist_timeout_s``
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel
-       subgroups. Unset keeps PyTorch's default; ``MSTAR_DIST_TIMEOUT_S`` overrides.
+       subgroups during weight load and warmup; serving keeps PyTorch's default.
+       Unset keeps PyTorch's default throughout; ``MSTAR_DIST_TIMEOUT_S`` overrides.
    * - ``tp_allreduce``
      - *(optional)* Small-message all-reduce path: ``nccl`` (default),
        ``symm_oneshot`` or ``symm_multimem`` (see ``MSTAR_TP_ALLREDUCE``, which
