@@ -454,6 +454,47 @@ def test_a_sampled_request_is_served_beside_a_greedy_one():
     assert got.numel() >= 14 and bool(((got >= 0) & (got < cfg.vocab_size)).all())
 
 
+def test_a_follower_keeps_rank_0s_sampled_verdict():
+    """A TP follower whose own draw refuses every draft emits and seeds from rank 0's draw,
+    which keeps every draft: the sampled verify broadcasts it."""
+    cfg = _cfg(2, True)
+    sub = Glm52LLMSubmodule(_model(cfg), cfg)
+    driver = _Driver(sub, cfg, [])
+    sampler = SamplerResource(vocab_size=None, enable_repetion_penalty=False,
+                              device=torch.device("cpu"))
+    sampler.sample = lambda request_ids, logits, **kw: logits.argmax(-1)
+    drafts = {}
+
+    def own_draw(request_ids, logits, step_drafts):  # every draft refused, token 7 instead
+        drafts["d"] = step_drafts.clone()
+        n, k = step_drafts.shape
+        return torch.full((n, k + 1), 7), torch.zeros(n, dtype=torch.long)
+
+    class _Rank0:  # rank 0's draw: every draft kept, then token 5
+        world_size, rank = 2, 1
+
+        def broadcast(self, t, src=0):
+            assert src == 0
+            d = drafts["d"]
+            n, k = d.shape
+            t.copy_(torch.cat([d, torch.full((n, 1), 5), torch.full((n, 1), k)], 1))
+            return t
+
+    sampler.speculative_sample = own_draw
+    sub.lm_head.comm_group = _Rank0()
+    driver.resources = {**driver.resources, SAMPLER_RESOURCE: sampler}
+    driver.runner = StepRunner(driver.resources, node_resources={"LLM": list(driver.resources)})
+    sub.bind_node_resources(driver.resources)
+    driver.runner.ingest_request("s", {SAMPLER_RESOURCE: SamplingReqConfig(
+        temperature=0.8, ignore_eos=True)})
+    info = _fwd_info("s", 14, True)
+    info.resource_configs[SAMPLER_RESOURCE].temperature = 0.8
+    out = driver.step("prefill", {"s": (info, torch.arange(3, dtype=torch.long) + 9)})["s"]
+    out = driver.step("decode", {"s": (info, out["text_inputs"][0])})["s"]
+    assert out["new_token"][0].tolist() == [*drafts["d"][0].tolist(), 5]
+    assert out["text_inputs"][0].tolist() == [5]
+
+
 def test_declare_step_shapes():
     cfg = _cfg(0, True)
     sub = Glm52LLMSubmodule(_model(cfg), cfg)

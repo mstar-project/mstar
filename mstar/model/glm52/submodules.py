@@ -926,6 +926,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if step is not None and step.cg_key_info == SAMPLED:
             target, accepted = engine_inputs.resources[SAMPLER_RESOURCE].speculative_sample(
                 engine_inputs.request_ids, self.lm_head(hidden).view(n, block, -1), drafts)
+            # every rank keeps rank 0's draw, as the sampler does its tokens
+            verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
+            target, accepted = verdict[:, :block].contiguous(), verdict[:, block]
         else:
             target = self.lm_head(hidden).argmax(-1).view(n, block)
             accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
@@ -970,6 +973,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         verdicts, seq = self._mailboxes[self._mailbox_key(engine_inputs)]
         verdicts[: verdict.shape[0]].copy_(verdict, non_blocking=True)
         seq.copy_(mtp_seq, non_blocking=True)
+
+    # dynamo traces no in-place broadcast
+    @torch.compiler.disable
+    def _broadcast(self, t: torch.Tensor) -> torch.Tensor:
+        """Rank 0's copy: every rank must keep the same tail."""
+        return self.lm_head.comm_group.broadcast(t, src=0)
 
     # Keyed by request id, so outside dynamo (as _sample).
     @torch.compiler.disable
