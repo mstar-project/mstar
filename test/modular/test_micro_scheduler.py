@@ -41,7 +41,7 @@ from mstar.worker.batch_builder import (
     BatchBuildResult,
     FIFOBatchBuilder,
 )
-from mstar.worker.micro_scheduler import ChunkProgress, MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import ChunkProgress, MicroScheduler, ReadyNodeEntry, ScheduledBatch
 
 
 def _edge_block(rids) -> ColumnarEdgeSpecs:
@@ -1384,6 +1384,24 @@ def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
     )
 
     assert merged.chunk_ranges == {"p0": chunk}
+
+
+def test_a_row_mid_prefill_takes_its_next_chunk_while_the_last_is_in_flight():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+    first = _next_batch(sched, manager)
+    assert first.chunk_ranges == {"p0": (0, 2)}
+
+    # the speculation merge for the two decode rows; nothing is on the queues
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=2,
+        pre_existing_seq_lens=[1, 1], mid_prefill=[ReadyNodeEntry("p0", "wg0", "prefill")],
+    )
+
+    assert merged.chunk_ranges == {"p0": (2, 4)}, "the next chunk starts where the one in flight ends"
+    assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(0, 4, 10)
+    assert not manager.queues["wg0"].get_ready_node_names(), "a row whose chunk is in flight was put back on its queue"
 
 
 def test_a_follower_runs_the_leaders_chunks():

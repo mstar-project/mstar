@@ -356,6 +356,76 @@ def test_a_budget_the_model_does_not_set_is_refused():
         engine.set_token_budgets({"LLM": 0}, {"prefill"})
 
 
+# ── worker: a row whose next chunk is already scheduled ───────────────
+
+
+def _settling_worker(progress):
+    """A worker stub, its real scheduler holding ``progress`` for rid 0, and the list of rids pushed back."""
+    from types import SimpleNamespace
+
+    from mstar.worker.micro_scheduler import MicroScheduler
+
+    sched = MicroScheduler(engine_manager=None)
+    sched.chunk_progress[(0, "LLM")] = progress
+    pushed = []
+    worker = SimpleNamespace(
+        _partial_stream_edges=frozenset(),
+        scheduler=sched,
+        engine_manager=SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+            chunked_prefill_output_policies=lambda node, walk: {},
+        )),
+        _graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, wgs: pushed.extend(rids)),
+    )
+    return worker, sched, pushed
+
+
+def _step(chunk):
+    """A step running ``chunk`` of rid 0, with more of the row to come."""
+    from types import SimpleNamespace
+
+    from mstar.worker.micro_scheduler import ScheduledBatch
+
+    batch = ScheduledBatch(node_name="LLM", graph_walk="prefill", request_to_worker_graph={0: 0})
+    batch.chunk_ranges = {0: chunk}
+    batch.incomplete_node_rids = {0}
+    node_batch = SimpleNamespace(request_ids=[0], per_request_info={0: None})
+    return SimpleNamespace(batch=batch, node_name="LLM", node_batch=node_batch)
+
+
+def _land(worker, step):
+    from mstar.model.submodule_base import BatchedModelOutput
+    from mstar.worker.worker import Worker
+
+    Worker._settle_chunks(worker, step, BatchedModelOutput(per_rid_outputs={0: {}}))
+
+
+def test_a_row_that_continued_is_not_pushed_back_when_its_chunk_lands():
+    from mstar.worker.micro_scheduler import ChunkProgress
+
+    worker, sched, pushed = _settling_worker(ChunkProgress(done=0, scheduled=8, total=10))
+
+    _land(worker, _step((0, 4)))
+
+    assert sched.chunk_progress[(0, "LLM")].done == 4, "the chunk that landed was not counted"
+    assert not pushed, "on its queue while its next chunk is in flight, the row would be scheduled twice"
+
+
+def test_a_refused_speculative_step_puts_the_row_back_once():
+    from mstar.worker.micro_scheduler import ChunkProgress
+    from mstar.worker.worker import Worker
+
+    worker, sched, pushed = _settling_worker(ChunkProgress(done=0, scheduled=8, total=10))
+    _land(worker, _step((0, 4)))
+
+    # the step running [4, 8) is refused at admit
+    refused = _step((4, 8)).batch
+    sched.rewind_chunks(refused)
+    Worker._push_back_batch(worker, refused)
+
+    assert pushed == [0], "the row was pushed back for the landed chunk as well as the refused step"
+    assert sched.chunk_progress[(0, "LLM")] == ChunkProgress(4, 4, 10), "the refused chunk has to run again"
+
+
 # ── sampler: a non-final chunk's token is not kept ────────────────────
 
 
