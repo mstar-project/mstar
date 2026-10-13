@@ -31,11 +31,17 @@ def test_a_null_kwarg_is_unset(kwargs):
     {"top_k": "many"}, {"temperature": "hot"}, {"top_p": [0.9]}, {"repetition_penalty": float("nan")},
     {"max_output_tokens": "100x"}, {"max_output_tokens": 1.5}, {"seed": "abc"},
     {"top_k": 2**31}, {"top_k": "1e30"}, {"seed": 2**63}, {"seed": -(2**63) - 1},
-    {"max_output_tokens": 2**64},
+    {"max_output_tokens": 2**64}, {"temperature": -1}, {"top_p": 0}, {"top_p": -0.5}, {"top_p": 1.5},
+    {"repetition_penalty": 0},
 ])
 def test_a_kwarg_it_cannot_read_is_refused_in_process_prompt(kwargs):
     with pytest.raises(ValueError, match=next(iter(kwargs))):
         _model().process_prompt("Hi", ["text"], ["text"], **kwargs)
+
+
+def test_the_edges_of_each_range_are_served():
+    kwargs = {"temperature": 0, "top_p": 1, "repetition_penalty": 1}
+    assert _model().process_prompt("Hi", ["text"], ["text"], **kwargs)["text_inputs"][0].tolist() == [72, 105]
 
 
 def test_numbers_sent_as_strings_are_read_as_numbers():
