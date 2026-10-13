@@ -31,6 +31,7 @@ def test_a_null_kwarg_is_unset(kwargs):
     {"top_k": "many"}, {"temperature": "hot"}, {"top_p": [0.9]}, {"repetition_penalty": float("nan")},
     {"max_output_tokens": "100x"}, {"max_output_tokens": 1.5}, {"seed": "abc"},
     {"top_k": 2**31}, {"top_k": "1e30"}, {"seed": 2**63}, {"seed": -(2**63) - 1},
+    {"max_output_tokens": 2**64},
 ])
 def test_a_kwarg_it_cannot_read_is_refused_in_process_prompt(kwargs):
     with pytest.raises(ValueError, match=next(iter(kwargs))):

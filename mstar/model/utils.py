@@ -431,8 +431,9 @@ SAMPLING_NUMBERS = {
     "temperature": float, "top_p": float, "top_k": int, "min_p": float,
     "repetition_penalty": float, "max_output_tokens": int, "seed": int,
 }
-# the sampler keeps these in int32 / int64 rows; a step writing one past them raises on every rank
-SAMPLING_INT_BOUNDS = {"top_k": 2**31, "seed": 2**63}
+# the sampler keeps top_k and seed in int32 / int64 rows, where one past them raises on every
+# rank; max_output_tokens is an int64 in the Rust server, and past 2**64 fails the wire as a 500
+SAMPLING_INT_BOUNDS = {"top_k": 2**31, "seed": 2**63, "max_output_tokens": 2**63}
 
 
 def sampling_kwargs(model_kwargs: dict | None) -> dict:
