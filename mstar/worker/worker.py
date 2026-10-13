@@ -464,16 +464,16 @@ class Worker:
         self._reads_done_sent: set[str] = set()
         # Handles minted for requests whose session has not handed its state
         # over yet: everything keyed by a handle can act on them, but nothing
-        # may schedule them. Shared by reference with the scheduler.
+        # may schedule them.
         self._handles_awaiting_admit: set[int] = set()
 
         self._sessions = WorkerSessionManager(is_leaving=self._rid_is_leaving)
-        # Let the scheduler see deferred removes so it stops initiating new work
-        # for those rids (shared by reference — mutations are visible to both).
-        self.scheduler.pending_removes = self._pending_removes
-        # Same: rank 0 must not schedule one, and a follower answers
-        # REMOVED_RID for it so a batch naming it is deferred.
-        self.scheduler.handles_awaiting_admit = self._handles_awaiting_admit
+        # The rid sets the scheduler gates new work on; it holds them by
+        # reference, so what is added here takes effect on the same iteration.
+        self.scheduler.share_worker_rid_sets(
+            pending_removes=self._pending_removes,
+            handles_awaiting_admit=self._handles_awaiting_admit,
+        )
 
         # Side stream for D→H copies in postprocess (check_stop pre-materialize).
         # The default stream has GPU(N+1) queued behind GPU(N)'s outputs after

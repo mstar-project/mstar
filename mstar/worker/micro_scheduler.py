@@ -185,12 +185,11 @@ class MicroScheduler:
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
-        # Rids with a deferred remove; stop initiating new work for them.
-        # Shared by reference with Worker._pending_removes.
+        # Worker-owned, adopted by share_worker_rid_sets; empty until then.
+        # Rids with a deferred remove.
         self.pending_removes: set[int] = set()
         # Handles minted for requests whose session has not handed its state
-        # over yet, so the engine has no state for them. Shared by reference
-        # with Worker._handles_awaiting_admit.
+        # over yet, so the engine has no state for them.
         self.handles_awaiting_admit: set[int] = set()
 
         # WIRE STRING -> number of committed (ZMQ received) tp follow batches
@@ -240,6 +239,26 @@ class MicroScheduler:
         deadline = time.monotonic() + self.HOLD_BACKOFF_SECONDS
         for rid in request_ids:
             self.held_until[rid] = deadline
+
+    def share_worker_rid_sets(
+        self, *,
+        pending_removes: set[int],
+        handles_awaiting_admit: set[int],
+    ) -> None:
+        """Adopt the worker's rid sets, by reference rather than by copy.
+
+        The worker mutates these as removals defer behind in-flight steps and
+        as sessions hand their state over, and the scheduler has to see that on
+        the same iteration. Every one of them gates new work; see
+        ``unschedulable_rids``.
+
+        Keyword-only on purpose: they are all ``set[int]``, so a positional
+        call could transpose two of them and nothing would complain -- the
+        scheduler would then defer the wrong batches and schedule requests
+        whose engine state is not open.
+        """
+        self.pending_removes = pending_removes
+        self.handles_awaiting_admit = handles_awaiting_admit
 
     @property
     def unschedulable_rids(self) -> set[int]:
