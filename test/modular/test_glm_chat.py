@@ -350,3 +350,18 @@ def test_a_long_call_is_read_once_and_parses_as_whole():
     [call] = [c for d in deltas for c in d.get("tool_calls", [])]
     assert json.loads(call["function"]["arguments"]) == {"path": "a.py", "content": body}
     assert _parser(tools=write).message(text)["tool_calls"][0]["function"] == call["function"]
+
+
+@pytest.mark.parametrize("make", [_glm52, _glm53])
+def test_the_chat_stays_in_the_data_worker(make, tmp_path):
+    from mstar.communication import wire
+    from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, NewRequestConductor
+
+    tool = {"type": "function", "function": {"name": "f", "parameters": {
+        "type": "object", "properties": {"n": {"type": "integer", "maximum": 2**64}}}}}
+    mk = adapters.get_adapter("glm52").chat_to_request(_chat(tools=[tool]), tmp_path).model_kwargs
+    # what the data worker sends the conductor: the wire carries no int past 64 bits
+    sent = {k: v for k, v in mk.items() if k not in make().PREPROCESS_ONLY_KWARGS}
+    assert {"messages", "tools", "chat_template_kwargs"} <= set(mk) and not {"messages", "tools"} & set(sent)
+    body = NewRequestConductor("r", {}, ["text"], ["text"], {}, sent)
+    wire.encode(ConductorMessage(message_type=ConductorMessageType.NEW_REQUEST, body=body))

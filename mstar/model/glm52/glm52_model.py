@@ -64,6 +64,9 @@ class Glm52Model(Model):
 
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
+    # read only by process_prompt's template, and kept off the conductor's wire,
+    # which cannot carry every number a tool schema may hold (2**64)
+    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs")
 
     def __init__(
         self,
