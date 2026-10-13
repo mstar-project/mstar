@@ -637,7 +637,7 @@ class PreprocessWorkerThread:
 
     def _fail_request(
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
-        sequence: int | None = None,
+        sequence: int | None = None, bad_input: bool = False,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -649,9 +649,12 @@ class PreprocessWorkerThread:
         ``sequence`` is the output slot the failed tensor held. Its error chunk
         takes that slot in the reorder buffer; put straight on ``out_queue`` it
         would leave every later sequence held in ``pending`` until the TTL.
+
+        ``bad_input``: the stage reads the request, so a ValueError or TypeError
+        there is the client's (400); one producing its output is ours (500).
         """
         logger.exception("%s failed for request %s", stage, request_id)
-        status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
+        status = 400 if bad_input and isinstance(exc, (ValueError, TypeError)) else 500
         chunks = [
             ResultChunk(
                 request_id=request_id,
@@ -1008,7 +1011,7 @@ class PreprocessWorkerThread:
                         # error chunk instead of leaving the client to hit the
                         # server timeout.
                         self._fail_request(
-                            pre_input.request_id, exc, "preprocessing",
+                            pre_input.request_id, exc, "preprocessing", bad_input=True,
                         )
                         # Never reached the conductor, so there are no remote
                         # readers to race: hard-drop the (possibly persisted)
