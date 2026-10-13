@@ -18,7 +18,8 @@ def _mtp_model() -> Glm5NextModel:
     {"repetition_penalty": 1.1}, {"repetition_penalty": 0.9}, {"min_p": 0.1},
 ])
 def test_process_prompt_refuses_a_penalty_under_mtp(kwargs):
-    with pytest.raises(ValueError, match="repetition_penalty"):
+    # min_p is refused for every request, before MTP's own check
+    with pytest.raises(ValueError, match="repetition_penalty|min_p"):
         _mtp_model().process_prompt("hi", ["text"], ["text"], **kwargs)
 
 
