@@ -39,6 +39,7 @@ from mstar.worker.batch_builder import (
     BaseBatchBuilder,
     BatchBuildRequest,
     BatchBuildResult,
+    BudgetSplit,
     FIFOBatchBuilder,
 )
 from mstar.worker.micro_scheduler import ChunkProgress, MicroScheduler, ReadyNodeEntry, ScheduledBatch
@@ -1402,6 +1403,32 @@ def test_a_row_mid_prefill_takes_its_next_chunk_while_the_last_is_in_flight():
     assert merged.chunk_ranges == {"p0": (2, 4)}, "the next chunk starts where the one in flight ends"
     assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(0, 4, 10)
     assert not manager.queues["wg0"].get_ready_node_names(), "a row whose chunk is in flight was put back on its queue"
+
+
+class _LongPrompts(_ChunkingEngine):
+    """Splits by ``fit_first``. Every prompt is 300 tokens, more than one 128-token chunk."""
+
+    budget_split = BudgetSplit.FIT_FIRST
+
+    def input_sequence_len(self, node_name, graph_walk, request_info, inputs, rid=None):
+        del node_name, request_info, inputs, rid
+        return InputSeqLenInfo(300 if graph_walk == "prefill" else 1)
+
+
+def test_fit_first_cuts_no_second_prompt_while_one_is_partway_through():
+    sched = _combined_scheduler(_LongPrompts(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+    manager.queues["wg0"]._ready.pop("p1")
+    first = _next_batch(sched, manager)
+    assert first.chunk_ranges == {"p0": (0, 128)}
+
+    # p1 arrives while p0's chunk is in flight
+    manager.queues["wg0"]._ready["p1"] = {NODE}
+
+    assert _next_batch(sched, manager) is None, "a second prompt was cut beside the one partway through"
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"p1"}
+    assert ("p1", NODE) not in sched.chunk_progress, "p1 started while p0 is partway through"
 
 
 def test_a_follower_runs_the_leaders_chunks():
