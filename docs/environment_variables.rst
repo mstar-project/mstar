@@ -344,8 +344,27 @@ Read by the ``mstar-server`` binary and its bridge
      - Sample rate stamped on ``/v1/audio/speech`` WAV output.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
-     - Allow ``http(s)`` media URLs in requests (fetched server-side,
-       30 s timeout). Off by default.
+     - Allow ``http(s)`` media URLs in requests, fetched server-side by both
+       frontends (``media_io.save_remote_url`` and ``save_remote_url`` in
+       ``rust/server/src/media.rs``). Off by default. A fetch follows at
+       most 3 redirects and takes at most 30 s; proxy variables are not
+       used, so the connection goes to the address that was checked. A host
+       that resolves to a loopback, private, link-local, multicast or
+       reserved address (cloud metadata included) is refused unless
+       allowlisted. Failures return a 400 with a short message; the details
+       are only logged.
+   * - ``MSTAR_REMOTE_ALLOWED_HOSTS``
+     - unset
+     - Comma-separated hosts and ``*.suffix`` patterns (``*.example.com``
+       matches its subdomains, not ``example.com``). When set, only these
+       hosts are fetched, on every redirect hop; listed hosts skip the
+       address check. Read by the same two functions; the Rust frontend
+       reads it once at startup.
+   * - ``MSTAR_REMOTE_MAX_BYTES``
+     - ``67108864``
+     - Largest remote media file fetched (64 MiB), checked against
+       ``Content-Length`` and while streaming. Read like
+       ``MSTAR_REMOTE_ALLOWED_HOSTS``.
    * - ``MSTAR_MAX_CONCURRENT_REQUESTS``
      - ``256``
      - Admission cap on in-flight generation requests; beyond it clients
