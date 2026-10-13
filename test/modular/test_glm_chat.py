@@ -329,3 +329,22 @@ def test_the_data_worker_tags_text_chunks_with_usage():
                                         get_tensor=lambda uuid: torch.tensor([4, 9]), dereference=lambda uuid: None)
     assert wt._process_read_tensors() is True
     assert wt.out_queue.get_nowait().metadata == {"tokens": 2, "prompt_tokens": 7, "stop_token": True}
+
+
+def test_a_long_call_is_read_once_and_parses_as_whole():
+    # quadratic otherwise: each feed copied and searched the whole call so far
+    write = glm_chat.tool_parameters([{"type": "function", "function": {"name": "write", "parameters": {
+        "type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}}])
+    body = "x = 1  # filler line\n" * 5000
+    text = ("plan</think><tool_call>write<arg_key>path</arg_key><arg_value>a.py</arg_value>"
+            "<arg_key>content</arg_key><arg_value>" + body + "</arg_value></tool_call>")
+    p, deltas, longest = _parser(tools=write), [], 0
+    for i in range(0, len(text), 4):
+        deltas += p.feed(text[i:i + 4])
+        longest = max(longest, len(p._buf))
+    deltas += p.finish()
+    # what is still searched for the end tag stays a feed long, whatever the call's length
+    assert longest < len(glm_chat.CALL_END) + 4
+    [call] = [c for d in deltas for c in d.get("tool_calls", [])]
+    assert json.loads(call["function"]["arguments"]) == {"path": "a.py", "content": body}
+    assert _parser(tools=write).message(text)["tool_calls"][0]["function"] == call["function"]

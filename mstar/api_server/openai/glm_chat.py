@@ -159,6 +159,8 @@ class GlmReplyParser:
         self._state = "reasoning" if thinking else "content"
         self._tools = tools
         self._buf = ""
+        # a call's text up to the last feed that did not end it
+        self._call_text: list[str] = []
         self._calls = 0
         self._content_started = False
         self._held_space = ""
@@ -204,10 +206,17 @@ class GlmReplyParser:
                 if end < 0:
                     if final:  # cut off inside a call: its text is all there is
                         self._state = "content"
-                        self._emit(out, CALL_START + self._buf)
-                        self._buf = ""
+                        self._emit(out, CALL_START + "".join(self._call_text) + self._buf)
+                        self._call_text, self._buf = [], ""
+                        break
+                    # set aside all but a possible start of the end tag, so a long call is
+                    # not copied and searched whole on every feed
+                    cut = max(0, len(self._buf) - len(CALL_END) + 1)
+                    self._call_text.append(self._buf[:cut])
+                    self._buf = self._buf[cut:]
                     break
-                body, self._buf = self._buf[:end], self._buf[end + len(CALL_END):]
+                body = "".join(self._call_text) + self._buf[:end]
+                self._call_text, self._buf = [], self._buf[end + len(CALL_END):]
                 self._state = "content"
                 call = self._call(body)
                 if call is None:
