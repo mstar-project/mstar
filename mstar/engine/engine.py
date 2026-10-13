@@ -257,6 +257,9 @@ class ExecutingBatch:
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[str] = field(default_factory=set)
+    # rids whose whole walk this node's resources already hold. They run no
+    # forward, but their node still completes so the request reaches its next walk.
+    cached_rids: set[str] = field(default_factory=set)
     # rid -> error, for per-rid stages that raised. The rid leaves the batch;
     # the rest of it runs.
     failed_requests: dict[str, str] = field(default_factory=dict)
@@ -498,6 +501,11 @@ class Engine:
         Compiles each submodule's ``forward`` and ``forward_batched`` with the
         default mode (fullgraph=False, dynamic=None), which in general provides
         performance gains without frequent slow recompiles.
+
+        A node in ``_item_encoders`` is compiled with dynamic=True instead. Under
+        the default it recompiles on its second input shape and the new graph
+        rounds differently, so the KV cached from its earlier outputs would no
+        longer match what it computes.
         """
         if not torch.cuda.is_available():
             return
@@ -509,16 +517,17 @@ class Engine:
                 logger.info("Engine: torch.compile disabled for %s (submodule opt-out)", node_name)
                 continue
 
+            dynamic = True if node_name in self._item_encoders else None
             try:
                 submodule_mgmt.forward = torch.compile(
                     submodule.forward,
                     fullgraph=False,
-                    dynamic=None,
+                    dynamic=dynamic,
                 )
                 submodule_mgmt.forward_batched = torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
-                    dynamic=None,
+                    dynamic=dynamic,
                 )
                 logger.info("Engine: torch.compile applied to %s", node_name)
             except Exception:
@@ -640,14 +649,20 @@ class Engine:
         ]
         declared = model.prefix_key_streams() if model is not None else {}
         self._prefix_model = type(model).__name__
-        # node -> the walks a probe may run on: the keyed walk of every stream
-        # declared on a cache the node uses
+        # node -> the walks a probe may run on: the keyed walk and the layout walks
+        # of every stream declared on a cache the node uses
         self._keyed_walks: dict[str, set[str]] = {}
         for key, by_label in declared.items():
             for node in specs_by_key[key].nodes:
                 self._keyed_walks.setdefault(node, set()).update(
-                    stream.walk for stream in by_label.values()
+                    walk for stream in by_label.values()
+                    for walk in (stream.walk, *stream.layout_walks)
                 )
+        # a cache another engine holds is taken as open when its config says so
+        opened_keys = {
+            key for key in declared
+            if key not in self._resources and specs_by_key[key].config.prefix_cache
+        }
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
                 config = specs_by_key[key].config
@@ -669,11 +684,12 @@ class Engine:
                     if mark is not None:
                         parts.append(mark)
             opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
-                label: (stream.walk, stream.decode_walk)
+                label: (stream.walk, stream.decode_walk, *stream.layout_walks)
                 for label, stream in declared.get(key, {}).items()
             })
             if not opened or not declared.get(key):
                 continue
+            opened_keys.add(key)
             nodes = ", ".join(sorted(specs_by_key[key].nodes))
             for label in declared[key]:
                 logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
@@ -689,6 +705,14 @@ class Engine:
                     "prompt frees little",
                     key,
                 )
+        # the nodes of a layout walk that don't use the stream's cache, such as an image
+        # encoder. The KV computed from their output is cached under their input's digest.
+        self._item_encoders: set[str] = set()
+        for key in opened_keys:
+            for stream in declared[key].values():
+                for walk in stream.layout_walks:
+                    nodes = model.get_graph_walk_graphs()[walk].get_nodes()
+                    self._item_encoders.update(set(nodes) - specs_by_key[key].nodes)
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.
@@ -755,27 +779,36 @@ class Engine:
 
     def _skip_cached_prefix(
         self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,
-    ) -> NodeInputs:
-        """Cut the leading tokens this node's resources already hold.
+    ) -> NodeInputs | None:
+        """Cut the leading tokens this node's resources already hold, or return
+        None when they hold the whole walk.
 
-        Only the keyed walk is probed, and only when `split_inputs` can cut its
-        inputs; a guided walk writes two labels from one input, so it is skipped.
+        Only the walks a keyed stream names are probed, and only when
+        `split_inputs` can cut their inputs; a guided walk writes two labels
+        from one input, so it is skipped. A skipped walk is still passed to
+        `apply_cached_prefix` with no prefix, because it writes over whatever
+        the resources hold for it.
         """
         walk = batch.step_context.graph_walk
         if walk not in self._keyed_walks.get(batch.node_name, ()):
             return inputs
-        assert isinstance(inputs, ARNodeInputs) and inputs.custom_pos_ids is None, (
+        assert isinstance(inputs, ARNodeInputs), (
             f"{self._prefix_model} keys the {walk!r} walk of {batch.node_name} "
-            "for prefix reuse, but that walk places positions of its own"
+            "for prefix reuse, but that walk's inputs are not a sequence to cut"
         )
         if inputs.tensor_inputs or inputs.kwargs or inputs.resource_step_info:
+            self._runner.apply_cached_prefix(rid, batch.node_name, walk, inputs, None)
             return inputs
-        matched = self._runner.resolve_cached_prefix(rid, batch.node_name, walk)
+        prefix = self._runner.resolve_cached_prefix(rid, batch.node_name, walk, inputs)
         self._runner.apply_cached_prefix(
-            rid, batch.node_name, walk, inputs, matched,
+            rid, batch.node_name, walk, inputs, prefix,
         )
+        matched = prefix.tokens if prefix is not None else 0
         if matched <= 0:
             return inputs
+        if matched >= inputs.input_seq_len:
+            batch.cached_rids.add(rid)
+            return None
         return self._submodules[batch.node_name].submodule.split_inputs(
             walk, batch.per_request_info_wrapped[rid], inputs,
             matched, inputs.input_seq_len,
@@ -1319,6 +1352,8 @@ class Engine:
         # so the tail has nothing to consume; the worker re-drives the step.
         if batch.admit_error is None:
             self.postprocess_batch(batch, outputs)
+            for rid in batch.cached_rids:
+                self._runner.complete_cached_walk(rid, batch.node_name, batch.graph_walk)
         return outputs
 
     def check_stop_for_batch(

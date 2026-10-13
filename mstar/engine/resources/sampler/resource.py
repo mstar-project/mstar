@@ -5,7 +5,7 @@ from dataclasses import asdict
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.sampler.config import (
     SamplerSpec,
     SamplerStep,
@@ -70,8 +70,9 @@ class SamplerResource(Resource):
         self._preplan_cg_sampler: CudaGraphableSampler | None = None
         self._preplan_key = None
         self._preplanned = False
-        # rid -> the prompt tokens a cache hit kept out of this step's inputs
-        self._cached_prefix: dict[str, torch.Tensor] = {}
+        # rid -> the prompt tokens a cache hit kept out of each walk's inputs. Keyed by the
+        # position after them, so a repeated probe replaces its own entry.
+        self._cached_prefix: dict[str, dict[int, torch.Tensor]] = {}
         # this step's `SamplerStep.kept_rids`, for the eager draw
         self._kept_rids: frozenset[int] | None = None
 
@@ -157,18 +158,22 @@ class SamplerResource(Resource):
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
-        inputs, matched_len: int,
+        inputs, prefix: CachedPrefix | None,
     ) -> None:
         """Keep the tokens the cache is about to skip, for `plan` to fold in.
 
         A step declares its tracked tokens from inputs the prefix has already
         been cut out of, so without these the mask would hold the prompt's tail
-        alone and the penalty would let the model repeat the rest.
+        alone and the penalty would let the model repeat the rest. A walk the
+        cache serves whole runs no plan, so its tokens are kept until the next
+        walk that does.
         """
         del node_name, graph_walk
         # a walk that prefills from embeddings has no ids to keep
-        if matched_len > 0 and inputs.input_ids is not None:
-            self._cached_prefix[rid] = inputs.input_ids[:matched_len]
+        if prefix is not None and prefix.tokens > 0 and inputs.input_ids is not None:
+            self._cached_prefix.setdefault(rid, {})[prefix.position] = (
+                inputs.input_ids[:prefix.tokens]
+            )
 
     def remove_request(self, rid: str):
         self._sampler.remove_request(rid)
@@ -242,8 +247,7 @@ class SamplerResource(Resource):
             # dropped as they are used: `plan` runs on every step of a resident
             # request, and these belong to the one prefill that was cut
             for rid in ctx.request_ids:
-                skipped = self._cached_prefix.pop(rid, None)
-                if skipped is not None:
+                for skipped in self._cached_prefix.pop(rid, {}).values():
                     self._sampler.get_token_mask(rid).add_tokens(skipped)
 
         # A step planned ahead promotes here. Its static config was gathered in

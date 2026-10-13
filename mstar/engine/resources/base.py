@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -77,6 +77,17 @@ class EngineResourceInfo:
         return spec
 
 
+class CachedPrefix(NamedTuple):
+    """How much of a walk's input a resource already holds for ``label``.
+
+    ``tokens`` counts the walk's leading inputs held, and ``position`` is the
+    stream's position counter once they are skipped.
+    """
+    label: str
+    tokens: int
+    position: int
+
+
 class Resource(ABC):
     @classmethod
     @abstractmethod
@@ -92,30 +103,29 @@ class Resource(ABC):
     prefix_skip_safe: bool = False
 
     def enable_prefix_cache(
-        self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
+        self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
     ) -> bool:
         """Open whatever this resource keeps across requests, under ``root``;
         True if anything opened.
 
-        ``walks`` names, per label, the walk that writes the keyed span and the
-        one that decodes after it.
+        ``walks`` names, per label, the walks that write the keyed stream.
         """
         return False
 
     def resolve_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str,
-    ) -> int | None:
-        """How many of this request's leading tokens this resource already holds.
+        self, rid: str, node_name: str, graph_walk: str, inputs: Any,
+    ) -> CachedPrefix | None:
+        """How much of this walk's leading inputs this resource already holds.
 
-        None leaves the length to other resources; 0 means nothing can be skipped.
+        None leaves the answer to other resources; 0 tokens means nothing can be skipped.
         """
         return None
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
-        inputs: Any, matched_len: int,
+        inputs: Any, prefix: CachedPrefix | None,
     ) -> None:
-        """Take on the length every resource agreed to skip.
+        """Take on the prefix every resource agreed to skip, or None if there is none.
 
         The inputs are untrimmed, so a resource that needs the tokens being
         skipped can still read them.
@@ -126,6 +136,10 @@ class Resource(ABC):
         self, rid: str, node_name: str, graph_walk: str, outputs: Any,
     ) -> None:
         """Take this step's sampled tokens, so what was generated can be keyed."""
+        return
+
+    def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
+        """Called for a walk the cache served whole, since that walk never admits or commits."""
         return
 
     def fingerprint(self) -> bytes | None:
