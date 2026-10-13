@@ -30,6 +30,7 @@ from mstar.model.glm52.config import (
     Glm52ModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import sampling_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -342,6 +343,10 @@ class Glm52Model(Model):
     ) -> NameToTensorList:
         if prompt is None:
             return {}
+        # the conductor reads these kwargs; read here first, a bad one is the
+        # client's 400 before the request reaches any rank
+        self.get_request_resource_configs({}, kwargs)
+        self.get_max_output_tokens(**kwargs)
 
         if self._tokenizer_mode == "byte":
             # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
@@ -376,7 +381,7 @@ class Glm52Model(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args
-        model_kwargs = model_kwargs or {}
+        model_kwargs = sampling_kwargs(model_kwargs)
         keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
             k: model_kwargs.get(k, getattr(self.config, k))
@@ -403,7 +408,7 @@ class Glm52Model(Model):
         # the request's budget, held to the window: a one-token prompt emits at
         # most ``context_limit`` tokens (the last is never stored), so a larger
         # budget is unreachable and check_stop could never fire on it
-        budget = model_kwargs.get("max_output_tokens", self.config.max_output_tokens)
+        budget = sampling_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
         return min(budget, self.context_limit())
 
     # -------------------------------------------------------------------
