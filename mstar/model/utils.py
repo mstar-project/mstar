@@ -431,6 +431,8 @@ SAMPLING_NUMBERS = {
     "temperature": float, "top_p": float, "top_k": int, "min_p": float,
     "repetition_penalty": float, "max_output_tokens": int, "seed": int,
 }
+# the sampler keeps these in int32 / int64 rows; a step writing one past them raises on every rank
+SAMPLING_INT_BOUNDS = {"top_k": 2**31, "seed": 2**63}
 
 
 def sampling_kwargs(model_kwargs: dict | None) -> dict:
@@ -439,13 +441,17 @@ def sampling_kwargs(model_kwargs: dict | None) -> dict:
     kwargs = {k: v for k, v in (model_kwargs or {}).items() if v is not None}
     for key, kind in SAMPLING_NUMBERS.items():
         value = kwargs.get(key)
-        if value is None or (kind is int and isinstance(value, int) and not isinstance(value, bool)):
+        if value is None:
             continue
-        try:
-            number = float(value)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f"{key} must be a number; got {value!r}") from None
-        if not math.isfinite(number) or (kind is int and not number.is_integer()):
-            raise ValueError(f"{key} must be a finite {kind.__name__}; got {value!r}")
-        kwargs[key] = kind(number)
+        if not (kind is int and isinstance(value, int) and not isinstance(value, bool)):
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(f"{key} must be a number; got {value!r}") from None
+            if not math.isfinite(number) or (kind is int and not number.is_integer()):
+                raise ValueError(f"{key} must be a finite {kind.__name__}; got {value!r}")
+            kwargs[key] = kind(number)
+        bound = SAMPLING_INT_BOUNDS.get(key)
+        if bound is not None and not -bound <= kwargs[key] < bound:
+            raise ValueError(f"{key} must fit in a signed {bound.bit_length()}-bit integer; got {value!r}")
     return kwargs
