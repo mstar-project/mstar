@@ -4,11 +4,13 @@ right, one that is right for a prefix), and every verify step keeps its whole bl
 KV cache (rejected rows as holes)."""
 from __future__ import annotations
 
+import logging
 import sys
 import types
 
 import pytest
 import torch
+from request_walks import run_walks
 
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -456,3 +458,50 @@ def test_the_stop_counts_this_steps_tokens_not_the_next_ones():
     state.add("mtp_generated", 9)  # and the second
     assert not check("decode", 0, 4)
     assert check("decode", 1, 4)
+
+
+# -- a stop on the prefill walk -----------------------------------------------
+
+
+def _serve(engine, prompt: torch.Tensor, max_tokens: int, ignore_eos=False) -> list[int]:
+    """The tokens one request sends the client, its stops going through the graph runtime."""
+    engine.add_request("r", {SAMPLER: SamplingReqConfig(temperature=0.0, ignore_eos=ignore_eos)})
+
+    def step(walk, inputs, iteration):
+        out, stops = _step(engine, walk, {"r": inputs["text_inputs"][0]}, max_tokens, iteration,
+                           ignore_eos=ignore_eos)
+        return out.get("r", {}), stops.get("r", set())
+
+    k = engine._submodules["LLM"].submodule.mtp_k
+    tokens = run_walks(Glm5NextModel("x", config_variant="reduced", mtp_num_draft_tokens=k),
+                       step, prompt, max_tokens)
+    engine.remove_request("r")
+    return tokens
+
+
+def _errors(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
+    # the prefill walk has no decode_loop: the runtime drops a stop named there
+    engine, _, cfg = _build_engine(k)
+    eos = cfg.eos_token_ids[1]
+    greedy = engine._resources[SAMPLER]
+
+    def eos_once(rids, logits, **kw):
+        del greedy.sample  # back to the class's argmax
+        return torch.full((logits.shape[0],), eos, dtype=torch.long)
+
+    greedy.sample = eos_once
+    assert _serve(engine, PROMPTS["a"], MAX_TOKENS) == [eos]
+    assert _errors(caplog) == []
+
+
+@pytest.mark.parametrize("k", [0, 3])
+@pytest.mark.parametrize("max_tokens", [1, 2, 3])
+def test_short_budgets_are_exact_and_name_no_missing_loop(k, max_tokens, caplog):
+    engine, _, _ = _build_engine(k)
+    assert len(_serve(engine, PROMPTS["a"], max_tokens, ignore_eos=True)) == max_tokens
+    assert _errors(caplog) == []

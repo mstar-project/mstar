@@ -715,9 +715,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # Seed the next decode step from the emitted token: the walk's
         # text_inputs loop-back edge (get_graph_walk_graphs) carries it. An MTP
         # verify step already set it: the token after the accepted drafts.
-        if "new_token" not in outputs or "text_inputs" in outputs:
+        if "new_token" not in outputs:
             return
-        outputs["text_inputs"] = outputs["new_token"]
+        outputs.setdefault("text_inputs", outputs["new_token"])
+        state = self.request_states.get(request_id)
+        if state is not None and state.get("ended_at_prefill"):
+            # the reply already ended: this step only closes the decode loop
+            del outputs["new_token"]
 
     def check_stop(
         self, request_id: str,
@@ -726,6 +730,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     ) -> set[str]:
         # The ONLY place .item() on a token value is allowed (slow-postprocess
         # path, off the step-critical GPU thread — base-class contract).
+        state = self.request_states.get(request_id)
+        if state is not None and state.get("ended_at_prefill"):
+            return {"decode_loop"}
         if "new_token" not in outputs:
             return set()
         if self.mtp_k > 0:
@@ -733,6 +740,12 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         token = outputs["new_token"][0].item()
         is_eos = token in self.config.eos_token_ids
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
+        if request_info.graph_walk == "prefill":
+            # no decode_loop on this walk to stop: a stop token ends the reply at the first
+            # decode step, and the conductor ends a max_tokens of 1 here
+            if not ignore_eos and is_eos:
+                self.request_state(request_id).add("ended_at_prefill", True)
+            return set()
         # Total generated = 1 prefill-emitted token + (decode iters + 1):
         # max_tokens counts the token the prefill emits, so the decode loop
         # runs one fewer.
@@ -740,7 +753,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # The next step takes the context to prompt + generated, and it may
         # already be scheduled when this stop lands, so stop while it still
         # fits: past index_topk prepare_inputs refuses it.
-        state = self.request_states.get(request_id)
         prompt_len = state.get("prompt_len", 0) if state is not None else 0
         full = prompt_len + generated >= self.config.index_topk
         if (not ignore_eos and is_eos) or generated >= request_info.max_tokens or full:
@@ -763,6 +775,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         is_eos = not ignore_eos and any(
             t in self.config.eos_token_ids for t in new_token.tolist())
+        if request_info.graph_walk == "prefill":
+            # as in check_stop: the prefill walk has no decode_loop to stop
+            if is_eos:
+                state.add("ended_at_prefill", True)
+            return set()
         steps = request_info.dynamic_loop_iter_counts.get("decode_loop", 0)
         if request_info.graph_walk == "decode":
             steps += 1
