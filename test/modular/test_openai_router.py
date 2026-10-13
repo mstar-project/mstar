@@ -126,6 +126,18 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
         },
     )
     assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_chat_engine_error_is_a_server_error(client_and_stub):
+    client, stub = client_and_stub
+
+    def submit_request(**kw):
+        raise RuntimeError("boom")
+
+    stub.submit_request = submit_request
+    r = client.post("/v1/chat/completions", json={"model": "bagel", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 500
     assert r.json()["error"]["type"] == "server_error"
 
 
@@ -250,6 +262,7 @@ def test_videos_generations_wan22_rejects_video_conditioning(client_and_stub):
     )
     assert r.status_code == 400
     assert "video" in r.json()["error"]["message"]
+    assert r.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_chat_stream(client_and_stub):
