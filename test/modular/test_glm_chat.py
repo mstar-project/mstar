@@ -166,6 +166,12 @@ def test_developer_turns_are_system_turns():
     assert [m["role"] for m in msgs] == ["system", "user"]
 
 
+@pytest.mark.parametrize("role", ["function", "observation", None])
+def test_a_role_the_templates_skip_is_refused(role):
+    with pytest.raises(ValueError, match="role"):
+        glm_chat.template_messages([{"role": role, "content": "x"}, {"role": "user", "content": "hi"}])
+
+
 def _chat(**body):
     body.setdefault("messages", [
         {"role": "system", "content": "Be brief."}, {"role": "user", "content": "weather in Paris?"},

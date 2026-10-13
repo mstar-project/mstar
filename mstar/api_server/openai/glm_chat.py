@@ -35,6 +35,9 @@ def template_messages(messages) -> list[dict]:
         msg = {k: v for k, v in msg.items() if v is not None}
         if msg.get("role") == "developer":
             msg["role"] = "system"
+        if msg.get("role") not in ("system", "user", "assistant", "tool"):
+            # the templates skip any other role: the model would answer without that turn
+            raise ValueError(f"role {msg.get('role')!r} is not supported; use system, user, assistant or tool")
         if msg.get("tool_calls"):
             msg["tool_calls"] = [_call_for_template(c) for c in msg["tool_calls"]]
         out.append(msg)
