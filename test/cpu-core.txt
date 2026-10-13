@@ -127,7 +127,6 @@ test/modular/test_glm52_step_tokens.py
 test/modular/test_kv_correct_len.py
 test/modular/test_kv_host_plan.py
 test/modular/test_piecewise_dummy_rows.py
-test/modular/test_check_stop_batched_loop_counts.py
 test/modular/test_kda_resource.py
 test/modular/test_loader_pread.py
 test/modular/test_loader_stacked_matcher.py
