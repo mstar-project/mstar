@@ -337,7 +337,7 @@ class _LabelRows:
 
     __slots__ = (
         "rows", "streams", "lens", "npages", "row_pages", "last_page",
-        "indices", "n_pad", "pad_span", "pad_pages",
+        "indices", "gens", "n_pad", "pad_span", "pad_pages", "built",
     )
 
     def __init__(self, **kw):
@@ -1577,8 +1577,10 @@ class KVManager(AttentionResource):
                 indices=np.fromiter(
                     itertools.chain.from_iterable(row_pages), np.int32, sum(len(p) for p in row_pages),
                 ),
+                gens=np.fromiter((v.generation for v in real), np.int64, n_real),
                 n_pad=len(pad), pad_span=pad[0].to_compute if pad else 0,
                 pad_pages=len(pad[0].page_idxs) if pad else 0,
+                built=None,
             )
         return derived
 
@@ -1628,21 +1630,32 @@ class KVManager(AttentionResource):
             last = (lens - 1) % page_size + 1
             npages = (lens + page_size - 1) // page_size
             crossed = np.flatnonzero(npages != rows.npages)
+            # the one commit since bumped each row; a new page's alloc bumps it again
+            gens = rows.gens + 1
             if crossed.size:
+                # copy only while the last plan's unbuilt views still hold the list
+                row_pages = rows.row_pages
+                if rows.built is not None and not rows.built[0]:
+                    row_pages = list(row_pages)
+                streams, last_page = rows.streams, rows.last_page
                 for i in crossed.tolist():
                     want = int(npages[i])
-                    held = rows.streams[i].page_indices
+                    stream = streams[i]
+                    held = stream.page_indices
                     if len(held) < want:
                         stats["miss"] += 1
                         return None
                     pages = held[:want]
-                    rows.row_pages[i] = pages
-                    rows.last_page[i] = pages[-1]
+                    row_pages[i] = pages
+                    last_page[i] = pages[-1]
+                    gens[i] = stream.generation
+                rows.row_pages = row_pages
                 rows.indices = np.fromiter(
-                    itertools.chain.from_iterable(rows.row_pages), np.int32, int(npages.sum()),
+                    itertools.chain.from_iterable(row_pages), np.int32, int(npages.sum()),
                 )
             rows.lens = lens
             rows.npages = npages
+            rows.gens = gens
             n_pad, pad_span, pad_pages = rows.n_pad, rows.pad_span, rows.pad_pages
             if n_pad:
                 pad_last = (pad_span - 1) % page_size + 1
@@ -1656,16 +1669,20 @@ class KVManager(AttentionResource):
             n_rows = n_real + n_pad
             qo_indptr = np.arange(n_rows + 1, dtype=np.int32)
             kv_lens = (npages_all - 1) * page_size + last_all
-            row_pages_now, lens_now, streams = rows.row_pages, lens.tolist(), rows.streams
+            row_pages_now, lens_now = rows.row_pages, lens.tolist()
             pad_now = [(seg.request_id, seg.label, seg.span) for seg in pad_segs]
+            rows.built = built = [False]
 
             def build_views(
-                row_pages_now=row_pages_now, lens_now=lens_now, streams=streams, pad_now=pad_now, rows=rows,
+                row_pages_now=row_pages_now, lens_now=lens_now, gens_now=gens, pad_now=pad_now, rows=rows,
+                built=built,
             ):
+                built[0] = True
+                # generations as of this plan, not read off the streams a later commit bumps
                 views = [
-                    SequenceView(rid, lab, pages, length, 1, 0, stream.generation)
-                    for (rid, lab, _), pages, length, stream in zip(
-                        rows.rows, row_pages_now, lens_now, streams, strict=True,
+                    SequenceView(rid, lab, pages, length, 1, 0, gen)
+                    for (rid, lab, _), pages, length, gen in zip(
+                        rows.rows, row_pages_now, lens_now, gens_now.tolist(), strict=True,
                     )
                 ]
                 views.extend(
@@ -1701,7 +1718,7 @@ class KVManager(AttentionResource):
             if len(x.views) != len(y.views):
                 return False
             for u, v in zip(x.views, y.views, strict=True):
-                if u[:5] != v[:5]:
+                if u[:5] != v[:5] or u.generation != v.generation:
                     return False
             for p, q in zip(x.cpu_indptrs[:5], y.cpu_indptrs[:5], strict=True):
                 if (p is None) != (q is None) or (
@@ -1766,7 +1783,8 @@ class KVManager(AttentionResource):
 
                 self._preplan_new_labels = []
                 self._preplan_marked = []
-                self.clear_preplan()
+                # the promoted step runs; the plan cache still describes it
+                self.clear_preplan(promoted=True)
                 return res
             # A different step reached the GPU thread before the one planned
             # ahead (e.g. a new request's prefill while a decode step sits
@@ -1828,8 +1846,9 @@ class KVManager(AttentionResource):
         lease = ctx.slot_lease
         return tuple(step.segments), (lease.slot if lease is not None else None)
 
-    def clear_preplan(self):
-        self._touch_plan_cache()
+    def clear_preplan(self, promoted: bool = False):
+        if not promoted:
+            self._touch_plan_cache()
         # the staged step is not going to run, so undo what it did to live
         # state. the pre-forks need no rewinding — staging only read them —
         # but admit's reservations are real pages and real streams

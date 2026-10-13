@@ -227,3 +227,63 @@ def test_padding_rows_may_change_their_dummy_ids_between_steps():
             m.commit(step, ctx)
     assert plans[1] == plans[0]
     assert kv.plan_cache_stats == {"hit": 5, "miss": 0, "mismatch": 0}
+
+
+def _preplanned_decode(kv: KVManager, rids: tuple[str, ...], slot: int, pad: int = 0):
+    """A decode step as the worker runs it: pre-planned, promoted, committed."""
+    padded = rids + tuple(f"pad{i}" for i in range(pad))
+    step = KVStep(segments=tuple(Segment(r, "main", 1) for r in padded))
+    bucket = BucketKey(graph_walk=WALK, bs=len(padded), num_tokens=len(padded))
+    ctx = StepContext(
+        request_ids=rids, graph_walk=WALK, slot=slot, capture=False,
+        slot_lease=SlotLease(slot=slot, bucket=bucket),
+    )
+    ctx.set_padded_rids(padded)
+    ctx.is_preplan = True
+    assert kv.admit(step, ctx).ok
+    kv.plan(step, ctx)
+    ctx.is_preplan = False
+    assert kv.admit(step, ctx).ok
+    res = kv.plan(step, ctx)
+    return res, step, ctx
+
+
+@pytest.mark.parametrize("pad", [0, 2])
+def test_preplanned_steps_hit_after_promotion(pad):
+    """Promotion is the staged step running, so it keeps the cache."""
+    _, full = _run(0, 12, pad)
+    kv = _manager(2)
+    for rid, n in (("a", 5), ("b", 7), ("c", 4)):
+        _prefill(kv, rid, n)
+    fast = []
+    for t in range(12):
+        res, step, ctx = _preplanned_decode(kv, ("a", "b", "c"), t % 2, pad)
+        fast.append(_flat(res))
+        kv.commit(step, ctx)
+    assert fast == full
+    assert kv.plan_cache_stats == {"hit": 11, "miss": 0, "mismatch": 0}
+
+
+def test_views_built_after_the_next_preplan_keep_their_step():
+    """A view built late, after the next step's pre-plan hit, still describes
+    its own step: page crossings and commits must not leak into it."""
+    ref = _manager(0)
+    kv = _manager(1)
+    for m in (ref, kv):
+        for rid, n in (("a", 5), ("b", 7), ("c", 4)):
+            _prefill(m, rid, n)
+    want = [[tuple(v) for v in _decode(ref, ("a", "b", "c"), t % 2)[0]["main"].views] for t in range(12)]
+    late = None
+    got = []
+    for t in range(12):
+        res, step, ctx = _preplanned_decode(kv, ("a", "b", "c"), t % 2)
+        if late is not None:
+            got.append([tuple(v) for v in late.views])
+        out = res["main"]
+        if out._view_builder is not None:
+            out._views = None  # a lazy consumer: nothing has asked yet
+        late = out
+        kv.commit(step, ctx)
+    got.append([tuple(v) for v in late.views])
+    assert got == want
+    assert kv.plan_cache_stats["hit"] == 11
