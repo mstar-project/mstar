@@ -160,6 +160,24 @@ def test_fail_defers_client_notification_until_barrier_completes():
     assert _remove_targets(c, "r1") == {"w0", PREPROCESS}
 
 
+def test_a_failure_reaches_the_client_with_the_status_the_worker_gave():
+    """A request failed to unstick a full KV cache is the server being busy,
+    not broken: its client gets the 503 the worker sent, the rest a 500."""
+    c = _conductor({"r1": _request_data(), "r2": _request_data()})
+    c._fail_requests(FailRequests(
+        errors={"r1": "KV cache is full", "r2": "boom"}, statuses={"r1": 503},
+    ))
+    for rid in ("r1", "r2"):
+        c._handle_reads_done(ReadsDone(request_id=rid, entity_id="w0"))
+        c._handle_reads_done(ReadsDone(request_id=rid, entity_id=PREPROCESS))
+
+    statuses = {
+        m.body.request_id: m.body.status for e, m in c.sent
+        if e == "api_server" and m.message_type == "request_failed"
+    }
+    assert statuses == {"r1": 503, "r2": 500}
+
+
 # ── happy path ──────────────────────────────────────────────────────────────
 
 def test_done_completes_client_immediately_but_defers_remove():

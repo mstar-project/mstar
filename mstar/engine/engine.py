@@ -294,6 +294,9 @@ class ExecutingBatch:
     admit_error: AdmitFailedReason | None = None
     # the resource that ran out, so an eviction can be scoped to it
     failed_resource: str | None = None
+    # the worker's removal count when it built this batch: a refusal from
+    # before a removal may have lacked only the pages that removal freed
+    removals_seen: int = 0
 
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
@@ -714,9 +717,9 @@ class Engine:
                 # a hit allocates only the prompt's tail, so admission no longer
                 # bounds how many requests decode at once
                 logger.warning(
-                    "KV %s: prefix cache on with cpu_offload_pages 0: a decode "
-                    "step that finds nothing to evict holds its requests until "
-                    "they time out. Set max_concurrent_requests to the pool's "
+                    "KV %s: prefix cache on with cpu_offload_pages 0: once every "
+                    "request holding pages waits for one, with nothing to evict, "
+                    "the newest is failed (503). Set max_concurrent_requests to the pool's "
                     "pages over the pages one request needs. cpu_offload_pages "
                     "gives the worker a victim, but one that shares most of its "
                     "prompt frees little",
@@ -2129,6 +2132,17 @@ class Engine:
             self._resources[res].reclaimable(request_id)
             for res in affected_resources if res in submod_mgmt.resources \
                 and self._resources[res].supports_eviction
+        )
+
+    def held(self, node_name: str, request_id: int, resources: set[str] | None = None) -> int:
+        """What the request holds of this node's resources, whether or not they
+        can offload it. 0 for a request admitted but not yet run."""
+        submod_mgmt = self._submodules[node_name]
+        if resources is None:
+            resources = submod_mgmt.resources.keys()
+        return sum(
+            self._resources[res].reclaimable(request_id)
+            for res in resources if res in submod_mgmt.resources
         )
 
     def offload_priority(

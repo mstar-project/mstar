@@ -40,6 +40,7 @@ def _worker(
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
     w._pending_removes = set()
+    w._refused_for_pages, w._removals = {}, 0
     # Identity interning: these tests use the rid string as its own handle, so
     # the string/handle split is exercised without a real runtime.
     w._graph_runtime = SimpleNamespace(
@@ -127,6 +128,44 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     assert pending.batch.request_to_worker_graph == {}
     assert ranges == []
     assert markers == (["push", "pop", "push", "pop"] if enable_nvtx else [])
+
+
+def test_a_step_that_ran_restarts_the_count_of_requests_refused_a_page():
+    """Pages moved, so a request refused one may now get it: it is back after
+    the usual backoff, and failing anyone for pages has to wait until each has
+    been refused again. Another node's pool did not move."""
+    w = _worker()
+    w.enable_nvtx = False
+    w._refused_for_pages = {"LLM": {7}, "talker": {8}}
+    held = []
+    w.scheduler.hold_requests = lambda rids, seconds=None: held.append((rids, seconds))
+    w.tensor_manager.cleanup_collectable = lambda *args: None
+    w._graph_runtime.cleanup_consumed_inputs = lambda *args: ({}, {})
+    w._graph_runtime.pending_loop_stop_rids = lambda *args: {7}
+    pending = SimpleNamespace(
+        batch=SimpleNamespace(node_name="LLM", request_to_worker_graph={7: 0}),
+        node_batch=SimpleNamespace(request_ids=[7], per_request_info={7: object()}),
+        speculative_new_iter=True, graph_walk="decode", loop_name="decode",
+    )
+
+    Worker._postprocess_batch(w, pending, BatchedModelOutput(per_rid_outputs={7: {}}))
+
+    assert w._refused_for_pages == {"talker": {8}}, "an LLM step released the talker's holders"
+    assert held == [([7], None)], "a refused request stays held after pages moved"
+
+
+def test_a_removal_restarts_the_count_of_requests_refused_a_page():
+    """Its pages are free, and each request refused one tries them first."""
+    w = _worker(known_rids=("X", "Y"))
+    w._refused_for_pages = {"LLM": {"Y"}}
+    held = []
+    w.scheduler.hold_requests = lambda rids, seconds=None: held.append((rids, seconds))
+
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+
+    assert w._refused_for_pages == {}
+    assert held == [(["Y"], None)], "a refused request stays held after pages moved"
+    assert w._removals == 1, "a step built before this removal would count as refused"
 
 
 def test_draining_and_pending_removal_rids_are_not_published():

@@ -97,6 +97,7 @@ def _worker():
     w._in_flight_rids = set()
     w._pending_removes = set()
     w._last_active = {}
+    w._refused_for_pages, w._removals = {}, 0
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w.enable_nvtx = False

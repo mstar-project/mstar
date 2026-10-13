@@ -231,9 +231,9 @@ class MicroScheduler:
                     best_graph_walk = req.graph_walk
         return best_node_name, best_graph_walk
 
-    def hold_requests(self, request_ids: list[int]) -> None:
-        """Put requests on hold for a brief backoff period after OOM."""
-        deadline = time.monotonic() + self.HOLD_BACKOFF_SECONDS
+    def hold_requests(self, request_ids: list[int], seconds: float | None = None) -> None:
+        """Put requests on hold for a brief backoff period after OOM, or for ``seconds``."""
+        deadline = time.monotonic() + (self.HOLD_BACKOFF_SECONDS if seconds is None else seconds)
         for rid in request_ids:
             self.held_until[rid] = deadline
 

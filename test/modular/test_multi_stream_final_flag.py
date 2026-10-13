@@ -52,6 +52,7 @@ def _worker(rids=("r",)):
         request_state=SimpleNamespace(per_request_info=per_request_info),
         _consumer_node_cache={name: node for name, (node, _) in TOPOLOGY.items()},
         _stream_partition={name: PARTITION for name in TOPOLOGY},
+        _removals=0,
     )
     worker._settle_final_streams = lambda *a: Worker._settle_final_streams(worker, *a)
     return worker

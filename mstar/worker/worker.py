@@ -83,6 +83,11 @@ logger = logging.getLogger(__name__)
 # retried every backoff, and a line per retry buries the rest of the log
 _HOLD_LOG_INTERVAL = 5.0
 
+_KV_FULL_ERROR = (
+    "KV cache is full: the server stopped this request, the newest one holding "
+    "cache pages, so that older requests can finish. Retry it."
+)
+
 # ``_await_admit_settled``'s safety net, not a tuning knob: the GPU thread
 # releases the event on every exit, so this only fires if that thread died.
 _ADMIT_FENCE_TIMEOUT_S = 10.0
@@ -471,6 +476,13 @@ class Worker:
         self.eviction_policy = EvictionPolicy.LRU
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
+        # node -> requests refused a page there, with nothing to offload, since a
+        # step last ran there or a request was removed, and held until then; see
+        # ``_fail_newest_if_stuck``
+        self._refused_for_pages: dict[str, set[int]] = {}
+        # requests removed so far; a batch built before the latest removal was
+        # refused against a pool that has since grown
+        self._removals = 0
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -782,6 +794,9 @@ class Worker:
         self._pending_drains.discard(body.request_id)
         self._reads_done_sent.discard(body.request_id)
         self.engine_manager.remove_request(request_id)
+        # its pages are free, and every refused request gets to try for them
+        self._release_refused()
+        self._removals += 1
         self.request_state.remove_request(request_id)
         self.tensor_manager.force_cleanup_request(request_id)
         self.profile_info.pop_request(request_id)
@@ -1460,6 +1475,7 @@ class Worker:
         )
         return ExecutingBatch(
             node_name=node_name,
+            removals_seen=self._removals,
             per_request_info=per_request_info,
             per_request_input_tensors=per_request_input_tensors,
             final_stream_rids=final_stream_rids,
@@ -2008,6 +2024,7 @@ class Worker:
             blamed = getattr(node_batch.admit_error, "request_id", None)
             shed = [blamed] if blamed in batch_ids else list(batch_ids)
             self.scheduler.hold_requests(shed)
+            self._fail_newest_if_stuck(batch.node_name, node_batch)
             key = (batch.node_name, batch.graph_walk)
             now = _time.monotonic()
             last, unlogged = self._hold_logged.get(key, (None, 0))
@@ -2022,6 +2039,54 @@ class Worker:
                 blamed if len(shed) == 1 else f"all {len(shed)}",
                 len(batch_ids), unlogged,
             )
+
+    def _fail_newest_if_stuck(self, node_name: str, node_batch: ExecutingBatch) -> None:
+        """Fail the newest request holding pages once every holder is refused one.
+
+        With nothing to offload, a page comes free only when a step runs on the
+        node or a request is removed, and either releases ``_refused_for_pages``.
+        Until then a refused holder stays held, so each retry names another one.
+        Once every holder on the node is in it, none of them can run again, and
+        all of them would wait out the API timeout. The newest has done the least
+        work. A request holding nothing (a prefill) only waits: failing it would
+        free nothing.
+        """
+        if node_batch.removals_seen != self._removals:
+            return  # built before a removal freed pages it may have lacked
+        engine = self.engine_manager.get_engine(node_name)
+        resource = node_batch.failed_resource
+        resources = None if resource is None else {resource}
+        blamed = getattr(node_batch.admit_error, "request_id", None)
+        # per_request_info is keyed in arrival order
+        holders = [
+            rid for rid in self.request_state.per_request_info
+            if engine.held(node_name, rid, resources)
+        ]
+        # per node: another node's pool says nothing about this one's
+        refused = self._refused_for_pages.setdefault(node_name, set())
+        if blamed in holders:
+            refused.add(blamed)
+            # until pages move, not the usual 50 ms: back sooner, it is named
+            # again ahead of the holders behind it, and they are never tried
+            self.scheduler.hold_requests([blamed], seconds=float("inf"))
+        if not holders or not refused.issuperset(holders):
+            return
+        if any(self._is_tearing_down(rid) for rid in holders):
+            return  # its pages are on their way back; one failure at a time
+        logger.warning(
+            "KV stall on node=%s: all %d requests holding pages are waiting for "
+            "one and nothing can be offloaded; failing the newest",
+            node_name, len(holders),
+        )
+        self._fail_requests({holders[-1]: _KV_FULL_ERROR}, status=503)
+
+    def _release_refused(self, node_name: str | None = None) -> None:
+        """Pages moved on ``node_name``, or on every node: each request refused
+        one there gets the usual backoff, then tries again."""
+        for node in list(self._refused_for_pages) if node_name is None else [node_name]:
+            refused = self._refused_for_pages.pop(node, None)
+            if refused:
+                self.scheduler.hold_requests(list(refused))
 
     # ------------------------------------------------------------------
     # Speculation
@@ -2743,6 +2808,10 @@ class Worker:
             now = _time.perf_counter()
             self._phase_buf[f"worker.postprocess.{name}"].append(now - _pp_t)
             _pp_t = now
+
+        # a step ran, so this node's pages moved: whoever was refused one there
+        # gets to try again
+        self._release_refused(batch_N.batch.node_name)
 
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
@@ -3467,10 +3536,11 @@ class Worker:
 
         self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
 
-    def _fail_requests(self, errors: dict[int, str]) -> None:
+    def _fail_requests(self, errors: dict[int, str], status: int | None = None) -> None:
         """Report requests this worker can no longer serve to the conductor.
 
-        ``errors`` maps request_id -> message. Rids the worker has already
+        ``errors`` maps request_id -> message; ``status`` is the HTTP status
+        their clients get, the conductor's 500 if None. Rids the worker has already
         torn down are dropped: reporting them would leave a permanent entry
         in ``scheduler.failed_rids`` (the conductor answers a failure with a
         REMOVE_REQUEST, and it won't send one for a request it no longer
@@ -3492,7 +3562,10 @@ class Worker:
             "conductor",
             ConductorMessage(
                 message_type=ConductorMessageType.FAIL_REQUESTS,
-                body=FailRequests(errors=wire_errors),
+                body=FailRequests(
+                    errors=wire_errors,
+                    statuses={} if status is None else dict.fromkeys(wire_errors, status),
+                ),
             ),
         )
         # Note: we do not cleanup the request right now; we wait for the conductor

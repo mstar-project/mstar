@@ -267,6 +267,8 @@ class FailRequests(MessageBody):
     step can fail several of them for different reasons.
     """
     errors: dict[str, str]
+    # request_id -> the client's HTTP status; 500 for a request not named
+    statuses: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass

@@ -11,7 +11,9 @@ was the only reason a resource could give:
 Only an ``AllocationFailed`` additionally calls for an eviction;
 ``RequestOffloading`` says the rid is already on its way to the host. When
 nothing can be evicted the batch is held and retried every backoff, so the line
-saying so is kept to one per node and walk every few seconds.
+saying so is kept to one per node and walk every few seconds. A request holding
+pages that is refused one waits until pages move, and once every holder has been
+refused, the newest is failed.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.worker import worker as worker_mod
-from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.worker import Worker
 
 
@@ -190,6 +192,10 @@ class _HoldingWorker:
         # no victim
         del node_name, batch_ids, affected_resources
 
+    def _fail_newest_if_stuck(self, node_name, node_batch):
+        # these tests are about the line a hold logs
+        del node_name, node_batch
+
 
 def _hold(worker, monkeypatch, at: float, walk: str = "walk") -> None:
     monkeypatch.setattr(worker_mod, "_time", SimpleNamespace(monotonic=lambda: at))
@@ -233,6 +239,185 @@ def test_a_hold_on_another_walk_is_logged_inside_the_interval(monkeypatch, caplo
     assert len(_hold_lines(caplog)) == 2, (
         "one walk's hold silenced another's, so a stall on it would go unseen"
     )
+
+
+# --- a KV stall: every request holding pages is waiting for one ------------
+
+
+class _Pages:
+    """The engine as a stall sees it: the pages each request holds of the
+    resource that ran out."""
+
+    def __init__(self, pages):
+        self.pages = dict(pages)
+        self.asked_for = None
+
+    def held(self, node_name, rid, resources=None):
+        del node_name
+        self.asked_for = resources
+        return self.pages.get(rid, 0)
+
+
+def _stalled_worker(pages: dict[str, int]) -> Worker:
+    """A rank with nothing to offload, serving ``pages``' requests, which
+    arrived in that order."""
+    w = Worker.__new__(Worker)
+    w.worker_id = "w0"
+    w.sent = []
+    w.communicator = SimpleNamespace(send=lambda to, msg: w.sent.append(msg))
+    w.engine = _Pages(pages)
+    w.engine_manager = SimpleNamespace(get_engine=lambda node: w.engine)
+    w.request_state = SimpleNamespace(per_request_info=dict.fromkeys(pages))
+    w._graph_runtime = SimpleNamespace(
+        push_back_node=lambda node, rids, wg_ids: None,
+        get_rid_string=lambda rid: rid,
+    )
+    failed: set[str] = set()
+    w.scheduler = SimpleNamespace(
+        hold_requests=lambda rids, seconds=None: None, failed_rids=failed, fail_rids=failed.update,
+    )
+    w.parallel_nodes, w.parallel_leader_nodes = set(), set()
+    w._hold_logged = {}
+    w._refused_for_pages, w._removals = {}, 0
+    w._pending_removes, w._pending_drains, w._draining_rids = set(), set(), set()
+    w._apply_removes_whose_step_landed = lambda: None
+    w._apply_pending_removes_safe_to_drop = lambda in_flight: None
+    w._try_offload_cold_request = lambda node, batch_ids, affected_resources=None: None
+    return w
+
+
+def _refuse(w, rid: str, node: str = "node", removals_seen: int | None = None) -> None:
+    """``rid``'s step on ``node`` is refused a page; it was built after the
+    latest removal unless ``removals_seen`` says otherwise."""
+    batch = ScheduledBatch(
+        node_name=node, graph_walk="decode", request_to_worker_graph={rid: 0},
+    )
+    node_batch = SimpleNamespace(
+        node_name=node, admit_error=_alloc_failed(rid), failed_resource="kv",
+        removals_seen=w._removals if removals_seen is None else removals_seen,
+    )
+    w._handle_allocation_failure(batch, node_batch)
+
+
+def _remove(w, rid: str) -> None:
+    """What the conductor's REMOVE_REQUEST leaves: the request and its pages gone."""
+    del w.request_state.per_request_info[rid]
+    del w.engine.pages[rid]
+    w.scheduler.failed_rids.discard(rid)
+    w._release_refused()
+    w._removals += 1
+
+
+def test_a_kv_stall_fails_the_newest_request_holding_pages():
+    """GLM-5.3, 64 x (17k prompt + 2k out): every decode needed a page, none was
+    free and nothing could be offloaded, so all 64 waited out the 600 s timeout.
+    Once every holder has been refused, the newest goes, with a 503."""
+    w = _stalled_worker({"first": 9, "second": 9, "third": 9, "prefill": 0})
+
+    for rid in ("first", "second", "prefill", "prefill"):
+        _refuse(w, rid)
+    assert w.sent == [], "failed a request while third could still run"
+
+    _refuse(w, "third")
+
+    assert len(w.sent) == 1, "nothing was failed, so every request waits out the timeout"
+    body = w.sent[0].body
+    assert body.errors == {"third": worker_mod._KV_FULL_ERROR}
+    assert body.statuses == {"third": 503}
+    assert w.engine.asked_for == {"kv"}, "only pages of the resource that ran out count"
+
+
+def test_a_refused_holder_waits_until_pages_move(monkeypatch):
+    """The same GLM-5.3 run: a refusal came every ~14 ms and a hold lasted 50 ms,
+    so only ~4 requests were ever out of the batch. The same few were refused
+    again and again, the other 60 never were, and nothing was failed."""
+    now = [0.0]
+    monkeypatch.setattr("mstar.worker.micro_scheduler.time", SimpleNamespace(monotonic=lambda: now[0]))
+    scheduler = MicroScheduler.__new__(MicroScheduler)
+    scheduler.held_until = {}
+    rids = [f"r{i}" for i in range(64)]
+    w = _stalled_worker(dict.fromkeys(rids, 9))
+    w.scheduler.hold_requests = scheduler.hold_requests
+
+    while not w.sent:
+        now[0] += 0.014
+        assert now[0] < 5, "the same few requests were refused again and again"
+        batch = [rid for rid in rids if scheduler.held_until.get(rid, 0.0) <= now[0]]
+        assert batch, "every holder was refused and none was failed"
+        _refuse(w, batch[0])  # every decode needs a page: the admit names the first
+
+    assert w.sent[0].body.errors.keys() == {"r63"}
+    _remove(w, "r63")
+    backoff = now[0] + MicroScheduler.HOLD_BACKOFF_SECONDS
+    assert {scheduler.held_until[rid] for rid in rids[:63]} == {backoff}, "pages moved, yet they stay held"
+
+
+def test_nothing_is_failed_while_a_holder_still_runs():
+    """third's steps still admit, so pages still move. And a prefill holding
+    nothing never gets anyone failed: failing it would free nothing."""
+    w = _stalled_worker({"first": 9, "second": 9, "third": 9, "prefill": 0})
+
+    for _ in range(50):
+        for rid in ("first", "second", "prefill"):
+            _refuse(w, rid)
+
+    assert w.sent == []
+
+
+def test_one_failure_at_a_time_each_after_the_last_freed_its_pages():
+    """A failure frees pages only when its REMOVE lands, so nothing else goes
+    before then; after it, every holder has to be refused again."""
+    w = _stalled_worker({"first": 9, "second": 9, "third": 9})
+    for rid in ("first", "second", "third"):
+        _refuse(w, rid)
+    assert len(w.sent) == 1, "nothing was failed"
+
+    for rid in ("first", "second", "first", "second"):
+        _refuse(w, rid)
+    assert len(w.sent) == 1, "failed another before third's pages came back"
+
+    _remove(w, "third")
+    _refuse(w, "first")
+    assert len(w.sent) == 1, "failed second before it could try third's pages"
+    _refuse(w, "second")
+    assert w.sent[-1].body.errors.keys() == {"second"}
+
+
+def test_refusals_on_another_node_do_not_count():
+    """Qwen-Omni's thinker and talker share a worker, each with its own pool: a
+    talker refusal says nothing about whether a thinker step can run."""
+    w = _stalled_worker({"first": 9, "second": 9})
+
+    _refuse(w, "first", node="talker")
+    _refuse(w, "second")
+
+    assert w.sent == [], "failed a request whose own node never refused it"
+
+
+def test_a_refusal_from_before_a_removal_does_not_count():
+    """The pages a removal frees may be all a refused step lacked; a step built
+    before them was refused against the smaller pool."""
+    w = _stalled_worker({"only": 9, "gone": 9})
+    built_before = w._removals
+    _remove(w, "gone")
+
+    _refuse(w, "only", removals_seen=built_before)
+    assert w.sent == [], "failed a request the freed pages could serve"
+
+    _refuse(w, "only")
+    assert w.sent[-1].body.errors.keys() == {"only"}
+
+
+def test_a_follow_rank_leaves_the_failing_to_rank_zero():
+    """Rank 0 is refused the same step and decides; the conductor's teardown
+    then reaches every rank, as for any failed request."""
+    w = _stalled_worker({"first": 9, "second": 9})
+    w.parallel_nodes = {"node"}  # sharded, and led by another rank
+
+    for rid in ("first", "second", "first", "second"):
+        _refuse(w, rid)
+
+    assert w.sent == []
 
 
 # --- the unbatchable path admits everything before it runs anything --------

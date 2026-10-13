@@ -40,6 +40,7 @@ def _worker(shared: dict[int, CurrentForwardPassInfo]):
         _graph_runtime=SimpleNamespace(get_consumed_edges=lambda *a: []),
         _stream_chunks_for=lambda rid, node_name, inputs: None,
         _settle_final_streams=lambda node_name, final_edges: (set(), set()),
+        _removals=0,
     )
     for name in ("_make_executing_batch", "_build_input_metadata_and_fwd_info", "_assemble_speculation"):
         setattr(worker, name, getattr(Worker, name).__get__(worker))

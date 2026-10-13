@@ -226,7 +226,7 @@ travels with its other ``model_kwargs``.
 
 A cached prompt no longer reserves its pages, so the pool no longer limits how many
 requests are admitted. It has to hold the decode of every request allowed to run at once,
-and a decode step that finds no free page holds its requests until they time out.
+and once no decode step gets a page, with nothing to offload, the newest fails with a 503.
 ``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
 pool's pages divided by the pages one request needs, prompt and output together, is a
 safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. An offload

@@ -260,8 +260,8 @@ class ChatterboxModel(Model):
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a request cap the T3 KV pool cannot hold.
 
-        Nothing preempts a stream once the pool is full: the requests wait on
-        each other until they time out. So ``max_concurrent_requests`` requests
+        Once the pool is full and every stream waits for a page, the newest is
+        failed with a 503 so the rest can finish. So ``max_concurrent_requests`` requests
         at full text and ``max_new_tokens_limit`` speech tokens must fit, next to
         the sink page (which a captured decode's padding rows also run against).
         """
@@ -269,7 +269,7 @@ class ChatterboxModel(Model):
         if cap is None:
             logger.warning(
                 "%s sets no max_concurrent_requests: a burst of long requests can fill "
-                "the T3 KV cache and stall until the requests time out", config_path,
+                "the T3 KV cache, and the newest is then failed with a 503", config_path,
             )
             return
         kv = next(s for s in self.get_node_resources() if s.resource_key == T3_KV).config

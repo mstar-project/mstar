@@ -907,6 +907,7 @@ class _ForwardingLeader:
     """Rank 0's ``_remove_request``, over stubs, to pin what it forwards."""
 
     _remove_request = Worker._remove_request
+    _release_refused = Worker._release_refused
     _removal_step_reached = Worker._removal_step_reached
     _rid = Worker._rid
 
@@ -917,6 +918,8 @@ class _ForwardingLeader:
         self._in_flight_rids: set[int] = set()
         self._pending_removes: set[int] = set()
         self._last_active: dict = {}
+        self._refused_for_pages: dict[str, set[int]] = {}
+        self._removals = 0
         self.streaming_buffers: dict = {}
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
