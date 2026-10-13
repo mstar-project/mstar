@@ -239,8 +239,7 @@ class WorkerSessionManager:
                 "down: %s", len(dropped), session_id,
                 [held.request_id for held in dropped],
             )
-        # Returned, not just dropped: the caller still has to clear their
-        # handles and fail them, exactly as it does for ``take_held_ingests``'s
-        # dropped list. Letting them go silently leaves the handle in
-        # ``_handles_awaiting_admit``, where nothing would ever take it out.
+        # Returned, not swallowed: the caller clears their handles and fails
+        # them. Dropped silently, the handle stays in _handles_awaiting_admit
+        # and nothing ever takes it out.
         return dropped

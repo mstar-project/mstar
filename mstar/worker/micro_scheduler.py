@@ -245,17 +245,12 @@ class MicroScheduler:
         pending_removes: set[int],
         handles_awaiting_admit: set[int],
     ) -> None:
-        """Adopt the worker's rid sets, by reference rather than by copy.
-
-        The worker mutates these as removals defer behind in-flight steps and
-        as sessions hand their state over, and the scheduler has to see that on
-        the same iteration. Every one of them gates new work; see
+        """Adopt the worker's rid sets by reference, so what it adds takes
+        effect the same iteration. All of them gate new work; see
         ``unschedulable_rids``.
 
-        Keyword-only on purpose: they are all ``set[int]``, so a positional
-        call could transpose two of them and nothing would complain -- the
-        scheduler would then defer the wrong batches and schedule requests
-        whose engine state is not open.
+        Keyword-only: they are all ``set[int]``, so a positional call could
+        transpose two and nothing would complain.
         """
         self.pending_removes = pending_removes
         self.handles_awaiting_admit = handles_awaiting_admit

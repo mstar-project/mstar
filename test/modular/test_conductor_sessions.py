@@ -333,11 +333,15 @@ def test_teardown_drops_the_session_s_queued_requests():
 
 
 def test_the_last_requests_teardown_drops_the_session_s_queued_siblings():
-    # A queued request has not been ingested, so it is not in
-    # session.request_ids and the end_session test cannot see it. Without this
-    # the _try_admit_waiting at the end of _finalize_draining dispatches it
-    # into a session whose state the workers are freeing: it would adopt
-    # nothing and continue from an empty context.
+    # Pins a guard that nothing can trigger today: the API server tombstones
+    # the session as soon as an end_session request is accepted, and allows one
+    # request in flight, so no sibling can be queued once session.ending is
+    # set. It is here because that is an upstream invariant, and because
+    # max_requests_in_flight is documented as the assumption bidirectional
+    # streaming will relax. A queued request is not in session.request_ids
+    # (registration happens at ingest), so the end_session test cannot see it,
+    # and _try_admit_waiting would dispatch it into a session whose state the
+    # workers are freeing.
     session = SessionData("s", {"wg": ["w0"]}, request_ids={"r0"}, ending=True)
     c = _conductor(requests={"r0": _request_data(("w0",))}, sessions=[session])
     c.request_sessions["r0"] = "s"

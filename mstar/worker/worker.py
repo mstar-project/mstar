@@ -637,13 +637,10 @@ class Worker:
         # The one place a handle is minted; a request with several partitions
         # on this worker gets the same one for each. Everything below keys on it.
         #
-        # Before the session hold, deliberately. The handle is what every
-        # message about this request is keyed by -- a REMOVE with no handle is
-        # parked by _process_message_list, and a DRAIN with no handle can
-        # neither gate the scheduler nor name the TP followers to fan to. A
-        # resumed request whose session has not handed its state over yet still
-        # has to answer both, so it gets its handle now and waits for the state
-        # in _handles_awaiting_admit.
+        # Before the session wait, deliberately: without a handle a REMOVE gets
+        # parked and a DRAIN can neither gate the scheduler nor name the TP
+        # followers to fan to. A resumed request still has to answer both while
+        # it waits, so it gets its handle now.
         request_id = self._graph_runtime.add_request(
             request_id=body.request_id,
             partition=body.request_info.partition_name,
@@ -660,9 +657,8 @@ class Worker:
 
         if self._sessions.hold_if_not_ready(body, request_id):
             # Nothing may schedule it until its session hands over: rank 0
-            # skips it, and a follower answers REMOVED_RID for it so a batch
-            # naming it is deferred rather than run against engine state that
-            # does not exist yet.
+            # skips it, and a follower answers REMOVED_RID so a batch naming it
+            # defers rather than running against engine state that is not open.
             self._handles_awaiting_admit.add(request_id)
             return
         self._finish_admission(body, request_id)
@@ -670,10 +666,9 @@ class Worker:
     def _finish_admission(self, body: NewRequest, request_id: int) -> None:
         """Open the request's engine state and let it be scheduled.
 
-        Split from ``_add_new_request`` at the engine call: a resumed request
-        takes on the state its session holds, which the session's previous
-        request has to hand back first. Everything before this point is keyed
-        by the handle and safe to do while that is still pending.
+        Split off at the engine call because that is the step that adopts the
+        session's state, which its previous request has to hand back first.
+        Everything before it is keyed by the handle and safe to do meanwhile.
         """
         session = body.request_info.session
         session_id = None if session is None else session.session_id
@@ -720,9 +715,9 @@ class Worker:
     def _open_stream_buffers(self, body: NewRequest, request_id: int) -> None:
         """The request's consumer-side stream buffers.
 
-        With the handle, not with the engine state: an INPUT_SIGNALS for a
-        streaming edge is no longer parked once the handle exists, and it
-        indexes these directly.
+        With the handle, not the engine state: once the handle exists an
+        INPUT_SIGNALS for a streaming edge is no longer parked, and it indexes
+        these directly.
         """
         # A request with several partitions here arrives once per partition:
         # keep the buffer the first arrival made (it may already hold items).
@@ -865,10 +860,8 @@ class Worker:
             self._pending_drains.add(body.request_id)
             return
 
-        # A request still waiting on its session needs no special case: the
-        # handle was minted before the wait, so the drain below gates the
-        # scheduler and reaches the TP followers exactly as it does for an
-        # admitted one.
+        # No special case for a request still waiting on its session: the
+        # handle predates the wait, so the drain below gates and fans as usual.
         self._begin_drain(body.request_id)
 
     def _begin_drain(self, request_id: str) -> None:
@@ -989,10 +982,9 @@ class Worker:
     ) -> None:
         """Fail requests that were waiting on a session that has now gone.
 
-        Admitting one would resume it from an empty context, which is worse
-        than an error; 410 is what the route promises for state that is gone.
-        One message for all of them, so a request with several partitions here
-        -- which appears once per partition -- is reported once.
+        Admitting one would resume it from an empty context; 410 is what the
+        route promises for state that is gone. Keyed by handle, so a request
+        with several partitions here is reported once.
         """
         errors, statuses = {}, {}
         for body in bodies:
@@ -1028,13 +1020,11 @@ class Worker:
         for body in ready:
             handle = body.request_info.rid_handle
             if body.request_id in self._draining_rids:
-                # Drained while it waited, so never open its engine state. The
-                # handle stays in _handles_awaiting_admit until the REMOVE
-                # clears it: `failed_rids` does not gate the TP-follow path (a
-                # rid in the head batch is scheduled anyway, micro_scheduler
-                # `_backlog_has_schedulable`), so `tp_rids` answering
-                # REMOVED_RID is the only thing keeping a batch that names it
-                # from running against state that was never ingested.
+                # Drained while it waited: open no engine state, and leave the
+                # handle gated until its REMOVE. failed_rids does not gate the
+                # TP-follow path, so tp_rids answering REMOVED_RID is the only
+                # thing stopping a batch naming it from running against state
+                # that was never ingested.
                 continue
             if self._sessions.hold_if_not_ready(body, handle):
                 continue  # another of its session's requests is still leaving
