@@ -733,7 +733,8 @@ class Engine:
     ) -> None:
         """Warn when a step runs over its walk's token budget: the scheduler
         sizes a speculation merge's continuing rows by guess, before their
-        inputs exist. Logged on the 1st, 2nd, 4th, ... overrun per walk."""
+        inputs exist, and ``fit_first`` and ``arrival`` cut no chunk below 128
+        tokens. Logged on the 1st, 2nd, 4th, ... overrun per walk."""
         walk = batch.step_context.graph_walk
         budget = self.get_max_batch_tokens(batch.node_name, walk)
         if budget is None:
@@ -746,7 +747,8 @@ class Engine:
         if count & (count - 1) == 0:
             logger.warning(
                 "%s/%s: step of %d tokens over its budget of %d (%d overruns so far); "
-                "a speculation merge's continuing rows ran more tokens than their last step",
+                "a speculation merge's continuing rows ran more tokens than their last step, "
+                "or a chunk took the 128-token floor of fit_first and arrival",
                 batch.node_name, walk, total, budget, count,
             )
 

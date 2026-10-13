@@ -1,4 +1,5 @@
 import functools
+import itertools
 import logging
 import time
 from collections import defaultdict, deque
@@ -13,9 +14,11 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RequestWal
 from mstar.model.submodule_base import InputSeqLenInfo
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
+    MIN_CHUNK,
     BatchBuilderType,
     BatchBuildRequest,
     BatchBuildResult,
+    BudgetSplit,
     make_batch_builder,
 )
 from mstar.worker.chunk_outputs import ChunkOutputAccumulator
@@ -276,6 +279,9 @@ class MicroScheduler:
         self.cached_prefix: dict[tuple[int, str], int] = {}
         # their non-final chunks' outputs, routed with the final chunk
         self.chunk_outputs = ChunkOutputAccumulator()
+        # rid -> its place in the order rids were first seen ready
+        self.arrival: dict[int, int] = {}
+        self._arrivals = itertools.count()
         self._warned_removed_rid = False
         self.sched_type = sched_type
 
@@ -686,8 +692,13 @@ class MicroScheduler:
             wg_id = self.runtime.get_worker_graph_id_for_node(
                 spec.node_name, spec.graph_walk,
             )
+            # max-min never reads the arrival order
+            split = getattr(self.engine_manager.get_engine(spec.node_name), "budget_split", None)
+            ordered = split is not None and split is not BudgetSplit.MAX_MIN
             entries = None
             for rid in spec.rids:
+                if ordered and rid not in self.arrival:
+                    self.arrival[rid] = next(self._arrivals)
                 fwd_info = request_state.get_fwd_info(rid, node_partition)
                 # check if the node is ready on the engine level
                 # (e.g., for AR, whether the kv cache is read in)
@@ -741,9 +752,15 @@ class MicroScheduler:
             # nodes off their ready queues with nowhere to run them, so leave
             # them and the backlog as they are for the next pass.
             return None
-        max_tokens = self.engine_manager.get_engine(node_walk[0]).get_max_batch_tokens(*node_walk)
+        engine = self.engine_manager.get_engine(node_walk[0])
+        max_tokens = engine.get_max_batch_tokens(*node_walk)
         if max_tokens is not None:
             max_tokens -= _pre_existing_tokens(pre_existing_seq_lens, pre_existing_batch_size)
+        split = getattr(engine, "budget_split", None) or BudgetSplit.MAX_MIN
+        # A chunk is MIN_CHUNK tokens even with less budget left, so a row needs room for that many.
+        chunk_room = max_tokens
+        if max_tokens is not None and split is not BudgetSplit.MAX_MIN:
+            chunk_room = max(max_tokens, MIN_CHUNK)
         row_tokens: dict[int, int] = {}
         chunkable: set[int] = set()
         backlogged = self.backlog.pop(node_walk, None)
@@ -751,7 +768,7 @@ class MicroScheduler:
         if backlogged is not None:
             waiting = self._waiting_rids(backlogged)
             infos, tokens, chunks = self._measure_rows(
-                request_state, backlogged, waiting, max_tokens,
+                request_state, backlogged, waiting, chunk_room,
             )
             blocked = self._unready_backlog_rids(backlogged, request_state, waiting, infos)
             row_tokens.update(tokens)
@@ -765,7 +782,7 @@ class MicroScheduler:
         if fresh:
             # a row whose KV does not fit sits this step out, rather than refusing the step
             infos, tokens, chunks = self._measure_rows(
-                request_state, fresh, max_tokens=max_tokens,
+                request_state, fresh, max_tokens=chunk_room,
             )
             no_room = self._rows_without_room(request_state, fresh, infos)
             row_tokens.update(tokens)
@@ -780,13 +797,16 @@ class MicroScheduler:
         if mid_prefill:
             continuing = self._in_flight_rows(*node_walk, mid_prefill)
             infos, tokens, chunks = self._measure_rows(
-                request_state, continuing, max_tokens=max_tokens,
+                request_state, continuing, max_tokens=chunk_room,
             )
             blocked |= self._rows_without_room(request_state, continuing, infos)
             row_tokens.update(tokens)
             chunkable |= chunks
         if backlogged is None and not fresh and continuing is None:
             return None
+        partial = set()
+        if split is not BudgetSplit.MAX_MIN:
+            partial = {rid for rid in row_tokens if (rid, node_walk[0]) in self.chunk_progress}
         return self._build_and_schedule(request_state, BatchBuildRequest(
             node_name=node_walk[0], graph_walk=node_walk[1],
             backlog=backlogged, fresh=fresh or None, blocked_rids=blocked,
@@ -798,6 +818,9 @@ class MicroScheduler:
             max_batch_tokens=max_tokens if row_tokens else None,
             row_tokens=row_tokens,
             chunkable=chunkable,
+            budget_split=split,
+            partial_rids=partial,
+            arrival=self.arrival,
         ), in_flight={entry.request_id for entry in mid_prefill} if mid_prefill else ())
 
     def _in_flight_rows(
@@ -1345,6 +1368,7 @@ class MicroScheduler:
         for key in [key for key in self.cached_prefix if key[0] == rid]:
             del self.cached_prefix[key]
         self.chunk_outputs.drop(rid)
+        self.arrival.pop(rid, None)
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)
         self.clear_wire_rid(rid_str)
