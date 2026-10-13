@@ -462,6 +462,9 @@ class Worker:
         self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
         # The same for session teardowns rank 0 forwarded.
         self._teardowns_awaiting_step: dict[int, list[TeardownSession]] = {}
+        # And for drains: gating a rid before this rank has run the batches
+        # rank 0 already committed for it stalls the TP FIFO.
+        self._drains_awaiting_step: dict[int, list[DrainRequest]] = {}
 
         # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
         # behind an in-flight GPU step; _draining_rids have stopped reading and
@@ -848,10 +851,18 @@ class Worker:
         then ACK READS_DONE once its in-flight reads finish. The hard cleanup
         (force_cleanup_request) waits for the conductor's REMOVE_REQUEST, sent
         only after every reader has ACKed."""
-        if self.is_tp_follower and body.source not in (
-            MessageSource.TP_RANK_0, MessageSource.SELF
-        ):
-            return  # honor only the leader's forwarded drain, like REMOVE_REQUEST
+        if self.is_tp_follower:
+            if body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF):
+                return  # honor only the leader's forward, like REMOVE_REQUEST
+            if not self._removal_step_reached(body):
+                # Stop reading where rank 0 stopped, not before. Draining ahead
+                # of the sequence gates a rid whose batches this rank has not
+                # run yet; if it is also still waiting on its session, the gate
+                # keeps the FIFO from ever reaching the step that would lift it.
+                self._drains_awaiting_step.setdefault(
+                    body.after_tp_seq, []
+                ).append(body)
+                return
 
         # Defer behind an in-flight GPU step, same as REMOVE_REQUEST: clearing
         # the scheduler while a step references the rid would race the GPU thread.
@@ -879,6 +890,9 @@ class Worker:
                         body=DrainRequest(
                             request_id=request_id,
                             source=MessageSource.TP_RANK_0,
+                            # this rank stops reading here, having broadcast up
+                            # to this step; followers stop at the same point
+                            after_tp_seq=self._tp_broadcast_seq - 1,
                         )
                     )
                 )
@@ -3415,10 +3429,22 @@ class Worker:
     def _apply_removes_whose_step_landed(self) -> None:
         """Tear down the requests rank 0 released once this rank reaches the step
         it released them after. Cannot strand them: the step was broadcast before
-        the removal, so this rank gets there."""
-        if not (self._removes_awaiting_step or self._teardowns_awaiting_step):
+        the removal, so this rank gets there.
+
+        Drains first: the rid has to stop being read before it is torn down,
+        and both are stamped with the step rank 0 did it after.
+        """
+        if not (
+            self._removes_awaiting_step or self._teardowns_awaiting_step
+            or self._drains_awaiting_step
+        ):
             return
         reached = self.scheduler.last_consumed_tp_seq
+        for seq in sorted(s for s in self._drains_awaiting_step if s <= reached):
+            for parked_drain in self._drains_awaiting_step.pop(seq):
+                self._drain_request(replace(
+                    parked_drain, source=MessageSource.SELF, after_tp_seq=-1,
+                ))
         for seq in sorted(s for s in self._removes_awaiting_step if s <= reached):
             for parked in self._removes_awaiting_step.pop(seq):
                 # replace, not a fresh body: every field it carried survives
