@@ -24,7 +24,8 @@ def _decode(m: Glm5NextModel) -> Loop:
 
 def test_request_budget_above_the_default_is_honored():
     m = _model()
-    assert m.get_max_output_tokens() == m.config.max_output_tokens == 1024
+    assert m.config.max_output_tokens is None
+    assert m.get_max_output_tokens() == m.config.index_topk
     assert m.get_max_output_tokens(max_output_tokens=2000) == 2000
     # each decode iteration emits a token on top of the prefill's
     assert _decode(m).max_iters >= 2000 - 1

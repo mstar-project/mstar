@@ -50,3 +50,10 @@ def test_min_p_is_refused_in_process_prompt(k):
     with pytest.raises(ValueError, match="min_p"):
         m.process_prompt("Hi", ["text"], ["text"], min_p=0.2)
     assert m.process_prompt("Hi", ["text"], ["text"], min_p=0)["text_inputs"][0].numel() == 2
+
+
+def test_a_request_without_max_tokens_runs_to_the_window():
+    # a thinking reply was cut at a fixed 1024 tokens with "length", on any window
+    m = _model()
+    assert m.get_max_output_tokens() == m.get_max_output_tokens(max_output_tokens=None) == m.config.index_topk
+    assert m.get_max_output_tokens(max_output_tokens=100) == 100

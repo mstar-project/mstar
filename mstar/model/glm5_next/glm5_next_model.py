@@ -482,7 +482,7 @@ class Glm5NextModel(Model):
     def get_max_output_tokens(self, **model_kwargs):
         # held to the window: a one-token prompt emits at most index_topk tokens
         budget = sampling_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
-        return min(budget, self.config.index_topk)
+        return self.config.index_topk if budget is None else min(budget, self.config.index_topk)
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

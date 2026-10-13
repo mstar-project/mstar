@@ -188,7 +188,9 @@ class Glm5NextModelConfig:
     # --- tokens / generation defaults ---
     eos_token_ids: tuple[int, ...] = (154820, 154827, 154829)
     pad_token_id: int = 154820
-    max_output_tokens: int = 1024
+    # None: a request that names no max_tokens may run to the end of the window,
+    # as in vLLM; check_stop ends each request where its prompt leaves no room.
+    max_output_tokens: int | None = None
     temperature: float = 1.0
     top_p: float = 0.95
     repetition_penalty: float = 1.0
