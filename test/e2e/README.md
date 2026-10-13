@@ -76,16 +76,20 @@ server's startup.
   `pykakasi` and `spacy-pkuseg`); Qwen3-TTS needs `qwen-tts`; Qwen3-Omni needs
   `qwen-omni-utils` and `flash-attn`; OmniVoice needs the git build described in
   `docs/installation.rst`. Install them without changing the installed `torch`,
-  `torchcodec` or `transformers` versions.
+  `torchcodec` or `transformers` versions. The exception is OmniVoice: its git
+  build requires `transformers>=5.3`, so run it from a separate environment.
 - Gated checkpoints (Orpheus, FLUX.2-klein 9B) need a logged-in Hugging Face
   account that has accepted the model's license.
 - Weights download from the Hub on first use unless `--offline` is given. Some
   configs' warm-up requests also fetch `hf://` assets.
 - The speech-recognition and voice-cloning cases use one LibriSpeech utterance
   from the public `hf-internal-testing/librispeech_asr_dummy` dataset.
-- V-JEPA 2 decodes video input on the server with `torchcodec`, which needs
-  FFmpeg shared libraries on the loader path (for example `LD_LIBRARY_PATH`).
-  The server environment is inherited from the runner.
+- V-JEPA 2, Whisper, Higgs Audio and OmniVoice voice cloning decode their
+  input on the server with `torchcodec`, which needs FFmpeg shared libraries on
+  the loader path (a system FFmpeg, or `LD_LIBRARY_PATH`). Without them those
+  cases fail, and so does every speech profile's "says the sentence" check,
+  which transcribes with Whisper. The server environment is inherited from the
+  runner.
 
 ## Comparing two checkouts
 

@@ -286,8 +286,9 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
         Case("text_to_speech", "speech", speech(voice="default"), SPEECH),
     ), "speech", requires=CHATTERBOX, peak_vram_gb=14.3),
     ModelSpec("omnivoice", "configs/omnivoice.yaml", (
-        Case("text_to_speech", "speech", speech(voice="A calm female voice"), SPEECH),
-    ), "speech", requires=("omnivoice.models.omnivoice_flashinfer",)),
+        # Voice design accepts only OmniVoice's listed instruct items, comma separated.
+        Case("text_to_speech", "speech", speech(voice="female, low pitch"), SPEECH),
+    ), "speech", requires=("omnivoice.models.omnivoice_flashinfer",), peak_vram_gb=3.7),
     ModelSpec("whisper_large", "configs/whisper_large.yaml", (
         Case("speech_to_text", "transcribe", transcribe(),
              Expect("text", transcript="MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES"), smoke=True),
