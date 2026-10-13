@@ -416,7 +416,17 @@ class MicroScheduler:
         if not head.prefix_hits:
             return True
         engine = self.engine_manager.get_engine(head.node_name)
-        return engine.adopt_cached_prefix(head)
+        try:
+            return engine.adopt_cached_prefix(head)
+        except RuntimeError as exc:
+            # a divergence never heals: drop the head and fail its requests (as
+            # `_check_ready` does a terminal admit error), so it raises once
+            rids = {rid for rid in self.tp_rids(head) if rid != REMOVED_RID}
+            self.pop_tp_follow_head()
+            for rid in rids:
+                self.admit_errors[rid] = f"TP ranks diverged: {exc}"
+            self.fail_rids(rids)
+            raise
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
