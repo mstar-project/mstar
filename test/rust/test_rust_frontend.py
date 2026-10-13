@@ -457,6 +457,7 @@ def test_nonstreaming_backend_error_maps_to_real_status():
                         "messages": [{"role": "user", "content": "hi"}]}).encode())
         assert code == 500, (code, body)
         assert "boom" in body["error"]["message"]
+        assert body["error"]["type"] == "server_error"
     # /generate: FastAPI {"detail": ...}, not 200 with the error in outputs.
     with _model_stack("qwen3_omni", _ErrorChunkStub(500)) as (port, _up):
         code, body = _generate_nonstream(port)
@@ -469,6 +470,7 @@ def test_nonstreaming_backend_error_maps_to_real_status():
             json.dumps({"model": "qwen3_omni",
                         "messages": [{"role": "user", "content": "hi"}]}).encode())
         assert code == 400, (code, body)
+        assert body["error"]["type"] == "invalid_request_error"
 
 
 def test_images_generations_on_cosmos3():
