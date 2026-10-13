@@ -177,11 +177,11 @@ def test_global_config_exposes_remote_replica_shapes_to_every_worker():
     ("device_type", "device_backend", "expected_backend"),
     [
         ("cpu", "gloo", "gloo"),
-        ("cuda", "nccl", "cpu:gloo,cuda:nccl"),
+        ("cuda", "nccl", "nccl"),
         ("xpu", "xccl", "cpu:gloo,xpu:xccl"),
     ],
 )
-def test_init_dist_shares_cpu_and_device_groups(
+def test_init_dist_uses_mixed_groups_only_on_xpu(
     monkeypatch, device_type, device_backend, expected_backend,
 ):
     from mstar.distributed import communication
@@ -208,29 +208,40 @@ def test_init_dist_shares_cpu_and_device_groups(
         communication.dist, "init_process_group", lambda **kwargs: calls.append(kwargs),
     )
 
-    def new_group(ranks):
+    def new_group(ranks, **kwargs):
         # Every rank creates even the subgroups it does not belong to.
-        # CPU-only twins would add calls or unexpected backend arguments.
-        calls.append(tuple(ranks))
-        handles[tuple(ranks)] = object()
-        return handles[tuple(ranks)]
+        calls.append((tuple(ranks), kwargs))
+        key = (tuple(ranks), kwargs.get("backend"))
+        handles[key] = object()
+        return handles[key]
 
     monkeypatch.setattr(communication.dist, "new_group", new_group)
     device = torch.device(device_type, 0) if device_type != "cpu" else torch.device("cpu")
     groups.init_dist(init_method="test://world", device=device)
 
+    expected_group_calls = []
+    for ranks in ((0, 1), (2, 3)):
+        expected_group_calls.append((ranks, {}))
+        if device_type != "xpu":
+            expected_group_calls.append((
+                ranks, {"backend": "gloo", "use_local_synchronization": True},
+            ))
     assert calls == [
         {
             "backend": expected_backend, "init_method": "test://world",
             "world_size": 4, "rank": 0,
-            "device_id": device if device_type != "cpu" else None,
+            "device_id": device,
         },
-        (0, 1), (2, 3),
+        *expected_group_calls,
     ]
     assert devices == ([] if device_type == "cpu" else [device])
     for group in (tp, sp):
         assert group.initialized
-        assert group.device_group is handles[(0, 1)]
-        assert group.cpu_group is group.device_group
+        assert group.device_group is handles[((0, 1), None)]
+        if device_type == "xpu":
+            assert group.cpu_group is group.device_group
+        else:
+            assert group.cpu_group is handles[((0, 1), "gloo")]
+            assert group.cpu_group is not group.device_group
     assert singleton.initialized
     assert singleton.device_group is None
