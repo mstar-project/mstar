@@ -63,10 +63,11 @@ def _read_compile_mode_override(environ: Mapping[str, str] | None = None) -> str
     """The env override, validated at import. Takes the mapping so a test
     can drive it without reloading this module."""
     env = os.environ if environ is None else environ
-    mode = env.get(_COMPILE_MODE_ENV)
-    if mode is not None:
-        _validate_compile_mode(mode, _COMPILE_MODE_ENV)
-    return mode
+    # an empty export (MODE=${MODE:-}) means unset, not a mode
+    mode = env.get(_COMPILE_MODE_ENV, "").strip()
+    if not mode:
+        return None
+    return _validate_compile_mode(mode, _COMPILE_MODE_ENV)
 
 
 _COMPILE_MODE_OVERRIDE = _read_compile_mode_override()

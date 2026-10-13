@@ -67,10 +67,10 @@ Communication
    * - ``MSTAR_GRAPH_COMPILE_MODE``
      - unset
      - Overrides the ``torch.compile`` mode of every captured forward
-       (whole forwards and piecewise regions). Unset, each capture config's
-       ``compile_mode`` applies, else ``max-autotune-no-cudagraphs``.
+       (whole forwards and piecewise regions). Unset or empty, each capture
+       config's ``compile_mode`` applies, else ``max-autotune-no-cudagraphs``.
        ``default`` keeps Inductor's fusion but takes cuBLAS for every GEMM
-       and skips autotuning. An unknown or empty mode fails at import, and so
+       and skips autotuning. An unknown mode fails at import, and so
        does one with Inductor's own CUDA graphs (``reduce-overhead``,
        ``max-autotune``).
    * - ``MSTAR_DIST_TIMEOUT_S``

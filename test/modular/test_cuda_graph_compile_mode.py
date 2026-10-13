@@ -87,9 +87,10 @@ def test_env_override_is_read_and_validated_at_import():
     assert read({}) is None
     assert read({ENV: "default"}) == "default"
     assert read({ENV: "max-autotune-no-cudagraphs"}) == "max-autotune-no-cudagraphs"
-    # an empty export (MODE=${MODE:-}) silently compiled in Inductor's default mode
-    with pytest.raises(ValueError, match="empty"):
-        read({ENV: ""})
+    # an empty export (MODE=${MODE:-}) is unset: it must neither reach
+    # torch.compile as a falsy mode nor fail every model at import
+    assert read({ENV: ""}) is None
+    assert read({ENV: " "}) is None
     with pytest.raises(ValueError, match=f"{ENV}='no-such-mode'"):
         read({ENV: "no-such-mode"})
 
