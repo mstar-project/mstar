@@ -3597,10 +3597,9 @@ class Worker:
 
                 # Build nothing on a refusal; the fence above is what makes it
                 # knowable here. Ordinary speculation would be dropped anyway,
-                # but a yield-away batch survives ``_maybe_clear_spec`` and is
-                # already broadcast — so the eviction below would land after its
-                # head went out, and the follower would admit it a delta behind.
-                # Skipping keeps that eviction in the gap between steps.
+                # but a yield-away batch survives ``_maybe_clear_spec``, so it
+                # would be built before the eviction below, from a ready set
+                # that eviction then changes.
                 #
                 # The marker below stays outside this: a follower settles N on
                 # exactly one of {head, marker}, and it moves no pages.
@@ -3673,11 +3672,6 @@ class Worker:
                                 is_same_node=False,
                                 is_yield_away=True
                             )
-
-                            # A leader stamps the seq it sends; a follower's
-                            # batch keeps the one it came off the FIFO with.
-                            ya_seq = self.maybe_send_zmq_to_tp_followers(node_batch)
-                            speculation.tp_seq = ya_seq if ya_seq >= 0 else batch.tp_seq
 
                 def _arm_speculation(spec: Speculation) -> None:
                     # Hand N+1 to the plan thread NOW. It waits on N's
@@ -3810,6 +3804,11 @@ class Worker:
                         )
 
                         if spec_batch.request_to_worker_graph:
+                            if speculation.is_yield_away:
+                                # Sent once N is known not to have raised: a follower runs
+                                # every batch it is sent, so one dropped here would run alone.
+                                ya_seq = self.maybe_send_zmq_to_tp_followers(spec_node_batch)
+                                speculation.tp_seq = ya_seq if ya_seq >= 0 else spec_batch.tp_seq
                             if self.enable_nvtx:
                                 range_push("worker.submit_spec", synchronize=False)
                             _t0 = _time.perf_counter() if phase_period else 0.0
