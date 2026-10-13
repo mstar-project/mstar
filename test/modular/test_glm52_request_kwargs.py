@@ -68,12 +68,17 @@ def test_a_request_without_max_tokens_runs_to_the_window():
     assert m.get_max_output_tokens(max_output_tokens=100) == 100
 
 
-@pytest.mark.parametrize("kwargs", [{"temperature": 0.7}, {"repetition_penalty": 1.1}])
+@pytest.mark.parametrize("kwargs", [{"repetition_penalty": 1.1}])
 def test_mtp_refuses_sampling_it_cannot_serve_in_process_prompt(kwargs):
-    with pytest.raises(ValueError, match="greedy only"):
+    with pytest.raises(ValueError, match="repetition_penalty"):
         _model(mtp_num_draft_tokens=2).process_prompt("Hi", ["text"], ["text"], **kwargs)
     # without MTP it samples
     assert _model().process_prompt("Hi", ["text"], ["text"], **kwargs)["text_inputs"][0].numel() == 2
+
+
+def test_mtp_samples_with_temperature():
+    m = _model(mtp_num_draft_tokens=2)
+    assert m.process_prompt("Hi", ["text"], ["text"], temperature=0.7, top_p=0.9)["text_inputs"][0].numel() == 2
 
 
 @pytest.mark.parametrize("kwargs", [{}, {"temperature": 0}, {"temperature": None}])
