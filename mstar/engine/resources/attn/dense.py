@@ -23,6 +23,16 @@ except Exception as _fa3_exc:  # noqa: BLE001
 else:
     _FA3_IMPORT_ERROR = None
 
+# ROCm has no FA3; AITER's varlen FMHA takes the same call, so dense runs on it
+# there instead of degrading to the paged backend
+if flash_attn_varlen_func is None and torch.version.hip is not None:
+    try:
+        from aiter import flash_attn_varlen_func
+    except Exception as _aiter_exc:  # noqa: BLE001
+        _FA3_IMPORT_ERROR = f"{_FA3_IMPORT_ERROR}; aiter: {type(_aiter_exc).__name__}: {_aiter_exc}"
+    else:
+        _FA3_IMPORT_ERROR = None
+
 
 @functools.cache
 def _fa3_unavailable_reason() -> str | None:
