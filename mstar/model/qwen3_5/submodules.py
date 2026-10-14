@@ -381,6 +381,7 @@ class LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         request_ids: list[str],
         inputs: list[ARNodeInputs],
+        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
         prefill_tokens = {}
@@ -395,6 +396,15 @@ class LLMSubmodule(ARNodeSubmodule):
                 rid: inp.tensor_inputs["text_token_ids"]
                 for rid, inp in zip(request_ids, inputs, strict=True)
             }
+
+        kept_rids = None
+        if graph_walk != "decode":
+            # only the last prefill's token survives `postprocess`
+            info = per_request_info or {}
+            kept_rids = frozenset(
+                rid for rid in request_ids
+                if rid in info and info[rid].step_metadata.get("last_prefill", False)
+            )
 
         # `advance=None` advances by the span, which is wrong for an image:
         # its 3D grid covers fewer positions than tokens.
@@ -421,6 +431,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 SAMPLER: SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
+                    kept_rids=kept_rids,
                 ),
                 ROPE: PositionStep(advance=advance),
             },

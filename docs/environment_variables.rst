@@ -42,12 +42,11 @@ Communication
      - How messages are encoded on every communicator edge (see
        :func:`mstar.communication.codec.default_codec`). ``msgpack``: the
        typed encoding in :mod:`mstar.communication.wire`, language-neutral
-       so an edge can terminate in a Rust process. ``pickle``: the old
-       Python-only wire, kept for bisecting a wire problem. Both ends of an
-       edge must agree, so this is all-or-nothing for a mesh -- one process
-       set differently cannot talk to its peers. ``pickle`` is incompatible
-       with the Rust graph runtime, which builds its frames as typed
-       msgpack; that pairing fails at startup rather than mixing wires.
+       so an edge can terminate in a Rust process. ``pickle`` is no longer
+       supported and fails at startup. Loosely typed metadata uses data-only
+       extensions instead of pickle. Upgrade all processes in a deployment
+       together: older processes cannot decode the new extensions, and
+       updated processes reject legacy pickle messages and metadata.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a
@@ -311,18 +310,6 @@ Worker scheduling
        ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
        former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
        Qwen3.5 alone.
-   * - ``MSTAR_EARLY_SPEC``
-     - ``1``
-     - Build and pre-plan step N+2 while N+1 runs, between the stop and
-       routing halves of step N's post-processing, so the pre-plan overlaps
-       work the main thread does anyway instead of the next launch. ``0``
-       builds each speculation at the top of the next iteration, after the
-       whole post-processing, which left the plan thread idle during it.
-       On a tensor-parallel node the leader's early build commits only when
-       it finds a head (it broadcasts it at once); when it finds nothing it
-       sends no marker and schedules no yield-away, and the top of the next
-       iteration decides, so the followers still settle every step on
-       exactly one decision.
    * - ``MSTAR_LAZY_PUBLISH``
      - ``1``
      - Publish resource state (KV pages, positions) only for the requests
@@ -370,14 +357,6 @@ Worker scheduling
        the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` concurrent
        requests (default 4096, a hard cap with this on). Only with the device
        loop-back on. An experiment knob; measure before turning it on.
-   * - ``MSTAR_TP_EARLY_SPEC``
-     - ``0``
-     - Let a tensor-parallel leader build its next speculation early, during
-       the current step's postprocess, committing only once it holds a head
-       (``MSTAR_EARLY_SPEC`` covers single-GPU nodes). Off by default: with
-       the device loop-back on a 4-way group every request stalled once for
-       about 1.2 s (27B TP4 at c8: 674 vs 1009 tok/s with it off), and the
-       tensor-parallel cells are GPU-bound, so there is nothing to buy.
    * - ``MSTAR_LAUNCH_SIGNAL_AFTER_COMMIT``
      - ``0``
      - Release the thread that submitted a step only once the gpu thread

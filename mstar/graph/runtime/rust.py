@@ -673,8 +673,8 @@ class RustGraphRuntime(GraphRuntime):
             ),
             prof_rids=[] if input.profiling is None else input.profiling.keys,
             # encode_fields, not encode: a bare tuple has no wire tag, so
-            # encode would pickle it, and Rust cannot split a pickle into
-            # WORKER_GRAPHS_DONE's three fields.
+            # encode would wrap it in a data envelope, which Rust cannot
+            # split into WORKER_GRAPHS_DONE's three fields.
             profiling=[] if input.profiling is None else [
                 wire.encode_fields(p, _PROFILING_HINTS)
                 for p in input.profiling.values
