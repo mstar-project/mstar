@@ -368,11 +368,6 @@ class StepRunner:
                 )
                 return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
-            # no room yet is not-ready: the scheduler retries the row later
-            if ready and seq_len_info is not None and not self._resources[key].has_room(
-                rid, node_name, graph_walk, seq_len_info.get_admit_segment_len(key),
-            ):
-                ready = False
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
 

@@ -406,20 +406,16 @@ def test_admit_retrieve_short_circuits_on_failure():
     assert sampler.calls == [], "the sweep stops at the first failure"
 
 
-def test_a_resource_without_room_makes_the_row_not_ready():
-    kv = _Stub("kv")
-    kv.has_room = lambda rid, node, walk, segment_len: segment_len <= 8
-    runner = StepRunner({"kv": kv})
+def test_a_declared_length_does_not_gate_the_row():
+    """Admission is the admit path's job: a declared length is carried for
+    chunk sizing, and must not make a row not-ready on its own. The gate that
+    did used to deadlock decode, which held every page and so could never run
+    to free one."""
+    runner = StepRunner({"kv": _Stub("kv")})
 
-    fits = runner.admit_retrieve("r1", "llm", "decode", None, InputSeqLenInfo(8))
-    too_big = runner.admit_retrieve("r1", "llm", "decode", None, InputSeqLenInfo(9))
-    per_resource = runner.admit_retrieve(
-        "r1", "llm", "decode", None, InputSeqLenInfo(9, {"kv": 2}),
-    )
-
-    assert (fits.ok, fits.ready) == (True, True)
-    assert (too_big.ok, too_big.ready) == (True, False), "no room is a retry, not a failure"
-    assert per_resource.ready
+    for info in (InputSeqLenInfo(8), InputSeqLenInfo(10_000)):
+        outcome = runner.admit_retrieve("r1", "llm", "decode", None, info)
+        assert (outcome.ok, outcome.ready) == (True, True)
 
 
 def test_build_accelerator_graph_buffers_reaches_every_resource():

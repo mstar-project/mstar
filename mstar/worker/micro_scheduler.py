@@ -788,17 +788,6 @@ class MicroScheduler:
 
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
             if entries else None
-        if fresh:
-            # a row whose KV does not fit sits this step out, rather than refusing the step
-            no_room = self._rows_without_room(request_state, fresh, self._row_lens(
-                request_state, fresh, list(fresh.request_to_worker_graph),
-            ) or {})
-            if no_room:
-                fresh, left = fresh.split_off_first(None, exclude_rids=no_room)
-                self.runtime.push_back_node(
-                    left.node_name, list(left.request_to_worker_graph),
-                    list(left.request_to_worker_graph.values()),
-                )
         if backlogged is None and not fresh:
             return None
         return self._build_and_schedule(request_state, BatchBuildRequest(
@@ -916,21 +905,6 @@ class MicroScheduler:
                     request_state.get_fwd_info(rid, partition), inputs.get(rid, {}),
                 )
         return batch.row_lens
-
-    def _rows_without_room(
-        self, request_state: RequestStateManager, batch: ScheduledBatch,
-        lens: dict[int, Any],
-    ) -> set[int]:
-        """Rows of ``batch`` with a length in ``lens`` whose node's resources
-        cannot take it now."""
-        partition = request_state.get_partition_for_node(batch.node_name)
-        return {
-            rid for rid, info in lens.items()
-            if info is not None and not self._check_ready(
-                batch.node_name, rid, request_state.get_fwd_info(rid, partition),
-                seq_len_info=info,
-            )
-        }
 
     def _waiting_rids(self, batch: ScheduledBatch) -> set[int]:
         """``batch``'s held (OOM backoff) and pending-remove rows."""

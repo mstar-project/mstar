@@ -1588,15 +1588,19 @@ def test_a_bad_mixing_setting_is_refused(mixes, error):
         _combined_scheduler(_Engine(max_bs=8), mixes)
 
 
-# ── rows without room ───────────────────────────────────────────────────
+# ── measured rows ───────────────────────────────────────────────────────
 
 
 class _SizedEngine(_Engine):
-    """Reports each row's length; ``too_big`` rows have no KV room."""
+    """Reports each row's length; ``unready`` rows the engine cannot take.
 
-    def __init__(self, too_big, **kw):
+    Readiness does not key on the reported length: admission is the admit
+    path's job, so a declared length never makes a row not-ready.
+    """
+
+    def __init__(self, unready, **kw):
         super().__init__(**kw)
-        self.too_big = set(too_big)
+        self.unready = set(unready)
         self.measured = []
 
     def declares_input_sequence_len(self, node_name):
@@ -1609,25 +1613,28 @@ class _SizedEngine(_Engine):
         return SimpleNamespace(seq_len=len(inputs))
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True, seq_len_info=None):
-        if seq_len_info is not None and rid in self.too_big:
+        del seq_len_info
+        if rid in self.unready:
             return FULL_ADMIT_NOT_READY
         return super().check_ready(node_name, rid, fwd_info, allow_reload)
 
 
-def test_a_row_without_room_sits_out_and_stays_ready():
-    sched = _scheduler(_SizedEngine(too_big={"r1"}, max_bs=8))
+def test_a_measured_row_is_not_gated_on_its_length():
+    """Every row goes in: a declared length is carried for the step build, it
+    is not an admission decision. The gate that used to live here deadlocked
+    decode, which holds every page and so can never run to free one."""
+    sched = _scheduler(_SizedEngine(unready=set(), max_bs=8))
     sched.get_tensor = lambda uuid: uuid
     manager = _Manager(["r0", "r1", "r2"])
 
     batch = _next_batch(sched, manager)
 
-    assert list(batch.request_to_worker_graph) == ["r0", "r2"]
+    assert list(batch.request_to_worker_graph) == ["r0", "r1", "r2"]
     assert not sched.backlog
-    assert set(manager.queues["wg0"].get_ready_node_names()) == {"r1"}
 
 
-def test_a_backlogged_row_without_room_stays_parked():
-    sched = _scheduler(_SizedEngine(too_big={"b1"}, max_bs=8))
+def test_a_backlogged_row_the_engine_cannot_take_stays_parked():
+    sched = _scheduler(_SizedEngine(unready={"b1"}, max_bs=8))
     sched.get_tensor = lambda uuid: uuid
     sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
 
@@ -1638,7 +1645,7 @@ def test_a_backlogged_row_without_room_stays_parked():
 
 
 def test_a_parked_row_is_measured_once_and_checked_once_per_pass():
-    engine = _SizedEngine(too_big={"b1"}, max_bs=8)
+    engine = _SizedEngine(unready={"b1"}, max_bs=8)
     sched = _scheduler(engine)
     sched.get_tensor = lambda uuid: uuid
     sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
