@@ -18,6 +18,8 @@ jobs:
       - name: Run Ruff
         # Use GitHub’s annotation format so lint errors show inline
         run: ruff check --output-format=github .
+      - name: Test the optional Mac runner
+        run: python -m unittest discover -s test/ci -v
   # The CPU-only engine/resource suite is listed in test/cpu-core.txt; other
   # modular tests import GPU backends during collection.
   cpu-core:
@@ -120,6 +122,8 @@ jobs:
           maturin build --release
           pip install target/wheels/*.whl
       - name: Interop tests (transport + arena + frontend)
+        env:
+          LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: |
           # pyyaml: the runtime tests reach mstar.model.base, which imports it
           pip install pytest pyzmq msgpack numpy pyyaml
@@ -129,4 +133,5 @@ jobs:
           pip install triton
           # the package itself, without its remaining (heavy) deps
           pip install --no-deps -e .
-          pytest test/rust/ -v
+          # the row store needs the columnar tensor store; cpu-core skips most of it
+          pytest test/rust/ test/modular/test_row_output_store.py -v

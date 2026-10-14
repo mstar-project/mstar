@@ -289,6 +289,11 @@ class ForwardPassArgs:
 
 
 class Model(ABC):
+    # Inputs consumed by process_prompt (tokenized or placed on tensor edges).
+    # Retain them locally for postprocessing, but do not send the original
+    # values to the conductor alongside their tensor descriptors.
+    PREPROCESS_ONLY_KWARGS: tuple[str, ...] = ()
+
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
     # default of one per core; ``preprocess_torch_threads`` in the model's
