@@ -1150,6 +1150,21 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">LATENTS</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">seed_latents</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">bucket_key</span><span class="p">,</span> <span class="n">generator</span><span class="p">)}</span></div>
 
 
+<div class="viewcode-block" id="DenoiseLoopSubmodule.initial_loop_back">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.diffusion.denoise_loop.html#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.initial_loop_back">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">initial_loop_back</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span> <span class="n">inputs</span><span class="p">:</span> <span class="n">NameToTensorList</span><span class="p">,</span> <span class="n">bucket_key</span><span class="p">:</span> <span class="n">Hashable</span><span class="p">,</span>
+        <span class="n">generator</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Iteration 0's loop-back values, with the step's inputs in view.</span>
+
+<span class="sd">        Default: :meth:`seed_loop_back`, i.e. a loop that starts from noise. A loop that</span>
+<span class="sd">        starts from given latents instead (a refinement stage, image-to-image) overrides</span>
+<span class="sd">        this and reads them from ``inputs``, the edges the walk routed to this node."""</span>
+        <span class="k">del</span> <span class="n">inputs</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">seed_loop_back</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">bucket_key</span><span class="p">,</span> <span class="n">generator</span><span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="DenoiseLoopSubmodule.request_inputs">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.diffusion.denoise_loop.html#mstar.model.components.diffusion.denoise_loop.DenoiseLoopSubmodule.request_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">request_inputs</span><span class="p">(</span>
@@ -1264,11 +1279,14 @@ window.runMermaid = runMermaid;</script>
         <span class="n">state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">fwd_info</span><span class="o">.</span><span class="n">rid_handle</span><span class="p">)</span>
         <span class="n">k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">step_index</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">)</span>
         <span class="n">device</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_device</span><span class="p">()</span>
-        <span class="k">if</span> <span class="s2">"schedule"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">state</span><span class="p">:</span>
+        <span class="c1"># One schedule per (request, walk): a request whose walks run this node in</span>
+        <span class="c1"># successive stages (a draft loop, then a refinement loop) gets a fresh shape</span>
+        <span class="c1"># and schedule for each.</span>
+        <span class="k">if</span> <span class="n">state</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"schedule_walk"</span><span class="p">)</span> <span class="o">!=</span> <span class="n">graph_walk</span><span class="p">:</span>
             <span class="n">bucket_key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">bucket_key_for</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">)</span>
             <span class="n">schedule</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">schedule_for</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">bucket_key</span><span class="p">)</span>
             <span class="n">state</span><span class="o">.</span><span class="n">add_all</span><span class="p">(</span>
-                <span class="n">schedule</span><span class="o">=</span><span class="n">schedule</span><span class="p">,</span> <span class="n">bucket_key</span><span class="o">=</span><span class="n">bucket_key</span><span class="p">,</span> <span class="n">num_steps</span><span class="o">=</span><span class="n">schedule</span><span class="o">.</span><span class="n">num_steps</span><span class="p">,</span>
+                <span class="n">schedule</span><span class="o">=</span><span class="n">schedule</span><span class="p">,</span> <span class="n">bucket_key</span><span class="o">=</span><span class="n">bucket_key</span><span class="p">,</span> <span class="n">num_steps</span><span class="o">=</span><span class="n">schedule</span><span class="o">.</span><span class="n">num_steps</span><span class="p">,</span> <span class="n">schedule_walk</span><span class="o">=</span><span class="n">graph_walk</span><span class="p">,</span>
                 <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_step_scalar_sources</span><span class="p">(</span><span class="n">schedule</span><span class="p">,</span> <span class="n">device</span><span class="p">),</span>
             <span class="p">)</span>
         <span class="n">bucket_key</span><span class="p">,</span> <span class="n">num_steps</span> <span class="o">=</span> <span class="n">state</span><span class="p">[</span><span class="s2">"bucket_key"</span><span class="p">],</span> <span class="n">state</span><span class="p">[</span><span class="s2">"num_steps"</span><span class="p">]</span>
@@ -1335,7 +1353,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Past iteration 0 a missing edge is a routing bug: raise rather than reseed."""</span>
         <span class="k">if</span> <span class="n">k</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">generator</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">)</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="n">fwd_info</span><span class="o">.</span><span class="n">random_seed</span><span class="p">)</span>
-            <span class="n">seeds</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">seed_loop_back</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">bucket_key</span><span class="p">,</span> <span class="n">generator</span><span class="p">)</span>
+            <span class="n">seeds</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">initial_loop_back</span><span class="p">(</span><span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">bucket_key</span><span class="p">,</span> <span class="n">generator</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">seed_to_device</span><span class="p">(</span><span class="n">fwd_info</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">):</span>
                 <span class="c1"># The model drew straight onto the device through a stager; staging</span>
                 <span class="c1"># again would copy a device tensor out to the host and back.</span>
