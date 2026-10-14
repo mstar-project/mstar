@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AdmitRuntimeError
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime
+from mstar.model.submodule_base import InputMetadata
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
     BatchBuilderType,
@@ -578,11 +579,17 @@ class MicroScheduler:
         self, request_state: RequestStateManager,
         node_name: str, graph_walk: str, rid: int,
     ) -> Any | None:
+        engine = self.engine_manager.get_engine(node_name)
+        if not engine.splits_by_capture_key(node_name, graph_walk):
+            return None
         fwd_info = request_state.get_fwd_info(
             rid, request_state.get_partition_for_node(node_name),
         )
-        return self.engine_manager.get_engine(node_name).capture_group(
+        # a streamed input's chunk can decide the capture (a codec's window size)
+        chunks = request_state.ingested_stream_chunks(rid, node_name)
+        return engine.capture_group(
             node_name, graph_walk, rid, fwd_info,
+            input_metadata=InputMetadata(stream_chunks=chunks) if chunks else None,
         )
 
     def backlog_splits_from(

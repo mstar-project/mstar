@@ -223,10 +223,11 @@ class SNACDecoderSubmodule(NodeSubmodule):
     ``OrpheusModelConfig.snac_chunk_policy``). The final window emits up to
     the last whole frame.
 
-    Batched: windows of one size decode in one SNAC forward. A batch that
-    mixes sizes (a ramp or flush window next to steady ones) decodes each
-    size apart, because the decoder is not causal and padding would change
-    the frames next to it.
+    Batched: windows of one size decode in one SNAC forward, and every size
+    a stream can produce has a capture. The scheduler batches each size
+    apart (``split_batches_by_capture_key``), because the decoder is not
+    causal and padding would change the frames next to it; a batch that
+    mixes sizes anyway decodes each size apart, eagerly.
     """
 
     # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
@@ -248,7 +249,13 @@ class SNACDecoderSubmodule(NodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[CudaGraphConfig]:
-        """One capture per non-final window size of the chunk schedule."""
+        """One capture per window size a stream can produce, final flushes included.
+
+        Not compiled, like the eager path (``disable_torch_compile``): the
+        captured and eager decodes of a stream then run the same kernels, and
+        max-autotune of SNAC's convolutions takes minutes per shape, for each
+        of the window sizes times batch sizes.
+        """
         del tp_world_size
         return [
             BatchedCudaGraphConfig(
@@ -263,6 +270,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
                 additional_key_info=frames,
                 capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
                 input_seq_dims={"codes_0": 0, "codes_1": 0, "codes_2": 0},
+                compile=False,
             )
             for frames in sorted(self.windows, reverse=True)
         ]
@@ -305,6 +313,10 @@ class SNACDecoderSubmodule(NodeSubmodule):
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[ARNodeInputs]) -> bool:
         return True
+
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        """A batch that mixes window sizes runs eager, so batch each size apart."""
+        return graph_walk == "snac_chunk"
 
     def cg_key_info(
         self,

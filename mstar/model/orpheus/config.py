@@ -104,15 +104,22 @@ class OrpheusModelConfig:
         )
 
     def snac_window_frames(self) -> list[int]:
-        """Frames in each non-final window of a stream, one entry per distinct size."""
-        context = self.snac_left_context_frames + self.snac_right_context_frames
-        windows, delivered = [], 0
-        for new in self.snac_chunk_schedule:
-            windows.append(min(context, delivered) + new)
-            delivered += new
-        while True:
-            window = min(context, delivered) + self.snac_chunk_frames
-            if window in windows[len(self.snac_chunk_schedule):]:
-                return sorted(set(windows))
-            windows.append(window)
-            delivered += self.snac_chunk_frames
+        """Every window size, in frames, a stream can hand the decoder.
+
+        The schedule's windows and every final flush: the policy runs over
+        each stream length until the windows repeat. The windows do not depend
+        on when tokens arrive, only on how many there are. A stream shorter
+        than a frame decodes one silent frame.
+        """
+        tpf = self.tokens_per_frame
+        steady = self.snac_left_context_frames + self.snac_right_context_frames + self.snac_chunk_frames
+        sizes = {1}
+        for frames in range(1, sum(self.snac_chunk_schedule) + 2 * steady + 1):
+            policy, left = self.snac_chunk_policy(), frames * tpf + 1  # the EOS token streams last
+            while policy.is_ready(left):
+                sizes.add(policy.window_size() // tpf)
+                stride = policy.next_chunk_size(left)
+                policy.register_chunk(stride)
+                left -= stride
+            sizes.add(left // tpf)
+        return sorted(sizes)
