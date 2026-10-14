@@ -279,13 +279,15 @@ def test_the_cap_counts_rows_the_caller_already_has():
     """The regression: continuing and fresh rids were each capped, their
     union was not, so a merged batch could pass the node's max."""
     sched = _scheduler(_Engine(max_bs=4))
+    manager = _Manager([f"r{i}" for i in range(4)])
 
-    batch = _next_batch(sched,
-        _Manager([f"r{i}" for i in range(4)]), pre_existing_batch_size=3,
-    )
+    batch = _next_batch(sched, manager, pre_existing_batch_size=3)
 
     assert len(batch) == 1, "4 cap - 3 already held = 1"
+    # No backlog was served, so the overflow parks exactly as main's scheduler
+    # did; only a step that drains a backlog hands fresh rows back.
     assert len(sched.backlog[(NODE, WALK)].request_to_worker_graph) == 3
+    assert not set(manager.queues["wg0"].get_ready_node_names())
 
 
 def test_a_full_caller_batch_schedules_nothing_and_leaves_the_queue_alone():
@@ -520,12 +522,16 @@ def test_fresh_work_does_not_evict_a_blocked_backlog_chunk():
     rids whose graph nodes are already off the ready queues."""
     sched = _scheduler(_Engine(max_bs=2, not_ready={"b0", "b1"}))
     sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
+    manager = _Manager(["f0", "f1", "f2"])
 
-    batch = _next_batch(sched, _Manager(["f0", "f1", "f2"]))
+    batch = _next_batch(sched, manager)
 
     assert set(batch.request_to_worker_graph) == {"f0", "f1"}
     held = set(sched.backlog[(NODE, WALK)].request_to_worker_graph)
-    assert held == {"b0", "b1", "f2"}, f"lost the blocked chunk: {held}"
+    assert held == {"b0", "b1"}, f"lost the blocked chunk: {held}"
+    # f2 was pushed out by the cap, not blocked, so it goes back rather than
+    # joining the parked chunk
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"f2"}
 
 
 def test_fresh_work_merges_into_an_existing_backlog_entry():
@@ -959,8 +965,10 @@ def test_fifo_puts_the_backlog_ahead_of_fresh_rows():
     ))
 
     assert list(result.scheduled.request_to_worker_graph) == ["b0", "b1", "f0"]
-    assert list(result.backlog.request_to_worker_graph) == ["f1"]
-    assert result.returned is None
+    # f1 arrived fresh and the cap pushed it out, so it is handed back to its
+    # ready queue instead of parking and keeping this key served first
+    assert result.backlog is None
+    assert list(result.returned) == ["f1"]
 
 
 # ── one builder call per step ───────────────────────────────────────────
@@ -971,11 +979,14 @@ def test_fresh_rows_join_a_short_backlog_in_one_step():
     queued: that step would run at a fraction of the batch."""
     sched = _scheduler(_Engine(max_bs=3))
     sched.backlog[(NODE, WALK)] = _batch(["b0"])
+    manager = _Manager(["f0", "f1", "f2"])
 
-    batch = _next_batch(sched, _Manager(["f0", "f1", "f2"]))
+    batch = _next_batch(sched, manager)
 
     assert list(batch.request_to_worker_graph) == ["b0", "f0", "f1"]
-    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["f2"]
+    # the backlog drains instead of refilling with f2
+    assert (NODE, WALK) not in sched.backlog
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"f2"}
 
 
 def test_a_backlogged_walk_goes_before_a_less_recent_fresh_one():
@@ -1031,14 +1042,25 @@ def test_an_input_landing_on_a_backlogged_row_does_not_ready_it_again():
     streamed input arriving for it then re-readied it, the next scan popped it
     again, and the rid ran twice."""
     sched = _scheduler(_Engine(max_bs=1))
-    manager = _Manager(["r0", "r1"])
-
-    assert list(_next_batch(sched, manager).request_to_worker_graph) == ["r0"]
+    manager = _Manager(["r0"])
+    sched.runtime = manager.runtime  # as _next_batch does, for _backlog below
+    # Parked through the real path, which claims the row like a running batch.
+    # A fresh row the cap pushes out no longer parks, so a row that genuinely
+    # waits is the case worth pinning here.
+    sched._backlog((NODE, WALK), _batch(["r1"]))
     assert ("r1", NODE) in manager.in_flight
-    manager.ingest("r1")
 
-    assert list(_next_batch(sched, manager).request_to_worker_graph) == ["r1"]
-    assert _next_batch(sched, manager) is None
+    manager.ingest("r1")
+    assert "r1" not in manager.queues["wg0"].get_ready_node_names(), \
+        "a streamed input re-readied a parked row"
+
+    ran: list[str] = []
+    for _ in range(4):
+        batch = _next_batch(sched, manager)
+        if batch is None:
+            break
+        ran.extend(batch.request_to_worker_graph)
+    assert sorted(ran) == ["r0", "r1"], f"each row must run exactly once: {ran}"
 
 
 def test_returned_rows_are_no_longer_in_flight():
@@ -1050,3 +1072,24 @@ def test_returned_rows_are_no_longer_in_flight():
     _next_batch(sched, manager)
 
     assert ("r1", NODE) not in manager.in_flight
+
+
+class _DroppingBuilder(BaseBatchBuilder):
+    """Runs the first row and loses the rest."""
+
+    def build_batch(self, request):
+        scheduled, _ = request.fresh.split_off_first(1)
+        return BatchBuildResult(scheduled)
+
+
+def test_a_builder_that_loses_a_row_is_refused():
+    """A row missing from scheduled, backlog and returned has already come off
+    its ready queue and is marked in flight, so nothing would ever schedule it
+    again -- the request would hang with no evidence of where it went."""
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.batch_builder = _DroppingBuilder()
+
+    with pytest.raises(AssertionError, match="dropped rows"):
+        _next_batch(sched, _Manager(["r0", "r1", "r2"]))
+
+

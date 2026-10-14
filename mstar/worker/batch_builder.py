@@ -107,10 +107,35 @@ class BaseBatchBuilder(ABC):
 
 class FIFOBatchBuilder(BaseBatchBuilder):
     """Backlog first, then fresh rows, in arrival order, up to the cap; one
-    capture group per step. Everything past the cap stays in the backlog."""
+    capture group per step.
+
+    Where this differs from the scheduler it replaces, and why. main had two
+    paths: with a backlog it drained that alone, never touching the ready
+    queues, so the backlog strictly shrank; with none it popped a fresh set,
+    capped it and parked the remainder. This builder always does both, which
+    is better -- a backlog one row short of the cap gets topped up instead of
+    running short -- but it means a step that drains a backlog also pops fresh
+    rows, and parking their overflow would refill the backlog from the queues
+    on every pass. It would then never drain, and since a key holding a
+    backlog is served before any other node, that node starves the rest: on
+    ``wan22.yaml`` with ``dit`` capped at 1 a fifth request's
+    ``text_encoder`` waited 48.7 s for its first step against 0.2 s on main.
+
+    So a fresh row the cap pushed out goes back to its ready queue **only on
+    a step that served a backlog**, which is the case main never created. With
+    no backlog it parks, exactly as main did, and the remainder keeps its
+    arrival order instead of being re-popped and reordered. A row held back
+    for any other reason -- OOM backoff, pending remove, a foreign capture
+    group -- always parks: it cannot run this step whoever holds it.
+    """
 
     def build_batch(self, request: BatchBuildRequest) -> BatchBuildResult:
         max_bs = request.max_batch_size
+        # both read before `_merged`, which folds `fresh` into `backlog` in place
+        had_backlog = request.backlog is not None
+        fresh_rids = (
+            set(request.fresh.request_to_worker_graph) if request.fresh else set()
+        )
         batch = _merged(request.backlog, request.fresh)
         if batch is None:
             return BatchBuildResult(None)
@@ -120,7 +145,19 @@ class FIFOBatchBuilder(BaseBatchBuilder):
             exclude_rids=request.blocked_rids, anchor=request.capture_group_of,
         )
         scheduled, remainder = batch.split_off_first(max_bs, exclude_rids=exclude)
-        return BatchBuildResult(scheduled, backlog=remainder)
+        if remainder is None:
+            return BatchBuildResult(scheduled)
+        give_back = {
+            rid for rid in remainder.request_to_worker_graph
+            if rid in fresh_rids and rid not in exclude
+        } if had_backlog else set()
+        if not give_back:
+            return BatchBuildResult(scheduled, backlog=remainder)
+        parked, returned = remainder.split_off_first(None, exclude_rids=give_back)
+        return BatchBuildResult(
+            scheduled, backlog=parked,
+            returned=dict(returned.request_to_worker_graph) if returned else None,
+        )
 
 
 class BatchBuilderType(Enum):
