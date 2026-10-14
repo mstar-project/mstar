@@ -680,10 +680,13 @@ class MicroScheduler:
         backlogged = self.backlog.pop(node_walk, None)
         blocked = set()
         if backlogged is not None:
-            # bounded by the room this step actually has, so a long backlog is
-            # not swept in full on every pass
+            # bounded by what this step could take, so a long backlog is not
+            # swept in full on every pass. Not `remaining`: that is the
+            # caller's own walk's leftover and is None when it holds no rows.
             blocked = self._unready_backlog_rids(
-                backlogged, request_state, remaining, capture_group_of,
+                backlogged, request_state,
+                self._scan_limit(node_walk, pre_existing_batch_size),
+                capture_group_of,
             )
             if not backlogged:
                 backlogged = None  # every row failed
@@ -712,6 +715,21 @@ class MicroScheduler:
             return None
         own_cap = self._walk_caps(node_walk).get(pre_existing_walk or node_walk[1])
         return None if own_cap is None else max(own_cap - pre_existing_batch_size, 0)
+
+    def _scan_limit(
+        self, node_walk: tuple[str, str], pre_existing_batch_size: int,
+    ) -> int | None:
+        """An upper bound on the rows this step can take, for bounding the
+        backlog's readiness scan.
+
+        The builder caps a mixed step at the min over the walks actually in
+        it, which nothing knows before the scan; the max over the key's caps
+        bounds that from above. None when any of them is uncapped.
+        """
+        caps = list(self._walk_caps(node_walk).values())
+        if not caps or any(cap is None for cap in caps):
+            return None
+        return max(max(caps) - pre_existing_batch_size, 0)
 
     def _capture_group(
         self, request_state: RequestStateManager,

@@ -1205,6 +1205,10 @@ pub struct RouteArg {
     /// the plain route input.
     inline_signal: Option<String>,
     inline_values: Vec<i64>,
+    /// Rows of several walks in one call: `rids[i]` ran `walks[rid_walk_idx[i]]`.
+    /// None, every row ran `graph_walk`.
+    walks: Option<Vec<String>>,
+    rid_walk_idx: Option<Vec<u32>>,
 }
 
 /// An item of a mapping that may be missing or None.
@@ -1232,6 +1236,8 @@ impl<'py> FromPyObject<'py> for RouteArg {
             num_tensors: r.num_tensors,
             inline_signal: optional_item(ob, "inline_signal")?,
             inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
+            walks: r.walks,
+            rid_walk_idx: r.rid_walk_idx,
         })
     }
 }
