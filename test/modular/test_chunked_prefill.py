@@ -8,7 +8,7 @@ sys.path.insert(0, ".")
 
 import torch
 
-from mstar.worker.batch_builder import fill_token_budget
+from mstar.worker.batch_builder import BudgetSplit, fill_token_budget
 from mstar.worker.chunk_outputs import ChunkOutputAccumulator
 
 # ── the token budget ────────────────────────────────────────────────────
@@ -37,6 +37,51 @@ def test_the_head_runs_over_budget_rather_than_nothing():
     take, dropped = fill_token_budget(["p0"], {"p0": 100}, set(), 10)
     assert take == {"p0": 100}
     assert not dropped
+
+
+def test_fit_first_gives_the_leftover_to_the_prompt_partway_through():
+    take, dropped = fill_token_budget(
+        ["d0", "fresh", "short", "d1", "partway"],
+        {"d0": 1, "fresh": 900, "short": 100, "d1": 1, "partway": 700},
+        {"fresh", "short", "partway"}, 512, BudgetSplit.FIT_FIRST, {"partway"},
+    )
+    assert take == {"d0": 1, "d1": 1, "short": 100, "partway": 410}
+    assert dropped == {"fresh"}, "a fresh prompt took the leftover from the one already started"
+
+
+def test_fit_first_runs_a_prompt_that_fits_while_another_is_partway_through():
+    """The prompt partway through is not among the step's rows."""
+    take, dropped = fill_token_budget(
+        ["d0", "short", "long"], {"d0": 1, "short": 100, "long": 3000},
+        {"short", "long"}, 1024, BudgetSplit.FIT_FIRST, {"partway"},
+    )
+    assert dropped == {"long"}, "a second prompt was cut while one is partway through"
+    assert take == {"d0": 1, "short": 100}, "the short prompt waited for the one partway through"
+
+
+def test_fit_first_starts_one_prompt_and_the_later_ones_sit_out():
+    take, dropped = fill_token_budget(
+        ["d0", "a", "b"], {"d0": 1, "a": 3000, "b": 3000}, {"a", "b"}, 1024, BudgetSplit.FIT_FIRST,
+    )
+    assert take == {"d0": 1, "a": 1023}
+    assert dropped == {"b"}, "two prompts were started in one step"
+
+
+def test_arrival_keeps_a_short_prompt_behind_an_earlier_long_one():
+    take, dropped = fill_token_budget(
+        ["long", "short"], {"long": 3000, "short": 100}, {"long", "short"}, 1024, BudgetSplit.ARRIVAL,
+    )
+    assert take == {"long": 1024}
+    assert dropped == {"short"}, "the short prompt ran ahead of the one that arrived first"
+
+
+def test_a_prompt_behind_decodes_that_fill_the_budget_still_runs_128_tokens():
+    decodes = [f"d{i}" for i in range(16)]
+    tokens = {**dict.fromkeys(decodes, 1), "p0": 1000}
+    for split in (BudgetSplit.FIT_FIRST, BudgetSplit.ARRIVAL):
+        take, dropped = fill_token_budget([*decodes, "p0"], tokens, {"p0"}, 16, split)
+        assert not dropped
+        assert take["p0"] == 128, f"{split.value} cut the prompt to what the decodes left"
 
 
 # ── output accumulation ─────────────────────────────────────────────────
@@ -354,6 +399,85 @@ def test_a_budget_the_model_does_not_set_is_refused():
         engine.set_token_budgets({"LLM": {"prefil": 8}}, {"prefill"})
     with pytest.raises(ValueError, match="positive int"):
         engine.set_token_budgets({"LLM": 0}, {"prefill"})
+
+
+def test_an_unknown_budget_split_fails_at_load():
+    import pytest
+
+    from mstar.worker.engine_manager import _budget_split
+
+    with pytest.raises(ValueError, match="budget_split 'fastest' is not one of"):
+        _budget_split({"budget_split": "fastest"})
+
+
+# ── worker: a row whose next chunk is already scheduled ───────────────
+
+
+def _settling_worker(progress):
+    """A worker stub, its real scheduler holding ``progress`` for rid 0, and the list of rids pushed back."""
+    from types import SimpleNamespace
+
+    from mstar.worker.micro_scheduler import MicroScheduler
+
+    sched = MicroScheduler(engine_manager=None)
+    sched.chunk_progress[(0, "LLM")] = progress
+    pushed = []
+    worker = SimpleNamespace(
+        _partial_stream_edges=frozenset(),
+        scheduler=sched,
+        engine_manager=SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+            chunked_prefill_output_policies=lambda node, walk: {},
+        )),
+        _graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, wgs: pushed.extend(rids)),
+    )
+    return worker, sched, pushed
+
+
+def _step(chunk):
+    """A step running ``chunk`` of rid 0, with more of the row to come."""
+    from types import SimpleNamespace
+
+    from mstar.worker.micro_scheduler import ScheduledBatch
+
+    batch = ScheduledBatch(node_name="LLM", graph_walk="prefill", request_to_worker_graph={0: 0})
+    batch.chunk_ranges = {0: chunk}
+    batch.incomplete_node_rids = {0}
+    node_batch = SimpleNamespace(request_ids=[0], per_request_info={0: None})
+    return SimpleNamespace(batch=batch, node_name="LLM", node_batch=node_batch)
+
+
+def _land(worker, step):
+    from mstar.model.submodule_base import BatchedModelOutput
+    from mstar.worker.worker import Worker
+
+    Worker._settle_chunks(worker, step, BatchedModelOutput(per_rid_outputs={0: {}}))
+
+
+def test_a_row_that_continued_is_not_pushed_back_when_its_chunk_lands():
+    from mstar.worker.micro_scheduler import ChunkProgress
+
+    worker, sched, pushed = _settling_worker(ChunkProgress(done=0, scheduled=8, total=10))
+
+    _land(worker, _step((0, 4)))
+
+    assert sched.chunk_progress[(0, "LLM")].done == 4, "the chunk that landed was not counted"
+    assert not pushed, "on its queue while its next chunk is in flight, the row would be scheduled twice"
+
+
+def test_a_refused_speculative_step_puts_the_row_back_once():
+    from mstar.worker.micro_scheduler import ChunkProgress
+    from mstar.worker.worker import Worker
+
+    worker, sched, pushed = _settling_worker(ChunkProgress(done=0, scheduled=8, total=10))
+    _land(worker, _step((0, 4)))
+
+    # the step running [4, 8) is refused at admit
+    refused = _step((4, 8)).batch
+    sched.rewind_chunks(refused)
+    Worker._push_back_batch(worker, refused)
+
+    assert pushed == [0], "the row was pushed back for the landed chunk as well as the refused step"
+    assert sched.chunk_progress[(0, "LLM")] == ChunkProgress(4, 4, 10), "the refused chunk has to run again"
 
 
 # ── sampler: a non-final chunk's token is not kept ────────────────────

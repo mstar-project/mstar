@@ -164,6 +164,31 @@ def test_allocation_failure_still_evicts():
     assert sorted(worker.held) == ["r0", "r1"]
 
 
+class _StoppedLoopRuntime(_Runtime):
+    def __init__(self, stopped):
+        super().__init__()
+        self.stopped = stopped
+
+    def pending_loop_stop_rids(self, graph_walks, loop_name):
+        assert (graph_walks, loop_name) == (["walk"], "loop")
+        return set(self.stopped)
+
+
+@pytest.mark.parametrize("new_iter", [True, False])
+def test_a_refused_new_iteration_does_not_push_back_a_row_whose_loop_stopped(new_iter):
+    """A row on its last token rides speculative N+1; N's postprocess stops its
+    loop and empties its node. Pushed back, it popped with no inputs."""
+    worker = _FakeWorker()
+    worker._graph_runtime = _StoppedLoopRuntime({"r1"})
+    batch, node_batch = _batches(_alloc_failed())
+    pending = SimpleNamespace(batch=batch, speculative_new_iter=new_iter, loop_name="loop")
+
+    Worker._drop_rows_whose_loop_stopped(worker, pending)
+    worker._handle_admit_failure(batch, node_batch)
+
+    assert sorted(worker.queue.pushed_back) == (["r0"] if new_iter else ["r0", "r1"])
+
+
 class _HoldingWorker:
     """Binds the real allocation handler onto a worker with nothing to evict."""
 

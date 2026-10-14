@@ -234,8 +234,8 @@ frees only the device pages no other running request reads, though, so a request
 shares most of its prompt frees little. Offload helps a pool that runs short now and then.
 It doesn't replace the cap.
 
-**Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
-budget per step, and a longer prompt is split across steps. Each model sets its own
+**Chunked prefill budgets.** A walk that supports chunked prefill has a token budget per
+step, and a longer prompt is split across steps. Each model sets its own
 budgets. A deployment can override them per node, either with one budget for every walk
 the model budgets or with a budget per walk:
 
@@ -249,6 +249,14 @@ the model budgets or with a budget per walk:
 
 Loading fails if a node is not in any node group, if a walk is one the model never runs, or
 if the model sets no budget for that walk.
+
+``budget_split`` sets how a step's budget is shared among its rows. ``max_min``, the default,
+gives every row an equal share. ``fit_first`` runs every row that fits whole and gives what is
+left to one longer prompt, and ``arrival`` serves prompts in the order they arrived. Under
+``fit_first`` and ``arrival`` only one prompt of a node is partway through its prefill at a time.
+Until it finishes, ``fit_first`` starts only prompts that fit whole and ``arrival`` starts none.
+Under both, a chunk is at least 128 tokens, which can take a step over its budget. Loading fails
+on any other value.
 
 **Single GPU.** Everything on rank 0:
 

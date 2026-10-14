@@ -39,9 +39,10 @@ from mstar.worker.batch_builder import (
     BaseBatchBuilder,
     BatchBuildRequest,
     BatchBuildResult,
+    BudgetSplit,
     FIFOBatchBuilder,
 )
-from mstar.worker.micro_scheduler import ChunkProgress, MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import ChunkProgress, MicroScheduler, ReadyNodeEntry, ScheduledBatch
 
 
 def _edge_block(rids) -> ColumnarEdgeSpecs:
@@ -212,6 +213,8 @@ class _Manager:
 
 
 class _Engine:
+    budget_split = None
+
     def __init__(
         self, max_bs=None, not_ready=frozenset(), unservable=frozenset(),
         groups=None,
@@ -1215,6 +1218,23 @@ def test_a_merge_counts_the_continuing_rows_walk():
     assert sched.room_for_continuing((NODE, WALK)) == 3
 
 
+def test_a_merge_at_its_walks_cap_parks_another_walks_rows():
+    """Continuing decode rows at the decode cap: the chain never yields for a
+    prompt of the same combined walk, so the merge parks it, and the next
+    merge's room leaves it a place."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}))
+    manager = _Manager(["p0", "d9"], walks={"p0": "prefill"})
+
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=8,
+    )
+
+    assert merged is None
+    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p0"]
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"d9"}
+    assert sched.room_for_continuing((NODE, WALK)) == 7
+
+
 
 def test_a_relabelled_step_routes_with_its_own_walks_outputs():
     """The merged batch keeps its first walk's output names; a step that turns
@@ -1347,7 +1367,7 @@ def test_a_chunked_row_starts_past_its_cached_prefix():
     first = _next_batch(sched, manager)
 
     assert first.chunk_ranges == {"p0": (4, 6)}
-    assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(4, 10)
+    assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(4, 6, 10)
     assert not sched.cached_prefix
 
 
@@ -1365,6 +1385,50 @@ def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
     )
 
     assert merged.chunk_ranges == {"p0": chunk}
+
+
+def test_a_row_mid_prefill_takes_its_next_chunk_while_the_last_is_in_flight():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+    first = _next_batch(sched, manager)
+    assert first.chunk_ranges == {"p0": (0, 2)}
+
+    # the speculation merge for the two decode rows; nothing is on the queues
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=2,
+        pre_existing_seq_lens=[1, 1], mid_prefill=[ReadyNodeEntry("p0", "wg0", "prefill")],
+    )
+
+    assert merged.chunk_ranges == {"p0": (2, 4)}, "the next chunk starts where the one in flight ends"
+    assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(0, 4, 10)
+    assert not manager.queues["wg0"].get_ready_node_names(), "a row whose chunk is in flight was put back on its queue"
+
+
+class _LongPrompts(_ChunkingEngine):
+    """Splits by ``fit_first``. Every prompt is 300 tokens, more than one 128-token chunk."""
+
+    budget_split = BudgetSplit.FIT_FIRST
+
+    def input_sequence_len(self, node_name, graph_walk, request_info, inputs, rid=None):
+        del node_name, request_info, inputs, rid
+        return InputSeqLenInfo(300 if graph_walk == "prefill" else 1)
+
+
+def test_fit_first_cuts_no_second_prompt_while_one_is_partway_through():
+    sched = _combined_scheduler(_LongPrompts(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+    manager.queues["wg0"]._ready.pop("p1")
+    first = _next_batch(sched, manager)
+    assert first.chunk_ranges == {"p0": (0, 128)}
+
+    # p1 arrives while p0's chunk is in flight
+    manager.queues["wg0"]._ready["p1"] = {NODE}
+
+    assert _next_batch(sched, manager) is None, "a second prompt was cut beside the one partway through"
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"p1"}
+    assert ("p1", NODE) not in sched.chunk_progress, "p1 started while p0 is partway through"
 
 
 def test_a_follower_runs_the_leaders_chunks():
