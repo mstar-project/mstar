@@ -951,7 +951,7 @@ class LLMSubmodule(ARNodeSubmodule):
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList, **kwargs,
     ) -> InputSeqLenInfo | None:
-        if graph_walk == "prefill_text":
+        if graph_walk == "prefill_text" and "text_inputs" in inputs:
             return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
         if graph_walk == "decode":
             return InputSeqLenInfo(1)
