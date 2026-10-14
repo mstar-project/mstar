@@ -47,7 +47,9 @@ def parse_ndjson_line(line: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     if "error" in msg:
-        raise RuntimeError(f"Server stream failed: {msg['error']}")
+        status = msg.get("status")
+        status_suffix = f" (status {status})" if status is not None else ""
+        raise RuntimeError(f"Server stream failed{status_suffix}: {msg['error']}")
     data = msg.get("data")
     return {
         "modality": msg.get("modality"),

@@ -562,23 +562,31 @@ async fn audio_speech(
     }
 
     if req.stream.unwrap_or(false) {
-        // Open-ended WAV: streaming header, then PCM16 frames as they arrive.
-        // A backend error ends the byte stream (the connection closes
-        // mid-WAV, matching mstar's generator exception).
-        let header = media::wav_stream_header(st.sample_rate, 1);
-        let base = result_stream(&st, &args, &request_id, true);
-        let audio_only = base.filter_map(|item| async move {
+        // Look at the first item before committing to a 200, as the Python
+        // frontend does: a refused request (bad voice, bad knob) gets its status.
+        let mut base = result_stream(&st, &args, &request_id, true);
+        let first = match base.next().await {
+            Some(Out::Error { status, message }) => {
+                return error(status, &message, error_type(status))
+            }
+            first => first,
+        };
+        // Open-ended WAV (a streaming header, then PCM16 frames), or bare PCM.
+        // A later error aborts the body: the status is already sent, and a
+        // cleanly ended stream would pass for a complete answer.
+        let audio = futures::stream::iter(first).chain(base).filter_map(|item| async move {
             match item {
                 Out::Chunk(c) if c.modality == "audio" && !c.data.is_empty() => {
-                    Some(Ok::<Bytes, Infallible>(Bytes::from(c.data)))
+                    Some(Ok(Bytes::from(c.data)))
                 }
-                _ => None,
+                Out::Chunk(_) => None,
+                Out::Error { message, .. } => Some(Err(std::io::Error::other(message))),
             }
         });
-        let body = futures::stream::once(async move { Ok::<Bytes, Infallible>(Bytes::from(header)) })
-            .chain(audio_only);
+        let header = (fmt == "wav").then(|| Ok(Bytes::from(media::wav_stream_header(st.sample_rate, 1))));
+        let body = futures::stream::iter(header).chain(audio);
         return Response::builder()
-            .header("content-type", "audio/wav")
+            .header("content-type", if fmt == "wav" { "audio/wav" } else { "audio/pcm" })
             .header("cache-control", "no-cache")
             .body(Body::from_stream(body))
             .unwrap();
@@ -623,7 +631,10 @@ async fn images_generations(
     // matching serving_images.create_images. Seeded requests follow the seed
     // contract — image i uses seed + i (i > 0), so image 0 is bit-identical to
     // the same request with n=1; unseeded requests draw independent seeds.
-    let n = req.n.unwrap_or(1).max(1);
+    let n = req.n.unwrap_or(1);
+    if n < 1 {
+        return error(400, &format!("n must be at least 1; got {n}"), "invalid_request_error");
+    }
     let seed = base.model_kwargs.get("seed").and_then(Value::as_i64);
     let futs = (0..n).map(|i| {
         let mut args = base.clone();
@@ -679,7 +690,8 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     };
     // Multipart (image file + prompt + passthrough fields), parsed manually so
     // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
-    let known = ["image", "prompt", "model", "n", "size", "response_format"];
+    // `size` is kept: the adapter maps "WxH" onto the model's width / height
+    let known = ["image", "prompt", "model", "n", "response_format"];
     let mut image_bytes: Option<Vec<u8>> = None;
     let mut image_filename: Option<String> = None;
     let mut prompt = String::new();
@@ -996,12 +1008,20 @@ async fn generate_finish(
 
     schedule_upload_cleanup(&st.upload_dir, &args);
     if streaming {
-        let base = result_stream(&st, &args, &request_id, true);
-        let body = base.map(|item| {
+        let mut base = result_stream(&st, &args, &request_id, true);
+        // Wait for the first item, as the Python frontend's open_result_stream
+        // does: a refused request gets its real status, not a 200. A client
+        // that leaves meanwhile drops this future, and the stream's guard aborts.
+        let first = match base.next().await {
+            Some(Out::Error { status, message }) => return detail_error(status, &message),
+            first => first,
+        };
+        let body = futures::stream::iter(first).chain(base).map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),
-                Out::Error { message, .. } => {
-                    let mut s = json!({"error": message}).to_string();
+                // after the 200 is committed the status travels in-band
+                Out::Error { status, message } => {
+                    let mut s = json!({"error": message, "status": status}).to_string();
                     s.push('\n');
                     s.into_bytes()
                 }

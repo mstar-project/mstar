@@ -471,6 +471,14 @@ def test_image_routes_report_validation_errors_as_400(client_and_stub):
     )
     assert resp.status_code == 400
 
+def test_images_n_below_one_is_400(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.submit_request = lambda **kw: pytest.fail("a refused n must not be submitted")
+    resp = client.post("/v1/images/generations", json={"model": "bagel", "prompt": "a cat", "n": 0})
+    assert resp.status_code == 400 and "n must be at least 1" in resp.json()["error"]["message"]
+
+
 def test_audio_voices_lists_model_voices(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "orpheus"

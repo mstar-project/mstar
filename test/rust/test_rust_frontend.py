@@ -127,12 +127,12 @@ def test_chat_roundtrip(stack):
     assert sub["out"] == ["text"]
 
 
-def _post_raw(port, path, raw_bytes, timeout=15):
-    """POST a raw body (possibly malformed) as application/json; return
-    (status, parsed_json_or_None)."""
+def _post_raw(port, path, raw_bytes, content_type="application/json", timeout=15):
+    """POST a raw body (possibly malformed), application/json by default;
+    return (status, parsed_json_or_None)."""
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}", data=raw_bytes,
-        headers={"Content-Type": "application/json"})
+        headers={"Content-Type": content_type})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read())
@@ -484,3 +484,133 @@ def test_images_generations_on_cosmos3():
         assert len(stub.submitted) == 2
         assert len(out["data"]) == 2
         assert base64.b64decode(out["data"][0]["b64_json"]) == b"\x89PNG\r\n\x1a\nFAKE"
+
+
+def _generate_stream(port, timeout=15):
+    import urllib.parse
+    data = urllib.parse.urlencode(
+        {"text": "hi", "output_modalities": "text", "streaming": "true"}).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate", data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, [json.loads(line) for line in r.read().splitlines() if line]
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_refused_streaming_generate_gets_its_status_not_a_200():
+    """A request refused before its first chunk answers with its status, as
+    the Python frontend's open_result_stream does."""
+    with _model_stack("qwen3_omni", _ErrorChunkStub(400)) as (port, _up):
+        code, body = _generate_stream(port)
+    assert code == 400, (code, body)
+    assert "boom" in body["detail"]
+
+
+class _FailsMidStreamStub(_StubAPIServer):
+    async def iter_result_chunks(self, request_id):
+        yield _Chunk("text", b"Hello ")
+        yield _Chunk("error", b"Error in worker: boom", {"status": 503})
+
+
+def test_streaming_generate_carries_a_late_errors_status_in_band():
+    with _model_stack("qwen3_omni", _FailsMidStreamStub()) as (port, _up):
+        code, lines = _generate_stream(port)
+    assert code == 200
+    assert lines[0]["modality"] == "text"
+    assert lines[-1] == {"error": "Error in worker: boom", "status": 503}
+
+
+def test_bagel_images_map_size_onto_width_and_height():
+    """Generations and edits both, as the Python BagelAdapter."""
+    stub = _ImageStubAPIServer()
+    with _model_stack("bagel", stub) as (port, _up):
+        _post_json(port, "/v1/images/generations",
+                   {"model": "bagel", "prompt": "a cat", "size": "512x768"})
+        boundary = "mstarboundary"
+        fields = {"prompt": "make it neon", "size": "640x480"}
+        data = (
+            "".join(f'--{boundary}\r\nContent-Disposition: form-data; '
+                    f'name="{k}"\r\n\r\n{v}\r\n' for k, v in fields.items())
+            + f'--{boundary}\r\nContent-Disposition: form-data; name="image"; '
+              'filename="in.png"\r\nContent-Type: image/png\r\n\r\n'
+        ).encode() + b"\x89PNGinput\r\n" + f"--{boundary}--\r\n".encode()
+        code, _ = _post_raw(port, "/v1/images/edits", data,
+                            f"multipart/form-data; boundary={boundary}")
+        assert code == 200
+        code, body = _post_raw(port, "/v1/images/generations", json.dumps(
+            {"model": "bagel", "prompt": "a cat", "size": "big"}).encode())
+        assert code == 400 and "WxH" in body["error"]["message"]
+    gen, edit = stub.submitted
+    assert (gen["mk"]["width"], gen["mk"]["height"]) == (512, 768)
+    assert (edit["mk"]["width"], edit["mk"]["height"]) == (640, 480)
+    assert "size" not in gen["mk"] and "size" not in edit["mk"]
+
+
+def test_images_n_below_one_is_400():
+    stub = _ImageStubAPIServer()
+    with _model_stack("cosmos3", stub) as (port, _up):
+        code, body = _post_raw(port, "/v1/images/generations", json.dumps(
+            {"model": "cosmos3", "prompt": "x", "n": 0}).encode())
+    assert code == 400 and "n must be at least 1" in body["error"]["message"]
+    assert not stub.submitted
+
+
+class _AudioStub(_StubAPIServer):
+    """Two PCM pieces, then optionally a late failure."""
+
+    def __init__(self, fail_after=False):
+        super().__init__()
+        self.fail_after = fail_after
+
+    async def iter_result_chunks(self, request_id):
+        yield _Chunk("audio", b"\x01\x00" * 4)
+        yield _Chunk("audio", b"\x02\x00" * 4)
+        if self.fail_after:
+            yield _Chunk("error", b"Error in worker: boom", {"status": 500})
+
+
+def _speech_stream(port, fmt="wav", timeout=15):
+    """(status, content_type, body) of a streaming /v1/audio/speech request."""
+    body = {"model": "orpheus", "input": "hi", "voice": "tara",
+            "stream": True, "response_format": fmt}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/audio/speech", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.headers["Content-Type"], r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers["Content-Type"], json.loads(e.read())
+
+
+def test_refused_streaming_speech_gets_its_status_not_a_200():
+    with _model_stack("orpheus", _ErrorChunkStub(400)) as (port, _up):
+        code, _ctype, body = _speech_stream(port)
+    assert code == 400, (code, body)
+    assert "boom" in body["error"]["message"]
+    assert body["error"]["type"] == "invalid_request_error"
+
+
+def test_streaming_speech_wav_and_pcm():
+    pcm = b"\x01\x00" * 4 + b"\x02\x00" * 4
+    with _model_stack("orpheus", _AudioStub()) as (port, _up):
+        code, ctype, wav = _speech_stream(port, "wav")
+        assert (code, ctype) == (200, "audio/wav")
+        assert wav[:4] == b"RIFF" and wav.endswith(pcm) and len(wav) == 44 + len(pcm)
+        # pcm is the bare samples, as the Python frontend serves it
+        code, ctype, raw = _speech_stream(port, "pcm")
+        assert (code, ctype, raw) == (200, "audio/pcm", pcm)
+
+
+def test_streaming_speech_aborts_the_body_on_a_late_error():
+    """A cleanly ended stream would pass for a complete answer, so the read
+    must fail: a truncated body, or a dropped connection when the error lands
+    before the headers are flushed (both are http.client.HTTPException)."""
+    import http.client
+
+    with _model_stack("orpheus", _AudioStub(fail_after=True)) as (port, _up):
+        with pytest.raises(http.client.HTTPException):
+            _speech_stream(port)

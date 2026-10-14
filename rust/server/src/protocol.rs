@@ -185,7 +185,6 @@ pub struct ImageGenerationRequest {
     /// OpenAI `n`: number of images to generate (submitted as n engine requests).
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub n: Option<i64>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub size: Option<String>,
     #[allow(dead_code)]
