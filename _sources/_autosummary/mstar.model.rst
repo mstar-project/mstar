@@ -36,6 +36,7 @@
    kokoro
    loader
    multimodal
+   nemotron_duplex
    omnivoice
    orpheus
    pi05
