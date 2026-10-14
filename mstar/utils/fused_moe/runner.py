@@ -14,10 +14,16 @@ import triton.language as tl
 from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import (
     act_and_mul_triton,
-    get_default_config,
+    get_config,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
 )
+
+
+def moe_block_m(num_tokens: int, w1: torch.Tensor, top_k: int) -> int:
+    """``BLOCK_SIZE_M`` that :func:`fused_experts` aligns to for this batch."""
+    experts, two_inter, hidden = w1.shape
+    return get_config(M=num_tokens, E=experts, N=two_inter, K=hidden, top_k=top_k)[0]["BLOCK_SIZE_M"]
 
 
 def _tl_compute_type(dtype: torch.dtype) -> tl.dtype:
@@ -36,6 +42,7 @@ def fused_experts(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     reduce_results: bool = True,
+    alignment: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -64,6 +71,10 @@ def fused_experts(
         ``(tokens, hidden)``. If False, skip the sum-reduce and return
         ``(tokens, top_k, hidden)`` — the caller is responsible for the
         reduce (e.g. after an all-reduce for TP).
+    alignment : tuple of torch.Tensor, optional
+        Precomputed ``(sorted_token_ids, expert_ids, num_tokens_post_padded)``
+        for ``topk_ids`` in the ``moe_align_block_size`` layout, aligned to
+        :func:`moe_block_m` for this shape. Computed here when omitted.
 
     Returns
     -------
@@ -90,11 +101,13 @@ def fused_experts(
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
 
-    config = get_default_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
+    config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)
+    if alignment is None:
+        alignment = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = alignment
 
     # 2. Scratch buffers (all sized from static inputs -- no data-dependent shapes).
     m_topk = num_tokens * top_k
@@ -147,7 +160,7 @@ def fused_experts(
         num_tokens_post_padded=num_tokens_post_padded,
         mul_routed_weight=True,
         top_k=1,
-        config=config,
+        config=down_config,
         compute_type=compute_type,
     )
 
