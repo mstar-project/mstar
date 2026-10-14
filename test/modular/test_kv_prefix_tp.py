@@ -37,7 +37,9 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
+from mstar.worker import worker as worker_mod  # noqa: E402
+from mstar.worker.micro_scheduler import MicroScheduler, TPDivergence  # noqa: E402
+from mstar.worker.worker import Worker  # noqa: E402
 
 PAGE_SIZE = 16
 ROOT = b"a root"
@@ -357,9 +359,8 @@ def test_rank_0s_hits_cross_the_wire():
     assert ScheduleTPNode("LLM", "decode", ["r1"]).prefix_hits == {}
 
 
-def test_a_diverged_hit_fails_its_requests_once():
-    """A follower that cannot take rank 0's hit never will: the head goes and its
-    requests fail, so the error surfaces once rather than at every poll."""
+def _diverged_scheduler():
+    """A follower's scheduler whose front head carries a hit this rank cannot take."""
     def adopt(node, walk, hits):
         raise RuntimeError("KV kv: prefix index diverged from rank 0")
 
@@ -372,14 +373,51 @@ def test_a_diverged_hit_fails_its_requests_once():
         NODE, WALK, ["r1", "r2"], spec_seq=3,
         prefix_hits={"r1": PrefixHit(tokens=64, pages={"kv": [5]})},
     ))
+    return sched
 
-    with pytest.raises(RuntimeError, match="diverged"):
-        sched.settle_tp_follow_delta()
-    assert sched.peek_tp_follow() is None
-    errors = sched.take_admit_errors()
-    assert set(errors) == {"r1", "r2"} and "diverged" in errors["r1"]
-    assert sched.failed_rids == {"r1", "r2"}
-    assert sched.settle_tp_follow_delta() is True
+
+def test_a_diverged_hit_is_not_a_step_error():
+    """The other ranks already run the step this rank cannot build, so failing its
+    requests leaves them in its collective: no step-error handler may catch it."""
+    with pytest.raises(TPDivergence, match="diverged"):
+        _diverged_scheduler().settle_tp_follow_delta()
+    assert not issubclass(TPDivergence, Exception)
+
+
+class _Stop(BaseException):
+    """Ends ``run`` when nothing else does."""
+
+
+def test_a_follower_whose_hit_diverged_exits(monkeypatch):
+    """``Worker.run`` on a follower leaves on the divergence rather than serving on."""
+    monkeypatch.setattr(worker_mod, "gc", SimpleNamespace(
+        collect=lambda: None, freeze=lambda: None, get_freeze_count=lambda: 0,
+    ))
+    w = Worker.__new__(Worker)
+    w.worker_id = "w1"
+    w.scheduler = _diverged_scheduler()
+    w.request_state = SimpleNamespace()
+    w.enable_nvtx, w._phase_period, w._phase_buf = False, 0, {}
+    w._in_flight_rids = set()
+    w.parallel_groups = SimpleNamespace(barrier_all=lambda: None, restore_default_timeout=lambda: None)
+    w.engine_manager = SimpleNamespace(warmup_all=lambda: None)
+    w.communicator = SimpleNamespace(send=lambda *a, **k: None, wait_for_work=lambda *a: None)
+    passes = iter(range(3))
+
+    def _messages():
+        if next(passes) == 2:
+            raise _Stop
+
+    w._process_messages = _messages
+    for name in (
+        "_verify_tp_async_sched_agrees", "_init_engine_thread", "_await_admit_settled",
+        "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
+        "_apply_removes_whose_step_landed", "_check_ready_tensors", "_poll_stream_buffers",
+        "_handle_main_loop_error",
+    ):
+        setattr(w, name, lambda *a, **k: None)
+    with pytest.raises(TPDivergence):
+        w.run()
 
 
 def test_rank_0s_hit_is_plain_ints_whatever_a_resource_answers():

@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 REMOVED_RID = -1
 
 
+class TPDivergence(BaseException):
+    """A follower can't take rank 0's step; not an Exception, so the worker exits."""
+
+
 @dataclass
 class ReadyNodeEntry:
     """A ready node entry for a single request."""
@@ -333,14 +337,9 @@ class MicroScheduler:
         try:
             return engine.adopt_cached_prefix(head.node_name, head.graph_walk, head.prefix_hits)
         except RuntimeError as exc:
-            # a divergence never heals: drop the head and fail its requests (as
-            # `_check_ready` does a terminal admit error), so it raises once
-            rids = {rid for rid in self.tp_rids(head) if rid != REMOVED_RID}
-            self.pop_tp_follow_head()
-            for rid in rids:
-                self.admit_errors[rid] = f"TP ranks diverged: {exc}"
-            self.fail_rids(rids)
-            raise
+            # a divergence never heals, and the other ranks already run this step:
+            # failing its requests here leaves them in its collective for good
+            raise TPDivergence(f"TP ranks diverged: {exc}") from exc
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
