@@ -943,11 +943,13 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">                                 prefill.</span>
 <span class="sd">  Cosmos3VAEDecoderSubmodule  -- Wan VAE decode (STATELESS): final latents to</span>
 <span class="sd">                                 pixels.</span>
-<span class="sd">  Cosmos3VAEDecoderARSubmodule -- streaming Wan VAE decode (STATELESS) for</span>
+<span class="sd">  Cosmos3VAEDecoderARSubmodule -- streaming Wan VAE decode (per-request</span>
+<span class="sd">                                 decoder cache; no engine resource) for</span>
 <span class="sd">                                 windowed AR video: one committed window's</span>
-<span class="sd">                                 latents per stream chunk, decoded behind</span>
-<span class="sd">                                 re-decoded context and emitted per window or</span>
-<span class="sd">                                 assembled.</span>
+<span class="sd">                                 latents per stream chunk, decoded from the</span>
+<span class="sd">                                 stream's warm decoder cache (behind</span>
+<span class="sd">                                 re-decoded context where it has none) and</span>
+<span class="sd">                                 emitted per window or assembled.</span>
 <span class="sd">  Cosmos3VisionEncoderSubmodule -- Edge reasoner vision tower (STATELESS):</span>
 <span class="sd">                                 packed image/video patches to text-space</span>
 <span class="sd">                                 tokens for the reasoner prefill.</span>
@@ -3592,6 +3594,14 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_wan_vae</span><span class="p">():</span>
+    <span class="c1"># The Wan VAE helpers import diffusers, an optional dependency; only the</span>
+    <span class="c1"># decode paths load them, so this module imports without it.</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components</span><span class="w"> </span><span class="kn">import</span> <span class="n">wan_vae</span>
+
+    <span class="k">return</span> <span class="n">wan_vae</span>
+
+
 <div class="viewcode-block" id="Cosmos3VAEDecoderSubmodule">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3VAEDecoderSubmodule</span><span class="p">(</span><span class="n">NodeSubmodule</span><span class="p">):</span>
@@ -3610,6 +3620,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">vae</span> <span class="o">=</span> <span class="n">vae</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_decode_dtype_cached</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_channels_last</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="c1"># The decode is 3D-conv bound, one-shot per request at request-specific</span>
         <span class="c1"># shapes, and not graph-captured; torch.compile fuses its pointwise</span>
         <span class="c1"># epilogues (~20-30% off the 189-frame video decode, neutral for</span>
@@ -3653,8 +3664,8 @@ window.runMermaid = runMermaid;</script>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_decode_dtype_cached</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">backends</span><span class="o">.</span><span class="n">cudnn</span><span class="o">.</span><span class="n">version</span><span class="p">())</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_dtype_cached</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_decode_pixels</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">latents</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Latents -&gt; uint8 pixel frames ``[1, 3, T, H, W]``."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_vae_input</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">latents</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""DiT latents -&gt; the VAE's raw latents ``z``, in the decode dtype."""</span>
         <span class="n">vae</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vae</span>
         <span class="n">vae_dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_dtype</span><span class="p">()</span>
         <span class="k">if</span> <span class="nb">next</span><span class="p">(</span><span class="n">vae</span><span class="o">.</span><span class="n">parameters</span><span class="p">())</span><span class="o">.</span><span class="n">dtype</span> <span class="o">!=</span> <span class="n">vae_dtype</span><span class="p">:</span>
@@ -3668,6 +3679,23 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># conv3d fails ("Input type (float) and bias type (BFloat16)"). No-op</span>
         <span class="c1"># on the fp32-decode path.</span>
         <span class="n">z</span> <span class="o">=</span> <span class="p">(</span><span class="n">latents</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">vae_dtype</span><span class="p">)</span> <span class="o">/</span> <span class="n">inv_std</span> <span class="o">+</span> <span class="n">mean</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">vae_dtype</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_channels_last</span><span class="p">:</span>
+            <span class="c1"># Also the layout the compiled decode's warm-up traces with.</span>
+            <span class="n">z</span> <span class="o">=</span> <span class="n">z</span><span class="o">.</span><span class="n">contiguous</span><span class="p">(</span><span class="n">memory_format</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">channels_last_3d</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">z</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_to_uint8</span><span class="p">(</span><span class="n">decoded</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="c1"># Quantize to 8-bit here (the output is an 8-bit image/mp4 either way) so</span>
+        <span class="c1"># only the uint8 frames cross the SHM edge to the data worker, not a 4x</span>
+        <span class="c1"># larger fp32 tensor — the decoded video transfer dominates the fixed cost</span>
+        <span class="c1"># at higher resolutions. Contiguous whatever layout the decoder ended in.</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">decoded</span> <span class="o">/</span> <span class="mi">2</span> <span class="o">+</span> <span class="mf">0.5</span><span class="p">)</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">mul</span><span class="p">(</span><span class="mi">255</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_decode_pixels</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">latents</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Latents -&gt; uint8 pixel frames ``[1, 3, T, H, W]``."""</span>
+        <span class="n">vae_dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_dtype</span><span class="p">()</span>
+        <span class="n">z</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_vae_input</span><span class="p">(</span><span class="n">latents</span><span class="p">)</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">autocast</span><span class="p">(</span><span class="n">device_type</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">enabled</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
             <span class="k">if</span> <span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_decode_compiled</span>
@@ -3684,11 +3712,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span><span class="p">(</span><span class="n">z</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_warmed_decode_shapes</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">z</span><span class="o">.</span><span class="n">shape</span><span class="p">))</span>
             <span class="n">decoded</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode</span><span class="p">(</span><span class="n">z</span><span class="p">)</span><span class="o">.</span><span class="n">sample</span>  <span class="c1"># [1, 3, T, H, W] in [-1, 1]</span>
-        <span class="c1"># Quantize to 8-bit here (the output is an 8-bit image/mp4 either way) so</span>
-        <span class="c1"># only the uint8 frames cross the SHM edge to the data worker, not a 4x</span>
-        <span class="c1"># larger fp32 tensor — the decoded video transfer dominates the fixed cost</span>
-        <span class="c1"># at higher resolutions.</span>
-        <span class="k">return</span> <span class="p">(</span><span class="n">decoded</span> <span class="o">/</span> <span class="mi">2</span> <span class="o">+</span> <span class="mf">0.5</span><span class="p">)</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">mul</span><span class="p">(</span><span class="mi">255</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_to_uint8</span><span class="p">(</span><span class="n">decoded</span><span class="p">)</span>
 
 <div class="viewcode-block" id="Cosmos3VAEDecoderSubmodule.forward">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule.forward">[docs]</a>
@@ -3712,16 +3736,29 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3VAEDecoderARSubmodule</span><span class="p">(</span><span class="n">Cosmos3VAEDecoderSubmodule</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Streaming Wan VAE decode for windowed AR video (ported from #198).</span>
 
-<span class="sd">    Consumes one committed window's latents per stream chunk. Each window is</span>
-<span class="sd">    decoded behind a re-decoded left context (the last few latents of the</span>
-<span class="sd">    stream so far) so the causal conv stack is warm at the kept frames; the</span>
-<span class="sd">    context- and overlap-derived pixels are trimmed, and the video is either</span>
-<span class="sd">    emitted per window (``stream_video``) or assembled and emitted once the</span>
-<span class="sd">    last window lands. The chunk count is the completion signal — it is known</span>
-<span class="sd">    per request up front — so the stream's terminal flush (an empty pass, and</span>
-<span class="sd">    the only pass a non-windowed request's idle stream ever delivers) runs as</span>
-<span class="sd">    a no-op forward: the pass must complete normally for the partition to</span>
-<span class="sd">    report done, so it is not vetoed.</span>
+<span class="sd">    Consumes one committed window's latents per stream chunk; the overlap a</span>
+<span class="sd">    window re-pins is trimmed, and the video is either emitted per window</span>
+<span class="sd">    (``stream_video``) or assembled and emitted once the last window lands.</span>
+
+<span class="sd">    A live stream keeps the VAE decoder's causal conv cache in its request</span>
+<span class="sd">    state (``windowed_decode_warm_cache``), so each window decodes only its</span>
+<span class="sd">    new latents, continuing the cache the previous window left: the frames</span>
+<span class="sd">    are those of one decode of the whole stream. A warm stream's first</span>
+<span class="sd">    window (fresh or resumed) is decoded behind a re-decoded left context</span>
+<span class="sd">    (the last few latents of the resumed session, if any), so the conv stack</span>
+<span class="sd">    is warm at the kept frames, and the context-derived pixels are trimmed;</span>
+<span class="sd">    that decode leaves the cache the stream continues from. All of a</span>
+<span class="sd">    stream's windows reach the decoder copy it was admitted to. With the</span>
+<span class="sd">    warm cache off, or for a stream that starts while</span>
+<span class="sd">    ``windowed_decode_max_warm_streams`` streams already hold a cache, every</span>
+<span class="sd">    window takes that stateless re-decode.</span>
+<span class="sd">    Sessions store only the latent context, never the cache.</span>
+
+<span class="sd">    The chunk count is the completion signal — it is known per request up</span>
+<span class="sd">    front — so the stream's terminal flush (an empty pass, and the only pass</span>
+<span class="sd">    a non-windowed request's idle stream ever delivers) runs as a no-op</span>
+<span class="sd">    forward: the pass must complete normally for the partition to report</span>
+<span class="sd">    done, so it is not vetoed.</span>
 <span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">vae</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
@@ -3732,6 +3769,13 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_sessions</span> <span class="o">=</span> <span class="n">SessionStore</span><span class="p">(</span>
             <span class="n">config</span><span class="o">.</span><span class="n">session_store_size</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">session_timeout_s</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">session_timeout_max_s</span><span class="p">,</span>
         <span class="p">)</span>
+        <span class="c1"># Before any compile traces the decode; only this node's VAE instance</span>
+        <span class="c1"># is converted (see Cosmos3Model).</span>
+        <span class="k">if</span> <span class="n">vae</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">config</span><span class="o">.</span><span class="n">vae_decode_channels_last</span><span class="p">:</span>
+            <span class="n">_wan_vae</span><span class="p">()</span><span class="o">.</span><span class="n">to_channels_last</span><span class="p">(</span><span class="n">vae</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_channels_last</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_warm_enabled</span> <span class="o">=</span> <span class="n">vae</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">bool</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">windowed_decode_warm_cache</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_step</span> <span class="o">=</span> <span class="n">_wan_vae</span><span class="p">()</span><span class="o">.</span><span class="n">DecoderStep</span><span class="p">(</span><span class="n">vae</span><span class="p">,</span> <span class="nb">compile</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_decode_compiled</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_warm_enabled</span> <span class="k">else</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="Cosmos3VAEDecoderARSubmodule.prepare_inputs">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.prepare_inputs">[docs]</a>
@@ -3772,6 +3816,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">ar_resume</span><span class="o">=</span><span class="n">resume</span><span class="p">,</span>
                 <span class="n">ar_end_session</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">md</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"end_session"</span><span class="p">)),</span>
                 <span class="n">ar_session_ttl</span><span class="o">=</span><span class="n">md</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"session_timeout_s"</span><span class="p">),</span>
+                <span class="c1"># Decided once per stream, so a stream never switches paths.</span>
+                <span class="n">ar_warm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_warm_enabled</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_warm_slot_free</span><span class="p">(),</span>
             <span class="p">)</span>
             <span class="k">if</span> <span class="n">resume</span> <span class="ow">and</span> <span class="n">session_id</span><span class="p">:</span>
                 <span class="n">tail</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sessions</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">session_id</span><span class="p">))</span>  <span class="c1"># promotes, like the DiT</span>
@@ -3785,20 +3831,43 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># the window's new latents yields the [context | window] decode input</span>
         <span class="c1"># and the next tail in one tensor.</span>
         <span class="n">stream_tail</span> <span class="o">=</span> <span class="n">new</span> <span class="k">if</span> <span class="n">tail</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">tail</span><span class="p">,</span> <span class="n">new</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tail</span><span class="o">.</span><span class="n">dtype</span><span class="p">)],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
-        <span class="n">pixels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_pixels</span><span class="p">(</span><span class="n">stream_tail</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">tail</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="c1"># A mid-stream latent decodes to scale_factor_temporal frames; the</span>
-            <span class="c1"># leading context (and the clip-start special frame, which falls</span>
-            <span class="c1"># inside it) is exactly the part being trimmed.</span>
-            <span class="n">keep</span> <span class="o">=</span> <span class="n">new</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">vae</span><span class="o">.</span><span class="n">scale_factor_temporal</span>
-            <span class="n">pixels</span> <span class="o">=</span> <span class="n">pixels</span><span class="p">[:,</span> <span class="p">:,</span> <span class="o">-</span><span class="n">keep</span><span class="p">:]</span>
+        <span class="n">feat_cache</span> <span class="o">=</span> <span class="n">st</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"ar_feat_cache"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">feat_cache</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">pixels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_stream</span><span class="p">(</span><span class="n">new</span><span class="p">,</span> <span class="n">feat_cache</span><span class="p">,</span> <span class="n">clip_start</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                <span class="c1"># The cache is updated in place, so a decode that raised has</span>
+                <span class="c1"># left it half-advanced. Drop it: a retry of this window (the</span>
+                <span class="c1"># tail and window count have not moved) re-decodes behind its</span>
+                <span class="c1"># context like a stream's first window.</span>
+                <span class="n">st</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="s2">"ar_feat_cache"</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_log_warm_streams</span><span class="p">(</span><span class="s2">"dropped"</span><span class="p">,</span> <span class="n">rid</span><span class="p">)</span>
+                <span class="k">raise</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">st</span><span class="p">[</span><span class="s2">"ar_warm"</span><span class="p">]:</span>
+                <span class="n">feat_cache</span> <span class="o">=</span> <span class="n">_wan_vae</span><span class="p">()</span><span class="o">.</span><span class="n">new_feat_cache</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vae</span><span class="p">)</span>
+                <span class="n">pixels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_stream</span><span class="p">(</span><span class="n">stream_tail</span><span class="p">,</span> <span class="n">feat_cache</span><span class="p">,</span> <span class="n">clip_start</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                <span class="n">st</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="s2">"ar_feat_cache"</span><span class="p">,</span> <span class="n">feat_cache</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_log_warm_streams</span><span class="p">(</span><span class="s2">"start"</span><span class="p">,</span> <span class="n">rid</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">pixels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_pixels</span><span class="p">(</span><span class="n">stream_tail</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">tail</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="c1"># A mid-stream latent decodes to scale_factor_temporal frames; the</span>
+                <span class="c1"># leading context (and the clip-start special frame, which falls</span>
+                <span class="c1"># inside it) is exactly the part being trimmed.</span>
+                <span class="n">keep</span> <span class="o">=</span> <span class="n">new</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">vae</span><span class="o">.</span><span class="n">scale_factor_temporal</span>
+                <span class="n">pixels</span> <span class="o">=</span> <span class="n">pixels</span><span class="p">[:,</span> <span class="p">:,</span> <span class="o">-</span><span class="n">keep</span><span class="p">:]</span>
         <span class="n">st</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="s2">"ar_tail"</span><span class="p">,</span> <span class="n">stream_tail</span><span class="p">[:,</span> <span class="p">:,</span> <span class="o">-</span><span class="n">st</span><span class="p">[</span><span class="s2">"ar_ctx"</span><span class="p">]:])</span>
         <span class="n">st</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="s2">"ar_chunks"</span><span class="p">,</span> <span class="n">index</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">index</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">&gt;=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"ar_windows"</span><span class="p">]</span> <span class="ow">and</span> <span class="n">st</span><span class="p">[</span><span class="s2">"ar_session_id"</span><span class="p">]:</span>
-            <span class="k">if</span> <span class="n">st</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"ar_end_session"</span><span class="p">):</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_sessions</span><span class="o">.</span><span class="n">end</span><span class="p">(</span><span class="n">st</span><span class="p">[</span><span class="s2">"ar_session_id"</span><span class="p">])</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_sessions</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">st</span><span class="p">[</span><span class="s2">"ar_session_id"</span><span class="p">],</span> <span class="n">st</span><span class="p">[</span><span class="s2">"ar_tail"</span><span class="p">],</span> <span class="n">st</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"ar_session_ttl"</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">index</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">&gt;=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"ar_windows"</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="n">st</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"ar_feat_cache"</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">st</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="s2">"ar_feat_cache"</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_log_warm_streams</span><span class="p">(</span><span class="s2">"end"</span><span class="p">,</span> <span class="n">rid</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">st</span><span class="p">[</span><span class="s2">"ar_session_id"</span><span class="p">]:</span>
+                <span class="k">if</span> <span class="n">st</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"ar_end_session"</span><span class="p">):</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_sessions</span><span class="o">.</span><span class="n">end</span><span class="p">(</span><span class="n">st</span><span class="p">[</span><span class="s2">"ar_session_id"</span><span class="p">])</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_sessions</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">st</span><span class="p">[</span><span class="s2">"ar_session_id"</span><span class="p">],</span> <span class="n">st</span><span class="p">[</span><span class="s2">"ar_tail"</span><span class="p">],</span> <span class="n">st</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"ar_session_ttl"</span><span class="p">))</span>
         <span class="k">if</span> <span class="n">st</span><span class="p">[</span><span class="s2">"ar_stream"</span><span class="p">]:</span>
             <span class="c1"># Deliver each window as its own chunk, capped at the frames still</span>
             <span class="c1"># owed (the padded final window can outrun the requested count);</span>
@@ -3811,7 +3880,49 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="p">{}</span>
         <span class="n">video</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">st</span><span class="p">[</span><span class="s2">"ar_pixels"</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)[:,</span> <span class="p">:,</span> <span class="p">:</span> <span class="n">st</span><span class="p">[</span><span class="s2">"ar_out_frames"</span><span class="p">]]</span>
         <span class="k">return</span> <span class="p">{</span><span class="s2">"video_output"</span><span class="p">:</span> <span class="p">[</span><span class="n">video</span><span class="p">]}</span></div>
-</div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_warm_streams_live</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+        <span class="c1"># A snapshot: the worker's main thread removes request states while</span>
+        <span class="c1"># forwards run on its GPU thread, and list() copies under the GIL.</span>
+        <span class="n">states</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">request_states</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">s</span><span class="p">[</span><span class="s2">"ar_feat_cache"</span><span class="p">]</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">states</span> <span class="k">if</span> <span class="n">s</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"ar_feat_cache"</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_warm_slot_free</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="n">cap</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">windowed_decode_max_warm_streams</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">cap</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_warm_streams_live</span><span class="p">())</span> <span class="o">&lt;</span> <span class="n">cap</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_log_warm_streams</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">event</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">logger</span><span class="o">.</span><span class="n">isEnabledFor</span><span class="p">(</span><span class="n">logging</span><span class="o">.</span><span class="n">DEBUG</span><span class="p">):</span>
+            <span class="n">caches</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_warm_streams_live</span><span class="p">()</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+                <span class="s2">"vae_decoder_ar: warm stream </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%s</span><span class="s2">); </span><span class="si">%d</span><span class="s2"> live, </span><span class="si">%.2f</span><span class="s2"> GiB of decoder cache"</span><span class="p">,</span>
+                <span class="n">event</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">caches</span><span class="p">),</span> <span class="nb">sum</span><span class="p">(</span><span class="n">_wan_vae</span><span class="p">()</span><span class="o">.</span><span class="n">feat_cache_bytes</span><span class="p">(</span><span class="n">c</span><span class="p">)</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">caches</span><span class="p">)</span> <span class="o">/</span> <span class="mi">2</span><span class="o">**</span><span class="mi">30</span><span class="p">,</span>
+            <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_decode_pixels</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">latents</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">vae_decode_cudnn_benchmark</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">_decode_pixels</span><span class="p">(</span><span class="n">latents</span><span class="p">)</span>
+        <span class="k">with</span> <span class="n">_wan_vae</span><span class="p">()</span><span class="o">.</span><span class="n">cudnn_benchmark</span><span class="p">(</span><span class="kc">True</span><span class="p">):</span>
+            <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">_decode_pixels</span><span class="p">(</span><span class="n">latents</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_decode_stream</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">latents</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">feat_cache</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">clip_start</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``_decode_pixels`` continuing the stream whose decoder cache is</span>
+<span class="sd">        ``feat_cache`` (updated in place)."""</span>
+        <span class="n">wan_vae</span> <span class="o">=</span> <span class="n">_wan_vae</span><span class="p">()</span>
+        <span class="n">z</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_vae_input</span><span class="p">(</span><span class="n">latents</span><span class="p">)</span>
+        <span class="c1"># Only steady windows group latents per call: a stream's first window</span>
+        <span class="c1"># (the clip start, or a resumed session's context ahead of its new</span>
+        <span class="c1"># latents) runs one latent per call, so its peak stays the default's.</span>
+        <span class="n">per_call</span> <span class="o">=</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">clip_start</span> <span class="k">else</span> <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">windowed_decode_latents_per_call</span><span class="p">)</span>
+        <span class="k">with</span> <span class="p">(</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">autocast</span><span class="p">(</span><span class="n">device_type</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">,</span> <span class="n">enabled</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
+            <span class="n">wan_vae</span><span class="o">.</span><span class="n">cudnn_benchmark</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">vae_decode_cudnn_benchmark</span><span class="p">),</span>
+        <span class="p">):</span>
+            <span class="n">decoded</span> <span class="o">=</span> <span class="n">wan_vae</span><span class="o">.</span><span class="n">decode_causal</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">vae</span><span class="p">,</span> <span class="n">z</span><span class="p">,</span> <span class="n">feat_cache</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_step</span><span class="p">,</span> <span class="n">clip_start</span><span class="o">=</span><span class="n">clip_start</span><span class="p">,</span> <span class="n">latents_per_call</span><span class="o">=</span><span class="n">per_call</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_to_uint8</span><span class="p">(</span><span class="n">decoded</span><span class="p">)</span></div>
 
 
 

@@ -39,4 +39,5 @@ mstar.model.components
    moe
    norm
    qwen3_lm
+   wan_vae
 

@@ -741,10 +741,12 @@ prefill.</p>
 </dd>
 <dt>Cosmos3VAEDecoderSubmodule  – Wan VAE decode (STATELESS): final latents to</dt><dd><p>pixels.</p>
 </dd>
-<dt>Cosmos3VAEDecoderARSubmodule – streaming Wan VAE decode (STATELESS) for</dt><dd><p>windowed AR video: one committed window’s
-latents per stream chunk, decoded behind
-re-decoded context and emitted per window or
-assembled.</p>
+<dt>Cosmos3VAEDecoderARSubmodule – streaming Wan VAE decode (per-request</dt><dd><p>decoder cache; no engine resource) for
+windowed AR video: one committed window’s
+latents per stream chunk, decoded from the
+stream’s warm decoder cache (behind
+re-decoded context where it has none) and
+emitted per window or assembled.</p>
 </dd>
 <dt>Cosmos3VisionEncoderSubmodule – Edge reasoner vision tower (STATELESS):</dt><dd><p>packed image/video patches to text-space
 tokens for the reasoner prefill.</p>
@@ -1390,16 +1392,27 @@ that don’t need audio);</p></li>
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.submodules.</span></span><span class="sig-name descname"><span class="pre">Cosmos3VAEDecoderARSubmodule</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">vae</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3VAEDecoderARSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule" title="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderSubmodule"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cosmos3VAEDecoderSubmodule</span></code></a></p>
 <p>Streaming Wan VAE decode for windowed AR video (ported from #198).</p>
-<p>Consumes one committed window’s latents per stream chunk. Each window is
-decoded behind a re-decoded left context (the last few latents of the
-stream so far) so the causal conv stack is warm at the kept frames; the
-context- and overlap-derived pixels are trimmed, and the video is either
-emitted per window (<code class="docutils literal notranslate"><span class="pre">stream_video</span></code>) or assembled and emitted once the
-last window lands. The chunk count is the completion signal — it is known
-per request up front — so the stream’s terminal flush (an empty pass, and
-the only pass a non-windowed request’s idle stream ever delivers) runs as
-a no-op forward: the pass must complete normally for the partition to
-report done, so it is not vetoed.</p>
+<p>Consumes one committed window’s latents per stream chunk; the overlap a
+window re-pins is trimmed, and the video is either emitted per window
+(<code class="docutils literal notranslate"><span class="pre">stream_video</span></code>) or assembled and emitted once the last window lands.</p>
+<p>A live stream keeps the VAE decoder’s causal conv cache in its request
+state (<code class="docutils literal notranslate"><span class="pre">windowed_decode_warm_cache</span></code>), so each window decodes only its
+new latents, continuing the cache the previous window left: the frames
+are those of one decode of the whole stream. A warm stream’s first
+window (fresh or resumed) is decoded behind a re-decoded left context
+(the last few latents of the resumed session, if any), so the conv stack
+is warm at the kept frames, and the context-derived pixels are trimmed;
+that decode leaves the cache the stream continues from. All of a
+stream’s windows reach the decoder copy it was admitted to. With the
+warm cache off, or for a stream that starts while
+<code class="docutils literal notranslate"><span class="pre">windowed_decode_max_warm_streams</span></code> streams already hold a cache, every
+window takes that stateless re-decode.
+Sessions store only the latent context, never the cache.</p>
+<p>The chunk count is the completion signal — it is known per request up
+front — so the stream’s terminal flush (an empty pass, and the only pass
+a non-windowed request’s idle stream ever delivers) runs as a no-op
+forward: the pass must complete normally for the partition to report
+done, so it is not vetoed.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">latents</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/submodules.html#Cosmos3VAEDecoderARSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.submodules.Cosmos3VAEDecoderARSubmodule.forward" title="Link to this definition">#</a></dt>

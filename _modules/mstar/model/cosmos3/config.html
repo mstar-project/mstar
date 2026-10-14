@@ -1293,7 +1293,51 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Latent frames of already-generated context re-decoded ahead of each</span>
     <span class="c1"># window so the causal VAE's conv stack is warm at the kept frames; the</span>
     <span class="c1"># context-derived pixels are trimmed. Raise if window boundaries seam.</span>
+    <span class="c1"># With windowed_decode_warm_cache this re-decode runs only for a warm</span>
+    <span class="c1"># stream's first window (fresh or resumed); a stream's windows all go to</span>
+    <span class="c1"># the decoder copy it was admitted to.</span>
     <span class="n">windowed_decode_context_latents</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span>
+    <span class="c1"># Keep each live stream's VAE decoder cache (the last frames every causal</span>
+    <span class="c1"># conv saw) in its request state, so a window decodes only its new latents.</span>
+    <span class="c1"># Without compile, at windowed_decode_latents_per_call=1 and the contiguous</span>
+    <span class="c1"># layout, the frames are bit-identical to one decode of the whole stream</span>
+    <span class="c1"># (the CPU tests assert it); under compile, channels-last or =0 they match</span>
+    <span class="c1"># it to bf16 rounding. Costs the cache per live stream, freed when the</span>
+    <span class="c1"># stream's last window is decoded or the request goes away: 1.33 GiB of</span>
+    <span class="c1"># tensors at 832x480 in bf16 (the Wan2.2 VAE), growing with the frame</span>
+    <span class="c1"># area, and twice that when the decode runs in fp32 (cuDNN before 9.16,</span>
+    <span class="c1"># or COSMOS3_VAE_DECODE_FP32). Sessions still store only latents. False</span>
+    <span class="c1"># re-decodes the context ahead of every window.</span>
+    <span class="n">windowed_decode_warm_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># At most this many streams per decoder copy hold a warm cache (0: no cap).</span>
+    <span class="c1"># A stream that starts while the cap is reached takes the stateless</span>
+    <span class="c1"># re-decode for its whole life. The cap counts streams, not bytes: size it</span>
+    <span class="c1"># from the per-stream cache at the served resolution and decode dtype. The caches sit outside any engine resource</span>
+    <span class="c1"># pool, and the shipped configs set no max_concurrent_requests, so with no</span>
+    <span class="c1"># cap their total is bounded only by how many streams are admitted.</span>
+    <span class="n">windowed_decode_max_warm_streams</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># Latent frames per VAE decoder call in the streaming decode. 1 issues the</span>
+    <span class="c1"># same decoder calls as ``vae.decode`` (bit-exact against it in fp32 and</span>
+    <span class="c1"># eagerly in the default layout). N &gt; 1 groups N latents per call and 0</span>
+    <span class="c1"># puts a window's new latents in one call: the same math to float</span>
+    <span class="c1"># rounding, fewer and larger kernels, and a transient activation peak that</span>
+    <span class="c1"># grows with the latents per call, on the GPU the DiT may share. Grouping</span>
+    <span class="c1"># applies to steady windows; a stream's first window, which re-decodes</span>
+    <span class="c1"># its context (fresh or resumed), always runs one latent per call.</span>
+    <span class="n">windowed_decode_latents_per_call</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="c1"># Run the streaming decode on channels-last weights and activations,</span>
+    <span class="c1"># cuDNN's native conv3d layout: no per-conv layout conversion kernels.</span>
+    <span class="c1"># Same math; bf16 output differs from the default layout only by rounding.</span>
+    <span class="c1"># The streaming node then loads its own copy of the VAE decoder instead of</span>
+    <span class="c1"># sharing the whole-clip decoder's, which keeps the default layout: a fixed</span>
+    <span class="c1"># ~1.03 GiB of bf16 weights (Wan2.2 VAE) in a process hosting both nodes.</span>
+    <span class="n">vae_decode_channels_last</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># Let cuDNN time its conv algorithms for each new streaming-decode shape</span>
+    <span class="c1"># (once, then cached) instead of its heuristic pick. Same math, but the</span>
+    <span class="c1"># timed pick can differ between server launches, and so can the frames</span>
+    <span class="c1"># (by bf16 rounding). Gains nothing on the Wan2.2 VAE at 832x480 on a</span>
+    <span class="c1"># B200; it took ~18% off the Wan 2.1 VAE's decode on an H200.</span>
+    <span class="n">vae_decode_cudnn_benchmark</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># Sessions (``session_id`` on a windowed request): the DiT node keeps the</span>
     <span class="c1"># last window's clean latents and the streaming decoder its decode</span>
     <span class="c1"># context per session, so a later request with ``resume_session`` picks</span>
@@ -1433,6 +1477,30 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># ----- provenance -----</span>
     <span class="n">local_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
+
+<div class="viewcode-block" id="Cosmos3Config.check_streaming_decode">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3Config.check_streaming_decode">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_streaming_decode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Reject streaming-decoder settings the decoder would otherwise</span>
+<span class="sd">        reinterpret silently: a non-boolean switch (a yaml ``"false"`` is</span>
+<span class="sd">        truthy), a negative warm-stream cap (read as no cap), or more latents</span>
+<span class="sd">        per call than the default window holds (read as one call per window)."""</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"windowed_decode_warm_cache"</span><span class="p">,</span> <span class="s2">"vae_decode_channels_last"</span><span class="p">,</span> <span class="s2">"vae_decode_cudnn_benchmark"</span><span class="p">):</span>
+            <span class="n">value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Cosmos3 </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> must be true or false, got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"windowed_decode_max_warm_streams"</span><span class="p">,</span> <span class="s2">"windowed_decode_latents_per_call"</span><span class="p">):</span>
+            <span class="n">value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">or</span> <span class="n">value</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Cosmos3 </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> must be an integer &gt;= 0, got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span>
+        <span class="n">window</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">+</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">window_frames_default</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">vae</span><span class="o">.</span><span class="n">scale_factor_temporal</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">windowed_decode_latents_per_call</span> <span class="o">&gt;</span> <span class="n">window</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"Cosmos3 windowed_decode_latents_per_call=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">windowed_decode_latents_per_call</span><span class="si">}</span><span class="s2"> is more "</span>
+                <span class="sa">f</span><span class="s2">"than the </span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2"> latent frames of the default window (window_frames_default="</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">window_frames_default</span><span class="si">}</span><span class="s2">); 0 decodes each window's new latents in one call."</span>
+            <span class="p">)</span></div>
+
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">nemotron_norm</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>

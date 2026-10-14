@@ -47,4 +47,5 @@ mstar.model.cosmos3.tests
    test_video
    test_video_capture
    test_windowed
+   test_windowed_decode
 
