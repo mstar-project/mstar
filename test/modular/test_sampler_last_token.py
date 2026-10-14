@@ -74,7 +74,7 @@ def test_ingraph_scatter_rows_land_by_slot_and_padding_hits_the_trash_row():
     CPU views: gather the offsets off the master, advance, scatter offsets
     and tokens back; padding rows read and write the trash row only."""
     bufs = _ingraph()
-    assert bufs.ingraph_scatter and bufs._trash_slot == 8
+    assert bufs.ingraph_scatter and bufs._trash_slot == 0
     assert bufs.last_token.master.shape[0] == 9 and bufs.offset.master.shape[0] == 9
     for rid in ("a", "b", "c"):
         bufs.register_request(rid)
@@ -83,7 +83,7 @@ def test_ingraph_scatter_rows_land_by_slot_and_padding_hits_the_trash_row():
     bufs.gather_dynamic(["b", "a"], 4, 1)  # uploads the index row, no offset gather
     # (a fresh slot's offset reset ran there; an advanced offset survives)
     bufs.offset.master[bufs._rid_to_slot["a"]] = 10
-    assert bufs._slot_idx_gpu[1, :4].tolist()[2:] == [8, 8]
+    assert bufs._slot_idx_gpu[1, :4].tolist()[2:] == [0, 0]
     s = bufs.sampler_for(4, 1)
     assert s.ingraph_scatter and s.slot_idx_view.tolist()[:2] == [bufs._rid_to_slot[r] for r in ("b", "a")]
     s.gather_in_graph()
@@ -92,10 +92,10 @@ def test_ingraph_scatter_rows_land_by_slot_and_padding_hits_the_trash_row():
     s.scatter_in_graph(torch.tensor([22, 21, 99, 98]))
     assert bufs.last_tokens_for(["a", "b", "c"]).tolist() == [21, 22, 3]
     assert bufs.offset.master[bufs._rid_to_slot["a"]].item() == 11
-    assert bufs.last_token.master[8].item() in (99, 98)
+    assert bufs.last_token.master[0].item() in (99, 98)
     # the next step's input ids: real rows by slot, padding rows the trash row
     got = bufs.gather_last_tokens(1, 4).tolist()
-    assert got[:2] == [22, 21] and got[2] == got[3] == bufs.last_token.master[8].item()
+    assert got[:2] == [22, 21] and got[2] == got[3] == bufs.last_token.master[0].item()
 
 
 def test_ingraph_scatter_masters_never_grow():

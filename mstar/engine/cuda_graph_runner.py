@@ -223,7 +223,7 @@ class DummyRowPool:
         held = self._held.setdefault(key, [])
         rids = self.handles(key, bs)
         for rid in rids[len(held):]:
-            self._step_runner.ingest_request(rid)
+            self._step_runner.ingest_capture_row(rid)
             held.append(rid)
         return rids
 

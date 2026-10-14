@@ -163,6 +163,13 @@ class SamplerResource(Resource):
                 rid, sampling_config=self._sampler._sampling_config[rid]
             )
 
+    def ingest_capture_row(self, rid: str):
+        """A capture padding row: default config, no seen-token mask, and the
+        trash row in the graph buffers rather than a slot of its own."""
+        self._sampler.add_request(request_id=rid)
+        if self._cg_buffers is not None:
+            self._cg_buffers.register_trash_row(rid)
+
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
         inputs, matched_len: int,

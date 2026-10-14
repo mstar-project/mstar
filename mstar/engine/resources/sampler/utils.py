@@ -20,7 +20,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -1181,8 +1181,8 @@ class Buffer:
         """Persist the per-step rows back to their slots (GPU-only, no CPU).
 
         Inverse of ``gather`` — for buffers whose per-step value is advanced in
-        graph (the RNG offset). REAL rows only: padding rows all gather from
-        slot 0 and get advanced too, so scattering them would clobber slot 0.
+        graph (the RNG offset). REAL rows only: padding rows all map to the trash
+        row, so writing them back is wasted work.
         """
         self.master.index_copy_(0, idx_view, self.slot_view(cg_slot, real_bs))
 
@@ -1335,13 +1335,12 @@ class SamplerBuffers:
     # Per-request min-p; allocated only for submodules whose spec enables it,
     # so every other node's captured sampler is unchanged.
     min_p: "HostBuffer | None" = None
-    # Master cache capacity (grown by doubling when more requests are
-    # concurrently registered than the per-step buffer holds).
+    # Request rows in the masters, trash row excluded; doubles when registrations outgrow it.
     _master_capacity: int = field(default=0, repr=False)
-    # the in-graph scatter (knob): padding rows address ``_trash_slot``, one
-    # master row past the capacity that no request is ever given
     ingraph_scatter: bool = False
-    _trash_slot: int = 0
+    # Master row 0, never given to a request, so its config stays SamplingConfig().
+    # Padding rows, unregistered rids and capture rows read it; in graph they write it.
+    _trash_slot: ClassVar[int] = 0
     # Number of double-buffer slots (per-step buffers carry this leading dim).
     cg_slots: int = 1
     # Per-step slot-index staging, per cg slot. ``_slot_idx_cpu`` is pinned so
@@ -1412,23 +1411,23 @@ class SamplerBuffers:
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
-        With ``ingraph_scatter`` the masters hold ``slots`` rows (the knob's
-        4096 by default) plus one trash row for padding, allocated once: the
-        captured graphs keep their addresses, so they never grow.
+        The masters hold the trash row (row 0, ``_trash_slot``) plus one row per
+        request. With ``ingraph_scatter`` that is ``slots`` request rows (the
+        knob's 4096 by default), allocated once: the captured graphs keep their
+        addresses, so they never grow.
 
         ``vocab_size`` (when not None) enables the seen-token mask buffer for the
         repetition penalty. The master rows default to a ``SamplingConfig()`` row
-        (temp=1, top_k=0, top_p=1, rep_penalty=1) — what an unregistered slot
-        would surface if accidentally indexed. ``cg_slots`` double-buffers the
-        per-step tensors so the sampler can pre-plan.
+        (temp=1, top_k=0, top_p=1, rep_penalty=1), which the trash row keeps for
+        good. ``cg_slots`` double-buffers the per-step tensors so the sampler can
+        pre-plan.
         """
         pinned = torch.cuda.is_available() and device.type == "cuda"
         cap = max_batch_size
         if ingraph_scatter:
             cap = max(max_batch_size, slots if slots is not None else sampler_slots())
-        # one row past the capacity is the trash row for padding when the
-        # in-graph scatter is on (harmless, never read for a request)
-        rows = cap + 1 if ingraph_scatter else cap
+        # row 0 is the trash row; requests take rows 1..cap
+        rows = cap + 1
 
         def mk(dtype: torch.dtype, default: float) -> HostBuffer:
             return HostBuffer.allocate(
@@ -1455,12 +1454,11 @@ class SamplerBuffers:
             min_p=mk(torch.float32, 0.0) if enable_min_p else None,
             _master_capacity=cap,
             ingraph_scatter=ingraph_scatter,
-            _trash_slot=cap if ingraph_scatter else 0,
             cg_slots=cg_slots,
             _slot_idx_cpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, pin_memory=pinned),
             _slot_idx_gpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, device=device),
             _last_real_bs=[0] * cg_slots,
-            _free_slots=list(range(cap)),
+            _free_slots=list(range(1, cap + 1)),
         )
 
     def slice_for_bs(self, bs: int, cg_slot: int = 0) -> dict[str, Any]:
@@ -1528,13 +1526,14 @@ class SamplerBuffers:
                 "sampler with the in-graph scatter on; raise MSTAR_SAMPLER_SLOTS "
                 "or set MSTAR_SAMPLER_INGRAPH_SCATTER=0"
             )
+        rows = new_capacity + 1  # plus the trash row
         for buf in self._scalar_buffers():
-            buf.grow_master(new_capacity)
-        self.offset.grow_master(new_capacity)
-        self.last_token.grow_master(new_capacity)
+            buf.grow_master(rows)
+        self.offset.grow_master(rows)
+        self.last_token.grow_master(rows)
         if self.seen_tokens is not None:
-            self.seen_tokens.grow_master(new_capacity)
-        self._free_slots.extend(range(self._master_capacity, new_capacity))
+            self.seen_tokens.grow_master(rows)
+        self._free_slots.extend(range(self._master_capacity + 1, rows))
         self._master_capacity = new_capacity
 
     def register_request(
@@ -1556,10 +1555,18 @@ class SamplerBuffers:
             sampling_config if sampling_config is not None else SamplingConfig()
         )
 
+    def register_trash_row(self, rid: str) -> None:
+        """Point ``rid`` at the trash row instead of a slot of its own.
+
+        For capture padding rows: they hold no request state, so they take no
+        master row, and their in-graph writes land on the trash row.
+        """
+        self._rid_to_slot.setdefault(rid, self._trash_slot)
+
     def unregister_request(self, rid: str) -> None:
         """Free the slot owned by ``rid`` (no GPU writes)."""
         slot = self._rid_to_slot.pop(rid, None)
-        if slot is None:
+        if slot is None or slot == self._trash_slot:
             return
         self._cached_config.pop(rid, None)
         self._pending_init.discard(slot)
@@ -1576,10 +1583,10 @@ class SamplerBuffers:
         separately (see ``stage_seen_token_masks``) because it grows every step.
         """
         slot = self._rid_to_slot.get(rid)
-        if slot is None:
+        if slot is None or slot == self._trash_slot:
             # Request not yet registered for this submodule (e.g. ar_engine
             # may invoke set_config for a node that doesn't own a runner /
-            # SamplerBuffers). Silently no-op.
+            # SamplerBuffers), or a capture row whose trash row stays defaults.
             return
         prev = self._cached_config.get(rid)
         if prev == sampling_config:
@@ -1639,10 +1646,10 @@ class SamplerBuffers:
     ) -> None:
         """Write this batch's master-slot indices into ``cg_slot``'s pinned row.
 
-        Padding slots (``i >= len(request_ids)``) reuse slot 0's row — the
+        Padding slots (``i >= len(request_ids)``) read the trash row: the
         captured graph forwards them through the same kernels as real slots,
         but their outputs are discarded by the runner's dummy-rid remap.
-        Unregistered rids fall back to slot 0 (the config defaults).
+        Unregistered rids fall back to the trash row too (the config defaults).
         """
         assert padded_bs <= self.max_batch_size, (
             f"padded_bs={padded_bs} exceeds SamplerBuffers.max_batch_size="
@@ -1659,7 +1666,7 @@ class SamplerBuffers:
         for rid in request_ids:
             slot = get(rid)
             if slot is None:
-                slot = 0
+                slot = self._trash_slot
             elif slot in pending:
                 self._init_slot(slot, rid)
             rows.append(slot)
@@ -1761,7 +1768,7 @@ class SamplerBuffers:
     def scatter_offset(self, cg_slot: int = 0) -> None:
         """Persist the (in-graph advanced) per-step offsets back to their slot
         masters. Call once AFTER the graph replay for the gather on ``cg_slot``;
-        GPU-only, real rows only (padding rows all map to slot 0)."""
+        GPU-only, real rows only (padding rows all map to the trash row)."""
         idx, real_bs = self._scatter_idx(cg_slot)
         self.offset.scatter(idx, real_bs, cg_slot)
 
@@ -1777,7 +1784,7 @@ class SamplerBuffers:
 
     def gather_last_tokens(self, cg_slot: int, padded_bs: int) -> torch.Tensor:
         """``[padded_bs]`` last tokens of the batch staged on ``cg_slot``, in
-        its row order (padding rows read slot 0, like every other gather).
+        its row order (padding rows read the trash row, like every other gather).
         A fresh tensor on the current stream; the runner stages it into the
         slot's static ``input_ids``. Call after ``gather_dynamic`` uploaded the
         slot's index row for this step."""
