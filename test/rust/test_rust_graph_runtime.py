@@ -535,8 +535,12 @@ def test_pop_with_check_ready_is_all_or_nothing(runtime):
     assert out.wg_ids.keys == [a]
 
 
-def test_pop_of_an_unknown_node_returns_none(runtime):
-    assert runtime.pop_rids("nope", WALK, []) is None
+def test_pop_of_an_unknown_node_raises(runtime):
+    """Not None: nothing in the deployment runs this pair, and returning None
+    would have the scheduler read a structural error as "not ready yet" and
+    retry the row forever. PythonGraphRuntime has always raised here."""
+    with pytest.raises(RuntimeError):
+        runtime.pop_rids("nope", WALK, [])
 
 
 def test_push_back_makes_a_popped_node_ready_again(runtime):

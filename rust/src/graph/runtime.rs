@@ -978,6 +978,20 @@ pub struct GraphRuntime {
         self.node_owner.get(&(w, n)).copied()
     }
 
+    /// Whether ANY worker graph in the deployment runs `node` in `walk`, this
+    /// worker's or another's. `node_owner` only holds the local ones, so it
+    /// cannot tell "somebody else's" from "nobody's"; Python keys its index on
+    /// the conductor's deployment-wide maps and so draws that line for free.
+    fn runs_anywhere(&self, node: &str, walk: &str) -> bool {
+        let (Some(n), Some(w)) = (self.interner.get(node), self.interner.get(walk))
+        else {
+            return false;
+        };
+        self.all_worker_graphs
+            .iter()
+            .any(|m| m.graph_walks.contains(&w) && m.nodes.contains(&n))
+    }
+
     fn live_wgs(&self, walk: Sym) -> Vec<WgIndex> {
         self.walk_to_local_wgs.get(&walk).cloned().unwrap_or_default()
     }
@@ -1519,9 +1533,11 @@ impl GraphRuntime {
         let states: Vec<Vec<Option<RequestState>>> =
             (0..graphs.len()).map(|_| Vec::new()).collect();
 
-        // Local worker graph metadata. Remote ones arrive via
-        // `set_remote_worker_graphs`, which the worker calls with the
-        // conductor's all_worker_graph_ids_to_* maps.
+        // Local worker graph metadata; the remote ones are appended just below
+        // from `remote_worker_graphs`, which rust.py derives from the
+        // conductor's all_worker_graph_ids_to_* maps. Both halves are in place
+        // before any request arrives, so a lookup over this answers for the
+        // whole deployment and not just what this worker owns.
         let mut all_worker_graphs = Vec::with_capacity(worker_graphs.len());
         let mut walk_to_local_wgs: FxHashMap<Sym, Vec<WgIndex>> = FxHashMap::default();
         for (idx, wga) in worker_graphs.iter().enumerate() {
@@ -2165,7 +2181,7 @@ impl GraphRuntime {
         graph_walk: &str,
         request_ids: Vec<u32>,
         check_ready: bool,
-    ) -> Option<PopRidsOut> {
+    ) -> PyResult<Option<PopRidsOut>> {
         let n = request_ids.len();
         self.pop_walk_rids(
             node_name, vec![graph_walk.to_string()], request_ids, vec![0; n], check_ready,
@@ -2183,24 +2199,55 @@ impl GraphRuntime {
         request_ids: Vec<u32>,
         rid_walk_idx: Vec<u32>,
         check_ready: bool,
-    ) -> Option<PopRidsOut> {
+    ) -> PyResult<Option<PopRidsOut>> {
         if request_ids.len() != rid_walk_idx.len() {
-            return None;
+            return Err(PyValueError::new_err(format!(
+                "pop_walk_rids: {} rids but {} walk indices",
+                request_ids.len(),
+                rid_walk_idx.len(),
+            )));
         }
-        // (worker graph, node) per walk; a walk this worker does not own pops nothing
+        if let Some(&w) = rid_walk_idx.iter().find(|&&w| w as usize >= graph_walks.len()) {
+            return Err(PyValueError::new_err(format!(
+                "pop_walk_rids: walk index {} past the {} walks given",
+                w,
+                graph_walks.len(),
+            )));
+        }
+        // (worker graph, node) per walk. A walk some OTHER worker owns pops
+        // nothing, but a pair no worker graph anywhere runs is a structural
+        // error -- the split PythonGraphRuntime makes by consulting the
+        // deployment-wide index before its own queues. Collapsing the two into
+        // None let a bad (node, walk) read to the scheduler as "nothing ready
+        // yet", so it retried forever instead of failing.
         let mut targets = Vec::with_capacity(graph_walks.len());
         for walk in &graph_walks {
-            let wg = self.owner_of(node_name, walk)?;
-            targets.push((wg, self.nid(wg, node_name)?));
+            let Some(wg) = self.owner_of(node_name, walk) else {
+                if self.runs_anywhere(node_name, walk) {
+                    return Ok(None);
+                }
+                return Err(PyRuntimeError::new_err(format!(
+                    "Could not find worker graph for node '{}', graph_walk '{}'",
+                    node_name, walk,
+                )));
+            };
+            let Some(node) = self.nid(wg, node_name) else {
+                return Err(PyRuntimeError::new_err(format!(
+                    "worker graph {} owns node '{}' in walk '{}' but has no such node",
+                    wg, node_name, walk,
+                )));
+            };
+            targets.push((wg, node));
         }
 
         if check_ready {
             for (&rid, &w) in request_ids.iter().zip(&rid_walk_idx) {
-                let (wg, node) = *targets.get(w as usize)?;
+                // in range: validated above
+                let (wg, node) = targets[w as usize];
                 let ready = self.state(wg, rid)
                     .is_some_and(|s| s.is_ready(node));
                 if !ready {
-                    return None; // unknown rid counts as not ready
+                    return Ok(None); // unknown rid counts as not ready
                 }
             }
         }
@@ -2228,7 +2275,7 @@ impl GraphRuntime {
         // of a pop reads it.
         let mut cols = EdgeColumns::default();
         for (rid, w) in request_ids.into_iter().zip(rid_walk_idx) {
-            let Some(&(wg, node)) = targets.get(w as usize) else { continue };
+            let (wg, node) = targets[w as usize];
             let wg_id = self.wg_ids[wg as usize];
             let Some(state) = self.state_mut(wg, rid) else {
                 continue;
@@ -2246,7 +2293,7 @@ impl GraphRuntime {
             }
         }
         out.set_edges(cols);
-        Some(out)
+        Ok(Some(out))
     }
 
     // --------- Speculation ----------

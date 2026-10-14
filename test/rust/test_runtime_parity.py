@@ -239,6 +239,32 @@ def test_structural_lookups_agree(pair):
     assert rt.is_async_schedulable("prefill", WALK)
 
 
+@pytest.mark.parametrize(
+    ("node", "walk"),
+    [("no_such_node", WALK), ("prefill", "no_such_walk")],
+    ids=["unknown_node", "unknown_walk"],
+)
+def test_popping_a_pair_no_worker_graph_runs_raises_in_both(pair, node, walk):
+    """A (node, walk) nothing in the deployment runs is a structural error.
+
+    Rust used to fold it into the same None that means "not ready yet", so the
+    scheduler read a bad pair as a row to retry and came back forever instead
+    of failing. Python raised here all along; AUTO prefers Rust, so the silent
+    side was the one that actually ran.
+    """
+    rt, _book, _store = pair
+    with pytest.raises(RuntimeError):
+        rt.pop_rids(node, walk, [])
+
+
+def test_popping_an_unready_rid_is_still_not_an_error(pair):
+    """The other half of the split: not-ready stays None, so the all-or-nothing
+    retry that check_ready exists for keeps working."""
+    rt, _book, _store = pair
+    rid = _admit(rt)  # admitted, but no input has landed
+    assert rt.pop_rids("prefill", WALK, [rid], check_ready=True) is None
+
+
 def test_refusals_agree(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
