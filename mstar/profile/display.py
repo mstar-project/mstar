@@ -155,6 +155,17 @@ def pretty_print_profile(prof: RequestProfile, filename=None):
                     f"       {tx.edge_name:<22} {_human_bytes(tx.num_bytes):>10}"
                     f"  {_fmt_ms(tx.time):>8} ms  (x{tx.count})"
                 )
+
+    # ---- buffers kept from failed reads (process totals) -------------------
+    if prof.read_quarantine:
+        lines.append(rule)
+        lines.append(" Read quarantine (buffers kept from failed reads, process totals):")
+        for q in sorted(prof.read_quarantine, key=lambda q: q.entity_id):
+            flag = "  OVER BUDGET" if q.over_budget else ""
+            lines.append(
+                f"   {q.entity_id:<28} {_human_bytes(q.nbytes):>10}  (x{q.reads})"
+                f"  budget {_human_bytes(q.budget_bytes)}{flag}"
+            )
     lines.append(sep)
 
     text = "\n".join(lines) + "\n"

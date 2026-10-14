@@ -1,6 +1,7 @@
 import errno
 import hashlib
 import logging
+import math
 import os
 import platform
 import shutil
@@ -10,7 +11,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext as _nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from mstar.communication.tensor_store import (  # NameToTensorList, Rid re-exported
@@ -20,7 +21,7 @@ from mstar.communication.tensor_store import (  # NameToTensorList, Rid re-expor
     TensorStore,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.profile.format import RxInfo, TxInfo
+from mstar.profile.format import ReadQuarantine, RxInfo, TxInfo
 from mstar.utils.containers import ParallelList
 
 try:
@@ -43,6 +44,24 @@ from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageT
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 logger = logging.getLogger(__name__)
+
+READ_QUARANTINE_BUDGET_ENV = "MSTAR_READ_QUARANTINE_BUDGET_MB"
+_DEFAULT_READ_QUARANTINE_BUDGET_MB = 1024
+
+
+def read_quarantine_budget_bytes() -> int:
+    """Bytes of failed-read buffers a process may keep before it reports
+    itself unhealthy (``MSTAR_READ_QUARANTINE_BUDGET_MB``, default 1024)."""
+    raw = os.environ.get(READ_QUARANTINE_BUDGET_ENV, str(_DEFAULT_READ_QUARANTINE_BUDGET_MB))
+    try:
+        megabytes = float(raw)
+    except ValueError:
+        raise ValueError(f"{READ_QUARANTINE_BUDGET_ENV} must be a number of MB, got {raw!r}") from None
+    if not math.isfinite(megabytes) or megabytes < 0:
+        raise ValueError(
+            f"{READ_QUARANTINE_BUDGET_ENV} must be a finite, non-negative number of MB, got {raw!r}"
+        )
+    return int(megabytes * (1 << 20))
 
 
 class StoredOutputs(NamedTuple):
@@ -68,6 +87,17 @@ class FutureAndPointers:
     graph_edges: list[GraphEdge]
     request_id: Rid = ""
     rx_time: float | None = None # seconds
+    # uuids whose local buffers this read writes into
+    transfer_uuids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class FailedRead:
+    """Edges of a request that will not be delivered because one of its
+    reads failed. ``error`` is that read's exception."""
+    request_id: Rid
+    graph_edges: list[GraphEdge]
+    error: BaseException
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +372,14 @@ class TensorCommunicationManager(ABC):
         self.rid_to_str: Callable[[Rid], str] = str
         self._uuid_minter = TensorUuidMinter(my_entity_id)
         self.pending: list[FutureAndPointers] = []
+        # rid -> the error of its first failed read; held until cleanup_request
+        self._failed_read_errors: dict[Rid, BaseException] = {}
+        self._failed_reads: list[FailedRead] = []
+        # local buffers of failed transfers, still registered, never freed
+        self._quarantined_buffers: list[torch.Tensor] = []
+        self.quarantined_reads = 0
+        self.quarantined_bytes = 0
+        self.quarantine_budget_bytes = read_quarantine_budget_bytes()
         self.read_finished: dict[Rid, set[int]] = {}
 
         self.req_rx_info: dict[Rid, SourceAndEdgeToRxInfo] = {}
@@ -1067,6 +1105,95 @@ class TensorCommunicationManager(ABC):
         """
         self._collect_and_send_acks(request_id, graph_edges)
 
+    @staticmethod
+    def _poll_read(ep: FutureAndPointers) -> tuple[bool, BaseException | None]:
+        """``(done, error)`` for a read, at one ``done()`` query per call. A
+        read that finished cleanly drops its future, so later polls of it (it
+        can wait behind an earlier read of its request) query nothing."""
+        if ep.future is None:
+            return True, None
+        if not ep.future.done():
+            return False, None
+        try:
+            ep.future.result()
+        except Exception as exc:  # noqa: BLE001 — includes a cancelled read
+            return True, exc
+        ep.future = None
+        return True, None
+
+    def _drop_failed_read(self, ep: FutureAndPointers, error: BaseException | None) -> None:
+        """Retire a finished read that will not be delivered.
+
+        ``error`` set: this read failed. A failed transfer may still be writing
+        into its local buffers (Mooncake's sync read gives up on a timeout
+        without draining the batch), so they are kept for the life of the
+        process instead of being freed with the request, and the producer is
+        not acked; it reclaims its copy when the request is torn down.
+        ``error`` None: an earlier read of the request failed; this one
+        completed, so it is acked and its buffers go with the request.
+        """
+        if error is None:
+            self._collect_and_send_acks(ep.request_id, ep.graph_edges)
+        else:
+            if ep.request_id not in self._failed_read_errors:
+                logger.error(
+                    "Tensor read for request %s failed: %s: %s",
+                    self.rid_to_str(ep.request_id), type(error).__name__, error,
+                )
+            self._quarantine_read_buffers(ep)
+        error = self._failed_read_errors.setdefault(ep.request_id, error)
+        self._failed_reads.append(FailedRead(ep.request_id, ep.graph_edges, error))
+
+    def _quarantine_read_buffers(self, ep: FutureAndPointers) -> None:
+        nbytes = 0
+        for uuid in ep.transfer_uuids:
+            if not self.tensor_store.check_uuid_presence(uuid):
+                continue
+            tensor = self.tensor_store.get_tensor(uuid)
+            self._quarantined_buffers.append(tensor)
+            nbytes += tensor.nbytes
+            self.uuid_to_shard_dim.pop(uuid, None)
+            self.uuid_to_edge_name.pop(uuid, None)
+            self.tensor_store.remove_tensor(uuid)
+        if not nbytes:
+            return
+        was_over_budget = self.quarantine_over_budget()
+        self.quarantined_reads += 1
+        self.quarantined_bytes += nbytes
+        logger.warning(
+            "Keeping %d bytes of read buffers for request %s: the transfer "
+            "may still write into them (%d reads, %d bytes kept so far; "
+            "budget %d bytes)", nbytes, self.rid_to_str(ep.request_id),
+            self.quarantined_reads, self.quarantined_bytes,
+            self.quarantine_budget_bytes,
+        )
+        if self.quarantine_over_budget() and not was_over_budget:
+            logger.error(
+                "%s keeps %d bytes of read buffers from %d failed reads, past "
+                "its budget of %d bytes (%s); reporting unhealthy",
+                self.my_entity_id, self.quarantined_bytes, self.quarantined_reads,
+                self.quarantine_budget_bytes, READ_QUARANTINE_BUDGET_ENV,
+            )
+
+    def quarantine_over_budget(self) -> bool:
+        return self.quarantined_bytes > self.quarantine_budget_bytes
+
+    def read_quarantine(self) -> ReadQuarantine:
+        """This process's buffers kept from failed reads, for stats and health."""
+        return ReadQuarantine(
+            entity_id=self.my_entity_id,
+            reads=self.quarantined_reads,
+            nbytes=self.quarantined_bytes,
+            budget_bytes=self.quarantine_budget_bytes,
+        )
+
+    def take_failed_reads(self) -> list[FailedRead]:
+        """Reads dropped by :meth:`get_ready_tensors` since the last call. The
+        caller fails their requests; their other reads are dropped as they
+        finish, until :meth:`cleanup_request`."""
+        failed, self._failed_reads = self._failed_reads, []
+        return failed
+
     def get_ready_tensors(self, graph_walk: str | None=None) -> dict[Rid, list[GraphEdge]]:
         ready: dict[Rid, list[GraphEdge]] = {}
         still_pending = []
@@ -1076,10 +1203,11 @@ class TensorCommunicationManager(ABC):
         # must not reach the client ahead of the one before it
         waiting: set[Rid] = set()
         for ep in self.pending:
-            done = ep.future is None or ep.future.done()
+            done, error = self._poll_read(ep)
+            if error is not None or (done and ep.request_id in self._failed_read_errors):
+                self._drop_failed_read(ep, error)
+                continue
             if done and ep.request_id not in waiting:
-                if ep.future is not None:
-                    ep.future.result()
                 for edge in ep.graph_edges:
                     ready.setdefault(ep.request_id, []).append(edge)
                     logger.debug(
@@ -1311,8 +1439,23 @@ class TensorCommunicationManager(ABC):
         referenced or persisted. Does NOT force-drop persisted signals — that
         is the conductor-coordinated hard cleanup, see
         :meth:`force_cleanup_request`.
+
+        Reads of the request still in ``pending`` that failed, or have not
+        finished, are quarantined first and not acked: their transfer may
+        still write into the buffers freed below.
         """
+        leftover = [ep for ep in self.pending if ep.request_id == request_id]
+        self.pending = [ep for ep in self.pending if ep.request_id != request_id]
+        ack_edges: list[GraphEdge] = []
+        for ep in leftover:
+            done, error = self._poll_read(ep)
+            if not done or error is not None:
+                self._quarantine_read_buffers(ep)
+            else:
+                ack_edges.extend(ep.graph_edges)
         self.read_finished.pop(request_id, None)
+        self._failed_read_errors.pop(request_id, None)
+        self._failed_reads = [f for f in self._failed_reads if f.request_id != request_id]
         self.buffered_shards.pop(request_id, None)
         self.sharding_configs.pop(request_id, None)
         self.req_rx_info.pop(request_id, None)
@@ -1327,11 +1470,7 @@ class TensorCommunicationManager(ABC):
                 continue
             self._cleanup_by_uuid(uuid)
 
-        self._collect_and_send_acks(
-            request_id,
-            sum([ep.graph_edges for ep in self.pending if ep.request_id == request_id], start=[]),
-        )
-        self.pending = [ep for ep in self.pending if ep.request_id != request_id]
+        self._collect_and_send_acks(request_id, ack_edges)
 
     def force_cleanup_request(self, request_id: Rid):
         """Unconditional teardown: drop every tensor for the request and unlink
@@ -1462,6 +1601,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             )
 
             read_info = []
+            transfer_uuids = []
             for info in graph_edge.tensor_info:
                 if info.source_entity == self.my_entity_id:
                     self._slice_existing_tensor(
@@ -1496,13 +1636,15 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     remote_ptr=info.address + info.offset,
                     nbytes=info.nbytes,
                 ))
+                transfer_uuids.append(info.uuid)
                 logger.debug("Started transfer read for uuid %s", info.uuid)
             # Create the FutureAndPointers before submit and point each read at
             # it, so the async reader can stamp ``rx_time`` on it when the read
             # completes (the reader runs on another thread; the object identity
             # is stable, only ``.future`` is filled in after submit).
             fp = FutureAndPointers(
-                future=None, graph_edges=[graph_edge], request_id=request_id
+                future=None, graph_edges=[graph_edge], request_id=request_id,
+                transfer_uuids=transfer_uuids,
             )
             if self.enable_prof:
                 for ri in read_info:

@@ -28,6 +28,7 @@ from mstar.conductor.conductor import (
     RequestData,
     _exit_when_orphaned,
 )
+from mstar.profile.format import ReadQuarantine
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.ipc_format import (
     ConductorMessage,
@@ -300,12 +301,14 @@ def test_stopping_data_worker_drops_tracked_requests():
         force_cleanup_request=cleaned.append,
         has_inflight_reads=lambda rid: False,
         get_ready_tensors=lambda: {},
+        take_failed_reads=lambda: [],
     )
     wt.in_flight_requests = {"r1", "r2"}
     wt.tensor_uuid_to_metadata_per_request = {"r2": {}}
     wt.request_model_kwargs = {"r1": {}}
     wt._draining_rids = {"r1"}
     wt._reads_done_sent = set()
+    wt._failed_rids = set()
 
     wt.run()
 
@@ -333,8 +336,12 @@ def _api_server(conductor_proc, inbox=()):
     server.on_fatal = None
     server._liveness_interval_s = 0.0
     server.communicator = SimpleNamespace(get_all_new_messages=_inbox(inbox))
+    server.worker_read_quarantine = {}
     server.preprocess_worker = SimpleNamespace(
-        get_profile_updates=lambda: [], get_result_chunks=lambda: []
+        get_profile_updates=lambda: [], get_result_chunks=lambda: [],
+        tensor_manager=SimpleNamespace(
+            read_quarantine=lambda: ReadQuarantine("api_server_preprocess_worker", 0, 0, 1 << 30),
+        ),
     )
     server.started = []
     server._msg_thread = SimpleNamespace(start=lambda: server.started.append(True))
@@ -423,15 +430,60 @@ def test_health_reports_unhealthy_once_fatal():
     client = TestClient(ep.app)
     previous = ep.api_server
     try:
-        ep.api_server = SimpleNamespace(fatal_error=None)
+        ep.api_server = _api_server(_Proc(5))
         assert client.get("/health").status_code == 200
 
-        ep.api_server = SimpleNamespace(
-            fatal_error="worker worker_0 (pid 7) exited with signal SIGKILL"
-        )
+        ep.api_server.fatal_error = "worker worker_0 (pid 7) exited with signal SIGKILL"
         response = client.get("/health")
         assert response.status_code == 503
         assert "worker_0" in response.json()["detail"]
+    finally:
+        ep.api_server = previous
+
+
+def test_health_fails_once_kept_read_buffers_pass_the_budget():
+    """Buffers kept from failed reads are never freed, so a transport that
+    keeps failing grows them until a restart. Past the budget /health fails,
+    so a liveness probe restarts the deployment instead of leaving it to
+    grow; a worker's report arrives as a message, the data worker's own
+    count is read in place."""
+    from fastapi.testclient import TestClient
+
+    import mstar.api_server.entrypoint as ep
+
+    client = TestClient(ep.app)
+    previous = ep.api_server
+    budget = 1000
+    own = ReadQuarantine("api_server_preprocess_worker", 0, 0, budget)
+    report = ReadQuarantine("worker_0", 2, budget, budget)
+    try:
+        server = _api_server(_Proc(5), inbox=[
+            APIServerMessage(message_type="read_quarantine", body=report),
+        ])
+        server.preprocess_worker.tensor_manager.read_quarantine = lambda: own
+        ep.api_server = server
+
+        thread = threading.Thread(target=server._process_messages, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 5
+        while "worker_0" not in server.worker_read_quarantine and time.monotonic() < deadline:
+            time.sleep(0.005)
+        server.running = False
+        thread.join(timeout=5)
+        # at the budget, not past it
+        assert server.read_quarantines() == [report]
+        assert client.get("/health").status_code == 200
+
+        server.worker_read_quarantine["worker_0"] = ReadQuarantine("worker_0", 3, budget + 1, budget)
+        response = client.get("/health")
+        assert response.status_code == 503
+        assert "worker_0 keeps 1001 bytes of buffers from 3 failed tensor reads" in response.json()["detail"]
+
+        server.worker_read_quarantine.clear()
+        own = ReadQuarantine("api_server_preprocess_worker", 1, budget + 1, budget)
+        response = client.get("/health")
+        assert response.status_code == 503
+        assert "api_server_preprocess_worker" in response.json()["detail"]
     finally:
         ep.api_server = previous
 

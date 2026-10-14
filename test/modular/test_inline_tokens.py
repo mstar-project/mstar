@@ -66,6 +66,9 @@ class _TM:
     def get_ready_tensors(self):
         return {}
 
+    def take_failed_reads(self):
+        return []
+
     def has_inflight_reads(self, request_id):
         return False
 
@@ -79,7 +82,9 @@ class _TM:
         pass
 
 
-def _thread():
+def _thread(*live):
+    """A data worker thread with ``live`` admitted (in flight), as tokens
+    only arrive for admitted requests."""
     stop = threading.Event()
     worker = PreprocessWorkerThread(
         in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
@@ -88,11 +93,12 @@ def _thread():
         discard_tensor_queue=queue.Queue(), stop_event=stop, communicator=_Comm(),
         tensor_manager=_TM(), model=_Model(),
     )
+    worker.in_flight_requests.update(live)
     return worker, stop
 
 
 def test_inline_tokens_are_detokenized_in_order_without_a_read():
-    worker, stop = _thread()
+    worker, stop = _thread("req", "other")
     for i, v in enumerate((11, 12, 13)):
         worker.result_tensor_queue.put(InlineToken("req", v, _loop(i), "text"))
     worker.result_tensor_queue.put(InlineToken("other", 99, None, "text"))
@@ -100,18 +106,19 @@ def test_inline_tokens_are_detokenized_in_order_without_a_read():
     thread.start()
     try:
         chunks = [worker.out_queue.get(timeout=5) for _ in range(4)]
+        # read before stopping: shutdown tears down every in-flight request
+        state = worker.request_output_state["req"]
     finally:
         stop.set()
         thread.join(timeout=5)
     assert all(isinstance(c, ResultChunk) for c in chunks)
     assert [c.data for c in chunks if c.request_id == "req"] == [b"<11>", b"<12>", b"<13>"]
     assert [c.data for c in chunks if c.request_id == "other"] == [b"<99>"]
-    state = worker.request_output_state["req"]
     assert state.next_sequence == 3 and state.next_emit == 3 and not state.pending
 
 
 def test_a_draining_request_drops_its_inline_tokens():
-    worker, stop = _thread()
+    worker, stop = _thread("gone", "live")
     worker._draining_rids.add("gone")
     worker.result_tensor_queue.put(InlineToken("gone", 1, None, "text"))
     worker.result_tensor_queue.put(InlineToken("live", 2, None, "text"))

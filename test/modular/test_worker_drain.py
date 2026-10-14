@@ -345,6 +345,7 @@ def _preprocess(inflight_reads=False):
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt._draining_rids = set()
     wt._reads_done_sent = set()
+    wt._failed_rids = set()
     wt.sent = []
     wt.forced = []
     wt.communicator = SimpleNamespace(send=lambda e, m: wt.sent.append((e, m)))
@@ -368,6 +369,7 @@ def _pw_reads_done(wt):
 
 def test_preprocess_drain_acks_when_reads_done():
     wt = _preprocess(inflight_reads=False)
+    wt.in_flight_requests.add("X")
     wt._begin_drain("X")
     assert "X" in wt._reads_done_sent
     acks = _pw_reads_done(wt)
@@ -377,6 +379,7 @@ def test_preprocess_drain_acks_when_reads_done():
 
 def test_preprocess_drain_waits_for_reads():
     wt = _preprocess(inflight_reads=True)
+    wt.in_flight_requests.add("X")
     wt._begin_drain("X")
     assert "X" in wt._draining_rids and not _pw_reads_done(wt)
 
@@ -396,6 +399,7 @@ def test_preprocess_finished_reading_acks_immediately_when_drained():
     """Happy path: delivery completed, so the ACK goes out without paying for a
     drain check (and without gating on reads that cannot exist)."""
     wt = _preprocess(inflight_reads=True)  # would block a gated ACK
+    wt.in_flight_requests.add("X")
     wt._finish_reading("X", drained=True)
     assert len(_pw_reads_done(wt)) == 1
     assert "X" not in wt._draining_rids
@@ -405,6 +409,7 @@ def test_preprocess_finished_reading_gates_ack_when_not_drained():
     """Abandoned delivery (TTL / client gone): reads may still be in flight, so
     the ACK must wait for them rather than let the conductor unlink under one."""
     wt = _preprocess(inflight_reads=True)
+    wt.in_flight_requests.add("X")
     wt._finish_reading("X", drained=False)
     assert not _pw_reads_done(wt)
     assert "X" in wt._draining_rids
@@ -432,7 +437,12 @@ def test_preprocess_hard_cleanup_force_drops_and_clears():
     wt._hard_cleanup("X")
     assert wt.forced == ["X"]
     assert "X" not in wt._draining_rids
+    # Teardown deletes the live flag; a later notice is dropped, not remembered.
     assert "X" not in wt._reads_done_sent
+    wt._finish_reading("X", drained=True)
+    wt._begin_drain("X")
+    assert "X" not in wt._draining_rids
+    assert not _pw_reads_done(wt)
     assert "X" not in wt.tensor_uuid_to_metadata_per_request
     assert "X" not in wt.request_model_kwargs
     assert "X" not in wt.in_flight_requests

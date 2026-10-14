@@ -17,12 +17,16 @@ import pytest
 import torch
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-from mstar.api_server.request_types import APIServerMessage, ResultTensors
+from mstar.api_server.request_types import (
+    APIServerMessage,
+    RequestFailed,
+    ResultTensors,
+)
 from mstar.communication.wire import _TYPE_TO_TAG, WireError, decode, encode
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.profile.format import GraphTiming, RxInfo, TxInfo
+from mstar.profile.format import GraphTiming, ReadQuarantine, RxInfo, TxInfo
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -234,6 +238,35 @@ def test_api_server_result_tensors():
     assert body.modality == "audio"
     assert body.graph_edge.name == "chunk"
     assert body.metadata == {"sr": 24000}
+
+
+def test_api_server_read_quarantine_round_trips():
+    """#419's quarantine report must survive #407's data-only codec."""
+    msg = APIServerMessage(
+        message_type="read_quarantine",
+        body=ReadQuarantine(
+            entity_id="worker_0", reads=7, nbytes=1368, budget_bytes=1048,
+        ),
+    )
+    got = roundtrip(msg)
+    assert got.message_type == "read_quarantine"
+    assert got.body == ReadQuarantine(
+        entity_id="worker_0", reads=7, nbytes=1368, budget_bytes=1048,
+    )
+    assert got.body.over_budget is True
+
+
+def test_api_server_request_failed_round_trips():
+    msg = APIServerMessage(
+        message_type="request_failed",
+        body=RequestFailed(
+            request_id="r0", error_message="boom", status=500,
+        ),
+    )
+    body = roundtrip(msg).body
+    assert body == RequestFailed(
+        request_id="r0", error_message="boom", status=500,
+    )
 
 
 def test_fail_requests_and_empty_collections():

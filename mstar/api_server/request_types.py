@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.multimodal import PromptPart
-from mstar.profile.format import InputInfo, RxInfo, TxInfo
+from mstar.profile.format import InputInfo, ReadQuarantine, RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 
 
@@ -67,13 +67,16 @@ class RequestFailed:
 
 
 # what an ``APIServerMessage`` carries; None for ``setup_done``
-APIServerMessageBody = ResultTensors | ResultTokens | RequestComplete | RequestFailed | None
+APIServerMessageBody = (
+    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ReadQuarantine | None
+)
 
 
 @dataclass
 class APIServerMessage:
     """Envelope for messages received by the API server."""
-    # "result_tensors" | "result_tokens" | "request_complete" | "request_failed" | "setup_done"
+    # "result_tensors" | "result_tokens" | "request_complete" | "request_failed"
+    # | "read_quarantine" | "setup_done"
     message_type: str
     body: APIServerMessageBody = None
 

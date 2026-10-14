@@ -64,6 +64,7 @@ def test_preprocess_failure_emits_error_chunk():
         force_cleanup_request=cleaned.append,
         has_inflight_reads=lambda rid: False,
         get_ready_tensors=lambda: {},
+        take_failed_reads=lambda: [],
     )
     wt.model = _RejectingModel()
     wt.device = "cpu"
@@ -72,6 +73,12 @@ def test_preprocess_failure_emits_error_chunk():
     wt.in_flight_requests = set()
     wt._draining_rids = set()
     wt._reads_done_sent = set()
+    wt._failed_rids = set()
+    wt._pending_ids = set()
+    wt._pre_admit_cancelled = set()
+    wt._admit_lock = threading.Lock()
+    wt.output_loop_idxs = {}
+    wt.per_request_reading_tensors = {}
 
     wt.in_queue.put(PreprocessInput(
         request_id="r1", text="x", file_paths=None,

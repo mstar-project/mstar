@@ -15,6 +15,7 @@
 //!       input_modalities, output_modalities, model_kwargs, streaming}
 //!   conductor -> frontend: {t:"chunk", rid, modality, data(bin), metadata}
 //!                        | {t:"done",  rid}
+//!                        | {t:"pong",  rid, msg}  (msg non-empty: unhealthy)
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,17 @@ pub enum StreamItem {
     /// frontend should return (from the error chunk's `metadata.status`).
     Error { status: u16, message: String },
     Done,
+}
+
+/// What the deep health check's ping learned about the backend.
+#[derive(Debug)]
+pub enum Health {
+    Healthy,
+    /// The backend answered but reports itself unhealthy; the reason is its
+    /// message (e.g. buffers kept from failed tensor reads past their budget).
+    Unhealthy(String),
+    /// No answer in time: the bridge loop or the backend behind it is gone.
+    Unreachable,
 }
 
 // ---- wire messages ----
@@ -157,7 +169,12 @@ impl Bridge {
                     true,
                 ),
                 "done" => (Some(StreamItem::Done), true),
-                // Liveness reply: completes the ping's route like a request.
+                // Liveness reply: completes the ping's route like a request. A
+                // non-empty `msg` is the backend reporting itself unhealthy.
+                "pong" if !msg.msg.is_empty() => (
+                    Some(StreamItem::Error { status: 503, message: msg.msg }),
+                    true,
+                ),
                 "pong" => (Some(StreamItem::Done), true),
                 _ => (None, false),
             };
@@ -215,9 +232,8 @@ impl Bridge {
     }
 
     /// Liveness round-trip for the deep health check: send `{t:"ping"}` and
-    /// wait for the backend's pong (routed like a completed request). False
-    /// on timeout — the bridge loop or the backend behind it is gone.
-    pub async fn ping(&self, timeout: Duration) -> bool {
+    /// wait for the backend's pong (routed like a completed request).
+    pub async fn ping(&self, timeout: Duration) -> Health {
         let rid = format!("ping-{}", uuid::Uuid::new_v4());
         let (tx, mut rx) = unbounded_channel();
         self.routes
@@ -228,9 +244,13 @@ impl Bridge {
         if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
             let _ = self.mbox.send("bridge", &payload);
         }
-        let ok = tokio::time::timeout(timeout, rx.recv()).await.is_ok();
+        let health = match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(StreamItem::Error { message, .. })) => Health::Unhealthy(message),
+            Ok(Some(_)) => Health::Healthy,
+            Ok(None) | Err(_) => Health::Unreachable,
+        };
         self.routes.lock().expect("routes lock").remove(&rid);
-        ok
+        health
     }
 
     /// Abort a request (client disconnected or timed out): tell the conductor

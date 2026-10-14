@@ -8,6 +8,7 @@ test/modular/test_ragged_attention_cpu.py
 test/modular/test_rid_handles.py
 test/modular/test_tensor_uuid.py
 test/modular/test_shm_tensor_comm.py
+test/modular/test_failed_tensor_read.py
 test/modular/test_deployment_lock.py
 test/modular/test_waypoint_components.py
 test/modular/test_waypoint_dit.py
@@ -25,6 +26,7 @@ test/modular/test_binary_framing.py
 test/modular/test_video_frame_protocol.py
 test/modular/test_client_sdk.py
 test/modular/test_request_failure_propagation.py
+test/modular/test_process_liveness.py
 test/modular/test_api_result_delivery.py
 test/modular/test_api_completion_guard.py
 test/modular/test_speculation_external_inputs.py

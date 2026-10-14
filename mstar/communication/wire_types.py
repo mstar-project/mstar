@@ -32,6 +32,7 @@ from mstar.engine.resources.kv.transfer import (
 from mstar.engine.resources.position.manager import PublishedPositionInfo
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.profile.format import ReadQuarantine
 from mstar.utils.ipc_format import (
     AbortRequest,
     ConductorMessage,
@@ -83,6 +84,7 @@ _TYPES: dict[str, type] = {
     "result_tokens": ResultTokens,
     "request_complete": RequestComplete,
     "request_failed": RequestFailed,
+    "read_quarantine": ReadQuarantine,
     "result_chunk": ResultChunk,
     "preprocess_input": PreprocessInput,
     "data_worker_profile": DataWorkerProfile,

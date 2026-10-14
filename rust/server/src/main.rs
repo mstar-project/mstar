@@ -49,7 +49,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use adapters::{Adapter, SubmitArgs};
-use bridge::{Bridge, ResultChunk};
+use bridge::{Bridge, Health, ResultChunk};
 use protocol::{
     ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest,
     VideoGenerationRequest,
@@ -343,13 +343,20 @@ fn sse_error_event(status: u16, msg: &str) -> Event {
 /// Deep health: liveness of the whole serving path, not just this process.
 /// With a bridge configured, a ping must round-trip to the Python backend —
 /// so a dead bridge loop or conductor turns the LB check red instead of
-/// letting requests queue into the timeout. Mock mode stays shallow.
+/// letting requests queue into the timeout. A backend that answers but
+/// reports itself unhealthy turns it red too, with the backend's reason.
+/// Mock mode stays shallow.
 async fn health(State(st): State<AppState>) -> Response {
     if let Some(bridge) = &st.bridge {
-        if !bridge.ping(std::time::Duration::from_secs(2)).await {
+        let reason = match bridge.ping(std::time::Duration::from_secs(2)).await {
+            Health::Healthy => None,
+            Health::Unhealthy(reason) => Some(reason),
+            Health::Unreachable => Some("backend bridge unreachable".to_string()),
+        };
+        if let Some(reason) = reason {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"status": "unhealthy", "reason": "backend bridge unreachable"})),
+                Json(json!({"status": "unhealthy", "reason": reason})),
             )
                 .into_response();
         }

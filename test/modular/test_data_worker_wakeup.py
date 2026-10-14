@@ -60,6 +60,9 @@ class _TM:
     def get_ready_tensors(self):
         return {}
 
+    def take_failed_reads(self):
+        return []
+
     def has_inflight_reads(self, request_id):
         return False
 
@@ -83,6 +86,8 @@ def _thread(comm, wakeup, idle_wait_ms=2000):
         tensor_manager=_TM(), model=_Model(), wakeup=wakeup,
     )
     worker.idle_wait_ms = idle_wait_ms
+    # tokens only arrive for admitted requests
+    worker.in_flight_requests.add("req")
     t = threading.Thread(target=worker.run, daemon=True)
     t.start()
     return worker, stop, t
