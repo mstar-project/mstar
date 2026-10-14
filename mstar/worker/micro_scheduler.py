@@ -697,7 +697,14 @@ class MicroScheduler:
         request.capture_group = functools.partial(
             self._capture_group, request_state, *node_walk,
         )
+        # Read before the build: `_merged` folds `fresh` into `backlog` in place.
+        expected = set()
+        if request.backlog is not None:
+            expected |= request.backlog.request_to_worker_graph.keys()
+        if request.fresh is not None:
+            expected |= request.fresh.request_to_worker_graph.keys()
         result: BatchBuildResult = self.batch_builder.build_batch(request)
+        self._refuse_lost_rows(node_walk, expected, result)
         # Whatever was popped past this step has to be remembered here, or it
         # would never run.
         if result.backlog is not None:
@@ -711,6 +718,30 @@ class MicroScheduler:
         if result.scheduled is not None:
             self._mark_scheduled(*node_walk, len(result.scheduled))
         return result.scheduled
+
+    @staticmethod
+    def _refuse_lost_rows(
+        node_walk: tuple[str, str], expected: set[int], result: BatchBuildResult,
+    ) -> None:
+        """Every row handed to a builder must come back out of it.
+
+        A row missing from all three of ``scheduled``, ``backlog`` and
+        ``returned`` has already come off its ready queue and is marked in
+        flight, so nothing will ever schedule it again and the request hangs
+        for good. Raising here costs one set per step and names the rows; the
+        alternative is a silent hang with no evidence of where it started.
+        """
+        got = set()
+        for part in (result.scheduled, result.backlog):
+            if part is not None:
+                got |= part.request_to_worker_graph.keys()
+        if result.returned:
+            got |= result.returned.keys()
+        if got != expected:
+            raise AssertionError(
+                f"batch builder dropped rows for {node_walk}: "
+                f"lost {sorted(expected - got)}, invented {sorted(got - expected)}"
+            )
 
     def _backlog(self, node_walk: tuple[str, str], batch: ScheduledBatch) -> None:
         """Park ``batch``, folding it into whatever already waits under this key.
