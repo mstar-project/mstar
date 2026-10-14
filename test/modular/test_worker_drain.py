@@ -17,6 +17,7 @@ from mstar.utils.ipc_format import (
     MessageSource,
     RemoveRequest,
 )
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
 from mstar.worker.worker import Worker
 
@@ -98,7 +99,11 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     w._graph_runtime.cleanup_consumed_inputs = lambda *args: ({}, {})
     w._graph_runtime.pending_loop_stop_rids = lambda *args: {7}
     pending = SimpleNamespace(
-        batch=SimpleNamespace(node_name="LLM", request_to_worker_graph={7: 0}),
+        # the real batch: postprocess groups its rids by walk and discards
+        # through it, which a namespace cannot answer for
+        batch=ScheduledBatch(
+            node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
+        ),
         node_batch=SimpleNamespace(request_ids=[7], per_request_info={7: object()}),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
     )
