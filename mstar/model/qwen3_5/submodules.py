@@ -72,7 +72,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     device_loopback_enabled,
 )
-from mstar.utils.knobs import ingraph_decode_rope, ingraph_decode_tokens
+from mstar.utils.knobs import ingraph_decode_rope
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 logger = logging.getLogger(__name__)
@@ -386,17 +386,13 @@ class LLMSubmodule(ARNodeSubmodule):
         out: dict[str, torch.Tensor | Any] = {}
         captured = self._captured_decode(engine_inputs, graph_walk)
         if inputs[0].input_ids is None and inputs[0].input_embeds is None:
-            if captured and ingraph_decode_tokens():
-                # the captured forward gathers the ids itself (see _forward)
-                pass
-            else:
-                # device loop-back: every row of a decode step is its request's
-                # last sampled token, read by slot (padding rows read slot 0)
-                sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-                t0 = perf_counter() if PHASE_PERIOD else 0.0
-                out["input_ids"] = sampler.loopback_tokens(engine_inputs.request_ids)
-                if PHASE_PERIOD:
-                    phase_record("engine.preprocess.loopback", perf_counter() - t0)
+            # device loop-back: every row of a decode step is its request's
+            # last sampled token, read by slot (padding rows read slot 0)
+            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            out["input_ids"] = sampler.loopback_tokens(engine_inputs.request_ids)
+            if PHASE_PERIOD:
+                phase_record("engine.preprocess.loopback", perf_counter() - t0)
             if captured and ingraph_decode_rope():
                 # the captured forward builds the rotary tables itself
                 return out
@@ -481,13 +477,7 @@ class LLMSubmodule(ARNodeSubmodule):
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         captured = self._captured_decode(engine_inputs, graph_walk)
-        if captured and ingraph_decode_tokens():
-            # MSTAR_INGRAPH_DECODE_TOKENS: the gather off the slot master is
-            # recorded in the graph. The capture hands over the slot's static
-            # input_ids as well; they stay unread, as a replay never refills them
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
-            input_embeds = None
-        elif input_ids is None and input_embeds is None:
+        if input_ids is None and input_embeds is None:
             input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
         if (captured and ingraph_decode_rope()) or cos_3d is None or sin_3d is None:
             # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned

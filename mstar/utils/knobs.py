@@ -49,15 +49,6 @@ def tp_early_spec() -> bool:
     return os.environ.get("MSTAR_TP_EARLY_SPEC", "0") == "1"
 
 
-def ingraph_decode_tokens() -> bool:
-    """``MSTAR_INGRAPH_DECODE_TOKENS`` (default 0): a captured decode step
-    gathers its input ids off the sampler's slot master inside the graph
-    instead of staging a gathered tensor before the replay. Experiment knob:
-    the combined form of this and ``ingraph_decode_rope`` produced wrong
-    outputs once; each half is gated on its own."""
-    return os.environ.get("MSTAR_INGRAPH_DECODE_TOKENS", "0") == "1"
-
-
 def ingraph_decode_rope() -> bool:
     """``MSTAR_INGRAPH_DECODE_ROPE`` (default 0): a captured decode step
     builds its rotary tables inside the graph from the position resource's

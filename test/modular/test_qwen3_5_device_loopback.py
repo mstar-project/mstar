@@ -93,7 +93,7 @@ def test_the_loop_back_decode_row_is_uniform(monkeypatch):
     assert LLMSubmodule.uniform_row_inputs(sub, "decode") is None
 
 
-def test_in_graph_decode_inputs_are_two_separate_knobs(monkeypatch):
+def test_in_graph_rope_knob_drops_only_the_staged_tables(monkeypatch):
     sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]))
     sub = _sub(sampler)
     rows = [_prepare(sub, "decode", {}) for _ in range(2)]
@@ -106,19 +106,12 @@ def test_in_graph_decode_inputs_are_two_separate_knobs(monkeypatch):
         embed_tokens=SimpleNamespace(weight=torch.zeros(1)),
     ))
     sub._position_ids_3d = lambda inputs: torch.zeros(3, len(inputs))
-    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_TOKENS", raising=False)
     monkeypatch.delenv("MSTAR_INGRAPH_DECODE_ROPE", raising=False)
     out = LLMSubmodule.preprocess(sub, "decode", leased, rows)
     assert out["input_ids"].tolist() == [3, 4] and "cos_3d" in out
-    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_TOKENS", "1")
-    out = LLMSubmodule.preprocess(sub, "decode", leased, rows)
-    assert "input_ids" not in out and "cos_3d" in out
     monkeypatch.setenv("MSTAR_INGRAPH_DECODE_ROPE", "1")
-    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_TOKENS", raising=False)
     out = LLMSubmodule.preprocess(sub, "decode", leased, rows)
     assert out["input_ids"].tolist() == [3, 4] and "cos_3d" not in out
-    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_TOKENS", "1")
-    assert LLMSubmodule.preprocess(sub, "decode", leased, rows) == {}
     eager = SimpleNamespace(
         resources={SAMPLER: sampler}, request_ids=["r1", "r2"],
         step=SimpleNamespace(ctx=SimpleNamespace(slot_lease=None, graph_walk="decode")),
@@ -127,10 +120,10 @@ def test_in_graph_decode_inputs_are_two_separate_knobs(monkeypatch):
     assert out["input_ids"].tolist() == [3, 4] and "cos_3d" in out
 
 
-def test_forward_in_graph_knobs_read_the_slot_buffers_at_capture(monkeypatch):
+def test_forward_in_graph_rope_reads_planned_positions_at_capture(monkeypatch):
     """A capture hands the region the slot's static input_ids and rotary
-    tables. With a knob on, the forward reads the sampler master / the
-    planned positions instead, so the graph records those reads; the
+    tables. The ids are always the static ones; with the rope knob on, the
+    forward builds the tables from the planned positions instead. The
     capture's own context carries the piecewise walk, not "decode"."""
     from mstar.model.qwen3_5.config import ATTN, ROPE
 
@@ -173,21 +166,13 @@ def test_forward_in_graph_knobs_read_the_slot_buffers_at_capture(monkeypatch):
         assert out == ("sampled", ["r1", "r2"])
         return dict(calls)
 
-    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_TOKENS", raising=False)
     monkeypatch.delenv("MSTAR_INGRAPH_DECODE_ROPE", raising=False)
     c = run(object())
     assert c["ids"] == [9, 9] and c["cos"] is static_cos and "built" not in c
-    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_TOKENS", "1")
-    c = run(object())
-    assert c["ids"] == [3, 4] and c["cos"] is static_cos
-    monkeypatch.delenv("MSTAR_INGRAPH_DECODE_TOKENS", raising=False)
     monkeypatch.setenv("MSTAR_INGRAPH_DECODE_ROPE", "1")
     c = run(object())
     assert c["ids"] == [9, 9] and c["built"].tolist() == [[10, 20]] * 3 and c["cos"] is not static_cos
-    monkeypatch.setenv("MSTAR_INGRAPH_DECODE_TOKENS", "1")
-    c = run(object())
-    assert c["ids"] == [3, 4] and "built" in c
-    # no lease (an eager step): the knobs do not apply, the inputs are used
+    # no lease (an eager step): the knob does not apply, the inputs are used
     c = run(None)
     assert c["ids"] == [9, 9] and c["cos"] is static_cos and "built" not in c
 

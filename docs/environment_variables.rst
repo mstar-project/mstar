@@ -398,11 +398,6 @@ Worker scheduling
        decoder) no longer pays the eager-step master write, a small
        synchronous host-to-device copy per step. ``0`` keeps every node on
        the per-request tensor path.
-   * - ``MSTAR_INGRAPH_DECODE_TOKENS``
-     - ``0``
-     - A captured decode step gathers its input ids off the sampler's slot
-       master inside the graph instead of staging them before the replay.
-       Experiment knob, measured and gated on its own.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
      - ``0``
      - A captured decode step builds its rotary tables inside the graph from
