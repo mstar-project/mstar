@@ -1025,3 +1025,38 @@ def test_inline_values_must_cover_every_rid_or_are_ignored():
     ))
     assert 201 in out.register_uuids, "no values, so the tensor path"
     rt.send_outputs(_send_input(rid, out.completion_id))
+
+
+def test_a_loop_back_routed_with_no_tensor_keeps_the_loop_going():
+    """The device-side loop-back: the worker routes the decode signal with
+    zero tensors per request (the token stays on the device) and the client
+    copy rides inline. The node stays ready, the loop counter advances, the
+    next pop reports the signal with no uuids, and cleanup frees nothing."""
+    rt = _client_loop_runtime()
+    rid = _admit(rt)
+    rt._communicator = _Recorder()
+    _reach_dec(rt, rid, 300)
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="dec",
+        output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[], num_tensors=[0], inline_signal="token", inline_values=[7],
+    ))
+    assert out.register_uuids == [], "nothing to stage for the client"
+    rt.send_outputs(_send_input(rid, out.completion_id))
+    popped = rt.pop_rids("dec", WALK, [rid])
+    assert popped is not None, "the loop-back with no tensor still fed the node"
+    inputs = popped.input_edges.to_input_tensors(lambda u: (_ for _ in ()).throw(KeyError(u)))
+    assert inputs.by_rid[rid] == {"token": []}
+    before = dict(rt.get_dynamic_loop_iters([rid], "default").values[0])
+    # another zero-tensor step: still ready, nothing freed by the cleanup, the
+    # loop counter moved
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="dec",
+        output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[], num_tensors=[0], inline_signal="token", inline_values=[8],
+    ))
+    assert out.freed_inputs.uuids == []
+    rt.send_outputs(_send_input(rid, out.completion_id))
+    assert rt.pop_rids("dec", WALK, [rid]) is not None
+    after = dict(rt.get_dynamic_loop_iters([rid], "default").values[0])
+    assert after["loop"] == before["loop"] + 1

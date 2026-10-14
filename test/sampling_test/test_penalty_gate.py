@@ -47,6 +47,8 @@ class _RecordingSampler:
 class _RecordingBuffers:
     """Stands in for SamplerBuffers, recording just what the gate controls."""
 
+    ingraph_scatter = False
+
     def __init__(self):
         self.sampler = _RecordingSampler()
         self.staged = 0
@@ -69,6 +71,9 @@ class _RecordingBuffers:
 
     def scatter_offset(self, cg_slot=0, keep=None):
         self.offset_scatters += 1
+
+    def keep_mask(self, keep):
+        return None if keep is None else torch.tensor(keep, dtype=torch.bool)
 
     def register_request(self, rid, sampling_config):
         pass

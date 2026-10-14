@@ -325,7 +325,7 @@ def test_two_capture_configs_can_each_open_and_claim():
     kv = _manager(_ring_config(num_sessions=1))
     pool = DummyRowPool(
         prefix="dit",
-        step_runner=SimpleNamespace(ingest_request=kv.ingest_request),
+        step_runner=SimpleNamespace(ingest_capture_row=kv.ingest_capture_row),
         resources={"kv": kv},
     )
 

@@ -1,0 +1,45 @@
+# NVIDIA NemotronLabs VoiceChat-11B — disaggregated duplex layout.
+#
+# Each streaming consumer runs on its own GPU / worker thread so the
+# frame-synchronous decode loop, the talker loop, and the codec run in a
+# pipeline instead of serializing on one GPU thread. The colocated single-GPU
+# layout (configs/nemotron_duplex.yaml) also works and produces identical
+# output; this layout trades GPUs for pipeline parallelism / throughput.
+# Encoder + LLM share rank 0 (the encoder runs once up front, then the LLM
+# decode loop consumes its frames — no interleaving between them).
+#
+#   rank 0: conformer_encoder (Encoder) + nano_llm (LLM)
+#   rank 1: eartts_talker     (Talker)
+#   rank 2: audio_codec       (Codec)
+model: "nemotron_duplex"
+max_seq_len: 12288
+
+# One recurrent slot per session (DEFAULT_MAMBA_SLOTS); past it the engine spins
+# on admit and wedges every session. Keep the two equal; the overflow queues.
+max_concurrent_requests: 32
+
+# Sessions longer than max_session_s get a 400. The talker KV pool is sized so
+# 32 sessions that long fit at once (160 s: 1025 pages, 28 GiB); a longer cap
+# grows it in step. A full talker pool stalls every session.
+model_kwargs:
+  max_session_s: 160
+  # Longer system prompts get a 400; the prompt prefills in one step that
+  # stalls every live session (~2.75 ms/token). TODO(prefill): drop once chunked.
+  max_prompt_tokens: 512
+
+node_groups:
+  - node_names:
+      - conformer_encoder
+      - nano_llm
+    ranks:
+      - 0
+
+  - node_names:
+      - eartts_talker
+    ranks:
+      - 1
+
+  - node_names:
+      - audio_codec
+    ranks:
+      - 2

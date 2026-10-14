@@ -150,6 +150,10 @@ class Resource(ABC):
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None):
         return
 
+    def ingest_capture_row(self, rid: str):
+        """Open an accelerator graph capture padding row; by default, as a request."""
+        self.ingest_request(rid, None)
+
     def remove_request(self, rid: str):
         return
 
