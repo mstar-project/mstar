@@ -333,7 +333,8 @@ class SNACDecoderSubmodule(NodeSubmodule):
             chunk = self._stream_chunk(per_request_input_metadata.get(request_id))
             if chunk is None:
                 return None
-            frames.add(chunk.num_items // self.config.tokens_per_frame)
+            # prepare_inputs decodes a stream shorter than a frame as one frame
+            frames.add(max(chunk.num_items // self.config.tokens_per_frame, 1))
         return frames.pop() if len(frames) == 1 else None
 
     def preprocess(

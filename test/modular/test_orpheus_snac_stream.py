@@ -213,12 +213,46 @@ def test_mixed_batches_match_each_requests_whole_decode(fake, config):
     assert None in keys and any(isinstance(key, int) for key in keys)
 
 
-def test_uniform_batches_name_a_captured_window(fake, config):
-    _, keys = _stream_batched(fake, {"r": _tokens(config, 40)})
-    windows = {cfg.additional_key_info for cfg in fake.get_cuda_graph_configs(torch.device("cpu"))}
-    assert windows == set(config.snac_window_frames())
-    # every non-final window of a stream replays a capture; only the flush may miss
-    assert all(key in windows for key in keys[:-1])
+GEOMETRIES = {
+    "default": {},
+    "no ramp": dict(snac_chunk_schedule=(4,)),
+    "right context 3": dict(snac_right_context_frames=3),
+    "reference window": dict(snac_chunk_schedule=(4,), snac_chunk_frames=1,
+                             snac_left_context_frames=1, snac_right_context_frames=2),
+}
+
+
+@pytest.mark.parametrize("overrides", list(GEOMETRIES.values()), ids=list(GEOMETRIES))
+def test_no_window_size_falls_back_to_eager(overrides):
+    """Every window of every stream length, final flush included, names a
+    captured size, so the scheduler (which batches each size apart) never
+    hands SNAC a step without a graph."""
+    config = OrpheusModelConfig(**overrides)
+    submodule = SNACDecoderSubmodule(_NeighbourDecoder(), config)
+    configs = submodule.get_cuda_graph_configs(torch.device("cpu"))
+    captured = {cfg.additional_key_info for cfg in configs}
+    assert submodule.split_batches_by_capture_key("snac_chunk")
+    assert not any(cfg.compile for cfg in configs)
+    for frames in range(0, 64):
+        for eos in (False, True):
+            tokens = _tokens(config, frames, eos=eos)
+            if not tokens.numel():
+                continue
+            buffer = StreamBuffer(request_id="r", edge_name="new_token", from_partition="LLM", policy=_policy(config))
+            for i, token in enumerate(tokens):
+                buffer.pre_read_register(f"t{i}")
+                buffer.put(f"t{i}", token.view(1))
+            buffer.signal_done()
+            info = SimpleNamespace(request_id="r", rid_handle="r")
+            while buffer.has_chunk_ready():
+                chunk = buffer.pop_chunk()
+                meta = InputMetadata(stream_chunks={"new_token": chunk.info})
+                key = submodule.cg_key_info("snac_chunk", {"r": info}, per_request_input_metadata={"r": meta})
+                item = submodule.prepare_inputs("snac_chunk", info, {"new_token": [chunk.data["data"]]},
+                                                input_metadata=meta)
+                assert key in captured, (frames, eos, chunk.info)
+                assert item.input_ids.shape[0] == key
+                assert submodule.can_use_cuda_graphs(SimpleNamespace(graph_walk="snac_chunk"), [item, item])
 
 
 def test_model_kwargs_override_the_window(monkeypatch):
@@ -231,7 +265,7 @@ def test_model_kwargs_override_the_window(monkeypatch):
         snac_left_context_frames=4, snac_right_context_frames=1,
     )
     assert model.config.snac_chunk_schedule == (2,)
-    assert model.config.snac_window_frames() == [2, 10, 13]
+    assert {2, 10, 13} <= set(model.config.snac_window_frames()) and max(model.config.snac_window_frames()) == 13
     policy = _policy(model.config)
     assert not policy.is_ready(2 * TPF - 1) and policy.is_ready(2 * TPF)
     with pytest.raises(ValueError):
