@@ -737,9 +737,12 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -1025,6 +1028,8 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># the step whose pre-plan is staged across the pre-planning resources,</span>
         <span class="c1"># as `_step_key` describes it; None when nothing is staged</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span><span class="p">:</span> <span class="nb">tuple</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># (step key, ready) of the last pre_admit whose stage is still up</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pre_admitted</span><span class="p">:</span> <span class="nb">tuple</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="StepRunner.resolve_cached_prefix">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.resolve_cached_prefix">[docs]</a>
@@ -1197,11 +1202,23 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
         <span class="n">overrides</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""open state on all resources; `overrides` are per-resource"""</span>
-        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">ingest_request</span><span class="p">(</span>
-                <span class="n">rid</span><span class="p">,</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">overrides</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">overrides</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
-            <span class="p">)</span></div>
+<span class="w">        </span><span class="sd">"""open state on all resources; `overrides` are per-resource. All or</span>
+<span class="sd">        nothing: a resource that raises leaves the request on none of them."""</span>
+        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">key</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">):</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">ingest_request</span><span class="p">(</span>
+                    <span class="n">rid</span><span class="p">,</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">overrides</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">overrides</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+                <span class="p">)</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                <span class="c1"># the raising resource may have taken part of it too</span>
+                <span class="k">for</span> <span class="n">done</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">[:</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]:</span>
+                    <span class="k">try</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">done</span><span class="p">]</span><span class="o">.</span><span class="n">remove_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+                    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                        <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span>
+                            <span class="s2">"rolling back request </span><span class="si">%s</span><span class="s2"> on resource </span><span class="si">%s</span><span class="s2"> failed"</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">done</span><span class="p">,</span>
+                        <span class="p">)</span>
+                <span class="k">raise</span></div>
 
 
 <div class="viewcode-block" id="StepRunner.remove_request">
@@ -1276,9 +1293,10 @@ window.runMermaid = runMermaid;</script>
             <span class="p">),</span>
         <span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_drop_stale_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_drop_stale_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Returns the step's key when the stage is for this very step."""</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">:</span>
-            <span class="k">return</span>
+            <span class="k">return</span> <span class="kc">None</span>
         <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_step_key</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span> <span class="o">!=</span> <span class="n">key</span><span class="p">:</span>
             <span class="c1"># Not the normal path: the worker meant to run the staged step</span>
@@ -1289,6 +1307,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_staged</span><span class="p">[</span><span class="mi">1</span><span class="p">]),</span> <span class="n">key</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">len</span><span class="p">(</span><span class="n">key</span><span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
             <span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="n">key</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">staged</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -1300,6 +1320,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">clear_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Drop the staged pre-plan on every resource, and the record of it."""</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pre_admitted</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span></div>
 
@@ -1310,10 +1331,21 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Reserve capacity for step. A refused admit gives back everything</span>
 <span class="sd">        the step reserved.</span>
 <span class="sd">        """</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_drop_stale_preplan</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
+        <span class="n">staged_key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_drop_stale_preplan</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
+        <span class="c1"># A step whose ``pre_admit`` ran a step ahead, and whose stage is still</span>
+        <span class="c1"># up for it, skips the resources that sweep covered: each would only</span>
+        <span class="c1"># find its own reservation and no-op (0.1 ms of Python per step at</span>
+        <span class="c1"># 128 rows, on the gpu thread). A refusal below still unwinds them.</span>
+        <span class="n">covered</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">ready</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="n">pre</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pre_admitted</span>
+        <span class="k">if</span> <span class="n">pre</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">staged_key</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">pre</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">staged_key</span><span class="p">:</span>
+            <span class="n">covered</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
+            <span class="n">ready</span> <span class="o">=</span> <span class="n">pre</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
         <span class="n">admitted</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">covered</span><span class="p">:</span>
+                <span class="k">continue</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                 <span class="n">range_push</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.admit.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
             <span class="n">t0</span> <span class="o">=</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="k">if</span> <span class="n">PHASE_PERIOD</span> <span class="k">else</span> <span class="mf">0.0</span>
@@ -1329,7 +1361,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">"Admit for resource </span><span class="si">%s</span><span class="s2"> failed with error: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
                     <span class="n">key</span><span class="p">,</span> <span class="n">outcome</span><span class="o">.</span><span class="n">reason</span><span class="o">.</span><span class="n">message</span>
                 <span class="p">)</span>
-                <span class="k">for</span> <span class="n">done</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">([</span><span class="o">*</span><span class="n">admitted</span><span class="p">,</span> <span class="n">key</span><span class="p">]):</span>
+                <span class="k">for</span> <span class="n">done</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">([</span><span class="o">*</span><span class="n">covered</span><span class="p">,</span> <span class="o">*</span><span class="n">admitted</span><span class="p">,</span> <span class="n">key</span><span class="p">]):</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">done</span><span class="p">]</span><span class="o">.</span><span class="n">rollback_admit</span><span class="p">(</span>
                         <span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">done</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">,</span>
                     <span class="p">)</span>
@@ -1351,6 +1383,7 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># the resources promote their staged share below (or plan afresh</span>
             <span class="c1"># if nothing was staged): either way nothing stays staged</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pre_admitted</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">results</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">plan_results</span>
         <span class="n">results</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
@@ -1396,9 +1429,11 @@ window.runMermaid = runMermaid;</script>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">done</span><span class="p">]</span><span class="o">.</span><span class="n">rollback_admit</span><span class="p">(</span>
                         <span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">done</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">,</span>
                     <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_pre_admitted</span> <span class="o">=</span> <span class="kc">None</span>
                 <span class="k">return</span> <span class="n">FullAdmitOutcome</span><span class="p">(</span><span class="n">outcome</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span>
             <span class="n">admitted</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
             <span class="n">ready</span> <span class="o">=</span> <span class="n">ready</span> <span class="ow">and</span> <span class="n">outcome</span><span class="o">.</span><span class="n">ready</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pre_admitted</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_step_key</span><span class="p">(</span><span class="n">step</span><span class="p">),</span> <span class="n">ready</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">FULL_ADMIT_OK</span> <span class="k">if</span> <span class="n">ready</span> <span class="k">else</span> <span class="n">FULL_ADMIT_NOT_READY</span></div>
 
 

@@ -384,9 +384,12 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -621,6 +624,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.HostLens"><code class="docutils literal notranslate"><span class="pre">HostLens</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.cpu_indptrs"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.cpu_indptrs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.cuda_indptrs"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.cuda_indptrs</span></code></a></li>
@@ -690,21 +694,38 @@ consumer depends on the contract rather than on the cache.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.KVPlanOutput" title="mstar.engine.resources.kv.plan.KVPlanOutput"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVPlanOutput</span></code></a>(cpu_indptrs, views[, cuda_indptrs])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.HostLens" title="mstar.engine.resources.kv.plan.HostLens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HostLens</span></code></a></p></td>
+<td><p>A host int32 row whose iteration yields numpy scalars.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.KVPlanOutput" title="mstar.engine.resources.kv.plan.KVPlanOutput"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVPlanOutput</span></code></a>(cpu_indptrs, views[, cuda_indptrs])</p></td>
 <td><p>Output of KVManager.plan for a single label</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.KVPlanOutputs" title="mstar.engine.resources.kv.plan.KVPlanOutputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVPlanOutputs</span></code></a>([mapping, pre_forks, post_forks])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.KVPlanOutputs" title="mstar.engine.resources.kv.plan.KVPlanOutputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVPlanOutputs</span></code></a>([mapping, pre_forks, post_forks])</p></td>
 <td><p>Plan label -&gt; output, plus the label forks of the step it came from.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.PagedIndptrs" title="mstar.engine.resources.kv.plan.PagedIndptrs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PagedIndptrs</span></code></a>(qo_indptr, paged_kv_indptr, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.PagedIndptrs" title="mstar.engine.resources.kv.plan.PagedIndptrs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PagedIndptrs</span></code></a>(qo_indptr, paged_kv_indptr, ...)</p></td>
 <td><p>The four int32 index tensors a FlashInfer prefill/decode wrapper's <code class="docutils literal notranslate"><span class="pre">plan</span></code> consumes, built on CPU (so wrapper.plan's <code class="docutils literal notranslate"><span class="pre">.to(&quot;cpu&quot;)</span></code> is a no-op — see <code class="docutils literal notranslate"><span class="pre">FlashInferAttentionManager.plan</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.SequenceView" title="mstar.engine.resources.kv.plan.SequenceView"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SequenceView</span></code></a>(request_id, label, page_idxs, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.plan.SequenceView" title="mstar.engine.resources.kv.plan.SequenceView"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SequenceView</span></code></a>(request_id, label, page_idxs, ...)</p></td>
 <td><p>One (request, label) stream as this step sees it.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.HostLens">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.plan.</span></span><span class="sig-name descname"><span class="pre">HostLens</span></span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#HostLens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.HostLens" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Tensor</span></code></a></p>
+<p>A host int32 row whose iteration yields numpy scalars.</p>
+<p>FlashInfer’s decode <code class="docutils literal notranslate"><span class="pre">plan</span></code> takes the longest row with the Python builtin
+<code class="docutils literal notranslate"><span class="pre">max(seq_lens)</span></code> and <code class="docutils literal notranslate"><span class="pre">.item()</span></code> on the result; iterating a tensor hands
+out one 0-d tensor per row, about 2 us each (0.35 ms at 128 rows, on the
+plan thread every decode step). Iterating the numpy view costs 0.1 us a
+row and the numpy scalar has <code class="docutils literal notranslate"><span class="pre">.item()</span></code> too. Everything else FlashInfer
+does with the row (<code class="docutils literal notranslate"><span class="pre">.cpu()</span></code>, <code class="docutils literal notranslate"><span class="pre">.min()</span></code>, <code class="docutils literal notranslate"><span class="pre">len</span></code>, a <code class="docutils literal notranslate"><span class="pre">copy_</span></code> into its
+device buffer) is plain tensor behaviour.</p>
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.plan.KVPlanOutput">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.plan.</span></span><span class="sig-name descname"><span class="pre">KVPlanOutput</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">cpu_indptrs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">views</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cuda_indptrs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/plan.html#KVPlanOutput"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.plan.KVPlanOutput" title="Link to this definition">#</a></dt>
@@ -1004,6 +1025,7 @@ will read <cite>plan</cite> output of KV</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.HostLens"><code class="docutils literal notranslate"><span class="pre">HostLens</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.cpu_indptrs"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.cpu_indptrs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.plan.KVPlanOutput.cuda_indptrs"><code class="docutils literal notranslate"><span class="pre">KVPlanOutput.cuda_indptrs</span></code></a></li>

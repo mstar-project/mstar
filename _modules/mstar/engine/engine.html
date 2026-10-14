@@ -737,9 +737,12 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -1226,6 +1229,12 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># the resource that ran out, so an eviction can be scoped to it</span>
     <span class="n">failed_resource</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="c1"># Every output signal of this step stays on the device (the node's</span>
+    <span class="c1"># ``device_loopback_signals``): collect builds no per-request output</span>
+    <span class="c1"># dicts and the per-request ``postprocess`` is skipped; the stop check,</span>
+    <span class="c1"># the inline emit and the speculation splice read the rows instead.</span>
+    <span class="n">rows_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
     <span class="c1"># This step's outputs, published as soon as the forward has been</span>
     <span class="c1"># submitted — the tensors exist then, even though their values land later.</span>
     <span class="n">outputs</span><span class="p">:</span> <span class="n">BatchedModelOutput</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">BatchedModelOutput</span><span class="p">)</span>
@@ -1454,6 +1463,9 @@ window.runMermaid = runMermaid;</script>
             <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">relevant_nodes</span><span class="p">:</span>
                 <span class="n">node_to_resources</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">)</span>
 
+        <span class="c1"># rid -&gt; (node, walk) of its last step here when that step was rows-only,</span>
+        <span class="c1"># i.e. the sampler's slot master holds the token its next step reads</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_loopback_steps</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_runner</span> <span class="o">=</span> <span class="n">StepRunner</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">,</span>
             <span class="c1"># every node, including one that owns nothing (Code2Wav) — an</span>
@@ -1718,7 +1730,22 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># read leniently, as the probe itself was only reached per prepared row</span>
         <span class="n">keyed</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_keyed_walks"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="n">probe_prefix</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">keyed</span><span class="p">)</span> <span class="ow">and</span> <span class="n">walk</span> <span class="ow">in</span> <span class="n">keyed</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="p">,</span> <span class="p">())</span>
-        <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">batch</span><span class="o">.</span><span class="n">request_ids</span><span class="p">:</span>
+        <span class="n">loopback</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_loopback_rows</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">probe_prefix</span><span class="p">:</span>
+            <span class="n">uniform</span> <span class="o">=</span> <span class="n">submodule</span><span class="o">.</span><span class="n">uniform_row_inputs</span><span class="p">(</span>
+                <span class="n">walk</span><span class="p">,</span> <span class="n">has_loopback</span><span class="o">=</span><span class="n">loopback</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="n">loopback</span><span class="p">),</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">uniform</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="c1"># one object for all the step's rows: the per-row call would</span>
+                <span class="c1"># return an equal one each time (128 calls at a full decode</span>
+                <span class="c1"># batch, on the gpu thread before the launch)</span>
+                <span class="n">node_inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">uniform</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">request_ids</span><span class="p">)</span>
+                <span class="n">batch</span><span class="o">.</span><span class="n">register_prepare_batch</span><span class="p">(</span><span class="n">node_inputs</span><span class="p">)</span>
+                <span class="n">batch</span><span class="o">.</span><span class="n">running_batched</span> <span class="o">=</span> <span class="n">submodule</span><span class="o">.</span><span class="n">can_batch</span><span class="p">(</span>
+                    <span class="n">batch</span><span class="o">=</span><span class="n">batch</span><span class="p">,</span> <span class="n">model_inputs</span><span class="o">=</span><span class="n">node_inputs</span>
+                <span class="p">)</span>
+                <span class="k">return</span>
+        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">rid</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">request_ids</span><span class="p">):</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">req_inputs</span> <span class="o">=</span> <span class="n">prepare</span><span class="p">(</span>
                     <span class="n">graph_walk</span><span class="o">=</span><span class="n">walk</span><span class="p">,</span>
@@ -1730,6 +1757,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="c1"># look-ahead frames a token encoder withholds)</span>
                     <span class="n">is_final_stream_chunk</span><span class="o">=</span><span class="n">rid</span> <span class="ow">in</span> <span class="n">final_rids</span><span class="p">,</span>
                     <span class="n">input_metadata</span><span class="o">=</span><span class="n">metadata</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">EMPTY_INPUT_METADATA</span><span class="p">),</span>
+                    <span class="n">has_loopback</span><span class="o">=</span><span class="n">loopback</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">loopback</span><span class="p">[</span><span class="n">i</span><span class="p">],</span>
                 <span class="p">)</span>
                 <span class="k">if</span> <span class="n">req_inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">probe_prefix</span><span class="p">:</span>
                     <span class="n">req_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_skip_cached_prefix</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">req_inputs</span><span class="p">)</span>
@@ -1751,6 +1779,26 @@ window.runMermaid = runMermaid;</script>
             <span class="n">batch</span><span class="o">=</span><span class="n">batch</span><span class="p">,</span> <span class="n">model_inputs</span><span class="o">=</span><span class="n">node_inputs</span>
         <span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_loopback_rows</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">:</span> <span class="n">ExecutingBatch</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Per row, whether its input token is on the device (see</span>
+<span class="sd">        ``_loopback_steps``); None when no row's is."""</span>
+        <span class="n">steps</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_loopback_steps</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">steps</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="p">,</span> <span class="n">batch</span><span class="o">.</span><span class="n">step_context</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">)</span>
+        <span class="n">get</span> <span class="o">=</span> <span class="n">steps</span><span class="o">.</span><span class="n">get</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span> <span class="o">==</span> <span class="n">key</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">batch</span><span class="o">.</span><span class="n">request_ids</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_record_loopback</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">:</span> <span class="n">ExecutingBatch</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">steps</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_loopback_steps</span>
+        <span class="k">if</span> <span class="n">batch</span><span class="o">.</span><span class="n">rows_only</span><span class="p">:</span>
+            <span class="n">steps</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span>
+                <span class="n">batch</span><span class="o">.</span><span class="n">request_ids</span><span class="p">,</span> <span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="p">,</span> <span class="n">batch</span><span class="o">.</span><span class="n">step_context</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">),</span>
+            <span class="p">))</span>
+        <span class="k">elif</span> <span class="n">steps</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">batch</span><span class="o">.</span><span class="n">request_ids</span><span class="p">:</span>
+                <span class="n">steps</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+
 <div class="viewcode-block" id="Engine.inline_client_signals">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine.inline_client_signals">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">inline_client_signals</span><span class="p">(</span>
@@ -1761,6 +1809,19 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">mgmt</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">{}</span>
         <span class="k">return</span> <span class="n">mgmt</span><span class="o">.</span><span class="n">submodule</span><span class="o">.</span><span class="n">inline_client_signals</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="Engine.device_loopback_signals">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine.device_loopback_signals">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">device_loopback_signals</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The node's loop-back signals it keeps on the device this walk, so</span>
+<span class="sd">        the worker routes them without a tensor (see the submodule hook)."""</span>
+        <span class="n">mgmt</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodules</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">node_name</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">mgmt</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">frozenset</span><span class="p">()</span>
+        <span class="k">return</span> <span class="n">mgmt</span><span class="o">.</span><span class="n">submodule</span><span class="o">.</span><span class="n">device_loopback_signals</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="Engine.extend_prefix_chains">
@@ -1857,10 +1918,15 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># admit/plan/commit assume the whole batch reaches the forward</span>
                 <span class="c1"># in order; an unbatchable walk with &gt;1 request can't, so each</span>
                 <span class="c1"># request runs its own full cycle and merges.</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">batch</span><span class="o">.</span><span class="n">running_batched</span> <span class="ow">and</span> <span class="n">lease</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="c1"># the unbatched forward has per-request outputs: no rows to stay on</span>
+                    <span class="n">batch</span><span class="o">.</span><span class="n">rows_only</span> <span class="o">=</span> <span class="kc">False</span>
                 <span class="k">if</span> <span class="ow">not</span> <span class="n">batch</span><span class="o">.</span><span class="n">running_batched</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">request_ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">lease</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="n">batch</span><span class="o">.</span><span class="n">outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_exec_per_request</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="n">batch</span><span class="o">.</span><span class="n">outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_exec_single</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">batch</span><span class="o">.</span><span class="n">admit_error</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_record_loopback</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
             <span class="n">batch</span><span class="o">.</span><span class="n">outputs_ready</span><span class="o">.</span><span class="n">set</span><span class="p">()</span>
             <span class="k">return</span> <span class="n">batch</span><span class="o">.</span><span class="n">outputs</span>
         <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
@@ -1936,6 +2002,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">submodule_mgmt</span><span class="p">,</span> <span class="n">lease</span><span class="p">,</span> <span class="n">raw</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">req_info</span><span class="p">,</span>
                     <span class="n">request_ids</span><span class="o">=</span><span class="n">batch</span><span class="o">.</span><span class="n">request_ids</span><span class="p">,</span>
                     <span class="n">step_request_ids</span><span class="o">=</span><span class="n">batch</span><span class="o">.</span><span class="n">step_context</span><span class="o">.</span><span class="n">padded_request_ids</span><span class="p">,</span>
+                    <span class="n">rows_only</span><span class="o">=</span><span class="n">batch</span><span class="o">.</span><span class="n">rows_only</span><span class="p">,</span>
                 <span class="p">)</span>
             <span class="k">finally</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">PHASE_PERIOD</span><span class="p">:</span>
@@ -2360,8 +2427,17 @@ window.runMermaid = runMermaid;</script>
         <span class="n">outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">exec</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
         <span class="c1"># A failed admit means no forward ran and every rid's outputs are empty,</span>
         <span class="c1"># so the tail has nothing to consume; the worker re-drives the step.</span>
+        <span class="c1"># A rows-only step has no per-request outputs; only a batch tail runs.</span>
         <span class="k">if</span> <span class="n">batch</span><span class="o">.</span><span class="n">admit_error</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">postprocess_batch</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">outputs</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">batch</span><span class="o">.</span><span class="n">rows_only</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">postprocess_batch</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">outputs</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">submodule</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodules</span><span class="p">[</span><span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">submodule</span>
+                <span class="c1"># no submodule overrides it as of now</span>
+                <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="n">submodule</span><span class="p">)</span><span class="o">.</span><span class="n">batch_postprocess</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">NodeSubmodule</span><span class="o">.</span><span class="n">batch_postprocess</span><span class="p">:</span>
+                    <span class="n">submodule</span><span class="o">.</span><span class="n">batch_postprocess</span><span class="p">(</span>
+                        <span class="n">outputs</span><span class="p">,</span> <span class="n">batch</span><span class="o">.</span><span class="n">per_request_info_wrapped</span><span class="p">,</span> <span class="n">batch</span><span class="o">.</span><span class="n">inputs</span><span class="p">,</span>
+                    <span class="p">)</span>
         <span class="k">return</span> <span class="n">outputs</span></div>
 
 
@@ -2518,15 +2594,39 @@ window.runMermaid = runMermaid;</script>
         <span class="n">req_info</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
         <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
         <span class="n">step_request_ids</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span>
+        <span class="n">rows_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BatchedModelOutput</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Per-rid outputs for the real requests: drop the padding rows and map</span>
 <span class="sd">        a captured graph's keys back to real ids.</span>
+
+<span class="sd">        ``rows_only`` (see ``ExecutingBatch.rows_only``) keeps the row views</span>
+<span class="sd">        and the stop buffers but builds no per-rid dicts: nothing downstream</span>
+<span class="sd">        reads them on such a step, and at 128 rows they were a few hundred</span>
+<span class="sd">        allocations on the gpu thread.</span>
 
 <span class="sd">        A captured forward emits its per-rid entries under the slot's padding</span>
 <span class="sd">        ids (those were the batch at capture time), so entry ``i`` belongs to</span>
 <span class="sd">        ``request_ids[i]`` on either path.</span>
 <span class="sd">        """</span>
         <span class="n">submodule</span> <span class="o">=</span> <span class="n">submodule_mgmt</span><span class="o">.</span><span class="n">submodule</span>
+        <span class="k">if</span> <span class="p">(</span>
+            <span class="n">rows_only</span>
+            <span class="ow">and</span> <span class="n">raw_outputs</span><span class="o">.</span><span class="n">check_stop_buffers</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="ow">and</span> <span class="ow">not</span> <span class="n">raw_outputs</span><span class="o">.</span><span class="n">per_rid_outputs</span>
+            <span class="ow">and</span> <span class="ow">not</span> <span class="n">raw_outputs</span><span class="o">.</span><span class="n">packed_outputs</span>
+            <span class="ow">and</span> <span class="nb">type</span><span class="p">(</span><span class="n">submodule</span><span class="p">)</span><span class="o">.</span><span class="n">filter_batched_output</span>
+            <span class="ow">is</span> <span class="n">NodeSubmodule</span><span class="o">.</span><span class="n">filter_batched_output</span>
+        <span class="p">):</span>
+            <span class="c1"># No clone either: the worker takes the host copy on this thread,</span>
+            <span class="c1"># on this stream, right behind the step (``_stage_host_rows``), so</span>
+            <span class="c1"># a later replay cannot overwrite the rows first, and nothing else</span>
+            <span class="c1"># reads them on the device. Padded rows past the real ones ride</span>
+            <span class="c1"># along and are never read.</span>
+            <span class="k">return</span> <span class="n">BatchedModelOutput</span><span class="p">(</span>
+                <span class="n">check_stop_buffers</span><span class="o">=</span><span class="n">raw_outputs</span><span class="o">.</span><span class="n">check_stop_buffers</span><span class="p">,</span>
+                <span class="n">row_request_ids</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">request_ids</span><span class="p">),</span>
+                <span class="n">rows_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="p">)</span>
         <span class="n">out_ids</span> <span class="o">=</span> <span class="p">(</span>
             <span class="n">step_request_ids</span> <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="kc">None</span>
             <span class="k">else</span> <span class="n">submodule_mgmt</span><span class="o">.</span><span class="n">cuda_graph_runner</span><span class="o">.</span><span class="n">slot_for</span><span class="p">(</span><span class="n">lease</span><span class="p">)</span><span class="o">.</span><span class="n">dummy_rids</span>
@@ -2535,6 +2635,7 @@ window.runMermaid = runMermaid;</script>
 
         <span class="n">row_clones</span><span class="p">,</span> <span class="n">row_views</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_merge_per_rid</span><span class="p">(</span>
             <span class="n">outputs</span><span class="p">,</span> <span class="n">raw_outputs</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">out_ids</span><span class="p">,</span> <span class="n">submodule</span><span class="p">,</span> <span class="n">req_info</span><span class="p">,</span>
+            <span class="n">rows_only</span><span class="o">=</span><span class="n">rows_only</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_merge_unpacked</span><span class="p">(</span>
             <span class="n">outputs</span><span class="p">,</span> <span class="n">raw_outputs</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">submodule</span><span class="p">,</span>
@@ -2542,6 +2643,7 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
         <span class="k">return</span> <span class="n">BatchedModelOutput</span><span class="p">(</span>
             <span class="n">per_rid_outputs</span><span class="o">=</span><span class="n">outputs</span><span class="p">,</span>
+            <span class="n">rows_only</span><span class="o">=</span><span class="n">rows_only</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">outputs</span><span class="p">,</span>
             <span class="c1"># the stop buffer that is a row output shares its clone: one copy</span>
             <span class="c1"># of the sampled tokens per step, not two</span>
             <span class="n">check_stop_buffers</span><span class="o">=</span><span class="n">raw_outputs</span><span class="o">.</span><span class="n">clone_check_stop_buffers</span><span class="p">(</span>
@@ -2561,6 +2663,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">out_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
         <span class="n">submodule</span><span class="p">:</span> <span class="n">NodeSubmodule</span><span class="p">,</span>
         <span class="n">req_info</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
+        <span class="n">rows_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""Fold the forward's per-rid entries into ``outputs``.</span>
 
@@ -2587,7 +2690,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">tensor</span> <span class="ow">in</span> <span class="n">row_clones</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
                 <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="ow">and</span> <span class="n">tensor</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span>
             <span class="p">}</span>
-            <span class="k">if</span> <span class="n">row_views</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">row_views</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">rows_only</span><span class="p">:</span>
                 <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">rid</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">request_ids</span><span class="p">):</span>
                     <span class="n">merged</span> <span class="o">=</span> <span class="n">outputs</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span>
                     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">views</span> <span class="ow">in</span> <span class="n">row_views</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
@@ -2853,6 +2956,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">batch</span><span class="o">.</span><span class="n">step_context</span><span class="o">.</span><span class="n">set_padded_rids</span><span class="p">(</span>
             <span class="n">cg_runner</span><span class="o">.</span><span class="n">step_ids</span><span class="p">(</span><span class="n">lease</span><span class="p">,</span> <span class="n">batch</span><span class="o">.</span><span class="n">request_ids</span><span class="p">)</span>
         <span class="p">)</span>
+        <span class="n">t0</span> <span class="o">=</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="k">if</span> <span class="n">PHASE_PERIOD</span> <span class="k">else</span> <span class="mf">0.0</span>
         <span class="n">step</span> <span class="o">=</span> <span class="n">submodule_mgmt</span><span class="o">.</span><span class="n">submodule</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span>
             <span class="n">graph_walk</span><span class="o">=</span><span class="n">batch</span><span class="o">.</span><span class="n">step_context</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">,</span>
             <span class="n">request_ids</span><span class="o">=</span><span class="n">batch</span><span class="o">.</span><span class="n">step_context</span><span class="o">.</span><span class="n">padded_request_ids</span><span class="p">,</span>
@@ -2860,6 +2964,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">slot_lease</span><span class="o">=</span><span class="n">lease</span><span class="p">,</span>
             <span class="n">per_request_info</span><span class="o">=</span><span class="n">batch</span><span class="o">.</span><span class="n">per_request_info</span><span class="p">,</span>
         <span class="p">)</span>
+        <span class="k">if</span> <span class="n">PHASE_PERIOD</span><span class="p">:</span>
+            <span class="n">phase_record</span><span class="p">(</span><span class="s2">"engine.pre_declare"</span><span class="p">,</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">step</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">False</span>
         <span class="k">if</span> <span class="n">batch</span><span class="o">.</span><span class="n">inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="p">(</span>
@@ -2868,14 +2974,17 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">batch</span><span class="o">.</span><span class="n">step_context</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="p">):</span>
-            <span class="c1"># exec drives this step as declared here (its admit ran as</span>
-            <span class="c1"># pre_admit), instead of declaring and admitting again</span>
+            <span class="c1"># exec drives this step as declared here, and its admit skips</span>
+            <span class="c1"># the resources pre_admit covered</span>
             <span class="n">batch</span><span class="o">.</span><span class="n">step</span> <span class="o">=</span> <span class="n">step</span>
 
         <span class="n">batch</span><span class="o">.</span><span class="n">step_context</span><span class="o">.</span><span class="n">is_preplan</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="n">step</span><span class="o">.</span><span class="n">set_ctx</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">step_context</span><span class="p">)</span>
         <span class="k">try</span><span class="p">:</span>
+            <span class="n">t0</span> <span class="o">=</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="k">if</span> <span class="n">PHASE_PERIOD</span> <span class="k">else</span> <span class="mf">0.0</span>
             <span class="n">admit_outcome</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_runner</span><span class="o">.</span><span class="n">pre_admit</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">PHASE_PERIOD</span><span class="p">:</span>
+                <span class="n">phase_record</span><span class="p">(</span><span class="s2">"engine.pre_admit"</span><span class="p">,</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">admit_outcome</span><span class="o">.</span><span class="n">ok</span><span class="p">:</span>
                 <span class="c1"># exec re-drives the step and reports the failure from there</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">reset_pre_plan_for_batch</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
@@ -3194,6 +3303,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Engine.remove_request">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine.remove_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">remove_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_loopback_steps</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_runner</span><span class="o">.</span><span class="n">remove_request</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">submodule_mgmt</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodules</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
             <span class="n">submodule_mgmt</span><span class="o">.</span><span class="n">submodule</span><span class="o">.</span><span class="n">cleanup_request</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span></div>

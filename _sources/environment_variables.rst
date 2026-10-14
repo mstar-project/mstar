@@ -236,6 +236,13 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_MAX_BODY_MB``
      - ``128``
      - Request body limit (multipart uploads included).
+   * - ``MSTAR_TOKENIZE_PARALLEL``
+     - ``1``
+     - When a long prompt is encoded as parallel chunks, set
+       ``TOKENIZERS_PARALLELISM=true`` for the process first: the Rust
+       tokenizer only uses its thread pool while that variable reads true,
+       and serving environments often export it false. ``0`` leaves the
+       variable as it is (the chunked encode then runs serially).
    * - ``MSTAR_TOKENIZER``
      - unset
      - Path to a HuggingFace ``tokenizer.json`` enabling frontend
@@ -315,6 +322,32 @@ Worker scheduling
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
        other ready work.
+   * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
+     - ``32,64,128,256,512,1024,2048,4096,8192``
+     - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
+       graph (one per bucket and batch size). A prompt past the top bucket
+       prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
+       spends 78 ms of wall time on 36 ms of kernels. The default now reaches
+       8192; narrow it to save graph memory and capture time, or extend it.
+   * - ``MSTAR_DEVICE_LOOPBACK``
+     - ``1``
+     - Whether a decode node may keep its loop-back token on the device:
+       the sampler writes each request's last token to a slot-addressed
+       master and the next step reads its input ids from it, so the worker
+       routes the signal with no tensor (no per-request store, hold or
+       cleanup per step). Only nodes that opt in (Qwen3.5 decode) and only
+       when the sampler has graph buffers; ``0`` keeps every node on the
+       per-request tensor path.
+   * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
+     - ``0``
+     - The captured sampler gathers its RNG offsets from the slot masters
+       and scatters the advanced offsets and the sampled tokens back inside
+       the graph, so a replayed decode step issues none of those launches on
+       the gpu thread afterwards (each one is a GIL release the main thread's
+       postprocess wins). Padding rows then address a trash master row and
+       the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` concurrent
+       requests (default 4096, a hard cap with this on). Only with the device
+       loop-back on. An experiment knob; measure before turning it on.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset
      - ``1`` makes the Rust runtime print, every 500 calls, how long the

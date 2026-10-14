@@ -737,9 +737,12 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -1062,13 +1065,36 @@ window.runMermaid = runMermaid;</script>
         <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="n">_int32_tensor</span><span class="p">(</span><span class="n">kv_indptr</span><span class="p">),</span>
         <span class="n">paged_kv_indices</span><span class="o">=</span><span class="n">_int32_tensor</span><span class="p">(</span><span class="n">all_pages</span><span class="p">),</span>
         <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="n">_int32_tensor</span><span class="p">(</span><span class="n">last_page_lens</span><span class="p">),</span>
-        <span class="n">kv_lens</span><span class="o">=</span><span class="n">_int32_tensor</span><span class="p">(</span><span class="n">kv_lens</span><span class="p">),</span>
+        <span class="n">kv_lens</span><span class="o">=</span><span class="n">_host_lens</span><span class="p">(</span><span class="n">kv_lens</span><span class="p">),</span>
     <span class="p">)</span></div>
 
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_int32_tensor</span><span class="p">(</span><span class="n">values</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
     <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">values</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">))</span>
+
+
+<div class="viewcode-block" id="HostLens">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.HostLens">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">HostLens</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A host int32 row whose iteration yields numpy scalars.</span>
+
+<span class="sd">    FlashInfer's decode ``plan`` takes the longest row with the Python builtin</span>
+<span class="sd">    ``max(seq_lens)`` and ``.item()`` on the result; iterating a tensor hands</span>
+<span class="sd">    out one 0-d tensor per row, about 2 us each (0.35 ms at 128 rows, on the</span>
+<span class="sd">    plan thread every decode step). Iterating the numpy view costs 0.1 us a</span>
+<span class="sd">    row and the numpy scalar has ``.item()`` too. Everything else FlashInfer</span>
+<span class="sd">    does with the row (``.cpu()``, ``.min()``, ``len``, a ``copy_`` into its</span>
+<span class="sd">    device buffer) is plain tensor behaviour.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__iter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="nb">iter</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">numpy</span><span class="p">())</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_host_lens</span><span class="p">(</span><span class="n">values</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">_int32_tensor</span><span class="p">(</span><span class="n">values</span><span class="p">)</span><span class="o">.</span><span class="n">as_subclass</span><span class="p">(</span><span class="n">HostLens</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="KVPlanOutput">

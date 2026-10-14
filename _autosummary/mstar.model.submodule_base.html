@@ -384,9 +384,12 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -641,12 +644,14 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.coerce"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.coerce()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.get"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.get()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.get_check_stop_input"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.get_check_stop_input()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.host_rows"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.host_rows</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.packed_outputs"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.packed_outputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.per_rid_outputs"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.per_rid_outputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.pop"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.pop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.row_outputs"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.row_outputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.row_request_ids"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.row_request_ids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.row_views"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.row_views</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.rows_only"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.rows_only</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.update"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.update()</span></code></a></li>
 </ul>
 </li>
@@ -683,6 +688,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.batch_postprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.batch_postprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.bind_node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_batch"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_use_cuda_graphs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_use_cuda_graphs()</span></code></a></li>
@@ -691,6 +697,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.check_stop_batched"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.check_stop_batched()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cleanup_request"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cleanup_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.declare_step"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.declare_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.device_loopback_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_autocast"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_autocast</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_torch_compile</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.filter_batched_output"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.filter_batched_output()</span></code></a></li>
@@ -711,6 +718,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_batches_by_capture_key"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_batches_by_capture_key()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.step_is_input_free"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.step_is_input_free()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.uniform_row_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.uniform_row_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.unpack_packed_outputs()</span></code></a></li>
 </ul>
 </li>
@@ -897,7 +905,7 @@ of them says for itself how they are cut, or refuses to be cut at all.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.BatchedModelOutput">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">BatchedModelOutput</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">per_rid_outputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">packed_outputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">check_stop_buffers</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_outputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_request_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_views</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#BatchedModelOutput"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.BatchedModelOutput" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">BatchedModelOutput</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">per_rid_outputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">packed_outputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">check_stop_buffers</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_outputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_request_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_views</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_rows</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rows_only</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#BatchedModelOutput"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.BatchedModelOutput" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>A step’s outputs, split by how they are addressed.</p>
 <p><code class="docutils literal notranslate"><span class="pre">per_rid_outputs</span></code> is keyed by request id. <code class="docutils literal notranslate"><span class="pre">packed_outputs</span></code> holds whole
@@ -919,6 +927,8 @@ tensor once, not once per request, and hands out row views. Only
 <li><p><strong>row_outputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>row_request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>...</em><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>row_views</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>, </em><em>...</em><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>host_rows</strong> (<a class="reference internal" href="#mstar.model.submodule_base.HostRows" title="mstar.model.submodule_base.HostRows"><em>HostRows</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>rows_only</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -987,6 +997,11 @@ so padding rows are never copied (see <code class="docutils literal notranslate"
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.BatchedModelOutput.host_rows">
+<span class="sig-name descname"><span class="pre">host_rows</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.submodule_base.HostRows" title="mstar.model.submodule_base.HostRows"><span class="pre">HostRows</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.BatchedModelOutput.host_rows" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.BatchedModelOutput.packed_outputs">
 <span class="sig-name descname"><span class="pre">packed_outputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.BatchedModelOutput.packed_outputs" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -1021,6 +1036,11 @@ alone, and the caller takes the request out of the batch instead.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.BatchedModelOutput.row_views">
 <span class="sig-name descname"><span class="pre">row_views</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.BatchedModelOutput.row_views" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.BatchedModelOutput.rows_only">
+<span class="sig-name descname"><span class="pre">rows_only</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.model.submodule_base.BatchedModelOutput.rows_only" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -1240,6 +1260,26 @@ its own type back without restating this.</p>
 <p>Base class for a model’s compute units: defines the prepare_inputs →
 preprocess → forward(_batched) contract the engines drive.</p>
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.batch_postprocess">
+<span class="sig-name descname"><span class="pre">batch_postprocess</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_infos</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.batch_postprocess"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.batch_postprocess" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">postprocess</span></code> for a rows-only step, which has no per-request
+outputs: works on the rows of <code class="docutils literal notranslate"><span class="pre">outputs</span></code> in place. Optional; only
+called when overridden.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>outputs</strong> (<a class="reference internal" href="#mstar.model.submodule_base.BatchedModelOutput" title="mstar.model.submodule_base.BatchedModelOutput"><em>BatchedModelOutput</em></a>)</p></li>
+<li><p><strong>request_infos</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a><em>]</em>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.bind_node_resources">
 <span class="sig-name descname"><span class="pre">bind_node_resources</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resources</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.bind_node_resources"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.bind_node_resources" title="Link to this definition">#</a></dt>
 <dd><p>Receive the engine-built resources for this submodule’s node, and
@@ -1435,6 +1475,31 @@ passes dummy metadata); padding rows are absent, so read it with
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.device_loopback_signals">
+<span class="sig-name descname"><span class="pre">device_loopback_signals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.device_loopback_signals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.device_loopback_signals" title="Link to this definition">#</a></dt>
+<dd><p>Loop-back input signals of this walk whose per-row value the node
+keeps on the device itself (a sampler’s slot master), so the worker
+routes them with no tensor: the next step reads the value in
+<code class="docutils literal notranslate"><span class="pre">preprocess</span></code> and every fallback batch arrives with the signal
+empty. <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> is told per row (<code class="docutils literal notranslate"><span class="pre">has_loopback</span></code>) whether
+its last step here kept the value on the device; a row without it
+(e.g. its previous step ran on another rank) brings the tensor.
+On a walk whose output signals all stay on the device the
+engine builds no per-request output dicts and does not call
+<code class="docutils literal notranslate"><span class="pre">postprocess</span></code>: the stop check, the inline emit and the next step’s
+speculation read the step’s rows instead. Empty by default;
+<code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK=0</span></code> keeps every node on the tensor path.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)">frozenset</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1771,6 +1836,30 @@ declaring and admitting a second time.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.uniform_row_inputs">
+<span class="sig-name descname"><span class="pre">uniform_row_inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">has_loopback</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.uniform_row_inputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.uniform_row_inputs" title="Link to this definition">#</a></dt>
+<dd><p>The inputs every row of this walk gets, when <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>
+would return an equal object for each regardless of the request, its
+routed signals and its metadata (a decode walk that reads its token
+off the device). The engine then prepares the batch with one call and
+shares the object across the step’s rows, so it must not be mutated
+per row. <code class="docutils literal notranslate"><span class="pre">has_loopback</span></code>: every row’s last step on this node kept its
+loop-back signals on the device (<code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code>). None
+(the default) prepares row by row.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>has_loopback</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs">
 <span class="sig-name descname"><span class="pre">unpack_packed_outputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">static_output</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">real_seq_lens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_request_info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.unpack_packed_outputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs" title="Link to this definition">#</a></dt>
 <dd><p>Per-rid slicing for packed sentinels emitted by the captured graph.</p>
@@ -1974,12 +2063,14 @@ transfer yet.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.coerce"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.coerce()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.get"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.get()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.get_check_stop_input"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.get_check_stop_input()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.host_rows"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.host_rows</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.packed_outputs"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.packed_outputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.per_rid_outputs"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.per_rid_outputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.pop"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.pop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.row_outputs"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.row_outputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.row_request_ids"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.row_request_ids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.row_views"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.row_views</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.rows_only"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.rows_only</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.BatchedModelOutput.update"><code class="docutils literal notranslate"><span class="pre">BatchedModelOutput.update()</span></code></a></li>
 </ul>
 </li>
@@ -2016,6 +2107,7 @@ transfer yet.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.batch_postprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.batch_postprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.bind_node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_batch"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_use_cuda_graphs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_use_cuda_graphs()</span></code></a></li>
@@ -2024,6 +2116,7 @@ transfer yet.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.check_stop_batched"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.check_stop_batched()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cleanup_request"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cleanup_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.declare_step"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.declare_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.device_loopback_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_autocast"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_autocast</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_torch_compile</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.filter_batched_output"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.filter_batched_output()</span></code></a></li>
@@ -2044,6 +2137,7 @@ transfer yet.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_batches_by_capture_key"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_batches_by_capture_key()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.step_is_input_free"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.step_is_input_free()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.uniform_row_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.uniform_row_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.unpack_packed_outputs()</span></code></a></li>
 </ul>
 </li>

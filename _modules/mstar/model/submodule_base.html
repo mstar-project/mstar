@@ -737,9 +737,12 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -927,6 +930,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">NameToTensorList</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.knobs</span><span class="w"> </span><span class="kn">import</span> <span class="n">device_loopback_enabled</span>  <span class="c1"># noqa: F401  (re-export)</span>
 
 
 <div class="viewcode-block" id="HostRows">
@@ -1006,6 +1010,13 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># of a batch clone: name -&gt; the views, row i for ``row_request_ids[i]``.</span>
     <span class="c1"># The store describes such rows without reading each view.</span>
     <span class="n">row_views</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The stop buffers' host copy, staged by the gpu thread on the execution</span>
+    <span class="c1"># stream behind the step so the step's completion event covers it; the</span>
+    <span class="c1"># main thread reads it after waiting on that event.</span>
+    <span class="n">host_rows</span><span class="p">:</span> <span class="n">HostRows</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># No per-rid entries were built: every output signal of the step stays on</span>
+    <span class="c1"># the device (see ``ExecutingBatch.rows_only``). Readers use the rows.</span>
+    <span class="n">rows_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
 <div class="viewcode-block" id="BatchedModelOutput.coerce">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.coerce">[docs]</a>
@@ -1709,6 +1720,23 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">outputs</span></div>
 
 
+<div class="viewcode-block" id="NodeSubmodule.uniform_row_inputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.uniform_row_inputs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">uniform_row_inputs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">has_loopback</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"NodeInputs | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The inputs every row of this walk gets, when ``prepare_inputs``</span>
+<span class="sd">        would return an equal object for each regardless of the request, its</span>
+<span class="sd">        routed signals and its metadata (a decode walk that reads its token</span>
+<span class="sd">        off the device). The engine then prepares the batch with one call and</span>
+<span class="sd">        shares the object across the step's rows, so it must not be mutated</span>
+<span class="sd">        per row. ``has_loopback``: every row's last step on this node kept its</span>
+<span class="sd">        loop-back signals on the device (``device_loopback_signals``). None</span>
+<span class="sd">        (the default) prepares row by row."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">has_loopback</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
 <div class="viewcode-block" id="NodeSubmodule.step_is_input_free">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.step_is_input_free">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">step_is_input_free</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -1719,6 +1747,25 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        declaring and admitting a second time."""</span>
         <span class="k">del</span> <span class="n">graph_walk</span>
         <span class="k">return</span> <span class="kc">False</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.device_loopback_signals">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.device_loopback_signals">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">device_loopback_signals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Loop-back input signals of this walk whose per-row value the node</span>
+<span class="sd">        keeps on the device itself (a sampler's slot master), so the worker</span>
+<span class="sd">        routes them with no tensor: the next step reads the value in</span>
+<span class="sd">        ``preprocess`` and every fallback batch arrives with the signal</span>
+<span class="sd">        empty. ``prepare_inputs`` is told per row (``has_loopback``) whether</span>
+<span class="sd">        its last step here kept the value on the device; a row without it</span>
+<span class="sd">        (e.g. its previous step ran on another rank) brings the tensor.</span>
+<span class="sd">        On a walk whose output signals all stay on the device the</span>
+<span class="sd">        engine builds no per-request output dicts and does not call</span>
+<span class="sd">        ``postprocess``: the stop check, the inline emit and the next step's</span>
+<span class="sd">        speculation read the step's rows instead. Empty by default;</span>
+<span class="sd">        ``MSTAR_DEVICE_LOOPBACK=0`` keeps every node on the tensor path."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span>
+        <span class="k">return</span> <span class="nb">frozenset</span><span class="p">()</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.inline_client_signals">
@@ -1891,6 +1938,18 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Modifies ``outputs`` in-place; returns nothing.</span>
 <span class="sd">        """</span>
         <span class="k">return</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.batch_postprocess">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.batch_postprocess">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">batch_postprocess</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">outputs</span><span class="p">:</span> <span class="n">BatchedModelOutput</span><span class="p">,</span>
+        <span class="n">request_infos</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``postprocess`` for a rows-only step, which has no per-request</span>
+<span class="sd">        outputs: works on the rows of ``outputs`` in place. Optional; only</span>
+<span class="sd">        called when overridden."""</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.check_stop">
