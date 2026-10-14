@@ -345,13 +345,13 @@ class MicroScheduler:
         ``Worker._removal_step_reached``."""
         return self._last_popped_tp_seq
 
-    def _select_node_rr(
+    def _node_rr_order(
         self, ready: dict[tuple[str, str], list[ReadyNodeEntry]],
-    ) -> tuple[str, str] | None:
-        """The least recently scheduled (node, walk) with a ready row; ties go
-        to the first scanned."""
-        return min(
-            ready, default=None,
+    ) -> list[tuple[str, str]]:
+        """The (node, walk) keys with a ready row, least recently scheduled
+        first; ties go to the first scanned."""
+        return sorted(
+            ready,
             key=lambda key: self.node_and_walk_to_last_batch_num.get(key, 0),
         )
 
@@ -665,14 +665,21 @@ class MicroScheduler:
                 return scheduled
         if ready is None:
             ready = self._scan_ready(request_state, scan_target, scan_exclude)
-        # A walk with no room (a cap of 0) takes nothing, so it stays the least
-        # recent; picked anyway, it would starve the walk that frees the room.
-        rr_key = self._select_node_rr({
+        ready = {
             key: rows for key, rows in ready.items() if self._walk_caps(key)[key[1]] != 0
-        })
-        if rr_key is None or rr_key in keys:
-            return None
-        return schedule(rr_key, ready.get(rr_key, []))
+        }
+        # Keep going down the round-robin order rather than idling behind the
+        # first node whose step comes out empty. That node is not marked
+        # scheduled, so round robin picks it again next pass anyway -- and
+        # under a colocated model the node behind it is the one that frees
+        # its pages (snac_decoder behind Orpheus's LLM).
+        for rr_key in self._node_rr_order(ready):
+            if rr_key in keys:
+                continue  # already tried above, off its backlog
+            scheduled = schedule(rr_key, ready.get(rr_key, []))
+            if scheduled is not None:
+                return scheduled
+        return None
 
     def _park_other_walks(
         self, request_state: RequestStateManager,

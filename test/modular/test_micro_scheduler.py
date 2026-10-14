@@ -798,9 +798,36 @@ def test_a_chain_does_not_yield_to_a_failed_rid():
 # ── round robin ─────────────────────────────────────────────────────────
 
 
+def test_an_empty_step_falls_through_to_the_next_node():
+    """Only the first round-robin pick used to be tried, so a node whose step
+    came out empty left the worker idle for the pass -- and since it is not
+    marked scheduled, round robin picked it again every pass. Under a
+    colocated model that starves the node which frees the first one's pages:
+    snac_decoder waits behind Orpheus's LLM, whose pages only come back once
+    snac_decoder finishes the request."""
+    engine = _Engine(max_bs=8)
+    sched = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda name: engine),
+        parallel_leader_nodes={NODE, "B"},
+    )
+    manager = _Manager(["r0"])
+    manager.per_request_info["r1"] = object()
+    manager.ingest("r1", node="B")
+    # the first key scanned is NODE's; make its step come out empty
+    real = sched._schedule_key
+    sched._schedule_key = lambda rs, key, entries, **kw: (
+        None if key[0] == NODE else real(rs, key, entries, **kw)
+    )
+
+    batch = _next_batch(sched, manager)
+
+    assert batch is not None, "idled behind the node whose step was empty"
+    assert batch.node_name == "B"
+
+
 def test_scheduling_a_batch_advances_the_round_robin_cursor():
     """The regression: the bookkeeping moved out of batch assembly, so every
-    (node, walk) stayed at 0 and `_select_node_rr` kept picking the same one."""
+    (node, walk) stayed at 0 and `_node_rr_order` kept returning it first."""
     sched = _scheduler(_Engine(max_bs=2))
 
     _next_batch(sched, _Manager([f"r{i}" for i in range(4)]))
