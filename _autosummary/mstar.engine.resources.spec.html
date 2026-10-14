@@ -641,6 +641,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig.apply_conductor_config"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig.apply_conductor_config()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig.validate"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig.validate()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">apply_yaml_overrides()</span></code></a></li>
@@ -754,11 +755,28 @@ resource stays free of the manager and its kernels.</p>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Per-request parameters for one resource, carried on the request and
 handed to that resource at ingest. Keyed by resource key, so it needs no
-tag of its own — a marker base, with no contract beyond the hook below.</p>
+tag of its own — a marker base, with no contract beyond the hooks below.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.spec.ResourceReqConfig.apply_conductor_config">
 <span class="sig-name descname"><span class="pre">apply_conductor_config</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#ResourceReqConfig.apply_conductor_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.ResourceReqConfig.apply_conductor_config" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.spec.ResourceReqConfig.validate">
+<span class="sig-name descname"><span class="pre">validate</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#ResourceReqConfig.validate"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.ResourceReqConfig.validate" title="Link to this definition">#</a></dt>
+<dd><p>Raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> if a client-supplied value is out of range, or
+one the resource built from <code class="docutils literal notranslate"><span class="pre">spec</span></code> cannot honour.</p>
+<p>The conductor calls it at admission, so a bad request is a 400 before
+any worker sees it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>spec</strong> (<a class="reference internal" href="#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em> | </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
 
 </dd></dl>
 
@@ -856,6 +874,7 @@ would otherwise be a silently ineffective setting.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig.apply_conductor_config"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig.apply_conductor_config()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig.validate"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig.validate()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">apply_yaml_overrides()</span></code></a></li>

@@ -9,6 +9,12 @@ mstar.engine.resources.sampler.config
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      derive_seed
+   
    
 
    

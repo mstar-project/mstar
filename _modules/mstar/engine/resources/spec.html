@@ -1002,11 +1002,23 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">ResourceReqConfig</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Per-request parameters for one resource, carried on the request and</span>
 <span class="sd">    handed to that resource at ingest. Keyed by resource key, so it needs no</span>
-<span class="sd">    tag of its own — a marker base, with no contract beyond the hook below."""</span>
+<span class="sd">    tag of its own — a marker base, with no contract beyond the hooks below."""</span>
 
 <div class="viewcode-block" id="ResourceReqConfig.apply_conductor_config">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.ResourceReqConfig.apply_conductor_config">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">apply_conductor_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="k">return</span></div>
+
+
+<div class="viewcode-block" id="ResourceReqConfig.validate">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.ResourceReqConfig.validate">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="s2">"NodeResourceSpec | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Raise ``ValueError`` if a client-supplied value is out of range, or</span>
+<span class="sd">        one the resource built from ``spec`` cannot honour.</span>
+
+<span class="sd">        The conductor calls it at admission, so a bad request is a 400 before</span>
+<span class="sd">        any worker sees it.</span>
+<span class="sd">        """</span>
         <span class="k">return</span></div>
 </div>
 
