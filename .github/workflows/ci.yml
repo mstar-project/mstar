@@ -129,4 +129,5 @@ jobs:
           pip install triton
           # the package itself, without its remaining (heavy) deps
           pip install --no-deps -e .
-          pytest test/rust/ -v
+          # the row store needs the columnar tensor store; cpu-core skips most of it
+          pytest test/rust/ test/modular/test_row_output_store.py -v
