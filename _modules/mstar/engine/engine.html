@@ -1499,7 +1499,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">joint_comm_group</span><span class="o">=</span><span class="n">parallel_groups</span><span class="o">.</span><span class="n">get_joint_group_for_node</span><span class="p">(</span><span class="n">node_name</span><span class="p">),</span>
                 <span class="n">resources</span><span class="o">=</span><span class="n">resources</span>
             <span class="p">)</span>
-            <span class="n">submodule</span><span class="o">.</span><span class="n">bind_node_resources</span><span class="p">(</span><span class="n">resources</span><span class="p">)</span></div>
+            <span class="n">submodule</span><span class="o">.</span><span class="n">bind_node_resources</span><span class="p">(</span><span class="n">resources</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="s2">"reads_device_loopback"</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
+                <span class="c1"># the sampler keeps its slot masters only for a node that</span>
+                <span class="c1"># reads them back on the device (see NodeSubmodule)</span>
+                <span class="k">for</span> <span class="n">resource</span> <span class="ow">in</span> <span class="n">resources</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+                    <span class="n">enable</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">resource</span><span class="p">,</span> <span class="s2">"enable_device_loopback_reader"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">enable</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">enable</span><span class="p">()</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_compile_submodules</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>

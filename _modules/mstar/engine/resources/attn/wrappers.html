@@ -1238,6 +1238,18 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Inputs may be on CPU; see prefill wrapper's plan docstring.</span>
 <span class="sd">        """</span>
         <span class="n">n_req</span> <span class="o">=</span> <span class="n">paged_kv_indptr</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span>
+        <span class="k">if</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span> <span class="ow">and</span> <span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cuda"</span>
+            <span class="ow">and</span> <span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">is_pinned</span><span class="p">()</span>
+        <span class="p">):</span>
+            <span class="c1"># FlashInfer copies host indices with a blocking copy; page-locked</span>
+            <span class="c1"># indices (the KV plan's ring, MSTAR_KV_PINNED_INDPTRS) go in one</span>
+            <span class="c1"># non-blocking copy into its own buffer instead, and its copy_ of</span>
+            <span class="c1"># that buffer onto itself is a no-op. Pageable indices keep</span>
+            <span class="c1"># FlashInfer's path, so the knob is a full toggle.</span>
+            <span class="n">n</span> <span class="o">=</span> <span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">paged_kv_indices</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="n">paged_kv_indices</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_nvtx</span><span class="p">:</span>
             <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">range_pop</span><span class="p">,</span> <span class="n">range_push</span>

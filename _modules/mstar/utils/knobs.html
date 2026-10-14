@@ -959,6 +959,62 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    when the in-graph scatter is on (see ``sampler_ingraph_scatter``)."""</span>
     <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_SAMPLER_SLOTS"</span><span class="p">,</span> <span class="s2">"4096"</span><span class="p">))</span></div>
 
+
+
+
+<div class="viewcode-block" id="ingraph_decode_rope">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.ingraph_decode_rope">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">ingraph_decode_rope</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``MSTAR_INGRAPH_DECODE_ROPE`` (default 0): a captured decode step</span>
+<span class="sd">    builds its rotary tables inside the graph from the position resource's</span>
+<span class="sd">    planned positions instead of staging them before the replay."""</span>
+    <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_INGRAPH_DECODE_ROPE"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
+
+
+
+<div class="viewcode-block" id="kv_chain_lazy_steps">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.kv_chain_lazy_steps">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">kv_chain_lazy_steps</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``MSTAR_KV_CHAIN_LAZY_STEPS`` (default 16): how many decode steps of</span>
+<span class="sd">    sampled tokens the KV manager batches before extending the requests'</span>
+<span class="sd">    prefix chains, one extend per request per batch instead of one per step</span>
+<span class="sd">    (the per-row Python of that extension was 0.3-0.4 ms a step at 128</span>
+<span class="sd">    rows). A page key then appears up to that many steps late, and a later</span>
+<span class="sd">    commit indexes it, which the single-request path already allows for.</span>
+<span class="sd">    ``1`` (the default) extends every step: 16 measured as noise at c64/c128</span>
+<span class="sd">    on 0.8B (the extension is a small part of the stop check's tail)."""</span>
+    <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_KV_CHAIN_LAZY_STEPS"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)))</span></div>
+
+
+
+<div class="viewcode-block" id="kv_plan_cache">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.kv_plan_cache">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">kv_plan_cache</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``MSTAR_KV_PLAN_CACHE`` (default 1): the KV manager plans a leased</span>
+<span class="sd">    decode step from the previous step's plan when the batch is the same</span>
+<span class="sd">    rows in the same order and nothing but that step's commit touched the</span>
+<span class="sd">    streams: lengths advance by one, pages change only where a row crossed</span>
+<span class="sd">    a page boundary, and the five index arrays come from numpy instead of a</span>
+<span class="sd">    per-row Python pass. ``0`` (the default until the reworked path is</span>
+<span class="sd">    measured) plans every step from the streams; ``2`` does both and logs any</span>
+<span class="sd">    difference (a correctness check for runs)."""</span>
+    <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_KV_PLAN_CACHE"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">))</span></div>
+
+
+
+<div class="viewcode-block" id="kv_pinned_indptrs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.kv_pinned_indptrs">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">kv_pinned_indptrs</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``MSTAR_KV_PINNED_INDPTRS`` (default 1): the KV plan writes FlashInfer's</span>
+<span class="sd">    index arrays (qo_indptr, kv_indptr, kv_indices, last_page_len) into a</span>
+<span class="sd">    ring of page-locked host buffers, and the decode wrapper copies the</span>
+<span class="sd">    indices straight into its captured device buffer from there. The copies</span>
+<span class="sd">    are then really asynchronous; from pageable memory the driver stages each</span>
+<span class="sd">    one, and FlashInfer makes the indices copy blocking. Off by default: the</span>
+<span class="sd">    event bookkeeping per take cost about what the staged copies did at</span>
+<span class="sd">    c32-c128 on 0.8B (measured neutral to slightly negative)."""</span>
+    <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_KV_PINNED_INDPTRS"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
+
 </pre></div>
 
                 </article>

@@ -684,6 +684,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.extend_prefix_chain"><code class="docutils literal notranslate"><span class="pre">KVManager.extend_prefix_chain()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.extend_prefix_chains_batch"><code class="docutils literal notranslate"><span class="pre">KVManager.extend_prefix_chains_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.fingerprint"><code class="docutils literal notranslate"><span class="pre">KVManager.fingerprint()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.flush_chain_backlog"><code class="docutils literal notranslate"><span class="pre">KVManager.flush_chain_backlog()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.get_offload_priority"><code class="docutils literal notranslate"><span class="pre">KVManager.get_offload_priority()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.ingest_request"><code class="docutils literal notranslate"><span class="pre">KVManager.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.is_offloaded"><code class="docutils literal notranslate"><span class="pre">KVManager.is_offloaded()</span></code></a></li>
@@ -1174,8 +1175,13 @@ earlier call already sized.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.clear_preplan">
-<span class="sig-name descname"><span class="pre">clear_preplan</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.clear_preplan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.clear_preplan" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
+<span class="sig-name descname"><span class="pre">clear_preplan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">promoted</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.clear_preplan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.clear_preplan" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>promoted</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.commit">
@@ -1233,8 +1239,13 @@ step commits, so a later commit indexes the page.</p>
 <span class="sig-name descname"><span class="pre">extend_prefix_chains_batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_rows</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.extend_prefix_chains_batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.extend_prefix_chains_batch" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">extend_prefix_chain</span></code> for a step, from the stop check’s row
 buffers (<code class="docutils literal notranslate"><span class="pre">HostRows</span></code>: row i of every buffer belongs to
-<code class="docutils literal notranslate"><span class="pre">host_rows.request_ids[i]</span></code>). One lock, one <code class="docutils literal notranslate"><span class="pre">tolist</span></code> per buffer
-instead of one per request.</p>
+<code class="docutils literal notranslate"><span class="pre">host_rows.request_ids[i]</span></code>).</p>
+<p>Lazy by default: the step’s rows are copied aside and the chains are
+extended once every <code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code> steps, one extend per
+request with all its tokens since the last flush, so the per-row Python
+runs once per batch of steps instead of every step. A key can thus
+appear a few steps late and is indexed by a later commit, as the
+single-request path allows. Removals and resets flush first.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1259,6 +1270,17 @@ change what a page holds.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.flush_chain_backlog">
+<span class="sig-name descname"><span class="pre">flush_chain_backlog</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.flush_chain_backlog"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.flush_chain_backlog" title="Link to this definition">#</a></dt>
+<dd><p>Extend the chains with every step waiting in the backlog.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2191,6 +2213,7 @@ counts and seals need none of their own.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.extend_prefix_chain"><code class="docutils literal notranslate"><span class="pre">KVManager.extend_prefix_chain()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.extend_prefix_chains_batch"><code class="docutils literal notranslate"><span class="pre">KVManager.extend_prefix_chains_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.fingerprint"><code class="docutils literal notranslate"><span class="pre">KVManager.fingerprint()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.flush_chain_backlog"><code class="docutils literal notranslate"><span class="pre">KVManager.flush_chain_backlog()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.get_offload_priority"><code class="docutils literal notranslate"><span class="pre">KVManager.get_offload_priority()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.ingest_request"><code class="docutils literal notranslate"><span class="pre">KVManager.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.is_offloaded"><code class="docutils literal notranslate"><span class="pre">KVManager.is_offloaded()</span></code></a></li>

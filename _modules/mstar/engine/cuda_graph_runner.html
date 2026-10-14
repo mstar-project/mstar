@@ -1178,7 +1178,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">held</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_held</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="p">[])</span>
         <span class="n">rids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">handles</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">bs</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">held</span><span class="p">):]:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_step_runner</span><span class="o">.</span><span class="n">ingest_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_step_runner</span><span class="o">.</span><span class="n">ingest_capture_row</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
             <span class="n">held</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">rids</span></div>
 
@@ -2323,7 +2323,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">dummy_rids</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">seq_lens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">),</span> <span class="n">capture</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
             <span class="n">slot</span><span class="o">=</span><span class="n">slot</span>
         <span class="p">)</span>
-        <span class="n">call</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_call_inputs</span><span class="p">(</span><span class="n">static_inputs</span><span class="p">,</span> <span class="n">dummy_rids</span><span class="p">)</span>
+        <span class="n">call</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_call_inputs</span><span class="p">(</span><span class="n">static_inputs</span><span class="p">,</span> <span class="n">dummy_rids</span><span class="p">,</span> <span class="n">step</span><span class="p">)</span>
 
         <span class="n">fn</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">capture_fn</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">compile</span><span class="p">:</span>
@@ -2371,12 +2371,16 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">static_inputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
         <span class="n">step_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+        <span class="n">step</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PiecewiseCallInputs</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""What the region is handed, over the padded capture batch.</span>
 
 <span class="sd">        Built once, for the capture: the region's Python runs only there, so</span>
 <span class="sd">        the rows are the runner's padding ids and the only thing a replay</span>
-<span class="sd">        changes is the contents of the static buffers.</span>
+<span class="sd">        changes is the contents of the static buffers. ``step`` is the</span>
+<span class="sd">        capture's declaration, so the region can tell it runs on a leased</span>
+<span class="sd">        slot (its context names the lease) and record the in-graph reads of</span>
+<span class="sd">        the slot's buffers a replay relies on.</span>
 <span class="sd">        """</span>
         <span class="k">return</span> <span class="n">PiecewiseCallInputs</span><span class="p">(</span>
             <span class="n">static_inputs</span><span class="o">=</span><span class="n">static_inputs</span><span class="p">,</span>
@@ -2384,6 +2388,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">request_ids</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">step_ids</span><span class="p">),</span>
                 <span class="n">per_request_info</span><span class="o">=</span><span class="n">dummy_metadata</span><span class="p">(</span><span class="n">step_ids</span><span class="p">,</span> <span class="n">PIECEWISE_WALK</span><span class="p">),</span>
                 <span class="n">resources</span><span class="o">=</span><span class="nb">dict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">),</span>
+                <span class="n">step</span><span class="o">=</span><span class="n">step</span><span class="p">,</span>
             <span class="p">),</span>
             <span class="n">kwargs</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">forward_kwargs</span><span class="p">,</span>
         <span class="p">)</span>

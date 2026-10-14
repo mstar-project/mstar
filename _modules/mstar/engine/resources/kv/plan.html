@@ -931,7 +931,6 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">"""</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">itertools</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
@@ -1046,6 +1045,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">build_paged_indptrs</span><span class="p">(</span>
     <span class="n">segments</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">SequenceView</span><span class="p">],</span>
     <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="n">ring</span><span class="p">:</span> <span class="s2">"PinnedIndexRing | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PagedIndptrs</span><span class="p">:</span>
     <span class="c1"># Most of this is the five list-to-tensor conversions; they go through</span>
     <span class="c1"># numpy, which builds an int32 array from a list of ints in about half</span>
@@ -1067,11 +1067,12 @@ window.runMermaid = runMermaid;</script>
         <span class="n">last_page_lens</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">last</span><span class="p">)</span>
         <span class="c1"># FlashInfer's `get_seq_lens`, on the ints already here</span>
         <span class="n">kv_lens</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">num_pages</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">*</span> <span class="n">page_size</span> <span class="o">+</span> <span class="n">last</span><span class="p">)</span>
+    <span class="n">make</span> <span class="o">=</span> <span class="n">ring</span><span class="o">.</span><span class="n">take</span> <span class="k">if</span> <span class="n">ring</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">_int32_tensor</span>
     <span class="k">return</span> <span class="n">PagedIndptrs</span><span class="p">(</span>
-        <span class="n">qo_indptr</span><span class="o">=</span><span class="n">_int32_tensor</span><span class="p">(</span><span class="n">qo_indptr</span><span class="p">),</span>
-        <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="n">_int32_tensor</span><span class="p">(</span><span class="n">kv_indptr</span><span class="p">),</span>
-        <span class="n">paged_kv_indices</span><span class="o">=</span><span class="n">_int32_tensor</span><span class="p">(</span><span class="n">all_pages</span><span class="p">),</span>
-        <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="n">_int32_tensor</span><span class="p">(</span><span class="n">last_page_lens</span><span class="p">),</span>
+        <span class="n">qo_indptr</span><span class="o">=</span><span class="n">make</span><span class="p">(</span><span class="n">qo_indptr</span><span class="p">),</span>
+        <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="n">make</span><span class="p">(</span><span class="n">kv_indptr</span><span class="p">),</span>
+        <span class="n">paged_kv_indices</span><span class="o">=</span><span class="n">make</span><span class="p">(</span><span class="n">all_pages</span><span class="p">),</span>
+        <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="n">make</span><span class="p">(</span><span class="n">last_page_lens</span><span class="p">),</span>
         <span class="n">kv_lens</span><span class="o">=</span><span class="n">_host_lens</span><span class="p">(</span><span class="n">kv_lens</span><span class="p">),</span>
     <span class="p">)</span></div>
 
@@ -1079,6 +1080,75 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_int32_tensor</span><span class="p">(</span><span class="n">values</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
     <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">values</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">))</span>
+
+
+<div class="viewcode-block" id="PinnedIndexRing">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.PinnedIndexRing">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">PinnedIndexRing</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A ring of page-locked int32 host buffers for the index arrays a plan</span>
+<span class="sd">    hands FlashInfer, so its ``copy_(non_blocking=True)`` calls are really</span>
+<span class="sd">    asynchronous (from pageable memory the driver stages each one).</span>
+
+<span class="sd">    ``take`` fills the next buffer and returns a view of it. A buffer is</span>
+<span class="sd">    rewritten only after the copies out of it have completed: the stream a</span>
+<span class="sd">    plan ran on records an event when the next ``take`` happens on that</span>
+<span class="sd">    stream (by then the plan's copies were issued), and a slot waits on its</span>
+<span class="sd">    event before reuse. Plans do not overlap, so one pending slot suffices.</span>
+<span class="sd">    Without CUDA the buffers are plain tensors and nothing is recorded.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">numel</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4096</span><span class="p">,</span> <span class="n">depth</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_depth</span> <span class="o">=</span> <span class="n">depth</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_numel</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pinned</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_bufs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_events</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">depth</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">depth</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_next</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_last</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_grow</span><span class="p">(</span><span class="n">numel</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_grow</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">numel</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">numel</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">numel</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_numel</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">256</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_bufs</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">numel</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pinned</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_depth</span><span class="p">)</span>
+        <span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_numel</span> <span class="o">=</span> <span class="n">numel</span>
+
+<div class="viewcode-block" id="PinnedIndexRing.take">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.PinnedIndexRing.take">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">take</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">values</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">values</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_numel</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_grow</span><span class="p">(</span><span class="n">n</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pinned</span><span class="p">:</span>
+            <span class="n">stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">stream</span><span class="p">:</span>
+                <span class="c1"># the previous plan's copies were issued on another stream</span>
+                <span class="c1"># (an inline plan on the gpu thread after a pre-plan): record</span>
+                <span class="c1"># there, where they are</span>
+                <span class="n">ev</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_events</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last</span><span class="p">]</span> <span class="ow">or</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">()</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_events</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last</span><span class="p">]</span> <span class="o">=</span> <span class="n">ev</span>
+                <span class="n">ev</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last</span><span class="p">])</span>
+            <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">ev</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_events</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last</span><span class="p">]</span> <span class="ow">or</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">()</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_events</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last</span><span class="p">]</span> <span class="o">=</span> <span class="n">ev</span>
+                <span class="n">ev</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="n">stream</span><span class="p">)</span>
+            <span class="n">i</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_next</span>
+            <span class="n">ev</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_events</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">ev</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">ev</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">stream</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">i</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_next</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_next</span> <span class="o">=</span> <span class="p">(</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">_depth</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_last</span> <span class="o">=</span> <span class="n">i</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_bufs</span><span class="p">[</span><span class="n">i</span><span class="p">][:</span><span class="n">n</span><span class="p">]</span>
+        <span class="n">out</span><span class="o">.</span><span class="n">numpy</span><span class="p">()[:]</span> <span class="o">=</span> <span class="n">values</span>
+        <span class="k">return</span> <span class="n">out</span></div>
+</div>
+
 
 
 <div class="viewcode-block" id="HostLens">
@@ -1106,17 +1176,44 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="KVPlanOutput">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.KVPlanOutput">[docs]</a>
-<span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">KVPlanOutput</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""</span>
 <span class="sd">    Output of KVManager.plan for a single label</span>
 <span class="sd">    """</span>
-    <span class="n">cpu_indptrs</span><span class="p">:</span> <span class="n">PagedIndptrs</span>
-    <span class="c1"># packing in plan order w/h 1 view per segment covered by plan</span>
-    <span class="n">views</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">SequenceView</span><span class="p">]</span>
-    <span class="c1"># only the packed write addressing needs these on device, and only the</span>
-    <span class="c1"># resource that builds them reads them; see KVManager._setup_plan_states</span>
-    <span class="n">cuda_indptrs</span><span class="p">:</span> <span class="n">PagedIndptrs</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"cpu_indptrs"</span><span class="p">,</span> <span class="s2">"_views"</span><span class="p">,</span> <span class="s2">"_view_builder"</span><span class="p">,</span> <span class="s2">"cuda_indptrs"</span><span class="p">,</span> <span class="s2">"decode_pages"</span><span class="p">,</span> <span class="s2">"decode_offsets"</span><span class="p">,</span> <span class="s2">"rows"</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">cpu_indptrs</span><span class="p">:</span> <span class="n">PagedIndptrs</span><span class="p">,</span> <span class="n">views</span><span class="p">:</span> <span class="s2">"list[SequenceView] | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">cuda_indptrs</span><span class="p">:</span> <span class="s2">"PagedIndptrs | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">decode_pages</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">decode_offsets</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">rows</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">view_builder</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cpu_indptrs</span> <span class="o">=</span> <span class="n">cpu_indptrs</span>
+        <span class="c1"># packing in plan order w/h 1 view per segment covered by plan; a plan</span>
+        <span class="c1"># off the KV manager's cache hands a builder instead and the views are</span>
+        <span class="c1"># made on first use (the FlashInfer path never asks for them)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_views</span> <span class="o">=</span> <span class="n">views</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_view_builder</span> <span class="o">=</span> <span class="n">view_builder</span>
+        <span class="c1"># only the packed write addressing needs these on device, and only the</span>
+        <span class="c1"># resource that builds them reads them; see KVManager._setup_plan_states</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cuda_indptrs</span> <span class="o">=</span> <span class="n">cuda_indptrs</span>
+        <span class="c1"># a decode step planned off the previous one (KVManager's plan cache):</span>
+        <span class="c1"># each row's write page and offset in it, so staging need not walk the views</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">decode_pages</span> <span class="o">=</span> <span class="n">decode_pages</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">decode_offsets</span> <span class="o">=</span> <span class="n">decode_offsets</span>
+        <span class="c1"># (request_id, label, to_compute) per view, for consumers that need no</span>
+        <span class="c1"># pages or lengths (the position resource); None means read the views</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rows</span> <span class="o">=</span> <span class="n">rows</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">views</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"list[SequenceView]"</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_views</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_views</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_view_builder</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_views</span>
+
+    <span class="nd">@views</span><span class="o">.</span><span class="n">setter</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">views</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_views</span> <span class="o">=</span> <span class="n">value</span>
 
 <div class="viewcode-block" id="KVPlanOutput.get_total_len">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.KVPlanOutput.get_total_len">[docs]</a>
@@ -1126,6 +1223,8 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_decode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decode_pages</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">True</span>
         <span class="k">return</span> <span class="nb">all</span><span class="p">(</span><span class="n">view</span><span class="o">.</span><span class="n">to_compute</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">for</span> <span class="n">view</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">views</span><span class="p">)</span></div>
 
 

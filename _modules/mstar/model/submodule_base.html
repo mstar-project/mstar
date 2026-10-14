@@ -1487,6 +1487,14 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># autocast, and explicitly disables any ambient one.</span>
     <span class="n">disable_autocast</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
+    <span class="c1"># Set True on a submodule whose decode walk may read its last sampled</span>
+    <span class="c1"># tokens back off the sampler's slot masters (``device_loopback_signals``).</span>
+    <span class="c1"># The sampler keeps the masters only for a node that says so: the eager</span>
+    <span class="c1"># step write behind them is a small synchronous host-to-device copy per</span>
+    <span class="c1"># step, which a node that reads its tokens on the host (Whisper's decoder)</span>
+    <span class="c1"># would pay for nothing.</span>
+    <span class="n">reads_device_loopback</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="c1"># Per-request state store. prepare_inputs-time code (no engine inputs</span>

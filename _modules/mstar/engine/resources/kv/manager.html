@@ -922,12 +922,15 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.engine.resources.kv.manager</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">itertools</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">Counter</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">Future</span><span class="p">,</span> <span class="n">wait</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.communication</span><span class="w"> </span><span class="kn">import</span> <span class="n">JointGroups</span>
@@ -949,9 +952,11 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">fingerprint</span><span class="p">,</span> <span class="n">page_key</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">SINK_PAGE</span><span class="p">,</span>
+    <span class="n">HostLens</span><span class="p">,</span>
     <span class="n">KVPlanOutput</span><span class="p">,</span>
     <span class="n">KVPlanOutputs</span><span class="p">,</span>
     <span class="n">PagedIndptrs</span><span class="p">,</span>
+    <span class="n">PinnedIndexRing</span><span class="p">,</span>
     <span class="n">SequenceView</span><span class="p">,</span>
     <span class="n">build_paged_indptrs</span><span class="p">,</span>
     <span class="n">group_by_plan_label</span><span class="p">,</span>
@@ -969,6 +974,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">StepContext</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.h2d</span><span class="w"> </span><span class="kn">import</span> <span class="n">PinnedStager</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.knobs</span><span class="w"> </span><span class="kn">import</span> <span class="n">kv_chain_lazy_steps</span><span class="p">,</span> <span class="n">kv_pinned_indptrs</span><span class="p">,</span> <span class="n">kv_plan_cache</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -1317,6 +1323,55 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">_LabelRows</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""One plan label's real rows of a cached decode plan, derived from the</span>
+<span class="sd">    full plan's views at the first hit: streams, lengths, page lists and the</span>
+<span class="sd">    numpy index arrays FlashInfer takes. Padding rows are not here; they are</span>
+<span class="sd">    rebuilt per step from the step's own padding segments (same layout, other</span>
+<span class="sd">    dummy ids)."""</span>
+
+    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="s2">"rows"</span><span class="p">,</span> <span class="s2">"streams"</span><span class="p">,</span> <span class="s2">"lens"</span><span class="p">,</span> <span class="s2">"npages"</span><span class="p">,</span> <span class="s2">"row_pages"</span><span class="p">,</span> <span class="s2">"last_page"</span><span class="p">,</span>
+        <span class="s2">"indices"</span><span class="p">,</span> <span class="s2">"gens"</span><span class="p">,</span> <span class="s2">"n_pad"</span><span class="p">,</span> <span class="s2">"pad_span"</span><span class="p">,</span> <span class="s2">"pad_pages"</span><span class="p">,</span> <span class="s2">"built"</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kw</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__slots__</span><span class="p">:</span>
+            <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">kw</span><span class="p">[</span><span class="n">k</span><span class="p">])</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_DecodePlanCache</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The last leased decode plan, as `_fast_decode_plan` continues it."""</span>
+
+    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="s2">"step_segments"</span><span class="p">,</span> <span class="s2">"real_segments"</span><span class="p">,</span> <span class="s2">"n_real"</span><span class="p">,</span> <span class="s2">"pad_layout"</span><span class="p">,</span> <span class="s2">"views"</span><span class="p">,</span> <span class="s2">"epoch"</span><span class="p">,</span> <span class="s2">"pending"</span><span class="p">,</span> <span class="s2">"derived"</span><span class="p">,</span> <span class="s2">"_rows"</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step_segments</span><span class="p">,</span> <span class="n">real_segments</span><span class="p">,</span> <span class="n">n_real</span><span class="p">,</span> <span class="n">pad_layout</span><span class="p">,</span> <span class="n">views</span><span class="p">,</span> <span class="n">epoch</span><span class="p">):</span>
+        <span class="c1"># the planned step's own segments tuple: a commit of that object is the</span>
+        <span class="c1"># one commit the next plan may assume</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">step_segments</span> <span class="o">=</span> <span class="n">step_segments</span>
+        <span class="c1"># the real rows' segments, the key the next step must match</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">real_segments</span> <span class="o">=</span> <span class="n">real_segments</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">n_real</span> <span class="o">=</span> <span class="n">n_real</span>
+        <span class="c1"># (count, span) of the padding rows, which change dummy ids per slot</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">pad_layout</span> <span class="o">=</span> <span class="n">pad_layout</span>
+        <span class="c1"># the full plan's views per label, the source of `derived`</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">views</span> <span class="o">=</span> <span class="n">views</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">epoch</span> <span class="o">=</span> <span class="n">epoch</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">derived</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rows</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">rows</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The real (request, label) pairs, for the commit check of a step</span>
+<span class="sd">        that is not the cached batch."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rows</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_rows</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">seg</span><span class="p">[:</span><span class="mi">2</span><span class="p">]</span> <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">real_segments</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rows</span>
+
+
 <div class="viewcode-block" id="KVManager">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">KVManager</span><span class="p">(</span><span class="n">AttentionResource</span><span class="p">):</span>
@@ -1365,6 +1420,16 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># (node, walk) -&gt; (label, stop buffer name) per request, for the</span>
         <span class="c1"># decode-step chain extension; dropped with the request</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_chain_lookup</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">tuple</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># decode steps of sampled tokens waiting to extend the chains (lazy)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chain_lazy_steps</span> <span class="o">=</span> <span class="n">kv_chain_lazy_steps</span><span class="p">()</span>
+        <span class="c1"># steps waiting per request, and the widest row among them: a</span>
+        <span class="c1"># commit tolerates a chain that lags by that many tokens</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chain_pending</span><span class="p">:</span> <span class="n">Counter</span> <span class="o">=</span> <span class="n">Counter</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog_width</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="c1"># requests whose waiting tokens went out early (a removal): the next</span>
+        <span class="c1"># flush leaves them out</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chain_drained</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
         <span class="c1"># its entity id is the worker id, and one worker is one copy of a node</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_replica</span> <span class="o">=</span> <span class="p">(</span>
             <span class="n">transfer_engine_info</span><span class="o">.</span><span class="n">my_entity_id</span>
@@ -1387,6 +1452,16 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># copy-only H2D into those, see `_stage_decode_plan_state`</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stager</span> <span class="o">=</span> <span class="n">PinnedStager</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_cg_max_seq_len</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="c1"># the plan cache (`_fast_decode_plan`): bumped by everything that</span>
+        <span class="c1"># changes a stream's pages or length other than a step's commit</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_plan_epoch</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_decode_plan_cache</span><span class="p">:</span> <span class="n">_DecodePlanCache</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_plan_cache_mode</span> <span class="o">=</span> <span class="n">kv_plan_cache</span><span class="p">()</span>
+        <span class="c1"># FlashInfer's index arrays from page-locked memory (see PinnedIndexRing)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_indptr_ring</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">PinnedIndexRing</span><span class="p">()</span> <span class="k">if</span> <span class="n">kv_pinned_indptrs</span><span class="p">()</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">plan_cache_stats</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"hit"</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">"miss"</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">"mismatch"</span><span class="p">:</span> <span class="mi">0</span><span class="p">}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KVPlanState</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">reset_default_cursors</span><span class="p">()</span>
 
@@ -1560,8 +1635,13 @@ window.runMermaid = runMermaid;</script>
             <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="k">return</span>
         <span class="c1"># what was here before this write, not after: a decode step can commit</span>
-        <span class="c1"># before the token it writes is read back and counted</span>
-        <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">released</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">-</span> <span class="n">segment</span><span class="o">.</span><span class="n">span</span> <span class="o">&gt;</span> <span class="n">chain</span><span class="o">.</span><span class="n">covered_len</span><span class="p">:</span>
+        <span class="c1"># before the token it writes is read back and counted. the lazy chain</span>
+        <span class="c1"># extension holds back a few steps more (`extend_prefix_chains_batch`)</span>
+        <span class="n">lag</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_chain_pending</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog_width</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog</span> <span class="k">else</span> <span class="mi">0</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">released</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">-</span> <span class="n">segment</span><span class="o">.</span><span class="n">span</span> <span class="o">&gt;</span> <span class="n">chain</span><span class="o">.</span><span class="n">covered_len</span> <span class="o">+</span> <span class="n">lag</span><span class="p">:</span>
             <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="k">return</span>
         <span class="n">filled</span> <span class="o">=</span> <span class="n">chain</span><span class="o">.</span><span class="n">pages_filled</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span>
@@ -1615,6 +1695,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        leased: the read is issued under this same lock, so nothing can come</span>
 <span class="sd">        between the two.</span>
 <span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_touch_plan_cache</span><span class="p">()</span>
         <span class="k">if</span> <span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="kc">None</span>
             <span class="ow">or</span> <span class="ow">not</span> <span class="n">rooted</span>
@@ -1705,6 +1786,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        The ids come from the stop check's host copy, which can land after their</span>
 <span class="sd">        step commits, so a later commit indexes the page.</span>
 <span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">flush_chain_backlog</span><span class="p">()</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
             <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_label</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -1732,8 +1814,42 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""``extend_prefix_chain`` for a step, from the stop check's row</span>
 <span class="sd">        buffers (``HostRows``: row i of every buffer belongs to</span>
-<span class="sd">        ``host_rows.request_ids[i]``). One lock, one ``tolist`` per buffer</span>
-<span class="sd">        instead of one per request."""</span>
+<span class="sd">        ``host_rows.request_ids[i]``).</span>
+
+<span class="sd">        Lazy by default: the step's rows are copied aside and the chains are</span>
+<span class="sd">        extended once every ``MSTAR_KV_CHAIN_LAZY_STEPS`` steps, one extend per</span>
+<span class="sd">        request with all its tokens since the last flush, so the per-row Python</span>
+<span class="sd">        runs once per batch of steps instead of every step. A key can thus</span>
+<span class="sd">        appear a few steps late and is indexed by a later commit, as the</span>
+<span class="sd">        single-request path allows. Removals and resets flush first."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_lazy_steps</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_extend_chains_eager</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">host_rows</span><span class="p">)</span>
+            <span class="k">return</span>
+        <span class="n">step</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="nb">tuple</span><span class="p">(</span><span class="n">host_rows</span><span class="o">.</span><span class="n">request_ids</span><span class="p">),</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">request_ids</span><span class="p">),</span>
+            <span class="p">{</span>
+                <span class="n">name</span><span class="p">:</span> <span class="n">buf</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">buf</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+                <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">buf</span> <span class="ow">in</span> <span class="n">host_rows</span><span class="o">.</span><span class="n">buffers</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+                <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_tensor</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span> <span class="ow">and</span> <span class="n">buf</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">!=</span> <span class="mi">0</span>
+            <span class="p">},</span>
+        <span class="p">)</span>
+        <span class="n">width</span> <span class="o">=</span> <span class="nb">max</span><span class="p">((</span><span class="n">a</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">step</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span><span class="o">.</span><span class="n">values</span><span class="p">()),</span> <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_chain_pending</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">step</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog_width</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog_width</span><span class="p">,</span> <span class="n">width</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_lazy_steps</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">flush_chain_backlog</span><span class="p">()</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_extend_chains_eager</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">host_rows</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The per-step extension (MSTAR_KV_CHAIN_LAZY_STEPS=1): one lock,</span>
+<span class="sd">        one ``tolist`` per buffer instead of one per request. The round-2</span>
+<span class="sd">        body, kept as it was: at c32 the step is GIL-bound and even the</span>
+<span class="sd">        few extra numpy calls of the lazy path's bookkeeping showed."""</span>
         <span class="n">row_of</span> <span class="o">=</span> <span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">rid</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">host_rows</span><span class="o">.</span><span class="n">request_ids</span><span class="p">)}</span>
         <span class="n">buffers</span> <span class="o">=</span> <span class="n">host_rows</span><span class="o">.</span><span class="n">buffers</span>
         <span class="n">rows_of</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1774,8 +1890,126 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">released</span><span class="p">:</span>
                     <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="o">=</span> <span class="kc">None</span>
                     <span class="k">continue</span>
-                <span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">rows</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">page_size</span><span class="p">)</span></div>
+                <span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">rows</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">page_size</span><span class="p">)</span>
 
+<div class="viewcode-block" id="KVManager.flush_chain_backlog">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.flush_chain_backlog">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">flush_chain_backlog</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Extend the chains with every step waiting in the backlog."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="c1"># the swap under the lock, so two flushing threads (the stop check</span>
+            <span class="c1"># and a removal) cannot both take the same steps</span>
+            <span class="n">steps</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog</span><span class="p">,</span> <span class="p">[]</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_chain_pending</span> <span class="o">=</span> <span class="n">Counter</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog_width</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="n">drained</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_drained</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_drained</span><span class="p">,</span> <span class="nb">set</span><span class="p">()</span>
+            <span class="c1"># runs of steps with the same rows and batch go out as one extend</span>
+            <span class="c1"># per request; a change of batch composition starts a new run</span>
+            <span class="n">run</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">st</span> <span class="ow">in</span> <span class="n">steps</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">run</span> <span class="ow">and</span> <span class="n">run</span><span class="p">[</span><span class="mi">0</span><span class="p">][:</span><span class="mi">4</span><span class="p">]</span> <span class="o">!=</span> <span class="n">st</span><span class="p">[:</span><span class="mi">4</span><span class="p">]:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_extend_chains_from</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">drained</span><span class="p">)</span>
+                    <span class="n">run</span> <span class="o">=</span> <span class="p">[]</span>
+                <span class="n">run</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">st</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">run</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_extend_chains_from</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">drained</span><span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_drain_chain_backlog</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Under the lock: extend one request's chain with its tokens waiting</span>
+<span class="sd">        in the backlog, and leave them out of the next flush. A removal does</span>
+<span class="sd">        this instead of a flush, which at high concurrency would come every</span>
+<span class="sd">        step or two."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog</span> <span class="ow">or</span> <span class="n">rid</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_drained</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chain_drained</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chain_pending</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">st</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_backlog</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">i</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">index</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">st</span><span class="p">[</span><span class="mi">3</span><span class="p">]:</span>
+                <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">st</span><span class="p">,</span> <span class="n">i</span><span class="p">))</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">parts</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">st0</span> <span class="o">=</span> <span class="n">parts</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">entry</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_lookup</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">((</span><span class="n">st0</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">st0</span><span class="p">[</span><span class="mi">2</span><span class="p">]))</span>
+        <span class="k">if</span> <span class="n">entry</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_label</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">st0</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">st0</span><span class="p">[</span><span class="mi">2</span><span class="p">])</span>
+            <span class="n">tensor</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span><span class="o">.</span><span class="n">prefix_decode</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">label</span><span class="p">,</span> <span class="n">tensor</span> <span class="o">=</span> <span class="n">entry</span>
+        <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">tensor</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">stream</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">unkeyed</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">released</span><span class="p">:</span>
+            <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">return</span>
+        <span class="n">tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">st</span><span class="p">,</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">:</span>
+            <span class="n">arr</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="mi">4</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">tensor</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">arr</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">arr</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span>
+                <span class="n">tokens</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">arr</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span>
+        <span class="k">if</span> <span class="n">tokens</span><span class="p">:</span>
+            <span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">tokens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_extend_chains_from</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">steps</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">drained</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">())</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Under the lock: one extend per request with the tokens of</span>
+<span class="sd">        ``steps`` (same rows and batch) in step order."""</span>
+        <span class="n">rows</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">steps</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">row_of</span> <span class="o">=</span> <span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">rid</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">rows</span><span class="p">)}</span>
+        <span class="n">page_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span>
+        <span class="n">lookup</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_lookup</span>
+        <span class="n">cols</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">drained</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="c1"># the label and buffer name do not change over a request's</span>
+            <span class="c1"># life (its overrides are set at ingest), so each is looked up</span>
+            <span class="c1"># once instead of on every decode step</span>
+            <span class="n">per_rid</span> <span class="o">=</span> <span class="n">lookup</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">per_rid</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">per_rid</span> <span class="o">=</span> <span class="n">lookup</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+            <span class="n">entry</span> <span class="o">=</span> <span class="n">per_rid</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">entry</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_label</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span>
+                <span class="n">tensor</span> <span class="o">=</span> <span class="p">(</span>
+                    <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span><span class="o">.</span><span class="n">prefix_decode</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+                <span class="p">)</span>
+                <span class="n">entry</span> <span class="o">=</span> <span class="n">per_rid</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">tensor</span><span class="p">)</span>
+            <span class="n">label</span><span class="p">,</span> <span class="n">tensor</span> <span class="o">=</span> <span class="n">entry</span>
+            <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">tensor</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="n">i</span> <span class="o">=</span> <span class="n">row_of</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">i</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="n">col</span> <span class="o">=</span> <span class="n">cols</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">tensor</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">col</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">st</span><span class="p">[</span><span class="mi">4</span><span class="p">][</span><span class="n">tensor</span><span class="p">]</span> <span class="k">for</span> <span class="n">st</span> <span class="ow">in</span> <span class="n">steps</span> <span class="k">if</span> <span class="n">tensor</span> <span class="ow">in</span> <span class="n">st</span><span class="p">[</span><span class="mi">4</span><span class="p">]]</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">parts</span> <span class="ow">or</span> <span class="n">i</span> <span class="o">&gt;=</span> <span class="n">parts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span>
+                    <span class="k">continue</span>
+                <span class="c1"># (steps * values per row) tokens for every row, in step order</span>
+                <span class="n">col</span> <span class="o">=</span> <span class="n">cols</span><span class="p">[</span><span class="n">tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span><span class="n">parts</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">i</span> <span class="o">&gt;=</span> <span class="n">col</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span>
+                <span class="k">continue</span>
+            <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">stream</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">unkeyed</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">released</span><span class="p">:</span>
+                <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="k">continue</span>
+            <span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">col</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span> <span class="n">page_size</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_release_lease</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">CacheStream</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Give back a lease `admit` never converted; a converted one is released</span>
@@ -1797,6 +2031,10 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="KVManager.ingest_request">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.ingest_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">overrides</span><span class="p">:</span> <span class="n">KVReqConfig</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_touch_plan_cache</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chain_drained</span><span class="p">:</span>
+            <span class="c1"># the handle comes back while steps under its old name still wait</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">flush_chain_backlog</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">overrides</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">overrides</span> <span class="o">=</span> <span class="n">KVReqConfig</span><span class="p">()</span>
         <span class="c1"># guards `_streams`/`_overrides` against a concurrent admit/plan/commit</span>
@@ -1822,6 +2060,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
         <span class="n">published</span><span class="p">:</span> <span class="n">PublishedKVInfo</span> <span class="o">|</span> <span class="kc">None</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AdmitOutcome</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_touch_plan_cache</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">published</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">ADMIT_OK</span>
 
@@ -1977,6 +2216,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">):</span>
                     <span class="c1"># drop the empty pages a refused batch admit left, before taking the lease</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_plan_epoch</span> <span class="o">+=</span> <span class="mi">1</span>
                     <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">lease</span><span class="p">)</span>
                     <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">=</span> <span class="p">(</span>
                         <span class="nb">len</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">lease</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
@@ -2074,6 +2314,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        only be dropped off the tail. If something else has extended the stream</span>
 <span class="sd">        since, the tail can no longer be safely removed.</span>
 <span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_touch_plan_cache</span><span class="p">()</span>
         <span class="k">del</span> <span class="n">step</span><span class="p">,</span> <span class="n">ctx</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
             <span class="n">reserved</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_reserved_pages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_admit_reserved_pages</span><span class="p">,</span> <span class="p">{}</span>
@@ -2226,19 +2467,20 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">pages</span><span class="p">,</span> <span class="n">offsets</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_stage_decode_plan_state</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">views</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">SequenceView</span><span class="p">],</span> <span class="n">static_state</span><span class="p">:</span> <span class="n">KVPlanState</span><span class="p">,</span>
-        <span class="n">capture_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">views</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">SequenceView</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">static_state</span><span class="p">:</span> <span class="n">KVPlanState</span><span class="p">,</span>
+        <span class="n">capture_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">pages</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">offsets</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">KVPlanState</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""``_decode_plan_state`` + ``KVPlanState.copy_`` with no device staging</span>
 <span class="sd">        tensor; rows past the real tokens get SINK_PAGE / 0."""</span>
-        <span class="n">pages</span><span class="p">,</span> <span class="n">offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_locations</span><span class="p">(</span><span class="n">views</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">pages</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">offsets</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">pages</span><span class="p">,</span> <span class="n">offsets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_locations</span><span class="p">(</span><span class="n">views</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stager</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span>
             <span class="n">static_state</span><span class="o">.</span><span class="n">token_to_page</span><span class="p">[:</span><span class="n">capture_len</span><span class="p">],</span> <span class="n">pages</span><span class="p">,</span> <span class="n">pad_value</span><span class="o">=</span><span class="n">SINK_PAGE</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_plan_stager</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span>
             <span class="n">static_state</span><span class="o">.</span><span class="n">token_to_cache</span><span class="p">[:</span><span class="n">capture_len</span><span class="p">],</span> <span class="n">offsets</span><span class="p">,</span> <span class="n">pad_value</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
         <span class="p">)</span>
-        <span class="n">static_state</span><span class="o">.</span><span class="n">total_tokens</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">views</span><span class="p">)</span>
+        <span class="n">static_state</span><span class="o">.</span><span class="n">total_tokens</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">pages</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">static_state</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_setup_plan_states</span><span class="p">(</span>
@@ -2250,9 +2492,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># Straight into the captured buffers in one H2D per buffer:</span>
                 <span class="c1"># this runs in the pre-plan beside a live graph, where a</span>
                 <span class="c1"># device-side copy + fill would slow it (see mstar.utils.h2d).</span>
+                <span class="c1"># a cached plan hands its locations; reading `views` there</span>
+                <span class="c1"># would build them eagerly and defeat the lazy builder</span>
+                <span class="n">cached</span> <span class="o">=</span> <span class="n">indptrs</span><span class="o">.</span><span class="n">decode_pages</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
                 <span class="n">plan_state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stage_decode_plan_state</span><span class="p">(</span>
-                    <span class="n">indptrs</span><span class="o">.</span><span class="n">views</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_static_plan_state</span><span class="p">(</span><span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span> <span class="n">label</span><span class="p">),</span>
+                    <span class="kc">None</span> <span class="k">if</span> <span class="n">cached</span> <span class="k">else</span> <span class="n">indptrs</span><span class="o">.</span><span class="n">views</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_static_plan_state</span><span class="p">(</span><span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span> <span class="n">label</span><span class="p">),</span>
                     <span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span>
+                    <span class="n">pages</span><span class="o">=</span><span class="n">indptrs</span><span class="o">.</span><span class="n">decode_pages</span><span class="p">,</span> <span class="n">offsets</span><span class="o">=</span><span class="n">indptrs</span><span class="o">.</span><span class="n">decode_offsets</span><span class="p">,</span>
                 <span class="p">)</span>
                 <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">plan_state</span>
@@ -2279,9 +2526,250 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_plan_output</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">views</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">SequenceView</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">KVPlanOutput</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">KVPlanOutput</span><span class="p">(</span>
-            <span class="n">cpu_indptrs</span><span class="o">=</span><span class="n">build_paged_indptrs</span><span class="p">(</span><span class="n">views</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache</span><span class="o">.</span><span class="n">page_size</span><span class="p">),</span>
+            <span class="n">cpu_indptrs</span><span class="o">=</span><span class="n">build_paged_indptrs</span><span class="p">(</span>
+                <span class="n">views</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span> <span class="n">ring</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_indptr_ring</span><span class="p">,</span>
+            <span class="p">),</span>
             <span class="n">views</span><span class="o">=</span><span class="n">views</span><span class="p">,</span>
         <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_touch_plan_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A stream of ``rid`` (any stream, when None) changed other than by a</span>
+<span class="sd">        commit: the plan cache no longer describes the streams if it holds</span>
+<span class="sd">        that request."""</span>
+        <span class="n">cache</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_plan_cache</span>
+        <span class="k">if</span> <span class="n">cache</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="n">rid</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="nb">any</span><span class="p">(</span><span class="n">rid</span> <span class="o">==</span> <span class="n">seg</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">cache</span><span class="o">.</span><span class="n">real_segments</span><span class="p">)):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_plan_epoch</span> <span class="o">+=</span> <span class="mi">1</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_split_padding</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""``(n_real, (n_pad, span))`` of a step whose real segments come</span>
+<span class="sd">        first and whose padding segments (a replay's dummy rows) all share</span>
+<span class="sd">        one span; None when the layout is anything else."""</span>
+        <span class="n">segs</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span>
+        <span class="n">n_real</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">segs</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_real_row</span><span class="p">(</span><span class="n">seg</span><span class="o">.</span><span class="n">request_id</span><span class="p">):</span>
+                <span class="k">break</span>
+            <span class="n">n_real</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="n">pad</span> <span class="o">=</span> <span class="n">segs</span><span class="p">[</span><span class="n">n_real</span><span class="p">:]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">pad</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">n_real</span><span class="p">,</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="n">span</span> <span class="o">=</span> <span class="n">pad</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">span</span>
+        <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">pad</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">seg</span><span class="o">.</span><span class="n">span</span> <span class="o">!=</span> <span class="n">span</span> <span class="ow">or</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_real_row</span><span class="p">(</span><span class="n">seg</span><span class="o">.</span><span class="n">request_id</span><span class="p">):</span>
+                <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="n">n_real</span><span class="p">,</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">pad</span><span class="p">),</span> <span class="n">span</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_remember_decode_plan</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">,</span> <span class="n">res</span><span class="p">:</span> <span class="s2">"KVPlanOutputs"</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Keep a leased decode step's plan so the next step of the same rows</span>
+<span class="sd">        can be planned off it (`_fast_decode_plan`). O(1): the full plan's</span>
+<span class="sd">        views are kept as they are and the per-row arrays are derived at the</span>
+<span class="sd">        first hit. Any other plan leaves the cache alone; the epoch and the</span>
+<span class="sd">        commit bookkeeping say whether it still describes the streams."""</span>
+        <span class="n">lease</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span>
+        <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">ctx</span><span class="o">.</span><span class="n">capture</span> <span class="ow">or</span> <span class="n">step</span><span class="o">.</span><span class="n">pre_forks</span> <span class="ow">or</span> <span class="n">step</span><span class="o">.</span><span class="n">post_forks</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">split</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_split_padding</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">split</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">n_real</span><span class="p">,</span> <span class="n">pad_layout</span> <span class="o">=</span> <span class="n">split</span>
+        <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">seg</span><span class="o">.</span><span class="n">span</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="k">return</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_decode_plan_cache</span> <span class="o">=</span> <span class="n">_DecodePlanCache</span><span class="p">(</span>
+            <span class="n">step_segments</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">,</span> <span class="n">real_segments</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">[:</span><span class="n">n_real</span><span class="p">],</span>
+            <span class="n">n_real</span><span class="o">=</span><span class="n">n_real</span><span class="p">,</span> <span class="n">pad_layout</span><span class="o">=</span><span class="n">pad_layout</span><span class="p">,</span>
+            <span class="n">views</span><span class="o">=</span><span class="p">{</span><span class="n">label</span><span class="p">:</span> <span class="n">out</span><span class="o">.</span><span class="n">views</span> <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">out</span> <span class="ow">in</span> <span class="n">res</span><span class="o">.</span><span class="n">items</span><span class="p">()},</span>
+            <span class="n">epoch</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_plan_epoch</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_derive_rows</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">cache</span><span class="p">:</span> <span class="n">_DecodePlanCache</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The per-label row arrays of a cached plan, from its views (once,</span>
+<span class="sd">        at the first hit)."""</span>
+        <span class="n">page_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache</span><span class="o">.</span><span class="n">page_size</span>
+        <span class="n">derived</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">_LabelRows</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">views</span> <span class="ow">in</span> <span class="n">cache</span><span class="o">.</span><span class="n">views</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">n_real</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">views</span><span class="p">:</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_real_row</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span> <span class="ow">and</span> <span class="n">v</span><span class="o">.</span><span class="n">request_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">:</span>
+                    <span class="k">break</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="nb">any</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">request_id</span> <span class="o">==</span> <span class="n">seg</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="ow">and</span> <span class="n">v</span><span class="o">.</span><span class="n">label</span> <span class="o">==</span> <span class="n">seg</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">cache</span><span class="o">.</span><span class="n">real_segments</span><span class="p">):</span>
+                    <span class="k">break</span>
+                <span class="n">n_real</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="n">real</span><span class="p">,</span> <span class="n">pad</span> <span class="o">=</span> <span class="n">views</span><span class="p">[:</span><span class="n">n_real</span><span class="p">],</span> <span class="n">views</span><span class="p">[</span><span class="n">n_real</span><span class="p">:]</span>
+            <span class="k">if</span> <span class="n">pad</span> <span class="ow">and</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">pad</span><span class="p">),</span> <span class="n">pad</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to_compute</span><span class="p">)</span> <span class="o">!=</span> <span class="n">cache</span><span class="o">.</span><span class="n">pad_layout</span><span class="p">:</span>
+                <span class="k">return</span> <span class="kc">None</span>
+            <span class="n">streams</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">real</span><span class="p">:</span>
+                <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">label</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">stream</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">page_idxs</span><span class="p">)</span> <span class="o">!=</span> <span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">v</span><span class="o">.</span><span class="n">length</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">):</span>
+                    <span class="k">return</span> <span class="kc">None</span>
+                <span class="n">streams</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">stream</span><span class="p">)</span>
+            <span class="n">row_pages</span> <span class="o">=</span> <span class="p">[</span><span class="n">v</span><span class="o">.</span><span class="n">page_idxs</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">real</span><span class="p">]</span>
+            <span class="n">derived</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">_LabelRows</span><span class="p">(</span>
+                <span class="n">rows</span><span class="o">=</span><span class="nb">tuple</span><span class="p">((</span><span class="n">v</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">v</span><span class="o">.</span><span class="n">label</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">real</span><span class="p">),</span>
+                <span class="n">streams</span><span class="o">=</span><span class="n">streams</span><span class="p">,</span>
+                <span class="n">lens</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">fromiter</span><span class="p">((</span><span class="n">v</span><span class="o">.</span><span class="n">length</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">real</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">n_real</span><span class="p">),</span>
+                <span class="n">npages</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">fromiter</span><span class="p">((</span><span class="nb">len</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">row_pages</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">n_real</span><span class="p">),</span>
+                <span class="n">row_pages</span><span class="o">=</span><span class="n">row_pages</span><span class="p">,</span>
+                <span class="n">last_page</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">fromiter</span><span class="p">((</span><span class="n">p</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">row_pages</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">n_real</span><span class="p">),</span>
+                <span class="n">indices</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">fromiter</span><span class="p">(</span>
+                    <span class="n">itertools</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">from_iterable</span><span class="p">(</span><span class="n">row_pages</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="nb">sum</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">row_pages</span><span class="p">),</span>
+                <span class="p">),</span>
+                <span class="n">gens</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">fromiter</span><span class="p">((</span><span class="n">v</span><span class="o">.</span><span class="n">generation</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">real</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">n_real</span><span class="p">),</span>
+                <span class="n">n_pad</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="n">pad</span><span class="p">),</span> <span class="n">pad_span</span><span class="o">=</span><span class="n">pad</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to_compute</span> <span class="k">if</span> <span class="n">pad</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
+                <span class="n">pad_pages</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="n">pad</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">page_idxs</span><span class="p">)</span> <span class="k">if</span> <span class="n">pad</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
+                <span class="n">built</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="n">derived</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_fast_decode_plan</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"KVPlanOutputs | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The plan of a leased decode step off the previous step's, when the</span>
+<span class="sd">        real rows are the same in the same order and only that step's commit</span>
+<span class="sd">        touched the streams (`_plan_epoch`, `pending`): every length is one</span>
+<span class="sd">        more, a page is new only where a row crossed a page boundary, the</span>
+<span class="sd">        index arrays come from numpy and the views are built only if a</span>
+<span class="sd">        consumer asks. None means plan from the streams."""</span>
+        <span class="n">cache</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_plan_cache</span>
+        <span class="n">stats</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">plan_cache_stats</span>
+        <span class="k">if</span> <span class="p">(</span>
+            <span class="n">cache</span> <span class="ow">is</span> <span class="kc">None</span>
+            <span class="ow">or</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span> <span class="ow">is</span> <span class="kc">None</span>
+            <span class="ow">or</span> <span class="n">ctx</span><span class="o">.</span><span class="n">capture</span>
+            <span class="ow">or</span> <span class="n">step</span><span class="o">.</span><span class="n">pre_forks</span>
+            <span class="ow">or</span> <span class="n">step</span><span class="o">.</span><span class="n">post_forks</span>
+        <span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">cache</span><span class="o">.</span><span class="n">epoch</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_epoch</span> <span class="ow">or</span> <span class="n">cache</span><span class="o">.</span><span class="n">pending</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">stats</span><span class="p">[</span><span class="s2">"miss"</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">n_real</span> <span class="o">=</span> <span class="n">cache</span><span class="o">.</span><span class="n">n_real</span>
+        <span class="n">segs</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span>
+        <span class="k">if</span> <span class="p">(</span>
+            <span class="nb">len</span><span class="p">(</span><span class="n">segs</span><span class="p">)</span> <span class="o">!=</span> <span class="n">n_real</span> <span class="o">+</span> <span class="n">cache</span><span class="o">.</span><span class="n">pad_layout</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="ow">or</span> <span class="n">segs</span><span class="p">[:</span><span class="n">n_real</span><span class="p">]</span> <span class="o">!=</span> <span class="n">cache</span><span class="o">.</span><span class="n">real_segments</span>
+            <span class="ow">or</span> <span class="nb">any</span><span class="p">(</span><span class="n">seg</span><span class="o">.</span><span class="n">span</span> <span class="o">!=</span> <span class="n">cache</span><span class="o">.</span><span class="n">pad_layout</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="ow">or</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_real_row</span><span class="p">(</span><span class="n">seg</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span> <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">segs</span><span class="p">[</span><span class="n">n_real</span><span class="p">:])</span>
+        <span class="p">):</span>
+            <span class="n">stats</span><span class="p">[</span><span class="s2">"miss"</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">cache</span><span class="o">.</span><span class="n">derived</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">cache</span><span class="o">.</span><span class="n">derived</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_derive_rows</span><span class="p">(</span><span class="n">cache</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">cache</span><span class="o">.</span><span class="n">derived</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_decode_plan_cache</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="n">stats</span><span class="p">[</span><span class="s2">"miss"</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+                <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">page_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache</span><span class="o">.</span><span class="n">page_size</span>
+        <span class="n">pad_segs</span> <span class="o">=</span> <span class="n">segs</span><span class="p">[</span><span class="n">n_real</span><span class="p">:]</span>
+        <span class="n">make</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_indptr_ring</span><span class="o">.</span><span class="n">take</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_indptr_ring</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span>
+        <span class="n">out</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KVPlanOutput</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">rows</span> <span class="ow">in</span> <span class="n">cache</span><span class="o">.</span><span class="n">derived</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">lens</span> <span class="o">=</span> <span class="n">rows</span><span class="o">.</span><span class="n">lens</span> <span class="o">+</span> <span class="mi">1</span>
+            <span class="n">last</span> <span class="o">=</span> <span class="p">(</span><span class="n">lens</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">page_size</span> <span class="o">+</span> <span class="mi">1</span>
+            <span class="n">npages</span> <span class="o">=</span> <span class="p">(</span><span class="n">lens</span> <span class="o">+</span> <span class="n">page_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="n">page_size</span>
+            <span class="n">crossed</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">flatnonzero</span><span class="p">(</span><span class="n">npages</span> <span class="o">!=</span> <span class="n">rows</span><span class="o">.</span><span class="n">npages</span><span class="p">)</span>
+            <span class="c1"># the one commit since bumped each row; a new page's alloc bumps it again</span>
+            <span class="n">gens</span> <span class="o">=</span> <span class="n">rows</span><span class="o">.</span><span class="n">gens</span> <span class="o">+</span> <span class="mi">1</span>
+            <span class="k">if</span> <span class="n">crossed</span><span class="o">.</span><span class="n">size</span><span class="p">:</span>
+                <span class="c1"># copy only while the last plan's unbuilt views still hold the list</span>
+                <span class="n">row_pages</span> <span class="o">=</span> <span class="n">rows</span><span class="o">.</span><span class="n">row_pages</span>
+                <span class="k">if</span> <span class="n">rows</span><span class="o">.</span><span class="n">built</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">rows</span><span class="o">.</span><span class="n">built</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span>
+                    <span class="n">row_pages</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">row_pages</span><span class="p">)</span>
+                <span class="n">streams</span><span class="p">,</span> <span class="n">last_page</span> <span class="o">=</span> <span class="n">rows</span><span class="o">.</span><span class="n">streams</span><span class="p">,</span> <span class="n">rows</span><span class="o">.</span><span class="n">last_page</span>
+                <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">crossed</span><span class="o">.</span><span class="n">tolist</span><span class="p">():</span>
+                    <span class="n">want</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">npages</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+                    <span class="n">stream</span> <span class="o">=</span> <span class="n">streams</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+                    <span class="n">held</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span>
+                    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">held</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">want</span><span class="p">:</span>
+                        <span class="n">stats</span><span class="p">[</span><span class="s2">"miss"</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+                        <span class="k">return</span> <span class="kc">None</span>
+                    <span class="n">pages</span> <span class="o">=</span> <span class="n">held</span><span class="p">[:</span><span class="n">want</span><span class="p">]</span>
+                    <span class="n">row_pages</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">pages</span>
+                    <span class="n">last_page</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">pages</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+                    <span class="n">gens</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">generation</span>
+                <span class="n">rows</span><span class="o">.</span><span class="n">row_pages</span> <span class="o">=</span> <span class="n">row_pages</span>
+                <span class="n">rows</span><span class="o">.</span><span class="n">indices</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">fromiter</span><span class="p">(</span>
+                    <span class="n">itertools</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">from_iterable</span><span class="p">(</span><span class="n">row_pages</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">npages</span><span class="o">.</span><span class="n">sum</span><span class="p">()),</span>
+                <span class="p">)</span>
+            <span class="n">rows</span><span class="o">.</span><span class="n">lens</span> <span class="o">=</span> <span class="n">lens</span>
+            <span class="n">rows</span><span class="o">.</span><span class="n">npages</span> <span class="o">=</span> <span class="n">npages</span>
+            <span class="n">rows</span><span class="o">.</span><span class="n">gens</span> <span class="o">=</span> <span class="n">gens</span>
+            <span class="n">n_pad</span><span class="p">,</span> <span class="n">pad_span</span><span class="p">,</span> <span class="n">pad_pages</span> <span class="o">=</span> <span class="n">rows</span><span class="o">.</span><span class="n">n_pad</span><span class="p">,</span> <span class="n">rows</span><span class="o">.</span><span class="n">pad_span</span><span class="p">,</span> <span class="n">rows</span><span class="o">.</span><span class="n">pad_pages</span>
+            <span class="k">if</span> <span class="n">n_pad</span><span class="p">:</span>
+                <span class="n">pad_last</span> <span class="o">=</span> <span class="p">(</span><span class="n">pad_span</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">page_size</span> <span class="o">+</span> <span class="mi">1</span>
+                <span class="n">last_all</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">((</span><span class="n">last</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">full</span><span class="p">(</span><span class="n">n_pad</span><span class="p">,</span> <span class="n">pad_last</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)))</span>
+                <span class="n">npages_all</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">((</span><span class="n">npages</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">full</span><span class="p">(</span><span class="n">n_pad</span><span class="p">,</span> <span class="n">pad_pages</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)))</span>
+                <span class="n">indices</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">((</span><span class="n">rows</span><span class="o">.</span><span class="n">indices</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">full</span><span class="p">(</span><span class="n">n_pad</span> <span class="o">*</span> <span class="n">pad_pages</span><span class="p">,</span> <span class="n">SINK_PAGE</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">)))</span>
+                <span class="n">pages_all</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">((</span><span class="n">rows</span><span class="o">.</span><span class="n">last_page</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">full</span><span class="p">(</span><span class="n">n_pad</span><span class="p">,</span> <span class="n">SINK_PAGE</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">)))</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">last_all</span><span class="p">,</span> <span class="n">npages_all</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span> <span class="n">pages_all</span> <span class="o">=</span> <span class="n">last</span><span class="p">,</span> <span class="n">npages</span><span class="p">,</span> <span class="n">rows</span><span class="o">.</span><span class="n">indices</span><span class="p">,</span> <span class="n">rows</span><span class="o">.</span><span class="n">last_page</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+            <span class="n">kv_indptr</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">((</span><span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">int64</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">npages_all</span><span class="p">)))</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+            <span class="n">n_rows</span> <span class="o">=</span> <span class="n">n_real</span> <span class="o">+</span> <span class="n">n_pad</span>
+            <span class="n">qo_indptr</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">n_rows</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+            <span class="n">kv_lens</span> <span class="o">=</span> <span class="p">(</span><span class="n">npages_all</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">page_size</span> <span class="o">+</span> <span class="n">last_all</span>
+            <span class="n">row_pages_now</span><span class="p">,</span> <span class="n">lens_now</span> <span class="o">=</span> <span class="n">rows</span><span class="o">.</span><span class="n">row_pages</span><span class="p">,</span> <span class="n">lens</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
+            <span class="n">pad_now</span> <span class="o">=</span> <span class="p">[(</span><span class="n">seg</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">seg</span><span class="o">.</span><span class="n">label</span><span class="p">,</span> <span class="n">seg</span><span class="o">.</span><span class="n">span</span><span class="p">)</span> <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">pad_segs</span><span class="p">]</span>
+            <span class="n">rows</span><span class="o">.</span><span class="n">built</span> <span class="o">=</span> <span class="n">built</span> <span class="o">=</span> <span class="p">[</span><span class="kc">False</span><span class="p">]</span>
+
+            <span class="k">def</span><span class="w"> </span><span class="nf">build_views</span><span class="p">(</span>
+                <span class="n">row_pages_now</span><span class="o">=</span><span class="n">row_pages_now</span><span class="p">,</span> <span class="n">lens_now</span><span class="o">=</span><span class="n">lens_now</span><span class="p">,</span> <span class="n">gens_now</span><span class="o">=</span><span class="n">gens</span><span class="p">,</span> <span class="n">pad_now</span><span class="o">=</span><span class="n">pad_now</span><span class="p">,</span> <span class="n">rows</span><span class="o">=</span><span class="n">rows</span><span class="p">,</span>
+                <span class="n">built</span><span class="o">=</span><span class="n">built</span><span class="p">,</span>
+            <span class="p">):</span>
+                <span class="n">built</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="c1"># generations as of this plan, not read off the streams a later commit bumps</span>
+                <span class="n">views</span> <span class="o">=</span> <span class="p">[</span>
+                    <span class="n">SequenceView</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">lab</span><span class="p">,</span> <span class="n">pages</span><span class="p">,</span> <span class="n">length</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">gen</span><span class="p">)</span>
+                    <span class="k">for</span> <span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">lab</span><span class="p">,</span> <span class="n">_</span><span class="p">),</span> <span class="n">pages</span><span class="p">,</span> <span class="n">length</span><span class="p">,</span> <span class="n">gen</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+                        <span class="n">rows</span><span class="o">.</span><span class="n">rows</span><span class="p">,</span> <span class="n">row_pages_now</span><span class="p">,</span> <span class="n">lens_now</span><span class="p">,</span> <span class="n">gens_now</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                    <span class="p">)</span>
+                <span class="p">]</span>
+                <span class="n">views</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span>
+                    <span class="n">SequenceView</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">lab</span><span class="p">,</span> <span class="p">[</span><span class="n">SINK_PAGE</span><span class="p">]</span> <span class="o">*</span> <span class="n">rows</span><span class="o">.</span><span class="n">pad_pages</span><span class="p">,</span> <span class="n">span</span><span class="p">,</span> <span class="n">span</span><span class="p">)</span> <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">lab</span><span class="p">,</span> <span class="n">span</span> <span class="ow">in</span> <span class="n">pad_now</span>
+                <span class="p">)</span>
+                <span class="k">return</span> <span class="n">views</span>
+
+            <span class="n">out</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">KVPlanOutput</span><span class="p">(</span>
+                <span class="n">cpu_indptrs</span><span class="o">=</span><span class="n">PagedIndptrs</span><span class="p">(</span>
+                    <span class="n">qo_indptr</span><span class="o">=</span><span class="n">make</span><span class="p">(</span><span class="n">qo_indptr</span><span class="p">),</span>
+                    <span class="n">paged_kv_indptr</span><span class="o">=</span><span class="n">make</span><span class="p">(</span><span class="n">kv_indptr</span><span class="p">),</span>
+                    <span class="n">paged_kv_indices</span><span class="o">=</span><span class="n">make</span><span class="p">(</span><span class="n">indices</span><span class="p">),</span>
+                    <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="n">make</span><span class="p">(</span><span class="n">last_all</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">)),</span>
+                    <span class="n">kv_lens</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">kv_lens</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">))</span><span class="o">.</span><span class="n">as_subclass</span><span class="p">(</span><span class="n">HostLens</span><span class="p">),</span>
+                <span class="p">),</span>
+                <span class="n">decode_pages</span><span class="o">=</span><span class="n">pages_all</span><span class="p">,</span>
+                <span class="n">decode_offsets</span><span class="o">=</span><span class="n">last_all</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span>
+                <span class="n">rows</span><span class="o">=</span><span class="n">rows</span><span class="o">.</span><span class="n">rows</span> <span class="o">+</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">pad_now</span><span class="p">),</span>
+                <span class="n">view_builder</span><span class="o">=</span><span class="n">build_views</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="n">cache</span><span class="o">.</span><span class="n">step_segments</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span>
+        <span class="n">cache</span><span class="o">.</span><span class="n">pending</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">stats</span><span class="p">[</span><span class="s2">"hit"</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="k">return</span> <span class="n">KVPlanOutputs</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="n">pre_forks</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">pre_forks</span><span class="p">,</span> <span class="n">post_forks</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">post_forks</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_same_plan</span><span class="p">(</span><span class="n">a</span><span class="p">:</span> <span class="s2">"KVPlanOutputs"</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="s2">"KVPlanOutputs"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The cached plan against the full one (MSTAR_KV_PLAN_CACHE=2)."""</span>
+        <span class="k">if</span> <span class="n">a</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span> <span class="o">!=</span> <span class="n">b</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">a</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">y</span> <span class="o">=</span> <span class="n">b</span><span class="p">[</span><span class="n">label</span><span class="p">]</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">views</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">len</span><span class="p">(</span><span class="n">y</span><span class="o">.</span><span class="n">views</span><span class="p">):</span>
+                <span class="k">return</span> <span class="kc">False</span>
+            <span class="k">for</span> <span class="n">u</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">views</span><span class="p">,</span> <span class="n">y</span><span class="o">.</span><span class="n">views</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+                <span class="k">if</span> <span class="n">u</span><span class="p">[:</span><span class="mi">5</span><span class="p">]</span> <span class="o">!=</span> <span class="n">v</span><span class="p">[:</span><span class="mi">5</span><span class="p">]</span> <span class="ow">or</span> <span class="n">u</span><span class="o">.</span><span class="n">generation</span> <span class="o">!=</span> <span class="n">v</span><span class="o">.</span><span class="n">generation</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="kc">False</span>
+            <span class="k">for</span> <span class="n">p</span><span class="p">,</span> <span class="n">q</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">cpu_indptrs</span><span class="p">[:</span><span class="mi">5</span><span class="p">],</span> <span class="n">y</span><span class="o">.</span><span class="n">cpu_indptrs</span><span class="p">[:</span><span class="mi">5</span><span class="p">],</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">p</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">)</span> <span class="o">!=</span> <span class="p">(</span><span class="n">q</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="p">(</span>
+                    <span class="n">p</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">q</span><span class="p">)</span>
+                <span class="p">):</span>
+                    <span class="k">return</span> <span class="kc">False</span>
+            <span class="k">if</span> <span class="n">x</span><span class="o">.</span><span class="n">decode_pages</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">pages</span> <span class="o">=</span> <span class="p">[</span><span class="n">v</span><span class="o">.</span><span class="n">page_idxs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">y</span><span class="o">.</span><span class="n">views</span><span class="p">]</span>
+                <span class="k">if</span> <span class="n">x</span><span class="o">.</span><span class="n">decode_pages</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span> <span class="o">!=</span> <span class="n">pages</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="kc">False</span>
+        <span class="k">return</span> <span class="kc">True</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_maybe_apply_forks</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
         <span class="k">for</span> <span class="p">(</span><span class="n">from_label</span><span class="p">,</span> <span class="n">to_label</span><span class="p">)</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">pre_forks</span><span class="p">:</span>
@@ -2337,7 +2825,8 @@ window.runMermaid = runMermaid;</script>
 
                 <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_new_labels</span> <span class="o">=</span> <span class="p">[]</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_marked</span> <span class="o">=</span> <span class="p">[]</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span>
+                <span class="c1"># the promoted step runs; the plan cache still describes it</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">(</span><span class="n">promoted</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
                 <span class="k">return</span> <span class="n">res</span>
             <span class="c1"># A different step reached the GPU thread before the one planned</span>
             <span class="c1"># ahead (e.g. a new request's prefill while a decode step sits</span>
@@ -2353,18 +2842,34 @@ window.runMermaid = runMermaid;</script>
             <span class="n">pending</span> <span class="o">=</span> <span class="p">{}</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_maybe_apply_forks</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
 
-        <span class="n">res</span> <span class="o">=</span> <span class="n">KVPlanOutputs</span><span class="p">(</span>
-            <span class="p">{</span>
-                <span class="n">plan_label</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_output</span><span class="p">(</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_sequence_views</span><span class="p">(</span><span class="n">segments</span><span class="p">,</span> <span class="n">pending</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
+        <span class="n">res</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_cache_mode</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">pending</span><span class="p">:</span>
+            <span class="n">res</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_fast_decode_plan</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">res</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_cache_mode</span> <span class="o">==</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="n">full</span> <span class="o">=</span> <span class="n">KVPlanOutputs</span><span class="p">(</span>
+                <span class="p">{</span>
+                    <span class="n">plan_label</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_output</span><span class="p">(</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_sequence_views</span><span class="p">(</span><span class="n">segments</span><span class="p">,</span> <span class="n">pending</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
+                    <span class="p">)</span>
+                    <span class="k">for</span> <span class="n">plan_label</span><span class="p">,</span> <span class="n">segments</span> <span class="ow">in</span> <span class="n">group_by_plan_label</span><span class="p">(</span>
+                        <span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">,</span> <span class="n">step</span><span class="o">.</span><span class="n">combined_labels</span>
+                    <span class="p">)</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+                <span class="p">},</span>
+                <span class="n">pre_forks</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">pre_forks</span><span class="p">,</span>
+                <span class="n">post_forks</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">post_forks</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">res</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_same_plan</span><span class="p">(</span><span class="n">res</span><span class="p">,</span> <span class="n">full</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">plan_cache_stats</span><span class="p">[</span><span class="s2">"mismatch"</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+                    <span class="s2">"KV </span><span class="si">%s</span><span class="s2">: the plan cache disagrees with the full plan for "</span>
+                    <span class="s2">"</span><span class="si">%d</span><span class="s2"> segments; using the full plan (MSTAR_KV_PLAN_CACHE=2)"</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">),</span>
                 <span class="p">)</span>
-                <span class="k">for</span> <span class="n">plan_label</span><span class="p">,</span> <span class="n">segments</span> <span class="ow">in</span> <span class="n">group_by_plan_label</span><span class="p">(</span>
-                    <span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">,</span> <span class="n">step</span><span class="o">.</span><span class="n">combined_labels</span>
-                <span class="p">)</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
-            <span class="p">},</span>
-            <span class="n">pre_forks</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">pre_forks</span><span class="p">,</span>
-            <span class="n">post_forks</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">post_forks</span><span class="p">,</span>
-        <span class="p">)</span>
+                <span class="n">res</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">res</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">res</span> <span class="o">=</span> <span class="n">full</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_cache_mode</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">pending</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_remember_decode_plan</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">,</span> <span class="n">res</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_setup_plan_states</span><span class="p">(</span><span class="n">res</span><span class="p">,</span> <span class="n">ctx</span><span class="p">,</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_key</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
@@ -2386,7 +2891,9 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="KVManager.clear_preplan">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.clear_preplan">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">clear_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">clear_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">promoted</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">promoted</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_touch_plan_cache</span><span class="p">()</span>
         <span class="c1"># the staged step is not going to run, so undo what it did to live</span>
         <span class="c1"># state. the pre-forks need no rewinding — staging only read them —</span>
         <span class="c1"># but admit's reservations are real pages and real streams</span>
@@ -2416,6 +2923,20 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">commit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
         <span class="n">streams</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span>
         <span class="n">retention</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">retention</span>
+        <span class="c1"># what the plan cache may assume of the next step: this step's spans</span>
+        <span class="c1"># landed, nothing else (a step that keeps no tokens is "something else")</span>
+        <span class="n">cache</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_plan_cache</span>
+        <span class="k">if</span> <span class="n">cache</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">is</span> <span class="n">cache</span><span class="o">.</span><span class="n">step_segments</span><span class="p">:</span>
+                <span class="n">cache</span><span class="o">.</span><span class="n">pending</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">elif</span> <span class="nb">len</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">cache</span><span class="o">.</span><span class="n">step_segments</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">any</span><span class="p">(</span>
+                <span class="p">(</span><span class="n">seg</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">seg</span><span class="o">.</span><span class="n">label</span><span class="p">)</span> <span class="ow">in</span> <span class="n">cache</span><span class="o">.</span><span class="n">rows</span> <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span>
+            <span class="p">):</span>
+                <span class="c1"># another batch that is as big (surely sharing rows) or that</span>
+                <span class="c1"># names a cached row: the cache no longer describes the streams</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_plan_epoch</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">step</span><span class="o">.</span><span class="n">commit</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_plan_epoch</span> <span class="o">+=</span> <span class="mi">1</span>
         <span class="c1"># the index only sees real rows of a non-capture step; checked once</span>
         <span class="n">index_on</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">capture</span>
         <span class="c1"># atomic against admit_retrieve reading stored_len on another thread</span>
@@ -2441,6 +2962,7 @@ window.runMermaid = runMermaid;</script>
                             <span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">segment</span><span class="o">.</span><span class="n">span</span><span class="p">,</span>
                             <span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">,</span>
                         <span class="p">)</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_plan_epoch</span> <span class="o">+=</span> <span class="mi">1</span>
                         <span class="k">continue</span>
                     <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">+=</span> <span class="n">segment</span><span class="o">.</span><span class="n">span</span>
                     <span class="c1"># committed, so there is no refused admit left for a re-probe to answer</span>
@@ -2550,6 +3072,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_release_oldest_locked</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">CacheStream</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""The page-floored front release shared by ``release_oldest`` and the</span>
 <span class="sd">        commit-time retention. Under the lock."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_touch_plan_cache</span><span class="p">()</span>
         <span class="n">page_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
         <span class="n">first</span> <span class="o">=</span> <span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="o">+</span> <span class="n">page_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="n">page_size</span>
         <span class="n">releasable</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">//</span> <span class="n">page_size</span> <span class="o">-</span> <span class="n">first</span>
@@ -2724,6 +3247,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        have a torn host copy, and that fork's source is one of these streams,</span>
 <span class="sd">        so the whole request stays on device rather than half of it.</span>
 <span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_touch_plan_cache</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
             <span class="n">streams</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span>
             <span class="k">for</span> <span class="n">claim</span> <span class="ow">in</span> <span class="n">moved</span><span class="p">:</span>
@@ -2794,6 +3318,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        False when the device can't fit them right now; nothing moves in that</span>
 <span class="sd">        case, so the caller can evict further and try again.</span>
 <span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_touch_plan_cache</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span><span class="o">.</span><span class="n">is_offloaded</span><span class="p">(</span><span class="n">rid</span><span class="p">):</span>
             <span class="k">return</span> <span class="kc">False</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
@@ -3061,6 +3586,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="KVManager.reset_request">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.reset_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">reset_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">free</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_touch_plan_cache</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">flush_chain_backlog</span><span class="p">()</span>
         <span class="n">streams</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">streams</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span>
@@ -3095,6 +3622,10 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="KVManager.remove_request">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.remove_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">remove_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_touch_plan_cache</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="c1"># its waiting tokens first, before the handle can name another request</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_drain_chain_backlog</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="n">streams</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">streams</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># drain in-flight reads outside the lock; see reset_request</span>
@@ -3301,6 +3832,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Locked (reentrant): called from plan (pre-forks, else unguarded) and</span>
 <span class="sd">        from the already-locked commit (post-forks).</span>
 <span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_touch_plan_cache</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">from_label</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="n">rid</span><span class="p">]:</span>
                 <span class="k">return</span>

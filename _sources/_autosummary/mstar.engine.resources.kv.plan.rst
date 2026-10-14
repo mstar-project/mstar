@@ -28,6 +28,7 @@ mstar.engine.resources.kv.plan
       KVPlanOutput
       KVPlanOutputs
       PagedIndptrs
+      PinnedIndexRing
       SequenceView
    
    

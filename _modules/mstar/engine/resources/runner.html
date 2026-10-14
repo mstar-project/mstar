@@ -1228,6 +1228,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">raise</span></div>
 
 
+<div class="viewcode-block" id="StepRunner.ingest_capture_row">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.ingest_capture_row">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">ingest_capture_row</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""open a capture padding row on all resources"""</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">ingest_capture_row</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="StepRunner.remove_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.remove_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">remove_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
