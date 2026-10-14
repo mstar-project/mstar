@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.graph.runtime.base import SpeculationOutput  # noqa: E402
+from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 LOOP = "denoise"
@@ -31,6 +32,16 @@ def _info(rid: int, k: int) -> CurrentForwardPassInfo:
     )
 
 
+def _scheduler():
+    """The real ``label_for`` over an empty combined-walk map: these batches
+    are uniform, so it labels each with its own walk and carries no
+    per-row walks."""
+    scheduler = SimpleNamespace(combined_walk_of={})
+    for name in ("label_for", "_key"):
+        setattr(scheduler, name, getattr(MicroScheduler, name).__get__(scheduler))
+    return scheduler
+
+
 def _worker(shared: dict[int, CurrentForwardPassInfo]):
     """A bare worker: the request state answers with the shared info (which the
     worker refreshes to the loop's index when a step's outputs are routed); the
@@ -40,6 +51,7 @@ def _worker(shared: dict[int, CurrentForwardPassInfo]):
         _graph_runtime=SimpleNamespace(get_consumed_edges=lambda *a: []),
         _stream_chunks_for=lambda rid, node_name, inputs: None,
         _settle_final_streams=lambda node_name, final_edges: (set(), set()),
+        scheduler=_scheduler(),
     )
     for name in ("_make_executing_batch", "_build_input_metadata_and_fwd_info", "_assemble_speculation"):
         setattr(worker, name, getattr(Worker, name).__get__(worker))
