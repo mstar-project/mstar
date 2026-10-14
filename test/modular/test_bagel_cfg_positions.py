@@ -27,7 +27,7 @@ from mstar.engine.resources import PagedKVConfig, PositionConfig, StepContext, S
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.manager import RopeManager
-from mstar.model.bagel.submodules import LLMSubmodule, active_labels
+from mstar.model.bagel.submodules import MIXED_TEXT, LLMSubmodule, active_labels
 from mstar.model.submodule_base import ARNodeInputs
 
 pytestmark = pytest.mark.skipif(
@@ -224,6 +224,59 @@ def _llm_stub():
             object()
         ),
     )
+
+
+def _segments_by_label(step):
+    out: dict[str, set[str]] = {}
+    for segment in step.steps["kv"].segments:
+        out.setdefault(segment.label, set()).add(segment.request_id)
+    return out
+
+
+def test_a_mixed_step_keeps_an_unguided_row_out_of_the_guidance_branch():
+    """Guidance is a per-request property, so the cache labels are too.
+
+    `requires_cfg` is read with `any()` over the rows, which was right while a
+    step held one walk -- every row of it was guided or none was. Under the
+    combined walk an unguided decode row can share a step with a guided
+    prefill, and it used to be handed the guided row's cfg_img segments: with
+    T2T requests decoding beside seeded T2I, one of six images and one of six
+    greedy texts changed, where on main both were identical to the alone runs.
+    """
+    submodule = _llm_stub()
+    guided = ARNodeInputs(
+        input_seq_len=4, graph_walk="prefill_text", resource_step_info={"cfg": True},
+    )
+    plain = ARNodeInputs(
+        input_seq_len=1, graph_walk="decode", resource_step_info=None,
+    )
+
+    step = LLMSubmodule.declare_step(
+        submodule, MIXED_TEXT, ["guided", "plain"], [guided, plain],
+    )
+
+    by_label = _segments_by_label(step)
+    assert by_label["main"] == {"guided", "plain"}, "both rows run the main branch"
+    assert by_label.get("cfg_img", set()) == {"guided"}, (
+        "only the guided row belongs in the guidance branch"
+    )
+    # the step still declares the branch, so the guided row is not silently
+    # demoted to an unguided forward
+    assert step.cg_key_info is True
+
+
+def test_a_mixed_step_of_unguided_rows_declares_no_branch():
+    """The other direction: nothing to scope, so the step is plain."""
+    submodule = _llm_stub()
+    rows = [
+        ARNodeInputs(input_seq_len=4, graph_walk="prefill_text", resource_step_info=None),
+        ARNodeInputs(input_seq_len=1, graph_walk="decode", resource_step_info=None),
+    ]
+
+    step = LLMSubmodule.declare_step(submodule, MIXED_TEXT, ["a", "b"], rows)
+
+    assert set(_segments_by_label(step)) == {"main"}
+    assert step.cg_key_info is False
 
 
 @pytest.mark.parametrize("cfg_on", [False, True], ids=["cfg_off", "cfg_on"])

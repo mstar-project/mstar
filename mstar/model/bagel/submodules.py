@@ -910,18 +910,35 @@ class LLMSubmodule(ARNodeSubmodule):
         requires_cfg = requires_cfg_for_inputs(inputs)
         labels = self._get_active_labels(graph_walk, requires_cfg)
         spans = tuple(inp.input_seq_len for inp in inputs)
+        # Guidance is a per-REQUEST property, so the labels are too. Reading
+        # one flag for the step was right while a step held one walk: every row
+        # of it was guided or none was. Under a combined walk an unguided
+        # decode row can share a step with a guided prefill, and giving it the
+        # guided row's cfg_text/cfg_img segments puts its tokens in branches it
+        # never asked for -- which changed one of six images and one of six
+        # greedy texts when T2T decoded beside T2I.
+        row_labels = [
+            frozenset(self._get_active_labels(graph_walk, bool(inp.resource_step_info)))
+            for inp in inputs
+        ]
 
         # Label-major, matching how a combined plan concatenates its sources;
         # this tuple is the ordering authority for every per-token array.
         segments = tuple(
             Segment(rid, label, span)
             for label in labels
-            for rid, span in zip(request_ids, spans, strict=True)
+            for rid, span, mine in zip(request_ids, spans, row_labels, strict=True)
+            if label in mine
         )
+        # Filtered on the same `label in mine` as `segments`, in the same
+        # order: these ids are concatenated positionally against that tuple, so
+        # the two predicates have to agree or a row reads another's positions.
         per_label_pos_ids = {
             label: [
-                inp.custom_pos_ids[label] for inp in inputs
-                if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
+                inp.custom_pos_ids[label]
+                for inp, mine in zip(inputs, row_labels, strict=True)
+                if label in mine
+                and isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
             ] for label in labels
         }
 
