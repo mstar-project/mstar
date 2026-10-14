@@ -51,8 +51,11 @@ class OrpheusModelConfig:
     # final flush decodes the real tail of the stream. Chunk k takes
     # ``snac_chunk_schedule[k]`` new frames (``snac_chunk_frames`` after it),
     # so the first audio leaves after ``snac_chunk_schedule[0]`` frames.
+    # Two-frame chunks for the first ~1.9 s never wait on an LLM that is
+    # only just faster than real time, while the listener's buffer is short;
+    # four-frame chunks after that decode half as many frames per frame.
     # Deployment YAML ``model_kwargs`` override these.
-    snac_chunk_schedule: tuple[int, ...] = (4,)
+    snac_chunk_schedule: tuple[int, ...] = (4,) + (2,) * 10
     snac_chunk_frames: int = 4
     snac_left_context_frames: int = 3
     snac_right_context_frames: int = 2
