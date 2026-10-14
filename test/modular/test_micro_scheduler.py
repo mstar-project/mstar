@@ -1186,9 +1186,10 @@ def test_the_backlog_and_round_robin_key_on_the_combined_walk():
 
     first = _next_batch(sched, manager)
     assert (NODE, MIXED) in sched.node_and_walk_to_last_batch_num
-    # it drains rather than refilling: a row the cap pushed out goes back to
-    # its ready queue instead of parking under the combined key
-    assert not sched.backlog
+    # Rows the per-walk cap left out park under the combined key as well --
+    # unlike a row the plain cap pushes out, they cannot run this step
+    # whichever walk holds them, so going back would re-pop them every pass.
+    assert set(sched.backlog) == {(NODE, MIXED)}
     second = _next_batch(sched, manager)
 
     assert len(first) + len(second) == 4
