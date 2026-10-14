@@ -81,6 +81,8 @@ class SamplerResource(Resource):
         self._keep_last_token = False
         # rid -> the prompt tokens a cache hit kept out of this step's inputs
         self._cached_prefix: dict[str, torch.Tensor] = {}
+        # this step's `SamplerStep.kept_rids`, for the eager draw
+        self._kept_rids: frozenset[int] | None = None
 
     @property
     def _penalty_live(self) -> bool:
@@ -249,6 +251,8 @@ class SamplerResource(Resource):
 
     def plan(self, step: SamplerStep, ctx: StepContext):
         self._set_penalty_flags(step, ctx)
+        if not ctx.is_preplan:
+            self._kept_rids = step.kept_rids
         if not ctx.is_preplan and self._penalty_live:
             for rid, tokens in step.prefill_tracked_tokens.items():
                 self._sampler.get_token_mask(rid).add_tokens(tokens)
@@ -330,20 +334,24 @@ class SamplerResource(Resource):
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return
+        kept = step.kept_rids
+        keep = None if kept is None else [rid in kept for rid in ctx.request_ids]
         if self._cg_buffers.ingraph_scatter:
             # the captured sample scattered both rows itself
             if self._penalty_needed_this_step:
                 self._cg_sampler.sync_seen_token_masks(
-                    [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
+                    [self._sampler.get_token_mask(rid) for rid in ctx.request_ids],
+                    keep=keep,
                 )
             return
         t0 = perf_counter() if PHASE_PERIOD else 0.0
-        self._cg_buffers.scatter_offset(ctx.slot_lease.slot)
+        keep_gpu = self._cg_buffers.keep_mask(keep)
+        self._cg_buffers.scatter_offset(ctx.slot_lease.slot, keep=keep_gpu)
         if PHASE_PERIOD:
             phase_record("res.commit.sampler.offset", perf_counter() - t0)
             t0 = perf_counter()
         if self._keep_last_token:
-            self._cg_buffers.scatter_last_token(ctx.slot_lease.slot)
+            self._cg_buffers.scatter_last_token(ctx.slot_lease.slot, keep=keep_gpu)
             if PHASE_PERIOD:
                 phase_record("res.commit.sampler.last_token", perf_counter() - t0)
         # Skipped when nothing read the mask this step: there is then nothing to
@@ -351,7 +359,8 @@ class SamplerResource(Resource):
         # which never read them. See `_penalty_live` for why that stays sound.
         if self._penalty_needed_this_step:
             self._cg_sampler.sync_seen_token_masks(
-                [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
+                [self._sampler.get_token_mask(rid) for rid in ctx.request_ids],
+                keep=keep,
             )
 
     ### Submodule-level functionality
@@ -376,7 +385,7 @@ class SamplerResource(Resource):
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step
             )
-        tokens = self._sampler.sample(request_ids, logits)
+        tokens = self._sampler.sample(request_ids, logits, kept_rids=self._kept_rids)
         # An eager step has no per-step row to scatter from: write the masters
         # by request, so the next step can still read its token on the device.
         bufs = self._cg_buffers

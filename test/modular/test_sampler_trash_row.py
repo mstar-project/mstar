@@ -46,7 +46,12 @@ def test_no_request_is_given_row_zero(ingraph):
     # growing keeps row 0 out of the free list and hands out new rows only
     bufs.register_request("extra")
     assert bufs._master_capacity == 2 * cap
+    assert bufs.temperature.master.shape[0] == 2 * cap + 1
+    # the device masters follow on the gpu thread's next gather
+    assert bufs.offset.master.shape[0] == cap + 1
+    bufs._sync_device_capacity()
     assert bufs.offset.master.shape[0] == 2 * cap + 1
+    assert bufs.last_token.master.shape[0] == 2 * cap + 1
     assert bufs._rid_to_slot["extra"] > cap
     assert 0 not in bufs._free_slots
 

@@ -290,21 +290,24 @@ class LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        has_loopback: bool = False,
         **kwargs: Any,
     ) -> ARNodeInputs:
         if graph_walk == "prefill_vision":
             return self._vision_inputs(fwd_info, inputs)
 
-        if graph_walk == "decode" and self._device_loopback():
+        if graph_walk == "decode" and has_loopback and self._device_loopback():
             # one token per row, read off the sampler's slot master in
             # `preprocess`; the routed signal is empty (or ignored) here
             return ARNodeInputs(input_seq_len=1)
         input_ids = inputs["text_inputs"][0]
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
 
-    def uniform_row_inputs(self, graph_walk: str) -> ARNodeInputs | None:
+    def uniform_row_inputs(
+        self, graph_walk: str, has_loopback: bool = False,
+    ) -> ARNodeInputs | None:
         # the loop-back decode row above, built once for the step's rows
-        if graph_walk == "decode" and self._device_loopback():
+        if graph_walk == "decode" and has_loopback and self._device_loopback():
             return ARNodeInputs(input_seq_len=1)
         return None
 
@@ -385,12 +388,26 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
         captured = self._captured_decode(engine_inputs, graph_walk)
-        if inputs[0].input_ids is None and inputs[0].input_embeds is None:
+        first = inputs[0]
+        if first.input_embeds is None and (
+            first.input_ids is None or any(inp.input_ids is None for inp in inputs)
+        ):
             # device loop-back: every row of a decode step is its request's
             # last sampled token, read by slot (padding rows read slot 0)
             sampler: SamplerResource = engine_inputs.resources[SAMPLER]
             t0 = perf_counter() if PHASE_PERIOD else 0.0
-            out["input_ids"] = sampler.loopback_tokens(engine_inputs.request_ids)
+            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            # rows whose last step ran elsewhere brought their token
+            routed = [
+                i for i, inp in enumerate(inputs)
+                if inp.input_ids is not None and inp.input_seq_len
+            ]
+            if routed:
+                ids.index_copy_(
+                    0, torch.tensor(routed, device=ids.device),
+                    torch.cat([inputs[i].input_ids for i in routed]).to(ids.dtype),
+                )
+            out["input_ids"] = ids
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
             if captured and ingraph_decode_rope():
@@ -416,6 +433,7 @@ class LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         request_ids: list[str],
         inputs: list[ARNodeInputs],
+        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
         prefill_tokens = {}
@@ -430,6 +448,15 @@ class LLMSubmodule(ARNodeSubmodule):
                 rid: inp.tensor_inputs["text_token_ids"]
                 for rid, inp in zip(request_ids, inputs, strict=True)
             }
+
+        kept_rids = None
+        if graph_walk != "decode":
+            # only the last prefill's token survives `postprocess`
+            info = per_request_info or {}
+            kept_rids = frozenset(
+                rid for rid in request_ids
+                if rid in info and info[rid].step_metadata.get("last_prefill", False)
+            )
 
         # `advance=None` advances by the span, which is wrong for an image:
         # its 3D grid covers fewer positions than tokens.
@@ -456,6 +483,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 SAMPLER: SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
+                    kept_rids=kept_rids,
                 ),
                 ROPE: PositionStep(advance=advance),
             },

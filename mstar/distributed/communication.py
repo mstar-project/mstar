@@ -345,9 +345,12 @@ class WorkerParallelGroups:
         rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
             rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
-            # same iteration on every rank, so the gloo groups' tags agree too
+            # Members only: with the default group bound to a device, a
+            # non-member's subgroup creation joins an ncclCommSplit that
+            # members never call for a gloo group, and blocks forever.
             rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
                 ranks=list(rank_tuple), backend="gloo",
+                use_local_synchronization=True,
             )
 
         seen: set[int] = set()

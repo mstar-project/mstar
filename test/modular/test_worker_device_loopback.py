@@ -17,9 +17,10 @@ class _Engine:
         return self.on_device.get((node, walk), frozenset())
 
 
-def _worker():
+def _worker(inline_emit=True):
     w = Worker.__new__(Worker)
     w._device_loopback = {}
+    w._graph_runtime = SimpleNamespace(supports_inline_emit=inline_emit)
     return w
 
 
@@ -34,6 +35,12 @@ def test_all_on_device_is_per_step_signals_and_cached_per_node_and_walk():
     assert not w._all_on_device(engine, "LLM", "prefill_text", ["new_token"])
     assert not w._all_on_device(engine, "LLM", "decode", [])
     assert engine.calls == 2
+
+
+def test_no_rows_only_step_on_a_runtime_without_inline_emit():
+    """Rows-only steps send the client's tokens inline; without it they were dropped."""
+    engine = _Engine({("LLM", "decode"): frozenset({"text_inputs"})})
+    assert not _worker(inline_emit=False)._all_on_device(engine, "LLM", "decode", ["text_inputs"])
 
 
 def test_the_zero_tensor_store_shape_matches_the_route_layout():

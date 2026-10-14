@@ -39,12 +39,16 @@ class _Sub:
     def __init__(self, uniform=None):
         self.uniform = uniform
         self.calls = []
+        self.row_loopback = []
+        self.uniform_loopback = None
 
-    def uniform_row_inputs(self, graph_walk):
+    def uniform_row_inputs(self, graph_walk, has_loopback=False):
+        self.uniform_loopback = has_loopback
         return self.uniform
 
     def prepare_inputs(self, **kw):
         self.calls.append(kw["graph_walk"])
+        self.row_loopback.append(kw["has_loopback"])
         return object()
 
     def can_batch(self, batch, model_inputs):
@@ -55,6 +59,7 @@ def _engine(sub):
     eng = Engine.__new__(Engine)
     eng._submodules = {"llm": SimpleNamespace(submodule=sub, resources={})}
     eng._enable_nvtx = False
+    eng._loopback_steps = {}
     return eng
 
 
@@ -72,3 +77,26 @@ def test_other_walks_still_prepare_row_by_row():
     batch = _Batch([1, 2])
     _engine(sub).prepare_inputs(batch)
     assert sub.calls == ["decode", "decode"] and len(batch.inputs) == 2
+
+
+def test_loopback_is_per_row_and_tracks_each_request_s_last_step():
+    sub = _Sub(uniform=None)
+    eng = _engine(sub)
+    ran = _Batch([1, 2])
+    ran.rows_only = True
+    eng._record_loopback(ran)
+    eng.prepare_inputs(_Batch([1, 2, 3]))
+    # 3 never ran rows-only here (e.g. its prefill ran on another rank)
+    assert sub.uniform_loopback is False and sub.row_loopback == [True, True, False]
+    eng.prepare_inputs(_Batch([1, 2]))
+    assert sub.uniform_loopback is True
+    # a step that is not rows-only clears the record; so does another walk's
+    other = _Batch([2])
+    other.rows_only = False
+    eng._record_loopback(other)
+    sub.row_loopback.clear()
+    eng.prepare_inputs(_Batch([1, 2]))
+    assert sub.row_loopback == [True, False]
+    sub.row_loopback.clear()
+    eng.prepare_inputs(_Batch([1], walk="prefill"))
+    assert sub.row_loopback == [False]

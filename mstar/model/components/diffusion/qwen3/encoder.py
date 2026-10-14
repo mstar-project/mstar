@@ -17,6 +17,8 @@ reference's own kernel.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -55,6 +57,69 @@ def padded_causal_mask(attention_mask: torch.Tensor) -> torch.Tensor:
     seq = attention_mask.shape[1]
     causal = torch.ones(seq, seq, dtype=torch.bool, device=attention_mask.device).tril()
     return causal[None, None] & attention_mask.bool()[:, None, None, :]
+
+
+@dataclass(frozen=True)
+class Qwen3EncoderConfig:
+    """``text_encoder/config.json`` of the Qwen3 LM the prompt runs through,
+    plus the pipeline's tapping recipe (``text_encoder_out_layers``,
+    ``max_sequence_length``)."""
+
+    vocab_size: int = 151936
+    hidden_size: int = 2560
+    intermediate_size: int = 9728
+    num_hidden_layers: int = 36
+    num_attention_heads: int = 32
+    num_key_value_heads: int = 8
+    head_dim: int = 128
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 1_000_000.0
+    pad_token_id: int = 151643
+    # Pipeline recipe (Flux2KleinPipeline.encode_prompt defaults).
+    hidden_state_layers: tuple[int, ...] = (9, 18, 27)
+    max_sequence_length: int = 512
+
+    def __post_init__(self):
+        if not self.hidden_state_layers or min(self.hidden_state_layers) < 1:
+            raise ValueError(
+                f"hidden_state_layers must name decoder layers (1-indexed); got {self.hidden_state_layers}"
+            )
+        if max(self.hidden_state_layers) >= self.num_hidden_layers:
+            raise ValueError(
+                f"hidden_state_layers {self.hidden_state_layers} must lie below layer {self.num_hidden_layers}: "
+                "HF's hidden_states[num_hidden_layers] is the normed last_hidden_state, which this encoder "
+                "(no final norm) does not produce"
+            )
+
+    @property
+    def num_layers_needed(self) -> int:
+        """Decoder layers that must run to produce the deepest tap
+        (``hidden_states[k]`` is the output of layer ``k``, 1-indexed)."""
+        return max(self.hidden_state_layers)
+
+    @property
+    def output_dim(self) -> int:
+        return self.hidden_size * len(self.hidden_state_layers)
+
+    @classmethod
+    def from_dict(cls, cfg: dict, **overrides) -> "Qwen3EncoderConfig":
+        if cfg.get("model_type") not in (None, "qwen3"):
+            raise NotImplementedError(f"text encoder model_type {cfg.get('model_type')!r} is not Qwen3")
+        if cfg.get("rope_scaling"):
+            raise NotImplementedError("Qwen3 text encoder with rope_scaling is not supported")
+        return cls(
+            vocab_size=int(cfg["vocab_size"]),
+            hidden_size=int(cfg["hidden_size"]),
+            intermediate_size=int(cfg["intermediate_size"]),
+            num_hidden_layers=int(cfg["num_hidden_layers"]),
+            num_attention_heads=int(cfg["num_attention_heads"]),
+            num_key_value_heads=int(cfg["num_key_value_heads"]),
+            head_dim=int(cfg.get("head_dim") or cfg["hidden_size"] // cfg["num_attention_heads"]),
+            rms_norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
+            rope_theta=float(cfg.get("rope_theta", 1_000_000.0)),
+            pad_token_id=int(cfg.get("pad_token_id") or 151643),
+            **overrides,
+        )
 
 
 class Qwen3RMSNorm(nn.Module):

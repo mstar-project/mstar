@@ -503,6 +503,9 @@ class Engine:
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
 
+        # rid -> (node, walk) of its last step here when that step was rows-only,
+        # i.e. the sampler's slot master holds the token its next step reads
+        self._loopback_steps: dict[int, tuple[str, str]] = {}
         self._runner = StepRunner(
             self._resources,
             # every node, including one that owns nothing (Code2Wav) — an
@@ -767,8 +770,11 @@ class Engine:
         # read leniently, as the probe itself was only reached per prepared row
         keyed = getattr(self, "_keyed_walks", None)
         probe_prefix = bool(keyed) and walk in keyed.get(batch.node_name, ())
+        loopback = self._loopback_rows(batch)
         if not probe_prefix:
-            uniform = submodule.uniform_row_inputs(walk)
+            uniform = submodule.uniform_row_inputs(
+                walk, has_loopback=loopback is not None and all(loopback),
+            )
             if uniform is not None:
                 # one object for all the step's rows: the per-row call would
                 # return an equal one each time (128 calls at a full decode
@@ -779,7 +785,7 @@ class Engine:
                     batch=batch, model_inputs=node_inputs
                 )
                 return
-        for rid in batch.request_ids:
+        for i, rid in enumerate(batch.request_ids):
             try:
                 req_inputs = prepare(
                     graph_walk=walk,
@@ -791,6 +797,7 @@ class Engine:
                     # look-ahead frames a token encoder withholds)
                     is_final_stream_chunk=rid in final_rids,
                     input_metadata=metadata.get(rid, EMPTY_INPUT_METADATA),
+                    has_loopback=loopback is not None and loopback[i],
                 )
                 if req_inputs is not None and probe_prefix:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
@@ -811,6 +818,26 @@ class Engine:
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
         )
+
+    def _loopback_rows(self, batch: ExecutingBatch) -> list[bool] | None:
+        """Per row, whether its input token is on the device (see
+        ``_loopback_steps``); None when no row's is."""
+        steps = self._loopback_steps
+        if not steps:
+            return None
+        key = (batch.node_name, batch.step_context.graph_walk)
+        get = steps.get
+        return [get(rid) == key for rid in batch.request_ids]
+
+    def _record_loopback(self, batch: ExecutingBatch) -> None:
+        steps = self._loopback_steps
+        if batch.rows_only:
+            steps.update(dict.fromkeys(
+                batch.request_ids, (batch.node_name, batch.step_context.graph_walk),
+            ))
+        elif steps:
+            for rid in batch.request_ids:
+                steps.pop(rid, None)
 
     def inline_client_signals(
         self, node_name: str, graph_walk: str,
@@ -920,10 +947,15 @@ class Engine:
                 # admit/plan/commit assume the whole batch reaches the forward
                 # in order; an unbatchable walk with >1 request can't, so each
                 # request runs its own full cycle and merges.
+                if not batch.running_batched and lease is None:
+                    # the unbatched forward has per-request outputs: no rows to stay on
+                    batch.rows_only = False
                 if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
+            if batch.admit_error is None:
+                self._record_loopback(batch)
             batch.outputs_ready.set()
             return batch.outputs
         except Exception:
@@ -1148,6 +1180,7 @@ class Engine:
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
                     slot_lease=ctx.slot_lease,
                     piecewise_leases=ctx.piecewise_leases,
+                    per_request_info=batch.per_request_info,
                 )
             finally:
                 if PHASE_PERIOD:
@@ -1417,9 +1450,17 @@ class Engine:
         outputs = self.exec(batch)
         # A failed admit means no forward ran and every rid's outputs are empty,
         # so the tail has nothing to consume; the worker re-drives the step.
-        # A rows-only step has no per-request outputs for a tail to work on.
-        if batch.admit_error is None and not batch.rows_only:
-            self.postprocess_batch(batch, outputs)
+        # A rows-only step has no per-request outputs; only a batch tail runs.
+        if batch.admit_error is None:
+            if not batch.rows_only:
+                self.postprocess_batch(batch, outputs)
+            else:
+                submodule = self._submodules[batch.node_name].submodule
+                # no submodule overrides it as of now
+                if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
+                    submodule.batch_postprocess(
+                        outputs, batch.per_request_info_wrapped, batch.inputs,
+                    )
         return outputs
 
     def check_stop_for_batch(
@@ -1913,6 +1954,7 @@ class Engine:
             request_ids=batch.step_context.padded_request_ids,
             inputs=inputs,
             slot_lease=lease,
+            per_request_info=batch.per_request_info,
         )
         if PHASE_PERIOD:
             phase_record("engine.pre_declare", perf_counter() - t0)
@@ -2218,6 +2260,7 @@ class Engine:
         self._runner.ingest_request(request_id, overrides)
 
     def remove_request(self, request_id: str) -> None:
+        self._loopback_steps.pop(request_id, None)
         self._runner.remove_request(request_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
