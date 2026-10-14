@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 13, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -986,6 +986,34 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_seen_dtypes</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+
+<div class="viewcode-block" id="ColumnarTensorInfo.dtype_index">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.ColumnarTensorInfo.dtype_index">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">dtype_index</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The batch-local index of ``dtype``, registering it on first use."""</span>
+        <span class="n">idx</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_seen_dtypes</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">idx</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">idx</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_seen_dtypes</span><span class="p">[</span><span class="n">dtype</span><span class="p">]</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype_names</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">dtype_names</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">_dtype_name</span><span class="p">(</span><span class="n">dtype</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">idx</span></div>
+
+
+<div class="viewcode-block" id="ColumnarTensorInfo.add_row">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.ColumnarTensorInfo.add_row">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">add_row</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">address</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">ndims</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">dims</span><span class="p">,</span> <span class="n">stride</span><span class="p">,</span> <span class="n">dtype_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""One tensor whose layout is already known (a row of a template):</span>
+<span class="sd">        its entry in every column, in the layout's order."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">uuids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">addresses</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">address</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">nbytes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">nbytes</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ndims</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ndims</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dims_flat</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">dims</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">stride_flat</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">stride</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dtype_idx</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">dtype_idx</span><span class="p">)</span></div>
+
 
 <div class="viewcode-block" id="ColumnarTensorInfo.add_tensors_canonical">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.ColumnarTensorInfo.add_tensors_canonical">[docs]</a>
@@ -1721,10 +1749,15 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Record which request owns each tensor. Pure Python dicts, so this</span>
 <span class="sd">        stays a loop -- only the bookkeeping call crosses into Rust.</span>
 <span class="sd">        ``cpu_tensors``, when given, is index-parallel to ``tensors``."""</span>
-        <span class="k">for</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">tensor</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">uuids</span><span class="p">,</span> <span class="n">tensors</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_tensors</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">tensor</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_rid_to_uuids</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="nb">set</span><span class="p">())</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_uuid_to_rid</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">request_id</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">len</span><span class="p">(</span><span class="n">uuids</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="n">uuids</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">len</span><span class="p">(</span><span class="n">tensors</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"request_ids, uuids and tensors must be parallel"</span><span class="p">)</span>
+        <span class="c1"># two of the three maps take the batch in one update each; only the</span>
+        <span class="c1"># per-request set stays a loop</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tensors</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">uuids</span><span class="p">,</span> <span class="n">tensors</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_uuid_to_rid</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">uuids</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+        <span class="n">owned</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rid_to_uuids</span>
+        <span class="k">for</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">uuids</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+            <span class="n">owned</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="nb">set</span><span class="p">())</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">cpu_tensors</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">cpu_tensor</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">uuids</span><span class="p">,</span> <span class="n">cpu_tensors</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
                 <span class="k">if</span> <span class="n">cpu_tensor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -1926,7 +1959,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 13, 2026.
+  Last updated on Oct 14, 2026.
   <br/>
 </p>
   </div>

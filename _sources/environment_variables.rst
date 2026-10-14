@@ -294,10 +294,33 @@ Worker scheduling
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
        thread.
+   * - ``MSTAR_DECODE_BUCKETS``
+     - ``1,2,4,8,16,32,48,64,96,128``
+     - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
+       it; a model with its own ladder reads it the same way). A decode step
+       runs at the smallest bucket that holds its rows, so the ladder bounds
+       both the rows per step and the graph memory; narrow it (for example
+       ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
+       former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
+       Qwen3.5 alone.
+   * - ``MSTAR_LAZY_PUBLISH``
+     - ``1``
+     - Publish resource state (KV pages, positions) only for the requests
+       whose frame or completion carries it: ``finalize_batch`` keeps a
+       cheap per-request snapshot and the worker finishes it on demand.
+       ``0`` builds the full publication for every request on every step,
+       the old behaviour; it was a quarter of the GPU thread's host time at
+       batch 32 in a decode loop that never reads it.
    * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
        other ready work.
+   * - ``MSTAR_RUST_SEND_TIMING``
+     - unset
+     - ``1`` makes the Rust runtime print, every 500 calls, how long the
+       worker's per-step send spends in its own work against the whole call
+       (which includes taking the GIL back when the send had to release it).
+       A diagnostic for the host-overhead work; off by default.
    * - ``MSTAR_SPEC_PEEK_FOR_FAIRNESS``
      - ``1``
      - Yield the speculation chain only when another (node, walk) is

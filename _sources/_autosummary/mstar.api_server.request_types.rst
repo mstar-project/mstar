@@ -24,6 +24,7 @@ mstar.api\_server.request\_types
       RequestFailed
       ResultChunk
       ResultTensors
+      ResultTokens
    
    
 

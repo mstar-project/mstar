@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 13, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1855,6 +1855,50 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
+<div class="viewcode-block" id="ArenaShmCommunicationManager.cleanup_collectable">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.cleanup_collectable">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">cleanup_collectable</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">collectable</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">registered</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">],</span>
+    <span class="p">):</span>
+<span class="w">        </span><span class="sd">"""``_cleanup_by_uuid`` for a batch, inlined: a decode step frees one</span>
+<span class="sd">        tensor per request here, and the three-level call chain per uuid was</span>
+<span class="sd">        most of the cost. Same steps in the same order as the per-uuid form."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">collectable</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">del</span> <span class="n">registered</span>  <span class="c1"># no transfer engine to unregister from</span>
+        <span class="n">store</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span>
+        <span class="n">store</span><span class="o">.</span><span class="n">mark_forgotten</span><span class="p">(</span><span class="n">collectable</span><span class="p">)</span>
+        <span class="n">shard_dims</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span>
+        <span class="n">edge_names</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_edge_name</span>
+        <span class="n">arena_ts</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span>
+        <span class="n">arena_locs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span>
+        <span class="n">shm_files</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_files</span>
+        <span class="n">present</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">check_uuid_presence</span>
+        <span class="n">remove</span> <span class="o">=</span> <span class="n">store</span><span class="o">.</span><span class="n">remove_tensor</span>
+        <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">collectable</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">shard_dims</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="n">edge_names</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">present</span><span class="p">(</span><span class="n">uuid</span><span class="p">):</span>
+                    <span class="n">remove</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                        <span class="s2">"Trying to cleanup tensor </span><span class="si">%s</span><span class="s2">, but uuid not found"</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span>
+                    <span class="p">)</span>
+                <span class="n">arena_ts</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">loc</span> <span class="o">:=</span> <span class="n">arena_locs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="o">*</span><span class="n">loc</span><span class="p">)</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">path</span> <span class="o">:=</span> <span class="n">shm_files</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">try</span><span class="p">:</span>
+                        <span class="n">os</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+                    <span class="k">except</span> <span class="ne">FileNotFoundError</span><span class="p">:</span>
+                        <span class="k">pass</span>
+            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+                    <span class="s2">"Error cleaning up tensor uuid </span><span class="si">%d</span><span class="s2">: </span><span class="si">%s</span><span class="s2">, skipping."</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">e</span><span class="p">,</span>
+                <span class="p">)</span></div>
+
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_cleanup_by_uuid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">registered</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="c1"># Grandparent cleanup (refcounts): skip the file manager's unlink.</span>
         <span class="nb">super</span><span class="p">(</span><span class="n">SharedMemoryCommunicationManager</span><span class="p">,</span> <span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="n">_cleanup_by_uuid</span><span class="p">(</span>
@@ -1920,7 +1964,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 13, 2026.
+  Last updated on Oct 14, 2026.
   <br/>
 </p>
   </div>

@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 13, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -621,6 +621,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.cleanup_collectable"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.cleanup_collectable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.close"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.close()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.register_for_send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.register_for_send_uuids()</span></code></a></li>
@@ -698,6 +699,22 @@ transport. See <span class="xref std std-doc">environment_variables</span> for a
 </ul>
 </dd>
 </dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.arena.ArenaShmCommunicationManager.cleanup_collectable">
+<span class="sig-name descname"><span class="pre">cleanup_collectable</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">collectable</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">registered</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/arena.html#ArenaShmCommunicationManager.cleanup_collectable"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager.cleanup_collectable" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">_cleanup_by_uuid</span></code> for a batch, inlined: a decode step frees one
+tensor per request here, and the three-level call chain per uuid was
+most of the cost. Same steps in the same order as the per-uuid form.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>collectable</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>registered</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.arena.ArenaShmCommunicationManager.close">
 <span class="sig-name descname"><span class="pre">close</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/arena.html#ArenaShmCommunicationManager.close"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager.close" title="Link to this definition">#</a></dt>
@@ -837,6 +854,7 @@ and <code class="docutils literal notranslate"><span class="pre">refresh_shm_pla
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.cleanup_collectable"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.cleanup_collectable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.close"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.close()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.register_for_send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.register_for_send_uuids()</span></code></a></li>
@@ -878,7 +896,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 13, 2026.
+  Last updated on Oct 14, 2026.
   <br/>
 </p>
   </div>

@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 13, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -675,6 +675,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.get_offload_priority"><code class="docutils literal notranslate"><span class="pre">Resource.get_offload_priority()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.ingest_request"><code class="docutils literal notranslate"><span class="pre">Resource.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.is_offloaded"><code class="docutils literal notranslate"><span class="pre">Resource.is_offloaded()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.keys_prefix_chains"><code class="docutils literal notranslate"><span class="pre">Resource.keys_prefix_chains</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.offload"><code class="docutils literal notranslate"><span class="pre">Resource.offload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.plan"><code class="docutils literal notranslate"><span class="pre">Resource.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.post_warmup_validate"><code class="docutils literal notranslate"><span class="pre">Resource.post_warmup_validate()</span></code></a></li>
@@ -682,6 +683,9 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish"><code class="docutils literal notranslate"><span class="pre">Resource.publish()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish_after_stop"><code class="docutils literal notranslate"><span class="pre">Resource.publish_after_stop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish_for_step"><code class="docutils literal notranslate"><span class="pre">Resource.publish_for_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish_from_snapshot"><code class="docutils literal notranslate"><span class="pre">Resource.publish_from_snapshot()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish_snapshot_batch"><code class="docutils literal notranslate"><span class="pre">Resource.publish_snapshot_batch()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish_snapshot_for_step"><code class="docutils literal notranslate"><span class="pre">Resource.publish_snapshot_for_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.reclaimable"><code class="docutils literal notranslate"><span class="pre">Resource.reclaimable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.reload"><code class="docutils literal notranslate"><span class="pre">Resource.reload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.remove_request"><code class="docutils literal notranslate"><span class="pre">Resource.remove_request()</span></code></a></li>
@@ -1235,6 +1239,15 @@ resource to ask; LRU never calls it.</p>
 </dl>
 </dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.keys_prefix_chains">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">keys_prefix_chains</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.base.Resource.keys_prefix_chains" title="Link to this definition">#</a></dt>
+<dd><p>Whether <code class="docutils literal notranslate"><span class="pre">extend_prefix_chain</span></code> can do anything right now (a prefix
+cache is open). The runner skips the per-request sweep otherwise. A
+resource that overrides <code class="docutils literal notranslate"><span class="pre">extend_prefix_chain</span></code> but not this is swept
+every step.</p>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.offload">
 <span class="sig-name descname"><span class="pre">offload</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.offload"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.offload" title="Link to this definition">#</a></dt>
@@ -1326,6 +1339,69 @@ that need node/walk context can override this method.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.base.PublishedInfo" title="mstar.engine.resources.base.PublishedInfo"><em>PublishedInfo</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.publish_from_snapshot">
+<span class="sig-name descname"><span class="pre">publish_from_snapshot</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">snapshot</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.publish_from_snapshot"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.publish_from_snapshot" title="Link to this definition">#</a></dt>
+<dd><p>Finish a <code class="docutils literal notranslate"><span class="pre">publish_snapshot_for_step</span></code> record into the published info.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>snapshot</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.base.PublishedInfo" title="mstar.engine.resources.base.PublishedInfo"><em>PublishedInfo</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.publish_snapshot_batch">
+<span class="sig-name descname"><span class="pre">publish_snapshot_batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.publish_snapshot_batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.publish_snapshot_batch" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">publish_snapshot_for_step</span></code> for every request of a step, one
+entry per request in order (None for nothing to publish). A resource
+with per-request locking or lookups overrides this to do them once.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.publish_snapshot_for_step">
+<span class="sig-name descname"><span class="pre">publish_snapshot_for_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.publish_snapshot_for_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.publish_snapshot_for_step" title="Link to this definition">#</a></dt>
+<dd><p>A cheap record of what <code class="docutils literal notranslate"><span class="pre">publish_for_step</span></code> would export right now.</p>
+<p>The worker finishes it with <code class="docutils literal notranslate"><span class="pre">publish_from_snapshot</span></code> only for the
+requests whose frame or completion carries the publication, which in a
+steady decode loop is none of them. The default takes the eager
+publication itself, so a resource is correct without overriding; one
+whose publish builds something per request (a page list, a transfer
+descriptor) overrides both to record a few scalars here instead.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1557,6 +1633,7 @@ lease converted onto a stream, belongs to whoever else holds it.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.get_offload_priority"><code class="docutils literal notranslate"><span class="pre">Resource.get_offload_priority()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.ingest_request"><code class="docutils literal notranslate"><span class="pre">Resource.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.is_offloaded"><code class="docutils literal notranslate"><span class="pre">Resource.is_offloaded()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.keys_prefix_chains"><code class="docutils literal notranslate"><span class="pre">Resource.keys_prefix_chains</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.offload"><code class="docutils literal notranslate"><span class="pre">Resource.offload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.plan"><code class="docutils literal notranslate"><span class="pre">Resource.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.post_warmup_validate"><code class="docutils literal notranslate"><span class="pre">Resource.post_warmup_validate()</span></code></a></li>
@@ -1564,6 +1641,9 @@ lease converted onto a stream, belongs to whoever else holds it.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish"><code class="docutils literal notranslate"><span class="pre">Resource.publish()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish_after_stop"><code class="docutils literal notranslate"><span class="pre">Resource.publish_after_stop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish_for_step"><code class="docutils literal notranslate"><span class="pre">Resource.publish_for_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish_from_snapshot"><code class="docutils literal notranslate"><span class="pre">Resource.publish_from_snapshot()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish_snapshot_batch"><code class="docutils literal notranslate"><span class="pre">Resource.publish_snapshot_batch()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.publish_snapshot_for_step"><code class="docutils literal notranslate"><span class="pre">Resource.publish_snapshot_for_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.reclaimable"><code class="docutils literal notranslate"><span class="pre">Resource.reclaimable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.reload"><code class="docutils literal notranslate"><span class="pre">Resource.reload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.remove_request"><code class="docutils literal notranslate"><span class="pre">Resource.remove_request()</span></code></a></li>
@@ -1608,7 +1688,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 13, 2026.
+  Last updated on Oct 14, 2026.
   <br/>
 </p>
   </div>

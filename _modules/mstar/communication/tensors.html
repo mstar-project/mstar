@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 13, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1539,6 +1539,170 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
         <span class="k">return</span> <span class="n">tensor_info</span></div>
 
+
+<div class="viewcode-block" id="TensorCommunicationManager.store_row_outputs_batch">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.store_row_outputs_batch">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">store_row_outputs_batch</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Rid</span><span class="p">],</span>
+        <span class="n">outputs</span><span class="p">,</span>
+        <span class="n">signals</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+        <span class="n">row_views</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="o">...</span><span class="p">]],</span>
+        <span class="n">row_request_ids</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span>
+        <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">host_rows</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">StoredOutputs</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``store_and_return_tensor_info_batch`` for a step whose per-request</span>
+<span class="sd">        outputs are views of row-addressed batch tensors (a decode step: row i</span>
+<span class="sd">        of ``new_token`` is request i).</span>
+
+<span class="sd">        The rows of one batch tensor differ only in address, so their</span>
+<span class="sd">        descriptors are built from one row's shape, stride and dtype instead</span>
+<span class="sd">        of being read off every view, and the host copies come from the stop</span>
+<span class="sd">        check's row buffers (``host_rows``) by index rather than being matched</span>
+<span class="sd">        tensor by tensor. Every (request, signal) entry must be exactly one</span>
+<span class="sd">        tensor that *is* a row view, or the result is None and the caller</span>
+<span class="sd">        takes the general path; nothing is recorded before that is settled.</span>
+<span class="sd">        What is stored is what the general path would store: one uuid per</span>
+<span class="sd">        (request, signal), request-major, the same row views.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">row_views</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">has_put_tensor_batch_columns</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">row_of</span> <span class="o">=</span> <span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">rid</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">row_request_ids</span><span class="p">)}</span>
+        <span class="n">sharding</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sharding_configs</span>
+        <span class="n">first_cfg</span> <span class="o">=</span> <span class="n">sharding</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">request_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="k">if</span> <span class="n">request_ids</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">tp_size</span><span class="p">,</span> <span class="n">tp_rank</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_source_tp</span><span class="p">(</span><span class="n">first_cfg</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span>
+        <span class="n">columns</span> <span class="o">=</span> <span class="n">ColumnarTensorInfo</span><span class="p">(</span>
+            <span class="n">source_session_id</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">my_session_id</span><span class="p">,</span>
+            <span class="n">source_entity</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">,</span>
+            <span class="n">source_node_name</span><span class="o">=</span><span class="n">node_name</span><span class="p">,</span>
+            <span class="n">source_graph_walk</span><span class="o">=</span><span class="n">graph_walk</span><span class="p">,</span>
+            <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+            <span class="n">tp_rank</span><span class="o">=</span><span class="n">tp_rank</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="n">want_cpu</span> <span class="o">=</span> <span class="n">host_rows</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">needs_cpu_tensor</span>
+        <span class="c1"># signal -&gt; the row tensor it views, learned from the first request</span>
+        <span class="c1"># that has it and checked on every other</span>
+        <span class="n">alias</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># row tensor -&gt; (base address, row step, nbytes, ndims, dims, stride,</span>
+        <span class="c1"># dtype index, host rows or None)</span>
+        <span class="n">template</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="n">flat_uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">flat_rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">signal_idxs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">num_tensors</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">canonicals</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">cpus</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="p">[]</span> <span class="k">if</span> <span class="n">want_cpu</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">sharded_uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">mint</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_uuid_minter</span><span class="o">.</span><span class="n">mint</span>
+        <span class="n">add_row</span> <span class="o">=</span> <span class="n">columns</span><span class="o">.</span><span class="n">add_row</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">:</span>
+                <span class="n">i</span> <span class="o">=</span> <span class="n">row_of</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">i</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="kc">None</span>
+                <span class="n">rid_out</span> <span class="o">=</span> <span class="n">outputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+                <span class="n">cfg</span> <span class="o">=</span> <span class="n">sharding</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">cfg</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">first_cfg</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_source_tp</span><span class="p">(</span>
+                    <span class="n">cfg</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span>
+                <span class="p">)</span> <span class="o">!=</span> <span class="p">(</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">tp_rank</span><span class="p">):</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">"request </span><span class="si">{</span><span class="n">rid</span><span class="si">}</span><span class="s2"> has sharding "</span>
+                        <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_source_tp</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span><span class="w"> </span><span class="n">node_name</span><span class="p">,</span><span class="w"> </span><span class="n">graph_walk</span><span class="p">)</span><span class="si">}</span><span class="s2"> for "</span>
+                        <span class="sa">f</span><span class="s2">"node </span><span class="si">{</span><span class="n">node_name</span><span class="si">!r}</span><span class="s2"> walk </span><span class="si">{</span><span class="n">graph_walk</span><span class="si">!r}</span><span class="s2">, but the batch "</span>
+                        <span class="sa">f</span><span class="s2">"was built for </span><span class="si">{</span><span class="p">(</span><span class="n">tp_size</span><span class="p">,</span><span class="w"> </span><span class="n">tp_rank</span><span class="p">)</span><span class="si">}</span><span class="s2">; one batch is one "</span>
+                        <span class="s2">"node on one worker and cannot mix sharding groups"</span>
+                    <span class="p">)</span>
+                <span class="k">for</span> <span class="n">s</span><span class="p">,</span> <span class="n">signal</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">signals</span><span class="p">):</span>
+                    <span class="n">lst</span> <span class="o">=</span> <span class="n">rid_out</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">signal</span><span class="p">)</span> <span class="k">if</span> <span class="n">rid_out</span> <span class="k">else</span> <span class="kc">None</span>
+                    <span class="k">if</span> <span class="ow">not</span> <span class="n">lst</span><span class="p">:</span>
+                        <span class="n">num_tensors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+                        <span class="k">continue</span>
+                    <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="n">lst</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="nb">list</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="n">lst</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
+                        <span class="k">return</span> <span class="kc">None</span>
+                    <span class="n">tensor</span> <span class="o">=</span> <span class="n">lst</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                    <span class="n">name</span> <span class="o">=</span> <span class="n">alias</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">signal</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">name</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="k">for</span> <span class="n">cand</span><span class="p">,</span> <span class="n">views</span> <span class="ow">in</span> <span class="n">row_views</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                            <span class="k">if</span> <span class="n">views</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="ow">is</span> <span class="n">tensor</span><span class="p">:</span>
+                                <span class="n">name</span> <span class="o">=</span> <span class="n">cand</span>
+                                <span class="k">break</span>
+                        <span class="k">if</span> <span class="n">name</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                            <span class="k">return</span> <span class="kc">None</span>
+                        <span class="n">alias</span><span class="p">[</span><span class="n">signal</span><span class="p">]</span> <span class="o">=</span> <span class="n">name</span>
+                        <span class="k">if</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">template</span><span class="p">:</span>
+                            <span class="n">template</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_row_template</span><span class="p">(</span>
+                                <span class="n">views</span><span class="p">,</span> <span class="n">columns</span><span class="p">,</span> <span class="n">host_rows</span> <span class="k">if</span> <span class="n">want_cpu</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span>
+                            <span class="p">)</span>
+                    <span class="k">elif</span> <span class="n">row_views</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="n">i</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">tensor</span><span class="p">:</span>
+                        <span class="k">return</span> <span class="kc">None</span>
+                    <span class="c1"># a sharded output is permuted on store; not a plain row</span>
+                    <span class="k">if</span> <span class="n">cfg</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">cfg</span><span class="o">.</span><span class="n">shard_dim</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">signal</span><span class="p">):</span>
+                        <span class="k">return</span> <span class="kc">None</span>
+                    <span class="n">base</span><span class="p">,</span> <span class="n">step</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="n">ndims</span><span class="p">,</span> <span class="n">dims</span><span class="p">,</span> <span class="n">stride</span><span class="p">,</span> <span class="n">dtype_idx</span><span class="p">,</span> <span class="n">host</span> <span class="o">=</span> <span class="n">template</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+                    <span class="n">uuid</span> <span class="o">=</span> <span class="n">mint</span><span class="p">()</span>
+                    <span class="n">flat_uuids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+                    <span class="n">flat_rids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+                    <span class="n">signal_idxs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">s</span><span class="p">)</span>
+                    <span class="n">num_tensors</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+                    <span class="n">canonicals</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">tensor</span><span class="p">)</span>
+                    <span class="n">add_row</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="n">base</span> <span class="o">+</span> <span class="n">i</span> <span class="o">*</span> <span class="n">step</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="n">ndims</span><span class="p">,</span> <span class="n">dims</span><span class="p">,</span> <span class="n">stride</span><span class="p">,</span> <span class="n">dtype_idx</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">want_cpu</span><span class="p">:</span>
+                        <span class="n">cpus</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">host</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">if</span> <span class="n">host</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">cfg</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">sharded_uuids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">IndexError</span><span class="p">:</span>
+            <span class="c1"># a row index past the views or the host rows: not this batch's rows</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="c1"># nothing above touched shared state; from here the general path's</span>
+        <span class="c1"># guarantees apply</span>
+        <span class="n">shard_dims</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span>
+        <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">sharded_uuids</span><span class="p">:</span>
+            <span class="n">shard_dims</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">edge_names</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_edge_name</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">s</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">flat_uuids</span><span class="p">,</span> <span class="n">signal_idxs</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+                <span class="n">edge_names</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">signals</span><span class="p">[</span><span class="n">s</span><span class="p">]</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">put_tensor_batch_columns</span><span class="p">(</span>
+                <span class="n">flat_rids</span><span class="p">,</span> <span class="n">canonicals</span><span class="p">,</span> <span class="n">columns</span><span class="p">,</span> <span class="n">cpu_tensors</span><span class="o">=</span><span class="n">cpus</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">flat_uuids</span><span class="p">:</span>
+                <span class="n">shard_dims</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="n">edge_names</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">raise</span>
+        <span class="k">return</span> <span class="n">StoredOutputs</span><span class="p">(</span><span class="n">flat_uuids</span><span class="p">,</span> <span class="n">flat_rids</span><span class="p">,</span> <span class="n">signal_idxs</span><span class="p">,</span> <span class="n">num_tensors</span><span class="p">)</span></div>
+
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_row_template</span><span class="p">(</span>
+        <span class="n">views</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span> <span class="n">columns</span><span class="p">:</span> <span class="n">ColumnarTensorInfo</span><span class="p">,</span>
+        <span class="n">host_rows</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""What every row of one batch tensor shares, for the row store: the</span>
+<span class="sd">        first row's address and the step to the next, byte size, shape,</span>
+<span class="sd">        stride and dtype index, plus the matching host rows (one view per row)</span>
+<span class="sd">        when ``host_rows`` carries a buffer of this name with the rows' shape</span>
+<span class="sd">        and dtype."""</span>
+        <span class="n">first</span> <span class="o">=</span> <span class="n">views</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">base</span> <span class="o">=</span> <span class="n">first</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span>
+        <span class="n">step</span> <span class="o">=</span> <span class="n">views</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span> <span class="o">-</span> <span class="n">base</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">views</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="mi">0</span>
+        <span class="n">dims</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">first</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+        <span class="n">host</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">host_rows</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">buf</span> <span class="o">=</span> <span class="n">host_rows</span><span class="o">.</span><span class="n">buffers</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+            <span class="k">if</span> <span class="p">(</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">is_tensor</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span> <span class="ow">and</span> <span class="n">buf</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"cpu"</span>
+                <span class="ow">and</span> <span class="n">buf</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="n">dims</span><span class="p">)</span> <span class="ow">and</span> <span class="n">buf</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">first</span><span class="o">.</span><span class="n">dtype</span>
+                <span class="ow">and</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">buf</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">:])</span> <span class="o">==</span> <span class="n">dims</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span> <span class="ow">and</span> <span class="n">buf</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">views</span><span class="p">)</span>
+            <span class="p">):</span>
+                <span class="n">host</span> <span class="o">=</span> <span class="n">buf</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">(</span>
+            <span class="n">base</span><span class="p">,</span> <span class="n">step</span><span class="p">,</span> <span class="n">first</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">dims</span><span class="p">),</span> <span class="n">dims</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">first</span><span class="o">.</span><span class="n">stride</span><span class="p">()),</span>
+            <span class="n">columns</span><span class="o">.</span><span class="n">dtype_index</span><span class="p">(</span><span class="n">first</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span> <span class="n">host</span><span class="p">,</span>
+        <span class="p">)</span>
 
 <div class="viewcode-block" id="TensorCommunicationManager.store_and_return_tensor_info_batch">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info_batch">[docs]</a>
@@ -2891,7 +3055,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 13, 2026.
+  Last updated on Oct 14, 2026.
   <br/>
 </p>
   </div>

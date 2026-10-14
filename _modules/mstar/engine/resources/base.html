@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 13, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -1073,6 +1073,14 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span></div>
 
 
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">keys_prefix_chains</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether ``extend_prefix_chain`` can do anything right now (a prefix</span>
+<span class="sd">        cache is open). The runner skips the per-request sweep otherwise. A</span>
+<span class="sd">        resource that overrides ``extend_prefix_chain`` but not this is swept</span>
+<span class="sd">        every step."""</span>
+        <span class="k">return</span> <span class="kc">False</span>
+
 <div class="viewcode-block" id="Resource.fingerprint">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.fingerprint">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">fingerprint</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
@@ -1190,6 +1198,61 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Publish state that is useful only when a dynamic loop stops."""</span>
         <span class="k">del</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span>
         <span class="k">return</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="Resource.publish_snapshot_batch">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.publish_snapshot_batch">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">publish_snapshot_batch</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+        <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``publish_snapshot_for_step`` for every request of a step, one</span>
+<span class="sd">        entry per request in order (None for nothing to publish). A resource</span>
+<span class="sd">        with per-request locking or lookups overrides this to do them once."""</span>
+        <span class="k">return</span> <span class="p">[</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">publish_snapshot_for_step</span><span class="p">(</span>
+                <span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="o">=</span><span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="o">=</span><span class="n">graph_walk</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span>
+        <span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="Resource.publish_snapshot_for_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.publish_snapshot_for_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">publish_snapshot_for_step</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A cheap record of what ``publish_for_step`` would export right now.</span>
+
+<span class="sd">        The worker finishes it with ``publish_from_snapshot`` only for the</span>
+<span class="sd">        requests whose frame or completion carries the publication, which in a</span>
+<span class="sd">        steady decode loop is none of them. The default takes the eager</span>
+<span class="sd">        publication itself, so a resource is correct without overriding; one</span>
+<span class="sd">        whose publish builds something per request (a page list, a transfer</span>
+<span class="sd">        descriptor) overrides both to record a few scalars here instead.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">publish_for_step</span><span class="p">(</span>
+            <span class="n">request_id</span><span class="p">,</span> <span class="n">node_name</span><span class="o">=</span><span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="o">=</span><span class="n">graph_walk</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="Resource.publish_from_snapshot">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.publish_from_snapshot">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">publish_from_snapshot</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">snapshot</span><span class="p">:</span> <span class="n">Any</span><span class="p">,</span>
+        <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PublishedInfo | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Finish a ``publish_snapshot_for_step`` record into the published info."""</span>
+        <span class="k">del</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span>
+        <span class="k">return</span> <span class="n">snapshot</span></div>
 
 
 <div class="viewcode-block" id="Resource.reset_request">
@@ -1450,7 +1513,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 13, 2026.
+  Last updated on Oct 14, 2026.
   <br/>
 </p>
   </div>

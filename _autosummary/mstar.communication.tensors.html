@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 13, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -708,6 +708,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.start_read_tensors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_and_return_tensor_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_and_return_tensor_info_batch()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_row_outputs_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_row_outputs_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.uuid_to_edge_name"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.uuid_to_edge_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.uuid_to_shard_dim"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.uuid_to_shard_dim</span></code></a></li>
 </ul>
@@ -1720,6 +1721,38 @@ kept only if <code class="docutils literal notranslate"><span class="pre">needs_
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.store_row_outputs_batch">
+<span class="sig-name descname"><span class="pre">store_row_outputs_batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">signals</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_views</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">row_request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_rows</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.store_row_outputs_batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.store_row_outputs_batch" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">store_and_return_tensor_info_batch</span></code> for a step whose per-request
+outputs are views of row-addressed batch tensors (a decode step: row i
+of <code class="docutils literal notranslate"><span class="pre">new_token</span></code> is request i).</p>
+<p>The rows of one batch tensor differ only in address, so their
+descriptors are built from one row’s shape, stride and dtype instead
+of being read off every view, and the host copies come from the stop
+check’s row buffers (<code class="docutils literal notranslate"><span class="pre">host_rows</span></code>) by index rather than being matched
+tensor by tensor. Every (request, signal) entry must be exactly one
+tensor that <em>is</em> a row view, or the result is None and the caller
+takes the general path; nothing is recorded before that is settled.
+What is stored is what the general path would store: one uuid per
+(request, signal), request-major, the same row views.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>signals</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>row_views</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>, </em><em>...</em><em>]</em><em>]</em>)</p></li>
+<li><p><strong>row_request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.communication.tensors.StoredOutputs" title="mstar.communication.tensors.StoredOutputs"><em>StoredOutputs</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.uuid_to_edge_name">
 <span class="sig-name descname"><span class="pre">uuid_to_edge_name</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.uuid_to_edge_name" title="Link to this definition">#</a></dt>
@@ -2005,6 +2038,7 @@ file-transport consumer cannot read an arena producer.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.start_read_tensors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_and_return_tensor_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_and_return_tensor_info_batch()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_row_outputs_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_row_outputs_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.uuid_to_edge_name"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.uuid_to_edge_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.uuid_to_shard_dim"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.uuid_to_shard_dim</span></code></a></li>
 </ul>
@@ -2058,7 +2092,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 13, 2026.
+  Last updated on Oct 14, 2026.
   <br/>
 </p>
   </div>

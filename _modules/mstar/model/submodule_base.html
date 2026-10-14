@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 13, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1001,6 +1001,10 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># the stop check, and slicing rows against that list would hand one</span>
     <span class="c1"># request another's token. None when there are no row-addressed buffers.</span>
     <span class="n">row_request_ids</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Set by ``Engine._collect_outputs`` when every per-rid entry is a row view</span>
+    <span class="c1"># of a batch clone: name -&gt; the views, row i for ``row_request_ids[i]``.</span>
+    <span class="c1"># The store describes such rows without reading each view.</span>
+    <span class="n">row_views</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="BatchedModelOutput.coerce">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.coerce">[docs]</a>
@@ -1041,14 +1045,29 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="BatchedModelOutput.clone_check_stop_buffers">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.clone_check_stop_buffers">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">clone_check_stop_buffers</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">clone_check_stop_buffers</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">reuse</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
 <span class="w">        </span><span class="sd">"""A detached copy: the next replay overwrites a captured graph's</span>
-<span class="sd">        buffers before the stop check reads them."""</span>
+<span class="sd">        buffers before the stop check reads them.</span>
+
+<span class="sd">        ``reuse`` holds clones already taken of the row outputs (see</span>
+<span class="sd">        ``clone_row_outputs``); a stop buffer that is the very same tensor as a</span>
+<span class="sd">        row output takes that clone instead of a second copy. The row clone is</span>
+<span class="sd">        narrowed to the real rows, which is every row the stop check reads.</span>
+<span class="sd">        """</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">check_stop_buffers</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">rows</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">row_outputs</span> <span class="ow">or</span> <span class="p">{}</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">_clone</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">_clone</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+                <span class="k">if</span> <span class="p">(</span>
+                    <span class="n">reuse</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">name</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                    <span class="ow">and</span> <span class="n">value</span> <span class="ow">is</span> <span class="n">rows</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+                    <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">reuse</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span>
+                <span class="p">):</span>
+                    <span class="k">return</span> <span class="n">reuse</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
                 <span class="k">return</span> <span class="n">value</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
                 <span class="k">return</span> <span class="p">[</span>
@@ -1059,7 +1078,7 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># pass anything else through: dropping it could lose a stop signal</span>
             <span class="k">return</span> <span class="n">value</span>
 
-        <span class="k">return</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">_clone</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">check_stop_buffers</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span></div>
+        <span class="k">return</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">_clone</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">check_stop_buffers</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span></div>
 
 
 <div class="viewcode-block" id="BatchedModelOutput.clone_row_outputs">
@@ -1095,6 +1114,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">other</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">coerce</span><span class="p">(</span><span class="n">other</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">per_rid_outputs</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">other</span><span class="o">.</span><span class="n">per_rid_outputs</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">packed_outputs</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">other</span><span class="o">.</span><span class="n">packed_outputs</span><span class="p">)</span>
+        <span class="c1"># merged entries are no longer exactly one batch's row views</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">row_views</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># Row-addressed buffers describe one forward, so keep them only when</span>
         <span class="c1"># exactly one side had any; otherwise the stop check falls back to the</span>
         <span class="c1"># per-rid outputs.</span>
@@ -1687,6 +1708,30 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">outputs</span></div>
 
 
+<div class="viewcode-block" id="NodeSubmodule.step_is_input_free">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.step_is_input_free">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">step_is_input_free</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether ``declare_step`` for this walk reads nothing from the inputs</span>
+<span class="sd">        but their spans, and every real row has the span of the template row.</span>
+<span class="sd">        Then the step a pre-plan declared over the bucket's template rows is</span>
+<span class="sd">        the step the forward would declare, and the engine runs it instead of</span>
+<span class="sd">        declaring and admitting a second time."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span>
+        <span class="k">return</span> <span class="kc">False</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.inline_client_signals">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.inline_client_signals">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">inline_client_signals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Output signals whose client-facing value is one scalar per row that</span>
+<span class="sd">        the stop check already copies to the host, as signal name -&gt; the name</span>
+<span class="sd">        of the row-addressed stop buffer holding it. The worker then sends</span>
+<span class="sd">        those values inline, one frame per step, instead of one tensor per</span>
+<span class="sd">        request. Only for a walk whose emit edge is not persisted."""</span>
+        <span class="k">del</span> <span class="n">graph_walk</span>
+        <span class="k">return</span> <span class="p">{}</span></div>
+
+
 <div class="viewcode-block" id="NodeSubmodule.unpack_packed_outputs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">unpack_packed_outputs</span><span class="p">(</span>
@@ -2025,7 +2070,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 13, 2026.
+  Last updated on Oct 14, 2026.
   <br/>
 </p>
   </div>

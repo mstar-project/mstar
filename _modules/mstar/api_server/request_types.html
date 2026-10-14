@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 13, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -944,6 +944,23 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="ResultTokens">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultTokens">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ResultTokens</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""One step's client-facing scalars (sampled tokens), every request in one</span>
+<span class="sd">    frame. Replaces one ResultTensors per request for an output whose value</span>
+<span class="sd">    the worker already holds on the host: no transport tensor, no ack."""</span>
+    <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+    <span class="n">values</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="c1"># per request, the loop context of the step that produced the value</span>
+    <span class="n">loop_indices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NestedLoopIndices</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span>
+    <span class="n">signal</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">modality</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">metadata</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="RequestComplete">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestComplete">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -977,14 +994,18 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="c1"># what an ``APIServerMessage`` carries; None for ``setup_done``</span>
+<span class="n">APIServerMessageBody</span> <span class="o">=</span> <span class="n">ResultTensors</span> <span class="o">|</span> <span class="n">ResultTokens</span> <span class="o">|</span> <span class="n">RequestComplete</span> <span class="o">|</span> <span class="n">RequestFailed</span> <span class="o">|</span> <span class="kc">None</span>
+
+
 <div class="viewcode-block" id="APIServerMessage">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.APIServerMessage">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">APIServerMessage</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Envelope for messages received by the API server."""</span>
-    <span class="c1"># "result_tensors" | "request_complete" | "request_failed" | "setup_done"</span>
+    <span class="c1"># "result_tensors" | "result_tokens" | "request_complete" | "request_failed" | "setup_done"</span>
     <span class="n">message_type</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">body</span><span class="p">:</span> <span class="n">ResultTensors</span> <span class="o">|</span> <span class="n">RequestComplete</span> <span class="o">|</span> <span class="n">RequestFailed</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>  <span class="c1"># None for setup_done</span></div>
+    <span class="n">body</span><span class="p">:</span> <span class="n">APIServerMessageBody</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -1065,7 +1086,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 13, 2026.
+  Last updated on Oct 14, 2026.
   <br/>
 </p>
   </div>
