@@ -13,10 +13,12 @@ owns, and the stream has to start at frame 0 and end at the last frame.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import load_file
 
 from mstar.model.orpheus.components.snac import SNAC
 from mstar.model.orpheus.config import OrpheusModelConfig
@@ -257,12 +259,22 @@ def tiny() -> SNACDecoderSubmodule:
     return SNACDecoderSubmodule(_tiny_snac(), OrpheusModelConfig())
 
 
-@pytest.mark.parametrize("frames", [3, 6, 25])
-def test_tiny_snac_stream_is_close_to_whole_decode(tiny, frames):
-    tokens = _tokens(tiny.config, frames, seed=10 + frames, eos=True)
+RECORDED = Path(__file__).parents[1] / "integration" / "data" / "orpheus_tokens.safetensors"
+
+
+def _tiny_case(config: OrpheusModelConfig, case) -> torch.Tensor:
+    if case == "recorded":
+        # a real Orpheus generation (38 frames, EOS last)
+        return load_file(str(RECORDED))["short"].long()
+    return _tokens(config, case, seed=10 + case, eos=True)
+
+
+@pytest.mark.parametrize("case", [3, 6, 25, "recorded"])
+def test_tiny_snac_stream_is_close_to_whole_decode(tiny, case):
+    tokens = _tiny_case(tiny.config, case)
     chunks = _stream(tiny, tokens)
     stream, whole = torch.cat(chunks), _whole(tiny, tokens)
-    assert stream.numel() == whole.numel() == frames * HOP
+    assert stream.numel() == whole.numel() == (tokens.numel() // TPF) * HOP
     assert _snr(whole, stream) > 50.0
     # every chunk boundary, +-50 ms
     boundary = 0
