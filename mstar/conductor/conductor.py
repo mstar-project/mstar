@@ -33,6 +33,7 @@ from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.exitcode import describe_exitcode
+from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -49,7 +50,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
-from mstar.utils.profiler import range_pop, range_push
+from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
@@ -304,7 +305,6 @@ class Conductor:
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
-        self.enable_nvtx = enable_nvtx
         self.enable_prof = enable_prof
         self.tensor_comm_protocol = tensor_comm_protocol
         self.tcp_transfer_device = tcp_transfer_device
@@ -321,6 +321,7 @@ class Conductor:
             self.model_config = yaml.safe_load(f)
         accelerator = torch.accelerator.current_accelerator(check_available=True)
         self.device_type = accelerator.type if accelerator is not None else "cpu"
+        self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
@@ -1537,6 +1538,8 @@ class Conductor:
         from mstar.utils.profiler import range_pop, range_push
 
         self._wait_for_workers_ready()
+        # the set-up heap is complete: keep gen-2 collections off it
+        freeze_after_setup("Conductor")
 
         self.communicator.send(
             "api_server",

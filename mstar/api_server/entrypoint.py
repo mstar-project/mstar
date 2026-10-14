@@ -29,11 +29,12 @@ from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.multimodal import PromptPart
-from mstar.model.registry import HF_MODELS
+from mstar.model.registry import model_init_kwargs
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
 from mstar.utils.exitcode import describe_exitcode
+from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 
@@ -121,9 +122,8 @@ def _conductor_process_target(
         )
 
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
         cache_dir=cache_dir,
-        **yaml_model_kwargs,
+        **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
     conductor = Conductor(
         model=model,
@@ -185,6 +185,47 @@ class PendingRequest:
     consumed_chunks: int = 0
     error: Any | None = None
     error_status: int = 500
+    # Set by the streaming handler on its event loop; the message thread wakes
+    # it through these when a chunk or the completion lands, so the handler
+    # sleeps between chunks instead of polling every millisecond per request.
+    wake: Any | None = None
+    loop: Any | None = None
+
+    def notify(self) -> None:
+        """Wake the streaming handler, from any thread."""
+        loop, wake = self.loop, self.wake
+        if loop is None or wake is None:
+            return
+        try:
+            loop.call_soon_threadsafe(wake.set)
+        except RuntimeError:
+            pass  # the loop is closed: the client is gone
+
+
+def _set_events(wakes: list) -> None:
+    for wake in wakes:
+        wake.set()
+
+
+def notify_many(reqs) -> None:
+    """``PendingRequest.notify`` for a batch: one loop wake-up (a self-pipe
+    write) per event loop rather than one per chunk. A step's RESULT_TOKENS
+    frame lands one chunk per running request, so the message thread was
+    waking the loop once per token."""
+    by_loop: dict[int, tuple[Any, list]] = {}
+    for req in reqs:
+        loop, wake = req.loop, req.wake
+        if loop is None or wake is None:
+            continue
+        entry = by_loop.get(id(loop))
+        if entry is None:
+            entry = by_loop[id(loop)] = (loop, [])
+        entry[1].append(wake)
+    for loop, wakes in by_loop.values():
+        try:
+            loop.call_soon_threadsafe(_set_events, wakes)
+        except RuntimeError:
+            pass  # the loop is closed: the client is gone
 
 
 def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
@@ -247,7 +288,7 @@ class APIServer:
         # cost is invisible to worker-side markers. Streaming a 720p chunk means
         # base64-encoding 11 MiB into 14.7 MiB of ASCII and copying that again
         # through json.dumps, once per engine step.
-        self.enable_nvtx = enable_nvtx
+        self.enable_nvtx = profiler.nvtx_enabled(enable_nvtx)
 
         # Per-request profiling: when enabled, a RequestProfile is collected for
         # each request and pretty-printed when the request finishes. ``log_stats_file``
@@ -270,7 +311,7 @@ class APIServer:
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=self.log_stats,
-            enable_nvtx=enable_nvtx,
+            enable_nvtx=self.enable_nvtx,
         )
 
         # Concurrent request tracking
@@ -326,6 +367,9 @@ class APIServer:
                     and message.message_type == "setup_done"
                 ):
                     logger.info("All workers ready")
+                    # the set-up heap is complete: keep gen-2 collections off
+                    # it (measured 200 ms per pass on this process under load)
+                    freeze_after_setup("API server")
                     self._msg_thread.start()
                     return
                 logger.warning(
@@ -362,6 +406,7 @@ class APIServer:
                     req.error = message
                     req.error_status = 503
                 req.event.set()
+                req.notify()
             on_fatal = self.on_fatal
         if on_fatal is not None:
             on_fatal()
@@ -492,6 +537,7 @@ class APIServer:
                         )
                         req.error_status = 500
                 req.event.set()
+                req.notify()
                 # Snapshot the data worker's tx/rx now: the request is done (all
                 # final chunks received), so the worker thread is no longer mutating
                 # this rid's transport state, and we must read it before the hard
@@ -532,6 +578,30 @@ class APIServer:
                         logger.warning("Unexpected message type: %s", type(message))
                         continue
 
+                    if message.message_type == "result_tokens":
+                        # One frame for the step: every request's value.
+                        # A request that is gone needs nothing acked back.
+                        body = message.body
+                        queued = False
+                        with self.request_lock:
+                            for i, rid in enumerate(body.request_ids):
+                                if rid in self.pending_requests:
+                                    # one wake-up for the frame, after every
+                                    # request's value is queued
+                                    self.preprocess_worker.new_result_token(
+                                        rid, body.values[i],
+                                        body.loop_indices[i],
+                                        body.signal, body.modality, wake=False,
+                                    )
+                                    queued = True
+                                elif rid not in self.recently_completed:
+                                    logger.warning(
+                                        "Token for unknown request %s dropped", rid,
+                                    )
+                        if queued:
+                            self.preprocess_worker.wake()
+                        continue
+
                     rid = message.body.request_id
 
                     with self.request_lock:
@@ -560,6 +630,7 @@ class APIServer:
                                 # result is coming, so the alternative is the
                                 # blanket request timeout.
                                 req.event.set()
+                                req.notify()
                                 # The conductor has already dropped this rid,
                                 # so no abort is needed — but the data worker
                                 # still holds its transport state. Parking the
@@ -618,6 +689,9 @@ class APIServer:
                                 update.preprocess_finish_time
                             req.profile.inputs = update.inputs
 
+                # the handlers are woken once per pass, after every chunk of
+                # the pass has been appended, not once per chunk
+                to_wake: dict[int, PendingRequest] = {}
                 for result_chunk in self.preprocess_worker.get_result_chunks():
                     logger.debug(
                         "Got result chunk of %s modality for request %s",
@@ -639,6 +713,7 @@ class APIServer:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
                         req.chunks.append(result_chunk)
+                        to_wake[id(req)] = req
 
                         if result_chunk.modality == "error":
                             # The data worker failed this request (preprocess,
@@ -655,6 +730,8 @@ class APIServer:
                             # the data worker's per-request state once the
                             # client lets go of the request.
                             self.recently_completed[rid] = time.time()
+                if to_wake:
+                    notify_many(to_wake.values())
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
@@ -666,22 +743,50 @@ class APIServer:
     # ----------------------------------------------------------
 
     async def iter_result_chunks(self, request_id: str):
-        """Yield raw :class:`ResultChunk` objects as they arrive.
+        """Yield raw :class:`ResultChunk` objects as they arrive, one at a time.
 
         Shared source for both output surfaces: ``/generate`` formats each
         chunk as NDJSON (via :meth:`async_stream_results`), while the
-        OpenAI-compatible endpoints translate the same chunks into SSE. The
-        per-request timeout, incremental drain, and final flush behave exactly
-        as before — only the yielded type changed (``ResultChunk`` instead of a
-        pre-serialized line).
+        OpenAI-compatible endpoints translate the same chunks into SSE. This
+        is a flattening wrapper over :meth:`iter_result_chunk_batches`, which
+        hands out the chunks the way they arrive (several per wake under load)
+        and owns the timeout, the drain and the abort on an early exit.
+        """
+        batches = self.iter_result_chunk_batches(request_id)
+        try:
+            async for batch in batches:
+                for chunk in batch:
+                    yield chunk
+        finally:
+            await batches.aclose()
+
+    async def iter_result_chunk_batches(self, request_id: str):
+        """Yield the :class:`ResultChunk` objects as they arrive, as one list
+        per drain: everything the message thread appended since the last
+        wake. Under load several tokens of a request are often waiting when
+        the handler runs, and sending them as one body frame costs one write
+        instead of one per token; when the loop keeps up the lists are of
+        length one and nothing is delayed. The final flush and an in-band
+        error come as the last list.
         """
         start = time.time()
         finished = False
+        # Woken by the message thread (PendingRequest.notify) when a chunk or
+        # the completion lands; the timeout below is only a backstop.
+        wake = asyncio.Event()
+        with self.request_lock:
+            req = self.pending_requests.get(request_id)
+            if req is not None:
+                req.loop = asyncio.get_running_loop()
+                req.wake = wake
         try:
             while True:
                 if time.time() - start > self.timeout_seconds:
                     raise HTTPException(status_code=500, detail="Request timed out")
 
+                # Cleared before the read: a notification that lands after
+                # this point stays set and the wait below returns at once.
+                wake.clear()
                 new_chunks: list[ResultChunk] = []
                 done = False
                 with self.request_lock:
@@ -695,10 +800,11 @@ class APIServer:
                     else:
                         done = True
 
-                for chunk in new_chunks:
+                if new_chunks:
                     if self.enable_nvtx:
-                        profiler.mark("apiserver.chunk_available")
-                    yield chunk
+                        for _ in new_chunks:
+                            profiler.mark("apiserver.chunk_available")
+                    yield new_chunks
 
                 if done:
                     logger.info("Async stream results received finish for %s", request_id)
@@ -714,23 +820,29 @@ class APIServer:
                     # lock; the popped request is no longer shared with other threads.
                     if finished_req is not None:
                         self._finalize_profile(finished_req)
-                    for chunk in remaining:
-                        yield chunk
+                    tail = list(remaining)
                     # A request can fail after the stream is already open
                     # (preprocess error, result-delivery timeout); the HTTP
                     # status is committed by then, so the error must travel
                     # in-band as the final chunk.
                     if finished_req is not None and finished_req.error is not None:
-                        yield ResultChunk(
+                        tail.append(ResultChunk(
                             request_id=request_id,
                             modality="error",
                             data=str(finished_req.error).encode("utf-8"),
                             metadata={"status": finished_req.error_status},
-                        )
+                        ))
+                    if tail:
+                        yield tail
                     finished = True
                     break
 
-                await asyncio.sleep(0.001)
+                if new_chunks:
+                    continue  # more may already be waiting
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    pass
         finally:
             if not finished:
                 self.abort_request(request_id)
@@ -1493,7 +1605,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "--enable-nvtx",
         action="store_true",
-        help="Enable torch.cuda.nvtx markers during execution",
+        help="Enable NVTX markers during CUDA execution (disabled on XPU and CPU)",
     )
     parser.add_argument(
         "--tensor-comm-protocol",
@@ -1553,9 +1665,8 @@ def main(argv: list[str] | None = None):
     # (tokenization only — no GPU weights needed)
     from mstar.model.registry import get_model_class
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
         cache_dir=args.cache_dir,
-        **yaml_model_kwargs,
+        **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
     _set_preprocess_threads(model, config)
 

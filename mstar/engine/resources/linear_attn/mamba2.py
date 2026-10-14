@@ -29,7 +29,7 @@ from mstar.engine.resources.linear_attn.mamba2_kernels import (
     mamba2_state_update,
 )
 from mstar.engine.resources.recurrent.config import Mamba2Geometry
-from mstar.engine.resources.recurrent.pool import RecurrentAddressing
+from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentAddressing
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,9 @@ class Mamba2Manager(LinearAttnManager):
         self.state_dtype = state_dtype
         self._device = device
         self._pool_key = config.recurrent_state
-        self._has_sink = has_sink
+        # The pool's slot for rows with no request; the conv kernels skip it.
+        # Their default of 0 would skip a real request when the sink is off.
+        self._null_slot_id = SINK_SLOT if has_sink else NO_SLOT
         self._time_step_limit = tuple(config.time_step_limit)
 
         self._cg_max_bs = 0
@@ -162,6 +164,7 @@ class Mamba2Manager(LinearAttnManager):
             return causal_conv1d_update(
                 x=x, conv_state=conv_layer, weight=weight, bias=bias,
                 activation=activation, conv_state_indices=plan.slots,
+                null_block_id=self._null_slot_id,
             )
         cu = [0]
         for span in plan.spans:
@@ -176,6 +179,7 @@ class Mamba2Manager(LinearAttnManager):
             has_initial_state=plan.has_state,
             activation=activation,
             pad_slot_id=PAD_SLOT_ID,
+            null_block_id=self._null_slot_id,
             seqlens_cpu=torch.tensor(plan.spans, dtype=torch.int32),
         )
         return out.transpose(0, 1)
@@ -213,12 +217,14 @@ class Mamba2Manager(LinearAttnManager):
         # the sequential scan over its span, scatter the final state back.
         # Eager and per row: a system prompt is short and there is one per
         # request.
-        out = torch.empty_like(x)
+        # NO_SLOT rows are skipped and read as zeros, like the decode kernel's.
+        out = torch.zeros_like(x)
         slots = plan.slots.tolist()
         has_state = plan.has_state.tolist()
         start = 0
         for span, slot, carried in zip(plan.spans, slots, has_state, strict=True):
             if span <= 0 or slot == PAD_SLOT_ID:
+                start += max(span, 0)
                 continue
             h0 = ssm_layer[slot] if carried else None
             y, final = mamba2_scan(

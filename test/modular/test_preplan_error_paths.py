@@ -45,7 +45,7 @@ def _fake_worker() -> Worker:
     w.settled = []
     w._graph_runtime = SimpleNamespace(
         push_back_node=lambda node_name, rids, wg_ids: w.pushed_back.extend(rids),
-        set_speculatively_scheduled=(
+        set_in_flight=(
             lambda node_name, wg_id, rids, value: w.despeculated.extend(rids)
         ),
         commit_speculation=(
@@ -131,7 +131,7 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
         request_ids=("a",), release_waiters=lambda: released.append(True),
         per_request_info={"a": SimpleNamespace(request_id="a")},
     )
-    batch = SimpleNamespace(node_name="dit", graph_walk="decode")
+    batch = SimpleNamespace(node_name="dit", graph_walk="decode", output_signals=())
     with pytest.raises(RuntimeError, match="bad inputs"):
         Worker._execute_on_gpu_thread(w, batch, node_batch, _done_future())
     assert resets == [node_batch]
@@ -191,3 +191,26 @@ def test_exec_leaves_a_promoted_or_absent_stage_alone() -> None:
     with pytest.raises(ValueError):
         _exec_fake(runner, ValueError("forward failed")).exec(_batch(preplanned=None))
     assert cleared == []
+
+
+def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
+    # pre-planned over ["a", "b"] with inputs in hand (the step was kept for
+    # exec), then prepare_inputs dropped "b": the stale step must not reach
+    # admit, so the reset clears it even though the batch still has inputs
+    cleared = []
+    fake = SimpleNamespace(
+        _enable_nvtx=False,
+        _submodules={"dit": SimpleNamespace(cuda_graph_runner=None)},
+        _runner=SimpleNamespace(clear_preplan=lambda: cleared.append(True)),
+    )
+    fake.reset_pre_plan_for_batch = Engine.reset_pre_plan_for_batch.__get__(fake)
+    fake.preplan_is_stale = Engine.preplan_is_stale.__get__(fake)
+    batch = SimpleNamespace(
+        request_ids=["a"], node_name="dit", inputs=[object()], step=object(),
+        preplanned_rids=("a", "b"), preplan_event=object(),
+        step_context=SimpleNamespace(slot_lease=None),
+    )
+    assert fake.preplan_is_stale(batch)
+    fake.reset_pre_plan_for_batch(batch)
+    assert batch.step is None and batch.preplanned_rids is None and batch.preplan_event is None
+    assert cleared == [True]

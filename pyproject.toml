@@ -106,7 +106,7 @@ bagel_xpu = [
     "torchaudio",
     "torchcodec",
     "transformers",
-    "vllm-xpu-kernels==0.1.13.2",
+    "vllm-xpu-kernels==0.1.15.4",
 ]
 
 cosmos3 = [
@@ -172,6 +172,27 @@ kokoro = [
     "transformers",
 ]
 
+# Chatterbox / Chatterbox-Turbo: resemble-perth (MIT) carries the PerTh
+# watermark network applied to every output; pyloudnorm normalises Turbo's
+# reference clip like the reference package. Both are imported lazily.
+chatterbox = [
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "librosa",
+    "mooncake-transfer-engine",
+    "pyloudnorm",
+    "resemble-perth",
+    "safetensors",
+    "tokenizers",
+    "torchcodec",
+    "transformers",
+]
+chatterbox_multilingual = [
+    # Chatterbox Multilingual's Japanese kana reading and Chinese word segmentation
+    "pykakasi==2.3.0",
+    "spacy-pkuseg",
+]
+
 orpheus = [
     "einops",
     "flashinfer-python>=0.6.14",
@@ -225,6 +246,18 @@ waypoint = [
     "tensordict==0.10.0",
     # flash-attn-4 (flash_attn.cute, the default flex attention backend) is not
     # on PyPI; install it separately, see docs/installation.rst.
+]
+
+flux2_klein = [
+    # FLUX.2 [klein] 4B/9B: diffusers is the parity oracle in the tests only; serving
+    # runs the native ports. transformers provides the Qwen3 tokenizer (chat template).
+    "diffusers>=0.39",
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "Pillow",
+    "safetensors",
+    "torchvision",
+    "transformers",
 ]
 
 vjepa2_ac = [

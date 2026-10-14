@@ -156,7 +156,7 @@ def test_min_p_one_is_greedy_for_every_seed_on_cuda():
         offsets = torch.zeros(4, device=dev, dtype=torch.long)
         eager = sample_tokens(
             logits, temperature=1.0, min_p=1.0, seed=seeds, rand_offset=offsets,
-            any_greedy=False, any_top_k_zero=True, all_top_k_zero=True,
+            any_greedy=False, top_k_zero_count=logits.shape[0],
         )
         graph = sample_cuda_graphable_gpu(
             logits, torch.ones(4, device=dev), torch.zeros(4, device=dev, dtype=torch.int32),

@@ -49,16 +49,15 @@ MediaItem = "str | bytes | Path | tuple[str, bytes]"
 
 
 def _load_nvtx():
-    """Return ``(range_push, range_pop)``, importing torch only on demand.
+    """Return CUDA NVTX hooks or ``None``, importing torch only on demand.
 
     The SDK's dependency contract is stdlib + ``requests`` (+ ``numpy``), so
     the profiler import cannot happen at module scope. Only a caller that
-    explicitly asks for NVTX pays for it, and such a caller is by definition
-    running under a CUDA profiler already.
+    explicitly asks for NVTX pays for it. XPU and CPU clients keep it disabled.
     """
-    from mstar.utils.profiler import range_pop, range_push
+    from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 
-    return range_push, range_pop
+    return (range_push, range_pop) if nvtx_enabled(True) else None
 
 
 class MStarClient:

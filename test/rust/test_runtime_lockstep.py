@@ -602,7 +602,7 @@ def test_speculative_flag_survives_completion(lock):
     the completion of step N -- its rids are still in flight.
 
     Python's WorkerGraphIO.mark_node_complete -> GraphNode.complete() never
-    touches ``_speculatively_scheduled``; Rust's ``State::complete`` used to
+    touches ``_in_flight``; Rust's ``State::complete`` used to
     set ``st.scheduled = false``. Because ``refresh_ready`` gates the ready-set
     ADD on that flag (as Python's ``register_ingested_input`` does), clearing
     it let the runtime report a node ready whose rids were mid-flight, and
@@ -628,27 +628,27 @@ def test_speculative_flag_survives_completion(lock):
     lock.pop("ar_decode", rid)
 
     def flag(rt, b, s):
-        return rt.is_speculatively_scheduled("ar_decode", WG_ID, rid)
-    assert lock._both("is_spec_scheduled before", flag) is False
+        return rt.is_in_flight("ar_decode", WG_ID, rid)
+    assert lock._both("is_in_flight before", flag) is False
 
-    lock._both("set_speculatively_scheduled(ar_decode, True)",
-               lambda rt, b, s: rt.set_speculatively_scheduled(
+    lock._both("set_in_flight(ar_decode, True)",
+               lambda rt, b, s: rt.set_in_flight(
                    "ar_decode", WG_ID, [rid], True))
-    assert lock._both("is_spec_scheduled after set", flag) is True
+    assert lock._both("is_in_flight after set", flag) is True
 
     # Step N completes. The flag must not be cleared by it.
     lock.put(202)
     lock.route("ar_decode", rid, ["token"], [202])
-    assert lock._both("is_spec_scheduled after completion", flag) is True, (
+    assert lock._both("is_in_flight after completion", flag) is True, (
         "completion cleared the speculative-scheduling flag; the node's rids "
         "are still in flight and it will be reported ready again"
     )
 
     # Only the worker clearing it explicitly ends the speculation.
-    lock._both("set_speculatively_scheduled(ar_decode, False)",
-               lambda rt, b, s: rt.set_speculatively_scheduled(
+    lock._both("set_in_flight(ar_decode, False)",
+               lambda rt, b, s: rt.set_in_flight(
                    "ar_decode", WG_ID, [rid], False))
-    assert lock._both("is_spec_scheduled after clear", flag) is False
+    assert lock._both("is_in_flight after clear", flag) is False
 
 
 def _streaming_loop_graph():

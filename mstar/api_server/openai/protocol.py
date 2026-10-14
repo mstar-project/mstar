@@ -55,7 +55,7 @@ class SpeechRequest(BaseModel):
     stream: bool | None = False
     temperature: float | None = None
     top_p: float | None = None
-    seed: int | None = None
+    seed: int | None = Field(None, ge=-2**63, le=2**63 - 1)  # the conductor's seed is an int64
 
 
 class TranscriptionRequest(BaseModel):

@@ -13,6 +13,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
+from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 
 class HostRows(NamedTuple):
@@ -41,6 +42,8 @@ class InputMetadata(NamedTuple):
     """
     # input_name -> where that streamed input's chunk sits in its stream
     stream_chunks: Mapping[str, StreamChunkInfo] = MappingProxyType({})
+    dynamic_loop_iter_counts: Mapping[str, int] = MappingProxyType({})
+
     # TODO: fold in prepare_inputs' is_final_stream_chunk kwarg once the Chatterbox work settles.
     # TODO: move step_metadata and dynamic_loop_iter_counts here off CurrentForwardPassInfo (move, don't copy).
 
@@ -78,6 +81,17 @@ class BatchedModelOutput:
     # the stop check, and slicing rows against that list would hand one
     # request another's token. None when there are no row-addressed buffers.
     row_request_ids: tuple[str, ...] | None = None
+    # Set by ``Engine._collect_outputs`` when every per-rid entry is a row view
+    # of a batch clone: name -> the views, row i for ``row_request_ids[i]``.
+    # The store describes such rows without reading each view.
+    row_views: dict[str, tuple[torch.Tensor, ...]] | None = None
+    # The stop buffers' host copy, staged by the gpu thread on the execution
+    # stream behind the step so the step's completion event covers it; the
+    # main thread reads it after waiting on that event.
+    host_rows: HostRows | None = None
+    # No per-rid entries were built: every output signal of the step stays on
+    # the device (see ``ExecutingBatch.rows_only``). Readers use the rows.
+    rows_only: bool = False
 
     @classmethod
     def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:
@@ -107,14 +121,29 @@ class BatchedModelOutput:
         alone, and the caller takes the request out of the batch instead."""
         return self.per_rid_outputs.pop(request_id, default)
 
-    def clone_check_stop_buffers(self):
+    def clone_check_stop_buffers(
+        self, reuse: dict[str, torch.Tensor] | None = None,
+    ):
         """A detached copy: the next replay overwrites a captured graph's
-        buffers before the stop check reads them."""
+        buffers before the stop check reads them.
+
+        ``reuse`` holds clones already taken of the row outputs (see
+        ``clone_row_outputs``); a stop buffer that is the very same tensor as a
+        row output takes that clone instead of a second copy. The row clone is
+        narrowed to the real rows, which is every row the stop check reads.
+        """
         if self.check_stop_buffers is None:
             return None
+        rows = self.row_outputs or {}
 
-        def _clone(value):
+        def _clone(value, name=None):
             if isinstance(value, torch.Tensor):
+                if (
+                    reuse is not None and name is not None
+                    and value is rows.get(name)
+                    and isinstance(reuse.get(name), torch.Tensor)
+                ):
+                    return reuse[name]
                 return value.clone()
             if isinstance(value, list):
                 return [
@@ -125,7 +154,7 @@ class BatchedModelOutput:
             # pass anything else through: dropping it could lose a stop signal
             return value
 
-        return {k: _clone(v) for k, v in self.check_stop_buffers.items()}
+        return {k: _clone(v, k) for k, v in self.check_stop_buffers.items()}
 
     def clone_row_outputs(self, num_rows: int) -> dict[str, torch.Tensor]:
         """One clone per row-addressed batch tensor, narrowed to the real rows
@@ -152,6 +181,8 @@ class BatchedModelOutput:
         other = self.coerce(other)
         self.per_rid_outputs.update(other.per_rid_outputs)
         self.packed_outputs.update(other.packed_outputs)
+        # merged entries are no longer exactly one batch's row views
+        self.row_views = None
         # Row-addressed buffers describe one forward, so keep them only when
         # exactly one side had any; otherwise the stop check falls back to the
         # per-rid outputs.
@@ -592,6 +623,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         inputs: list[NodeInputs],
         slot_lease: SlotLease | None = None,
         piecewise_leases: Mapping[str, SlotLease] | None = None,
+        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
         **kwargs,
     ) -> SubmoduleStep | None:
         """Declare this batch's step for the runner to drive: which cache
@@ -614,7 +646,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
         ``piecewise_leases`` names the regions of this node that hold a slot
         for this step. Such a region declares, plans and commits its own work,
-        so a resource it owns must be left out of this declaration."""
+        so a resource it owns must be left out of this declaration.
+
+        ``per_request_info`` holds the real rows' forward-pass info (capture
+        passes dummy metadata); padding rows are absent, so read it with
+        ``.get``."""
         return None
 
     @abstractmethod
@@ -659,6 +695,54 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """Drop keys a real request shouldn't receive. A captured forward emits
         a fixed key set for graph compat, so the filtering happens here."""
         return outputs
+
+    def uniform_row_inputs(
+        self, graph_walk: str, has_loopback: bool = False,
+    ) -> "NodeInputs | None":
+        """The inputs every row of this walk gets, when ``prepare_inputs``
+        would return an equal object for each regardless of the request, its
+        routed signals and its metadata (a decode walk that reads its token
+        off the device). The engine then prepares the batch with one call and
+        shares the object across the step's rows, so it must not be mutated
+        per row. ``has_loopback``: every row's last step on this node kept its
+        loop-back signals on the device (``device_loopback_signals``). None
+        (the default) prepares row by row."""
+        del graph_walk, has_loopback
+        return None
+
+    def step_is_input_free(self, graph_walk: str) -> bool:
+        """Whether ``declare_step`` for this walk reads nothing from the inputs
+        but their spans, and every real row has the span of the template row.
+        Then the step a pre-plan declared over the bucket's template rows is
+        the step the forward would declare, and the engine runs it instead of
+        declaring and admitting a second time."""
+        del graph_walk
+        return False
+
+    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        """Loop-back input signals of this walk whose per-row value the node
+        keeps on the device itself (a sampler's slot master), so the worker
+        routes them with no tensor: the next step reads the value in
+        ``preprocess`` and every fallback batch arrives with the signal
+        empty. ``prepare_inputs`` is told per row (``has_loopback``) whether
+        its last step here kept the value on the device; a row without it
+        (e.g. its previous step ran on another rank) brings the tensor.
+        On a walk whose output signals all stay on the device the
+        engine builds no per-request output dicts and does not call
+        ``postprocess``: the stop check, the inline emit and the next step's
+        speculation read the step's rows instead. Empty by default;
+        ``MSTAR_DEVICE_LOOPBACK=0`` keeps every node on the tensor path."""
+        del graph_walk
+        return frozenset()
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        """Output signals whose client-facing value is one scalar per row that
+        the stop check already copies to the host, as signal name -> the name
+        of the row-addressed stop buffer holding it. The worker then sends
+        those values inline, one frame per step, instead of one tensor per
+        request. Only for a walk whose emit edge is not persisted."""
+        del graph_walk
+        return {}
 
     def unpack_packed_outputs(
         self,
@@ -798,6 +882,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         Modifies ``outputs`` in-place; returns nothing.
         """
         return
+
+    def batch_postprocess(
+        self, outputs: BatchedModelOutput,
+        request_infos: dict[int, CurrentForwardPassInfo],
+        inputs: list[NodeInputs],
+    ) -> None:
+        """``postprocess`` for a rows-only step, which has no per-request
+        outputs: works on the rows of ``outputs`` in place. Optional; only
+        called when overridden."""
 
     def check_stop(
         self, request_id: str,

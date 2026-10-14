@@ -17,10 +17,16 @@ adapter's ``speech_chunk_max_pieces`` chunks is rejected.
 A streaming request only commits to HTTP 200 once its first result chunk has
 arrived and is not an error; an error chunk before that becomes the HTTP error
 it carries (the non-streaming path gets the same from ``collect_results``).
+
+The adapter maps the request before anything is submitted, and that step can
+decode an uploaded clip or, where the server allows it, fetch one over HTTP.
+It runs in a worker thread so a slow reference cannot stall the streams the
+event loop is serving.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 
 from fastapi import HTTPException
@@ -57,8 +63,9 @@ def _chunk_kwargs(model_kwargs: dict, index: int) -> dict:
     kwargs = dict(model_kwargs)
     kwargs.pop("sentence_chunking", None)
     seed = kwargs.get("seed")
-    if isinstance(seed, int) and not isinstance(seed, bool):
-        kwargs["seed"] = seed + index
+    if isinstance(seed, int) and not isinstance(seed, bool) and index:
+        # the conductor's seed is an int64: a seed near the top wraps instead of overflowing
+        kwargs["seed"] = (seed + index) % 2**63
     return kwargs
 
 
@@ -75,10 +82,19 @@ def list_voices(api) -> VoiceList | None:
 
 
 async def create_speech(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
-    args = adapter.speech_to_request(req, api.upload_dir)
-    request_id = rid("speech")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
-    fmt = (req.response_format or "wav").lower()
+    # before any upload or GPU work: a format we cannot produce is the client's error
+    try:
+        fmt = media_io.check_audio_format(req.response_format, bool(req.stream), sample_rate)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # blocking work (base64 decode, file write, an allowed remote fetch) off the loop
+    try:
+        args = await asyncio.to_thread(adapter.speech_to_request, req, api.upload_dir)
+    except ValueError as exc:
+        # the adapter refused the request's fields (a bad data URL, a server path)
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    request_id = rid("speech")
     chunks = _plan_chunks(req, adapter, args.text or "")
 
     def submit(index: int) -> str:

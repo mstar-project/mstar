@@ -128,6 +128,14 @@ class Resource(ABC):
         """Take this step's sampled tokens, so what was generated can be keyed."""
         return
 
+    @property
+    def keys_prefix_chains(self) -> bool:
+        """Whether ``extend_prefix_chain`` can do anything right now (a prefix
+        cache is open). The runner skips the per-request sweep otherwise. A
+        resource that overrides ``extend_prefix_chain`` but not this is swept
+        every step."""
+        return False
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 
@@ -213,6 +221,52 @@ class Resource(ABC):
         """Publish state that is useful only when a dynamic loop stops."""
         del request_id, node_name, graph_walk
         return None
+
+    def publish_snapshot_batch(
+        self,
+        request_ids: list[str],
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> list:
+        """``publish_snapshot_for_step`` for every request of a step, one
+        entry per request in order (None for nothing to publish). A resource
+        with per-request locking or lookups overrides this to do them once."""
+        return [
+            self.publish_snapshot_for_step(
+                rid, node_name=node_name, graph_walk=graph_walk,
+            )
+            for rid in request_ids
+        ]
+
+    def publish_snapshot_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> Any:
+        """A cheap record of what ``publish_for_step`` would export right now.
+
+        The worker finishes it with ``publish_from_snapshot`` only for the
+        requests whose frame or completion carries the publication, which in a
+        steady decode loop is none of them. The default takes the eager
+        publication itself, so a resource is correct without overriding; one
+        whose publish builds something per request (a page list, a transfer
+        descriptor) overrides both to record a few scalars here instead.
+        """
+        return self.publish_for_step(
+            request_id, node_name=node_name, graph_walk=graph_walk,
+        )
+
+    def publish_from_snapshot(
+        self,
+        request_id: str,
+        snapshot: Any,
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> "PublishedInfo | None":
+        """Finish a ``publish_snapshot_for_step`` record into the published info."""
+        del request_id, node_name, graph_walk
+        return snapshot
 
     def reset_request(self, rid: str, free: bool=False):
         """For clearing dummy RIDs during cuda graph capture"""
