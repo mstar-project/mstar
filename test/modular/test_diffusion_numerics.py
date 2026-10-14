@@ -15,7 +15,7 @@ sys.path.insert(0, ".")
 
 from mstar.model.components.diffusion.flow_match import FlowMatchConfig, FlowMatchSchedule, euler_step  # noqa: E402
 from mstar.model.components.diffusion.image_io import encode_image, pixels_to_uint8, uint8_to_png  # noqa: E402
-from mstar.model.components.diffusion.text_encoder import Qwen3RMSNorm, qwen3_rotary_tables  # noqa: E402
+from mstar.model.components.diffusion.qwen3.encoder import Qwen3RMSNorm, qwen3_rotary_tables  # noqa: E402
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
