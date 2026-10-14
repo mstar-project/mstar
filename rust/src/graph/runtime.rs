@@ -1231,6 +1231,10 @@ pub struct RouteArg {
     /// None, every row ran `graph_walk`.
     walks: Option<Vec<String>>,
     rid_walk_idx: Option<Vec<u32>>,
+    /// Rows whose node (resp. walk) needs another step: a chunked prefill
+    /// streaming partial outputs is not done when its step lands.
+    incomplete_node_rids: Vec<u32>,
+    incomplete_walk_rids: Vec<u32>,
 }
 
 /// An item of a mapping that may be missing or None.
@@ -1260,6 +1264,8 @@ impl<'py> FromPyObject<'py> for RouteArg {
             inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
             walks: r.walks,
             rid_walk_idx: r.rid_walk_idx,
+            incomplete_node_rids: r.incomplete_node_rids,
+            incomplete_walk_rids: r.incomplete_walk_rids,
         })
     }
 }
