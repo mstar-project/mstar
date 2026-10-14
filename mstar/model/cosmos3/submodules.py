@@ -1013,7 +1013,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # Forward-dynamics conditions on a clean action chunk supplied with the
         # request; the other modes predict the action (clean values are zero).
         clean_action = torch.zeros((1, action_chunk, action_dim), device=device, dtype=dtype)
-        raw_act = md.get("action")
+        action_inputs = (inputs or {}).get("action_inputs")
+        raw_act = action_inputs[0] if action_inputs else None
         if mode == "forward_dynamics" and raw_act is not None:
             act = torch.as_tensor(raw_act, device=device, dtype=dtype)
             if act.ndim == 3:

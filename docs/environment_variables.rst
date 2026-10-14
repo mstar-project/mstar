@@ -42,12 +42,11 @@ Communication
      - How messages are encoded on every communicator edge (see
        :func:`mstar.communication.codec.default_codec`). ``msgpack``: the
        typed encoding in :mod:`mstar.communication.wire`, language-neutral
-       so an edge can terminate in a Rust process. ``pickle``: the old
-       Python-only wire, kept for bisecting a wire problem. Both ends of an
-       edge must agree, so this is all-or-nothing for a mesh -- one process
-       set differently cannot talk to its peers. ``pickle`` is incompatible
-       with the Rust graph runtime, which builds its frames as typed
-       msgpack; that pairing fails at startup rather than mixing wires.
+       so an edge can terminate in a Rust process. ``pickle`` is no longer
+       supported and fails at startup. Loosely typed metadata uses data-only
+       extensions instead of pickle. Upgrade all processes in a deployment
+       together: older processes cannot decode the new extensions, and
+       updated processes reject legacy pickle messages and metadata.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a
@@ -308,10 +307,33 @@ Worker scheduling
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
        thread.
+   * - ``MSTAR_DECODE_BUCKETS``
+     - ``1,2,4,8,16,32,48,64,96,128``
+     - The decode batch sizes a model captures as accelerator graphs (Qwen3.5 reads
+       it; a model with its own ladder reads it the same way). A decode step
+       runs at the smallest bucket that holds its rows, so the ladder bounds
+       both the rows per step and the graph memory; narrow it (for example
+       ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
+       former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
+       Qwen3.5 alone.
+   * - ``MSTAR_LAZY_PUBLISH``
+     - ``1``
+     - Publish resource state (KV pages, positions) only for the requests
+       whose frame or completion carries it: ``finalize_batch`` keeps a
+       cheap per-request snapshot and the worker finishes it on demand.
+       ``0`` builds the full publication for every request on every step,
+       the old behaviour; it was a quarter of the GPU thread's host time at
+       batch 32 in a decode loop that never reads it.
    * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
        other ready work.
+   * - ``MSTAR_RUST_SEND_TIMING``
+     - unset
+     - ``1`` makes the Rust runtime print, every 500 calls, how long the
+       worker's per-step send spends in its own work against the whole call
+       (which includes taking the GIL back when the send had to release it).
+       A diagnostic for the host-overhead work; off by default.
    * - ``MSTAR_SPEC_PEEK_FOR_FAIRNESS``
      - ``1``
      - Yield the speculation chain only when another (node, walk) is

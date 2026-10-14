@@ -137,6 +137,8 @@ def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
 
+    PREPROCESS_ONLY_KWARGS = ("robot_state",)
+
     PREFILL_WALK = "prefill"
     ACTION_GEN_WALK = "action_gen"
 

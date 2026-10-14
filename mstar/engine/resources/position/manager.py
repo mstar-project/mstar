@@ -195,6 +195,20 @@ class RopeManager(PositionManager):
             return None
         return PublishedPositionInfo(counters=dict(counters))
 
+    def publish_snapshot_for_step(
+        self, request_id: str, node_name: str | None, graph_walk: str | None,
+    ):
+        del node_name, graph_walk
+        counters = self._counters.get(request_id)
+        return tuple(counters.items()) if counters else None
+
+    def publish_from_snapshot(
+        self, request_id: str, snapshot, node_name: str | None,
+        graph_walk: str | None,
+    ):
+        del request_id, node_name, graph_walk
+        return PublishedPositionInfo(counters=dict(snapshot)) if snapshot else None
+
     def admit_retrieve(
         self, rid: str, node_name: str, graph_walk: str,
         published: "PublishedPositionInfo | None",

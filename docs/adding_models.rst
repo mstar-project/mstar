@@ -173,6 +173,16 @@ You must implement these abstract methods:
    read — also delete the key from ``_STRIP_KEYS``, or requests arriving through
    the Dynamo frontend will silently lose it.
 
+.. note::
+
+   ``model_kwargs`` cross the control plane to the conductor as plain data, so a
+   value that ``process_prompt`` moves onto a tensor edge must not travel there
+   too. List those kwargs in ``PREPROCESS_ONLY_KWARGS``: the data worker keeps the
+   originals for ``postprocess`` and leaves them out of the conductor's copy. Pi0.5
+   lists ``robot_state``, and Cosmos3 lists ``action`` (it passes only the shape on as
+   ``action_shape`` metadata). A tensor left in ``model_kwargs`` fails at send
+   with an error that names the kwarg.
+
 The following methods have defaults and are optional to override:
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
 ``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image``, ``load_audio``,

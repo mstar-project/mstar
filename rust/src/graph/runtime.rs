@@ -11,7 +11,7 @@ use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
 use crate::communicator::RawZmqCommunicator;
 use crate::PyZmqCommunicator;
 use std::sync::Arc;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -273,12 +273,44 @@ pub struct GraphRuntime {
     /// is right for the no-transport case: the frame builders are exercised
     /// without a socket, and the worker's flag gate already refuses to pair
     /// the Rust runtime with a communicator it cannot share.
-    fn dispatch(&self, peer: &str, bytes: &[u8]) -> PyResult<()> {
-        if let Some(comm) = &self.communicator {
-            comm.send(peer, bytes)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    /// Send frames in order. Each is first tried without blocking, with the
+    /// GIL held: a send that goes through costs no GIL reacquisition, which
+    /// the released-GIL form paid at up to a millisecond per step on the
+    /// worker's main thread. From the first frame a peer cannot take (its
+    /// high-water mark), the rest go out blocking with the GIL released, as
+    /// every send did before, so a stalled peer still cannot freeze the
+    /// other Python threads.
+    fn send_frames(
+        &self, py: Python<'_>, frames: Vec<(String, Vec<u8>)>,
+    ) -> PyResult<()> {
+        let Some(comm) = &self.communicator else { return Ok(()) };
+        let mut rest: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut blocked = false;
+        for (peer, bytes) in frames {
+            if blocked {
+                rest.push((peer, bytes));
+                continue;
+            }
+            match comm.try_send(&peer, &bytes) {
+                Ok(true) => {}
+                Ok(false) => {
+                    blocked = true;
+                    rest.push((peer, bytes));
+                }
+                Err(e) => return Err(PyRuntimeError::new_err(e.to_string())),
+            }
         }
-        Ok(())
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let comm = comm.clone();
+        py.allow_threads(move || -> Result<(), crate::communicator::CommError> {
+            for (peer, bytes) in &rest {
+                comm.send(peer, bytes)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// One WORKER_GRAPHS_DONE frame. Drains the request's pending persist
@@ -1076,6 +1108,8 @@ pub struct SendPlan {
     #[pyo3(get)] pub persist: Vec<(u32, String, Vec<u64>)>,
     /// (rid, signal, modality, tensors) -- sliced, as to_workers is.
     pub emit: Vec<(u32, String, String, Vec<TensorRef>)>,
+    /// (rid, signal, modality, value): emitted inline, one frame per step.
+    pub emit_inline: Vec<(u32, String, String, i64)>,
     /// (rid, finished worker graph ids, is_first_tp_rank)
     #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool)>,
     /// The pre-completion loop context, snapshotted at route time.
@@ -1090,9 +1124,9 @@ pub struct LoopStopArg {
     #[pyo3(item)] wg_fwd_pass_idx: u32,
 }
 
-/// `RouteInput`.
+/// `RouteInput`, the keys every caller sends.
 #[derive(FromPyObject)]
-pub struct RouteArg {
+struct RouteArgRequired {
     #[pyo3(item)] partition: String,
     #[pyo3(item)] graph_walk: String,
     #[pyo3(item)] node_name: String,
@@ -1100,6 +1134,54 @@ pub struct RouteArg {
     #[pyo3(item)] rids: Vec<u32>,
     #[pyo3(item)] tensors: Vec<u64>,
     #[pyo3(item)] num_tensors: Vec<usize>,
+}
+
+/// `RouteInput`.
+pub struct RouteArg {
+    partition: String,
+    graph_walk: String,
+    node_name: String,
+    output_signals: Vec<String>,
+    rids: Vec<u32>,
+    tensors: Vec<u64>,
+    num_tensors: Vec<usize>,
+    /// One output signal whose per-request value is a scalar the worker
+    /// already holds on the host (a sampled token). Its EMIT_TO_CLIENT edge
+    /// then rides inline in one frame per step instead of as a tensor per
+    /// request; `inline_values` are in `rids` order, or empty for none.
+    /// Both keys may be absent or None: a caller with no inline signal sends
+    /// the plain route input.
+    inline_signal: Option<String>,
+    inline_values: Vec<i64>,
+}
+
+/// An item of a mapping that may be missing or None.
+fn optional_item<'py, T: FromPyObject<'py>>(
+    ob: &Bound<'py, PyAny>, key: &str,
+) -> PyResult<Option<T>> {
+    match ob.get_item(key) {
+        Ok(v) if v.is_none() => Ok(None),
+        Ok(v) => v.extract().map(Some),
+        Err(e) if e.is_instance_of::<PyKeyError>(ob.py()) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+impl<'py> FromPyObject<'py> for RouteArg {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let r: RouteArgRequired = ob.extract()?;
+        Ok(RouteArg {
+            partition: r.partition,
+            graph_walk: r.graph_walk,
+            node_name: r.node_name,
+            output_signals: r.output_signals,
+            rids: r.rids,
+            tensors: r.tensors,
+            num_tensors: r.num_tensors,
+            inline_signal: optional_item(ob, "inline_signal")?,
+            inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
+        })
+    }
 }
 
 /// `RouteOutput`.
@@ -1171,6 +1253,9 @@ pub struct Completion {
     /// have to ask for it per rid, convert it to strings on the way out, and
     /// hand it back to be re-interned.
     pub nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
+    /// Per rid: (signal, modality, value) of the emit edge that rides inline
+    /// instead of as a tensor. Empty unless the route carried inline values.
+    pub emit_inline: FxHashMap<u32, (Sym, Sym, i64)>,
 }
 
 /// `SpeculationPrepInput`.
@@ -1855,6 +1940,49 @@ impl GraphRuntime {
             .collect()
     }
 
+    /// `get_dynamic_loop_iters` as four flat columns: the distinct loop names
+    /// once, then per entry the request's index in `request_ids`, the name's
+    /// index and the iteration. One string per loop name instead of one per
+    /// request per step.
+    fn get_dynamic_loop_iters_flat(
+        &self, request_ids: Vec<u32>, partition: &str,
+    ) -> (Vec<String>, Vec<u32>, Vec<u32>, Vec<u32>) {
+        let mut names: Vec<String> = Vec::new();
+        let mut name_idx_of: FxHashMap<Sym, u32> = FxHashMap::default();
+        let mut rid_idx: Vec<u32> = Vec::new();
+        let mut name_idx: Vec<u32> = Vec::new();
+        let mut iters: Vec<u32> = Vec::new();
+        let Some(p) = self.interner.get(partition) else {
+            return (names, rid_idx, name_idx, iters);
+        };
+        for (i, &rid) in request_ids.iter().enumerate() {
+            let Some(info) = self.info(rid) else { continue };
+            let Some(part) = info.partitions.get(&p) else { continue };
+            for &wg in &part.walk_worker_graphs {
+                let Some(state) = self.state(wg, rid) else {
+                    continue;
+                };
+                let g = &self.graphs[wg as usize];
+                for (lid, iter) in state.loop_indices().into_iter().enumerate() {
+                    let sym = g.lp(lid as LoopId).name;
+                    let ni = match name_idx_of.get(&sym) {
+                        Some(&n) => n,
+                        None => {
+                            let n = names.len() as u32;
+                            names.push(self.interner.name(sym).to_string());
+                            name_idx_of.insert(sym, n);
+                            n
+                        }
+                    };
+                    rid_idx.push(i as u32);
+                    name_idx.push(ni);
+                    iters.push(iter);
+                }
+            }
+        }
+        (names, rid_idx, name_idx, iters)
+    }
+
     /// No-op by construction. Python clears `tensor_info` off the node's
     /// output edges because the edges are per-request objects that carry it;
     /// here outputs are passed into `complete_and_route_batch`, so there is
@@ -2197,6 +2325,16 @@ impl GraphRuntime {
         let mut nested_snapshot: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)> =
             FxHashMap::default();
         let mut cursor = 0usize;
+        // The emit edge of this signal carries its value inline: no staging,
+        // no per-request frame, no reference for the api server to release.
+        // A persisted signal keeps the tensor: the conductor reads it.
+        let inline_sym: Option<Sym> = input
+            .inline_signal
+            .as_deref()
+            .and_then(|s| self.interner.get(s));
+        let inline_on = inline_sym.is_some()
+            && input.inline_values.len() == input.rids.len();
+        let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
 
         for (i, &rid) in input.rids.iter().enumerate() {
             // Slice this rid's uuids back out of the flat, rid-major layout.
@@ -2546,9 +2684,19 @@ impl GraphRuntime {
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
+                let inline_edge = inline_on
+                    && matches!(e.dest, Dest::EmitToClient)
+                    && Some(e.name) == inline_sym
+                    && !e.persist;
+                if inline_edge {
+                    emit_inline.insert(
+                        rid, (e.name, e.modality, input.inline_values[i]),
+                    );
+                }
                 let remote = (e.persist && has_remote)
                     || e.declined_local
                     || (!is_local
+                        && !inline_edge
                         && matches!(e.dest, Dest::External(_) | Dest::EmitToClient));
                 if remote {
                     for t in &e.tensors {
@@ -2603,7 +2751,11 @@ impl GraphRuntime {
                         // then nothing counted it and it goes on the wire.
                         Dest::Local(_) if e.declined_local => 1,
                         Dest::Local(_) | Dest::Empty => 0,
-                        Dest::EmitToClient => 1,
+                        // An inline emit holds no reference: nothing reads
+                        // the tensor on the api server's behalf.
+                        Dest::EmitToClient => i64::from(
+                            !(inline_on && Some(e.name) == inline_sym && !e.persist),
+                        ),
                         // One reference per destination WORKER, minus this
                         // one when the edge was already ingested into a local
                         // graph -- that copy is in local_counts. Python does
@@ -2713,6 +2865,7 @@ impl GraphRuntime {
                 first_tp_rank,
                 speculative,
                 nested: nested_snapshot,
+                emit_inline,
             },
         );
         Ok(out)
@@ -2731,7 +2884,9 @@ impl GraphRuntime {
         loop_names: Vec<Vec<String>>,
     ) -> PyResult<Vec<u32>> {
         // One release for the whole batch; see send_outputs.
-        py.allow_threads(move || -> PyResult<Vec<u32>> {
+        // bookkeeping with the GIL held; the frames go out through send_frames
+        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+        let out = (|| -> PyResult<Vec<u32>> {
             if rids.len() != loop_names.len() {
                 return Err(PyValueError::new_err(
                     "stop_loops_batched: rids and loop_names must be the same length",
@@ -2780,12 +2935,15 @@ impl GraphRuntime {
                         loop_stop_times: stop_times.clone(),
                     }
                     .encode(&self.interner);
-                    self.dispatch(self.interner.name(worker), &bytes)?;
+                    frames.push((self.interner.name(worker).to_string(), bytes));
                 }
                 stopped_rids.push(rid);
             }
             Ok(stopped_rids)
-        })
+        })();
+        let out = out?;
+        self.send_frames(py, frames)?;
+        Ok(out)
     }
 
     /// A peer's STOP_LOOPS landing here.
@@ -2892,7 +3050,13 @@ impl GraphRuntime {
         // Python thread may call into this runtime while a send is in
         // flight: it would get `Already mutably borrowed` rather than block.
         // Only the worker's main loop does today.
-        py.allow_threads(move || -> PyResult<Vec<u32>> {
+        let t_call = std::time::Instant::now();
+        // Encoding and bookkeeping run with the GIL held (tens of
+        // microseconds); the frames go out through send_frames, which
+        // releases the GIL only for a peer at its high-water mark.
+        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+        let t_body = std::time::Instant::now();
+        let out = (|| -> PyResult<Vec<u32>> {
             let request_infos: Vec<(u32, Option<Vec<u8>>)> =
                 info_rids.into_iter().zip(request_infos).collect();
             let new_token_counts: Vec<(u32, Vec<(String, i64)>)> = ntc_rids
@@ -2977,9 +3141,8 @@ impl GraphRuntime {
                     ));
                 }
             }
-            for (worker, bytes) in &frames_out {
-                let name = self.interner.name(*worker).to_string();
-                self.dispatch(&name, bytes)?;
+            for (worker, bytes) in frames_out {
+                frames.push((self.interner.name(worker).to_string(), bytes));
             }
 
             for (rid, signal, modality, refs) in plan.emit {
@@ -3004,7 +3167,50 @@ impl GraphRuntime {
                     }
                     .encode(&self.interner, bk.strings())
                 };
-                self.dispatch("api_server", &bytes)?;
+                frames.push(("api_server".to_string(), bytes));
+            }
+
+            // Inline emits: one RESULT_TOKENS frame per (signal, modality)
+            // per step, with the same per-request bookkeeping as a tensor
+            // emit so the completion report names the signal and its loop
+            // context. Usually one group.
+            if !plan.emit_inline.is_empty() {
+                let mut groups: Vec<((String, String), Vec<(u32, i64)>)> = Vec::new();
+                for (rid, signal, modality, value) in plan.emit_inline {
+                    let key = (signal, modality);
+                    match groups.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, items)) => items.push((rid, value)),
+                        None => groups.push((key, vec![(rid, value)])),
+                    }
+                }
+                for ((signal, modality), items) in groups {
+                    let sig = self.interner.intern(&signal);
+                    let mut request_ids: Vec<String> = Vec::with_capacity(items.len());
+                    let mut values: Vec<i64> = Vec::with_capacity(items.len());
+                    let mut loop_indices = Vec::with_capacity(items.len());
+                    for (rid, value) in items {
+                        let request_id = self.rid_name(rid)?;
+                        let idx = nested.get(&rid).cloned();
+                        if let Some(info) = self.requests[rid as usize].as_mut() {
+                            info.pending.output_signals.push(sig);
+                            if let Some(i) = idx.clone() {
+                                info.pending.set_loop_indices(sig, i);
+                            }
+                        }
+                        request_ids.push(request_id);
+                        values.push(value);
+                        loop_indices.push(idx);
+                    }
+                    let bytes = frames::ResultTokens {
+                        request_ids: &request_ids,
+                        values: &values,
+                        loop_indices: &loop_indices,
+                        signal: &signal,
+                        modality: &modality,
+                    }
+                    .encode(&self.interner);
+                    frames.push(("api_server".to_string(), bytes));
+                }
             }
 
             for (rid, signal, uuids) in plan.persist {
@@ -3027,11 +3233,16 @@ impl GraphRuntime {
                     profiling.get(&rid).and_then(|b| b.as_deref()),
                     spec_flags.get(&rid).copied().unwrap_or(false),
                 )?;
-                self.dispatch("conductor", &bytes)?;
+                frames.push(("conductor".to_string(), bytes));
                 sent_rids.push(rid);
             }
             Ok(sent_rids)
-        })
+        })();
+        send_timing::record_body(t_body);
+        let out = out?;
+        self.send_frames(py, frames)?;
+        send_timing::record_total(t_call);
+        Ok(out)
     }
 
     fn get_loop_stop_times(
@@ -3065,9 +3276,10 @@ impl GraphRuntime {
     /// itself are in `frames.rs` (INPUT_SIGNALS, WORKER_GRAPHS_DONE,
     /// STOP_LOOPS).
     fn take_send_plan(&mut self, completion_id: u64) -> PyResult<SendPlan> {
-        let c = self.completions.remove(&completion_id).ok_or_else(|| {
+        let mut c = self.completions.remove(&completion_id).ok_or_else(|| {
             PyValueError::new_err(format!("unknown completion {completion_id}"))
         })?;
+        let emit_inline = std::mem::take(&mut c.emit_inline);
         let g = self.graphs[c.wg as usize].clone();
         let mut plan = SendPlan {
             partition: c.partition.clone(),
@@ -3113,12 +3325,22 @@ impl GraphRuntime {
             for e in edges {
                 let name = self.interner.name(e.name).to_string();
                 match e.dest {
-                    Dest::EmitToClient => plan.emit.push((
-                        rid,
-                        name.clone(),
-                        self.interner.name(e.modality).to_string(),
-                        e.tensors.clone(),
-                    )),
+                    Dest::EmitToClient => match emit_inline.get(&rid) {
+                        Some(&(sig, modality, value)) if sig == e.name => {
+                            plan.emit_inline.push((
+                                rid,
+                                name.clone(),
+                                self.interner.name(modality).to_string(),
+                                value,
+                            ));
+                        }
+                        _ => plan.emit.push((
+                            rid,
+                            name.clone(),
+                            self.interner.name(e.modality).to_string(),
+                            e.tensors.clone(),
+                        )),
+                    },
                     Dest::External(dest) => {
                         // `Sym::MAX` is the fanout's marker for a destination
                         // with no sharding group, i.e. one no worker runs.
@@ -3342,5 +3564,49 @@ mod tests {
     fn releasing_an_unknown_handle_is_ignored() {
         let mut rids = InternedRids::new();
         assert!(!rids.release(42));
+    }
+}
+
+/// Env-gated timing of `send_outputs` (MSTAR_RUST_SEND_TIMING=1): how long
+/// the GIL-free body takes against the whole call, which also pays for
+/// taking the GIL back. Printed to stderr every 500 calls.
+mod send_timing {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static BODY_NS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    const EVERY: u64 = 500;
+
+    fn enabled() -> bool {
+        *ENABLED.get_or_init(|| {
+            std::env::var("MSTAR_RUST_SEND_TIMING").map(|v| v == "1").unwrap_or(false)
+        })
+    }
+
+    pub fn record_body(t: std::time::Instant) {
+        if enabled() {
+            BODY_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_total(t: std::time::Instant) {
+        if !enabled() {
+            return;
+        }
+        TOTAL_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % EVERY == 0 {
+            let body = BODY_NS.swap(0, Ordering::Relaxed) as f64;
+            let total = TOTAL_NS.swap(0, Ordering::Relaxed) as f64;
+            let per = EVERY as f64 * 1000.0;
+            eprintln!(
+                "mstar_rust send_outputs timing over {} calls: body {:.1} us, \
+                 total {:.1} us, gil reacquire {:.1} us",
+                EVERY, body / per, total / per, (total - body) / per,
+            );
+        }
     }
 }

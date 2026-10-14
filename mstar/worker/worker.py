@@ -206,6 +206,52 @@ class EvictionPolicy(Enum):
     # resource to consult.
 
 
+class _LazyPerRid:
+    """``Worker._rows_to_per_rid`` on demand: the per-rid host dicts are built
+    the first time a consumer reads them. The batched stop check, the row store
+    and the inline emit read the rows directly, so in the common decode step
+    nobody does, and the per-request dicts are never built."""
+
+    __slots__ = ("_host", "_request_ids", "_built")
+
+    def __init__(self, host: dict, request_ids: list[int]):
+        self._host = host
+        self._request_ids = request_ids
+        self._built: dict | None = None
+
+    def _dict(self) -> dict:
+        if self._built is None:
+            self._built = Worker._rows_to_per_rid(self._host, self._request_ids)
+        return self._built
+
+    def get(self, key, default=None):
+        return self._dict().get(key, default)
+
+    def __getitem__(self, key):
+        return self._dict()[key]
+
+    def __contains__(self, key) -> bool:
+        return key in self._dict()
+
+    def __iter__(self):
+        return iter(self._dict())
+
+    def __len__(self) -> int:
+        return len(self._request_ids)
+
+    def __bool__(self) -> bool:
+        return bool(self._request_ids)
+
+    def items(self):
+        return self._dict().items()
+
+    def keys(self):
+        return self._dict().keys()
+
+    def values(self):
+        return self._dict().values()
+
+
 class Worker:
     """
     Real worker that integrates RequestStateManager, EngineManager,
@@ -1562,6 +1608,23 @@ class Worker:
             for edge_name, sbuf in req_info.stream_buffers.items()
         }
 
+    def _stream_consumption_batch(
+        self, rids: list[int],
+    ) -> list[tuple[int, dict[str, int]]]:
+        """``_stream_consumption`` for the rids that have stream buffers at
+        all; the rest would report an empty dict."""
+        infos = self.request_state.per_request_info
+        out: list[tuple[int, dict[str, int]]] = []
+        for rid in rids:
+            req_info = infos.get(rid)
+            if req_info is None or not req_info.stream_buffers:
+                continue
+            out.append((rid, {
+                edge_name: sbuf._consumed
+                for edge_name, sbuf in req_info.stream_buffers.items()
+            }))
+        return out
+
     def _profiling_payloads(self, rids: list[int]) -> ParallelList:
         """rx/tx/timings for each rid's WORKER_GRAPHS_DONE."""
         return ParallelList(rids, [
@@ -2780,7 +2843,7 @@ class Worker:
                 "worker.postprocess.check_stop", _time.perf_counter() - _t_stop,
             )
         # the same host copy, before stops, so a request ending here still indexes its pages
-        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs)
+        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
 
         # Stream-terminated loop: a stream-consuming node inside a loop has no
         # internal stop signal (unlike a self-EOS loop), so when it consumes the
@@ -2835,18 +2898,22 @@ class Worker:
 
         # Ordinary publication precedes stop detection on the GPU thread.
         # Export final-only state now, after the last iteration committed and
-        # before routing reports the completed loop to the conductor.
+        # before routing reports the completed loop to the conductor. The
+        # ordinary publication of a stopping request is finished first, so the
+        # completion carries both, as it did when every step published.
         if stopped_rids:
+            engine.materialize_publish(batch_N.node_batch, stopped_rids)
             engine.finalize_stopped_requests(batch_N.node_batch, stopped_rids)
 
         # CurrentForwardPassInfo also contains publication inherited from peer
         # ranks. Buffer only what this worker produced for the conductor.
-        for rid in batch_N.node_batch.request_ids:
-            self.request_state.buffer_publish_info(
-                rid,
-                batch_N.partition,
-                batch_N.node_batch.resource_publish_info.get(rid, {}),
-            )
+        buffered_publish: set[int] = set()
+        for rid, published in batch_N.node_batch.resource_publish_info.items():
+            if published:
+                self.request_state.buffer_publish_info(
+                    rid, batch_N.partition, published,
+                )
+                buffered_publish.add(rid)
 
         _pp_stage("stop_loops")
         if self.enable_nvtx:
@@ -2869,13 +2936,24 @@ class Worker:
         # Pass the stop check's host copies so a host-memory transport needn't
         # copy the rows again. They are views of pinned buffers the next step
         # reuses; safe because the sends below are their last reader.
-        stored = self.tensor_manager.store_and_return_tensor_info_batch(
-            rids, outputs, signals,
-            node_name=batch_N.node_name,
-            graph_walk=batch_N.graph_walk,
-            skip_cuda_sync=True,
-            cpu_tensors=cpu_outputs,
-        )
+        # Row views of one batch clone (a decode step) are described from one
+        # row; anything else goes through the general per-tensor path.
+        stored = None
+        if outputs.row_views and outputs.row_request_ids is not None:
+            stored = self.tensor_manager.store_row_outputs_batch(
+                rids, outputs, signals, outputs.row_views, outputs.row_request_ids,
+                node_name=batch_N.node_name,
+                graph_walk=batch_N.graph_walk,
+                host_rows=host_rows,
+            )
+        if stored is None:
+            stored = self.tensor_manager.store_and_return_tensor_info_batch(
+                rids, outputs, signals,
+                node_name=batch_N.node_name,
+                graph_walk=batch_N.graph_walk,
+                skip_cuda_sync=True,
+                cpu_tensors=cpu_outputs,
+            )
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
         signal_idxs = stored.signal_idxs
@@ -2894,6 +2972,9 @@ class Worker:
 
         # The graph runtime's own share of postprocess: the routing call.
         _t_route = _time.perf_counter() if self._phase_period else 0.0
+        inline_signal, inline_values = self._inline_emit_values(
+            engine, batch_N, host_rows, rids, signals,
+        )
         route_output = self._graph_runtime.complete_and_route_batch(
             RouteInput(
                 partition=batch_N.partition,
@@ -2906,6 +2987,8 @@ class Worker:
                 ),
                 tensors=flat_uuids,
                 num_tensors=num_tensors,
+                inline_signal=inline_signal,
+                inline_values=inline_values,
             ),
         )
         if self._phase_period:
@@ -2913,11 +2996,9 @@ class Worker:
                 "worker.postprocess.route", _time.perf_counter() - _t_route,
             )
 
-        per_request_info = batch_N.node_batch.per_request_info
-        for rid, new_iters in self._graph_runtime.get_dynamic_loop_iters(
-            list(per_request_info), partition=batch_N.partition,
-        ):
-            per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
+        self._graph_runtime.update_dynamic_loop_iters(
+            batch_N.node_batch.per_request_info, batch_N.partition,
+        )
 
         # Normally empty: cleanup_consumed_inputs ran above and took them. Not
         # empty if a completion ever precedes it, and then nobody else will.
@@ -2984,6 +3065,31 @@ class Worker:
             send_rids if needs_info is None
             else [rid for rid in send_rids if rid in needs_info]
         )
+        # A frame to a peer or the conductor carries this step's publication:
+        # finish the snapshot for those rids (the stopped ones already are).
+        # The snapshot pins the lengths and page counts of step N, so the
+        # commit of N+1 that may have landed since does not leak in; only a
+        # reset or fork in between moves a stream past its snapshot, and the
+        # KV manager publishes such a stream as it stands (its generation
+        # says so).
+        if info_rids:
+            engine.materialize_publish(batch_N.node_batch, info_rids)
+            for rid in info_rids:
+                if rid in buffered_publish:
+                    continue
+                published = batch_N.node_batch.resource_publish_info.get(rid)
+                if published:
+                    self.request_state.buffer_publish_info(
+                        rid, batch_N.partition, published,
+                    )
+                    buffered_publish.add(rid)
+        # Only the rids with something to report cross: a decode step has no
+        # new-token counts (the inline token is not counted) and no stream
+        # buffers, and an empty entry per rid cost a dict each to build and to
+        # extract on the runtime side. A rid left out gets nothing added,
+        # which is what an empty entry did.
+        ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
+        consumed = self._stream_consumption_batch(send_rids)
         send_input = SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
@@ -2994,12 +3100,10 @@ class Worker:
                 ],
             ),
             new_token_counts=ParallelList(
-                send_rids,
-                [new_token_counts.get(rid, {}) for rid in send_rids],
+                ntc_rids, [new_token_counts[rid] for rid in ntc_rids],
             ),
             stream_tokens_consumed=ParallelList(
-                send_rids,
-                [self._stream_consumption(rid) for rid in send_rids],
+                [rid for rid, _ in consumed], [c for _, c in consumed],
             ),
             profiling=self._profiling_payloads(send_rids) if self.enable_prof
             else None,
@@ -3030,6 +3134,37 @@ class Worker:
         _pp_stage("send_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
+
+    def _inline_emit_values(
+        self, engine, batch_N: PendingBatch, host_rows: "HostRows | None",
+        rids: list[int], signals,
+    ) -> tuple[str | None, list[int]]:
+        """The values of a client signal that can ride inline this step.
+
+        Taken off the stop check's host copy, one ``tolist`` for the batch.
+        Every rid must have a row, or the step keeps the tensor path for the
+        whole batch: the runtime applies the values positionally.
+        """
+        if host_rows is None or not self._graph_runtime.supports_inline_emit:
+            return None, []
+        candidates = engine.inline_client_signals(
+            batch_N.node_name, batch_N.graph_walk,
+        )
+        if not candidates:
+            return None, []
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        for signal, buffer_name in candidates.items():
+            if signal not in signals:
+                continue
+            buf = host_rows.buffers.get(buffer_name)
+            if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
+                continue
+            values = buf.reshape(buf.shape[0], -1)[:, 0].tolist()
+            try:
+                return signal, [values[row_of[rid]] for rid in rids]
+            except (KeyError, IndexError):
+                return None, []
+        return None, []
 
     def _get_pinned_d2h_buffer(
         self,
@@ -3162,7 +3297,7 @@ class Worker:
         if outputs.check_stop_buffers is not None and row_rids is not None:
             host = self._d2h_batched(outputs.check_stop_buffers, side)
             return (
-                Worker._rows_to_per_rid(host, row_rids),
+                _LazyPerRid(host, row_rids),
                 HostRows(tuple(row_rids), host),
             )
 
