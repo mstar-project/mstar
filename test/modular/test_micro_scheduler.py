@@ -1700,7 +1700,7 @@ class _ChunkingEngine(_SizedEngine):
     """A 4-token budget; ``p0``'s walk can be chunked and it is 10 tokens long."""
 
     def __init__(self, cached=None, **kw):
-        super().__init__(too_big=(), **kw)
+        super().__init__(unready=(), **kw)
         self.cached = cached or {}
 
     def get_max_batch_tokens(self, node_name, graph_walk):
