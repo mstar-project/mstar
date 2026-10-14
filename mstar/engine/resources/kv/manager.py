@@ -3,7 +3,6 @@ import os
 import threading
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 
@@ -34,7 +33,7 @@ from mstar.engine.resources.kv.plan import (
     group_by_plan_label,
 )
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
-from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
+from mstar.engine.resources.kv.transfer import KVTransferInfo, KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
     ADMIT_OK,
     AdmitFailedReason,
@@ -240,7 +239,7 @@ LabelToStream = dict[str, CacheStream]
 class KVSequenceInfo:
     seq_len: int
     # for tracking KV cache
-    latest_kv_transfer_info: Any
+    latest_kv_transfer_info: KVTransferInfo | None
     page_indices: list[int] = field(default_factory=list)
     reset_generation: int | None = None
 

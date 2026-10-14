@@ -5,10 +5,14 @@ The codec is type-driven, so a field whose declared type lies about its value
 dict keys, sets, abstract field types) is exactly where it breaks. Each of
 those has a test.
 """
+import datetime
+import os
 import sys
 
 sys.path.insert(0, ".")
 
+import msgpack
+import numpy as np
 import pytest
 import torch
 
@@ -31,6 +35,18 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_unpickling(monkeypatch):
+    """Every round trip in this module must decode without pickle."""
+    import pickle
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the wire codec unpickled a value")
+
+    for name in ("loads", "load", "Unpickler"):
+        monkeypatch.setattr(pickle, name, refuse)
 
 
 def _info(uuid="u-1", dtype=torch.bfloat16) -> TensorPointerInfo:
@@ -151,11 +167,8 @@ def test_polymorphic_body_dispatch():
 
 
 def test_unregistered_payloads_still_round_trip():
-    """The codec has to be total. A communicator carries whatever a caller
-    hands it, and raising on some payloads turns into a hang at the receiver:
-    the send dies and the peer waits forever for a frame that never came.
-    Unregistered values fall back to pickle inside the frame — lossless,
-    including tuple-ness, which a plain msgpack fallback would flatten."""
+    """Supported unregistered values retain their types in a data envelope,
+    including tuple-ness, which plain msgpack would flatten."""
     for payload in [
         "first",
         ("done", 42),
@@ -373,11 +386,11 @@ def test_untyped_model_kwargs_round_trip_exactly():
 
 
 def test_json_shaped_untyped_values_stay_plain_msgpack():
-    """Only what msgpack cannot carry exactly is pickled: plain data stays
+    """Only what msgpack cannot carry exactly needs extensions: plain data stays
     readable by a non-Python peer."""
     import msgpack
 
-    from mstar.communication.wire import PICKLED_EXT
+    from mstar.communication.wire import DATA_EXT
 
     def body_of(frame):
         # [envelope tag, {..., "body": [body tag, {fields}]}]
@@ -388,8 +401,8 @@ def test_json_shaped_untyped_values_stay_plain_msgpack():
     assert body["model_kwargs"] == {"steps": 30, "cfg": [1.5, 2.0]}
 
     body = body_of(encode(_conductor_request({"size": (1, 2)})))
-    assert isinstance(body["model_kwargs"], msgpack.ExtType)
-    assert body["model_kwargs"].code == PICKLED_EXT
+    assert isinstance(body["model_kwargs"]["size"], msgpack.ExtType)
+    assert body["model_kwargs"]["size"].code == DATA_EXT
 
 
 def test_one_undecodable_frame_does_not_lose_the_batch():
@@ -517,3 +530,216 @@ def test_a_polymorphic_field_keeps_its_tag_when_encoded_alone():
     )
     assert alone == in_place
     assert alone["kv"][0] == tag, "the subclass tag has to survive"
+
+
+@pytest.mark.parametrize("value", [
+    torch.Size([2, 3]),
+    torch.Size([]),
+    torch.Size([-1, 3]),
+    frozenset({1, (2, 3)}),
+    {(1, "x"): {"nested": [(1, 2), {3, 4}]}},
+    torch.int64,
+])
+def test_dynamic_containers_preserve_their_types(value):
+    got = decode(encode(value))
+    assert type(got) is type(value)
+    assert got == value
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA IPC needs a GPU")
+def test_real_cuda_ipc_transfer_descriptor_round_trips():
+    import subprocess
+
+    from mstar.engine.resources.kv.cache import KVCache
+    from mstar.engine.resources.kv.config import PagedKVConfig
+    from mstar.engine.resources.kv.transfer import CudaIpcKVTransferEngine
+
+    config = PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8,
+        max_seq_len=16, max_num_pages=4, page_size=8,
+    )
+    cache = KVCache(config, torch.device("cuda:0"))
+    cache.chunk_view(layer_idx=0, page_idx=1, token_start=0, token_end=8).fill_(3.0)
+    expected = cache.chunk_view(layer_idx=0, page_idx=1, token_start=0, token_end=8).float().sum().item()
+    transfer = CudaIpcKVTransferEngine(cache)
+    try:
+        info = transfer.get_kv_transfer_info()
+        frame = encode(_conductor_request({"transfer": info}))
+        assert decode(frame).body.model_kwargs["transfer"] == info
+        # A real CUDA IPC open needs a second process.
+        pythonpath = os.pathsep.join([".", os.environ.get("PYTHONPATH", "")])
+        reader = subprocess.run(
+            [sys.executable, "-c", _CUDA_IPC_READER], input=frame, capture_output=True,
+            check=False, timeout=120, env={**os.environ, "PYTHONPATH": pythonpath},
+        )
+        assert reader.returncode == 0, reader.stderr.decode()[-2000:]
+        assert float(reader.stdout.decode().split()[-1]) == expected
+    finally:
+        transfer.shutdown()
+
+
+_CUDA_IPC_READER = """
+import sys, torch
+import mstar.communication.wire_types
+from mstar.communication.wire import decode
+from mstar.engine.resources.kv.cache import KVCache
+from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.transfer import CudaIpcKVTransferEngine, KVReadInfo
+
+info = decode(sys.stdin.buffer.read()).body.model_kwargs["transfer"]
+config = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=16, max_num_pages=4, page_size=8)
+cache = KVCache(config, torch.device("cuda:0"))
+engine = CudaIpcKVTransferEngine(cache)
+read = KVReadInfo(layer_idx=0, local_page_idx=2, remote_page_idx=1, token_start=0, token_end=8)
+engine.read_batched_async(info, [read])
+engine.shutdown()
+torch.cuda.synchronize()
+print(cache.chunk_view(layer_idx=0, page_idx=2, token_start=0, token_end=8).float().sum().item())
+"""
+
+
+@pytest.mark.parametrize("dtype", ["int16", ">f4", "complex128", "bool", "S3", "U3", "datetime64[ns]"])
+@pytest.mark.parametrize("shape", [(), (0,), (2, 3)])
+def test_numpy_arrays_preserve_dtype_shape_and_values(dtype, shape):
+    import numpy as np
+
+    value = np.ones(shape, dtype=dtype)
+    got = decode(encode(value))
+    assert type(got) is np.ndarray
+    assert got.dtype == value.dtype
+    assert got.shape == value.shape
+    np.testing.assert_array_equal(got, value)
+
+
+def test_noncontiguous_numpy_array_and_numpy_scalar():
+    import numpy as np
+
+    value = np.arange(24).reshape(4, 6).T[::2]
+    np.testing.assert_array_equal(decode(encode(value)), value)
+    value = np.float32(1.5)
+    got = decode(encode(value))
+    assert type(got) is np.float32
+    assert got == value
+
+
+@pytest.mark.parametrize("dtype", [
+    [("x", "i4"), ("y", "f8")],                           # structured
+    [("x", np.dtype("i4", metadata={"unit": "m"}))],      # nested field metadata
+    np.dtype("f4", metadata={"unit": "m"}),                # metadata
+    "V0",                                                  # zero itemsize
+])
+def test_numpy_dtypes_that_cannot_round_trip_are_refused_at_send(dtype):
+    """A refused value fails at the sender; one the receiver can't rebuild would
+    instead drop the whole frame and leave its request waiting."""
+    with pytest.raises(WireError):
+        encode(np.zeros(2, dtype=np.dtype(dtype)))
+
+
+# --- values a /generate/ws client or warmup YAML can produce ------------------
+
+@pytest.mark.parametrize("value", [
+    msgpack.Timestamp(1_700_000_000, 123),
+    msgpack.ExtType(5, b"client bytes"),
+    datetime.date(2024, 1, 2),
+    datetime.datetime(2024, 1, 2, 3, 4, 5, 6),
+    datetime.datetime(2024, 1, 2, 3, 4, 5, tzinfo=datetime.timezone(datetime.timedelta(hours=-7))),
+])
+def test_client_and_yaml_values_round_trip(value):
+    got = decode(encode(_conductor_request({"v": value}))).body.model_kwargs["v"]
+    assert type(got) is type(value)
+    assert got == value
+
+
+@pytest.mark.parametrize("code", [80, 81])
+def test_client_extensions_with_wire_codes_stay_opaque(code):
+    """A client's own ext 80 or 81 is data; it is never read as legacy pickle or
+    as one of the wire's own data extensions."""
+    value = msgpack.ExtType(code, b"client bytes")
+    assert decode(encode(_conductor_request({"v": value}))).body.model_kwargs["v"] == value
+
+
+def test_warmup_yaml_dates_round_trip():
+    import yaml
+
+    kwargs = yaml.safe_load("day: 2024-01-02\nat: 2024-01-02 03:04:05+07:00\n")
+    assert decode(encode(_conductor_request(kwargs))).body.model_kwargs == kwargs
+
+
+def test_datetime_with_zone_rules_is_refused():
+    from zoneinfo import ZoneInfo
+
+    value = datetime.datetime(2024, 1, 2, tzinfo=ZoneInfo("America/Los_Angeles"))
+    with pytest.raises(WireError, match="fixed-offset"):
+        encode(_conductor_request({"v": value}))
+
+
+def test_kv_transfer_descriptors_round_trip():
+    from mstar.engine.resources.kv.config import KVLayout
+    from mstar.engine.resources.kv.transfer import (
+        MooncakeKVTransferInfo,
+        ShmKVSnapshotChunk,
+        ShmKVTransferInfo,
+    )
+
+    layout = next(iter(KVLayout))
+    for info in (
+        ShmKVTransferInfo(path="/dev/shm/kv", page_indices=(1, 2), layout=layout,
+                          chunks=(ShmKVSnapshotChunk(path="/dev/shm/c0", start_len=0, end_len=8, page_indices=(1,)),)),
+        MooncakeKVTransferInfo(entity_id="w0", session_id="h:1", data_ptr=0xDEAD, layout=layout),
+    ):
+        assert decode(encode(_conductor_request({"kv": info}))).body.model_kwargs["kv"] == info
+
+
+def test_auto_tagged_messages_stay_self_describing(monkeypatch):
+    """The first send of an unregistered mstar dataclass auto-registers its tag;
+    a later send must still decode on a peer that never saw the class."""
+    import dataclasses
+
+    from mstar.communication import wire
+    from mstar.engine.resources.kv.transfer import KVReadInfo
+
+    msg = KVReadInfo(**{f.name: 0 for f in dataclasses.fields(KVReadInfo)})
+    encode(msg)
+    frame = encode(msg)
+    assert msgpack.unpackb(frame, raw=False, strict_map_key=False)[0] == wire.DATA
+    monkeypatch.delitem(wire._TAG_TO_TYPE, wire._TYPE_TO_TAG[KVReadInfo])
+    monkeypatch.delitem(wire._TYPE_TO_TAG, KVReadInfo)
+    assert decode(frame) == msg
+
+
+def test_per_pass_kv_publish_info_takes_the_typed_path():
+    """The conductor re-sends KV publish info in every INPUT_SIGNALS; its
+    transfer descriptor must travel as [tag, fields], not a data extension."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.engine.resources.kv.config import KVLayout
+    from mstar.engine.resources.kv.manager import KVSequenceInfo, PublishedKVInfo
+    from mstar.engine.resources.kv.transfer import MooncakeKVTransferInfo, ShmKVTransferInfo
+    from mstar.utils.ipc_format import InputSignals, WorkerMessage, WorkerMessageType
+
+    def extensions(value):
+        if isinstance(value, msgpack.ExtType):
+            return 1
+        if isinstance(value, list):
+            return sum(extensions(v) for v in value)
+        if isinstance(value, dict):
+            return sum(extensions(k) + extensions(v) for k, v in value.items())
+        return 0
+
+    layout = next(iter(KVLayout))
+    for info in (
+        ShmKVTransferInfo(path="/dev/shm/kv", page_indices=(1, 2), layout=layout),
+        MooncakeKVTransferInfo(entity_id="w0", session_id="h:1", data_ptr=0xDEAD, layout=layout),
+        None,
+    ):
+        seq = KVSequenceInfo(seq_len=4, latest_kv_transfer_info=info, page_indices=[1, 2])
+        msg = WorkerMessage(
+            message_type=WorkerMessageType.INPUT_SIGNALS,
+            body=InputSignals(request_id="r", inputs=[], request_info=CurrentForwardPassInfo(
+                request_id="r", graph_walk="decode", fwd_index=1, random_seed=0, max_tokens=8,
+                resource_publish_info={"kv": PublishedKVInfo(info={0: {"kv": seq}})},
+            )),
+        )
+        frame = encode(msg)
+        assert extensions(msgpack.unpackb(frame, raw=False, strict_map_key=False)) == 0
+        got = decode(frame).body.request_info.resource_publish_info["kv"].info[0]["kv"]
+        assert got == seq

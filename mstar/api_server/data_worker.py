@@ -551,6 +551,8 @@ class PreprocessWorkerThread:
 
         self.request_model_kwargs[input.request_id] = model_kwargs
         self.request_output_state[input.request_id] = RequestOutputState()
+        preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
+        conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
             message_type=ConductorMessageType.NEW_REQUEST,
             body=NewRequestConductor(
@@ -559,7 +561,7 @@ class PreprocessWorkerThread:
                 initial_input_modalities=input.input_modalities,
                 initial_output_modalities=input.output_modalities,
                 input_metadata=input_metadata,
-                model_kwargs=model_kwargs
+                model_kwargs=conductor_kwargs
             ),
         )
         self.communicator.send("conductor", msg)

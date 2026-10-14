@@ -42,12 +42,11 @@ Communication
      - How messages are encoded on every communicator edge (see
        :func:`mstar.communication.codec.default_codec`). ``msgpack``: the
        typed encoding in :mod:`mstar.communication.wire`, language-neutral
-       so an edge can terminate in a Rust process. ``pickle``: the old
-       Python-only wire, kept for bisecting a wire problem. Both ends of an
-       edge must agree, so this is all-or-nothing for a mesh -- one process
-       set differently cannot talk to its peers. ``pickle`` is incompatible
-       with the Rust graph runtime, which builds its frames as typed
-       msgpack; that pairing fails at startup rather than mixing wires.
+       so an edge can terminate in a Rust process. ``pickle`` is no longer
+       supported and fails at startup. Loosely typed metadata uses data-only
+       extensions instead of pickle. Upgrade all processes in a deployment
+       together: older processes cannot decode the new extensions, and
+       updated processes reject legacy pickle messages and metadata.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a
