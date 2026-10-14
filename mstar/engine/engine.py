@@ -940,9 +940,10 @@ class Engine:
                 # admit/plan/commit assume the whole batch reaches the forward
                 # in order; an unbatchable walk with >1 request can't, so each
                 # request runs its own full cycle and merges.
-                if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
-                    # per-request outputs: the step cannot stay on the rows
+                if not batch.running_batched and lease is None:
+                    # the unbatched forward has per-request outputs: no rows to stay on
                     batch.rows_only = False
+                if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)

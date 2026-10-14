@@ -1,5 +1,6 @@
 """A rows-only step runs only a submodule's batch tail, and only when it has
-one; a step that falls back to the per-request path is not rows-only."""
+one; a step on the unbatched forward (per request or a single row) is not
+rows-only."""
 import threading
 from types import SimpleNamespace
 
@@ -55,7 +56,8 @@ def test_rows_only_runs_the_batch_tail_only_when_overridden(sub_cls):
     assert len(eng.per_request_tails) == 1
 
 
-def test_the_per_request_fallback_clears_rows_only():
+@pytest.mark.parametrize("rids", [[1, 2], [1]])
+def test_an_unbatched_step_clears_rows_only(rids):
     eng = _engine(_Plain.__new__(_Plain))
     eng._enable_nvtx = False
     eng._enable_profile = False
@@ -69,8 +71,9 @@ def test_the_per_request_fallback_clears_rows_only():
         return BatchedModelOutput()
 
     eng._exec_per_request = _per_request
+    eng._exec_single = _per_request
     batch = SimpleNamespace(
-        node_name="llm", request_ids=[1, 2], rows_only=True, running_batched=False,
+        node_name="llm", request_ids=rids, rows_only=True, running_batched=False,
         step_context=SimpleNamespace(slot_lease=None, graph_walk="decode"),
         exec_timings=SimpleNamespace(start=None), admit_error=None,
         outputs_ready=threading.Event(), release_waiters=lambda: None,
