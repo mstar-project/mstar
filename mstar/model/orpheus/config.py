@@ -48,9 +48,11 @@ class OrpheusModelConfig:
     # sides: each chunk decodes its frames with up to ``left_context`` earlier
     # and ``right_context`` later ones and emits only its own. The last
     # ``right_context`` frames of a chunk are emitted by the next one, and the
-    # final flush decodes the real tail of the stream. The first audio leaves
-    # after ``first_chunk`` frames; deployment YAML ``model_kwargs`` override.
-    snac_first_chunk_frames: int = 4
+    # final flush decodes the real tail of the stream. Chunk k takes
+    # ``snac_chunk_schedule[k]`` new frames (``snac_chunk_frames`` after it),
+    # so the first audio leaves after ``snac_chunk_schedule[0]`` frames.
+    # Deployment YAML ``model_kwargs`` override these.
+    snac_chunk_schedule: tuple[int, ...] = (4,)
     snac_chunk_frames: int = 4
     snac_left_context_frames: int = 3
     snac_right_context_frames: int = 2
@@ -76,10 +78,13 @@ class OrpheusModelConfig:
         if self.snac_chunk_frames <= 0 or self.snac_left_context_frames < 0 \
                 or self.snac_right_context_frames < 0:
             raise ValueError("snac_chunk_frames must be positive and SNAC context frames non-negative")
-        if self.snac_first_chunk_frames <= self.snac_right_context_frames:
+        self.snac_chunk_schedule = tuple(int(n) for n in self.snac_chunk_schedule)
+        if any(n <= 0 for n in self.snac_chunk_schedule):
+            raise ValueError("snac_chunk_schedule sizes must be positive")
+        if (self.snac_chunk_schedule or (self.snac_chunk_frames,))[0] <= self.snac_right_context_frames:
             raise ValueError(
-                "snac_first_chunk_frames must exceed snac_right_context_frames, "
-                "or the first chunk emits no audio"
+                "the first SNAC chunk must exceed snac_right_context_frames, "
+                "or it emits no audio"
             )
 
     def snac_chunk_policy(self) -> ScheduledLeftContextChunkPolicy:
@@ -90,7 +95,7 @@ class OrpheusModelConfig:
         """
         tpf = self.tokens_per_frame
         return ScheduledLeftContextChunkPolicy(
-            schedule=(self.snac_first_chunk_frames * tpf,),
+            schedule=tuple(n * tpf for n in self.snac_chunk_schedule),
             chunk=self.snac_chunk_frames * tpf,
             left_context=(self.snac_left_context_frames + self.snac_right_context_frames) * tpf,
         )
@@ -98,11 +103,13 @@ class OrpheusModelConfig:
     def snac_window_frames(self) -> list[int]:
         """Frames in each non-final window of a stream, one entry per distinct size."""
         context = self.snac_left_context_frames + self.snac_right_context_frames
-        windows, delivered, new = [], 0, self.snac_first_chunk_frames
-        while True:
-            window = min(context, delivered) + new
-            if window in windows:
-                return windows
-            windows.append(window)
+        windows, delivered = [], 0
+        for new in self.snac_chunk_schedule:
+            windows.append(min(context, delivered) + new)
             delivered += new
-            new = self.snac_chunk_frames
+        while True:
+            window = min(context, delivered) + self.snac_chunk_frames
+            if window in windows[len(self.snac_chunk_schedule):]:
+                return sorted(set(windows))
+            windows.append(window)
+            delivered += self.snac_chunk_frames

@@ -72,7 +72,7 @@ class OrpheusModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
-        snac_first_chunk_frames: int | None = None,
+        snac_chunk_schedule: list[int] | None = None,
         snac_chunk_frames: int | None = None,
         snac_left_context_frames: int | None = None,
         snac_right_context_frames: int | None = None,
@@ -81,13 +81,13 @@ class OrpheusModel(Model):
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
         snac_overrides = {
-            "snac_first_chunk_frames": snac_first_chunk_frames,
+            "snac_chunk_schedule": snac_chunk_schedule,
             "snac_chunk_frames": snac_chunk_frames,
             "snac_left_context_frames": snac_left_context_frames,
             "snac_right_context_frames": snac_right_context_frames,
         }
         self.config = OrpheusModelConfig(
-            **{k: int(v) for k, v in snac_overrides.items() if v is not None}
+            **{k: v for k, v in snac_overrides.items() if v is not None}
         )
 
         tokenizer_source = _resolve_local_hf_snapshot(
