@@ -77,8 +77,9 @@ logger = logging.getLogger(__name__)
 
 class LLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
-    # past 16 for the mixed walk, whose decode rows ride in these captures
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # sized for the mixed walk, whose decode rows ride in these captures: a
+    # mixed step capped below the decode batch splits it
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64, 128]
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).

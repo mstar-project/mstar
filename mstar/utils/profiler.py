@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections import defaultdict
 from contextlib import contextmanager
+from time import perf_counter  # noqa: F401  (re-exported for phase timers)
 from typing import Iterator
 
 import torch
@@ -26,9 +28,25 @@ def nvtx_enabled(
     return device is not None and device.type == "cuda"
 
 
+# The walk label of the step this thread is working on. A sample recorded
+# under one is kept twice, as ``name`` and as ``name.walk_<label>``, so a mixed
+# step's cost is not averaged into a decode step's.
+_PHASE_LABEL = threading.local()
+
+
+def set_phase_label(label: str | None) -> None:
+    """Tag this thread's later samples with ``label`` (None: untagged)."""
+    _PHASE_LABEL.value = label
+
+
 def phase_record(name: str, dt: float) -> None:
     if PHASE_PERIOD:
         _PHASE_BUF[name].append(dt)
+        label = getattr(_PHASE_LABEL, "value", None)
+        if label is not None:
+            # a count keeps its trailing '#', which the flush reads
+            count = "#" if name.endswith("#") else ""
+            _PHASE_BUF[f"{name.removesuffix('#')}.walk_{label}{count}"].append(dt)
 
 
 def phase_buffer() -> dict[str, list[float]]:

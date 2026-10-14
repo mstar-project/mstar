@@ -971,12 +971,19 @@ class CudaGraphRunner:
         earlier hands the main thread a GIL the GPU thread still needs. Only
         `graph.replay()` below drops it in C++.
         """
+        t0 = profiler.perf_counter() if profiler.PHASE_PERIOD else 0.0
         self._stage(lease, preprocessed)
         if plan_done_event is not None:
             torch.cuda.default_stream(self._device).wait_event(plan_done_event)
         if launch_started_event is not None:
             launch_started_event.set()
-        return self._replay(lease)
+        if not profiler.PHASE_PERIOD:
+            return self._replay(lease)
+        t1 = profiler.perf_counter()
+        profiler.phase_record("engine.forward.stage", t1 - t0)
+        out = self._replay(lease)
+        profiler.phase_record("engine.forward.replay", profiler.perf_counter() - t1)
+        return out
 
     def release(self, lease: SlotLease, real_bs: int) -> None:
         """Return the padding rows to their at-rest state after a step.

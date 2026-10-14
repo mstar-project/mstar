@@ -165,7 +165,12 @@ class PackedCudaGraphConfig(CudaGraphConfig):
         return CudaGraphConfigType.FLASH_INFER_PACKED
 
     def get_total_tokens(self, bs: int) -> list[int]:
-        return [n * self.total_tokens_multiplier for n in self.capture_token_lengths]
+        # every real row carries a token, so a bucket with fewer tokens than
+        # rows could never serve a step; capturing it would give rows of none
+        return [
+            n * self.total_tokens_multiplier for n in self.capture_token_lengths
+            if n >= bs
+        ]
 
     def get_node_inputs(self, bs: int, num_tokens: int):
         # ``num_tokens`` is the bucket's plan tokens; the rows get input tokens

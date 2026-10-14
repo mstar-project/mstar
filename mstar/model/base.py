@@ -1,4 +1,5 @@
 import itertools
+import os
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
@@ -457,6 +458,9 @@ class Model(ABC):
 
     def combined_walk_of(self) -> dict[tuple[str, str], str]:
         """``(node, real walk) -> combined walk``, validated."""
+        # MSTAR_COMBINED_WALKS=0: run every walk on its own (an A/B control)
+        if os.environ.get("MSTAR_COMBINED_WALKS", "1") == "0":
+            return {}
         walks = self.get_graph_walk_graphs()
         out: dict[tuple[str, str], str] = {}
         for node, combined in self.get_combined_graph_walks().items():
