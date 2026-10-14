@@ -304,15 +304,6 @@ Worker scheduling
        ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
        former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
        Qwen3.5 alone.
-   * - ``MSTAR_EARLY_SPEC``
-     - ``1``
-     - Build and pre-plan step N+2 while N+1 runs, between the stop and
-       routing halves of step N's post-processing, so the pre-plan overlaps
-       work the main thread does anyway instead of the next launch. ``0``
-       builds each speculation at the top of the next iteration, after the
-       whole post-processing, which left the plan thread idle during it.
-       Non-parallel (TP1) nodes only; a tensor-parallel node keeps the old
-       order so the followers see heads in the order they settle them.
    * - ``MSTAR_LAZY_PUBLISH``
      - ``1``
      - Publish resource state (KV pages, positions) only for the requests
