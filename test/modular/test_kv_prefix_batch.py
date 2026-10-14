@@ -49,7 +49,7 @@ def _run(batched: bool):
         rows = HostRows(request_ids=tuple(rids), buffers={
             H.TENSOR: torch.tensor([[sampled[r]] for r in rids]),
         })
-        kv.extend_prefix_chains_batch(rids, H.NODE, H.WALK, rows)
+        kv.extend_prefix_chains_batch(rids, H.NODE, lambda _r: H.WALK, rows)
     else:
         for rid in rids:
             kv.extend_prefix_chain(rid, H.NODE, H.WALK, {H.TENSOR: [torch.tensor([sampled[rid]])]})
@@ -62,7 +62,7 @@ def _run(batched: bool):
             rows = HostRows(request_ids=tuple(reversed(rids)), buffers={
                 H.TENSOR: torch.tensor([[tokens[r]] for r in reversed(rids)]),
             })
-            kv.extend_prefix_chains_batch(rids, H.NODE, H.WALK, rows)
+            kv.extend_prefix_chains_batch(rids, H.NODE, lambda _r: H.WALK, rows)
         else:
             for rid in rids:
                 kv.extend_prefix_chain(rid, H.NODE, H.WALK, {H.TENSOR: [torch.tensor([tokens[rid]])]})
@@ -84,9 +84,9 @@ def test_batched_extension_skips_rows_it_does_not_have():
     H._step(kv, "r0", len(prompt))
     before = _chain_state(kv, "r0")
     # no buffer under the keyed tensor name, and a request with no row
-    kv.extend_prefix_chains_batch(["r0", "ghost"], H.NODE, H.WALK,
+    kv.extend_prefix_chains_batch(["r0", "ghost"], H.NODE, lambda _r: H.WALK,
                                   HostRows(request_ids=("r0",), buffers={"other": torch.tensor([[1]])}))
-    kv.extend_prefix_chains_batch(["r0"], H.NODE, H.WALK,
+    kv.extend_prefix_chains_batch(["r0"], H.NODE, lambda _r: H.WALK,
                                   HostRows(request_ids=("r1",), buffers={H.TENSOR: torch.tensor([[1]])}))
     assert _chain_state(kv, "r0") == before
 
@@ -105,5 +105,27 @@ def test_runner_dispatch_falls_back_per_request():
     runner = StepRunner.__new__(StepRunner)
     runner._resources = {"a": _Batch(), "b": _PerRid()}
     outputs = {"r0": {"x": 1}, "r1": None}
-    runner.extend_prefix_chains_batch(["r0", "r1"], "n", "w", HostRows((), {}), outputs, keys=["a", "b"])
+    runner.extend_prefix_chains_batch(
+        ["r0", "r1"], "n", lambda _r: "w", HostRows((), {}), outputs, keys=["a", "b"],
+    )
     assert calls == [("batch", ("r0", "r1")), ("rid", "r0", {"x": 1})]
+
+
+def test_runner_dispatch_keys_each_row_under_its_own_walk():
+    """A step mixing walks used to skip the batch form entirely and key row by
+    row; now the walk is a per-rid lookup on both paths, so a mixed step takes
+    the batched call and each row still gets its own walk."""
+    seen = []
+
+    class _PerRid:
+        def extend_prefix_chain(self, rid, node, walk, outputs):
+            seen.append((rid, walk))
+
+    runner = StepRunner.__new__(StepRunner)
+    runner._resources = {"b": _PerRid()}
+    walks = {"r0": "prefill_text", "r1": "decode"}
+    runner.extend_prefix_chains_batch(
+        ["r0", "r1"], "n", walks.__getitem__, HostRows((), {}),
+        {"r0": {"x": 1}, "r1": {"y": 2}}, keys=["b"],
+    )
+    assert seen == [("r0", "prefill_text"), ("r1", "decode")]

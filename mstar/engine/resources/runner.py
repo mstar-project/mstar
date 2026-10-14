@@ -8,7 +8,7 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from time import perf_counter
 from typing import Any
 
@@ -168,21 +168,25 @@ class StepRunner:
             )
 
     def extend_prefix_chains_batch(
-        self, request_ids: list[str], node_name: str, graph_walk: str,
-        host_rows, outputs, keys: list[str],
+        self, request_ids: list[str], node_name: str,
+        walk_of: Callable[[str], str], host_rows, outputs, keys: list[str],
     ) -> None:
         """``extend_prefix_chains`` for a step: a resource with a batch form
-        takes the host rows; the others are offered each request's host copy."""
+        takes the host rows; the others are offered each request's host copy.
+
+        ``walk_of`` rather than one walk for the step, so a combined walk comes
+        through here too instead of falling back to a call per row.
+        """
         for key in keys:
             resource = self._resources[key]
             batched = getattr(resource, "extend_prefix_chains_batch", None)
             if batched is not None:
-                batched(request_ids, node_name, graph_walk, host_rows)
+                batched(request_ids, node_name, walk_of, host_rows)
                 continue
             for rid in request_ids:
                 per_rid = outputs.get(rid)
                 if isinstance(per_rid, dict):
-                    resource.extend_prefix_chain(rid, node_name, graph_walk, per_rid)
+                    resource.extend_prefix_chain(rid, node_name, walk_of(rid), per_rid)
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.

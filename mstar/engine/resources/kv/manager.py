@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+from collections.abc import Callable
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 
@@ -706,20 +707,24 @@ class KVManager(AttentionResource):
             stream.chain.extend(sampled[0].flatten().tolist(), self.config.page_size)
 
     def extend_prefix_chains_batch(
-        self, request_ids: list[str], node_name: str, graph_walk: str,
-        host_rows,
+        self, request_ids: list[str], node_name: str,
+        walk_of: Callable[[str], str], host_rows,
     ) -> None:
         """``extend_prefix_chain`` for a step, from the stop check's row
         buffers (``HostRows``: row i of every buffer belongs to
         ``host_rows.request_ids[i]``). One lock, one ``tolist`` per buffer
-        instead of one per request."""
+        instead of one per request.
+
+        The walk is per row, so a step mixing walks keys each row under its
+        own; nothing here was ever shared across the batch but the lock.
+        """
         row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
         buffers = host_rows.buffers
         rows_of: dict[str, list] = {}
         page_size = self.config.page_size
         with self._lock:
             for rid in request_ids:
-                label = self._keyed_label(rid, node_name, graph_walk)
+                label = self._keyed_label(rid, node_name, walk_of(rid))
                 if label is None:
                     continue
                 tensor = (self._overrides[rid].prefix_decode or {}).get(label)

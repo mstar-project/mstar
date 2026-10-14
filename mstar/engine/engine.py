@@ -809,13 +809,12 @@ class Engine:
         keys = self._runner.prefix_chain_keys(batch.node_name)
         if not keys:
             return
-        # The batch call takes one walk for every row, so it is only right when
-        # the step is not a combined walk; a mixed step falls through to the
-        # per-row loop, which keys each row under its own walk.
-        if host_rows is not None and not batch.step_context.request_walks:
+        # The batch call keys each row under its own walk, so a combined-walk
+        # step takes it too; only the absence of host rows falls through.
+        if host_rows is not None:
             self._runner.extend_prefix_chains_batch(
                 batch.request_ids, batch.node_name,
-                batch.step_context.graph_walk, host_rows, outputs,
+                batch.step_context.walk_of, host_rows, outputs,
                 keys=keys,
             )
             return
