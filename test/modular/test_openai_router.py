@@ -5,6 +5,7 @@ APIServer + model are stubbed so adapters, serving handlers, SSE, and error
 paths are all exercised without the engine.
 """
 
+import asyncio
 import base64
 import json
 import sys
@@ -57,19 +58,31 @@ class _StubAPI:
         self.last_raw_request = raw_request
         return self._chunks.get(request_id, [])
 
-    async def iter_result_chunks(self, request_id):
+    async def iter_result_chunk_batches(self, request_id):
         # Same contract as the real one: a consumer that stops early, or an
-        # exception, aborts the request; a fully drained stream does not.
+        # exception, aborts the request; a fully drained stream does not. The
+        # chunks come the way the server hands them out, in batches (here all
+        # at once), so the streaming handlers see the coalesced form.
         finished = False
         try:
-            for c in self._chunks.get(request_id, []):
-                yield c
+            chunks = self._chunks.get(request_id, [])
+            if chunks:
+                yield list(chunks)
             if self.raise_after is not None:
                 raise self.raise_after
             finished = True
         finally:
             if not finished:
                 self.aborted.append(request_id)
+
+    async def iter_result_chunks(self, request_id):
+        batches = self.iter_result_chunk_batches(request_id)
+        try:
+            async for batch in batches:
+                for c in batch:
+                    yield c
+        finally:
+            await batches.aclose()
 
 
 @pytest.fixture
@@ -298,6 +311,40 @@ def test_videos_stream_ndjson(client_and_stub):
     ).json()
     assert stub.last_submit["streaming"] is False
     assert _b64.b64decode(body["data"][0]["b64_json"]) == b"mp4-full"
+
+
+def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
+    """Tokens that were waiting together leave as one body frame (one write
+    on the socket), still one SSE event per token for the client; a chunk
+    of another modality gets a frame of its own."""
+    from mstar.api_server.openai.serving_chat import _stream
+
+    class _Batches:
+        async def iter_result_chunk_batches(self, request_id):
+            yield [_Chunk("text", b"a"), _Chunk("text", b"b"), _Chunk("text", b"c")]
+            yield [_Chunk("text", b"d"), _Chunk("audio", b"\x00\x01"), _Chunk("text", b"e")]
+
+    async def _collect():
+        return [frame async for frame in _stream(_Batches(), "bagel", "rid", 24000)]
+
+    frames = asyncio.run(_collect())
+    # role, abc, d, audio, e, stop, DONE
+    assert [f.count("data: ") for f in frames] == [1, 3, 1, 1, 1, 1, 1]
+    events = [json.loads(l[6:]) for f in frames[:-1] for l in f.splitlines() if l.startswith("data: ")]
+    assert "".join(e["choices"][0]["delta"].get("content", "") for e in events) == "abcde"
+    assert events[5]["choices"][0]["delta"]["audio"]["data"] == base64.b64encode(b"\x00\x01").decode()
+    assert events[-1]["choices"][0]["finish_reason"] == "stop"
+    assert frames[-1] == "data: [DONE]\n\n"
+
+
+def test_sse_event_is_one_json_line():
+    from mstar.api_server.openai._util import sse
+
+    obj = {"choices": [{"delta": {"content": "h\u00e9llo \"q\""}}], "n": 1}
+    line = sse(obj)
+    assert line.startswith("data: ") and line.endswith("\n\n")
+    assert "\n" not in line[:-2]
+    assert json.loads(line[6:-2]) == obj
 
 
 def test_chat_stream_reports_a_failed_request_in_band(client_and_stub):

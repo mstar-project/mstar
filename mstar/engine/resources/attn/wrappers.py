@@ -298,6 +298,18 @@ class FlashInferDecodeWrapper:
         Inputs may be on CPU; see prefill wrapper's plan docstring.
         """
         n_req = paged_kv_indptr.shape[0] - 1
+        if (
+            self.use_cuda_graph and paged_kv_indices.device.type != "cuda"
+            and paged_kv_indices.is_pinned()
+        ):
+            # FlashInfer copies host indices with a blocking copy; page-locked
+            # indices (the KV plan's ring, MSTAR_KV_PINNED_INDPTRS) go in one
+            # non-blocking copy into its own buffer instead, and its copy_ of
+            # that buffer onto itself is a no-op. Pageable indices keep
+            # FlashInfer's path, so the knob is a full toggle.
+            n = paged_kv_indices.shape[0]
+            self._paged_kv_indices_buf[:n].copy_(paged_kv_indices, non_blocking=True)
+            paged_kv_indices = self._paged_kv_indices_buf[:n]
 
         if self.enable_nvtx:
             from mstar.utils.profiler import range_pop, range_push

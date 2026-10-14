@@ -14,7 +14,10 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_i2v_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
+    "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
+    "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
@@ -29,6 +32,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
     "waypoint": ("mstar.model.waypoint.waypoint_model", "WaypointModel"),
     "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
+    "z_image_turbo": ("mstar.model.z_image.z_image_model", "ZImageModel"),
 }
 
 HF_MODELS: dict[str, dict] = {
@@ -66,9 +70,18 @@ HF_MODELS: dict[str, dict] = {
     # deployment as Super.
     "cosmos3_super_i2v_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Image2Video-4Step"},
     "cosmos3_super_t2i_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Text2Image-4Step"},
+    # FLUX.2 [klein]: step-distilled rectified-flow text-to-image + multi-reference
+    # editing (Qwen3 hidden-state text encoder, FLUX.2 VAE). 4B is Apache-2.0; 9B is
+    # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.
+    "flux2_klein": {"model_path_hf": "black-forest-labs/FLUX.2-klein-4B"},
+    "flux2_klein_9b": {"model_path_hf": "black-forest-labs/FLUX.2-klein-9B"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
+    # NVIDIA NemotronLabs VoiceChat-11B: full-duplex S2S -- Fast-Conformer STT
+    # encoder + Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B) + EarTTS
+    # (Gemma3 talker + RVQ codec). Single composite ``model.safetensors``.
+    "nemotron_duplex": {"model_path_hf": "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B"},
     # OmniVoice — masked-diffusion TTS, 600+ languages. A Qwen3-0.6B body read
     # bidirectionally over an 8-codebook canvas, plus the Higgs-Audio-v2 codec
     # shipped in the checkpoint's audio_tokenizer/ subfolder (~3.3 GB total).
@@ -110,6 +123,9 @@ HF_MODELS: dict[str, dict] = {
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
+    # Z-Image-Turbo: 8-step distilled single-stream flow DiT (Qwen3-4B caption encoder,
+    # FLUX.1 VAE), text-to-image only. Apache-2.0.
+    "z_image_turbo": {"model_path_hf": "Tongyi-MAI/Z-Image-Turbo"},
 }
 
 # qwen 3.5 family: dense (MoE TODO)

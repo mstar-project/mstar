@@ -543,8 +543,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
         slot_lease: SlotLease | None = None,
         piecewise_leases: Mapping[str, SlotLease] | None = None,
+        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
+        kept_rids = None
+        if graph_walk != "thinker_decode":
+            # only the last prefill's token survives `postprocess`
+            info = per_request_info or {}
+            kept_rids = frozenset(
+                rid for rid in request_ids
+                if rid in info and info[rid].step_metadata.get("is_last_prefill", False)
+            )
         prefill_tokens = {}
         if graph_walk == "prefill_text":
             prefill_tokens={
@@ -572,7 +581,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 THINKER_ATTN: AttentionStep(causal=True),
                 THINKER_SAMPLER: SamplerStep(
                     apply_penalty=True,
-                    prefill_tracked_tokens=prefill_tokens
+                    prefill_tracked_tokens=prefill_tokens,
+                    kept_rids=kept_rids,
                 ),
                 THINKER_POS: PositionStep(
                     advance=pos_advance
