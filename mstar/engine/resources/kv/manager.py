@@ -1431,7 +1431,7 @@ class KVManager(AttentionResource):
         return pages, offsets
 
     def _stage_decode_plan_state(
-        self, views: list[SequenceView], static_state: KVPlanState,
+        self, views: list[SequenceView] | None, static_state: KVPlanState,
         capture_len: int, pages=None, offsets=None,
     ) -> KVPlanState:
         """``_decode_plan_state`` + ``KVPlanState.copy_`` with no device staging
@@ -1444,7 +1444,7 @@ class KVManager(AttentionResource):
         self._plan_stager.copy_(
             static_state.token_to_cache[:capture_len], offsets, pad_value=0,
         )
-        static_state.total_tokens = len(views)
+        static_state.total_tokens = len(pages)
         return static_state
 
     def _setup_plan_states(
@@ -1456,8 +1456,12 @@ class KVManager(AttentionResource):
                 # Straight into the captured buffers in one H2D per buffer:
                 # this runs in the pre-plan beside a live graph, where a
                 # device-side copy + fill would slow it (see mstar.utils.h2d).
+                # a cached plan hands its locations; reading `views` there
+                # would build them eagerly and defeat the lazy builder
+                cached = indptrs.decode_pages is not None
                 plan_state = self._stage_decode_plan_state(
-                    indptrs.views, self._static_plan_state(lease.slot, label),
+                    None if cached else indptrs.views,
+                    self._static_plan_state(lease.slot, label),
                     lease.bucket.num_tokens,
                     pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
                 )
