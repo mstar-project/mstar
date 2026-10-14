@@ -94,13 +94,18 @@ def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGrou
 
 
 def refuse_combined_walks_across_tp_groups(
-    model: Model, sharding: ShardingConfig, node_names: set[str],
+    model: Model, sharding: ShardingConfig, my_walks: set[tuple[str, str]],
 ) -> None:
     """A combined walk runs every walk's rows in one forward, so on this
-    worker its walks must share one TP group, or all have world size 1."""
+    worker its walks must share one TP group, or all have world size 1.
+
+    Keyed on the (node, walk) pairs this worker runs, not its nodes: under
+    P/D each half of a combined walk sits on a different worker, so neither
+    can build a step that mixes them and neither needs one group.
+    """
     groups: dict[tuple[str, str], dict[str, ShardingGroup | None]] = {}
     for (node, walk), combined in model.combined_walk_of().items():
-        if node in node_names:
+        if (node, walk) in my_walks:
             groups.setdefault((node, combined), {})[walk] = _tp_group_of(sharding, node, walk)
     for (node, combined), by_walk in groups.items():
         if len({id(group) for group in by_walk.values()}) > 1:

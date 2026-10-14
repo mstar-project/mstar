@@ -9,11 +9,13 @@ from mstar.worker.engine_manager import refuse_combined_walks_across_tp_groups
 
 COMBINED = {("LLM", "prefill"): "mixed", ("LLM", "decode"): "mixed"}
 MODEL = SimpleNamespace(combined_walk_of=lambda: COMBINED)
+# the (node, walk) pairs of a worker that runs both halves
+BOTH = frozenset({("LLM", "prefill"), ("LLM", "decode")})
 
 
-def _check(*groups, nodes=frozenset({"LLM"})):
+def _check(*groups, walks=BOTH):
     sharding = ShardingConfig(groups=list(groups), tp_enabled_nodes={"LLM"}, shard_dim={})
-    refuse_combined_walks_across_tp_groups(MODEL, sharding, set(nodes))
+    refuse_combined_walks_across_tp_groups(MODEL, sharding, set(walks))
 
 
 def test_one_group_for_every_walk_passes():
@@ -42,4 +44,19 @@ def test_a_group_of_one_counts_as_none():
 
 
 def test_another_workers_node_is_not_checked():
-    _check(ShardingGroup(nodes={"LLM"}, tp_size=2, graph_walks={"decode"}), nodes={"snac"})
+    _check(
+        ShardingGroup(nodes={"LLM"}, tp_size=2, graph_walks={"decode"}),
+        walks={("snac", "decode")},
+    )
+
+
+@pytest.mark.parametrize("walk", ["prefill", "decode"])
+def test_a_pd_worker_running_one_half_is_not_refused(walk):
+    """P/D at TP2 on both sides, which the docs allow: each worker runs one
+    half of the combined walk, so no worker can build a step that mixes
+    them and no config change is needed."""
+    _check(
+        ShardingGroup(nodes={"LLM"}, tp_size=2, graph_walks={"prefill"}),
+        ShardingGroup(nodes={"LLM"}, tp_size=2, graph_walks={"decode"}),
+        walks={("LLM", walk)},
+    )

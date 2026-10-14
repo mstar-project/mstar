@@ -356,10 +356,15 @@ class Worker:
             )
 
         node_names = set()
+        my_walks: set[tuple[str, str]] = set()
         for wg in my_worker_graphs:
-            node_names.update(wg.section.get_nodes())
+            wg_nodes = wg.section.get_nodes()
+            node_names.update(wg_nodes)
+            my_walks.update(
+                (node, walk) for node in wg_nodes for walk in wg.graph_walks
+            )
         if model is not None:
-            refuse_combined_walks_across_tp_groups(model, sharding_config, node_names)
+            refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
 
         # The graph runtime owns the per-request queues and the graph state.
         self._graph_runtime = _make_graph_runtime(
