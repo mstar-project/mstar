@@ -3,6 +3,7 @@ null is unset, types are strict, ranges are checked once for every endpoint,
 length aliases fold into ``max_output_tokens``, unread keys are logged, and a
 refused request gets its status before a stream opens."""
 
+import asyncio
 import types
 
 import pytest
@@ -86,6 +87,7 @@ class _RecordingServer:
         self.model = _Model()
         self.chunks = list(chunks)
         self.submitted = []
+        self.reported_ignored_params = set()
 
     def __getattr__(self, name):
         raise AttributeError(name)
@@ -140,6 +142,40 @@ def test_a_refused_stream_gets_its_status_not_a_200(monkeypatch):
     response = TestClient(entrypoint.app).post("/generate", data={"streaming": "true"})
     assert response.status_code == 400
     assert "min_p" in response.json()["detail"]
+
+
+def test_an_unread_key_warns_once_then_drops_to_debug(caplog):
+    server = _RecordingServer()
+    with caplog.at_level("DEBUG", logger=entrypoint.logger.name):
+        for _ in range(3):
+            server._report_ignored_params({"initial_prompt": "x"})
+        server._report_ignored_params({"initial_prompt": "x", "timestamps": "word"})
+    levels = [r.levelname for r in caplog.records if "does not read" in r.getMessage()]
+    # a key not seen before warns again, naming the whole set
+    assert levels == ["WARNING", "DEBUG", "DEBUG", "WARNING"]
+
+
+def test_a_client_gone_before_the_first_chunk_is_aborted():
+    unwound = []
+
+    class _Server(_RecordingServer):
+        async def iter_result_chunks(self, request_id):
+            try:
+                await asyncio.Event().wait()   # a long prefill
+                yield None
+            finally:
+                unwound.append(request_id)   # the real iterator aborts here
+
+    class _GoneClient:
+        async def is_disconnected(self):
+            return True
+
+    async def run():
+        chunks = await _Server().open_result_stream("r1", _GoneClient())
+        return [c async for c in chunks]
+
+    assert asyncio.run(asyncio.wait_for(run(), timeout=5)) == []
+    assert unwound == ["r1"]
 
 
 def _conductor(limit=None, default=64):

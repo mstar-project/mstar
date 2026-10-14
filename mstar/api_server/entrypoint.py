@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import collections
+import contextlib
 import json
 import logging
 import multiprocessing as mp
@@ -240,6 +241,12 @@ def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
     }) + "\n"
 
 
+async def _empty_stream():
+    """The body for a client that left before its first chunk."""
+    return
+    yield
+
+
 def _chunk_to_binary_frame(chunk: ResultChunk) -> tuple[bytes, bytes]:
     """Serialize one result chunk as a header line plus its untouched payload.
 
@@ -324,6 +331,8 @@ class APIServer:
         )
         self._recently_completed_ttl = 15.0
         self.request_lock = threading.Lock()
+        # unread model_kwargs already warned about; repeats go to debug
+        self.reported_ignored_params: set[str] = set()
         self.running = True
 
         # Set by main() once the conductor is spawned. It gets polled because a
@@ -433,7 +442,11 @@ class APIServer:
     # ----------------------------------------------------------
 
     def _report_ignored_params(self, model_kwargs: dict) -> None:
-        """Log the keys the model does not read; the request is served regardless."""
+        """Log the keys the model does not read; the request is served regardless.
+
+        Each key warns once per server; a client or adapter that always sends
+        it (Whisper's long-form windows) would otherwise warn on every request.
+        """
         model = getattr(self, "model", None)
         declared = model.request_kwargs() if model is not None else None
         if declared is None:
@@ -441,7 +454,12 @@ class APIServer:
         ignored = sorted(set(model_kwargs) - declared - SERVER_KWARGS)
         if not ignored:
             return
-        logger.warning("Ignoring model_kwargs this model does not read: %s", ignored)
+        new = [k for k in ignored if k not in self.reported_ignored_params]
+        if new:
+            self.reported_ignored_params.update(new)
+            logger.warning("Ignoring model_kwargs this model does not read: %s", ignored)
+        else:
+            logger.debug("Ignoring model_kwargs this model does not read: %s", ignored)
 
     def submit_request(
         self,
@@ -884,15 +902,32 @@ class APIServer:
             return self._stream_binary(chunks)
         return self._stream_ndjson(chunks)
 
-    async def open_result_stream(self, request_id: str):
+    async def open_result_stream(self, request_id: str, raw_request: Request | None = None):
         """The request's chunk iterator, after its first chunk has arrived.
 
         A request the engine refuses (a 400 from admission, a failed worker)
         raises ``HTTPException`` with its status here, before the caller commits
         a 200. Otherwise the returned iterator yields the first chunk again.
+        A client that disconnects first is aborted, as in ``collect_results``,
+        and gets an empty iterator.
         """
         chunks = self.iter_result_chunks(request_id)
-        first = await anext(chunks, None)
+        first_read = asyncio.ensure_future(anext(chunks, None))
+        try:
+            while not first_read.done():
+                await asyncio.wait({first_read}, timeout=0.05)
+                if (not first_read.done() and raw_request is not None
+                        and await raw_request.is_disconnected()):
+                    break
+        finally:
+            if not first_read.done():
+                # cancelling the read unwinds iter_result_chunks, which aborts the request
+                first_read.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await first_read
+        if first_read.cancelled():
+            return _empty_stream()
+        first = first_read.result()
         if first is not None and first.modality == "error":
             # read to the end, so the finished request is not aborted
             async for _ in chunks:
@@ -1591,7 +1626,7 @@ async def generate(
             # client that does not ask for it keeps the historical NDJSON body.
             binary = BINARY_STREAM_MEDIA_TYPE in request.headers.get("accept", "")
             # wait for the first chunk: a refused request gets its real status, not a 200
-            chunks = await api_server.open_result_stream(request_id)
+            chunks = await api_server.open_result_stream(request_id, request)
             return StreamingResponse(
                 api_server.async_stream_results(request_id, binary=binary, chunks=chunks),
                 media_type=BINARY_STREAM_MEDIA_TYPE if binary else NDJSON_STREAM_MEDIA_TYPE,
