@@ -37,7 +37,8 @@ NULL_BLOCK_ID = 0
 @functools.cache
 def _supports_pdl() -> bool:
     """Programmatic dependent launch: Hopper and newer."""
-    if not torch.cuda.is_available():
+    # ROCm reports gfx9 as compute capability 9.x, and has no PDL
+    if not torch.cuda.is_available() or torch.version.hip is not None:
         return False
     return torch.cuda.get_device_capability()[0] >= 9
 
