@@ -11,6 +11,7 @@ next iteration, which builds the other requests' step as a yield-away batch
 while that forward is still in flight.
 """
 
+import time
 import types
 
 import pytest
@@ -170,3 +171,41 @@ def test_follower_holds_nothing_after_the_raised_step(leader):
 
     left = f.scheduler.peek_tp_follow()
     assert left is None, f"follower still holds {left.request_ids}, which rank 0 dropped"
+
+
+def test_a_deferred_remove_waits_for_the_next_steps_admit(monkeypatch):
+    """A remove held back while its request ran is applied once the next step is
+    submitted. Rank 0 stamps it after that step, and a follower frees the pages
+    only after admitting it, so rank 0 must not free them before its own admit."""
+    monkeypatch.setattr(worker_mod, "gc", types.SimpleNamespace(
+        collect=lambda: None, freeze=lambda: None, get_freeze_count=lambda: 0,
+    ))
+    w = _leader([_batch("a", "x"), _batch("b")], bad_rid=None)
+    order = []
+    passes = iter(range(3))
+
+    def _messages():
+        n = next(passes)
+        if n == 1:
+            w._pending_removes.add("x")  # x's remove lands while its step runs
+        elif n == 2:
+            raise _Stop
+
+    def _forward(batch, node_batch, plan_future):
+        if "b" in node_batch.request_ids:
+            time.sleep(0.2)  # the GPU thread is still preparing b
+        order.append(("admit", *node_batch.request_ids))
+        node_batch.launch_started_event.set()
+        return {rid: {} for rid in node_batch.request_ids}
+
+    w._pending_removes = set()
+    w._process_messages = _messages
+    w._execute_on_gpu_thread = _forward
+    w._postprocess_batch = lambda *a: None
+    w._remove_request = lambda body: order.append(("release", body.request_id))
+    for name in ("_await_admit_settled", "_apply_pending_removes_safe_to_drop"):
+        setattr(w, name, types.MethodType(getattr(Worker, name), w))
+    with pytest.raises(_Stop):
+        w.run()
+
+    assert order == [("admit", "a", "x"), ("admit", "b"), ("release", "x")]

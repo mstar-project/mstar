@@ -3869,9 +3869,11 @@ class Worker:
                         with self._span("worker.postprocess_batch"):
                             self._postprocess_batch(pending, outputs)
 
-                    # Removes for any rid not in the in-flight spec step
-                    # are safe to apply now.
+                    # Removes for any rid not in the in-flight spec step are safe
+                    # once its admit has run: they are stamped after that step.
                     in_flight = set(spec_pending.batch.request_to_worker_graph) if spec_pending else set()
+                    if self._pending_removes:
+                        self._await_admit_settled(spec_pending)
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
                     _set_pending(None)
