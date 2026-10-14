@@ -35,6 +35,7 @@
    fast_tokenize
    fused_moe
    gc_freeze
+   generation_kwargs
    h2d
    hf_snapshot
    ipc_format
