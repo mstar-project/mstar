@@ -23,7 +23,8 @@ name: Claude Review
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `labeled` is for on-demand thorough reviews; other labels are filtered out below.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 
 permissions: {}
 
@@ -38,9 +39,12 @@ jobs:
     # preflight below, which is the same protection and visible in the log
     # rather than a silently skipped job. It also means a fork that *does* set
     # the key gets reviews, which is how you test changes to this workflow.
+    # A light review runs on every push. Applying the `ai-review-thorough` label
+    # (triage access or above) runs one thorough review; later pushes go back to light.
     if: >-
       !github.event.pull_request.draft &&
-      !contains(github.event.pull_request.labels.*.name, 'skip-ai-review')
+      !contains(github.event.pull_request.labels.*.name, 'skip-ai-review') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ai-review-thorough')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -81,7 +85,8 @@ jobs:
           path: pr-head
           persist-credentials: false
 
-      - name: Collect the diff
+      # The body and existing comments are untrusted; the prompt says so.
+      - name: Collect the diff, description and existing comments
         if: steps.pre.outputs.run == 'true'
         id: diff
         env:
@@ -90,34 +95,30 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           gh pr diff "$PR" --repo "$REPO" > pr.diff
-          lines=$(wc -l < pr.diff)
-          echo "lines=$lines" >> "$GITHUB_OUTPUT"
-          # Very large diffs are usually vendoring, generated code or a rename
-          # sweep. Reviewing all of it costs a lot and finds little, so tell the
-          # model to triage instead of pretending to cover it.
-          if [ "$lines" -gt 4000 ]; then
-            echo "note=This diff is $lines lines. Do not attempt full coverage: pick the files most likely to contain a defect by the routing table, review those, and say in your comment which files you did not review." >> "$GITHUB_OUTPUT"
-          else
-            echo "note=" >> "$GITHUB_OUTPUT"
-          fi
+          gh pr view "$PR" --repo "$REPO" --json body --jq .body > pr-body.md
+          gh api --paginate "repos/$REPO/pulls/$PR/comments" \
+            --jq '[.[] | {id, user: .user.login, path, line, side, in_reply_to_id, body}]' > pr-comments.json
+          echo "lines=$(wc -l < pr.diff)" >> "$GITHUB_OUTPUT"
 
       - name: Review
         if: steps.pre.outputs.run == 'true'
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          use_sticky_comment: true
           prompt: |
             Read .github/review/review-prompt.md from the repository root and follow it
             exactly. It defines your trust boundary, your method, your reporting bar and
             your output format.
 
+            Mode: ${{ github.event.action == 'labeled' && 'thorough' || 'light' }}
             PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}
-            ${{ steps.diff.outputs.note }}
+            pr.diff is ${{ steps.diff.outputs.lines }} lines.
           # Read-only. Blocking the mutation and network tools caps a prompt
-          # injection at a bad comment; the action's own comment plumbing is
-          # left alone deliberately, so this is a denylist and not an allowlist.
+          # injection at a bad comment. The only write tools allowed are the
+          # inline-comment tool (which the action loads only when it is listed
+          # here) and `gh pr comment` for the summary.
           claude_args: |
             --model claude-sonnet-5-5
             --max-turns 40
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*)"
             --disallowedTools Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch
