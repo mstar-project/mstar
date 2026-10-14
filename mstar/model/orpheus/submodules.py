@@ -259,7 +259,6 @@ class SNACDecoderSubmodule(NodeSubmodule):
                     ),
                     # 1, not the window: batched buckets match on bs
                     input_seq_len=1,
-                    kwargs={"start": 0, "end": frames},
                 ),
                 additional_key_info=frames,
                 capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
@@ -415,8 +414,10 @@ class SNACDecoderSubmodule(NodeSubmodule):
             ``(B, frames)``, ``(B, 2 * frames)``, ``(B, 4 * frames)``.
         """
         codes_0 = mf[:, :, 0]
-        codes_1 = torch.index_select(mf, dim=2, index=self.idx_14).reshape(mf.shape[0], -1)
-        codes_2 = torch.index_select(mf, dim=2, index=self.idx_2356).reshape(mf.shape[0], -1)
+        c1 = torch.index_select(mf, dim=2, index=self.idx_14)
+        codes_1 = c1.reshape(mf.shape[0], -1)
+        c2 = torch.index_select(mf, dim=2, index=self.idx_2356)
+        codes_2 = c2.reshape(mf.shape[0], -1)
         return codes_0, codes_1, codes_2
 
     def can_use_cuda_graphs(self, batch, model_inputs):
