@@ -594,10 +594,11 @@ class MicroScheduler:
         """
         if key not in self._walks_of_key:
             return
-        entries = [
-            entry for entry in self._scan_ready(request_state, key, None).get(key, [])
-            if entry.graph_walk != own_walk
-        ]
+        # Excluded in the scan, not filtered after: own_walk's rows would
+        # otherwise each pay a `check_ready` only to be dropped here.
+        entries = self._scan_ready(
+            request_state, key, (key[0], own_walk) if own_walk else None,
+        ).get(key, [])
         if not entries:
             return
         parked = self._assemble_batch(request_state, *key, entries)
