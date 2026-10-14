@@ -726,7 +726,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``preprocess`` and every fallback batch arrives with the signal
         empty. ``prepare_inputs`` is told per row (``has_loopback``) whether
         its last step here kept the value on the device; a row without it
-        (e.g. its previous step ran on another rank) brings the tensor. On a walk whose output signals all stay on the device the
+        (e.g. its previous step ran on another rank) brings the tensor.
+        On a walk whose output signals all stay on the device the
         engine builds no per-request output dicts and does not call
         ``postprocess``: the stop check, the inline emit and the next step's
         speculation read the step's rows instead. Empty by default;
