@@ -1581,6 +1581,9 @@ class SamplerBuffers:
         self, rid: str, sampling_config: SamplingConfig | None = None,
     ) -> None:
         """Allocate a slot for ``rid`` and seed its master row."""
+        # a capture padding handle (negative) takes no slot; it reads slot 0
+        if isinstance(rid, int) and rid < 0:
+            return
         if rid in self._rid_to_slot:
             # Re-registration: just refresh the config in place.
             if sampling_config is not None:
@@ -1844,7 +1847,10 @@ class SamplerBuffers:
         )
 
     def _slots_of(self, request_ids: list[str]) -> torch.Tensor:
-        slots = [self._rid_to_slot[rid] for rid in request_ids]
+        slots = [
+            0 if isinstance(rid, int) and rid < 0 else self._rid_to_slot[rid]
+            for rid in request_ids
+        ]
         return torch.tensor(slots, dtype=torch.long, device=self.last_token.master.device)
 
     def write_last_tokens(self, request_ids: list[str], tokens: torch.Tensor) -> None:

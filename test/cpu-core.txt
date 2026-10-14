@@ -72,3 +72,5 @@ test/modular/test_fast_tokenize.py
 test/modular/test_wire_codec.py
 test/modular/test_wire_security.py
 test/modular/test_model_kwargs_tensor_transport.py
+test/modular/test_engine_rows_only_tail.py
+test/modular/test_ingest_rollback.py

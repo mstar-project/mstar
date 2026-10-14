@@ -696,14 +696,18 @@ class NodeSubmodule(torch.nn.Module, ABC):
         a fixed key set for graph compat, so the filtering happens here."""
         return outputs
 
-    def uniform_row_inputs(self, graph_walk: str) -> "NodeInputs | None":
+    def uniform_row_inputs(
+        self, graph_walk: str, has_loopback: bool = False,
+    ) -> "NodeInputs | None":
         """The inputs every row of this walk gets, when ``prepare_inputs``
         would return an equal object for each regardless of the request, its
         routed signals and its metadata (a decode walk that reads its token
         off the device). The engine then prepares the batch with one call and
         shares the object across the step's rows, so it must not be mutated
-        per row. None (the default) prepares row by row."""
-        del graph_walk
+        per row. ``has_loopback``: every row's last step on this node kept its
+        loop-back signals on the device (``device_loopback_signals``). None
+        (the default) prepares row by row."""
+        del graph_walk, has_loopback
         return None
 
     def step_is_input_free(self, graph_walk: str) -> bool:
@@ -720,8 +724,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         keeps on the device itself (a sampler's slot master), so the worker
         routes them with no tensor: the next step reads the value in
         ``preprocess`` and every fallback batch arrives with the signal
-        empty. Only sound when ``prepare_inputs`` accepts the empty signal on
-        this walk. On a walk whose output signals all stay on the device the
+        empty. ``prepare_inputs`` is told per row (``has_loopback``) whether
+        its last step here kept the value on the device; a row without it
+        (e.g. its previous step ran on another rank) brings the tensor. On a walk whose output signals all stay on the device the
         engine builds no per-request output dicts and does not call
         ``postprocess``: the stop check, the inline emit and the next step's
         speculation read the step's rows instead. Empty by default;
@@ -876,6 +881,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         Modifies ``outputs`` in-place; returns nothing.
         """
         return
+
+    def batch_postprocess(
+        self, outputs: BatchedModelOutput,
+        request_infos: dict[int, CurrentForwardPassInfo],
+        inputs: list[NodeInputs],
+    ) -> None:
+        """``postprocess`` for a rows-only step, which has no per-request
+        outputs: works on the rows of ``outputs`` in place. Optional; only
+        called when overridden."""
 
     def check_stop(
         self, request_id: str,

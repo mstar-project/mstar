@@ -5,11 +5,8 @@ from mstar.api_server.data_worker import PreprocessWorker
 from mstar.utils.gc_freeze import freeze_after_setup
 
 
-def test_freeze_after_setup_moves_the_heap_and_honours_the_knob(monkeypatch):
+def test_freeze_after_setup_moves_the_heap():
     gc.unfreeze()
-    monkeypatch.setenv("MSTAR_GC_FREEZE", "0")
-    assert freeze_after_setup("test") == 0 and gc.get_freeze_count() == 0
-    monkeypatch.setenv("MSTAR_GC_FREEZE", "1")
     keep = [[i] for i in range(100)]  # live objects the collector tracks
     frozen = freeze_after_setup("test")
     try:

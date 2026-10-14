@@ -329,15 +329,6 @@ Worker scheduling
        prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
        spends 78 ms of wall time on 36 ms of kernels. The default now reaches
        8192; narrow it to save graph memory and capture time, or extend it.
-   * - ``MSTAR_GC_FREEZE``
-     - ``1``
-     - Once a process has finished its set-up (the API server and the
-       conductor when every worker is ready, the worker after warm-up and
-       graph capture), collect once and ``gc.freeze()`` the heap, so later
-       gen-2 collections do not walk the long-lived set-up objects. Measured
-       on the API server process: 200 ms per gen-2 pass every ~20 s under
-       load before, which stalled request admission and token delivery for
-       that long. ``0`` leaves the collector alone.
    * - ``MSTAR_DEVICE_LOOPBACK``
      - ``1``
      - Whether a decode node may keep its loop-back token on the device:
@@ -357,15 +348,6 @@ Worker scheduling
        the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` concurrent
        requests (default 4096, a hard cap with this on). Only with the device
        loop-back on. An experiment knob; measure before turning it on.
-   * - ``MSTAR_LAUNCH_SIGNAL_AFTER_COMMIT``
-     - ``0``
-     - Release the thread that submitted a step only once the gpu thread
-       has also committed it and staged its outputs, instead of at the
-       replay launch. Every torch call after the launch releases the GIL and
-       the woken main thread keeps it for its whole postprocess stretch, so
-       the first such call waits that long; signalling later costs the main
-       thread the uncontended commit and collect instead. An experiment
-       knob; measure before turning it on.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset
      - ``1`` makes the Rust runtime print, every 500 calls, how long the

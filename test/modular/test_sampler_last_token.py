@@ -165,3 +165,17 @@ def test_ingraph_scatter_masters_never_grow():
         plain.register_request(rid)
     plain.write_last_tokens(["c"], torch.tensor([7]))  # a gpu-thread access grows the device rows
     assert plain.last_token.master.shape[0] >= 3 and not plain.ingraph_scatter
+
+
+def test_capture_padding_rows_take_no_slot():
+    bufs = _buffers()
+    free = len(bufs._free_slots)
+    for rid in (-2, -3, -4):
+        bufs.register_request(rid)
+    assert len(bufs._free_slots) == free and not bufs.has_slot(-2)
+    bufs.register_request("a")
+    bufs.write_last_tokens(["a"], torch.tensor([5]))
+    # padding rows read slot 0
+    assert bufs.last_tokens_for([-2, "a"]).tolist() == [
+        bufs.last_token.master[0].item(), 5,
+    ]

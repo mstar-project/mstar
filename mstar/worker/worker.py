@@ -73,7 +73,6 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.knobs import launch_signal_after_commit
 from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
@@ -277,8 +276,6 @@ class Worker:
     # Empty for a text model, which lets a speculation build skip its three
     # per-row stream polls; None (a bare instance) means unknown, so poll.
     _stream_buffer_rids: set[int] | None = None
-    # a bare instance keeps the launch signal where the engine sets it
-    _launch_signal_after_commit: bool = False
 
     def __init__(
         self,
@@ -308,7 +305,6 @@ class Worker:
         self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
         self._host_rows_slot = 0
         self._stream_buffer_rids = set()
-        self._launch_signal_after_commit = launch_signal_after_commit()
 
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads
@@ -690,12 +686,19 @@ class Worker:
             self._last_active[(request_id, node_name)] = now
 
         self.request_state.add_request(request_id, body.request_info)
-        self.engine_manager.add_request(
-            request_id, body.request_info.resource_configs,
-        )
         self.tensor_manager.register_request(
             request_id, self._graph_runtime.get_sharding_config(request_id),
         )
+        try:
+            self.engine_manager.add_request(
+                request_id, body.request_info.resource_configs,
+            )
+        except Exception as err:
+            # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
+            logger.exception("Worker %s: ingest of request %s failed", self.worker_id, body.request_id)
+            self._fail_requests({request_id: f"Error in worker: {type(err).__name__}: {err}"})
+            self._process_unprocessed(body.request_id)
+            return
 
         # Create StreamBuffers for consumer connections on this worker. A request
         # with several partitions here arrives once per partition: keep the
@@ -735,10 +738,13 @@ class Worker:
             self._graph_runtime.ingest_inputs_batch(
                 self._one_rids_edges(request_id, signal_only), can_buffer=True,
             )
-        # process messages that may have came in out-of-order
-        if body.request_id in self._unprocessed_messages:
-            self._process_message_list(self._unprocessed_messages[body.request_id])
-            del self._unprocessed_messages[body.request_id]
+        self._process_unprocessed(body.request_id)
+
+    def _process_unprocessed(self, wire_rid: str) -> None:
+        """Process messages for ``wire_rid`` that came in before its NEW_REQUEST."""
+        if wire_rid in self._unprocessed_messages:
+            self._process_message_list(self._unprocessed_messages[wire_rid])
+            del self._unprocessed_messages[wire_rid]
 
 
     def _remove_request(self, body: RemoveRequest) -> None:
@@ -1899,12 +1905,18 @@ class Worker:
                 self._phase_record(
                     f"rows.{batch.graph_walk}#", len(node_batch.request_ids),
                 )
-            outputs = self._exec_step(engine, node_batch, execution_stream)
-            if gpu_start is not None:
-                gpu_end = torch.Event(enable_timing=True)
-                gpu_end.record(execution_stream)
-                self._gpu_spans.append((gpu_start, gpu_end))
-                self._drain_gpu_spans()
+            with self._span("worker.gpu_thread.exec"):
+                outputs = engine.exec_and_postprocess(node_batch)
+            if execution_stream is not None:
+                self._stage_host_rows(outputs)
+                event = torch.Event()
+                event.record(execution_stream)
+                node_batch.completion_event = event
+                if gpu_start is not None:
+                    gpu_end = torch.Event(enable_timing=True)
+                    gpu_end.record(execution_stream)
+                    self._gpu_spans.append((gpu_start, gpu_end))
+                    self._drain_gpu_spans()
             return outputs
         finally:
             # Safety net: a step that raised before the forward would otherwise
@@ -3249,33 +3261,6 @@ class Worker:
             except (KeyError, IndexError):
                 return None, []
         return None, []
-
-    def _exec_step(self, engine, node_batch: ExecutingBatch, execution_stream):
-        """The step on the gpu thread: the engine's forward and commit, the
-        staged host rows, the completion event.
-
-        With ``MSTAR_LAUNCH_SIGNAL_AFTER_COMMIT`` the engine sees no event to
-        set at the replay launch; the submitter is released here afterwards,
-        once commit, collect and the staging are done, so none of those torch
-        calls has to win the GIL back from the thread it woke.
-        """
-        deferred_signal = None
-        if self._launch_signal_after_commit and node_batch.launch_started_event is not None:
-            deferred_signal = node_batch.launch_started_event
-            node_batch.launch_started_event = None
-        try:
-            with self._span("worker.gpu_thread.exec"):
-                outputs = engine.exec_and_postprocess(node_batch)
-            if execution_stream is not None:
-                self._stage_host_rows(outputs)
-                event = torch.Event()
-                event.record(execution_stream)
-                node_batch.completion_event = event
-        finally:
-            if deferred_signal is not None:
-                node_batch.launch_started_event = deferred_signal
-                deferred_signal.set()
-        return outputs
 
     def _stage_host_rows(self, outputs: "BatchedModelOutput") -> None:
         """Start the device-to-host copy of the step's row-addressed stop

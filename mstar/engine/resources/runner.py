@@ -263,11 +263,23 @@ class StepRunner:
         self, rid: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
     ) -> None:
-        """open state on all resources; `overrides` are per-resource"""
-        for key in self._order:
-            self._resources[key].ingest_request(
-                rid, None if overrides is None else overrides.get(key)
-            )
+        """open state on all resources; `overrides` are per-resource. All or
+        nothing: a resource that raises leaves the request on none of them."""
+        for i, key in enumerate(self._order):
+            try:
+                self._resources[key].ingest_request(
+                    rid, None if overrides is None else overrides.get(key)
+                )
+            except Exception:
+                # the raising resource may have taken part of it too
+                for done in self._order[:i + 1]:
+                    try:
+                        self._resources[done].remove_request(rid)
+                    except Exception:
+                        logger.exception(
+                            "rolling back request %s on resource %s failed", rid, done,
+                        )
+                raise
 
     def remove_request(self, rid: str) -> None:
         for key in self._order:

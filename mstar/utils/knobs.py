@@ -10,17 +10,6 @@ def device_loopback_enabled() -> bool:
     return os.environ.get("MSTAR_DEVICE_LOOPBACK", "1") == "1"
 
 
-def launch_signal_after_commit() -> bool:
-    """``MSTAR_LAUNCH_SIGNAL_AFTER_COMMIT`` (default 0): release the thread
-    that submitted a step only once the gpu thread has also committed the
-    step and staged its outputs, instead of at the replay launch. Every torch
-    call after the launch releases the GIL, and the woken main thread keeps
-    it for its whole postprocess stretch, so the first such call waits that
-    long; signalling later costs the main thread the uncontended commit and
-    collect (a fraction of a millisecond) instead."""
-    return os.environ.get("MSTAR_LAUNCH_SIGNAL_AFTER_COMMIT", "0") == "1"
-
-
 def sampler_ingraph_scatter() -> bool:
     """``MSTAR_SAMPLER_INGRAPH_SCATTER`` (default 0): the captured sampler
     gathers its RNG offsets from the slot masters and scatters the advanced

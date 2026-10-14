@@ -11,17 +11,13 @@ only a reference cycle alive at the freeze would be retained for good.
 """
 import gc
 import logging
-import os
 
 logger = logging.getLogger(__name__)
 
 
 def freeze_after_setup(who: str) -> int:
     """``gc.collect()`` then ``gc.freeze()`` for a process that finished its
-    set-up. Returns the number of objects frozen; 0 and no change when
-    ``MSTAR_GC_FREEZE=0``."""
-    if os.environ.get("MSTAR_GC_FREEZE", "1") != "1":
-        return 0
+    set-up. Returns the number of objects frozen."""
     gc.collect()
     gc.freeze()
     frozen = gc.get_freeze_count()
