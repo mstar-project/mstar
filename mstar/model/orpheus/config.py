@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 
+from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
+
 # Constants
 KV_CACHE = "kv_cache"
 ATTN = "attn"
@@ -39,11 +41,19 @@ class OrpheusModelConfig:
     tokens_per_frame: int = 7
     sample_rate: int = 24000
 
-    # Streaming chunking params (for async partition mode)
-    snac_window_tokens: int = 28      # 4 frames * 7 tokens/frame
-    snac_stride_tokens: int = 7       # 1 frame advance per chunk
-    snac_audio_slice_start: int = 2048  # middle region start in decoded audio
-    snac_audio_slice_end: int = 4096    # middle region end in decoded audio
+    snac_hop_samples: int = 2048      # audio samples per 7-token frame
+
+    # Streaming SNAC decode (async partition mode), in 7-token frames. The
+    # decoder is not causal, so a frame's audio depends on frames on both
+    # sides: each chunk decodes its frames with up to ``left_context`` earlier
+    # and ``right_context`` later ones and emits only its own. The last
+    # ``right_context`` frames of a chunk are emitted by the next one, and the
+    # final flush decodes the real tail of the stream. The first audio leaves
+    # after ``first_chunk`` frames; deployment YAML ``model_kwargs`` override.
+    snac_first_chunk_frames: int = 4
+    snac_chunk_frames: int = 4
+    snac_left_context_frames: int = 3
+    snac_right_context_frames: int = 2
 
     # Generation defaults
     temperature: float = 0.6
@@ -63,3 +73,36 @@ class OrpheusModelConfig:
             raise ValueError(
                 f"default_voice {self.default_voice!r} is not in available_voices"
             )
+        if self.snac_chunk_frames <= 0 or self.snac_left_context_frames < 0 \
+                or self.snac_right_context_frames < 0:
+            raise ValueError("snac_chunk_frames must be positive and SNAC context frames non-negative")
+        if self.snac_first_chunk_frames <= self.snac_right_context_frames:
+            raise ValueError(
+                "snac_first_chunk_frames must exceed snac_right_context_frames, "
+                "or the first chunk emits no audio"
+            )
+
+    def snac_chunk_policy(self) -> ScheduledLeftContextChunkPolicy:
+        """The LLM -> SNAC edge's chunking, in tokens.
+
+        A chunk's leading ``context_items`` are its left context plus the
+        previous chunk's right context, which this chunk emits.
+        """
+        tpf = self.tokens_per_frame
+        return ScheduledLeftContextChunkPolicy(
+            schedule=(self.snac_first_chunk_frames * tpf,),
+            chunk=self.snac_chunk_frames * tpf,
+            left_context=(self.snac_left_context_frames + self.snac_right_context_frames) * tpf,
+        )
+
+    def snac_window_frames(self) -> list[int]:
+        """Frames in each non-final window of a stream, one entry per distinct size."""
+        context = self.snac_left_context_frames + self.snac_right_context_frames
+        windows, delivered, new = [], 0, self.snac_first_chunk_frames
+        while True:
+            window = min(context, delivered) + new
+            if window in windows:
+                return windows
+            windows.append(window)
+            delivered += new
+            new = self.snac_chunk_frames

@@ -13,7 +13,16 @@ from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerS
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
-from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import (
+    EMPTY_INPUT_METADATA,
+    ARNodeInputs,
+    ARNodeSubmodule,
+    InputMetadata,
+    ModelInputsFromEngine,
+    NodeInputs,
+    NodeSubmodule,
+)
+from mstar.streaming.stream_buffer import StreamChunkInfo
 
 logger = logging.getLogger(__name__)
 
@@ -207,18 +216,25 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
 class SNACDecoderSubmodule(NodeSubmodule):
     """SNAC 24kHz streaming decoder submodule.
 
-    Receives a window of raw audio token tensors from StreamBuffer
-    (via normal graph input routing), converts to SNAC codes, and
-    decodes the middle region of the audio for low-latency output.
+    Receives a window of raw audio tokens from the StreamBuffer (via normal
+    graph input routing), decodes all of its frames and emits the audio of
+    the frames the window owns: it skips the left context and holds back the
+    right context, which the next window emits (see
+    ``OrpheusModelConfig.snac_chunk_policy``). The final window emits up to
+    the last whole frame.
 
-    Supports batched inference: multiple requests are decoded in a
-    single SNAC forward pass when all windows have the same frame count.
+    Batched: windows of one size decode in one SNAC forward. A batch that
+    mixes sizes (a ramp or flush window next to steady ones) decodes each
+    size apart, because the decoder is not causal and padding would change
+    the frames next to it.
     """
 
     # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
     # stateless engine, stated directly now that the v1 engine reads these.
     disable_torch_compile = True
     disable_autocast = True
+
+    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
     def __init__(self, snac_model: nn.Module, config: OrpheusModelConfig):
         super().__init__()
@@ -227,54 +243,87 @@ class SNACDecoderSubmodule(NodeSubmodule):
         self.idx_14 = torch.tensor([1, 4], dtype=torch.long, device=device)
         self.idx_2356 = torch.tensor([2, 3, 5, 6], dtype=torch.long, device=device)
         self.config = config
-
-        self._orig_seq_len = {}
-
-    # _tokens_to_codes pads to multiples of 28 tokens then reshapes to
-    # (N_frames, 4, 7); for a single streaming window this is 1 frame.
-    @property
-    def _num_frames(self) -> int:
-        return self.config.snac_window_tokens // (4 * self.config.tokens_per_frame)
+        self.windows = config.snac_window_frames()
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[CudaGraphConfig]:
-        """Declare the SNAC decode capture.
-        """
-        # One streaming window is ``snac_window_tokens`` raw tokens
-        # (4 frames × 7 codes). Make the dummy tokens a multiple of 28 so
-        # ``_tokens_to_codes`` doesn't take the pad branch during capture
-        # (the pad branch creates a fresh tensor that would be graph-time
-        # churn we don't want in the cached trace).
-        tokens_per_window = self.config.snac_window_tokens
-        dummy = ARNodeInputs(
-            input_ids=torch.zeros((1, 4, 7), dtype=torch.long, device=device),
-            input_seq_len=tokens_per_window
-        )
+        """One capture per non-final window size of the chunk schedule."""
+        del tp_world_size
         return [
             BatchedCudaGraphConfig(
                 capture_graph_walk="snac_chunk",
-                single_request_inputs=dummy,
-                capture_batch_sizes=[1, 2, 4, 8, 16]
-            ),
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(
+                        (frames, self.config.tokens_per_frame), dtype=torch.long, device=device,
+                    ),
+                    # 1, not the window: batched buckets match on bs
+                    input_seq_len=1,
+                    kwargs={"start": 0, "end": frames},
+                ),
+                additional_key_info=frames,
+                capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
+                input_seq_dims={"codes_0": 0, "codes_1": 0, "codes_2": 0},
+            )
+            for frames in sorted(self.windows, reverse=True)
         ]
+
+    def _stream_chunk(self, input_metadata: InputMetadata | None) -> StreamChunkInfo | None:
+        return input_metadata.stream_chunks.get("new_token") if input_metadata else None
 
     def prepare_inputs(
         self,
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
+        is_final_stream_chunk: bool = False,
         **kwargs
     ) -> ARNodeInputs:
+        """One window's tokens -> ``(frames, 7)`` codes plus the frames to emit.
+
+        A trailing partial frame (the EOS token the LLM streams last) is not
+        audio and is dropped. Without stream chunk info the window is treated
+        as a whole utterance.
+        """
+        tpf = self.config.tokens_per_frame
+        right = self.config.snac_right_context_frames
         tokens = inputs["new_token"][0].flatten()
-        self._orig_seq_len[fwd_info.rid_handle] = tokens.shape[0]
+        chunk = self._stream_chunk(input_metadata)
+        frames = tokens.numel() // tpf
+        final = is_final_stream_chunk or chunk is None or chunk.is_final
+        start = max((chunk.context_items if chunk is not None else 0) // tpf - right, 0)
+        end = max(frames if final else frames - right, start)
+        codes = (tokens[: frames * tpf].view(frames, tpf) - self.config.custom_token_base_id - 10) % 4096
+        if frames == 0:
+            # a stream shorter than one frame: decode a silent frame, emit nothing
+            codes = torch.zeros((1, tpf), dtype=tokens.dtype, device=tokens.device)
         return ARNodeInputs(
-            input_ids=self._tokens_to_codes(tokens),
-            input_seq_len=tokens.shape[0]
+            input_ids=codes,
+            input_seq_len=1,
+            kwargs={"start": start, "end": end},
         )
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[ARNodeInputs]) -> bool:
         return True
+
+    def cg_key_info(
+        self,
+        graph_walk: str,
+        per_request_info: Mapping[str, CurrentForwardPassInfo],
+        per_request_input_metadata: Mapping[str, InputMetadata] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """The batch's window size in frames when all its windows share one."""
+        del graph_walk, kwargs
+        per_request_input_metadata = per_request_input_metadata or {}
+        frames = set()
+        for request_id in per_request_info:
+            chunk = self._stream_chunk(per_request_input_metadata.get(request_id))
+            if chunk is None:
+                return None
+            frames.add(chunk.num_items // self.config.tokens_per_frame)
+        return frames.pop() if len(frames) == 1 else None
 
     def preprocess(
         self,
@@ -282,17 +331,35 @@ class SNACDecoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
+        widths = tuple(item.input_ids.shape[0] for item in inputs)
+        width = max(widths)
         stacked = torch.stack([
-            input.input_ids for input in inputs
-        ], dim=0)
-        B, N = stacked.shape[0], stacked.shape[1]
-        flat = stacked.reshape(B * N, 4, 7)
-        codes_0, codes_1, codes_2 = self._extract_snac_codes(flat)
-        return {
-            "codes_0": codes_0.reshape(B, N * 4),
-            "codes_1": codes_1.reshape(B, N * 8),
-            "codes_2": codes_2.reshape(B, N * 16),
-        }
+            torch.nn.functional.pad(item.input_ids, (0, 0, 0, width - item.input_ids.shape[0]))
+            for item in inputs
+        ])
+        codes_0, codes_1, codes_2 = self._extract_snac_codes(stacked)
+        return {"codes_0": codes_0, "codes_1": codes_1, "codes_2": codes_2, "widths": widths}
+
+    def _decode(self, codes_0, codes_1, codes_2) -> torch.Tensor:
+        audio = self.snac_model.decode([codes_0, codes_1, codes_2])
+        return (audio.clamp(-1, 1) * 32767).to(torch.int16).squeeze(1)
+
+    def _decode_rows(self, codes_0, codes_1, codes_2, widths) -> torch.Tensor:
+        """``[B, widest * hop]`` int16 audio, each row decoded at its own width."""
+        if len(set(widths)) == 1:
+            return self._decode(codes_0, codes_1, codes_2)
+        hop = self.config.snac_hop_samples
+        audio = torch.zeros(
+            (codes_0.shape[0], max(widths) * hop), dtype=torch.int16, device=codes_0.device,
+        )
+        for width in sorted(set(widths)):
+            rows = torch.tensor(
+                [i for i, w in enumerate(widths) if w == width], device=codes_0.device,
+            )
+            audio[rows, : width * hop] = self._decode(
+                codes_0[rows, :width], codes_1[rows, : 2 * width], codes_2[rows, : 4 * width],
+            )
+        return audio
 
     def forward(
         self,
@@ -301,13 +368,10 @@ class SNACDecoderSubmodule(NodeSubmodule):
         codes_0: torch.Tensor,
         codes_1: torch.Tensor,
         codes_2: torch.Tensor,
+        widths: tuple[int, ...] = (),
+        **kwargs,
     ) -> NameToTensorList:
-        audio_hat = self.snac_model.decode([codes_0, codes_1, codes_2])
-        audio_slice = audio_hat[
-            :, :, self.config.snac_audio_slice_start:self.config.snac_audio_slice_end,
-        ]
-        audio_int16 = (audio_slice.clamp(-1, 1) * 32767).to(torch.int16)
-        return {"audio_chunk": audio_int16.squeeze(1)}
+        return {"audio_chunk": [self._decode_rows(codes_0, codes_1, codes_2, widths or (codes_0.shape[1],))[0]]}
 
     def forward_batched(
         self,
@@ -316,52 +380,48 @@ class SNACDecoderSubmodule(NodeSubmodule):
         codes_0: torch.Tensor,
         codes_1: torch.Tensor,
         codes_2: torch.Tensor,
-    )  -> dict[str, NameToTensorList]: # request_id to tensors
-        stacked = self.forward(
-            graph_walk=graph_walk,
-            engine_inputs=engine_inputs,
-            codes_0=codes_0,
-            codes_1=codes_1,
-            codes_2=codes_2
-        )
-
+        widths: tuple[int, ...] = (),
+        **kwargs,
+    ) -> dict[str, NameToTensorList]: # request_id to tensors
+        audio = self._decode_rows(codes_0, codes_1, codes_2, widths or (codes_0.shape[1],) * codes_0.shape[0])
         return {
-            rid: {name: [stacked[name][i].detach()] for name in stacked}
+            rid: {"audio_chunk": [audio[i].detach()]}
             for i, rid in enumerate(engine_inputs.request_ids)
         }
 
-    def _tokens_to_codes(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Pad raw token IDs to a multiple of 28 and convert to SNAC codes.
-
-        Args:
-            tokens: flat 1-D token tensor for one request.
-
-        Returns:
-            SNAC codes tensor of shape ``(num_frames, 4, 7)``.
-        """
-        remainder = tokens.numel() % 28
-        if remainder != 0:
-            pad_len = 28 - remainder
-            pad = tokens[-1].repeat(pad_len)
-            tokens = torch.cat([tokens, pad], dim=0)
-
-        tokens = tokens.view(-1, 4, 7)
-        return (tokens - self.config.custom_token_base_id - 10) % 4096
+    def postprocess(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        inputs: ARNodeInputs | None = None,
+        **kwargs
+    ):
+        """Keep the window's own frames. The geometry rides with the pass's
+        inputs: under speculative scheduling the next window of the request is
+        prepared before this one is postprocessed."""
+        if "audio_chunk" not in outputs:
+            return
+        if inputs is None:
+            raise ValueError("SNAC postprocess needs the pass's inputs for its window geometry")
+        hop = self.config.snac_hop_samples
+        audio = outputs["audio_chunk"][0].reshape(-1)
+        outputs["audio_chunk"][0] = audio[inputs.kwargs["start"] * hop : inputs.kwargs["end"] * hop]
 
     def _extract_snac_codes(self, mf: torch.Tensor):
-        """Split (N, 4, 7) codes into the three codebook levels.
+        """Split ``(B, frames, 7)`` codes into the three codebook levels.
 
         Returns:
             (codes_0, codes_1, codes_2) with shapes
-            ``(N, 4)``, ``(N, 8)``, ``(N, 16)``.
+            ``(B, frames)``, ``(B, 2 * frames)``, ``(B, 4 * frames)``.
         """
         codes_0 = mf[:, :, 0]
-        c1 = torch.index_select(mf, dim=2, index=self.idx_14)
-        codes_1 = c1.reshape(mf.shape[0], -1)
-        c2 = torch.index_select(mf, dim=2, index=self.idx_2356)
-        codes_2 = c2.reshape(mf.shape[0], -1)
+        codes_1 = torch.index_select(mf, dim=2, index=self.idx_14).reshape(mf.shape[0], -1)
+        codes_2 = torch.index_select(mf, dim=2, index=self.idx_2356).reshape(mf.shape[0], -1)
         return codes_0, codes_1, codes_2
 
     def can_use_cuda_graphs(self, batch, model_inputs):
-        return super().can_use_cuda_graphs(batch, model_inputs) \
-            and self.can_batch(batch, model_inputs)
+        widths = {item.input_ids.shape[0] for item in model_inputs}
+        return (
+            len(widths) == 1 and widths <= set(self.windows)
+            and super().can_use_cuda_graphs(batch, model_inputs)
+        )
