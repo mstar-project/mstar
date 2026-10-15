@@ -93,8 +93,9 @@ def _vae_node(model, dtype):
 
 def test_vae_stream_equals_a_whole_decode(model, design):
     """#429: the chunk-policy stream has the whole decode's length exactly and,
-    in float64, its samples; one patch less context than the receptive field
-    does not."""
+    in float64, its samples up to rounding; one patch less context than the
+    receptive field does not. Bit equality depends on the CPU thread count
+    (1e-15 at 1 to 4 threads, 0 at 8), the short context is off by about 6e-7."""
     from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
     from test.voxcpm2.streaming import stream_through
 
@@ -108,8 +109,8 @@ def test_vae_stream_equals_a_whole_decode(model, design):
         streamed = torch.cat(stream_through(node, patches, policy))
         cut = torch.cat(stream_through(node, patches, short))
     assert streamed.numel() == cut.numel() == whole.numel() == 14 * model.config.patch_samples
-    assert torch.equal(streamed, whole)
-    assert not torch.equal(cut, whole)
+    assert (streamed - whole).abs().max() <= 1e-12
+    assert (cut - whole).abs().max() > 1e-9
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
