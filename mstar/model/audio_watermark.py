@@ -11,9 +11,12 @@ A deployment turns it on in its YAML ``model_kwargs``::
 The watermark is Meta's AudioSeal (MIT code and weights, ``pip install
 'mstar-ai[audioseal]'``): a 14.7M-parameter causal conv/LSTM generator whose
 output, the same length as its input, is added to the waveform. The matching
-detector gives a per-sample probability, so a part of the audio can be checked
-on its own; on Qwen3-TTS speech even a single 80 ms codec chunk is detected
-(``python -m mstar.model.audio_watermark detect out.wav``).
+detector scores a clip by the fraction of its samples it finds marked
+(``python -m mstar.model.audio_watermark detect out.wav``). Embedding is
+streaming-exact chunk by chunk; detection on one chunk is not guaranteed. On
+generated speech even 80 ms chunks scored as marked, but on a synthetic
+harmonic tone 200 ms slices scored about 0.07 and 1 s slices about 0.8, so
+detect on whole utterances, or at least a few seconds of audio.
 
 Streaming. Audio leaves the engine in chunks, and a chunk-by-chunk watermark
 must equal the watermark of the whole utterance, or the boundaries click.
@@ -433,7 +436,7 @@ def _main(argv: list[str] | None = None) -> None:
     )
     sub = parser.add_subparsers(dest="command", required=True)
     detect = sub.add_parser("detect", help="score audio files for the AudioSeal watermark")
-    detect.add_argument("files", nargs="+")
+    detect.add_argument("files", nargs="+", help="whole utterances; a clip under a few seconds can miss the mark")
     detect.add_argument("--device", default="cpu")
     detect.add_argument("--threshold", type=float, default=0.5, help="score above which a file counts as marked")
     args = parser.parse_args(argv)
