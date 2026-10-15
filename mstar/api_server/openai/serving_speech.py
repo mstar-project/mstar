@@ -4,6 +4,9 @@ Non-streaming speech returns the full audio as a container blob (WAV by
 default). Streaming returns one open-ended response as the audio is produced:
 a WAV header followed by PCM16 frames, or, with ``response_format="pcm"``,
 the bare PCM16 frames that the OpenAI TTS clients (LiveKit, Pipecat) expect.
+A request streams when it sets ``stream`` or OpenAI's ``stream_format``, which
+is what the OpenAI SDK sends: ``"audio"`` streams the bytes as above, ``"sse"``
+wraps them in ``speech.audio.delta`` events closed by ``speech.audio.done``.
 ``/v1/audio/voices`` lists the ``voice`` values the served model accepts.
 
 Long inputs can be synthesized as ordered sentence chunks (one engine request
@@ -27,13 +30,14 @@ event loop is serving.
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import Callable
 
 from fastapi import HTTPException
 from fastapi.responses import Response
 
 from mstar.api_server import media_io
-from mstar.api_server.openai._util import release_unread, rid
+from mstar.api_server.openai._util import release_unread, rid, sse
 from mstar.api_server.openai.protocol import VoiceCard, VoiceList
 from mstar.api_server.openai.speech_chunking import split_sentences
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
@@ -85,9 +89,21 @@ def list_voices(api) -> VoiceList | None:
 
 async def create_speech(api, model_name, adapter, req, raw_request=None):
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
+    # OpenAI's own streaming switch, which its SDK (and so LiveKit's TTS plugin)
+    # sends instead of ``stream``. Popped so it does not reach the model as a kwarg.
+    stream_format = (req.model_extra or {}).pop("stream_format", None)
+    if stream_format not in (None, "audio", "sse"):
+        raise HTTPException(status_code=400, detail=f"stream_format must be 'audio' or 'sse', got {stream_format!r}")
+    # A compressed container (the SDK's default mp3) cannot be streamed here;
+    # stream_format then falls back to one whole body, which those clients read too.
+    stream = bool(req.stream) or (
+        stream_format is not None and (req.response_format or "wav").lower() in media_io.audio_formats(stream=True)
+    )
+    if not stream:
+        stream_format = None
     # before any upload or GPU work: a format we cannot produce is the client's error
     try:
-        fmt = media_io.check_audio_format(req.response_format, bool(req.stream), sample_rate)
+        fmt = media_io.check_audio_format(req.response_format, stream, sample_rate)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # blocking work (base64 decode, file write, an allowed remote fetch) off the loop
@@ -111,14 +127,14 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):
                 input_modalities=args.input_modalities,
                 output_modalities=args.output_modalities,
                 model_kwargs=_chunk_kwargs(args.model_kwargs, index),
-                streaming=bool(req.stream),
+                streaming=stream,
                 request_id=chunk_id,
                 model=req.model,
             )
 
         lookahead = max(1, int(getattr(adapter, "speech_chunk_lookahead", 2)))
         pending = [submit(i) for i in range(min(lookahead, len(chunks)))]
-        if req.stream:
+        if stream:
             raw_pcm = fmt == "pcm"
             # a request the engine rejects gets its status, not an empty WAV
             try:
@@ -134,12 +150,16 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):
                 media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
 
             stream_owns_uploads = True
+            body = _stream_pcm(api, submit, len(chunks), pending, first_iter, sample_rate,
+                               with_wav_header=not raw_pcm, file_paths=args.file_paths)
+            if stream_format == "sse":
+                return ReleasingStreamingResponse(
+                    _as_sse(body), release=release_unstarted,
+                    media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
+                )
             return ReleasingStreamingResponse(
-                _stream_pcm(api, submit, len(chunks), pending, first_iter, sample_rate,
-                            with_wav_header=not raw_pcm, file_paths=args.file_paths),
-                release=release_unstarted,
-                media_type="audio/pcm" if raw_pcm else "audio/wav",
-                headers={"Cache-Control": "no-cache"},
+                body, release=release_unstarted,
+                media_type="audio/pcm" if raw_pcm else "audio/wav", headers={"Cache-Control": "no-cache"},
             )
 
         pcm_parts: list[bytes] = []
@@ -164,6 +184,19 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):
             media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
     audio_bytes, mime = media_io.pcm16_to_container(b"".join(pcm_parts), sample_rate, fmt)
     return Response(content=audio_bytes, media_type=mime)
+
+
+async def _as_sse(audio):
+    """OpenAI's ``stream_format="sse"``: one ``speech.audio.delta`` per piece of
+    audio (base64, in ``response_format``), then ``speech.audio.done``."""
+    try:
+        async for data in audio:
+            yield sse({"type": "speech.audio.delta", "audio": base64.b64encode(data).decode("ascii")})
+        yield sse({"type": "speech.audio.done"})
+    finally:
+        # A client that hangs up closes this generator only; closing ``audio``
+        # now runs its release of the pieces still in flight.
+        await audio.aclose()
 
 
 def _is_error(chunk) -> bool:
