@@ -9,7 +9,7 @@ import torch
 from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, PublishedInfo, Resource
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.kv.keys import fingerprint
-from mstar.engine.resources.kv.plan import KVPlanOutputs, SequenceView
+from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import (
     PosBackend,
     PositionConfig,
@@ -195,6 +195,20 @@ class RopeManager(PositionManager):
             return None
         return PublishedPositionInfo(counters=dict(counters))
 
+    def publish_snapshot_for_step(
+        self, request_id: str, node_name: str | None, graph_walk: str | None,
+    ):
+        del node_name, graph_walk
+        counters = self._counters.get(request_id)
+        return tuple(counters.items()) if counters else None
+
+    def publish_from_snapshot(
+        self, request_id: str, snapshot, node_name: str | None,
+        graph_walk: str | None,
+    ):
+        del request_id, node_name, graph_walk
+        return PublishedPositionInfo(counters=dict(snapshot)) if snapshot else None
+
     def admit_retrieve(
         self, rid: str, node_name: str, graph_walk: str,
         published: "PublishedPositionInfo | None",
@@ -288,7 +302,10 @@ class RopeManager(PositionManager):
         for plan_label, kv_out in plan_outputs.items():
             pos_ids = self._explicit_pos_ids(step, plan_label, len(plan_outputs))
             if pos_ids is None:
-                pos_ids = self._build_pos_ids(kv_out.views, plan_label, lease)
+                rows = kv_out.rows
+                if rows is None:
+                    rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
+                pos_ids = self._build_pos_ids(rows, plan_label, lease)
             pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
         self._preplanned = ctx.is_preplan
         return pos_ids_out
@@ -360,9 +377,10 @@ class RopeManager(PositionManager):
         return buffer
 
     def _build_pos_ids(
-        self, views: list[SequenceView], plan_label: str, lease,
+        self, rows, plan_label: str, lease,
     ) -> torch.Tensor:
-        """step positions in KV plan order from stream counters
+        """step positions in KV plan order from stream counters; ``rows`` is
+        ``(request_id, label, to_compute)`` per view in plan order
 
         Under a lease these go into pinned memory so `_place`'s `non_blocking`
         copy is really asynchronous; from pageable memory the host waits. The
@@ -370,12 +388,12 @@ class RopeManager(PositionManager):
         """
         block = self._config.scheme == PosScheme.BLOCK
         pos_ids: list[int] = []
-        for view in views:
-            start = self.position(view.request_id, view.label)
+        for rid, label, to_compute in rows:
+            start = self.position(rid, label)
             if block:
-                pos_ids.extend([start] * view.to_compute)
+                pos_ids.extend([start] * to_compute)
             else:
-                pos_ids.extend(range(start, start + view.to_compute))
+                pos_ids.extend(range(start, start + to_compute))
         if lease is None:
             return torch.tensor(pos_ids, dtype=torch.long)
         key = CGSlotKey(

@@ -63,6 +63,7 @@ from mstar.model.qwen3_5.config import (
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import drop_stop_tokens
+from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
 
@@ -425,8 +426,8 @@ class Qwen3_5DenseModel(Model):
             # a chat the template refuses (a system message after the first turn,
             # no user turn) is the client's to fix: a 400, not a 500
             raise ValueError(f"Qwen3.5's chat template refused the chat: {exc}") from exc
-        input_ids = self.tokenizer(text, return_tensors="pt").input_ids[0]
-
+        # a long prompt is encoded as parallel chunks, identical ids
+        input_ids = torch.tensor(encode_ids(self.tokenizer, text), dtype=torch.long)
         spans = find_media_spans(input_ids, self._placeholder_specs())
         segments = split_around_spans(input_ids, spans)
         check_plan(prefill_plan(parts), spans, len(segments))

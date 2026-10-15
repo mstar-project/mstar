@@ -67,9 +67,18 @@ class ToyDenoise(DenoiseLoopSubmodule):
         return euler_step(latents, velocity, sigma, sigma_next)
 
 
+_HANDLES: dict[str, int] = {}
+
+
+def _handle(rid: str) -> int:
+    """A stable integer handle per rid, as the worker stamps at add_request."""
+    return _HANDLES.setdefault(rid, len(_HANDLES))
+
+
 def _info(rid: str, k: int, steps: int = 4, tokens: int = 8, seed: int = 0) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id=rid, graph_walk=WALK, fwd_index=k, random_seed=seed, max_tokens=0,
+        rid_handle=_handle(rid),
         step_metadata={"tokens": tokens, "num_inference_steps": steps},
         dynamic_loop_iter_counts={LOOP: k},
     )
@@ -90,7 +99,7 @@ def test_iteration_zero_seeds_from_request_seed_and_is_repeatable():
     assert torch.equal(a.tensor_inputs[LATENTS], b.tensor_inputs[LATENTS])
     assert not torch.equal(a.tensor_inputs[LATENTS], c.tensor_inputs[LATENTS])
     assert a.input_seq_len == 8 + 3 and a.resource_step_info == (8, 3)
-    state = sub.request_state("r0")
+    state = sub.request_state(_handle("r0"))
     assert state["num_steps"] == 4 and state["schedule"].num_steps == 4
     # step scalars come off the device-resident schedule
     assert torch.equal(a.tensor_inputs["sigma"], state["sigmas"][0:1])
@@ -103,7 +112,7 @@ def test_later_iterations_take_the_loop_back_latents_and_step_k():
     x = torch.ones(8, 4)
     out = sub.prepare_inputs(WALK, _info("r0", 2), _inputs(x))
     assert out.tensor_inputs[LATENTS] is x
-    sched = sub.request_state("r0")["schedule"]
+    sched = sub.request_state(_handle("r0"))["schedule"]
     assert torch.equal(out.tensor_inputs["sigma"], sched.sigmas[2:3])
     assert torch.equal(out.tensor_inputs["sigma_next"], sched.sigmas[3:4])
 
@@ -125,8 +134,8 @@ def test_overshoot_iteration_is_vetoed():
 def test_check_stop_boundary(steps, k, expect):
     sub = ToyDenoise()
     sub.prepare_inputs(WALK, _info("r0", 0, steps=steps), _inputs())
-    assert (LOOP in sub.check_stop("r0", _info("r0", k, steps=steps), {})) is expect
-    assert sub.check_stop("unknown", _info("unknown", k), {}) == set()
+    assert (LOOP in sub.check_stop(_handle("r0"), _info("r0", k, steps=steps), {})) is expect
+    assert sub.check_stop(_handle("unknown"), _info("unknown", k), {}) == set()
 
 
 def test_can_batch_only_equal_shapes():
@@ -153,7 +162,7 @@ def test_preprocess_stacks_and_forward_batched_splits_rows():
     assert set(out) == {"a", "b"}
     assert out["a"][LATENTS][0].shape == (8, 4)
     # row b took its own sigma pair (step 1 of a 6-step schedule)
-    sched_b = sub.request_state("b")["schedule"]
+    sched_b = sub.request_state(_handle("b"))["schedule"]
     expected_b = euler_step(torch.ones(8, 4), -torch.ones(8, 4) * 0.5, sched_b.sigmas[1], sched_b.sigmas[2])
     assert torch.equal(out["b"][LATENTS][0], expected_b)
     assert sub.calls[-1] == ((2, 8, 4), (2,), (2, 1, 1), (2, 3))
@@ -321,7 +330,7 @@ def test_a_declared_step_scalar_is_sliced_reshaped_and_popped():
     # sliced at each row's own step index, and offset=1 still reads k + 1
     assert torch.equal(a.tensor_inputs["guidance"], torch.tensor([0.0]))
     assert torch.equal(b.tensor_inputs["guidance"], torch.tensor([2.0]))
-    sched_b = sub.request_state("b")["schedule"]
+    sched_b = sub.request_state(_handle("b"))["schedule"]
     assert torch.equal(b.tensor_inputs["sigma_next"], sched_b.sigmas[3:4])
 
     engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
@@ -335,7 +344,7 @@ def test_a_declared_step_scalar_is_sliced_reshaped_and_popped():
     cfg = GuidedDenoise(capture_buckets=[(WALK, (8, 3))]).get_cuda_graph_configs(torch.device("cpu"))[0]
     assert torch.equal(cfg.single_request_inputs.tensor_inputs["guidance"], torch.tensor([3.5]))
     # the base staged it off the schedule, so nothing had to touch the state
-    assert torch.equal(sub.request_state("a")["guidances"], torch.arange(4.0))
+    assert torch.equal(sub.request_state(_handle("a"))["guidances"], torch.arange(4.0))
 
 
 def test_a_step_scalar_the_schedule_does_not_carry_says_so():
@@ -387,3 +396,92 @@ def test_ragged_for_binds_the_label():
     assert ToyDenoise().ragged_for("image") is None  # no resource declared -> SDPA
     unbound = TwoSpanDenoise(attn_resource_key="dit_attn")
     assert unbound.ragged_for("image") is None  # declared but not bound yet -> SDPA
+
+
+def test_cg_key_info_accepts_the_contract_the_engine_calls_it_with():
+    """``Engine.reserve_replay_slot`` passes ``per_request_input_metadata`` by
+    keyword. This override did not take it, so every scaffold model raised
+    TypeError on the first captured replay -- reachable only with cuda_graph on,
+    on a GPU, which no test covered. Bind against the BASE signature rather than
+    a hardcoded list, so a future parameter breaks this test and not serving."""
+    import inspect
+
+    from mstar.model.submodule_base import NodeSubmodule
+
+    base = inspect.signature(NodeSubmodule.cg_key_info)
+    ours = inspect.signature(ToyDenoise.cg_key_info)
+    args = {name: None for name in base.parameters if name not in ("self", "kwargs")}
+    ours.bind(ToyDenoise(), **args)  # raises TypeError if the override narrowed it
+
+    # and the call as the engine actually spells it
+    sub = ToyDenoise()
+    assert sub.cg_key_info(
+        WALK, {"a": _info("a", 0)}, per_request_input_metadata={"a": object()},
+    ) == (8, 3)
+
+
+def test_check_stop_finds_the_schedule_under_the_engines_key():
+    """The loop's state must be keyed by the integer rid_handle, because that is
+    what the engine hands check_stop. Keyed by request_id instead, check_stop
+    missed, returned "do not stop", and the loop ran forever -- which hung every
+    served request on both klein and Z-Image."""
+    sub = ToyDenoise()
+    info = _info("r0", 0, steps=4)
+    sub.prepare_inputs(WALK, info, _inputs())
+
+    # the engine calls check_stop with batch.request_ids, i.e. the handle
+    assert info.rid_handle in sub.request_states
+    assert sub.check_stop(info.rid_handle, _info("r0", 3, steps=4), {}) == {LOOP}
+    assert sub.check_stop(info.rid_handle, _info("r0", 2, steps=4), {}) == set()
+
+    # the wire string is NOT the key: a lookup by it finds nothing, and the
+    # scaffold warns rather than silently declining to stop
+    assert info.request_id not in sub.request_states
+
+
+class ToyRefine(ToyDenoise):
+    """A loop that starts from the latents routed to it (a refinement stage)."""
+
+    def initial_loop_back(self, fwd_info, inputs, bucket_key, generator):
+        return {LATENTS: inputs["init"][0] + 0.1 * torch.randn(bucket_key[0], 4, generator=generator)}
+
+
+def test_initial_loop_back_defaults_to_seeding_from_noise():
+    sub = ToyDenoise()
+    gen = torch.Generator().manual_seed(7)
+    got = sub.prepare_inputs(WALK, _info("ra", 0, seed=7), _inputs()).tensor_inputs[LATENTS]
+    assert torch.equal(got, torch.randn(8, 4, generator=gen))
+
+
+def test_initial_loop_back_sees_the_steps_inputs_on_iteration_zero_only():
+    sub = ToyRefine()
+    init = torch.full((8, 4), 3.0)
+    first = sub.prepare_inputs(WALK, _info("rb", 0, seed=1), {**_inputs(), "init": [init]})
+    expected = init + 0.1 * torch.randn(8, 4, generator=torch.Generator().manual_seed(1))
+    assert torch.equal(first.tensor_inputs[LATENTS], expected)
+    # past iteration 0 the loop-back edge is carried as usual; "init" is not read again
+    carried = torch.zeros(8, 4)
+    later = sub.prepare_inputs(WALK, _info("rb", 1, seed=1), _inputs(carried))
+    assert torch.equal(later.tensor_inputs[LATENTS], carried)
+
+
+def test_a_second_walk_through_the_node_gets_its_own_shape_and_schedule():
+    """Two stages of one request run the node in successive walks (draft, then refine);
+    the second must not reuse the first's cached schedule or bucket."""
+    sub = ToyDenoise()
+    sub.prepare_inputs(WALK, _info("rs", 0, steps=4, tokens=8), _inputs())
+    refine = CurrentForwardPassInfo(
+        request_id="rs", graph_walk="refine", fwd_index=0, random_seed=0, max_tokens=0, rid_handle=_handle("rs"),
+        step_metadata={"tokens": 16, "num_inference_steps": 2}, dynamic_loop_iter_counts={LOOP: 0},
+    )
+    out = sub.prepare_inputs("refine", refine, _inputs())
+    state = sub.request_state(_handle("rs"))
+    assert state["num_steps"] == 2 and state["bucket_key"] == (16, 3)
+    assert out.tensor_inputs[LATENTS].shape == (16, 4)
+    assert sub.check_stop(_handle("rs"), dataclasses_replace(refine, dynamic_loop_iter_counts={LOOP: 1}), {}) == {LOOP}
+
+
+def dataclasses_replace(info, **changes):
+    import dataclasses
+
+    return dataclasses.replace(info, **changes)

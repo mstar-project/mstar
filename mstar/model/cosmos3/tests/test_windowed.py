@@ -477,9 +477,13 @@ def _tracing_vae():
 
 
 def _ar_decoder(monkeypatch):
+    """The AR decoder on its re-decode path, default layout (the tracing stub
+    has no causal decoder; test_windowed_decode.py covers the warm path)."""
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     cfg = Cosmos3Config()
     cfg.windowed_decode_context_latents = 3
+    cfg.windowed_decode_warm_cache = False
+    cfg.vae_decode_channels_last = False
     sub = Cosmos3VAEDecoderARSubmodule(_tracing_vae(), cfg)
     sub._decode_dtype_cached = torch.float32
     return sub
