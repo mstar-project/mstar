@@ -253,9 +253,9 @@ def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> 
         segment["total_size"] for segment in torch.cuda.memory_snapshot(pool)
     )
     del graph, outputs
-    if taken is None:
-        # a capture that never ended keeps its stream's cuBLAS workspace in the pool; no real graph uses it yet
-        torch._C._cuda_clearCublasWorkspaces()
+    # A capture that never ended, or any capture before torch 2.12, keeps its stream's cuBLAS
+    # workspace in the pool. No real graph uses it yet.
+    torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
     return taken
 
