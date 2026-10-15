@@ -14,9 +14,6 @@ from mstar.engine.resources.step import Segment, SlotLease, StepContext
 
 
 class FlashInferRaggedManager(RaggedAttnManager):
-    def can_capture(self) -> bool:
-        return self._device.type == "cuda"
-
     def __init__(
         self,
         device: torch.device,
