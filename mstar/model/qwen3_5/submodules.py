@@ -17,7 +17,6 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import (
-    distribute_tokens,
     BatchedCudaGraphConfig,
     CudaGraphConfig,
     PackedCudaGraphConfig,
@@ -25,6 +24,7 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseCudaGraphConfig,
     PiecewisePackedConfig,
+    distribute_tokens,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.attn.base import AttentionManager
