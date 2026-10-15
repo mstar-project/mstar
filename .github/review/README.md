@@ -1,6 +1,8 @@
 # Automated PR review
 
-An advisory LLM reviewer runs on every non-draft PR and posts a single comment. It is not a merge gate and does not submit GitHub reviews.
+An advisory LLM reviewer runs on every non-draft PR. It posts each finding as an inline comment, tagged P0-P3, plus one summary comment that covers the PR description and any open questions, and it updates that summary on each push. It is not a merge gate and does not submit GitHub reviews.
+
+The automatic run is the `light` mode (P0-P2 only). Applying the `ai-review-thorough` label runs one `thorough` review, which also reports P3 improvements and design questions.
 
 | File | Role |
 | --- | --- |
@@ -19,7 +21,7 @@ Procedural knowledge — how to run a benchmark, how to debug a hang — belongs
 ## One-time setup
 
 1. Add `ANTHROPIC_API_KEY` as an **organization** secret on `mstar-project` (Settings → Secrets and variables → Actions), scoped to this repository. Bill it to a project account rather than a personal one so usage is attributable.
-2. Create a `skip-ai-review` label. Applying it to a PR skips the reviewer.
+2. Create a `skip-ai-review` label (applying it to a PR skips the reviewer) and an `ai-review-thorough` label (applying it runs one thorough review).
 3. Nothing else. The workflow is advisory, so it needs no branch-protection change.
 
 Until the secret exists the job logs a warning and exits green, so the workflow can land first.
@@ -36,8 +38,8 @@ Do this before anyone comes to rely on it. The failure mode for a review bot is 
 Pick ten or so merged PRs: a few where a human reviewer caught a genuine defect, a few that were clean, and a couple of big refactors. Then:
 
 - **Missed a real defect** → the invariant it should have cited is missing or too vague in `AGENTS.md`. Add it with the concrete failure mode, not as a principle.
-- **Reported something nobody would ask for a change on** → tighten the "Do not report" list in `review-prompt.md`. Being specific about the *category* works better than lowering a severity dial.
-- **Rambled or padded to look useful** → the bar section is the lever. Zero findings must read as a success.
+- **Reported something nobody would ask for a change on** → tighten the "Don't report" list in `review-prompt.md`. Being specific about the *category* works better than lowering a severity dial.
+- **Rambled or padded to look useful** → the Findings criteria in `review-prompt.md` are the lever. Zero findings must read as a success.
 
 Track hit rate across the sample as you change things; it is easy to fix one case and regress two.
 
@@ -49,11 +51,11 @@ Reasonable criteria, once you have replay data:
 - It has caught at least one defect that human review missed.
 - Median runtime under ten minutes, and it does not flake.
 
-Even then, prefer keeping it advisory and switching to inline review comments first (`classify_inline_comments: true` in the action) — that improves usefulness without giving a non-deterministic check veto power over a merge.
+Even then, prefer keeping it advisory: a non-deterministic check shouldn't have veto power over a merge.
 
 ## Cost control
 
-Current levers, roughly in order of effect: draft PRs are skipped; `concurrency` cancels superseded runs when a PR is pushed to again; diffs over 4,000 lines get a triage instruction instead of full coverage; `--max-turns 40` caps a runaway session; the model is pinned to Sonnet in the workflow. Raise the model to Opus only if replay shows Sonnet missing defects it should catch.
+Current levers, roughly in order of effect: draft PRs are skipped; `concurrency` cancels superseded runs when a PR is pushed to again; in light mode, diffs over about 4,000 lines are triaged rather than covered in full; `--max-turns 40` caps a runaway session; the model is pinned to Sonnet in the workflow. Raise the model to Opus only if replay shows Sonnet missing defects it should catch.
 
 ## Threat model
 
