@@ -37,9 +37,11 @@ def autocast_scope(dtype: torch.dtype | None, device_type: str = "cuda"):
 
 
 def agree_across_ranks(
-    comm_group: JointGroups | None, flags: list[bool], device: torch.device,
-) -> list[bool]:
-    """AND each flag across every rank of the joint group.
+    comm_group: JointGroups | None, values: list[int], device: torch.device,
+    reduce: Callable[..., torch.Tensor],
+) -> list[int]:
+    """Reduce each of ``values`` over every rank of the joint group with
+    ``reduce``. `torch.amin` ANDs flags and `torch.amax` takes the largest.
 
     Capture failure is per-rank: a rank that keeps a graph another rank
     dropped replays it while the other runs eager, which hangs as soon as the
@@ -49,29 +51,15 @@ def agree_across_ranks(
     groups = [] if comm_group is None else [
         comm_group.tp_group, comm_group.sp_group
     ]
-    if not flags or all(group.world_size == 1 for group in groups):
-        return flags
-    gathered = torch.tensor(flags, dtype=torch.int64, device=device)
-    for group in groups:
-        if group.world_size > 1:
-            # all_gather is rank-major, so the min down dim 0 is the AND
-            gathered = group.all_gather(gathered, dim=0).reshape(
-                group.world_size, -1
-            ).amin(dim=0)
-    return [bool(value) for value in gathered.tolist()]
-
-
-def most_across_ranks(
-    comm_group: JointGroups | None, values: list[int], device: torch.device,
-) -> list[int]:
-    """The largest of each value on any rank of the joint group; see `agree_across_ranks`."""
-    groups = [] if comm_group is None else [comm_group.tp_group, comm_group.sp_group]
     if not values or all(group.world_size == 1 for group in groups):
         return values
     gathered = torch.tensor(values, dtype=torch.int64, device=device)
     for group in groups:
         if group.world_size > 1:
-            gathered = group.all_gather(gathered, dim=0).reshape(group.world_size, -1).amax(dim=0)
+            # all_gather is rank-major, so dim 0 runs over the ranks
+            gathered = reduce(group.all_gather(gathered, dim=0).reshape(
+                group.world_size, -1
+            ), dim=0)
     return gathered.tolist()
 
 
@@ -642,7 +630,7 @@ class CudaGraphRunner:
         all, and plan on the same kind of cost. With no forward and no barrier:
         sizing ran the forwards, and a capture runs no collective.
         """
-        if not most_across_ranks(self._comm_group, [int(wanted)], self._device)[0]:
+        if not agree_across_ranks(self._comm_group, [int(wanted)], self._device, torch.amax)[0]:
             return self._capture_costs
         for spec in self.prepare_for_capture():
             if spec.slot != 0 or spec.bucket not in self._lent:
@@ -684,9 +672,9 @@ class CudaGraphRunner:
         # costliest first, so the graphs after it fit in what it leaves free; by
         # the most each costs on any rank, so every rank warms up in one order
         buckets = list(dict.fromkeys(spec.bucket for spec in slot_specs))
-        costs = dict(zip(buckets, most_across_ranks(self._comm_group, [
+        costs = dict(zip(buckets, agree_across_ranks(self._comm_group, [
             self._capture_costs[bucket].graph if bucket in planned else 0 for bucket in buckets
-        ], self._device), strict=True))
+        ], self._device, torch.amax), strict=True))
 
         # bucket -> slot index -> (spec, captured slot). Registration is
         # deferred to a whole bucket at a time: its slots are double buffers of
@@ -782,7 +770,7 @@ class CudaGraphRunner:
         agreed = agree_across_ranks(
             self._comm_group,
             [len(captured.get(key, ())) == self._num_slots for key in order],
-            self._device,
+            self._device, torch.amin,
         )
         return {key for key, ok in zip(order, agreed, strict=True) if ok}
 
@@ -1548,7 +1536,7 @@ class PiecewiseCudaGraphRunner:
     def size_lent_captures(self, wanted: bool) -> dict[BucketKey, CaptureCost]:
         """Capture every shape a lender sized, thrown away, if ``wanted`` here
         or on another rank; see `CudaGraphRunner.size_lent_captures`."""
-        if not most_across_ranks(self._comm_group, [int(wanted)], self._device)[0]:
+        if not agree_across_ranks(self._comm_group, [int(wanted)], self._device, torch.amax)[0]:
             return self._capture_costs
         for shape in self.prepare_for_capture():
             bucket = self._bucket(shape)
@@ -1605,12 +1593,12 @@ class PiecewiseCudaGraphRunner:
         )
         # as in `CudaGraphRunner.warmup_and_capture`: what every rank planned, costliest first
         planned_everywhere = agree_across_ranks(
-            self._comm_group, [self._bucket(shape) in planned for shape in ordered], self._device,
+            self._comm_group, [self._bucket(shape) in planned for shape in ordered], self._device, torch.amin,
         )
-        costs = most_across_ranks(self._comm_group, [
+        costs = agree_across_ranks(self._comm_group, [
             self._capture_costs[self._bucket(shape)].graph if ok else 0
             for shape, ok in zip(ordered, planned_everywhere, strict=True)
-        ], self._device)
+        ], self._device, torch.amax)
         captured = [False] * len(ordered)
         for i in sorted(range(len(ordered)), key=lambda i: -costs[i]):
             shape = ordered[i]
@@ -1645,7 +1633,7 @@ class PiecewiseCudaGraphRunner:
         # `ordered` comes from the config, so every rank agrees on the order
         for shape, ok in zip(
             ordered,
-            agree_across_ranks(self._comm_group, captured, self._device),
+            agree_across_ranks(self._comm_group, captured, self._device, torch.amin),
             strict=True,
         ):
             if ok:
