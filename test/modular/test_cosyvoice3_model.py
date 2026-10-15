@@ -653,6 +653,35 @@ def test_flow_batches_rows_of_different_lengths_like_single_rows():
         torch.testing.assert_close(mel, flow.solve_rows([row], 3)[0], rtol=0, atol=1e-10)
 
 
+def test_flow_node_solves_without_tf32_and_restores_the_engine_setting(monkeypatch):
+    cfg = _tiny_config()
+    flow = _random_flow(cfg)
+    node = FlowSubmodule(flow, None, cfg)
+    seen = []
+    solve = flow.solve_rows
+
+    def spy(rows, steps):
+        seen.append((torch.get_float32_matmul_precision(), torch.backends.cudnn.allow_tf32))
+        if len(seen) == 2:
+            raise RuntimeError("boom")
+        return solve(rows, steps)
+
+    monkeypatch.setattr(flow, "solve_rows", spy)
+    voice = _voice(cfg, prompt_tokens=10)
+    prior = torch.get_float32_matmul_precision(), torch.backends.cudnn.allow_tf32
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        node._run([0], [torch.randint(0, 40, (12,))], [voice], [True], [2])
+        with pytest.raises(RuntimeError, match="boom"):
+            node._run([1], [torch.randint(0, 40, (12,))], [voice], [True], [2])
+        assert seen == [("highest", False)] * 2
+        assert (torch.get_float32_matmul_precision(), torch.backends.cudnn.allow_tf32) == ("high", True)
+    finally:
+        torch.set_float32_matmul_precision(prior[0])
+        torch.backends.cudnn.allow_tf32 = prior[1]
+
+
 # -- HiFT -----------------------------------------------------------------------------
 
 

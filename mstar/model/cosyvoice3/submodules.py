@@ -13,6 +13,7 @@ Reference behaviour these mirror: ``cosyvoice/cli/frontend.py``
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Mapping
 from typing import Any
@@ -352,6 +353,21 @@ def filter_tokens(raw: torch.Tensor, config: CosyVoice3Config) -> torch.Tensor:
     return tokens[keep]
 
 
+@contextlib.contextmanager
+def _without_tf32():
+    """float32 matmuls and convolutions at full precision. The engine enables
+    TF32 process-wide, and the guided flow solve amplifies its rounding far
+    beyond float32's."""
+    matmul, cudnn = torch.get_float32_matmul_precision(), torch.backends.cudnn.allow_tf32
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(matmul)
+        torch.backends.cudnn.allow_tf32 = cudnn
+
+
 class FlowSubmodule(NodeSubmodule):
     """Settles the stream's tokens in whole attention chunks and emits their mel.
 
@@ -453,10 +469,11 @@ class FlowSubmodule(NodeSubmodule):
             if row is not None:
                 rows.append((i, row))
         mels: dict[int, torch.Tensor] = {}
-        for steps in sorted({n_timesteps[i] for i, _ in rows}):
-            group = [(i, row) for i, row in rows if n_timesteps[i] == steps]
-            for (i, _), mel in zip(group, self.flow.solve_rows([row for _, row in group], steps), strict=True):
-                mels[i] = mel
+        with _without_tf32():
+            for steps in sorted({n_timesteps[i] for i, _ in rows}):
+                group = [(i, row) for i, row in rows if n_timesteps[i] == steps]
+                for (i, _), mel in zip(group, self.flow.solve_rows([row for _, row in group], steps), strict=True):
+                    mels[i] = mel
         out = []
         n_mel = self.config.flow.output_size
         for i, (rid, final) in enumerate(zip(rids, finals, strict=True)):
