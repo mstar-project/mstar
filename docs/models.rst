@@ -7,10 +7,6 @@ representative Hugging Face identifier.
 
 Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MODELS``).
 
-Graph capture uses the accelerator graph API for CUDA and XPU. Each model's attention
-and sampling kernels determine which devices it can capture on; see
-:doc:`adding_models` and use a configuration for your device.
-
 .. list-table:: Registered model families
    :header-rows: 1
    :widths: 14 34 30
@@ -127,42 +123,6 @@ Notes
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
 - To add a new family, see :doc:`adding_models`.
-
-Accelerator graph capture
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-BAGEL enables accelerator graph capture by default. Its XPU deployment configs
-disable capture with this option:
-
-.. code-block:: yaml
-
-   model_kwargs:
-     accelerator_graph: false
-
-BAGEL's LLM uses matching CUDA/XPU capture recipes for decode (CFG on/off)
-and text prefill (CFG off). Image-generation walks run eagerly.
-
-Waypoint and Cosmos3 enable their supported accelerator graph captures by
-default. To disable capture for these models, set this deployment option:
-
-.. code-block:: yaml
-
-   model_kwargs:
-     accelerator_graph: false
-
-Restart the server after changing this option. Model ``torch.compile`` settings
-are separate from the graph capture switch.
-
-For BAGEL, the switch also controls the optional ViT block loop capture. Optional
-ViT capture is enabled separately with ``MSTAR_VIT_ACCELERATOR_GRAPH=1`` and
-also requires ``accelerator_graph: true``.
-
-For Waypoint, this controls the VAE encoder and fused DiT/decoder captures.
-``capture_dit_prime`` controls prime capture when ``accelerator_graph`` is true.
-
-For Cosmos3, this disables denoise, understanding-tower prefill and reasoner
-decode captures. ``COSMOS3_DISABLE_ACCELERATOR_GRAPH`` and
-``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH`` provide environment controls.
 
 OmniVoice notes
 ~~~~~~~~~~~~~~~
@@ -831,7 +791,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 ``attention_backend``
    ``sdpa`` (default) is the reference kernel, cuDNN on an H100 and measured as fast as
    FlashInfer in the served path. ``flashinfer`` runs the DiT's joint attention on the
-   engine's ragged FlashInfer resource; both support accelerator graph replay.
+   engine's ragged FlashInfer resource; both are CUDA-graph replayable.
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.
@@ -856,7 +816,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
      distilled sampler amplifies the last bit of inductor's own reductions and activation
      decompositions.
 
-``accelerator_graph``, ``capture_sizes``, ``capture_batch_sizes``
+``cuda_graph``, ``capture_sizes``, ``capture_batch_sizes``
    The denoise step, Euler update included, is captured per listed ``[height, width]``
    and batch size. Other shapes run the eager batched path.
 
