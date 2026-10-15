@@ -1140,6 +1140,10 @@ class Qwen3OmniModel(Model):
         # (``ThinkerSubmodule._wrap_audio_input``) and the encoder embeddings
         # replace the pad tokens, so the Thinker's spans are what lies between
         # the placeholders.
+        #
+        # A voice persona as the system prompt keeps the Thinker's text plain
+        # enough for the Talker to say, so a client that sends its own system
+        # message and wants audio puts the persona text in that message.
         messages = messages_from_parts(parts, default_system=(
             "You are Qwen, a virtual human developed by the "
             "Qwen team, Alibaba Group, capable of perceiving "
