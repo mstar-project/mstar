@@ -288,8 +288,8 @@ class VoxCPM2Model(Model):
         Voice design: ``instruct`` (or OpenAI's ``instructions``) becomes the
         ``(description)`` prefix of the text, the reference's format.
         """
-        text = re.sub(r"\s+", " ", (prompt or "").replace("\n", " ")).strip()
-        if not text:
+        text = (prompt or "").replace("\n", " ")
+        if not text.strip():
             raise ValueError("VoxCPM2 requires a non-empty text prompt")
         if set(output_modalities) != {"audio"}:
             raise ValueError("VoxCPM2 supports audio output only")
@@ -313,7 +313,9 @@ class VoxCPM2Model(Model):
             raise ValueError(f"VoxCPM2 needs min_len >= 0 and 1 <= max_new_tokens <= {self.config.max_len}")
 
         clips = (tensors or {}).get("audio_inputs", [])
-        ref_text = str(kwargs.get("ref_text") or "").strip()
+        ref_text = str(kwargs.get("ref_text") or "")
+        if not ref_text.strip():
+            ref_text = ""
         if "audio" in input_modalities or clips:
             if len(clips) != 1:
                 raise ValueError(f"VoxCPM2 clones a voice from exactly one reference clip, got {len(clips)}")
@@ -328,7 +330,8 @@ class VoxCPM2Model(Model):
             mode = MODE_ZERO_SHOT
 
         target_ids = self.tokenize(text)
-        ids = (self.tokenize(ref_text) if mode == MODE_REF_CONTINUATION else []) + target_ids
+        # the reference tokenizes the transcript and the target as one string, with no separator
+        ids = self.tokenize(ref_text + text) if mode == MODE_REF_CONTINUATION else list(target_ids)
         ids.append(AUDIO_START_TOKEN)
         max_patches = self.config.max_patches(len(target_ids), max_len)
         prompt_len = len(ids) + (ref_patches + 2 if mode != MODE_ZERO_SHOT else 0)

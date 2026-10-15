@@ -42,8 +42,8 @@ from mstar.model.voxcpm2.voxcpm2_model import (
     decoder_receptive_field_patches,
 )
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
-from mstar.streaming.stream_buffer import StreamBuffer
 from test.voxcpm2.fake_resources import bind_dense_resources
+from test.voxcpm2.streaming import stream_through
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "voxcpm2.yaml"
 FACTORS = [1.0 + 0.25 * i for i in range(8)]
@@ -223,9 +223,13 @@ def test_process_prompt_builds_each_reference_mode(model):
     ref = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
     assert ref["prompt_layout"][0][0] == MODE_REFERENCE
     cont = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]},
-                                ref_text="world")
+                                ref_text="world ")
     tensors, metadata = cont
     assert tensors["text_inputs"][0].tolist() == [11, 10, AUDIO_START_TOKEN]   # transcript first
+    # transcript and target are tokenized as one string, with no separator added, as the reference does
+    joined, _ = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]},
+                                     ref_text="world")
+    assert joined["text_inputs"][0].tolist() == [3, AUDIO_START_TOKEN]   # "worldhello"
     # max patches follow the target text only
     assert tensors["prompt_layout"][0].tolist() == [MODE_REF_CONTINUATION, 16, 2]
     assert metadata == {STREAM_LEAD_KEY: 3}
@@ -350,7 +354,7 @@ def test_talker_clone_prefill_streams_the_prompt_tail_as_context(model):
     talker, plan, _ = _talker(model)
     clip = torch.zeros(16000)
     request, _ = model.process_prompt("hello", ["text", "audio"], ["audio"],
-                                      tensors={"audio_inputs": [clip]}, ref_text="world")
+                                      tensors={"audio_inputs": [clip]}, ref_text="world ")
     ref = torch.randn(2, 7, 4, 8)
     info = SimpleNamespace(rid_handle="c", request_id="c", random_seed=1)
     prepared = talker.prepare_inputs("talker_prefill_clone", info, {**request, "ref_patches": [ref]})
@@ -417,37 +421,6 @@ def test_talker_declares_the_same_span_in_both_caches(model):
 # -- VAE stream -------------------------------------------------------------------
 
 
-def _stream_through(vae_node, patches: torch.Tensor, policy, lead: torch.Tensor | None = None):
-    """Feed patches through a real StreamBuffer and the VAE node; return the emitted chunks."""
-    buffer = StreamBuffer(request_id="r", edge_name=STREAM_EDGE, from_partition="Talker", policy=policy)
-    items = list(lead) if lead is not None else []
-    if lead is not None:
-        buffer.prime_context(len(lead))
-    items += list(patches)
-    info = SimpleNamespace(rid_handle="r", request_id="r")
-    engine = SimpleNamespace(request_ids=["r"])
-    chunks = []
-
-    def drain():
-        while buffer.has_chunk_ready():
-            chunk = buffer.pop_chunk()
-            prepared = vae_node.prepare_inputs(
-                "vae_chunk", info, {STREAM_EDGE: [chunk.data["data"]]},
-                input_metadata=InputMetadata(stream_chunks={STREAM_EDGE: chunk.info}),
-            )
-            out = vae_node.forward_batched("vae_chunk", engine, **vae_node.preprocess("vae_chunk", engine, [prepared]))
-            vae_node.postprocess("r", None, out["r"], inputs=prepared)
-            chunks.append(out["r"]["audio_chunk"][0])
-
-    for i, item in enumerate(items):
-        buffer.pre_read_register(f"t{i}")
-        buffer.put(f"t{i}", item)
-        drain()
-    buffer.signal_done()
-    drain()
-    return chunks
-
-
 @pytest.mark.parametrize("num_patches", [1, 2, 3, 4, 7, 8, 15, 16, 24, 31])
 def test_streamed_audio_equals_a_whole_decode(model, num_patches):
     config = model.config
@@ -456,7 +429,7 @@ def test_streamed_audio_equals_a_whole_decode(model, num_patches):
     patches = torch.randn(num_patches, config.patch_size, config.feat_dim, dtype=torch.float64)
     policy = model.get_partition_topology().connections[0].chunk_policy_factory()
     with torch.no_grad():
-        chunks = _stream_through(vae_node, patches, policy)
+        chunks = stream_through(vae_node, patches, policy)
         whole = vae_node.vae.decode(patches.reshape(-1, config.feat_dim).t().unsqueeze(0))[0]
     streamed = torch.cat(chunks)
     _assert_unsaturated(whole)
@@ -474,7 +447,7 @@ def test_stream_context_below_the_receptive_field_changes_the_audio(model):
     patches = torch.randn(model.stream_left_context + 10, config.patch_size, config.feat_dim, dtype=torch.float64)
     short = ScheduledLeftContextChunkPolicy(schedule=(1, 2, 4), chunk=8, left_context=model.stream_left_context - 1)
     with torch.no_grad():
-        streamed = torch.cat(_stream_through(vae_node, patches, short))
+        streamed = torch.cat(stream_through(vae_node, patches, short))
         whole = vae_node.vae.decode(patches.reshape(-1, config.feat_dim).t().unsqueeze(0))[0]
     assert streamed.numel() == whole.numel()
     # float64 windows with the full context are bit-exact, so any difference is the missing context
@@ -490,7 +463,7 @@ def test_streamed_continuation_skips_the_prompt_lead(model):
     patches = torch.randn(11, 4, 8, dtype=torch.float64)
     policy = model.get_partition_topology().connections[0].chunk_policy_factory()
     with torch.no_grad():
-        streamed = torch.cat(_stream_through(vae_node, patches, policy, lead=lead))
+        streamed = torch.cat(stream_through(vae_node, patches, policy, lead=lead))
         whole = vae_node.vae.decode(torch.cat([lead, patches]).reshape(-1, 8).t().unsqueeze(0))[0]
     _assert_unsaturated(whole)
     assert torch.equal(streamed, whole[3 * config.patch_samples:])
