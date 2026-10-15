@@ -1894,6 +1894,8 @@ class Worker:
         node_batch.rows_only = self._all_on_device(
             engine, batch.node_name, batch.graph_walk, batch.output_signals,
         )
+        if batch.request_walks:
+            node_batch.loopback_rids = self._loopback_rids(engine, batch)
         if logger.isEnabledFor(logging.DEBUG):
             # test/waypoint/serve_rollout.py parses this line (wire ids, logged
             # before prepare_inputs runs) to recover the DiT schedule.
@@ -2568,9 +2570,17 @@ class Worker:
         # fallback batch of such a walk does (``device_loopback_signals``).
         rows_only = getattr(outputs_N, "rows_only", False)
         ran = frozenset(outputs_N.row_request_ids or ()) if rows_only else None
+        # a mixed N's rows that looped back on the device arrive empty too
+        loopback = getattr(outputs_N, "loopback_rids", frozenset())
         for rid in list(speculation.node_batch.request_ids):
             if rid not in speculation.continuing_rids:
                 continue  # fresh rid — inputs already gathered.
+            if rid in loopback:
+                inputs = speculation.node_batch.per_request_input_tensors[rid]
+                for input_name, _ in speculation.consumed_edges:
+                    inputs[input_name] = []
+                threaded_continuing.add(rid)
+                continue
             if ran is not None:
                 if rid in ran:
                     inputs = speculation.node_batch.per_request_input_tensors[rid]
@@ -3167,9 +3177,7 @@ class Worker:
             signals = batch.output_signals
         else:
             signals = list(dict.fromkeys(
-                signal for walk in walks
-                for signal in batch.walk_output_signals.get(walk)
-                or self._graph_runtime.get_output_signals(batch_N.node_name, walk)
+                signal for walk in walks for signal in self._walk_signals(batch, walk)
             ))
         # One store call for the batch rather than one per request, and the
         # flat columns come back already built: the manager fills them as it
@@ -3190,7 +3198,27 @@ class Worker:
         inline_signal, inline_values = self._inline_emit_values(
             engine, batch_N, host_rows, rids, signals,
         )
-        stored = None
+
+        def store(rids):
+            stored = None
+            if outputs.row_views and outputs.row_request_ids is not None:
+                stored = self.tensor_manager.store_row_outputs_batch(
+                    rids, outputs, signals, outputs.row_views, outputs.row_request_ids,
+                    node_name=batch_N.node_name,
+                    graph_walk=graph_walk,
+                    host_rows=host_rows,
+                )
+            if stored is None:
+                stored = self.tensor_manager.store_and_return_tensor_info_batch(
+                    rids, outputs, signals,
+                    node_name=batch_N.node_name,
+                    graph_walk=graph_walk,
+                    skip_cuda_sync=True,
+                    cpu_tensors=cpu_outputs,
+                )
+            return stored
+
+        loopback = outputs.loopback_rids if inline_signal is not None else ()
         if inline_signal is not None and self._all_on_device(
             engine, batch_N.node_name, batch_N.graph_walk, signals,
         ):
@@ -3200,21 +3228,23 @@ class Worker:
             # runs per request for the loop counters and the fallbacks; it
             # carries zero tensors per (request, signal).
             stored = StoredOutputs([], [], [], [0] * (len(rids) * len(signals)))
-        elif outputs.row_views and outputs.row_request_ids is not None:
-            stored = self.tensor_manager.store_row_outputs_batch(
-                rids, outputs, signals, outputs.row_views, outputs.row_request_ids,
-                node_name=batch_N.node_name,
-                graph_walk=graph_walk,
-                host_rows=host_rows,
-            )
-        if stored is None:
-            stored = self.tensor_manager.store_and_return_tensor_info_batch(
-                rids, outputs, signals,
-                node_name=batch_N.node_name,
-                graph_walk=graph_walk,
-                skip_cuda_sync=True,
-                cpu_tensors=cpu_outputs,
-            )
+        elif loopback:
+            # A mixed step: the rows whose walk loops back on the device carry
+            # zero tensors, as they would in a step of their walk alone; only
+            # the others are stored.
+            routed = [rid for rid in rids if rid not in loopback]
+            stored = store(routed) if routed else StoredOutputs([], [], [], [])
+            n_sig = len(signals)
+            counts, j = [], 0
+            for rid in rids:
+                if rid in loopback:
+                    counts.extend([0] * n_sig)
+                else:
+                    counts.extend(stored.num_tensors[j:j + n_sig])
+                    j += n_sig
+            stored = stored._replace(num_tensors=counts)
+        else:
+            stored = store(rids)
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
         signal_idxs = stored.signal_idxs
@@ -3368,6 +3398,28 @@ class Worker:
             self._phase_record(
                 "worker.postprocess.send", _time.perf_counter() - _t_send,
             )
+
+    def _walk_signals(self, batch: ScheduledBatch, walk: str):
+        return (
+            batch.walk_output_signals.get(walk)
+            or self._graph_runtime.get_output_signals(batch.node_name, walk)
+        )
+
+    def _loopback_rids(self, engine, batch: ScheduledBatch) -> frozenset:
+        """A mixed step's rows whose own walk keeps every output signal on
+        the device. Asked per real walk: the combined label is no walk of the
+        submodule's, and would keep none."""
+        on_device = {
+            walk for walk in set(batch.request_walks.values())
+            if self._all_on_device(
+                engine, batch.node_name, walk, self._walk_signals(batch, walk),
+            )
+        }
+        if not on_device:
+            return frozenset()
+        return frozenset(
+            rid for rid, walk in batch.request_walks.items() if walk in on_device
+        )
 
     def _all_on_device(self, engine, node_name: str, graph_walk: str, signals) -> bool:
         """Whether every output signal of this step is one the node keeps on

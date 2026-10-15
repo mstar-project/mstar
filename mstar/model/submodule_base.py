@@ -92,6 +92,9 @@ class BatchedModelOutput:
     # No per-rid entries were built: every output signal of the step stays on
     # the device (see ``ExecutingBatch.rows_only``). Readers use the rows.
     rows_only: bool = False
+    # A mixed step's rows whose own walk keeps every output signal on the
+    # device (see ``ExecutingBatch.loopback_rids``)
+    loopback_rids: frozenset = frozenset()
 
     @classmethod
     def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:

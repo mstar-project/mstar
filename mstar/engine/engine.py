@@ -301,6 +301,11 @@ class ExecutingBatch:
     # the inline emit and the speculation splice read the rows instead.
     rows_only: bool = False
 
+    # A mixed step's rows whose own walk keeps every output signal on the
+    # device: such a row loops back as it would in a step of its walk alone,
+    # while the step's other rows route tensors.
+    loopback_rids: frozenset = frozenset()
+
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
     outputs: BatchedModelOutput = field(default_factory=BatchedModelOutput)
@@ -852,6 +857,17 @@ class Engine:
             steps.update(dict.fromkeys(
                 batch.request_ids, (batch.node_name, batch.step_context.graph_walk),
             ))
+        elif batch.loopback_rids:
+            # a mixed step: a row looped back under its own walk, so the next
+            # step of that walk finds its token on the device
+            keep, node, walk_of = (
+                batch.loopback_rids, batch.node_name, batch.step_context.walk_of,
+            )
+            for rid in batch.request_ids:
+                if rid in keep:
+                    steps[rid] = (node, walk_of(rid))
+                else:
+                    steps.pop(rid, None)
         elif steps:
             for rid in batch.request_ids:
                 steps.pop(rid, None)
@@ -972,12 +988,14 @@ class Engine:
                 if not batch.running_batched and lease is None:
                     # the unbatched forward has per-request outputs: no rows to stay on
                     batch.rows_only = False
+                    batch.loopback_rids = frozenset()
                 if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
             if batch.admit_error is None:
                 self._record_loopback(batch)
+                batch.outputs.loopback_rids = batch.loopback_rids
             batch.outputs_ready.set()
             return batch.outputs
         except Exception:
