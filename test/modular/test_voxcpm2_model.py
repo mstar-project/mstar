@@ -24,6 +24,7 @@ from mstar.api_server.openai.protocol import SpeechRequest
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.submodule_base import InputMetadata
 from mstar.model.voxcpm2.components.audio_vae import AudioVAE, CausalResidualUnit, decoder_receptive_field_frames
+from mstar.model.voxcpm2.components.minicpm import RopeTable, longrope_cos_sin
 from mstar.model.voxcpm2.components.talker import VoxCPM2Generator
 from mstar.model.voxcpm2.config import (
     AUDIO_START_TOKEN,
@@ -161,6 +162,22 @@ def test_config_reads_checkpoint_json_and_rejects_other_architectures():
         VoxCPM2Config.from_dict({**TINY, "architecture": "voxcpm"})
     with pytest.raises(ValueError, match="muP"):
         VoxCPM2Config.from_dict({**TINY, "lm_config": {**TINY["lm_config"], "use_mup": True}})
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_rope_tables_are_rounded_through_the_stack_dtype(dtype):
+    """The reference's ``model.to(bf16)`` casts its LongRoPE tables too."""
+    config = VoxCPM2Config.from_dict(TINY).lm
+    with torch.device("meta"):
+        table = RopeTable(config, 32)
+    table = table.to(dtype).to_empty(device="cpu")
+    table.materialize()
+    cos, sin = longrope_cos_sin(config, 32)
+    assert table.cos.dtype == table.sin.dtype == torch.float32
+    assert torch.equal(table.cos, cos.to(dtype).float()) and torch.equal(table.sin, sin.to(dtype).float())
+    assert torch.equal(table.cos, cos) == (dtype == torch.float32)
+    table = table.to(torch.bfloat16)
+    assert table.cos.dtype == torch.float32 and torch.equal(table.cos, cos.to(dtype).float())
 
 
 def test_registry_yaml_and_adapter_agree(model):

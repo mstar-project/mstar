@@ -4,7 +4,7 @@ MiniCPM-4 (with ``use_mup`` off, as in VoxCPM2) is a Llama-style pre-norm
 decoder: GQA attention without biases or QK-norm, SwiGLU MLP, RMSNorm. Its one
 twist is LongRoPE: every rotary frequency is divided by its own factor from
 ``rope_scaling``, which FlashInfer's RoPE kernels cannot express, so the
-rotation here reads a precomputed fp32 cos/sin table, the way the reference
+rotation here reads a precomputed cos/sin table, the way the reference
 ``MiniCPMLongRoPE`` does.
 
 * :class:`MiniCPMLM` is a causal stack over the node's paged KV cache, used
@@ -72,6 +72,9 @@ class RopeTable(nn.Module):
 
     Non-persistent and absent from the checkpoint, so the module is built
     empty on ``meta`` and :meth:`materialize` fills it once on the device.
+    The reference casts its fp32 tables along with the model, so a bf16 model
+    rotates by bf16-rounded values: the tables hold fp32, rounded through the
+    dtype the stack was cast to before materializing.
     """
 
     def __init__(self, config: MiniCPM4Config, max_len: int):
@@ -83,12 +86,12 @@ class RopeTable(nn.Module):
 
     def materialize(self) -> None:
         cos, sin = longrope_cos_sin(self.config, self.max_len)
-        self.cos = cos.to(self.cos.device)
-        self.sin = sin.to(self.sin.device)
+        self.cos = cos.to(self.cos.dtype).to(device=self.cos.device, dtype=torch.float32)
+        self.sin = sin.to(self.sin.dtype).to(device=self.sin.device, dtype=torch.float32)
 
     def _apply(self, fn, recurse=True):
-        # The worker casts each submodule to the autocast dtype; the tables
-        # follow device moves but stay fp32, as the reference keeps them.
+        # The worker casts each submodule to the autocast dtype; once
+        # materialized, the tables follow device moves but stay fp32.
         before = dict(self._buffers)
         super()._apply(fn, recurse)
         for name, old in before.items():
