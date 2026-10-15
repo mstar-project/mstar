@@ -680,6 +680,38 @@ def test_speech_stream_releases_its_pieces_when_the_client_leaves_mid_write(spec
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("stream_format", ["audio", "sse"])
+def test_speech_stream_releases_its_request_when_the_response_start_fails(client_and_stub, stream_format):
+    # the body never runs, so its own release cannot; the response must do it
+    from mstar.api_server.openai.serving_speech import create_speech
+
+    _, stub = client_and_stub
+    stub.model_name = "kokoro"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2]))]
+
+    async def run():
+        from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
+        from mstar.api_server.openai.protocol import SpeechRequest
+
+        req = SpeechRequest(model="kokoro", input="hi", response_format="pcm", stream_format=stream_format)
+        response = await create_speech(stub, "kokoro", ADAPTER_REGISTRY["kokoro"], req)
+
+        async def receive():
+            await asyncio.sleep(3600)
+
+        async def send(message):
+            raise OSError("client went away")
+
+        from starlette.requests import ClientDisconnect
+
+        with pytest.raises(ClientDisconnect):
+            await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+        # checked inside the loop: asyncio.run would finalize the iterator on its way out
+        assert stub.aborted == [stub.last_submit["request_id"]]
+
+    asyncio.run(run())
+
+
 def test_speech_refuses_an_unknown_stream_format(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "kokoro"

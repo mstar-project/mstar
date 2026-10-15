@@ -146,12 +146,21 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
             raise
         body = _stream_pcm(api, submit, len(chunks), pending, first_iter, first, sample_rate,
                            with_wav_header=not raw_pcm)
+
+        async def release_unstarted() -> None:
+            # the body never ran, so its own release never will: the first piece
+            # releases itself when its iterator closes, the rest are released here
+            await first_iter.aclose()
+            _release_unread(api, pending, 1)
+
         if stream_format == "sse":
             return _ClosingStreamingResponse(
-                _as_sse(body), media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
+                _as_sse(body), on_unstarted=release_unstarted,
+                media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
             )
         return _ClosingStreamingResponse(
-            body, media_type="audio/pcm" if raw_pcm else "audio/wav", headers={"Cache-Control": "no-cache"},
+            body, on_unstarted=release_unstarted,
+            media_type="audio/pcm" if raw_pcm else "audio/wav", headers={"Cache-Control": "no-cache"},
         )
 
     pcm_parts: list[bytes] = []
@@ -176,10 +185,23 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
 
 
 class _ClosingStreamingResponse(StreamingResponse):
-    """Closes its body iterator however the response ends. Starlette stops at
-    the failed or cancelled ``send`` when a client leaves mid-stream and leaves
-    the generator suspended at its ``yield``, so its release of the sentence
-    pieces still in flight would wait for garbage collection."""
+    """Closes its body however the response ends. Starlette stops at the failed
+    or cancelled ``send`` when a client leaves mid-stream and leaves the body
+    suspended at its ``yield``, so its release of the sentence pieces still in
+    flight would wait for garbage collection. If even the response start fails,
+    the body never ran and closing it runs nothing, so ``on_unstarted`` does
+    the release instead."""
+
+    def __init__(self, content, *, on_unstarted=None, **kwargs) -> None:
+        self._body = content
+        self._started = False
+        self._on_unstarted = on_unstarted
+        super().__init__(self._track(content), **kwargs)
+
+    async def _track(self, body):
+        self._started = True
+        async for chunk in body:
+            yield chunk
 
     async def __call__(self, scope, receive, send) -> None:
         try:
@@ -187,6 +209,9 @@ class _ClosingStreamingResponse(StreamingResponse):
         finally:
             with anyio.CancelScope(shield=True):
                 await self.body_iterator.aclose()
+                await self._body.aclose()
+                if not self._started and self._on_unstarted is not None:
+                    await self._on_unstarted()
 
 
 async def _as_sse(audio):

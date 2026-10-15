@@ -175,13 +175,16 @@ class Conversation:
                 return None
         return None
 
-    def stopped_after(self, t: float, gap: float = 0.2) -> float:
-        """When the agent's audio first paused for ``gap`` seconds after ``t``."""
+    def stopped_after(self, t: float, gap: float = 0.2) -> float | None:
+        """When the agent's audio first paused for ``gap`` seconds after ``t``;
+        None while it is still playing (no pause seen yet)."""
         i = bisect.bisect_left(self.voiced, t)
         if i == len(self.voiced) or self.voiced[i] - t > gap:
             return t
         while i + 1 < len(self.voiced) and self.voiced[i + 1] - self.voiced[i] <= gap:
             i += 1
+        if i + 1 == len(self.voiced) and time.time() - self.voiced[i] <= gap:
+            return None
         return self.voiced[i]
 
     async def wait_state(self, states: tuple[str, ...], after: float, timeout: float) -> float | None:
@@ -229,9 +232,12 @@ async def turn(conv: Conversation, audio: np.ndarray, timeout: float, over_agent
     rec = {"user_start": start, "user_end": end}
     after = end
     if over_agent:
+        # ``end`` can lie ahead by the source's queue; judge the stop once it has passed
+        await asyncio.sleep(max(0.0, end + 0.25 - time.time()))
         stopped = conv.stopped_after(start)
-        rec["interrupt_s"] = stopped - start
-        if stopped >= end:
+        if stopped is not None:
+            rec["interrupt_s"] = stopped - start
+        if stopped is None or stopped >= end:
             rec.update(interrupt_failed=True, agent_first_audio=None, turn_latency_s=None)
             return rec
         after = max(end, stopped)
