@@ -77,5 +77,6 @@ Measured on one B200 with the three M\* servers, the LiveKit server, the agent a
 
 ## Known limits
 
-- **No tool calling:** `@function_tool` tools are accepted and ignored.
+- **No tool calling:** a chat with `tools` (any `@function_tool`) gets a 400.
+- **System messages only at the start (Qwen3.5):** Qwen3.5's chat template refuses a system message after the first turn, and a chat with no user turn, so `session.generate_reply(instructions=...)` gets a 400 both as a greeting before the user speaks and mid-conversation. Greet with `session.say(...)`, or pass `user_input=` instead.
 - **No speech-to-speech:** `openai.realtime.RealtimeModel` needs an OpenAI Realtime session on `/v1/realtime`, which M\* does not serve yet.
