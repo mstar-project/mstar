@@ -112,7 +112,9 @@ def test_interference_reports_extra_p99(monkeypatch):
         "--interference", "--bg-sizes", "1K", "--bg-streams", "4", "--bg-rate", "50",
         "--duration", "0.5", "--port", str(_free_port_pair()), "--quiet",
     ])
-    points = results["interference"]["points"]
+    inter = results["interference"]
+    points = inter["points"]
     assert [p["bg_size"] for p in points] == [0, 1024]
     assert points[1]["burst_bytes"] == 4096 and points[1]["bg_received"] > 0
-    assert all(p["probes"] > 0 for p in points)
+    assert all(p["probes"] > 0 and p["after_burst_p99_us"] > 0 for p in points)
+    assert inter["idle"]["probes"] > 0 and inter["idle"]["bg_received"] == 0

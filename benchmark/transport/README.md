@@ -28,7 +28,7 @@ Per path the tool prints p50 and p99 per size, throughput, the p50 of each phase
 - `--inflight N`: N tensors in flight at once, for throughput under concurrency.
 - Two machines: run the same command on both with `--role receiver` and `--role sender`, and `--sender-host` / `--receiver-host` set to each machine's reachable address. `--port` is the sender's ZMQ port, the receiver uses the next one; Mooncake picks its own ports.
 - `--tcp-device lo` for Mooncake TCP over loopback; empty lets Mooncake choose.
-- `--interference`: instead of the sweep, bursts of `--bg-streams` payloads of each `--bg-sizes` size at `--bg-rate` bursts per second (one decode step's frames), with a small probe message every `--probe-interval-ms` and one right behind each burst. Reports the probe's p50 and p99 against no load, and the largest burst whose extra p99 stays within `--p99-budget-ms`.
+- `--interference`: instead of the sweep, bursts of `--bg-streams` messages at `--bg-rate` bursts per second (one decode step's frames), each carrying a payload of each `--bg-sizes` size, with a small probe message every `--probe-interval-ms` and one right behind each burst (timed from before the burst, as a completion sent after a step's frames). The baseline is the same bursts with empty payloads, since a step sends those frames anyway; an idle run gives the scale. Reports the probes' p50 and p99, the extra p99 over the baseline, and the largest burst whose extra p99 stays within `--p99-budget-ms`.
 
 ## Use cases
 

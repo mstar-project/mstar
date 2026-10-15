@@ -232,6 +232,8 @@ class HostCopier:
         return host.numpy().tobytes()
 
     def from_bytes(self, data: bytes, dtype: torch.dtype, shape) -> torch.Tensor:
+        if not data:
+            return torch.empty(shape, dtype=dtype, device=self.device)
         host = torch.frombuffer(bytearray(data), dtype=torch.uint8).view(dtype).reshape(shape)
         if self.stream is None:
             return host
@@ -507,25 +509,29 @@ class Sender:
         a = self.args
         self._ctl("phase", path="control")
         self._await(self._reply("phase_ready"), timeout_s=60)
-        points = [{"bg_size": 0, **self._interference_point(0)}]
-        for size in a.bg_sizes:
-            points.append({"bg_size": size, **self._interference_point(size)})
+        # The frames of a step go out whether or not they carry bytes, so the
+        # baseline is a burst of empty ones; "idle" (no bursts) is for scale.
+        idle = {"bg_size": None, **self._interference_point(0, burst=False)}
+        points = [{"bg_size": size, **self._interference_point(size)} for size in [0, *a.bg_sizes]]
         self._ctl("phase_done")
         self._await(self._reply("phase_closed"))
-        base99 = points[0]["probe_p99_us"]
+        base = points[0]
         budget_us = a.p99_budget_ms * 1e3
         for p in points:
             p["burst_bytes"] = p["bg_size"] * a.bg_streams
-            p["extra_p99_us"] = p["probe_p99_us"] - base99
-        ok = [p["burst_bytes"] for p in points[1:] if p["extra_p99_us"] <= budget_us]
+            p["extra_p99_us"] = p["probe_p99_us"] - base["probe_p99_us"]
+            p["extra_after_burst_p99_us"] = p["after_burst_p99_us"] - base["after_burst_p99_us"]
+        ok = [p["burst_bytes"] for p in points[1:]
+              if max(p["extra_p99_us"], p["extra_after_burst_p99_us"]) <= budget_us]
         return {
+            "idle": idle,
             "bg_streams": a.bg_streams, "bg_rate_hz": a.bg_rate,
             "probe_interval_ms": a.probe_interval_ms, "duration_s": a.duration,
             "p99_budget_ms": a.p99_budget_ms, "points": points,
             "largest_burst_within_budget": max(ok) if ok else 0,
         }
 
-    def _interference_point(self, bg_size: int) -> dict:
+    def _interference_point(self, bg_size: int, burst: bool = True) -> dict:
         a = self.args
         payload = self.copier.to_bytes(self._tensor(bg_size)) if bg_size else b""
         sent_at: dict[int, float] = {}
@@ -553,7 +559,7 @@ class Sender:
             now = time.perf_counter()
             if now >= end:
                 break
-            if bg_size and now >= next_burst:
+            if burst and now >= next_burst:
                 # A completion right behind a step's frames: timed from before
                 # the frames, so encoding them counts as it would in a worker.
                 t_burst = time.perf_counter()
@@ -569,7 +575,7 @@ class Sender:
                 self._ctl("probe", seq=seq)
                 seq += 1
                 next_probe = max(next_probe + probe_period, now - probe_period)
-            wake = min(next_probe, next_burst if bg_size else end, end)
+            wake = min(next_probe, next_burst if burst else end, end)
             handle(recv(self.comm, min(max(0.0, wake - time.perf_counter()), 0.002)))
         deadline = time.perf_counter() + 5.0
         while sent_at and time.perf_counter() < deadline:
@@ -580,11 +586,13 @@ class Sender:
             "probes": len(rtts),
             "probe_p50_us": percentile(rtts, 50) * 1e6,
             "probe_p99_us": percentile(rtts, 99) * 1e6,
-            "after_burst_p99_us": percentile(after_burst, 99) * 1e6 if after_burst else None,
+            "after_burst_p50_us": percentile(after_burst, 50) * 1e6 if after_burst else 0.0,
+            "after_burst_p99_us": percentile(after_burst, 99) * 1e6 if after_burst else 0.0,
             "bg_received": report.get("bg_received", 0),
         }
         if not a.quiet:
-            print(f"  interference bg {human_size(bg_size) if bg_size else 'none':>9s} x{a.bg_streams}"
+            what = human_size(bg_size) if burst else "idle"
+            print(f"  interference bg {what:>9s} x{a.bg_streams}"
                   f" @ {a.bg_rate:.0f} Hz  probe p50 {out['probe_p50_us']:8.1f} us  "
                   f"p99 {out['probe_p99_us']:8.1f} us", flush=True)
         return out
@@ -785,11 +793,16 @@ def render(results: dict) -> str:
     if inter:
         lines += ["", f"interference: {inter['bg_streams']} payloads per burst at {inter['bg_rate_hz']:.0f} Hz,"
                       f" probe every {inter['probe_interval_ms']} ms"]
-        lines.append(f"{'payload':>10s} {'burst':>10s} {'probe p50 us':>13s} {'p99 us':>9s} {'extra p99 us':>13s}")
+        idle = inter["idle"]
+        lines.append(f"idle (no bursts): probe p50 {idle['probe_p50_us']:.1f} us, p99 {idle['probe_p99_us']:.1f} us")
+        lines.append(f"{'payload':>10s} {'burst':>10s} {'probe p50/p99 us':>18s} {'behind burst p50/p99 us':>24s}"
+                     f" {'extra p99 us (probe / behind burst)':>36s}")
         for pt in inter["points"]:
-            lines.append(f"{human_size(pt['bg_size']) if pt['bg_size'] else 'none':>10s} "
+            lines.append(f"{human_size(pt['bg_size']) if pt['bg_size'] else 'empty':>10s} "
                          f"{human_size(pt['burst_bytes']) if pt['burst_bytes'] else '-':>10s} "
-                         f"{pt['probe_p50_us']:13.1f} {pt['probe_p99_us']:9.1f} {pt['extra_p99_us']:13.1f}")
+                         f"{pt['probe_p50_us']:8.1f} / {pt['probe_p99_us']:7.1f} "
+                         f"{pt['after_burst_p50_us']:12.1f} / {pt['after_burst_p99_us']:9.1f} "
+                         f"{pt['extra_p99_us']:20.1f} / {pt['extra_after_burst_p99_us']:9.1f}")
         lines.append(f"largest burst with extra p99 <= {inter['p99_budget_ms']} ms: "
                      f"{human_size(inter['largest_burst_within_budget'])}")
     return "\n".join(lines)
