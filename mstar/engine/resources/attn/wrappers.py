@@ -239,6 +239,13 @@ class FlashInferDecodeWrapper:
         self.use_cuda_graph = use_cuda_graph
         self.enable_nvtx = enable_nvtx
         self.batch_size = batch_size
+        # ROCm decodes without tensor cores, ~4x faster at bs64; that path
+        # dispatches GQA groups of 1, 2, 3, 4 and 8 only. Pinned to fa2: `auto`
+        # picks AITER's paged decode, whose output went bad once KV pages were reused
+        rocm = torch.version.hip is not None
+        tensor_cores = not rocm or num_qo_heads // num_kv_heads not in (1, 2, 3, 4, 8)
+        if not tensor_cores:
+            backend = "fa2"
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -267,7 +274,7 @@ class FlashInferDecodeWrapper:
                 workspace_buffer,
                 "NHD",
                 use_cuda_graph=True,
-                use_tensor_cores=True,
+                use_tensor_cores=tensor_cores,
                 paged_kv_indptr_buffer=self._paged_kv_indptr_buf,
                 paged_kv_indices_buffer=self._paged_kv_indices_buf,
                 paged_kv_last_page_len_buffer=self._paged_kv_last_page_len_buf,
@@ -276,7 +283,7 @@ class FlashInferDecodeWrapper:
         else:
             self.attn_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD",
-                use_tensor_cores=True,
+                use_tensor_cores=tensor_cores,
                 backend=backend,
             )
 
