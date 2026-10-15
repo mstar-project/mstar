@@ -21,9 +21,6 @@ from mstar.engine.resources.step import SlotLease, StepContext
 
 
 class FlashInferManager(AttentionManager):
-    def can_capture(self) -> bool:
-        return self._device.type == "cuda"
-
     def __init__(
         self,
         kv_cache: str,

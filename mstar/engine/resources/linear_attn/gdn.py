@@ -42,9 +42,6 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
 
 
 class GDNManager(LinearAttnManager):
-    def can_capture(self) -> bool:
-        return self._device.type == "cuda"
-
     def __init__(
         self,
         config: LinearAttnConfig,
