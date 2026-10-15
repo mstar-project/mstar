@@ -213,7 +213,7 @@ Qwen3-TTS notes
 ---------------
 
 - Install the model-specific dependencies with ``pip install -e '.[qwen3_tts]'``
-  and launch a single-GPU deployment with ``mstar serve <key> --gpus 0`` where
+  plus ``pip install --no-deps 'qwen-tts==0.1.1'`` (see :doc:`installation`), and launch a single-GPU deployment with ``mstar serve <key> --gpus 0`` where
   ``<key>`` is one of ``qwen3_tts`` (0.6B CustomVoice), ``qwen3_tts_1p7b``,
   ``qwen3_tts_voicedesign`` or ``qwen3_tts_base``. One model class serves every
   12 Hz checkpoint; the variant (speakers, instruction support, reference

@@ -206,6 +206,26 @@ and not a dependency. Verify with:
 
    python -c "from omnivoice.models import omnivoice_flashinfer; print('ok')"
 
+qwen-tts (Qwen3-TTS)
+--------------------
+
+**Qwen3-TTS** loads its 12 Hz speech tokenizer from the ``qwen-tts`` package, which
+``.[qwen3_tts]`` and ``.[all]`` do **not** install. Add it as a separate step, without
+its dependencies:
+
+.. code-block:: bash
+
+   uv pip install --no-deps "qwen-tts==0.1.1"
+
+``qwen-tts`` pins ``transformers==4.57.3`` and ``accelerate==1.12.0``. Installed with
+them, it can't share an environment with ``diffusers>=0.40`` (Wan 2.2, Cosmos3,
+FLUX.2 [klein]), which needs ``huggingface-hub>=1.23``, or with OmniVoice, which needs
+``transformers>=5.3``, and installing it after them downgrades their dependencies.
+mstar reads only the speech-tokenizer source files and runs them under transformers
+4.57.3 or 5.x, so the package's own requirements are not needed. ``pip check`` still
+lists them (``transformers==4.57.3``, ``accelerate==1.12.0``, ``gradio``, ``sox`` and
+others) as unmet for ``qwen-tts``; that is expected.
+
 flash-attn (Qwen3-Omni)
 -----------------------
 

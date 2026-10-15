@@ -171,6 +171,11 @@ def _adapt_tokenizer_module(module) -> None:
         setattr(module, name, adapted)
 
 
+#: qwen-tts pins transformers==4.57.3, which most environments with other
+#: extras cannot satisfy; only its source files are used, so its pins are skipped.
+QWEN_TTS_INSTALL = 'uv pip install --no-deps "qwen-tts==0.1.1"'
+
+
 @lru_cache(maxsize=1)
 def _load_qwen3_tts_codec_classes() -> tuple[type, type, type]:
     """Load only qwen-tts' 12 Hz speech-tokenizer modules.
@@ -190,8 +195,9 @@ def _load_qwen3_tts_codec_classes() -> tuple[type, type, type]:
         distribution = importlib.metadata.distribution("qwen-tts")
     except importlib.metadata.PackageNotFoundError as exc:
         raise ImportError(
-            "Qwen3-TTS Codec requires the 'qwen-tts' package; install "
-            "M* with the qwen3_tts optional dependency"
+            "Qwen3-TTS Codec requires the 'qwen-tts' package, installed "
+            f"without its dependencies: {QWEN_TTS_INSTALL} (see "
+            "docs/installation.rst)"
         ) from exc
 
     source_root = Path(distribution.locate_file(
@@ -1149,8 +1155,7 @@ class Qwen3TTSModel(Model):
             decoder_config_cls, decoder_cls, _ = _load_qwen3_tts_codec_classes()
         except ImportError as exc:
             raise ImportError(
-                "Qwen3-TTS Codec requires the 'qwen-tts' package; install "
-                "M* with the qwen3_tts optional dependency"
+                f"Qwen3-TTS Codec could not load qwen-tts' speech tokenizer: {exc}"
             ) from exc
 
         from mstar.model.loader import load_hf_weights

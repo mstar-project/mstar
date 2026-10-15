@@ -150,12 +150,16 @@ qwen3_omni = [
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
 ]
 
+# qwen-tts is an install step with --no-deps, not a dependency: mstar loads only
+# its 12 Hz speech-tokenizer modules (under transformers 4.57.3 or 5.x), but its
+# metadata pins transformers==4.57.3 and accelerate==1.12.0. No environment that
+# also has diffusers>=0.40 or OmniVoice can satisfy that pin, and installing it
+# into one downgrades huggingface-hub under them. See docs/installation.rst.
 qwen3_tts = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
-    "qwen-tts==0.1.1",
     "safetensors",
     "soundfile",  # reference-audio decoding for Base voice cloning
     "transformers>=4.57.3",
@@ -302,7 +306,7 @@ all = [
     "safetensors",
     "triton",
     "qwen-omni-utils",
-    "qwen-tts==0.1.1",
+    # qwen-tts is installed separately with --no-deps; see the [qwen3_tts] extra.
     "numba>=0.61",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
     # wan22 (see the [wan22] extra for the rationale; av / diffusers already above)
