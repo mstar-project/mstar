@@ -116,7 +116,7 @@ HF_MODELS: dict[str, dict] = {
     # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
     # only; the A14B MoE variants are a separate follow-up.
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
-    # LingBot-World-V2 1.3B causal-fast (CC-BY-NC-SA-4.0): the DiT repo only;
+    # LingBot-World-V2 1.3B causal-fast (weights CC-BY-NC-SA-4.0): the DiT repo only;
     # UMT5 and the Wan2.1 VAE load from the diffusers repos mstar already uses.
     "lingbot_world_1_3b": {"model_path_hf": "robbyant/lingbot-world-v2-1.3b-causal-fast"},
     # Waypoint owns a variant -> Hub repository mapping. None is intentional:

@@ -1,18 +1,23 @@
-# Adapted from Robbyant/lingbot-world-v2, wan/image2video.py.
 # Copyright (c) 2026 Robbyant Team.
-# SPDX-License-Identifier: CC-BY-NC-SA-4.0
+# Copyright (c) 2024-2025 The Alibaba Wan Team Authors.
+# SPDX-License-Identifier: Apache-2.0
 #
-# Original file was released under CC BY-NC-SA 4.0, with the full license text
-# available at https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode.
-# Modified for M*: reimplemented as M* graph-node submodules with the same numerics.
-# This modified file is released under the same license, not the repository's
-# Apache-2.0: non-commercial use only, and adaptations must keep this license.
+# This file has been modified for M* in 2026: the schedule tables built without
+# the solver object, with the same numerics.
+#
+# Original files (Robbyant/lingbot-world, wan/image2video_fast.py and
+# wan/utils/fm_solvers_unipc.py) were released under Apache-2.0, with the full
+# license text available at https://github.com/Robbyant/lingbot-world/blob/main/LICENSE.txt.
+#
+# This modified file is released under the same license.
 
 """The causal-fast sampling schedule, ported exactly from the reference.
 
-Provenance: the step picks and re-noising loop are Robbyant/lingbot-world-v2's
-(CC-BY-NC-SA-4.0); ``FlowUniPCMultistepScheduler``'s shifted sigmas are
-Wan-Video/Wan2.1's (Apache-2.0).
+Provenance: the step picks and re-noising loop follow LingBot-World v1's
+``WanI2VFast.generate`` (Robbyant/lingbot-world, Apache-2.0);
+``FlowUniPCMultistepScheduler``'s shifted sigmas are Wan-Video/Wan2.1's
+(Apache-2.0). The step indices and shift are the V2 1.3B checkpoint's settings
+(``config.py``).
 
 The reference builds a ``FlowUniPCMultistepScheduler`` (shift 1), calls
 ``set_timesteps(1000, shift=shift)`` and picks four entries by index. It never

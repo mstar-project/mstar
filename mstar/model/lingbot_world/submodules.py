@@ -1,12 +1,14 @@
-# Adapted from Robbyant/lingbot-world-v2, wan/image2video.py (the causal-fast chunk loop).
 # Copyright (c) 2026 Robbyant Team.
-# SPDX-License-Identifier: CC-BY-NC-SA-4.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Original file was released under CC BY-NC-SA 4.0, with the full license text
-# available at https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode.
-# Modified for M*: reimplemented as M* graph-node submodules with the same numerics.
-# This modified file is released under the same license, not the repository's
-# Apache-2.0: non-commercial use only, and adaptations must keep this license.
+# This file has been modified for M* in 2026: the causal-fast chunk loop split
+# into M* graph-node submodules, one chunk per rollout iteration.
+#
+# Original file (Robbyant/lingbot-world, wan/image2video_fast.py) was released
+# under Apache-2.0, with the full license text available at
+# https://github.com/Robbyant/lingbot-world/blob/main/LICENSE.txt.
+#
+# This modified file is released under the same license.
 
 """LingBot-World-V2 node submodules.
 

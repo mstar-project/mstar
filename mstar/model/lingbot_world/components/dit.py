@@ -1,21 +1,23 @@
-# Adapted from Robbyant/lingbot-world-v2, wan/modules/model_fast.py.
 # Copyright (c) 2026 Robbyant Team.
-# SPDX-License-Identifier: CC-BY-NC-SA-4.0
+# Copyright (c) 2024-2025 The Alibaba Wan Team Authors.
+# SPDX-License-Identifier: Apache-2.0
 #
-# Original file was released under CC BY-NC-SA 4.0, with the full license text
-# available at https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode.
-# Modified for M*: reimplemented as M* graph-node submodules with the same numerics.
-# This modified file is released under the same license, not the repository's
-# Apache-2.0: non-commercial use only, and adaptations must keep this license.
+# This file has been modified for M* in 2026: reimplemented as an M* graph-node
+# module with the same numerics, camera conditioning only.
+#
+# Original files (Robbyant/lingbot-world, wan/modules/model_fast.py and
+# wan/modules/model.py) were released under Apache-2.0, with the full license
+# text available at https://github.com/Robbyant/lingbot-world/blob/main/LICENSE.txt.
+#
+# This modified file is released under the same license.
 
 """LingBot-World-V2 causal-fast DiT: a Wan2.1-layout I2V transformer with
 Plucker camera injection, run chunk by chunk against a rolling KV cache.
 
-Port of the reference ``wan/modules/model_fast.py`` (``WanModelFast``), itself
-built on Self-Forcing's causal Wan. Provenance: Robbyant/lingbot-world-v2
-(CC-BY-NC-SA-4.0) for the camera injection layers and the causal-fast chunk
-loop; Wan-Video/Wan2.1 (Apache-2.0) for the transformer blocks; guandeh17/Self-Forcing
-(Apache-2.0) for the rolling KV cache with attention sinks. Parameter names are the checkpoint's
+Port of LingBot-World v1's ``WanModelFast`` (Robbyant/lingbot-world,
+Apache-2.0), which V2's causal-fast checkpoints run unchanged. v1 takes the
+rolling KV cache with attention sinks from guandeh17/Self-Forcing and the
+transformer blocks from Wan-Video/Wan2.1 (both Apache-2.0). Parameter names are the checkpoint's
 (original Wan layout: ``self_attn.q``, ``ffn.0``, ``modulation``, ``norm3`` is
 the cross-attention norm), so a state dict loads with no renaming.
 

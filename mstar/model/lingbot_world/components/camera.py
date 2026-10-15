@@ -1,19 +1,21 @@
-# Adapted from Robbyant/lingbot-world-v2, wan/utils/cam_utils.py and wan/image2video.py.
 # Copyright (c) 2026 Robbyant Team.
-# SPDX-License-Identifier: CC-BY-NC-SA-4.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Original file was released under CC BY-NC-SA 4.0, with the full license text
-# available at https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode.
-# Modified for M*: reimplemented as M* graph-node submodules with the same numerics.
-# This modified file is released under the same license, not the repository's
-# Apache-2.0: non-commercial use only, and adaptations must keep this license.
+# This file has been modified for M* in 2026: the pose math split between the
+# data worker and the DiT's device, the rays folded per latent cell.
+#
+# Original files (Robbyant/lingbot-world, wan/utils/cam_utils.py and
+# wan/image2video_fast.py) were released under Apache-2.0, with the full license
+# text available at https://github.com/Robbyant/lingbot-world/blob/main/LICENSE.txt.
+#
+# This modified file is released under the same license.
 
 """Camera conditioning: a c2w pose trajectory to per-latent-frame Plucker rays.
 
-Ported from the reference's ``wan/utils/cam_utils.py`` and the preprocessing in
-``WanI2VCausal._generate_causal_fast`` (Robbyant/lingbot-world-v2,
-CC-BY-NC-SA-4.0); the Plucker ray construction follows hehao13/CameraCtrl
-(Apache-2.0). The pose math runs on the data worker
+Ported from LingBot-World v1's ``wan/utils/cam_utils.py`` and the camera
+preprocessing in ``WanI2VFast.generate`` (Robbyant/lingbot-world, Apache-2.0),
+which the V2 reference runs with the same math; the Plucker ray construction
+follows hehao13/CameraCtrl (Apache-2.0). The pose math runs on the data worker
 (``latent_camera_poses``, numpy/scipy on CPU, as the reference does before it
 moves the poses to the GPU); the Plucker rays are built on the DiT's device
 (``plucker_embedding``), where the reference builds them, because their matmul
@@ -120,18 +122,19 @@ def plucker_embedding(
     n_frames = c2ws.shape[0]
     device, dtype = c2ws.device, c2ws.dtype
     grid_y, grid_x = torch.meshgrid(
-        torch.arange(height, device=device, dtype=dtype) + 0.5,
-        torch.arange(width, device=device, dtype=dtype) + 0.5,
+        torch.arange(height, device=device, dtype=dtype),
+        torch.arange(width, device=device, dtype=dtype),
         indexing="ij",
     )
-    x_flat = grid_x.reshape(-1)
-    y_flat = grid_y.reshape(-1)
+    grid_xy = (torch.stack([grid_x, grid_y], dim=-1).view(-1, 2) + 0.5)[None].repeat(n_frames, 1, 1)
     Ks = intrinsics.to(device).reshape(1, 4).repeat(n_frames, 1)
-    fx, fy, cx, cy = Ks[0, 0], Ks[0, 1], Ks[0, 2], Ks[0, 3]
-    dirs = torch.stack([(x_flat - cx) / fx, (y_flat - cy) / fy, torch.ones_like(x_flat)], dim=-1)
+    fx, fy, cx, cy = Ks.chunk(4, dim=-1)
+    i, j = grid_xy[..., 0], grid_xy[..., 1]
+    zs = torch.ones_like(i)
+    dirs = torch.stack([(i - cx) / fx * zs, (j - cy) / fy * zs, zs], dim=-1)
     dirs = dirs / dirs.norm(dim=-1, keepdim=True)
-    rays_d = (c2ws[:, :3, :3] @ dirs.T).transpose(1, 2)
-    rays_o = c2ws[:, :3, 3].unsqueeze(1).expand_as(rays_d)
+    rays_d = dirs @ c2ws[:, :3, :3].transpose(-1, -2)
+    rays_o = c2ws[:, :3, 3][:, None, :].expand_as(rays_d)
     plucker = torch.cat([rays_o, rays_d], dim=-1).view(n_frames, height, width, 6)
     plucker = rearrange(
         plucker, "f (h c1) (w c2) c -> (f h w) (c c1 c2)",
