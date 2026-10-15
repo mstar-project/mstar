@@ -435,10 +435,11 @@ class VAEDecoderSubmodule(ARNodeSubmodule):
         chunk = input_metadata.stream_chunks.get("latent_patches")
         data = inputs["latent_patches"][0] if inputs.get("latent_patches") else None
         cfg = self.config
+        dtype = next(self.vae.parameters()).dtype
         if data is None:
-            patches = torch.zeros(0, cfg.patch_size, cfg.feat_dim, device=self.get_device())
+            patches = torch.zeros(0, cfg.patch_size, cfg.feat_dim, device=self.get_device(), dtype=dtype)
         else:
-            patches = data.to(device=self.get_device(), dtype=torch.float32).reshape(-1, cfg.patch_size, cfg.feat_dim)
+            patches = data.to(device=self.get_device(), dtype=dtype).reshape(-1, cfg.patch_size, cfg.feat_dim)
         num = patches.shape[0]
         context = min(chunk.context_items if chunk is not None else 0, num)
         logger.debug("VoxCPM2 vae %s: window %d patches, context %d", fwd_info.request_id, num, context)

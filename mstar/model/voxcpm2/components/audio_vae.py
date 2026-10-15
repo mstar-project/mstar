@@ -233,7 +233,8 @@ def _earliest_input(module: nn.Module, out_index: int) -> int:
 def decoder_receptive_field_frames(decoder: CausalDecoder) -> int:
     """Latent frames of left context a frame's audio needs to equal a whole decode.
 
-    Walks the decoder backwards from a frame's first output sample. The
+    Walks the decoder backwards from a frame's first output sample; exact for
+    the modules modelled in ``_earliest_input`` (20 frames for VoxCPM2). The
     sample-rate conditioning is per channel, so it adds nothing.
     """
     upsample = math.prod(
