@@ -1227,7 +1227,6 @@ class PiecewiseAcceleratorGraphRunner:
                     shapes = []
             if shapes:
                 self._size_slots()
-            if shapes:
                 self._step_runner.build_accelerator_graph_buffers(
                     [
                         CGSlotSpec(
