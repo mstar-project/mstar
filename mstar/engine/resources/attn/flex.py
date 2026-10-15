@@ -24,7 +24,7 @@ from torch.nn.attention.flex_attention import (
 
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.base import CGSlotSpec
+from mstar.engine.resources.base import GraphSlotSpec
 from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.ring.manager import RingPlan
 from mstar.engine.resources.step import StepContext
@@ -345,7 +345,7 @@ class FlexAttentionManager(AttentionManager):
         return table
 
     def build_accelerator_graph_buffers(
-        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
+        self, slots: list[GraphSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del max_bs, max_seq_len
         geometries = {self._geometry(layer) for layer in self._kv_config.layers}

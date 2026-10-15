@@ -12,8 +12,8 @@ import torch
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import (
     AttentionResource,
-    CGSlotSpec,
     EngineResourceInfo,
+    GraphSlotSpec,
     PublishedInfo,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
@@ -503,7 +503,7 @@ class KVManager(AttentionResource):
         )
 
     def build_accelerator_graph_buffers(
-        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
+        self, slots: list[GraphSlotSpec], max_bs: int, max_seq_len: int,
     ):
         del slots, max_bs
         # the per-(slot, label) buffers themselves are built on first plan for

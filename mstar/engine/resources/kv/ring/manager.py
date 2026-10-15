@@ -10,8 +10,8 @@ from torch import Tensor
 
 from mstar.engine.resources.base import (
     AttentionResource,
-    CGSlotSpec,
     EngineResourceInfo,
+    GraphSlotSpec,
 )
 from mstar.engine.resources.kv.config import KVSpec, RingKVConfig, RingKVStep
 from mstar.engine.resources.kv.ring.cache import LayerRingCache
@@ -393,7 +393,7 @@ class RingKVManager(AttentionResource):
     # `supports_preplan` stays the inherited False.
 
     def build_accelerator_graph_buffers(
-        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int
+        self, slots: list[GraphSlotSpec], max_bs: int, max_seq_len: int
     ) -> None:
         """No-op: every buffer a replay touches was allocated at ``build``,
         ``_static_session_idx`` included.
