@@ -295,6 +295,12 @@ class ExecutingBatch:
     # the resource that ran out, so an eviction can be scoped to it
     failed_resource: str | None = None
 
+    # Every output signal of this step stays on the device (the node's
+    # ``device_loopback_signals``): collect builds no per-request output
+    # dicts and the per-request ``postprocess`` is skipped; the stop check,
+    # the inline emit and the speculation splice read the rows instead.
+    rows_only: bool = False
+
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
     outputs: BatchedModelOutput = field(default_factory=BatchedModelOutput)
@@ -497,6 +503,9 @@ class Engine:
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
 
+        # rid -> (node, walk) of its last step here when that step was rows-only,
+        # i.e. the sampler's slot master holds the token its next step reads
+        self._loopback_steps: dict[int, tuple[str, str]] = {}
         self._runner = StepRunner(
             self._resources,
             # every node, including one that owns nothing (Code2Wav) — an
@@ -524,6 +533,13 @@ class Engine:
                 resources=resources
             )
             submodule.bind_node_resources(resources)
+            if getattr(submodule, "reads_device_loopback", False):
+                # the sampler keeps its slot masters only for a node that
+                # reads them back on the device (see NodeSubmodule)
+                for resource in resources.values():
+                    enable = getattr(resource, "enable_device_loopback_reader", None)
+                    if enable is not None:
+                        enable()
 
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
@@ -751,17 +767,35 @@ class Engine:
         final_rids = batch.final_stream_rids
         # only a keyed walk probes the prefix cache (see _skip_cached_prefix);
         # read leniently, as the probe itself was only reached per prepared row.
-        # The lookups hoist but the test cannot: under a combined walk each row
-        # has its own walk, so a mixed step would probe for the wrong one.
+        # Under a combined walk each row has its own walk, so a mixed step
+        # probes, prepares and stamps per row, and takes no uniform path.
+        walk = batch.step_context.graph_walk
+        mixed = bool(batch.step_context.request_walks)
+        walk_of = batch.step_context.walk_of
         keyed_walks = (getattr(self, "_keyed_walks", None) or {}).get(
             batch.node_name, (),
         )
-        for rid in batch.request_ids:
-            walk = batch.step_context.walk_of(rid)
-            probe_prefix = walk in keyed_walks
+        loopback = self._loopback_rows(batch)
+        if not mixed and walk not in keyed_walks:
+            uniform = submodule.uniform_row_inputs(
+                walk, has_loopback=loopback is not None and all(loopback),
+            )
+            if uniform is not None:
+                # one object for all the step's rows: the per-row call would
+                # return an equal one each time (128 calls at a full decode
+                # batch, on the gpu thread before the launch)
+                node_inputs = [uniform] * len(batch.request_ids)
+                batch.register_prepare_batch(node_inputs)
+                batch.running_batched = submodule.can_batch(
+                    batch=batch, model_inputs=node_inputs
+                )
+                return
+        for i, rid in enumerate(batch.request_ids):
+            row_walk = walk_of(rid) if mixed else walk
+            probe_prefix = row_walk in keyed_walks
             try:
                 req_inputs = prepare(
-                    graph_walk=walk,
+                    graph_walk=row_walk,
                     fwd_info=wrapped[rid],
                     inputs=tensors.get(rid, {}),
                     resources=resources,
@@ -770,14 +804,18 @@ class Engine:
                     # look-ahead frames a token encoder withholds)
                     is_final_stream_chunk=rid in final_rids,
                     input_metadata=metadata.get(rid, EMPTY_INPUT_METADATA),
+                    has_loopback=loopback is not None and loopback[i],
                 )
-                if req_inputs is not None and probe_prefix:
-                    req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
-                    req_inputs.graph_walk = walk
+                if req_inputs is not None:
+                    if probe_prefix:
+                        req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
+                    if probe_prefix or mixed:
+                        # the submodule reads a mixed step's rows by their own walk
+                        req_inputs.graph_walk = row_walk
             except Exception as error:
                 logger.exception(
                     "prepare_inputs failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, walk,
+                    rid, batch.node_name, row_walk,
                 )
                 batch.register_failure(rid, error)
                 continue
@@ -792,6 +830,32 @@ class Engine:
             batch=batch, model_inputs=node_inputs
         )
 
+    def _loopback_rows(self, batch: ExecutingBatch) -> list[bool] | None:
+        """Per row, whether its input token is on the device (see
+        ``_loopback_steps``); None when no row's is."""
+        steps = self._loopback_steps
+        if not steps:
+            return None
+        get = steps.get
+        ctx = batch.step_context
+        if ctx.request_walks:
+            # a mixed step: a row's token is on the device if its own walk's
+            # last step kept it there, whatever this step is labelled
+            node, walk_of = batch.node_name, ctx.walk_of
+            return [get(rid) == (node, walk_of(rid)) for rid in batch.request_ids]
+        key = (batch.node_name, ctx.graph_walk)
+        return [get(rid) == key for rid in batch.request_ids]
+
+    def _record_loopback(self, batch: ExecutingBatch) -> None:
+        steps = self._loopback_steps
+        if batch.rows_only:
+            steps.update(dict.fromkeys(
+                batch.request_ids, (batch.node_name, batch.step_context.graph_walk),
+            ))
+        elif steps:
+            for rid in batch.request_ids:
+                steps.pop(rid, None)
+
     def inline_client_signals(
         self, node_name: str, graph_walk: str,
     ) -> dict[str, str]:
@@ -800,6 +864,16 @@ class Engine:
         if mgmt is None:
             return {}
         return mgmt.submodule.inline_client_signals(graph_walk)
+
+    def device_loopback_signals(
+        self, node_name: str, graph_walk: str,
+    ) -> frozenset[str]:
+        """The node's loop-back signals it keeps on the device this walk, so
+        the worker routes them without a tensor (see the submodule hook)."""
+        mgmt = self._submodules.get(node_name)
+        if mgmt is None:
+            return frozenset()
+        return mgmt.submodule.device_loopback_signals(graph_walk)
 
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
@@ -893,10 +967,15 @@ class Engine:
                 # admit/plan/commit assume the whole batch reaches the forward
                 # in order; an unbatchable walk with >1 request can't, so each
                 # request runs its own full cycle and merges.
+                if not batch.running_batched and lease is None:
+                    # the unbatched forward has per-request outputs: no rows to stay on
+                    batch.rows_only = False
                 if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
+            if batch.admit_error is None:
+                self._record_loopback(batch)
             batch.outputs_ready.set()
             return batch.outputs
         except Exception:
@@ -971,6 +1050,7 @@ class Engine:
                     submodule_mgmt, lease, raw, inputs, req_info,
                     request_ids=batch.request_ids,
                     step_request_ids=batch.step_context.padded_request_ids,
+                    rows_only=batch.rows_only,
                 )
             finally:
                 if PHASE_PERIOD:
@@ -1390,8 +1470,17 @@ class Engine:
         outputs = self.exec(batch)
         # A failed admit means no forward ran and every rid's outputs are empty,
         # so the tail has nothing to consume; the worker re-drives the step.
+        # A rows-only step has no per-request outputs; only a batch tail runs.
         if batch.admit_error is None:
-            self.postprocess_batch(batch, outputs)
+            if not batch.rows_only:
+                self.postprocess_batch(batch, outputs)
+            else:
+                submodule = self._submodules[batch.node_name].submodule
+                # no submodule overrides it as of now
+                if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
+                    submodule.batch_postprocess(
+                        outputs, batch.per_request_info_wrapped, batch.inputs,
+                    )
         return outputs
 
     def check_stop_for_batch(
@@ -1537,15 +1626,39 @@ class Engine:
         req_info: Mapping[str, CurrentForwardPassInfo],
         request_ids: list[str],
         step_request_ids: tuple[str, ...],
+        rows_only: bool = False,
     ) -> BatchedModelOutput:
         """Per-rid outputs for the real requests: drop the padding rows and map
         a captured graph's keys back to real ids.
+
+        ``rows_only`` (see ``ExecutingBatch.rows_only``) keeps the row views
+        and the stop buffers but builds no per-rid dicts: nothing downstream
+        reads them on such a step, and at 128 rows they were a few hundred
+        allocations on the gpu thread.
 
         A captured forward emits its per-rid entries under the slot's padding
         ids (those were the batch at capture time), so entry ``i`` belongs to
         ``request_ids[i]`` on either path.
         """
         submodule = submodule_mgmt.submodule
+        if (
+            rows_only
+            and raw_outputs.check_stop_buffers is not None
+            and not raw_outputs.per_rid_outputs
+            and not raw_outputs.packed_outputs
+            and type(submodule).filter_batched_output
+            is NodeSubmodule.filter_batched_output
+        ):
+            # No clone either: the worker takes the host copy on this thread,
+            # on this stream, right behind the step (``_stage_host_rows``), so
+            # a later replay cannot overwrite the rows first, and nothing else
+            # reads them on the device. Padded rows past the real ones ride
+            # along and are never read.
+            return BatchedModelOutput(
+                check_stop_buffers=raw_outputs.check_stop_buffers,
+                row_request_ids=tuple(request_ids),
+                rows_only=True,
+            )
         out_ids = (
             step_request_ids if lease is None
             else submodule_mgmt.cuda_graph_runner.slot_for(lease).dummy_rids
@@ -1554,6 +1667,7 @@ class Engine:
 
         row_clones, row_views = self._merge_per_rid(
             outputs, raw_outputs, request_ids, out_ids, submodule, req_info,
+            rows_only=rows_only,
         )
         self._merge_unpacked(
             outputs, raw_outputs, request_ids, submodule,
@@ -1561,6 +1675,7 @@ class Engine:
         )
         return BatchedModelOutput(
             per_rid_outputs=outputs,
+            rows_only=rows_only and not outputs,
             # the stop buffer that is a row output shares its clone: one copy
             # of the sampled tokens per step, not two
             check_stop_buffers=raw_outputs.clone_check_stop_buffers(
@@ -1580,6 +1695,7 @@ class Engine:
         out_ids: list[str],
         submodule: NodeSubmodule,
         req_info: Mapping[str, CurrentForwardPassInfo],
+        rows_only: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[torch.Tensor, ...]] | None]:
         """Fold the forward's per-rid entries into ``outputs``.
 
@@ -1606,7 +1722,7 @@ class Engine:
                 for name, tensor in row_clones.items()
                 if isinstance(tensor, torch.Tensor) and tensor.dim()
             }
-            if row_views:
+            if row_views and not rows_only:
                 for i, rid in enumerate(request_ids):
                     merged = outputs.setdefault(rid, {})
                     for name, views in row_views.items():
@@ -1855,6 +1971,7 @@ class Engine:
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
         )
+        t0 = perf_counter() if PHASE_PERIOD else 0.0
         step = submodule_mgmt.submodule.declare_step(
             graph_walk=batch.step_context.graph_walk,
             request_ids=batch.step_context.padded_request_ids,
@@ -1862,6 +1979,8 @@ class Engine:
             slot_lease=lease,
             per_request_info=batch.per_request_info,
         )
+        if PHASE_PERIOD:
+            phase_record("engine.pre_declare", perf_counter() - t0)
         if step is None:
             return False
         if batch.inputs is not None or (
@@ -1870,14 +1989,17 @@ class Engine:
                 batch.step_context.graph_walk,
             )
         ):
-            # exec drives this step as declared here (its admit ran as
-            # pre_admit), instead of declaring and admitting again
+            # exec drives this step as declared here, and its admit skips
+            # the resources pre_admit covered
             batch.step = step
 
         batch.step_context.is_preplan = True
         step.set_ctx(batch.step_context)
         try:
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             admit_outcome = self._runner.pre_admit(step)
+            if PHASE_PERIOD:
+                phase_record("engine.pre_admit", perf_counter() - t0)
             if not admit_outcome.ok:
                 # exec re-drives the step and reports the failure from there
                 self.reset_pre_plan_for_batch(batch)
@@ -2161,6 +2283,7 @@ class Engine:
         self._runner.ingest_request(request_id, overrides)
 
     def remove_request(self, request_id: str) -> None:
+        self._loopback_steps.pop(request_id, None)
         self._runner.remove_request(request_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)

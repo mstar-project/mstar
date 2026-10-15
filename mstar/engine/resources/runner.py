@@ -106,6 +106,8 @@ class StepRunner:
         # the step whose pre-plan is staged across the pre-planning resources,
         # as `_step_key` describes it; None when nothing is staged
         self._staged: tuple | None = None
+        # (step key, ready) of the last pre_admit whose stage is still up
+        self._pre_admitted: tuple | None = None
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
@@ -265,11 +267,28 @@ class StepRunner:
         self, rid: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
     ) -> None:
-        """open state on all resources; `overrides` are per-resource"""
+        """open state on all resources; `overrides` are per-resource. All or
+        nothing: a resource that raises leaves the request on none of them."""
+        for i, key in enumerate(self._order):
+            try:
+                self._resources[key].ingest_request(
+                    rid, None if overrides is None else overrides.get(key)
+                )
+            except Exception:
+                # the raising resource may have taken part of it too
+                for done in self._order[:i + 1]:
+                    try:
+                        self._resources[done].remove_request(rid)
+                    except Exception:
+                        logger.exception(
+                            "rolling back request %s on resource %s failed", rid, done,
+                        )
+                raise
+
+    def ingest_capture_row(self, rid: str) -> None:
+        """open a capture padding row on all resources"""
         for key in self._order:
-            self._resources[key].ingest_request(
-                rid, None if overrides is None else overrides.get(key)
-            )
+            self._resources[key].ingest_capture_row(rid)
 
     def remove_request(self, rid: str) -> None:
         for key in self._order:
@@ -337,9 +356,10 @@ class StepRunner:
             ),
         )
 
-    def _drop_stale_preplan(self, step: SubmoduleStep) -> None:
+    def _drop_stale_preplan(self, step: SubmoduleStep) -> tuple | None:
+        """Returns the step's key when the stage is for this very step."""
         if self._staged is None or step.ctx.is_preplan:
-            return
+            return None
         key = self._step_key(step)
         if self._staged != key:
             # Not the normal path: the worker meant to run the staged step
@@ -350,6 +370,8 @@ class StepRunner:
                 self._staged[0], len(self._staged[1]), key[0], len(key[1]),
             )
             self.clear_preplan()
+            return None
+        return key
 
     @property
     def staged(self) -> bool:
@@ -359,6 +381,7 @@ class StepRunner:
     def clear_preplan(self) -> None:
         """Drop the staged pre-plan on every resource, and the record of it."""
         self._staged = None
+        self._pre_admitted = None
         for key in self._order:
             self._resources[key].clear_preplan()
 
@@ -366,10 +389,21 @@ class StepRunner:
         """Reserve capacity for step. A refused admit gives back everything
         the step reserved.
         """
-        self._drop_stale_preplan(step)
+        staged_key = self._drop_stale_preplan(step)
+        # A step whose ``pre_admit`` ran a step ahead, and whose stage is still
+        # up for it, skips the resources that sweep covered: each would only
+        # find its own reservation and no-op (0.1 ms of Python per step at
+        # 128 rows, on the gpu thread). A refusal below still unwinds them.
+        covered: list[str] = []
         ready = True
+        pre = self._pre_admitted
+        if pre is not None and staged_key is not None and pre[0] == staged_key:
+            covered = self._preplan_keys_for(step)
+            ready = pre[1]
         admitted: list[str] = []
         for key in self._keys_for(step):
+            if key in covered:
+                continue
             if self._nvtx:
                 range_push(f"res.admit.{key}")
             t0 = perf_counter() if PHASE_PERIOD else 0.0
@@ -385,7 +419,7 @@ class StepRunner:
                     "Admit for resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
-                for done in reversed([*admitted, key]):
+                for done in reversed([*covered, *admitted, key]):
                     self._resources[done].rollback_admit(
                         step.get(done), step.ctx,
                     )
@@ -404,6 +438,7 @@ class StepRunner:
             # the resources promote their staged share below (or plan afresh
             # if nothing was staged): either way nothing stays staged
             self._staged = None
+            self._pre_admitted = None
         results = step.ctx.plan_results
         results.clear()
         for key in self._keys_for(step):
@@ -446,9 +481,11 @@ class StepRunner:
                     self._resources[done].rollback_admit(
                         step.get(done), step.ctx,
                     )
+                self._pre_admitted = None
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready
+        self._pre_admitted = (self._step_key(step), ready)
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
     def pre_plan(self, step: SubmoduleStep) -> dict[str, Any]:
