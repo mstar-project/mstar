@@ -65,7 +65,7 @@ class BagelModelConfig:
     cfg_renorm_min: float = 0.0
     think_mode: bool = False
 
-    # Fallback sampling defaults; the checkpoint generation_config.json overrides them
+    # Sampling recipe; the checkpoint's generation_config.json is Qwen2.5's, so only do_sample is read
     temperature: float = 0.6  # 0 = greedy (argmax), >0 = sampling
     top_k: int = 0            # 0 = disabled
     top_p: float = 1.0        # 1.0 = disabled
