@@ -31,18 +31,27 @@ _DEVICES = [
 
 
 class _FakeCommGroup(CommGroup):
-    """One rank of a P-rank group whose all-reduce is the identity.
+    """One rank of a P-rank group, run in one process with its peers.
 
-    The test sums the rank outputs itself, which is what the real
-    all-reduce would compute.
+    A forward makes two all-reduces. The first syncs the routing; rank 0
+    runs first and posts its tensor to ``bus``, which the other ranks
+    take, as the real zero-padded all-reduce would. The second is the
+    identity; the test sums the rank outputs itself.
     """
 
-    def __init__(self, rank: int, world_size: int):
+    def __init__(self, rank: int, world_size: int, bus: dict | None = None):
         super().__init__(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world_size)))
         self.all_reduce_calls = 0
+        self.bus = bus if bus is not None else {}
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         self.all_reduce_calls += 1
+        if self.all_reduce_calls % 2 == 1:
+            if self.rank == 0:
+                self.bus["routing"] = input_.clone()
+            else:
+                assert (input_ == 0).all()
+                input_.copy_(self.bus["routing"])
         return input_
 
 
@@ -96,16 +105,17 @@ def _reference(ckpt, router, router_w, device, dtype):
     return ref.to(device, dtype)
 
 
-def _ep_blocks(world_size, ckpt, router_factory, router_w, device, dtype):
+def _ep_blocks(world_size, ckpt, router_factory, router_w, device, dtype, router_ws=None):
     blocks = []
+    bus = {}
     for rank in range(world_size):
         block = ExpertParallelSparseMoeBlock(
             HIDDEN, NUM_EXPERTS, TOP_K, INTER,
-            router=router_factory(), comm_group=_FakeCommGroup(rank, world_size),
+            router=router_factory(), comm_group=_FakeCommGroup(rank, world_size, bus),
         )
-        # The router is replicated on every rank.
+        # The router is replicated on every rank, unless a test perturbs it.
         with torch.no_grad():
-            block.gate.weight.copy_(router_w)
+            block.gate.weight.copy_(router_w if router_ws is None else router_ws[rank])
         block = block.to(device, dtype)
         _load(block, ckpt)
         blocks.append(block)
@@ -133,7 +143,31 @@ def test_ep_sum_matches_unsharded(world_size, num_tokens, dev):
 
     for b, out in zip(blocks, outs, strict=True):
         assert out.shape == x.shape
-        assert b.comm_group.all_reduce_calls == (0 if world_size == 1 else 1)
+        assert b.comm_group.all_reduce_calls == (0 if world_size == 1 else 2)
+    total = torch.stack([o.float() for o in outs]).sum(0).to(dtype)
+    torch.testing.assert_close(total, expected, **_tol(dtype))
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dev", _DEVICES)
+def test_ep_ranks_follow_rank0_routing(world_size, dev):
+    """Ranks whose routers disagree still dispatch rank 0's top-k.
+
+    Without the sync, the other ranks' own picks would give tokens more or
+    fewer than k experts.
+    """
+    device, dtype = dev
+    ckpt = _checkpoint()
+    router_w = torch.randn(NUM_EXPERTS, HIDDEN)
+    # Every non-zero rank routes from an unrelated router.
+    router_ws = [router_w] + [torch.randn(NUM_EXPERTS, HIDDEN) for _ in range(world_size - 1)]
+    blocks = _ep_blocks(world_size, ckpt, lambda: None, router_w, device, dtype, router_ws=router_ws)
+    ref = _reference(ckpt, None, router_w, device, dtype)
+
+    x = torch.randn(9, HIDDEN, device=device, dtype=dtype)
+    with torch.no_grad():
+        outs = [b(x) for b in blocks]
+        expected = ref(x)
     total = torch.stack([o.float() for o in outs]).sum(0).to(dtype)
     torch.testing.assert_close(total, expected, **_tol(dtype))
 
