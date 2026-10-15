@@ -1041,34 +1041,35 @@ def sample_accelerator_graphable_gpu(
                 rand_offset=offset,
                 min_p=min_p,
             )
-    if logits.device.type != "cuda":
+    elif logits.device.type == "cuda":
+        import flashinfer
+
+        with torch.cuda.device(logits.device):
+            probs = fused_temperature_softmax(
+                logits, temperature,
+                penalty=rep_penalty if apply_penalty else None,
+                seen_mask=seen_tokens if apply_penalty else None,
+                include_greedy=True,
+            )
+            if min_p is not None:
+                probs = apply_min_p(probs, min_p)
+            top_k = torch.where(top_k > 0, top_k, logits.shape[1])
+            # NOTE: this is NOT batch-invariant. FlashInfer reads only row 0's seed
+            # and offset and folds the row index into philox, so identical (probs,
+            # seed, offset) yield different tokens at different batch positions.
+            # Sampling is thus reproducible only within a fixed batch layout; under
+            # continuous batching (shifting positions) a request's stream is not.
+            # Measured in test/sampling_test/flashinfer_batch_test.py.
+            samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, top_k, top_p, deterministic=True,
+                seed=seed, offset=offset,
+            )
+        return samples.to(torch.int64)
+    else:
         raise ValueError(
             f"Graph-captured sampling is unsupported on {logits.device.type!r}; "
             "expected 'cuda' or 'xpu'."
         )
-    import flashinfer
-
-    with torch.cuda.device(logits.device):
-        probs = fused_temperature_softmax(
-            logits, temperature,
-            penalty=rep_penalty if apply_penalty else None,
-            seen_mask=seen_tokens if apply_penalty else None,
-            include_greedy=True,
-        )
-        if min_p is not None:
-            probs = apply_min_p(probs, min_p)
-        top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-        # NOTE: this is NOT batch-invariant. FlashInfer reads only row 0's seed
-        # and offset and folds the row index into philox, so identical (probs,
-        # seed, offset) yield different tokens at different batch positions.
-        # Sampling is thus reproducible only within a fixed batch layout; under
-        # continuous batching (shifting positions) a request's stream is not.
-        # Measured in test/sampling_test/flashinfer_batch_test.py.
-        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            probs, top_k, top_p, deterministic=True,
-            seed=seed, offset=offset,
-        )
-    return samples.to(torch.int64)
 
 
 @dataclass
