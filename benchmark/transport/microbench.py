@@ -87,6 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--duration", type=float, default=5.0, help="seconds per interference point")
     p.add_argument("--p99-budget-ms", type=float, default=1.0,
                    help="interference: report the largest burst whose extra p99 stays under this")
+    p.add_argument("--torch-threads", type=int, default=None,
+                   help="torch intra-op threads in both roles (default: torch's, as M* workers keep). "
+                        "On a busy host the pool's threads inflate host copies of 32K+ elements")
     p.add_argument("--json", default=None, help="write results here")
     p.add_argument("--quiet", action="store_true")
     return p
@@ -106,6 +109,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("--iters and --inflight must be >= 1, --warmup >= 0")
     if not hasattr(torch, args.dtype) or not isinstance(getattr(torch, args.dtype), torch.dtype):
         raise SystemExit(f"unknown dtype {args.dtype!r}")
+    if args.torch_threads is not None:
+        if args.torch_threads < 1:
+            raise SystemExit("--torch-threads must be >= 1")
+        torch.set_num_threads(args.torch_threads)
     return args
 
 
@@ -746,7 +753,8 @@ def crossovers(paths: dict) -> list[dict]:
 def render(results: dict) -> str:
     lines = [f"host {results['host']}  sender {results['sender_device']}  receiver {results['receiver_device']}"
              f"  inflight {results['inflight']}  mesh {results['mesh']}  mooncake {results.get('mooncake')}"
-             f"  load {results['loadavg_start']:.1f} on {results['cpus']} cpus", ""]
+             f"  load {results['loadavg_start']:.1f} on {results['cpus']} cpus"
+             f"  torch threads {results['torch_threads']}", ""]
     paths = results["paths"]
     names = [p for p in paths if paths[p].get("results")]
     if names:
@@ -798,6 +806,7 @@ def run_sender(args) -> dict:
         "mesh": type(sender.comm).__mro__[1].__name__, "paths": {},
         "torch": torch.__version__,
         "loadavg_start": os.getloadavg()[0], "cpus": os.cpu_count(),
+        "torch_threads": torch.get_num_threads(),
     }
     try:
         import importlib.metadata as md
