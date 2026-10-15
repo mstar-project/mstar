@@ -364,3 +364,46 @@ class ByteLevelDetokenizer:
         for token in tokens:
             raw.extend(self.byte_decoder[c] for c in token)
         return bytes(raw)
+
+
+# generation_config.json key -> mstar knob
+_KNOBS = {
+    "temperature": "temperature",
+    "top_p": "top_p",
+    "top_k": "top_k",
+    "min_p": "min_p",
+    "repetition_penalty": "repetition_penalty",
+    "max_new_tokens": "max_output_tokens",
+}
+
+
+def load_generation_defaults(
+    checkpoint_dir: str | Path | None, prefix: str = "", stage: str = "",
+) -> dict:
+    """The sampling defaults ``checkpoint_dir/generation_config.json`` declares.
+
+    Keys come back under mstar names (``max_new_tokens`` -> ``max_output_tokens``).
+    ``prefix`` selects one stage's keys in a multi-stage file (``"talker_"`` reads
+    ``talker_temperature``) and ``stage`` prefixes the returned names
+    (``"code_predictor_"``). ``do_sample: false`` is greedy: temperature 0.
+    Returns ``{}`` when there is no file, so the caller's own defaults apply.
+    """
+    if checkpoint_dir is None:
+        return {}
+    path = Path(checkpoint_dir) / "generation_config.json"
+    if not path.is_file():
+        return {}
+    try:
+        config = json.loads(path.read_text())
+    except (OSError, ValueError):
+        logger.warning("Unreadable %s; using the model's own defaults", path)
+        return {}
+    out = {}
+    for hf_key, knob in _KNOBS.items():
+        value = config.get(prefix + hf_key)
+        if value is not None:
+            out[stage + knob] = value
+    # HF spells a stage's switch both ways: ``talker_do_sample``, ``subtalker_dosample``
+    if False in (config.get(prefix + "do_sample"), config.get(prefix + "dosample")):
+        out[stage + "temperature"] = 0.0
+    return out

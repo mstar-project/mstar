@@ -44,9 +44,10 @@ Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
                  retention policy releases frames past the context horizon at
                  each commit). Each finished window's latents leave the loop on
                  a streaming edge.
-    vae_decoder_ar (partition ``window_decoder``) - decodes each window behind
-                 re-decoded context while the loop denoises the next one, and
-                 emits the video per window (``stream_video``) or assembled.
+    vae_decoder_ar (partition ``window_decoder``) - decodes each window,
+                 continuing the stream's decoder cache, while the loop
+                 denoises the next one, and emits the video per window
+                 (``stream_video``) or assembled.
 """
 
 from __future__ import annotations
@@ -252,6 +253,7 @@ class Cosmos3Model(Model):
                         "Cosmos3Model: yaml model_kwargs key %r is not a Cosmos3Config "
                         "field; ignored.", k,
                     )
+        cfg.check_streaming_decode()
         return cfg
 
     def _load_tokenizer(self):
@@ -1747,11 +1749,15 @@ class Cosmos3Model(Model):
                 vae=self._build_vae(device), config=self.config
             )
         if node_name == VAE_DECODER_AR_NODE:
-            # Shares the decoder VAE weights; only the streaming chunk state
+            # Shares the decoder VAE weights unless it decodes channels-last,
+            # which converts the VAE in place; only the streaming chunk state
             # and compile wrapper are per-node.
-            return Cosmos3VAEDecoderARSubmodule(
-                vae=self._build_vae(device), config=self.config
+            vae = (
+                self._build_decoder_only_vae(device)
+                if self.config.vae_decode_channels_last
+                else self._build_vae(device)
             )
+            return Cosmos3VAEDecoderARSubmodule(vae=vae, config=self.config)
         if node_name == AUDIO_DECODER_NODE:
             return Cosmos3AudioDecoderSubmodule(
                 sound_tokenizer=self._build_sound_tokenizer(device), config=self.config
@@ -1835,6 +1841,17 @@ class Cosmos3Model(Model):
         vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
         self._vae = vae.to(device).eval()
         return self._vae
+
+    def _build_decoder_only_vae(self, device: str):
+        # A separate instance (the decode needs no encoder), so converting it
+        # leaves the instance the whole-clip decoder uses untouched.
+        if self.skip_weight_loading:
+            return None
+        from diffusers import AutoencoderKLWan
+
+        vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
+        vae.encoder = None
+        return vae.to(device).eval()
 
     def _build_encode_vae(self, device: str):
         # The encoder node keeps its own fp32 instance instead of sharing the

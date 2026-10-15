@@ -254,13 +254,15 @@ class SamplerResource(Resource):
         if not ctx.is_preplan:
             self._kept_rids = step.kept_rids
         if not ctx.is_preplan and self._penalty_live:
+            configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
-                self._sampler.get_token_mask(rid).add_tokens(tokens)
+                if configs[rid].penalize_prompt:
+                    self._sampler.get_token_mask(rid).add_tokens(tokens)
             # dropped as they are used: `plan` runs on every step of a resident
             # request, and these belong to the one prefill that was cut
             for rid in ctx.request_ids:
                 skipped = self._cached_prefix.pop(rid, None)
-                if skipped is not None:
+                if skipped is not None and configs[rid].penalize_prompt:
                     self._sampler.get_token_mask(rid).add_tokens(skipped)
 
         # A step planned ahead promotes here. Its static config was gathered in
@@ -385,7 +387,10 @@ class SamplerResource(Resource):
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step
             )
-        tokens = self._sampler.sample(request_ids, logits, kept_rids=self._kept_rids)
+        tokens = self._sampler.sample(
+            request_ids, logits, apply_penalty=self._apply_penalty_this_step,
+            kept_rids=self._kept_rids,
+        )
         # An eager step has no per-step row to scatter from: write the masters
         # by request, so the next step can still read its token on the device.
         bufs = self._cg_buffers

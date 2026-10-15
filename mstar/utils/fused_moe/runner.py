@@ -36,6 +36,7 @@ def fused_experts(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     reduce_results: bool = True,
+    skip_invalid: bool = False,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -64,6 +65,10 @@ def fused_experts(
         ``(tokens, hidden)``. If False, skip the sum-reduce and return
         ``(tokens, top_k, hidden)`` — the caller is responsible for the
         reduce (e.g. after an all-reduce for TP).
+    skip_invalid : bool
+        Set when ``topk_ids`` may hold ids ``>= num_experts`` (the EP
+        sentinel for experts another rank owns). Those slots skip both GEMMs
+        and contribute zeros, at the cost of one memset of the output cache.
 
     Returns
     -------
@@ -108,7 +113,8 @@ def fused_experts(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    cache3 = torch.empty(
+    # Skipped slots are never written by GEMM 2, so they must start at zero.
+    cache3 = (torch.zeros if skip_invalid else torch.empty)(
         (num_tokens, top_k, hidden),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
