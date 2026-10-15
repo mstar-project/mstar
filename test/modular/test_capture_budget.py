@@ -10,6 +10,7 @@ measured before any of them captures.
 
 from __future__ import annotations
 
+import inspect
 import sys
 from contextlib import contextmanager
 from functools import partial
@@ -341,6 +342,24 @@ def test_a_throwaway_capture_frees_its_memory_pass_or_fail(forward, monkeypatch)
 
     assert (taken is None) == (forward is not _succeeds)
     assert torch.cuda.memory_reserved(device) == reserved, "a throwaway capture must hand back all it took"
+
+
+def test_a_throwaway_capture_reads_its_pool_as_the_installed_torch_takes_it(monkeypatch):
+    """`memory_snapshot` takes ``include_traces`` only from torch 2.11, and
+    pyproject allows 2.9. On 2.9 and 2.10 the call raised TypeError while
+    sizing, so no graph was captured and the server ran eager."""
+    signature = inspect.signature(torch.cuda.memory_snapshot)
+    calls = []
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: (0, 1))
+    monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda *args, **kwargs: calls.append((args, kwargs)) or [])
+
+    cuda_graph_runner._capture_thrown_away(lambda pool: (object(), {}), "decode")
+
+    (args, kwargs), = calls
+    try:
+        signature.bind(*args, **kwargs)
+    except TypeError as error:
+        pytest.fail(f"torch {torch.__version__} refuses the snapshot call, so every capture would fail: {error}")
 
 
 def _cost(graph: int, kept: int = 0, peak: int = 0, slots: int = 1) -> CaptureCost:
