@@ -516,7 +516,7 @@ class HiFTSubmodule(NodeSubmodule):
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         del graph_walk, kwargs
         device = self.get_device()
-        mel = inputs[MEL][0].to(device, torch.float32)
+        mel = inputs[MEL][0].to(device, self.hift.conv_pre.weight.dtype)
         final = bool(inputs[MEL_FINAL][0].reshape(-1)[0].item())
         return NodeInputs(tensor_inputs={MEL: mel}, kwargs={"rid": _rid(fwd_info), "final": final})
 

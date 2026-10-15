@@ -256,6 +256,9 @@ class CosyVoice3Model(Model):
         )
         if mk.get("seed") is not None:
             _integer("seed", mk["seed"], low=0, high=MAX_SEED)
+        if mk.get("ref_audio") is not None:
+            # only the OpenAI adapter turns a ref_audio string into an upload
+            raise ValueError("ref_audio cannot be a model kwarg; upload the clip as a file")
         for key in ("ref_text", "instruct"):
             if mk.get(key) is not None and not isinstance(mk[key], str):
                 raise ValueError(f"{key} must be a string")
@@ -356,9 +359,12 @@ class CosyVoice3Model(Model):
                 f"Unknown voice {voice!r}: CosyVoice3 has no built-in voice and no voices_dir is "
                 "configured; upload a reference clip (ref_audio, with its transcript in ref_text)"
             )
+        # checked before anything is opened, so a name cannot probe the disk
+        if not voice or voice.startswith(".") or any(c in voice for c in "/\\\0"):
+            raise ValueError(f"Invalid voice name {voice!r}")
         for ext in ("", ".wav", ".flac", ".mp3", ".ogg", ".m4a"):
             path = self.voices_dir / f"{voice}{ext}"
-            if path.is_file() and path.parent == self.voices_dir and path.suffix != ".txt":
+            if path.is_file() and path.suffix != ".txt":
                 text = path.with_suffix(".txt")
                 return path, text.read_text(encoding="utf-8").strip() if text.is_file() else None
         available = sorted({p.stem for p in self.voices_dir.iterdir() if p.is_file() and p.suffix != ".txt"})

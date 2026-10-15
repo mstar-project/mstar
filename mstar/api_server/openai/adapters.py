@@ -662,6 +662,72 @@ class ChatterboxAdapter(OpenAIAdapter):
         )
 
 
+def _uploaded_ref_audio(ref, upload_dir: Path) -> str:
+    """A reference clip from the request, saved under ``upload_dir``: a data URL,
+    an http(s) URL (fetched only when ``MSTAR_ALLOW_REMOTE`` allows it) or bare
+    base64 that soundfile opens. No string names a file on the server, not even
+    one under ``upload_dir``: ``/etc/passwd`` is valid base64, so it is decoded
+    into a new file and refused when that file is not audio, with nothing left
+    behind and nothing client-named opened."""
+    if not isinstance(ref, str):
+        raise ValueError(f"ref_audio must be a data URL or base64 audio, got {type(ref).__name__}")
+    if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
+        return media_io.resolve_media_ref(ref, upload_dir, allow_remote=False)[1]
+    try:
+        _, path = media_io.save_base64(ref, "wav", "audio", upload_dir)
+    except ValueError:
+        path = None
+    if path is not None:
+        try:
+            import soundfile
+
+            soundfile.info(path)
+            return path
+        except Exception:  # noqa: BLE001 - not audio the model's loader opens (or no soundfile)
+            Path(path).unlink(missing_ok=True)
+    raise ValueError(
+        "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
+        "or base64 audio"
+    )
+
+
+class CosyVoice3Adapter(OpenAIAdapter):
+    """Fun-CosyVoice3: TTS that always clones a voice.
+
+    ``voice`` names a preset in the deployment's ``voices_dir`` (with its
+    transcript in ``<voice>.txt``); ``ref_audio`` in ``extra_body`` uploads a
+    clip instead (see ``_uploaded_ref_audio``), with its transcript in
+    ``ref_text``. ``instructions`` becomes ``instruct``. ``temperature``,
+    ``top_p`` and ``seed`` are the standard fields; ``top_k``, ``ras_window``,
+    ``ras_tau``, ``n_cfm_timesteps`` and ``max_new_tokens`` (25 Hz speech
+    tokens) pass through ``extra_body``. ``speed`` is dropped.
+    """
+
+    supports_speech = True
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        if getattr(req, "voice", None):
+            mk.setdefault("voice", req.voice)
+        instructions = mk.pop("instructions", None)
+        if instructions:
+            mk.setdefault("instruct", instructions)
+        _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        file_paths = None
+        input_modalities = ["text"]
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            file_paths = {"audio": [_uploaded_ref_audio(ref_audio, upload_dir)]}
+            input_modalities = ["text", "audio"]
+        return SubmitArgs(
+            text=req.input,
+            file_paths=file_paths,
+            input_modalities=input_modalities,
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
 class Cosmos3Adapter(OpenAIAdapter):
     """NVIDIA Cosmos3: text-to-image and text/image-to-video generation.
 
@@ -1038,6 +1104,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "chatterbox": ChatterboxAdapter(),
     "chatterbox_multilingual": ChatterboxAdapter(),
     "chatterbox_turbo": ChatterboxAdapter(),
+    "cosyvoice3": CosyVoice3Adapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),
