@@ -1,0 +1,14 @@
+model: "lingbot_world_1_3b"
+
+# No node holds an engine KV cache yet (the rolling K/V is per-request state in
+# the dit); max_seq_len only satisfies the conductor's config check and matches
+# the UMT5 text length.
+max_seq_len: 512
+
+# One rollout per GPU: the dense K/V and the decoder cache are per request.
+max_concurrent_requests: 1
+
+# Single-GPU colocated; the Wan VAE decode is fused into the dit forward.
+node_groups:
+  - node_names: [text_encoder, vae_encoder, dit]
+    ranks: [0]

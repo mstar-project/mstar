@@ -20,6 +20,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
+    "lingbot_world_1_3b": ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
@@ -115,6 +116,9 @@ HF_MODELS: dict[str, dict] = {
     # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
     # only; the A14B MoE variants are a separate follow-up.
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
+    # LingBot-World-V2 1.3B causal-fast (CC-BY-NC-SA-4.0): the DiT repo only;
+    # UMT5 and the Wan2.1 VAE load from the diffusers repos mstar already uses.
+    "lingbot_world_1_3b": {"model_path_hf": "robbyant/lingbot-world-v2-1.3b-causal-fast"},
     # Waypoint owns a variant -> Hub repository mapping. None is intentional:
     # it lets WaypointModel distinguish the registry default from an explicit
     # local path or Hub ID, then select the 720P or 360P repository named by the

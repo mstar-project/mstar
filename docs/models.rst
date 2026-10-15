@@ -101,6 +101,12 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
+   * - ``lingbot_world_1_3b``
+     - ``robbyant/lingbot-world-v2-1.3b-causal-fast``
+     - LingBot-World-V2 1.3B causal-fast: camera-controlled image-to-world video, streamed
+       chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
+       The weights and the files under ``mstar/model/lingbot_world`` adapted from the reference
+       are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it before deploying.
    * - ``flux2_klein``
      - ``black-forest-labs/FLUX.2-klein-4B``
      - FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference

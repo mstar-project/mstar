@@ -50,6 +50,9 @@ jobs:
           # BAGEL's CPU graph/KV tests import these model modules without
           # loading weights or requiring the CUDA-only BAGEL extras.
           python -m pip install einops regex transformers
+          # LingBot-World's request contract tests clean prompts the way its
+          # reference tokenizer does (no weights needed).
+          python -m pip install ftfy
           # The Wan VAE decode tests build tiny random AutoencoderKLWan models
           # (no weights); 0.39 is the release the decoder was verified on.
           python -m pip install diffusers==0.39.0
