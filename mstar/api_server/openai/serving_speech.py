@@ -33,11 +33,12 @@ import asyncio
 import base64
 from collections.abc import Callable
 
+import anyio
 from fastapi import HTTPException
 from fastapi.responses import Response, StreamingResponse
 
 from mstar.api_server import media_io
-from mstar.api_server.openai._util import rid, sse
+from mstar.api_server.openai._util import error_type, rid, sse
 from mstar.api_server.openai.protocol import VoiceCard, VoiceList
 from mstar.api_server.openai.speech_chunking import split_sentences
 
@@ -146,10 +147,10 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
         body = _stream_pcm(api, submit, len(chunks), pending, first_iter, first, sample_rate,
                            with_wav_header=not raw_pcm)
         if stream_format == "sse":
-            return StreamingResponse(
+            return _ClosingStreamingResponse(
                 _as_sse(body), media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
             )
-        return StreamingResponse(
+        return _ClosingStreamingResponse(
             body, media_type="audio/pcm" if raw_pcm else "audio/wav", headers={"Cache-Control": "no-cache"},
         )
 
@@ -174,17 +175,36 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
     return Response(content=audio_bytes, media_type=mime)
 
 
+class _ClosingStreamingResponse(StreamingResponse):
+    """Closes its body iterator however the response ends. Starlette stops at
+    the failed or cancelled ``send`` when a client leaves mid-stream and leaves
+    the generator suspended at its ``yield``, so its release of the sentence
+    pieces still in flight would wait for garbage collection."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
+
+
 async def _as_sse(audio):
     """OpenAI's ``stream_format="sse"``: one ``speech.audio.delta`` per piece of
-    audio (base64, in ``response_format``), then ``speech.audio.done``."""
+    audio (base64, in ``response_format``), then ``speech.audio.done``. A failure
+    after the stream opened ends it with an ``error`` event instead of
+    ``speech.audio.done``: the 200 is already sent."""
     try:
         async for data in audio:
             yield sse({"type": "speech.audio.delta", "audio": base64.b64encode(data).decode("ascii")})
-        yield sse({"type": "speech.audio.done"})
+    except HTTPException as exc:
+        yield sse({"type": "error", "error": {
+            "message": str(exc.detail), "type": error_type(exc.status_code), "code": exc.status_code,
+        }})
+        return
     finally:
-        # A client that hangs up closes this generator only; closing ``audio``
-        # now runs its release of the pieces still in flight.
         await audio.aclose()
+    yield sse({"type": "speech.audio.done"})
 
 
 def _is_error(chunk) -> bool:

@@ -16,6 +16,9 @@ Scenarios (one per conversation; ``mix`` cycles through them):
 Per turn it records ``turn_latency_s``: from the end of the user's speech to
 the agent's first audible audio, which is what a caller hears. It includes the
 agent's endpointing delay and the WebRTC path as well as STT, LLM and TTS.
+When the user talks over the agent (``bargein``, the last turn of ``cancel``),
+the agent's earlier audio must stop before the user is done, or the turn counts
+as a failed interruption; only audio after that stop counts as the reply.
 
     python examples/livekit/participant.py --utterances 'utts/*.wav' \\
         --conversations 8 --scenario mix --out results.jsonl
@@ -139,7 +142,9 @@ class Conversation:
                 chunk = silence
             await self.source.capture_frame(rtc.AudioFrame(chunk.tobytes(), SAMPLE_RATE, 1, FRAME_SAMPLES))
             if current is not None and pos >= len(current):
-                done.set_result((done.start, time.time()))  # type: ignore[attr-defined]
+                # capture_frame returns once the frame is queued; the user stops
+                # talking when the queue has played out
+                done.set_result((done.start, time.time() + self.source.queued_duration))  # type: ignore[attr-defined]
                 current = None
             deadline += 0.01
             await asyncio.sleep(max(0.0, deadline - time.monotonic()))
@@ -216,11 +221,22 @@ def make_token(key: str, secret: str, room: str, identity: str) -> str:
     return api.AccessToken(key, secret).with_identity(identity).with_grants(grants).to_jwt()
 
 
-async def turn(conv: Conversation, audio: np.ndarray, timeout: float) -> dict:
+async def turn(conv: Conversation, audio: np.ndarray, timeout: float, over_agent: bool = False) -> dict:
+    """One user turn and the agent's reply. With ``over_agent`` the user talks
+    over the agent: its earlier audio must stop before the user is done (else
+    the interruption failed), and only audio after that stop is the reply."""
     start, end = await (await conv.say(audio))
-    first = await conv.first_voiced_after(end, timeout)
-    rec = {"user_start": start, "user_end": end, "agent_first_audio": first,
-           "turn_latency_s": None if first is None else first - end}
+    rec = {"user_start": start, "user_end": end}
+    after = end
+    if over_agent:
+        stopped = conv.stopped_after(start)
+        rec["interrupt_s"] = stopped - start
+        if stopped >= end:
+            rec.update(interrupt_failed=True, agent_first_audio=None, turn_latency_s=None)
+            return rec
+        after = max(end, stopped)
+    first = await conv.first_voiced_after(after, timeout)
+    rec.update(agent_first_audio=first, turn_latency_s=None if first is None else first - end)
     if first is not None:
         thinking = await conv.wait_state(("thinking",), after=end - 0.5, timeout=0.1)
         if thinking is not None and thinking < first:
@@ -252,8 +268,7 @@ async def run_conversation(args, idx: int, scenario: str, utts: list[np.ndarray]
             first = await conv.first_voiced_after(end, args.timeout)
             if first is not None:
                 await asyncio.sleep(0.8)
-                rec = await turn(conv, pick(1), args.timeout)
-                rec["interrupt_s"] = conv.stopped_after(rec["user_start"]) - rec["user_start"]
+                rec = await turn(conv, pick(1), args.timeout, over_agent=True)
                 summary["turns"].append(rec)
                 summary["ok"] = rec["turn_latency_s"] is not None
 
@@ -262,7 +277,7 @@ async def run_conversation(args, idx: int, scenario: str, utts: list[np.ndarray]
                 start, end = await (await conv.say(pick(k)))
                 await conv.wait_state(("thinking", "speaking"), after=end - 0.5, timeout=args.timeout)
                 await asyncio.sleep(0.3 * (k % 3))
-            rec = await turn(conv, pick(args.cancels), args.timeout)
+            rec = await turn(conv, pick(args.cancels), args.timeout, over_agent=True)
             summary["turns"].append(rec)
             summary["ok"] = rec["turn_latency_s"] is not None
 
@@ -288,6 +303,7 @@ def report(results: list[dict]) -> dict:
     lat = [t["turn_latency_s"] for r in results for t in r["turns"] if t.get("turn_latency_s") is not None]
     after = [t["after_endpoint_s"] for r in results for t in r["turns"] if t.get("after_endpoint_s") is not None]
     intr = [t["interrupt_s"] for r in results for t in r["turns"] if t.get("interrupt_s") is not None]
+    failed = sum(bool(t.get("interrupt_failed")) for r in results for t in r["turns"])
 
     def pct(xs: list[float]) -> dict | None:
         if not xs:
@@ -305,6 +321,7 @@ def report(results: list[dict]) -> dict:
         "turn_latency_s": pct(lat),
         "after_endpoint_s": pct(after),
         "interrupt_s": pct(intr),
+        "interrupts_failed": failed,
         "transcripts_with_think_tags": think,
     }
 
