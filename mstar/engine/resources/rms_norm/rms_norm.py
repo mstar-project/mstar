@@ -52,6 +52,10 @@ def _rms_norm_cuda(
     import flashinfer
 
     x, weight, orig_dtype = _prepare_inputs(x, weight, norm_dtype)
+    if torch.version.hip is not None and x.dim() > 2:
+        # FlashInfer's ROCm port takes 2D input only; per-head norms come in 3D
+        out = flashinfer.norm.rmsnorm(x.reshape(-1, x.shape[-1]), weight, eps=eps)
+        return out.view(x.shape).to(orig_dtype)
     return flashinfer.norm.rmsnorm(x, weight, eps=eps).to(orig_dtype)
 
 
