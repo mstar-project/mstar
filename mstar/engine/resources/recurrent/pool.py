@@ -59,6 +59,10 @@ class RecurrentAddressing:
     slot_indices: torch.Tensor  # [rows] int32, `pad_index` where nothing is addressed
     has_state: torch.Tensor     # [rows] bool, False where the slot reads as zeros
     num_rows: int               # real rows, before a capture bucket's padding
+    # The same two on the host, as built: a backend that splits rows between
+    # kernels by them must not read the device copies back
+    host_slot_indices: tuple[int, ...] | None = None
+    host_has_state: tuple[bool, ...] | None = None
 
 
 class RecurrentStatePool(Resource):
@@ -389,6 +393,8 @@ class RecurrentStatePool(Resource):
             slot_indices=target.slot_indices,
             has_state=target.has_state,
             num_rows=num_rows,
+            host_slot_indices=tuple(indices),
+            host_has_state=tuple(has_state),
         )
 
     def _addressing_buffers(

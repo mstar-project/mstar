@@ -236,6 +236,7 @@ class MicroScheduler:
         self._spec_exact_walk_checked = 0.0
         self._max_bs: dict[tuple[str, str], int | None] = {}
         self._walk_caps_of_key: dict[tuple[str, str], dict[str, int | None]] = {}
+        self._row_caps_of_key: dict[tuple[str, str], dict[str, int]] = {}
         self.batch_builder = make_batch_builder(batch_builder_type)
         self.batch_number = 0
         # The graph runtime, installed by the worker. Interning and the
@@ -733,6 +734,7 @@ class MicroScheduler:
             backlog=backlogged, fresh=fresh or None, blocked_rids=blocked,
             capture_group_of=capture_group_of,
             walk_caps=walk_caps,
+            walk_row_caps=self._walk_row_caps(node_walk),
             pre_existing_batch_size=pre_existing_batch_size,
             pre_existing_walk=pre_existing_walk,
         ))
@@ -1017,6 +1019,20 @@ class MicroScheduler:
             caps = {walk: self._max_batch_size(key[0], walk) for walk in walks}
             caps[key[1]] = self._max_batch_size(*key)
             self._walk_caps_of_key[key] = caps
+        return caps
+
+    def _walk_row_caps(self, key: tuple[str, str]) -> dict[str, int]:
+        """``BatchBuildRequest.walk_row_caps`` for ``key``: empty unless it is
+        a combined walk. Fixed by the model, so asked once."""
+        caps = self._row_caps_of_key.get(key)
+        if caps is None:
+            engine = self.engine_manager.get_engine(key[0])
+            caps = {}
+            for walk in self._walks_of_key.get(key, ()):
+                cap = engine.get_max_rows_in_combined(key[0], walk)
+                if cap is not None:
+                    caps[walk] = cap
+            self._row_caps_of_key[key] = caps
         return caps
 
     def _max_batch_size(self, node_name: str, graph_walk: str) -> int | None:

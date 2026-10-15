@@ -1817,6 +1817,10 @@ class Engine:
             graph_walk, {request_id: request_info},
         )
 
+    def get_max_rows_in_combined(self, node_name: str, graph_walk: str) -> int | None:
+        """Rows of ``graph_walk`` a step mixing it with another walk may hold."""
+        return self._submodules[node_name].submodule.max_rows_in_combined(graph_walk)
+
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """Most requests this node will take in one step, or None for no cap.
 

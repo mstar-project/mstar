@@ -17,6 +17,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import (
+    distribute_tokens,
     BatchedCudaGraphConfig,
     CudaGraphConfig,
     PackedCudaGraphConfig,
@@ -56,6 +57,7 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTN,
     LLM_MIXED,
+    MIXED_MAX_PREFILL_ROWS,
     ROPE,
     SAMPLER,
     VISION_ATTN,
@@ -94,9 +96,13 @@ class LLMSubmodule(ARNodeSubmodule):
             "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,256,512,1024,2048,4096,8192",
         ).split(",")
     ]
-    # sized for the mixed walk, whose decode rows ride in these captures: a
-    # mixed step capped below the decode batch splits it
+    # As wide as the mixed captures: the scheduler caps a step mixing walks at
+    # the smallest cap of the walks in it, so a narrower prefill ladder would
+    # cap every mixed step below the decode batch and split it.
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64, 128]
+    # A mixed step carries the decode batch beside its prompt rows, so its
+    # captures run to the decode batch: one capped below it splits the batch.
+    MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64, 128]
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
@@ -178,10 +184,21 @@ class LLMSubmodule(ARNodeSubmodule):
             ),
             PackedCudaGraphConfig(
                 capture_graph_walk="prefill_text",
-                replay_graph_walks=["prefill_text", LLM_MIXED],
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=dummy,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+            ),
+            PackedCudaGraphConfig(
+                capture_graph_walk=LLM_MIXED,
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                make_node_input=dummy,
+                capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
+                # decode rows and one prompt, the layout its GDN splits; a
+                # replay's padding rows (no tokens) stay empty
+                token_layout=lambda tokens, bs: (
+                    [1] * (bs - 1) + [tokens - (bs - 1)] if tokens >= bs
+                    else distribute_tokens(tokens, bs)
+                ),
             ),
             PackedCudaGraphConfig(
                 capture_graph_walk="prefill_vision",
@@ -569,6 +586,10 @@ class LLMSubmodule(ARNodeSubmodule):
         if graph_walk == "prefill_vision":
             return self.PREFILL_VISION_MAX_BATCH_SIZE
         return None
+
+    def max_rows_in_combined(self, graph_walk: str) -> int | None:
+        # a mixed step's prompt rows take the chunked GDN path, sized to these
+        return MIXED_MAX_PREFILL_ROWS if graph_walk == "prefill_text" else None
 
     def forward_batched(
         self,

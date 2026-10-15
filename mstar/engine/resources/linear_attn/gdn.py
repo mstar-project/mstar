@@ -18,6 +18,7 @@ from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
+    GDNMixedWrapper,
     GDNPrefillWrapper,
     GDNWrapper,
 )
@@ -166,6 +167,7 @@ class GDNManager(LinearAttnManager):
 
     def _get_wrapper(
         self, label: str, is_decode: bool, lease: SlotLease | None = None,
+        split: bool = False,
     ) -> GDNWrapper:
         """The wrapper this (label, walk) plans into, built once and reused.
 
@@ -174,7 +176,7 @@ class GDNManager(LinearAttnManager):
         """
         if lease is None:
             # both walks can run eagerly under one label
-            key, store = (label, is_decode), self._eager_wrappers
+            key, store = (label, "split" if split else is_decode), self._eager_wrappers
             bs, tok = None, None
         else:
             key = CGSlotKey(lease.bucket, lease.slot, label)
@@ -184,7 +186,21 @@ class GDNManager(LinearAttnManager):
 
         if key not in store:
             null_slot_id = SINK_SLOT if self._has_sink else NO_SLOT
-            if is_decode:
+            if split:
+                store[key] = GDNMixedWrapper(
+                    device=self._device,
+                    pad_slot_id=PAD_SLOT_ID,
+                    sm_scale=self.config.sm_scale,
+                    qk_l2norm=self.config.qk_l2norm,
+                    prefill_dtype=self._prefill_dtype,
+                    bs=bs,
+                    num_tokens=tok,
+                    cuda_graph=lease is not None,
+                    has_sink_state=self._has_sink,
+                    null_slot_id=null_slot_id,
+                    max_prefill_rows=self.config.split_max_prefill_rows,
+                )
+            elif is_decode:
                 store[key] = GDNDecodeWrapper(
                     device=self._device,
                     pad_slot_id=PAD_SLOT_ID,
@@ -223,7 +239,16 @@ class GDNManager(LinearAttnManager):
 
         # One kernel for the step: the chunked one unless every row is one
         # token, or always under a packed capture, which replays mixed steps.
+        # A split walk's step (decode rows beside prompt rows) takes both.
         is_decode = not ctx.force_prefill and bool(spans) and all(s == 1 for s in spans)
+        walk = ctx.slot_lease.bucket.graph_walk if ctx.slot_lease is not None else ctx.graph_walk
+        if walk in self.config.split_walks and addressing.host_slot_indices is not None:
+            wrapper = self._get_wrapper(label, False, ctx.slot_lease, split=True)
+            wrapper.plan(
+                spans, addressing.host_slot_indices[:num_rows],
+                addressing.host_has_state[:num_rows],
+            )
+            return wrapper
         wrapper = self._get_wrapper(label, is_decode, ctx.slot_lease)
         if is_decode:
             wrapper.plan(spans, slots)

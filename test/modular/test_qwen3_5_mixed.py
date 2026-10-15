@@ -36,8 +36,9 @@ def test_a_mixed_step_tracks_only_its_prefill_rows_prompt_tokens():
 class _Recorder(GDNManager):
     def __init__(self):
         self.kinds = []
+        self.config = SimpleNamespace(split_walks=())
 
-    def _get_wrapper(self, label, is_decode, lease=None):
+    def _get_wrapper(self, label, is_decode, lease=None, split=False):
         self.kinds.append("decode" if is_decode else "prefill")
         return SimpleNamespace(plan=lambda *args: None)
 
@@ -52,7 +53,7 @@ def test_the_kernel_follows_a_packed_capture_not_the_spans(force_prefill, spans,
     segments = [SimpleNamespace(span=s) for s in spans]
     addressing = SimpleNamespace(slot_indices=torch.zeros(4, dtype=torch.long),
                                  has_state=torch.zeros(4, dtype=torch.bool))
-    ctx = SimpleNamespace(force_prefill=force_prefill, slot_lease=None)
+    ctx = SimpleNamespace(force_prefill=force_prefill, slot_lease=None, graph_walk="decode")
 
     gdn._build_plan("main", segments, addressing, ctx)
 

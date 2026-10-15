@@ -144,6 +144,10 @@ class PackedCudaGraphConfig(CudaGraphConfig):
         # the resources size their per-bucket buffers for the whole plan.
         total_tokens_multiplier: int = 1,
         input_seq_dims: dict[str, int] | None = None,
+        # (input tokens, bs) -> each capture row's span; `distribute_tokens`
+        # by default. A walk whose kernels split rows by span (a mixed step's
+        # one-token rows beside a prompt) captures a layout it will replay.
+        token_layout: Callable[[int, int], list[int]] | None = None,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -160,6 +164,7 @@ class PackedCudaGraphConfig(CudaGraphConfig):
         self.make_node_input = make_node_input
         self.capture_token_lengths = capture_token_lengths
         self.total_tokens_multiplier = total_tokens_multiplier
+        self.token_layout = token_layout or distribute_tokens
 
     def get_config_type(self) -> CudaGraphConfigType:
         return CudaGraphConfigType.FLASH_INFER_PACKED
@@ -174,7 +179,7 @@ class PackedCudaGraphConfig(CudaGraphConfig):
 
     def get_node_inputs(self, bs: int, num_tokens: int):
         # ``num_tokens`` is the bucket's plan tokens; the rows get input tokens
-        seq_lens = distribute_tokens(num_tokens // self.total_tokens_multiplier, bs)
+        seq_lens = self.token_layout(num_tokens // self.total_tokens_multiplier, bs)
         return [
             self.make_node_input(n) for n in seq_lens
         ]

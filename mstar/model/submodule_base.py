@@ -777,6 +777,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
+    def max_rows_in_combined(self, graph_walk: str) -> int | None:
+        """How many rows of this real walk a step mixing it with another walk
+        of its combined walk may hold; None is uncapped. For a backend whose
+        mixed step runs the walk's rows on a path sized to a few of them."""
+        del graph_walk
+        return None
+
     def get_autocast_dtype(self) -> torch.dtype | None:
         """Per-submodule autocast dtype override for the engine's forward
         wrap. The engine consults this on each ``execute_batch`` and uses

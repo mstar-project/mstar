@@ -213,9 +213,11 @@ class _Manager:
 class _Engine:
     def __init__(
         self, max_bs=None, not_ready=frozenset(), unservable=frozenset(),
-        groups=None,
+        groups=None, row_caps=None,
     ):
         self._max_bs = max_bs
+        # real walk -> rows of it a mixed step may hold
+        self._row_caps = dict(row_caps or {})
         self.not_ready = set(not_ready)
         # rids a resource rejects outright, as opposed to "not yet"
         self.unservable = set(unservable)
@@ -223,6 +225,10 @@ class _Engine:
         self.groups = dict(groups or {})
         # rids check_ready was asked about, in order
         self.checked = []
+
+    def get_max_rows_in_combined(self, node_name, graph_walk):
+        del node_name
+        return self._row_caps.get(graph_walk)
 
     def get_max_batch_size(self, node_name, graph_walk):
         del node_name
@@ -1298,6 +1304,35 @@ def test_a_mixed_step_takes_the_combined_walks_cap():
     batch = _next_batch(sched, manager)
 
     assert batch.graph_walk == MIXED and len(batch) == 4
+
+
+def test_a_mixed_step_takes_at_most_its_row_cap_of_prompts():
+    """Three prompts ready beside decode rows, two allowed in a mixed step:
+    the third is left out and parked, first in line next time."""
+    sched = _combined_scheduler(_Engine(
+        max_bs={MIXED: 8, WALK: 8, "prefill": 8}, row_caps={"prefill": 2},
+    ))
+    manager = _Manager(
+        ["d0", "p0", "p1", "p2", "d1"], walks={"p0": "prefill", "p1": "prefill", "p2": "prefill"},
+    )
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == MIXED
+    assert sorted(batch.request_to_worker_graph) == ["d0", "d1", "p0", "p1"]
+    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p2"]
+
+
+def test_a_one_walk_step_is_not_bound_by_its_row_cap():
+    """The cap is on a step mixing walks: prompts alone fill their own step."""
+    sched = _combined_scheduler(_Engine(
+        max_bs={MIXED: 8, WALK: 8, "prefill": 8}, row_caps={"prefill": 2},
+    ))
+    manager = _Manager(["p0", "p1", "p2"], walks={"p0": "prefill", "p1": "prefill", "p2": "prefill"})
+
+    batch = _next_batch(sched, manager)
+
+    assert len(batch) == 3 and batch.graph_walk == "prefill"
 
 
 def test_a_merge_counts_the_continuing_rows_walk():

@@ -54,6 +54,7 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTN,
     LLM_MIXED,
+    MIXED_MAX_PREFILL_ROWS,
     ROPE,
     SAMPLER,
     VISION_ATTN,
@@ -227,6 +228,8 @@ class Qwen3_5DenseModel(Model):
                 config=LinearAttnConfig(
                     recurrent_state=GDN_STATE,
                     variant=LinearAttnVariant.GDN,
+                    split_walks=(LLM_MIXED,),
+                    split_max_prefill_rows=MIXED_MAX_PREFILL_ROWS,
                 ),
             ),
             SamplerSpec(

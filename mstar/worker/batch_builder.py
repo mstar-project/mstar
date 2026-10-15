@@ -34,6 +34,9 @@ class BatchBuildRequest:
     # walk, each real walk's, plus the combined walk's own under `graph_walk`,
     # which caps a step mixing walks.
     walk_caps: dict[str, int | None] = field(default_factory=dict)
+    # Under a combined walk: how many rows of each real walk a step mixing
+    # walks may hold (absent is uncapped). A step of one walk is not bound.
+    walk_row_caps: dict[str, int] = field(default_factory=dict)
     # The caller's own rows (a speculation merge's continuing ones) and their walk.
     pre_existing_batch_size: int = 0
     pre_existing_walk: str | None = None
@@ -200,8 +203,10 @@ def _compose_walks(
 ) -> tuple[int | None, set[int]]:
     """Rows left for the step after the caller's, and the rows left out."""
     caps = request.walk_caps
+    row_caps = request.walk_row_caps
     n = request.pre_existing_batch_size
     walks = {request.pre_existing_walk} if request.pre_existing_walk else set()
+    counts = {request.pre_existing_walk: n} if request.pre_existing_walk else {}
     cap = _min_cap(*(caps.get(walk) for walk in walks))
     left_out = set()
     for rid in batch.request_to_worker_graph:
@@ -215,7 +220,15 @@ def _compose_walks(
         if new_cap is not None and new_cap <= n:
             left_out.add(rid)
             continue
+        if row_caps and len(walks | {walk}) > 1 and any(
+            counts.get(w, 0) + (w == walk) > row_caps[w]
+            for w in walks | {walk} if w in row_caps
+        ):
+            # the step would mix walks past one's row cap
+            left_out.add(rid)
+            continue
         walks.add(walk)
+        counts[walk] = counts.get(walk, 0) + 1
         cap = new_cap
         n += 1
     return (None if cap is None else cap - request.pre_existing_batch_size), left_out
