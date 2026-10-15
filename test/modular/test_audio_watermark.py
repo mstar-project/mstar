@@ -205,6 +205,17 @@ def test_streamed_watermark_equals_the_offline_watermark(sizes):
     assert all(piece.shape[0] % wmk.hop == 0 for piece in pieces[:-1])
 
 
+def test_an_utterance_ending_mid_frame_differs_from_the_library_in_its_last_frame_only():
+    wmk = _watermarker(message=0xBEEF)
+    sizes = [1280, 20, 1260, 1440]   # 4,000 samples: 12.5 frames
+    audio = _speechlike(sum(sizes), seed=1)
+    streamed = torch.cat(_stream(wmk, audio, sizes))
+    assert streamed.shape == audio.shape
+    torch.testing.assert_close(streamed, wmk.offline(audio), atol=1e-6, rtol=0)
+    whole = audio.shape[0] - audio.shape[0] % wmk.hop
+    torch.testing.assert_close(streamed[:whole], _library_offline(wmk, audio)[:whole], atol=1e-6, rtol=0)
+
+
 def test_library_streaming_context_does_not_carry_history():
     """Why the module keeps the state itself (upstream issue #105)."""
     wmk = _watermarker()

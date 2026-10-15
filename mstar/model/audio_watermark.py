@@ -31,9 +31,11 @@ lets requests at the same point share one batched call.
 The generator works on whole 320-sample frames (its total stride). A chunk
 that is not a whole number of frames leaves its tail pending until the next
 chunk, or until the final chunk zero-pads it, so streamed output equals the
-offline watermark of the whole utterance to float rounding. Codecs whose
-chunks are whole frames (Qwen3-TTS: 1920 samples per codec frame) never hold
-anything back.
+offline watermark of the whole utterance to float rounding. AudioSeal's own
+whole-utterance call pads inside each layer instead, so for an utterance
+that ends mid-frame the two differ in that last partial frame only (a few
+tens of int16 steps). Codecs whose chunks are whole frames (Qwen3-TTS: 1920
+samples per codec frame) never hold anything back and never pad.
 """
 
 from __future__ import annotations
