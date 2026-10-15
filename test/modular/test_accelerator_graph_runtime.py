@@ -1,8 +1,7 @@
 """Device dispatch for graph execution and its worker output copies."""
 
-from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -15,19 +14,21 @@ from mstar.worker.worker import Worker
 
 
 @pytest.mark.parametrize("device_type", ["cuda", "xpu"])
-def test_output_copy_uses_worker_device_runtime(monkeypatch, device_type):
+def test_output_copy_uses_generic_stream_on_worker_device(monkeypatch, device_type):
     worker = object.__new__(Worker)
     worker.device = torch.device(device_type, 1)
     worker._d2h_stream = None
-    side = Mock()
+    side = MagicMock()
     runtime = SimpleNamespace(
         is_available=lambda: True,
         Stream=Mock(return_value=side),
         Event=Mock(),
-        stream=Mock(return_value=nullcontext()),
+        stream=Mock(),
     )
     monkeypatch.setattr(torch, device_type, runtime)
     worker.device_capability = DeviceCapability(worker.device)
+    make_stream = Mock(return_value=side)
+    monkeypatch.setattr(torch, "Stream", make_stream)
     tensor = SimpleNamespace(
         device=worker.device, dtype=torch.int64, shape=(1,), numel=lambda: 1,
     )
@@ -42,9 +43,12 @@ def test_output_copy_uses_worker_device_runtime(monkeypatch, device_type):
 
     copied, host_rows = worker._prematerialize_for_check_stop(outputs, event)
 
-    runtime.Stream.assert_called_once_with(device=worker.device)
+    make_stream.assert_called_once_with(device=worker.device)
     side.wait_event.assert_called_once_with(event)
-    runtime.stream.assert_called_once_with(side)
+    side.__enter__.assert_called_once_with()
+    side.__exit__.assert_called_once()
+    runtime.Stream.assert_not_called()
+    runtime.stream.assert_not_called()
     cpu_tensor.copy_.assert_called_once_with(tensor, non_blocking=True)
     side.synchronize.assert_called_once_with()
     assert copied == {7: {"token": [cpu_tensor, host_value], "metadata": "keep"}}

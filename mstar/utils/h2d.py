@@ -132,7 +132,7 @@ class PinnedStager:
                 view[n:total] = pad_value
             dst.view(-1)[:total].copy_(self._bufs[i][:total], non_blocking=True)
             if ev is None:
-                ev = self._events[i] = capability.new_event()
-            ev.record(capability.current_stream())
+                ev = self._events[i] = torch.Event(device=dst.device)
+            ev.record(torch.accelerator.current_stream(dst.device))
             if mirror is not None:
                 mirror.record(key, values)

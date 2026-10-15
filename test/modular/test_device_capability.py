@@ -21,8 +21,6 @@ def test_cpu_capability_is_cached_and_does_not_touch_accelerators(monkeypatch):
     assert not capability.pin_memory
     assert capability.graph_backend is None
     assert not capability.is_capturing()
-    capability.set_device()
-    capability.synchronize()
     fail.assert_not_called()
 
 
@@ -38,35 +36,22 @@ def test_unavailable_runtime_selection_does_not_initialize_hardware(monkeypatch,
     assert not capability.is_capturing()
 
 
-def test_another_runtime_can_supply_streams_and_graphs_without_call_site_changes(monkeypatch):
+def test_another_runtime_reports_capabilities_without_creating_streams_or_events(monkeypatch):
     device = torch.device("privateuseone:2")
-    stream, event = object(), object()
     runtime = SimpleNamespace(
-        is_available=lambda: True, Stream=Mock(return_value=stream),
-        Event=Mock(return_value=event), stream=Mock(return_value=nullcontext()),
+        is_available=lambda: True, Stream=Mock(),
+        Event=Mock(), stream=Mock(),
     )
     backend = SimpleNamespace(is_current_stream_capturing=Mock(return_value=True))
     monkeypatch.setattr(torch, "privateuseone", runtime, raising=False)
     monkeypatch.setitem(_GRAPH_BACKENDS, "privateuseone", lambda device: backend)
-    monkeypatch.setattr(torch.accelerator, "current_stream", Mock(return_value=stream))
-    monkeypatch.setattr(torch.accelerator, "synchronize", Mock())
-    monkeypatch.setattr(torch.accelerator, "set_device_index", Mock())
 
     capability = DeviceCapability(device)
     assert capability.is_accelerator and capability.pin_memory
     assert capability.graph_backend is backend and capability.is_capturing()
-    assert capability.new_stream() is stream
-    assert capability.current_stream() is stream
-    assert capability.new_event(enable_timing=True) is event
-    with capability.stream_context(stream):
-        pass
-    capability.set_device()
-    capability.synchronize()
-    runtime.Stream.assert_called_once_with(device=device)
-    runtime.Event.assert_called_once_with(enable_timing=True)
-    torch.accelerator.current_stream.assert_called_once_with(device)
-    torch.accelerator.set_device_index.assert_called_once_with(device)
-    torch.accelerator.synchronize.assert_called_once_with(device)
+    runtime.Stream.assert_not_called()
+    runtime.Event.assert_not_called()
+    runtime.stream.assert_not_called()
 
 
 @pytest.mark.parametrize("device_type", ["cuda", "xpu"])

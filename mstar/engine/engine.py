@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
@@ -1064,7 +1065,7 @@ class Engine:
                 if self._enable_nvtx:
                     range_push("engine.await_outputs")
                 try:
-                    self.device_capability.current_stream().synchronize()
+                    torch.accelerator.current_stream(self._device).synchronize()
                 finally:
                     if self._enable_nvtx:
                         range_pop()
@@ -1148,7 +1149,7 @@ class Engine:
                     continue
                 launched = True
                 if fence:
-                    slot_events[slot] = self.device_capability.new_event()
+                    slot_events[slot] = torch.Event(device=self._device)
                     slot_events[slot].record()
 
                 merged.update(self._collect_outputs(
@@ -1178,7 +1179,7 @@ class Engine:
             if nvtx:
                 range_push("engine.await_outputs")
             try:
-                self.device_capability.current_stream().synchronize()
+                torch.accelerator.current_stream(self._device).synchronize()
             finally:
                 if nvtx:
                     range_pop()
@@ -2006,9 +2007,9 @@ class Engine:
                 self.reset_pre_plan_for_batch(batch)
                 return False
             stream = cg_runner.plan_stream()
-            with self.device_capability.stream_context(stream):
+            with stream if stream is not None else nullcontext():
                 self._runner.pre_plan(step)
-            batch.preplan_event = self.device_capability.new_event()
+            batch.preplan_event = torch.Event(device=self._device)
             batch.preplan_event.record(stream)
             batch.preplanned_rids = tuple(batch.request_ids)
         finally:

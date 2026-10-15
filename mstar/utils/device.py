@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from functools import lru_cache
 
 import torch
@@ -14,10 +13,10 @@ from mstar.engine.accelerator_graph_backend import (
 
 
 class DeviceCapability:
-    """Runtime operations for one device, without initializing its hardware.
+    """Query one device's capabilities without initializing its hardware.
 
-    Kernel dispatch remains with the resource that owns the kernel. This
-    abstraction covers streams, events, host staging, and graph capture.
+    Runtime operations use PyTorch's generic stream, event, and accelerator
+    APIs directly. Kernel dispatch remains with the resource that owns it.
     """
 
     def __init__(self, device: torch.device):
@@ -54,26 +53,6 @@ class DeviceCapability:
             and self.is_available
             and self.graph_backend.is_current_stream_capturing()
         )
-
-    def set_device(self) -> None:
-        if self.is_accelerator and self.device.index is not None:
-            torch.accelerator.set_device_index(self.device)
-
-    def synchronize(self) -> None:
-        if self.is_available:
-            torch.accelerator.synchronize(self.device)
-
-    def current_stream(self):
-        return torch.accelerator.current_stream(self.device)
-
-    def new_stream(self):
-        return self._runtime.Stream(device=self.device)
-
-    def stream_context(self, stream):
-        return nullcontext() if stream is None else self._runtime.stream(stream)
-
-    def new_event(self, **kwargs):
-        return self._runtime.Event(**kwargs)
 
 
 @lru_cache(maxsize=None)
