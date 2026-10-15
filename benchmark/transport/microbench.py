@@ -837,11 +837,15 @@ def crossovers(paths: dict) -> list[dict]:
             common = sorted({r["size"] for r in ra} & {r["size"] for r in rb})
             pa = {r["size"]: r["p50_us"] for r in ra}
             pb = {r["size"]: r["p50_us"] for r in rb}
+            first = next((s for s in common if pa[s] != pb[s]), None)
             out.append({
                 "a": a, "b": b,
                 "fit_bytes": fit_crossover(la, lb),
+                # below the fitted crossover the line with the smaller fixed cost wins
+                "fit_cheaper_below": a if la.fixed_s < lb.fixed_s else b,
                 "measured_bytes": measured_crossover(common, [pa[s] for s in common], [pb[s] for s in common]),
-                "cheaper_below": a if common and pa[common[0]] < pb[common[0]] else b,
+                # at the smallest size where they differ
+                "measured_cheaper_first": None if first is None else (a if pa[first] < pb[first] else b),
             })
     return out
 
@@ -871,10 +875,12 @@ def render(results: dict) -> str:
                 bw = f"{f['bandwidth_bps'] / 1e6:.0f} MB/s" if f["bandwidth_bps"] else "flat"
                 lines.append(f"  {p:10s} fixed {f['fixed_s'] * 1e6:8.1f} us  bandwidth {bw:>12s}  r2 {f['r2']:.3f}")
         for c in results.get("crossovers", []):
-            fb = human_size(c["fit_bytes"]) if c["fit_bytes"] else "none"
+            fb = (f"{human_size(c['fit_bytes'])} ({c['fit_cheaper_below']} cheaper below)"
+                  if c["fit_bytes"] else "none")
             mb = human_size(c["measured_bytes"]) if c["measured_bytes"] else "none in range"
-            lines.append(f"  crossover {c['a']} vs {c['b']}: fit {fb}, measured {mb} "
-                         f"({c['cheaper_below']} cheaper below)")
+            first = c["measured_cheaper_first"] or "neither"
+            lines.append(f"  crossover {c['a']} vs {c['b']}: fit {fb}; measured {mb} "
+                         f"({first} cheaper at the smallest size)")
     for p, r in paths.items():
         if r.get("skipped"):
             lines.append(f"  skipped {p}: {r['skipped']}")

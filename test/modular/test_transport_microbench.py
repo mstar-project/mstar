@@ -144,5 +144,44 @@ def test_interference_reports_extra_p99(monkeypatch):
     assert points[1]["burst_bytes"] == 4096 and points[1]["bg_received"] > 0
     assert all(p["probes"] > 0 and p["after_burst_p99_us"] > 0 for p in points)
     assert inter["idle"]["probes"] > 0 and inter["idle"]["bg_received"] == 0
-    # the schedule keeps its rate (a 50 ms blocking receive would cut it)
-    assert points[1]["achieved_rate_hz"] > 40
+    assert points[1]["bursts"] > 0
+    assert points[1]["achieved_rate_hz"] == pytest.approx(points[1]["bursts"] / 0.5)
+
+
+class _PollRecorder:
+    """Records how ``recv`` waits: the Rust communicator's blocking receive
+    waits in 50 ms slices, so a short wait has to go through the poll."""
+
+    def __init__(self, ready):
+        self.ready, self.polls, self.blocking = ready, [], False
+
+    def get_all_new_messages(self, blocking=False, timeout_s=None):
+        self.blocking = self.blocking or blocking
+        return ["m"] if self.ready and self.polls else []
+
+    def poll_for_messages(self, timeout_ms=20):
+        self.polls.append(timeout_ms)
+        return self.ready
+
+
+def test_recv_waits_no_longer_than_asked():
+    comm = _PollRecorder(ready=False)
+    assert microbench.recv(comm, 0.002) == []
+    assert comm.polls == [2] and not comm.blocking
+    comm = _PollRecorder(ready=True)
+    assert microbench.recv(comm, 0.002) == ["m"]
+    comm = _PollRecorder(ready=False)
+    assert microbench.recv(comm, 0.0) == [] and comm.polls == []
+
+
+def test_crossover_labels_follow_the_fit_and_the_points_separately():
+    def path(fixed, bw, p50s):
+        return {"fit": {"fixed_s": fixed, "bandwidth_bps": bw, "r2": 1.0},
+                "results": [{"size": s, "p50_us": v} for s, v in p50s]}
+    # A = 1us + S/1e9 and B = 2us + S/2e9 cross at 2000 B; measured only above it
+    paths = {"A": path(1e-6, 1e9, [(4096, 5.1), (16384, 17.4)]),
+             "B": path(2e-6, 2e9, [(4096, 4.0), (16384, 10.2)])}
+    (c,) = microbench.crossovers(paths)
+    assert c["fit_bytes"] == pytest.approx(2000)
+    assert c["fit_cheaper_below"] == "A"
+    assert c["measured_cheaper_first"] == "B" and c["measured_bytes"] is None
