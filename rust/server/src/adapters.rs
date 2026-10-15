@@ -587,6 +587,7 @@ fn refuse_tool_calls(req: &ChatCompletionRequest) -> Result<(), String> {
         Some(Value::Array(t)) => !t.is_empty(),
         Some(_) => true,
     };
+    let says_none = |field: &str| req.extra.get(field).and_then(Value::as_str) == Some("none");
     let choice = match req.extra.get("tool_choice") {
         Some(Value::String(c)) => c == "required",
         Some(Value::Object(_)) => true,
@@ -597,7 +598,11 @@ fn refuse_tool_calls(req: &ChatCompletionRequest) -> Result<(), String> {
         Some(Value::String(c)) => c != "none" && c != "auto",
         Some(_) => true,
     };
-    if listed("tools") || listed("functions") || choice || function_call {
+    if (listed("tools") && !says_none("tool_choice"))
+        || (listed("functions") && !says_none("function_call"))
+        || choice
+        || function_call
+    {
         return Err("tool calling is not supported for this model".to_string());
     }
     Ok(())
