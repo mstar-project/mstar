@@ -81,3 +81,7 @@ test/modular/test_kv_decode_plan_cache.py
 test/modular/test_kv_pinned_index_ring.py
 test/modular/test_kv_plan_host_lens.py
 test/modular/test_sampler_trash_row.py
+test/modular/test_kv_prefix_stage.py
+test/modular/test_resident_delta.py
+test/modular/test_stream_consumer_final_flag.py
+test/modular/test_worker_speculation_loop_counter.py
