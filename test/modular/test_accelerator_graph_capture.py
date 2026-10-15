@@ -26,7 +26,7 @@ from mstar.engine.accelerator_graph_runner import (
     capture_into_graph,
     fail_if_graphs_required,
 )
-from mstar.engine.resources import BucketKey, GraphSlotSpec
+from mstar.engine.resources import BucketKey, CGSlotSpec
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="capture allocates a graph pool"
@@ -113,7 +113,7 @@ def _specs(walks=("decode",), num_slots=2):
     for walk in walks:
         bucket = BucketKey(graph_walk=walk, bs=1, num_tokens=8, cg_key_info=None)
         for slot in range(num_slots):
-            out.append(GraphSlotSpec(
+            out.append(CGSlotSpec(
                 bucket=bucket, slot=slot, config=SimpleNamespace(), config_idx=0,
             ))
     return out

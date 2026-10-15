@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.resources.base import EngineResourceInfo, GraphSlotKey, GraphSlotSpec, Resource
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
 from mstar.engine.resources.recurrent.config import (
     RecurrentStateConfig,
     RecurrentStateSpec,
@@ -98,10 +98,10 @@ class RecurrentStatePool(Resource):
         self._lock = threading.RLock()
 
         self._cg_max_bs = 0
-        self._cg_addressing: dict[GraphSlotKey, RecurrentAddressing] = {}
+        self._cg_addressing: dict[CGSlotKey, RecurrentAddressing] = {}
         # (slot_indices, has_state) mirrors per captured buffer: a steady batch
         # addresses the same slots every step, so its copies are skipped
-        self._cg_mirrors: dict[GraphSlotKey, tuple[H2DMirror, H2DMirror]] = {}
+        self._cg_mirrors: dict[CGSlotKey, tuple[H2DMirror, H2DMirror]] = {}
         # copy-only H2D for the addressing, see `_build_addressing`
         self._index_stager = PinnedStager(torch.int32)
         self._state_stager = PinnedStager(torch.bool)
@@ -406,7 +406,7 @@ class RecurrentStatePool(Resource):
                 buf = self._eager_addressing[label] = self._new_buffers(num_rows)
             return buf, (None, None)
 
-        key = GraphSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         buf = self._cg_addressing.get(key)
         if buf is None:
             size = max(self._cg_max_bs, lease.bucket.bs, num_rows)
@@ -441,7 +441,7 @@ class RecurrentStatePool(Resource):
     # Engine lifecycle
 
     def build_accelerator_graph_buffers(
-        self, slots: list[GraphSlotSpec], max_bs: int, max_seq_len: int,
+        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len
         # per-key buffers are built on first plan; every runner calls in, so

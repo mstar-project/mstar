@@ -9,7 +9,7 @@ from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.ragged.base import RaggedAttnManager
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig
 from mstar.engine.resources.attn.ragged.wrappers import RaggedPrefillWrapper
-from mstar.engine.resources.base import GraphSlotKey
+from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 
 
@@ -30,7 +30,7 @@ class FlashInferRaggedManager(RaggedAttnManager):
         # Persistent, because constructing one allocates FlashInfer's own
         # buffers and is far from free per step.
         self._eager_plan_states: dict[EagerSlotKey, RaggedPrefillWrapper] = {}
-        self._cg_plan_states: dict[GraphSlotKey, RaggedPrefillWrapper] = {}
+        self._cg_plan_states: dict[CGSlotKey, RaggedPrefillWrapper] = {}
 
         self._preplan_states: dict[str, RaggedPrefillWrapper] = {}
         self._preplanned = False
@@ -64,7 +64,7 @@ class FlashInferRaggedManager(RaggedAttnManager):
         plan's ``num_rows``, which is only one of the layouts the bucket will
         replay.
         """
-        key = GraphSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         wrapper = self._cg_plan_states.get(key)
         if wrapper is not None:
             return wrapper

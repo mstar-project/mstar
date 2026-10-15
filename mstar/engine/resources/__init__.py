@@ -23,7 +23,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
 )
-from mstar.engine.resources.base import GraphSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.kv.config import (
     KVConfig,
     KVLayout,
@@ -81,7 +81,7 @@ __all__ = [
     "AttentionStep",
     "AttnBackend",
     "BucketKey",
-    "GraphSlotSpec",
+    "CGSlotSpec",
     "CrossAttentionConfig",
     "CrossAttentionSpec",
     "KVConfig",
