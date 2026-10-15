@@ -3397,6 +3397,8 @@ class Worker:
         phase_record("worker.postprocess.host_rows#", int(host_rows is not None))
         if host_rows is None or not self._graph_runtime.supports_inline_emit:
             return None, []
+        if not batch_N.batch.request_walks:
+            return self._inline_emit_one_walk(engine, batch_N, host_rows, rids, signals)
         # Asked per real walk, not under the batch's label: a combined walk
         # is no walk of the submodule's, and would answer none. The runtime
         # only takes a row's value where that row's own walk has the signal as
@@ -3428,6 +3430,34 @@ class Worker:
                     return None, []  # an inline row with no value: tensor path
                 else:
                     out.append(0)  # its walk sends this signal no inline value
+            phase_record("worker.postprocess.inline#", 1)
+            return signal, out
+        return None, []
+
+    def _inline_emit_one_walk(
+        self, engine, batch_N: PendingBatch, host_rows: "HostRows",
+        rids: list[int], signals,
+    ) -> tuple[str | None, list[int]]:
+        """`_inline_emit_values` for a step of one walk: every row takes the
+        value, so one comprehension, and a slice when the host rows are in
+        the batch's order (the usual case)."""
+        candidates = engine.inline_client_signals(batch_N.node_name, batch_N.graph_walk)
+        for signal, buffer_name in candidates.items():
+            if signal not in signals:
+                continue
+            buf = host_rows.buffers.get(buffer_name)
+            if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
+                continue
+            values = buf.reshape(buf.shape[0], -1)[:, 0].tolist()
+            n = len(rids)
+            if len(values) >= n and list(host_rows.request_ids[:n]) == rids:
+                out = values[:n]
+            else:
+                row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+                try:
+                    out = [values[row_of[rid]] for rid in rids]
+                except (KeyError, IndexError):
+                    return None, []
             phase_record("worker.postprocess.inline#", 1)
             return signal, out
         return None, []

@@ -171,13 +171,14 @@ class StepRunner:
 
     def extend_prefix_chains_batch(
         self, request_ids: list[str], node_name: str,
-        walk_of: Callable[[str], str], host_rows, outputs, keys: list[str],
+        walk_of: Callable[[str], str] | str, host_rows, outputs, keys: list[str],
     ) -> None:
         """``extend_prefix_chains`` for a step: a resource with a batch form
         takes the host rows; the others are offered each request's host copy.
 
         ``walk_of`` rather than one walk for the step, so a combined walk comes
-        through here too instead of falling back to a call per row.
+        through here too instead of falling back to a call per row; a step of
+        one walk passes that walk itself.
         """
         for key in keys:
             resource = self._resources[key]
@@ -188,7 +189,10 @@ class StepRunner:
             for rid in request_ids:
                 per_rid = outputs.get(rid)
                 if isinstance(per_rid, dict):
-                    resource.extend_prefix_chain(rid, node_name, walk_of(rid), per_rid)
+                    resource.extend_prefix_chain(
+                        rid, node_name,
+                        walk_of if isinstance(walk_of, str) else walk_of(rid), per_rid,
+                    )
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.

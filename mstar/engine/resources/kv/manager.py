@@ -793,7 +793,7 @@ class KVManager(AttentionResource):
 
     def extend_prefix_chains_batch(
         self, request_ids: list[str], node_name: str,
-        walk_of: Callable[[str], str], host_rows,
+        walk_of: Callable[[str], str] | str, host_rows,
     ) -> None:
         """``extend_prefix_chain`` for a step, from the stop check's row
         buffers (``HostRows``: row i of every buffer belongs to
@@ -807,13 +807,16 @@ class KVManager(AttentionResource):
         single-request path allows. Removals and resets flush first.
 
         The walk is per row, so a step mixing walks keys each row under its
-        own: a step carries its rows' walks, in ``request_ids`` order."""
+        own: a step carries its rows' walks, in ``request_ids`` order. A step
+        of one walk passes that walk rather than a function."""
         if self._chain_lazy_steps <= 1:
             self._extend_chains_eager(request_ids, node_name, walk_of, host_rows)
             return
         step = (
             tuple(host_rows.request_ids), node_name,
-            tuple(walk_of(rid) for rid in request_ids), tuple(request_ids),
+            (walk_of,) * len(request_ids) if isinstance(walk_of, str)
+            else tuple(walk_of(rid) for rid in request_ids),
+            tuple(request_ids),
             {
                 name: buf.reshape(buf.shape[0], -1).cpu().numpy().copy()
                 for name, buf in host_rows.buffers.items()
@@ -830,7 +833,7 @@ class KVManager(AttentionResource):
 
     def _extend_chains_eager(
         self, request_ids: list[str], node_name: str,
-        walk_of: Callable[[str], str], host_rows,
+        walk_of: Callable[[str], str] | str, host_rows,
     ) -> None:
         """The per-step extension (MSTAR_KV_CHAIN_LAZY_STEPS=1): one lock,
         one ``tolist`` per buffer instead of one per request. The round-2
@@ -849,7 +852,7 @@ class KVManager(AttentionResource):
                 per_rid = lookup.get(rid)
                 if per_rid is None:
                     per_rid = lookup[rid] = {}
-                walk = walk_of(rid)
+                walk = walk_of if isinstance(walk_of, str) else walk_of(rid)
                 key = (node_name, walk)
                 entry = per_rid.get(key)
                 if entry is None:

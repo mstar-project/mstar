@@ -161,6 +161,8 @@ class _Engine:
 class _Scheduled:
     def __init__(self, walks):
         self._walks = walks
+        # rid -> real walk on a mixed step only, as ScheduledBatch keeps it
+        self.request_walks = dict(walks) if len(set(walks.values())) > 1 else {}
 
     def walk_of(self, rid):
         return self._walks.get(rid, "decode")

@@ -886,10 +886,12 @@ class Engine:
         # The batch call keys each row under its own walk, so a combined-walk
         # step takes it too; only the absence of host rows falls through.
         if host_rows is not None:
+            ctx = batch.step_context
             self._runner.extend_prefix_chains_batch(
                 batch.request_ids, batch.node_name,
-                batch.step_context.walk_of, host_rows, outputs,
-                keys=keys,
+                # a step of one walk passes the walk: no call per row
+                ctx.walk_of if ctx.request_walks else ctx.graph_walk,
+                host_rows, outputs, keys=keys,
             )
             return
         for rid in batch.request_ids:
@@ -1503,8 +1505,10 @@ class Engine:
         submodule = self._submodules[batch.node_name].submodule
         if host_rows is not None:
             try:
+                ctx = batch.step_context
                 batched = submodule.check_stop_batched(
                     batch.request_ids, batch.per_request_info_wrapped, host_rows,
+                    step_walk=None if ctx.request_walks else ctx.graph_walk,
                 )
             except Exception:
                 logger.debug(

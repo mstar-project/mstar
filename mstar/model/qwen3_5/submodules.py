@@ -669,8 +669,11 @@ class LLMSubmodule(ARNodeSubmodule):
         request_ids: list[str],
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
+        step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
         """``check_stop`` for every request off one ``tolist``."""
+        if step_walk is not None and step_walk != "decode":
+            return {}  # as check_stop: only a decode row's stop ends decode_loop
         tokens = host_rows.buffers.get("new_token")
         if not torch.is_tensor(tokens) or tokens.dim() == 0:
             return None
@@ -689,10 +692,12 @@ class LLMSubmodule(ARNodeSubmodule):
             )  # no row, no output: the per-request path skips it too
         stop_ids = self.config.stop_token_ids
         stops: dict[str, set[str]] = {}
+        mixed = step_walk is None
         for rid, value in pairs:
             info = request_infos[rid]
-            if info.graph_walk != "decode":
-                continue  # as check_stop: only a decode row's stop ends decode_loop
+            # a mixed step reads each row's walk; a decode step need not
+            if mixed and info.graph_walk != "decode":
+                continue
             # the set test first: a stop id is rare, the config read behind it
             # goes through the wrapper
             if (
