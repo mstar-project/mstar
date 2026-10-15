@@ -74,15 +74,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.profiler import (
-    PHASE_PERIOD,
-    nvtx_enabled,
-    phase_buffer,
-    phase_record,
-    range_pop,
-    range_push,
-    set_phase_label,
-)
+from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -1769,8 +1761,6 @@ class Worker:
         """
         spec_batch = speculation.node_batch
         engine = self.engine_manager.get_engine(spec_batch.node_name)
-        # the plan thread runs nothing else, so the label needs no reset
-        set_phase_label(spec_batch.graph_walk)
 
         if not engine.can_pre_plan(spec_batch.node_name):
             return False
@@ -1841,27 +1831,24 @@ class Worker:
             yield
         finally:
             if self._phase_period:
-                phase_record(name, _time.perf_counter() - t0)
+                self._phase_buf[name].append(_time.perf_counter() - t0)
             if nvtx:
                 range_pop(synchronize=False)
 
     def _phase_record(self, name: str, dt: float) -> None:
         if self._phase_period > 0:
-            phase_record(name, dt)
+            self._phase_buf[name].append(dt)
 
     def _drain_gpu_spans(self) -> None:
         """Record the GPU times whose events have landed, leaving the rest:
         reading a pair still in flight would block the host on the GPU."""
         while self._gpu_spans:
-            start, end, label = self._gpu_spans[0]
+            start, end = self._gpu_spans[0]
             if not end.query():
                 return
             self._gpu_spans.popleft()
-            # elapsed_time is ms; the phase buffer holds seconds. Labelled by
-            # the step it timed, not the one this thread is running now.
-            dt = start.elapsed_time(end) / 1000
-            self._phase_buf["gpu_exec"].append(dt)
-            self._phase_buf[f"gpu_exec.walk_{label}"].append(dt)
+            # elapsed_time is ms; the phase buffer holds seconds
+            self._phase_record("gpu_exec", start.elapsed_time(end) / 1000)
 
     def _execute_on_gpu_thread(
         self,
@@ -1882,12 +1869,6 @@ class Worker:
         from mstar.utils.profiler import range_pop, range_push
 
         engine = self.engine_manager.get_engine(batch.node_name)
-        set_phase_label(batch.graph_walk)
-        if self._phase_period:
-            # Why a step plans inline (engine.plan.fresh): it came with no
-            # pre-plan at all, or its pre-plan went stale below.
-            self._phase_record("gpu.steps#", 1)
-            self._phase_record("gpu.no_preplan#", int(plan_future is None))
         # Every output of this step stays on the device: the engine keeps the
         # rows and skips the per-request dicts and tail (cached per node and
         # walk, a dict read here).
@@ -1930,7 +1911,6 @@ class Worker:
             # call is_stale after prepare_inputs because prepare_inputs may drop rids
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
-                self._phase_record("gpu.preplan_stale#", 1)
             execution_stream = (
                 torch.accelerator.current_stream(self.device)
                 if self.device.type != "cpu"
@@ -1958,7 +1938,7 @@ class Worker:
                 if gpu_start is not None:
                     gpu_end = torch.Event(enable_timing=True)
                     gpu_end.record(execution_stream)
-                    self._gpu_spans.append((gpu_start, gpu_end, batch.graph_walk))
+                    self._gpu_spans.append((gpu_start, gpu_end))
                     self._drain_gpu_spans()
             return outputs
         finally:
@@ -1979,7 +1959,6 @@ class Worker:
             node_batch.resource_publish_info = engine.finalize_batch(
                 node_batch, publish_request_ids=publish_rids,
             )
-            set_phase_label(None)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -2418,15 +2397,7 @@ class Worker:
         spec_target = (spec_node_name, graph_walk)
         # The merge below takes only this chain's capture group; another
         # group's backlog runs only once the chain yields to it.
-        if self._phase_period:
-            self._phase_record("spec.rows_N#", len(batch_N.request_to_worker_graph))
-            # rows of N's other walks: this chain never continues them
-            self._phase_record(
-                "spec.other_walk_rows#",
-                sum(len(r) for w, r in groups.items() if w != graph_walk),
-            )
         if self.scheduler.backlog_splits_from(self.request_state, spec_target, rid):
-            self._phase_record("spec.backlog_split#", 1)
             return None
         max_continuing = self.scheduler.room_for_continuing(spec_target)
 
@@ -2480,10 +2451,6 @@ class Worker:
             per_request_inputs[r] = prepped_inputs[r]
             new_request_to_worker_graph[r] = prep.wg_ids[i]
 
-        if self._phase_period:
-            self._phase_record("spec.continuing#", len(continuing))
-            # chain rows the cap (room_for_continuing) or readiness left behind
-            self._phase_record("spec.displaced#", len(candidates) - len(continuing))
         if not continuing:
             return None
         spec_walks = dict.fromkeys(prep.ready_rids, graph_walk)
@@ -2531,18 +2498,6 @@ class Worker:
                 )
                 spec_walks[rid] = fresh_batch.walk_of(rid)
 
-        if self._phase_period:
-            n_fresh = len(spec_walks) - len(continuing)
-            self._phase_record("spec.fresh_merged#", n_fresh)
-            self._phase_record(
-                "spec.fresh_other_walk#",
-                sum(1 for w in spec_walks.values() if w != graph_walk),
-            )
-            self._phase_record("spec.mixed#", int(len(set(spec_walks.values())) > 1))
-            self._phase_record(
-                "sched.backlog_rows#",
-                sum(len(b) for b in self.scheduler.backlog.values()),
-            )
         logger.debug("Speculating: %s %s", spec_node_name, continuing)
         return self._assemble_speculation(
             pending, spec_target_info,
@@ -2913,7 +2868,7 @@ class Worker:
             if not self._phase_period:
                 return
             now = _time.perf_counter()
-            phase_record(f"worker.postprocess.{name}", now - _pp_t)
+            self._phase_buf[f"worker.postprocess.{name}"].append(now - _pp_t)
             _pp_t = now
 
         if self.enable_nvtx:
@@ -3446,7 +3401,6 @@ class Worker:
         Every rid must have a row, or the step keeps the tensor path for the
         whole batch: the runtime applies the values positionally.
         """
-        phase_record("worker.postprocess.host_rows#", int(host_rows is not None))
         if host_rows is None or not self._graph_runtime.supports_inline_emit:
             return None, []
         if not batch_N.batch.request_walks:
@@ -3482,7 +3436,6 @@ class Worker:
                     return None, []  # an inline row with no value: tensor path
                 else:
                     out.append(0)  # its walk sends this signal no inline value
-            phase_record("worker.postprocess.inline#", 1)
             return signal, out
         return None, []
 
@@ -3510,7 +3463,6 @@ class Worker:
                     out = [values[row_of[rid]] for rid in rids]
                 except (KeyError, IndexError):
                     return None, []
-            phase_record("worker.postprocess.inline#", 1)
             return signal, out
         return None, []
 
@@ -4217,16 +4169,6 @@ class Worker:
                 speculation, yield_away_from_target = self._build_speculation(
                     pending, consecutive_spec_steps, fair,
                 )
-                if phase_period and pending is not None:
-                    # How N+1 was chosen: the chain, a yield-away, or neither
-                    # (the serial path below, which plans inline)
-                    _phase_record("loop.spec#", int(
-                        speculation is not None and not speculation.is_yield_away
-                    ))
-                    _phase_record("loop.yield_away#", int(
-                        speculation is not None and speculation.is_yield_away
-                    ))
-                    _phase_record("loop.must_yield#", int(yield_away_from_target is not None))
                 if speculation is not None:
                     _arm_speculation(speculation)
 
@@ -4406,12 +4348,8 @@ class Worker:
                     # ``_handle_admit_failure`` already rehabilitated the
                     # failed rids upstream.
                     if pending.node_batch.admit_error is None:
-                        set_phase_label(pending.batch.graph_walk)
-                        try:
-                            with self._span("worker.postprocess_batch"):
-                                self._postprocess_batch(pending, outputs)
-                        finally:
-                            set_phase_label(None)
+                        with self._span("worker.postprocess_batch"):
+                            self._postprocess_batch(pending, outputs)
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
@@ -4436,8 +4374,6 @@ class Worker:
 
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
-                if phase_period:
-                    _phase_record("loop.serial#", 1)
                 with self._span("worker.schedule"):
                     batch = None
                     if yield_away_from_target is not None:
