@@ -436,6 +436,47 @@ impl ResultTensors<'_> {
     }
 }
 
+/// One step's inline emits to the api server: every request's value in one
+/// frame, where ResultTensors was one frame (and one tensor) per request.
+pub struct ResultTokens<'a> {
+    pub request_ids: &'a [String],
+    pub values: &'a [i64],
+    pub loop_indices: &'a [Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)>],
+    pub signal: &'a str,
+    pub modality: &'a str,
+}
+
+impl ResultTokens<'_> {
+    pub fn encode(&self, it: &StrToId) -> Vec<u8> {
+        let mut out = Vec::with_capacity(96 + 48 * self.request_ids.len());
+        // Untagged like ResultTensors: a declared body type of APIServerMessage.
+        open_frame(&mut out, "api_msg", "result_tokens", None);
+        w_map_counted(&mut out, |m| {
+            w_arr(m.key("request_ids"), self.request_ids.len() as u32);
+            for r in self.request_ids {
+                w_str(m.buf(), r);
+            }
+            w_arr(m.key("values"), self.values.len() as u32);
+            for &v in self.values {
+                w_i64(m.buf(), v);
+            }
+            w_arr(m.key("loop_indices"), self.loop_indices.len() as u32);
+            for li in self.loop_indices {
+                match li {
+                    Some((order, idxs, fwd)) => {
+                        nested_loop_indices(m.buf(), it, order, idxs, *fwd)
+                    }
+                    None => w_nil(m.buf()),
+                }
+            }
+            w_str(m.key("signal"), self.signal);
+            w_str(m.key("modality"), self.modality);
+            w_map(m.key("metadata"), 0);
+        });
+        out
+    }
+}
+
 /// Opens `[outer_tag, {message_type, body}]` and leaves the caller to write the
 /// body, which is the next value due. `body` is tagged only where its declared
 /// type is abstract.

@@ -16,13 +16,19 @@ from mstar.api_server.request_types import (
     RequestFailed,
     ResultChunk,
     ResultTensors,
+    ResultTokens,
 )
 from mstar.communication.wire import _set_polymorphic, register
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.base import PublishedInfo
 from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.manager import PublishedKVInfo
-from mstar.engine.resources.kv.transfer import CudaIpcKVTransferInfo
+from mstar.engine.resources.kv.transfer import (
+    CudaIpcKVTransferInfo,
+    KVTransferInfo,
+    MooncakeKVTransferInfo,
+    ShmKVTransferInfo,
+)
 from mstar.engine.resources.position.manager import PublishedPositionInfo
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
@@ -47,8 +53,8 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
 )
 
-# The three abstract field types; a value of one of these carries [tag, body].
-_set_polymorphic(MessageBody, PublishedInfo, ResourceReqConfig)
+# The abstract field types; a value of one of these carries [tag, body].
+_set_polymorphic(MessageBody, PublishedInfo, ResourceReqConfig, KVTransferInfo)
 
 _TYPES: dict[str, type] = {
     # top-level envelopes
@@ -74,6 +80,7 @@ _TYPES: dict[str, type] = {
     "fail_requests": FailRequests,
     # api-server bodies
     "result_tensors": ResultTensors,
+    "result_tokens": ResultTokens,
     "request_complete": RequestComplete,
     "request_failed": RequestFailed,
     "result_chunk": ResultChunk,
@@ -84,6 +91,8 @@ _TYPES: dict[str, type] = {
     "fwd_pass_info": CurrentForwardPassInfo,
     "published_kv": PublishedKVInfo,
     "cuda_ipc_kv_transfer": CudaIpcKVTransferInfo,
+    "shm_kv_transfer": ShmKVTransferInfo,
+    "mooncake_kv_transfer": MooncakeKVTransferInfo,
     "published_position": PublishedPositionInfo,
     "kv_req_config": KVReqConfig,
     "sampling_req_config": SamplingReqConfig,

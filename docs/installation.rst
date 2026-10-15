@@ -380,7 +380,9 @@ runs on the pure-Python paths as before. Migrated so far (see
   in the same extension).
 * **Message encoding** — ``MSTAR_WIRE_CODEC``: typed msgpack rather than
   pickle, which is what lets one end of an edge be Rust. On by default,
-  extension or not; ``pickle`` is kept for bisecting a wire problem.
+  extension or not. The legacy ``pickle`` codec is no longer supported.
+  Loosely typed metadata uses data-only extensions; upgrade all deployment
+  processes together, since legacy pickle frames are rejected.
 * **Graph runtime** — ``MSTAR_RUST_GRAPH``: graph state, scheduling,
   routing and speculation, and the frames a worker sends. Unlike the others
   this is not free-standing — it holds a share of the Rust transport and of
