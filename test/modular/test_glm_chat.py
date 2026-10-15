@@ -192,6 +192,19 @@ def test_adapter_sends_messages_tools_and_template_switches(tmp_path):
     assert p.message("Hi") == {"role": "assistant", "content": "Hi"}  # thinking off
 
 
+@pytest.mark.parametrize("model", ["glm52", "glm5_next"])
+def test_an_agent_turn_with_a_tool_result_reaches_the_template(model, tmp_path):
+    req = _chat(tools=[WEATHER], messages=[
+        {"role": "user", "content": "weather in Paris?"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function",
+         "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+    ])
+    mk = adapters.get_adapter(model).chat_to_request(req, tmp_path).model_kwargs
+    assert [m["role"] for m in mk["messages"]] == ["user", "assistant", "tool"]
+    assert mk["messages"][2] == {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+
+
 @pytest.mark.parametrize("value", [None, 0, ""])
 def test_a_falsy_enable_thinking_turns_thinking_off(value, tmp_path):
     # the GLM-5.2 template reads truthiness: its prompt ends in <think></think>

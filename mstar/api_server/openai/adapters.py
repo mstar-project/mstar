@@ -1104,7 +1104,12 @@ class GlmChatAdapter(TextChatAdapter):
         self.always_thinks = always_thinks
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        args = super().chat_to_request(req, upload_dir)
+        # flatten_messages refuses a tool turn; the template takes each turn's role
+        # from template_messages below, so the base checks read a tool result as user text
+        checked = req.model_copy(update={"messages": [
+            m.model_copy(update={"role": "user"}) if m.role == "tool" else m for m in req.messages
+        ]})
+        args = super().chat_to_request(checked, upload_dir)
         mk = args.model_kwargs
         tools, template_kwargs = self._options(mk)
         thinking = template_kwargs.get("enable_thinking")
