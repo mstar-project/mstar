@@ -186,7 +186,8 @@ def test_a_chat_that_asks_for_a_tool_call_is_refused(tmp_path, adapter, fields):
     {"tools": []}, {"tools": None}, {"tool_choice": "none"}, {"tool_choice": "auto"}, {"tool_choice": None},
     {"functions": []}, {"functions": None}, {"function_call": "none"}, {"function_call": "auto"},
     {"function_call": None},
-], ids=lambda f: "=".join(map(str, *f.items())))
+    {"tools": [_NAMED], "tool_choice": "none"}, {"functions": [_FUNCTION], "function_call": "none"},
+], ids=lambda f: ",".join(f"{k}={v}" for k, v in f.items()))
 def test_the_tool_fields_clients_send_by_default_pass(tmp_path, adapter, fields):
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
     assert adapter().chat_to_request(req, tmp_path).text == "hi", "a client's default tool fields refused a plain chat"

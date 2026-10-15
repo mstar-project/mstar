@@ -236,7 +236,7 @@ CHAT = [
 
 
 def test_a_chat_the_template_refuses_is_a_bad_request(model, tmp_path):
-    """The template's own error is a 500 at the data worker; the ValueError it becomes is what makes it a 400."""
+    """The model re-raises the template's error as a ValueError, which the data worker answers with a 400, not a 500."""
     messages = [CHAT[1], CHAT[0], CHAT[3]]
     text, _, in_mods, parts = flatten_messages(messages, tmp_path)
     with pytest.raises(ValueError, match="System message must be at the beginning"):

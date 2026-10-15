@@ -733,6 +733,8 @@ mod tests {
             r#""function_call":"none""#,
             r#""function_call":"auto""#,
             r#""function_call":null"#,
+            r#""tools":[{"type":"function","function":{"name":"get_weather"}}],"tool_choice":"none""#,
+            r#""functions":[{"name":"get_weather"}],"function_call":"none""#,
         ] {
             for adapter in [Adapter::Bagel, Adapter::Qwen3Omni] {
                 let args = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);

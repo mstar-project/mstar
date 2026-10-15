@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from jinja2 import TemplateError
 
 from mstar.api_server.openai.adapters import flatten_messages
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
@@ -320,6 +321,19 @@ def test_a_later_system_message_still_replaces_the_default_persona(model, tmp_pa
         {"role": "user", "content": [{"type": "text", "text": "Again."}]},
     ])
     assert span.tolist() == expected, "the default persona leads a chat whose client sent a system message"
+
+
+class _StubRefusingProcessor:
+    """The released template refuses no chat, but a checkpoint can ship its own."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        raise TemplateError("System message must be at the beginning.")
+
+
+def test_a_chat_the_template_refuses_is_a_bad_request(model):
+    model._processor = _StubRefusingProcessor()
+    with pytest.raises(ValueError, match="System message must be at the beginning"):
+        _new_text_inputs(model, "Hi.", ["text"])
 
 
 def test_a_reply_comes_back_without_its_end_token(model):
