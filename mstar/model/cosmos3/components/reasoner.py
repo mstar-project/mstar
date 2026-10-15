@@ -298,6 +298,10 @@ def render_chat(
     for part in parts:
         if part.modality not in ("text", IMAGE, VIDEO):
             raise ValueError(f"the Cosmos3 reasoner has no encoder for {part.modality!r} inputs")
+    if not any(part.text or part.modality != "text" for part in parts):
+        raise ValueError(
+            "Cosmos3-Edge got a request with no text and no attachments; send a prompt, an image or a video"
+        )
     messages = messages_from_parts(parts, default_system=system_prompt or None)
     kwargs = {}
     if enable_thinking is not None:
