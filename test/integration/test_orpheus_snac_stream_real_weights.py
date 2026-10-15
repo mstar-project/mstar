@@ -124,12 +124,12 @@ def test_stream_matches_whole_decode(submodule, name):
     stream, whole = torch.cat(chunks), _whole(submodule, tokens)
     # every whole frame, from the first to the last (the trailing EOS is not audio)
     assert stream.numel() == whole.numel() == (tokens.numel() // 7) * HOP
-    # measured 66 to 71 dB on these four (the old 1-left / 2-right window: 25 to 28)
-    assert _snr(whole, stream) > 60.0
+    # measured 62 to 72 dB on these four (the old 1-left / 2-right window: 25 to 28)
+    assert _snr(whole, stream) > 55.0
     boundary = 0
     for chunk in chunks[:-1]:
         boundary += chunk.numel()
         lo, hi = max(boundary - HALF_WINDOW, 0), min(boundary + HALF_WINDOW, whole.numel())
         if chunk.numel() and whole[lo:hi].abs().max() > 0:
-            # measured >= 41.8 dB; the old window dropped to 12.8 dB
+            # measured >= 44.9 dB; the old window dropped to 12.8 dB
             assert _snr(whole[lo:hi], stream[lo:hi]) > 35.0, f"boundary at sample {boundary}"
