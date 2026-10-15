@@ -11,6 +11,7 @@ from mstar.engine.resources.attn.base import (
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
+    FlashInferMixedWrapper,
     FlashInferPrefillWrapper,
     check_flashinfer_head_dim,
 )
@@ -28,8 +29,12 @@ class FlashInferManager(AttentionManager):
         dtype: torch.dtype,
         kv_config: PagedKVConfig,
         backend: str="auto",
+        split_walks: tuple[str, ...] = (),
+        split_max_prefill_rows: int = 4,
     ):
         self._kv_cache_name = kv_cache
+        self._split_walks = frozenset(split_walks)
+        self._split_max_prefill_rows = split_max_prefill_rows
         self._device = device
         self._dtype = dtype
 
@@ -93,7 +98,17 @@ class FlashInferManager(AttentionManager):
             **self._wrapper_kv_kwargs,
             "max_num_pages": num_rows * self._kv_config.max_num_pages,
         }
-        if bucket.bs == bucket.num_tokens and not force_prefill:
+        if bucket.graph_walk in self._split_walks:
+            # its own workspaces: both wrappers are planned for the one step
+            wrapper = FlashInferMixedWrapper(
+                decode_workspace=self._workspaces.get(f"{label}.split_decode", lease.slot),
+                prefill_workspace=self._workspaces.get(f"{label}.split_prefill", lease.slot),
+                batch_size=num_rows,
+                max_total_tokens=bucket.num_tokens,
+                max_prefill_rows=self._split_max_prefill_rows,
+                **kv_kwargs,
+            )
+        elif bucket.bs == bucket.num_tokens and not force_prefill:
             wrapper = FlashInferDecodeWrapper(
                 workspace_buffer=buffer,
                 batch_size=num_rows,

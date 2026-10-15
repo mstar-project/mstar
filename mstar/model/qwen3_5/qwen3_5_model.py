@@ -204,7 +204,11 @@ class Qwen3_5DenseModel(Model):
             ),
             AttentionSpec(
                 resource_key=ATTN, nodes={"LLM"},
-                config=AttentionConfig(kv_cache=KV_CACHE),
+                config=AttentionConfig(
+                    kv_cache=KV_CACHE,
+                    split_walks=(LLM_MIXED,),
+                    split_max_prefill_rows=MIXED_MAX_PREFILL_ROWS,
+                ),
             ),
             PositionSpec(
                 resource_key=ROPE, nodes={"LLM"},

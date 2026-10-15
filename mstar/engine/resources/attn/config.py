@@ -27,6 +27,12 @@ class AttentionConfig:
     kv_cache: str # name of the KV cache
     backend: AttnBackend = AttnBackend.FLASHINFER
     flashinfer_backend: str = "auto"
+    # FlashInfer only: walks whose captured steps mix one-token rows with
+    # prompt rows, and plan them on two wrappers (`FlashInferMixedWrapper`):
+    # the decode one for the one-token rows, the prefill one for at most
+    # ``split_max_prefill_rows`` prompt rows
+    split_walks: tuple[str, ...] = ()
+    split_max_prefill_rows: int = 4
 
 
 @dataclass
