@@ -32,6 +32,7 @@ import logging
 from pathlib import Path
 
 import torch
+from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
@@ -1146,11 +1147,14 @@ class Qwen3OmniModel(Model):
             "text and speech."
         ))
 
-        text = self._processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        try:
+            text = self._processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except TemplateError as exc:
+            raise ValueError(f"Qwen3-Omni's chat template refused the chat: {exc}") from exc
 
         input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"][0]
         spans = find_media_spans(input_ids, self._placeholder_specs())

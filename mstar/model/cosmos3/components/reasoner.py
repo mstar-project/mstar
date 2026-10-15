@@ -27,6 +27,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+from jinja2 import TemplateError
 from torchvision.transforms.v2 import InterpolationMode
 from torchvision.transforms.v2 import functional as tvF
 
@@ -303,4 +304,7 @@ def render_chat(
         kwargs["enable_thinking"] = bool(enable_thinking)
     elif not cfg.enable_thinking:
         kwargs["enable_thinking"] = False
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **kwargs)
+    try:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **kwargs)
+    except TemplateError as exc:
+        raise ValueError(f"Cosmos3-Edge's chat template refused the chat: {exc}") from exc
