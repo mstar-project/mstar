@@ -43,6 +43,9 @@ def test_arguments_are_checked():
         microbench.parse_args(["--inflight", "0"])
     with pytest.raises(SystemExit):
         microbench.parse_args(["--dtype", "float7"])
+    with pytest.raises(SystemExit, match="not whole float32"):
+        microbench.parse_args(["--dtype", "float32", "--sizes", "1,5"])
+    assert microbench.parse_args(["--dtype", "float32", "--sizes", "4,64"]).sizes == [4, 64]
 
 
 def test_fit_recovers_fixed_cost_and_bandwidth():
@@ -55,6 +58,12 @@ def test_fit_recovers_fixed_cost_and_bandwidth():
     assert fit_latency([64], [1e-5]) is None
     flat = fit_latency([64, 1024], [1e-5, 1e-5])
     assert math.isinf(flat.bandwidth_bps) and flat.to_json()["bandwidth_bps"] is None
+    # latency falling with size is no bandwidth: the flat model, not a
+    # negative slope's intercept with a perfect R^2
+    falling = fit_latency([64, 1024], [20e-6, 10e-6])
+    assert math.isinf(falling.bandwidth_bps)
+    assert falling.fixed_s == pytest.approx(falling.predict(1024))
+    assert 10e-6 < falling.fixed_s < 20e-6 and falling.r2 < 1
 
 
 def test_crossover_of_two_lines():
@@ -64,8 +73,11 @@ def test_crossover_of_two_lines():
     assert fit_crossover(cheap_fixed, cheap_bytes) == pytest.approx(1e5)
     assert fit_crossover(cheap_fixed, cheap_fixed) is None
     sizes = [1, 2, 4, 8]
-    assert measured_crossover(sizes, [1, 2, 3, 4], [3, 3, 3, 3]) == 4
+    assert measured_crossover(sizes, [1, 2, 3, 4], [3, 3, 3, 3]) == 8  # equal at 4, swapped at 8
     assert measured_crossover(sizes, [1, 1, 1, 1], [2, 2, 2, 2]) is None
+    # a tie is not a change of winner
+    assert measured_crossover([64, 1024], [1, 1], [2, 1]) is None
+    assert measured_crossover([1, 2, 3], [1, 1, 3], [2, 1, 2]) == 3
     assert percentile([3, 1, 2], 50) == 2
     assert math.isnan(percentile([], 99))
 
@@ -83,13 +95,25 @@ def _free_port_pair() -> int:
     pytest.skip("no free port pair")
 
 
+def _main_on_free_ports(argv):
+    """``microbench.main`` on a fresh port pair, retried if another process
+    took one of the ports between the check and the bind."""
+    for attempt in range(3):
+        try:
+            return microbench.main([*argv, "--port", str(_free_port_pair()), "--timeout-s", "30"])
+        except Exception as exc:  # noqa: BLE001 - the bind error type depends on the mesh
+            if attempt == 2 or not ("in use" in str(exc) or "receiver exited" in str(exc)):
+                raise
+
+
 def test_smoke_both_roles_on_localhost(tmp_path, monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    paths = ["control", "shm"] + (["tcp"] if MOONCAKE_IMPORT_ERROR is None else [])
+    paths = ["control", "shm"] + (["tcp", "tcp-pool"] if MOONCAKE_IMPORT_ERROR is None else [])
     out = tmp_path / "r.json"
-    results = microbench.main([
-        "--paths", ",".join(paths), "--sizes", "64,4K", "--iters", "5", "--warmup", "1",
-        "--port", str(_free_port_pair()), "--tcp-device", "lo", "--shm-dir", str(tmp_path),
+    # two in flight, so the pool path's slots are reused out of order
+    results = _main_on_free_ports([
+        "--paths", ",".join(paths), "--sizes", "64,4K", "--iters", "5", "--warmup", "3",
+        "--inflight", "2", "--tcp-device", "lo", "--shm-dir", str(tmp_path),
         "--json", str(out), "--quiet",
     ])
     saved = json.loads(out.read_text())
@@ -98,6 +122,8 @@ def test_smoke_both_roles_on_localhost(tmp_path, monkeypatch):
         rows = saved["paths"][path]["results"]
         assert [r["size"] for r in rows] == [64, 4096]
         assert all(r["iters"] == 5 and r["p50_us"] > 0 for r in rows)
+        # the receiver's phases cover the timed sends only, not the warmup
+        assert all(set(r["phases_n"].values()) == {5} for r in rows), rows
         assert saved["paths"][path]["fit"] is not None
     assert {(c["a"], c["b"]) for c in saved["crossovers"]} == {
         (a, b) for i, a in enumerate(paths) for b in paths[i + 1:]
@@ -108,9 +134,9 @@ def test_smoke_both_roles_on_localhost(tmp_path, monkeypatch):
 
 def test_interference_reports_extra_p99(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    results = microbench.main([
+    results = _main_on_free_ports([
         "--interference", "--bg-sizes", "1K", "--bg-streams", "4", "--bg-rate", "50",
-        "--duration", "0.5", "--port", str(_free_port_pair()), "--quiet",
+        "--duration", "0.5", "--quiet",
     ])
     inter = results["interference"]
     points = inter["points"]
@@ -118,3 +144,5 @@ def test_interference_reports_extra_p99(monkeypatch):
     assert points[1]["burst_bytes"] == 4096 and points[1]["bg_received"] > 0
     assert all(p["probes"] > 0 and p["after_burst_p99_us"] > 0 for p in points)
     assert inter["idle"]["probes"] > 0 and inter["idle"]["bg_received"] == 0
+    # the schedule keeps its rate (a 50 ms blocking receive would cut it)
+    assert points[1]["achieved_rate_hz"] > 40

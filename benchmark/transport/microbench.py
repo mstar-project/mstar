@@ -94,6 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--torch-threads", type=int, default=None,
                    help="torch intra-op threads in both roles (default: torch's, as M* workers keep). "
                         "On a busy host the pool's threads inflate host copies of 32K+ elements")
+    p.add_argument("--timeout-s", type=float, default=60.0,
+                   help="give up when no send completes for this long (a receiver that died)")
     p.add_argument("--json", default=None, help="write results here")
     p.add_argument("--quiet", action="store_true")
     return p
@@ -113,6 +115,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("--iters and --inflight must be >= 1, --warmup >= 0")
     if not hasattr(torch, args.dtype) or not isinstance(getattr(torch, args.dtype), torch.dtype):
         raise SystemExit(f"unknown dtype {args.dtype!r}")
+    itemsize = getattr(torch, args.dtype).itemsize
+    odd = [s for s in [*args.sizes, *args.bg_sizes] if s % itemsize]
+    if odd:
+        raise SystemExit(f"sizes {odd} are not whole {args.dtype} tensors ({itemsize} bytes each)")
     if args.gpu_busy_ms < 0:
         raise SystemExit("--gpu-busy-ms must be >= 0")
     if args.torch_threads is not None:
@@ -142,7 +148,7 @@ def unavailable_reason(path: str, args) -> str | None:
         return "same-host path, but sender and receiver hosts differ"
     if path == "arena":
         try:
-            import mstar.communication.arena  # noqa: F401
+            from mstar_rust import SegmentedShmArena, ShmArena  # noqa: F401
         except ImportError:
             return "mstar_rust (the arena) not installed"
     for dev in {args.device, args.receiver_device}:
@@ -183,7 +189,15 @@ def make_comm(my_id: str, args):
 
 
 def recv(comm, timeout_s: float) -> list:
-    return comm.get_all_new_messages(blocking=True, timeout_s=timeout_s)
+    """Messages within ``timeout_s``. Polls rather than blocking receives: the
+    Rust communicator's blocking receive waits in 50 ms slices, which would
+    overrun the interference schedule."""
+    msgs = comm.get_all_new_messages()
+    if msgs or timeout_s < 1e-3:
+        return msgs
+    if comm.poll_for_messages(timeout_ms=int(timeout_s * 1000)):
+        return comm.get_all_new_messages()
+    return []
 
 
 # -- tensor managers -------------------------------------------------------------
@@ -317,6 +331,7 @@ class SizeResult:
             "mean_us": sum(self.lat_s) / len(self.lat_s) * 1e6 if self.lat_s else float("nan"),
             "throughput_MBps": self.size * len(self.lat_s) / self.wall_s / 1e6 if self.wall_s else 0.0,
             "phases_p50_us": {k: percentile(v, 50) * 1e6 for k, v in self.phases.items()},
+            "phases_n": {k: len(v) for k, v in self.phases.items()},
         }
 
 
@@ -347,9 +362,11 @@ class Sender:
     def _reply(self, kind: str):
         return lambda m: m if isinstance(m, dict) and m.get("kind") == kind else None
 
-    def handshake(self) -> None:
+    def handshake(self, receiver_alive=lambda: True) -> None:
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
+            if not receiver_alive():
+                raise RuntimeError("the receiver exited before answering (see its output)")
             self._ctl("hello")
             try:
                 self._await(self._reply("ready"), timeout_s=1.0)
@@ -371,7 +388,12 @@ class Sender:
     def _windowed(self, total: int, start, finish, result: SizeResult | None, base: int = 0) -> None:
         t_start: dict = {}
         issued = done = 0
+        last_progress = time.monotonic()
         while done < total:
+            if time.monotonic() - last_progress > self.args.timeout_s:
+                raise TimeoutError(
+                    f"no send completed for {self.args.timeout_s:.0f} s "
+                    f"({done} of {total} done); did the receiver die?")
             while issued < total and len(t_start) < self.args.inflight:
                 t0 = time.perf_counter()
                 t_start[start(base + issued, t0)] = t0
@@ -385,6 +407,7 @@ class Sender:
                     if t0 is None:
                         continue
                     done += 1
+                    last_progress = time.monotonic()
                     if result is not None:
                         result.lat_s.append(time.perf_counter() - t0)
 
@@ -441,6 +464,7 @@ class Sender:
             return []
 
         self._windowed(warm, start, finish, None)
+        self._ctl("timing_start")
         t_wall = time.perf_counter()
         self._windowed(res.iters, start, finish, res, base=warm)
         res.wall_s = time.perf_counter() - t_wall
@@ -493,6 +517,7 @@ class Sender:
             return list(acked)
 
         self._windowed(self.args.warmup, start, finish, None)
+        self._ctl("timing_start")
         timed[0] = True
         t_wall = time.perf_counter()
         self._windowed(res.iters, start, finish, res)
@@ -519,7 +544,7 @@ class Sender:
                 buf[: t.nbytes].copy_(t.reshape(-1).view(torch.uint8))
                 _sync(self.args.device)
             t1 = time.perf_counter()
-            self._ctl("pool", seq=i, addr=buf.data_ptr(), nbytes=t.nbytes,
+            self._ctl("pool", seq=i, slot=slot, addr=buf.data_ptr(), nbytes=t.nbytes,
                       session=engine.get_session_id())
             if timed[0]:
                 res.add_phase("copy", t1 - t0)
@@ -534,6 +559,7 @@ class Sender:
             return []
 
         self._windowed(self.args.warmup, start, finish, None)
+        self._ctl("timing_start")
         timed[0] = True
         t_wall = time.perf_counter()
         self._windowed(res.iters, start, finish, res, base=self.args.warmup)
@@ -588,6 +614,7 @@ class Sender:
         a = self.args
         payload = self.copier.to_bytes(self._tensor(bg_size)) if bg_size else b""
         sent_at: dict[int, float] = {}
+        bursts = 0
         rtts: list[float] = []
         after_burst: list[float] = []
         tagged: set[int] = set()
@@ -618,6 +645,7 @@ class Sender:
                 t_burst = time.perf_counter()
                 for s in range(a.bg_streams):
                     self._ctl("bg", stream=s, data=payload)
+                bursts += 1
                 sent_at[seq] = t_burst
                 tagged.add(seq)
                 self._ctl("probe", seq=seq)
@@ -642,6 +670,8 @@ class Sender:
             "after_burst_p50_us": percentile(after_burst, 50) * 1e6 if after_burst else 0.0,
             "after_burst_p99_us": percentile(after_burst, 99) * 1e6 if after_burst else 0.0,
             "bg_received": report.get("bg_received", 0),
+            "bursts": bursts,
+            "achieved_rate_hz": bursts / a.duration,
         }
         if not a.quiet:
             what = human_size(bg_size) if burst else "idle"
@@ -720,7 +750,8 @@ class Receiver:
             ))
         elif kind == "pool":
             from mstar.communication.tensors import TransferReadInfo
-            local = self.pool_slots[msg["seq"] % len(self.pool_slots)]
+            # the sender's slot: a later send cannot reuse it before this one's ack
+            local = self.pool_slots[msg["slot"]]
             fut = self.pool_reader.submit([TransferReadInfo(
                 source_session_id=msg["session"], local_ptr=local.data_ptr(),
                 remote_ptr=msg["addr"], nbytes=msg["nbytes"],
@@ -729,6 +760,8 @@ class Receiver:
         elif kind == "bg":
             self.copier.from_bytes(msg["data"], torch.uint8, [len(msg["data"])])
             self.bg_received += 1
+        elif kind == "timing_start":
+            self.phases = {}
         elif kind == "probe":
             self._send({"kind": "echo", "seq": msg["seq"]})
         elif kind == "size_done":
@@ -852,21 +885,22 @@ def render(results: dict) -> str:
         idle = inter["idle"]
         lines.append(f"idle (no bursts): probe p50 {idle['probe_p50_us']:.1f} us, p99 {idle['probe_p99_us']:.1f} us")
         lines.append(f"{'payload':>10s} {'burst':>10s} {'probe p50/p99 us':>18s} {'behind burst p50/p99 us':>24s}"
-                     f" {'extra p99 us (probe / behind burst)':>36s}")
+                     f" {'extra p99 us (probe / behind burst)':>36s} {'bursts/s':>9s}")
         for pt in inter["points"]:
             lines.append(f"{human_size(pt['bg_size']) if pt['bg_size'] else 'empty':>10s} "
                          f"{human_size(pt['burst_bytes']) if pt['burst_bytes'] else '-':>10s} "
                          f"{pt['probe_p50_us']:8.1f} / {pt['probe_p99_us']:7.1f} "
                          f"{pt['after_burst_p50_us']:12.1f} / {pt['after_burst_p99_us']:9.1f} "
-                         f"{pt['extra_p99_us']:20.1f} / {pt['extra_after_burst_p99_us']:9.1f}")
+                         f"{pt['extra_p99_us']:20.1f} / {pt['extra_after_burst_p99_us']:9.1f}"
+                         f" {pt['achieved_rate_hz']:9.1f}")
         lines.append(f"largest burst with extra p99 <= {inter['p99_budget_ms']} ms: "
                      f"{human_size(inter['largest_burst_within_budget'])}")
     return "\n".join(lines)
 
 
-def run_sender(args) -> dict:
+def run_sender(args, receiver_alive=None) -> dict:
     sender = Sender(args)
-    sender.handshake()
+    sender.handshake(receiver_alive or (lambda: True))
     results = {
         "host": f"{socket.gethostname()} ({platform.processor() or platform.machine()})",
         "sender_host": args.sender_host, "receiver_host": args.receiver_host,
@@ -915,7 +949,7 @@ def main(argv: list[str] | None = None) -> dict | None:
         child = mp.get_context("spawn").Process(target=receiver_main, args=(argv,), daemon=True)
         child.start()
     try:
-        results = run_sender(args)
+        results = run_sender(args, receiver_alive=(child.is_alive if child is not None else None))
     finally:
         if child is not None:
             child.join(timeout=10)

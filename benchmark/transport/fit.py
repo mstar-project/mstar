@@ -91,6 +91,10 @@ def fit_latency(sizes: list[float], latencies_s: list[float]) -> LinearFit | Non
     sxx = sum(wi * (s - mx) ** 2 for wi, (s, _) in zip(w, pts, strict=True))
     sxy = sum(wi * (s - mx) * (y - my) for wi, (s, y) in zip(w, pts, strict=True))
     slope = sxy / sxx if sxx > 0 else 0.0
+    if slope <= 0:
+        # Latency that does not grow with size: the flat model, so the fixed
+        # cost is not an intercept extrapolated from a negative slope.
+        slope = 0.0
     fixed = my - slope * mx
     syy = sum(wi * (y - my) ** 2 for wi, (_, y) in zip(w, pts, strict=True))
     ss_res = sum(wi * (y - (fixed + slope * s)) ** 2 for wi, (s, y) in zip(w, pts, strict=True))
@@ -111,13 +115,15 @@ def fit_crossover(a: LinearFit, b: LinearFit) -> float | None:
 
 
 def measured_crossover(sizes: list[int], lat_a: list[float], lat_b: list[float]) -> int | None:
-    """The first measured size from which the cheaper path changes, or None if
-    the same path is cheaper (or equal) at every size."""
+    """The first measured size at which the other path becomes strictly
+    cheaper, or None if it never does. Ties change nothing."""
     first = None
     for s, x, y in zip(sizes, lat_a, lat_b, strict=True):
-        cheaper = x < y
+        if x == y:
+            continue
+        a_cheaper = x < y
         if first is None:
-            first = cheaper
-        elif cheaper != first:
+            first = a_cheaper
+        elif a_cheaper != first:
             return s
     return None
