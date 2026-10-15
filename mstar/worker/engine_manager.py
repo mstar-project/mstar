@@ -14,6 +14,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model
+from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,7 @@ class EngineManager:
         graph_runtime: GraphRuntime,
         enable_nvtx: bool = False,
         enable_prof: bool=False,
+        device_capability: DeviceCapability | None = None,
     ) -> "EngineManager":
         """Build the engine and load this worker's nodes into it.
 
@@ -170,6 +172,7 @@ class EngineManager:
             autocast_dtype=autocast_dtype,
             enable_nvtx=enable_nvtx,
             enable_profile=enable_prof,
+            device_capability=device_capability,
         )
         engine.load_model(
             submodules,
@@ -185,7 +188,7 @@ class EngineManager:
         return cls(engine=engine, node_names=set(node_names))
 
     def warmup_all(self) -> None:
-        """accelerator graph capture, for the whole forward and any piecewise region."""
+        """CUDA graph capture, for the whole forward and any piecewise region."""
         with torch.no_grad():
             self.engine.warmup()
         # warmup ran side-stream work beside graph replays; start serving from

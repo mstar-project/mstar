@@ -98,7 +98,11 @@ class _StubWorker:
 
     def __init__(self, device):
         from collections import defaultdict
+
+        from mstar.utils.device import DeviceCapability
+
         self.device = device
+        self.device_capability = DeviceCapability.of(device)
         self._pinned_d2h_buffers = defaultdict(list)
 
     _get_pinned_d2h_buffer = Worker._get_pinned_d2h_buffer

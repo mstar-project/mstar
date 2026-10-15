@@ -10,6 +10,7 @@ import torch
 from mstar.engine.engine import Engine
 from mstar.engine.resources.sampler.utils import sample_accelerator_graphable_gpu
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.utils.device import DeviceCapability
 from mstar.worker.worker import Worker
 
 
@@ -22,9 +23,11 @@ def test_output_copy_uses_worker_device_runtime(monkeypatch, device_type):
     runtime = SimpleNamespace(
         is_available=lambda: True,
         Stream=Mock(return_value=side),
+        Event=Mock(),
         stream=Mock(return_value=nullcontext()),
     )
     monkeypatch.setattr(torch, device_type, runtime)
+    worker.device_capability = DeviceCapability(worker.device)
     tensor = SimpleNamespace(
         device=worker.device, dtype=torch.int64, shape=(1,), numel=lambda: 1,
     )
@@ -66,7 +69,9 @@ def test_cpu_output_copy_needs_no_accelerator_runtime():
 def test_engine_compile_checks_its_own_device(monkeypatch, device_type, available, compiled):
     engine = object.__new__(Engine)
     engine._device = torch.device(device_type)
-    engine._device_module = SimpleNamespace(is_available=lambda: available)
+    engine._device_capability = SimpleNamespace(
+        is_available=available and device_type != "cpu",
+    )
     submodule = SimpleNamespace(forward=Mock(), forward_batched=Mock())
     engine._submodules = {"node": SimpleNamespace(submodule=submodule)}
     compile_fn = Mock(side_effect=lambda fn, **kwargs: fn)

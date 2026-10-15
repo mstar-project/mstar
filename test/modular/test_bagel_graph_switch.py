@@ -1,6 +1,7 @@
 """BAGEL deployment graph switches without checkpoints or GPU allocation."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -29,7 +30,7 @@ def model_factory(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(
     ("options", "enabled"),
-    [({}, False), ({"accelerator_graph": False}, False),
+    [({}, True), ({"accelerator_graph": False}, False),
      ({"accelerator_graph": True}, True)],
 )
 def test_model_resolves_graph_switch(model_factory, options, enabled):
@@ -39,6 +40,17 @@ def test_model_resolves_graph_switch(model_factory, options, enabled):
 def test_yaml_graph_switch_reaches_model(model_factory):
     deployment = yaml.safe_load("model: bagel\nmodel_kwargs:\n  accelerator_graph: false\n")
     assert model_factory(**deployment["model_kwargs"]).config.accelerator_graph is False
+
+
+@pytest.mark.parametrize(
+    ("name", "enabled"),
+    [("bagel.yaml", True), ("bagel_cfg_parallel.yaml", True),
+     ("bagel_xpu_tp2.yaml", False), ("bagel_xpu_cfg_tp2.yaml", False)],
+)
+def test_default_deployments_preserve_cuda_captures_and_disable_xpu(model_factory, name, enabled):
+    path = Path(__file__).resolve().parents[2] / "configs" / name
+    deployment = yaml.safe_load(path.read_text())
+    assert model_factory(**deployment.get("model_kwargs", {})).config.accelerator_graph is enabled
 
 
 def test_checkpoint_graph_setting_is_overridden_by_deployment(model_factory, monkeypatch):

@@ -11,7 +11,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from functools import partial
+from functools import cached_property, partial
 from time import sleep
 
 import torch
@@ -54,6 +54,7 @@ from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetada
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.utils.containers import ParallelList, RecentSet
+from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -277,6 +278,10 @@ class Worker:
     # per-row stream polls; None (a bare instance) means unknown, so poll.
     _stream_buffer_rids: set[int] | None = None
 
+    @cached_property
+    def device_capability(self) -> DeviceCapability:
+        return DeviceCapability.of(self.device)
+
     def __init__(
         self,
         worker_id: str,
@@ -317,8 +322,7 @@ class Worker:
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
 
-        if self.device.type != "cpu" and self.device.index is not None:
-            torch.accelerator.set_device_index(self.device)
+        self.device_capability.set_device()
 
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mstar`` runs on
@@ -409,6 +413,7 @@ class Worker:
             model=model,
             enable_nvtx=self.enable_nvtx,
             enable_prof=self.enable_prof,
+            device_capability=self.device_capability,
         )
 
         self.request_state = RequestStateManager(
@@ -1791,8 +1796,7 @@ class Worker:
         It also applies mstar's torch config, because dynamo config is
         per-thread since torch 2.12 and this thread compiles.
         """
-        if self.device.type != "cpu" and self.device.index is not None:
-            torch.accelerator.set_device_index(self.device)
+        self.device_capability.set_device()
         apply_torch_config()
 
     @contextmanager
@@ -1889,15 +1893,15 @@ class Worker:
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
             execution_stream = (
-                torch.accelerator.current_stream(self.device)
-                if self.device.type != "cpu"
+                self.device_capability.current_stream()
+                if self.device_capability.is_accelerator
                 else None
             )
             # Device time of the step; the phase timers only see host submit
             # time, and both are needed to tell a starved iter from a busy one.
             gpu_start = None
             if self._phase_period and execution_stream is not None:
-                gpu_start = torch.Event(enable_timing=True)
+                gpu_start = self.device_capability.new_event(enable_timing=True)
                 gpu_start.record(execution_stream)
             if self._phase_period:
                 # after prepare_inputs, which can drop rids — this is the row
@@ -1909,11 +1913,11 @@ class Worker:
                 outputs = engine.exec_and_postprocess(node_batch)
             if execution_stream is not None:
                 self._stage_host_rows(outputs)
-                event = torch.Event()
+                event = self.device_capability.new_event()
                 event.record(execution_stream)
                 node_batch.completion_event = event
                 if gpu_start is not None:
-                    gpu_end = torch.Event(enable_timing=True)
+                    gpu_end = self.device_capability.new_event(enable_timing=True)
                     gpu_end.record(execution_stream)
                     self._gpu_spans.append((gpu_start, gpu_end))
                     self._drain_gpu_spans()
@@ -2878,13 +2882,13 @@ class Worker:
 
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
-        if self.device.type != "cpu" and batch_N.batch.request_to_worker_graph:
+        if self.device_capability.is_accelerator and batch_N.batch.request_to_worker_graph:
             if batch_N.node_batch.completion_event is not None:
                 with self._span("worker.postprocess.event_sync"):
                     batch_N.node_batch.completion_event.synchronize()
             else:
                 with self._span("worker.postprocess.device_sync"):
-                    torch.accelerator.synchronize(self.device)
+                    self.device_capability.synchronize()
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
@@ -3282,7 +3286,7 @@ class Worker:
         for index, (name, tensor) in enumerate(buffers.items()):
             if not (
                 torch.is_tensor(tensor)
-                and self.device.type in {"cuda", "xpu"}
+                and self.device_capability.is_accelerator
                 and tensor.device.type == self.device.type
             ):
                 host[name] = tensor
@@ -3328,8 +3332,7 @@ class Worker:
         reused by the next step.
         """
         host: dict[str, torch.Tensor] = {}
-        device_module = getattr(torch, self.device.type)
-        with device_module.stream(side):
+        with self.device_capability.stream_context(side):
             for index, (name, tensor) in enumerate(buffers.items()):
                 if not (
                     torch.is_tensor(tensor)
@@ -3402,14 +3405,9 @@ class Worker:
             # staged by the gpu thread behind the step; the caller has waited
             # on the completion event, so the rows are here
             return _LazyPerRid(landed.buffers, list(landed.request_ids)), landed
-        device_module = (
-            getattr(torch, self.device.type)
-            if self.device.type in {"cuda", "xpu"} else None
-        )
         if (
             completion_event is None
-            or device_module is None
-            or not device_module.is_available()
+            or not self.device_capability.is_available
         ):
             if outputs.check_stop_buffers is not None and row_rids is not None:
                 # host tensors already (a CPU device): only the re-keying
@@ -3423,7 +3421,7 @@ class Worker:
             return source, None
 
         if self._d2h_stream is None:
-            self._d2h_stream = device_module.Stream(device=self.device)
+            self._d2h_stream = self.device_capability.new_stream()
         side = self._d2h_stream
         side.wait_event(completion_event)
 
@@ -3436,7 +3434,7 @@ class Worker:
 
         cpu_per_rid: dict = {}
         buffer_indices: dict[tuple[str, torch.dtype, int], int] = defaultdict(int)
-        with device_module.stream(side):
+        with self.device_capability.stream_context(side):
             for rid, name_to_list in source.items():
                 if not isinstance(name_to_list, dict):
                     cpu_per_rid[rid] = name_to_list
@@ -3754,7 +3752,7 @@ class Worker:
                 )
 
         # Bound the load-time asymmetry between workers before any
-        # subgroup NCCL collective fires inside the per-bs accelerator graph
+        # subgroup NCCL collective fires inside the per-bs CUDA-graph
         # capture loop. Without this fence, a worker with a small model
         # (e.g. an 8B Talker) can finish loading, enter warmup, and hit
         # its first subgroup barrier while a worker with a 30B Thinker
@@ -3767,11 +3765,11 @@ class Worker:
         self.parallel_groups.barrier_all()
         self._verify_tp_async_sched_agrees()
 
-        # accelerator graph capture before entering the main loop
+        # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
 
         # Sync every worker before the main loop opens. Per-batch-size
-        # captures inside AcceleratorGraphRunner are already barriered on the
+        # captures inside CudaGraphRunner are already barriered on the
         # node-local TP group, but that doesn't bound the time between
         # ``warmup_and_capture`` returning and ``run()`` starting to
         # schedule. Without this fence, a TP leader can finish warmup
@@ -3794,7 +3792,7 @@ class Worker:
             "permanent generation", self.worker_id, gc.get_freeze_count(),
         )
 
-        # Setup (weight load + warmup + accelerator graph capture) is complete. Tell
+        # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
         # the conductor this worker is ready. The conductor blocks its main
         # loop until every worker reports in, so the API server only advertises
         # readiness once all workers can actually serve.

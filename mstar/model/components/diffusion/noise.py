@@ -31,6 +31,8 @@ from collections.abc import Mapping
 
 import torch
 
+from mstar.utils.device import DeviceCapability
+
 
 class NoiseStager:
     """A ring of pinned host buffers for one dtype, plus the CPU generator.
@@ -106,7 +108,7 @@ class NoiseStager:
         numel = 1
         for dim in shape:
             numel *= dim
-        if device.type not in {"cuda", "xpu"} or not self._pinned:
+        if not DeviceCapability.of(device).is_accelerator or not self._pinned:
             return self.randn(shape, seed).to(device)
 
         out = torch.empty(shape, dtype=self.dtype, device=device)
@@ -140,8 +142,8 @@ class NoiseStager:
 
     def _record(self, index: int, event, device: torch.device) -> None:
         if event is None:
-            event = self._events[index] = torch.Event(device=device)
-        event.record(torch.accelerator.current_stream(device))
+            event = self._events[index] = DeviceCapability.of(device).new_event()
+        event.record(DeviceCapability.of(device).current_stream())
 
     def to_device(self, tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
         """``tensor`` on ``device``, copied from pinned memory without blocking.
@@ -151,7 +153,7 @@ class NoiseStager:
         needs that stream to wait on this one, as for any async copy.
         """
         device = torch.device(device)
-        if device.type not in {"cuda", "xpu"} or not self._pinned:
+        if not DeviceCapability.of(device).is_accelerator or not self._pinned:
             return tensor.to(device)
         if tensor.dtype != self.dtype:
             raise ValueError(f"stager holds {self.dtype}, got {tensor.dtype}")

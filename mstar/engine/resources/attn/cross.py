@@ -66,6 +66,9 @@ class CrossAttentionManager(AttentionResource):
 
 
 class FlashInferCrossManager(CrossAttentionManager):
+    def can_capture(self) -> bool:
+        return self._device.type == "cuda"
+
     """non-causal paged attention over fixed encoder context
 
     context is an ordinary kv stream so requires no additional storage

@@ -14,12 +14,16 @@ from mstar.engine.resources.sampler.config import (
 )
 from mstar.engine.resources.sampler.utils import AcceleratorGraphableSampler, Sampler, SamplerBuffers
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.utils.device import DeviceCapability
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 
 class SamplerResource(Resource):
     prefix_skip_safe = True
+
+    def can_capture(self) -> bool:
+        return DeviceCapability.of(self._device).graph_backend is not None
 
     # TODO: this is  a light wrapper around mstar/engine/resources/sampler/utils.py. In the future,
     # we should rip out the parts we need from sampling.py and discard the rest.

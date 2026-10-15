@@ -5,7 +5,7 @@ a few hundred mel frames. One Euler step launches several hundred kernels of
 a few microseconds each, so a solve (10 steps, guidance doubling the rows)
 is bound by kernel launches rather than by arithmetic, whatever the batch;
 the conformer encoder in front of it and the HiFT vocoder behind it have the
-same profile at chunk sizes. Capturing each stage as one accelerator graph per
+same profile at chunk sizes. Capturing each stage as one CUDA graph per
 input shape and replaying it removes that overhead.
 
 ``ShapeGraphs`` holds the mechanics: static input buffers per shape, capture
@@ -29,10 +29,9 @@ import torch
 
 from mstar.engine.accelerator_graph_backend import (
     CapturedGraph,
-    get_accelerator_graph_backend,
-    supports_accelerator_graphs,
 )
 from mstar.engine.accelerator_graph_runner import capture_into_graph
+from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +132,7 @@ class ShapeGraphs:
 
     @staticmethod
     def _capturable(tensors: Tensors) -> bool:
-        return supports_accelerator_graphs(next(iter(tensors.values())).device)
+        return DeviceCapability.of(next(iter(tensors.values())).device).graph_backend is not None
 
     @staticmethod
     def _load(entry: _CapturedGraph, tensors: Tensors) -> None:
@@ -160,7 +159,7 @@ class ShapeGraphs:
         Warmup selects kernels twice before the first capture, once thereafter.
         The engine's helper restores allocator and stream state after a failure.
         """
-        backend = get_accelerator_graph_backend(device)
+        backend = DeviceCapability.of(device).graph_backend
         index = device.index if device.index is not None else torch.accelerator.current_device_index()
         with torch.accelerator.device_index(index):
             if self._pool is None:

@@ -14,10 +14,6 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
-from mstar.engine.accelerator_graph_backend import (
-    get_accelerator_graph_backend,
-    supports_accelerator_graphs,
-)
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     PiecewiseAcceleratorGraphRunner,
@@ -58,6 +54,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
 )
 from mstar.profile.worker import ExecTimings
+from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import OffloadDelta
 from mstar.utils.profiler import (
     PHASE_PERIOD,
@@ -129,7 +126,7 @@ class SubmoduleManagement:
         init=False, default_factory=threading.Lock, repr=False
     )
 
-    # label -> PiecewiseAcceleratorGraphRunner for inner-loop capture; spread into
+    # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
     # ModelInputsFromEngine so the submodule's forward can look them up
     piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
@@ -143,7 +140,7 @@ class SubmoduleManagement:
         # specific — the main runner has it too (see `Resource`).
         # TODO: submodule-wide, so a capture touching neither kind still pays
         # double the buffers. Each runner could size its own count from the
-        # resources its captures touch, as PiecewiseAcceleratorGraphRunner does.
+        # resources its captures touch, as PiecewiseCudaGraphRunner does.
         preplan_enabled = os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1"
         self._forced_double_buffer = any(
             res.force_double_buffer for res in self.resources.values()
@@ -246,9 +243,9 @@ class ForwardPassInfoWrapper:
 class ExecutingBatch:
     node_name: str
 
-    # Keyed by the worker's integer rid handle. Accelerator graph capture pads with
+    # Keyed by the worker's integer rid handle. CUDA-graph capture pads with
     # its own rows, which carry negative handles from the same space (see
-    # accelerator_graph_runner.dummy_rid_handle), so a padded batch is still int-keyed
+    # cuda_graph_runner.dummy_rid_handle), so a padded batch is still int-keyed
     # throughout.
     per_request_info: Mapping[int, CurrentForwardPassInfo]
     step_context: StepContext
@@ -413,13 +410,22 @@ class ExecutingBatch:
 
 
 class Engine:
+    @property
+    def device_capability(self) -> DeviceCapability:
+        capability = getattr(self, "_device_capability", None)
+        if capability is None:
+            capability = self._device_capability = DeviceCapability.of(self._device or "cpu")
+        return capability
+
     def __init__(
         self, graph_runtime: GraphRuntime,
         autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
         enable_profile: bool=False,
+        device_capability: DeviceCapability | None = None,
     ):
         self._device = None
+        self._device_capability = device_capability
         self._autocast_dtype = autocast_dtype
         self._resources: dict[str, Resource] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
@@ -450,7 +456,7 @@ class Engine:
         model: "Model | None" = None,
     ):
         self._device = device
-        self._device_module = getattr(torch, device.type)
+        self._device_capability = self._device_capability or DeviceCapability.of(device)
         self._enable_nvtx = nvtx_enabled(self._enable_nvtx, device)
         if kv_cache_type is None:
             kv_cache_type = self._autocast_dtype
@@ -553,7 +559,7 @@ class Engine:
         default mode (fullgraph=False, dynamic=None), which in general provides
         performance gains without frequent slow recompiles.
         """
-        if self._device.type not in {"cuda", "xpu"} or not self._device_module.is_available():
+        if not self.device_capability.is_available:
             return
 
         for node_name, submodule_mgmt in self._submodules.items():
@@ -599,7 +605,8 @@ class Engine:
                 autocast_dtype=self._autocast_dtype_for(submodule),
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
-                enable_nvtx=self._enable_nvtx
+                enable_nvtx=self._enable_nvtx,
+                device_capability=self.device_capability,
             )
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt
@@ -661,11 +668,11 @@ class Engine:
         )
         runners: dict[str, PiecewiseAcceleratorGraphRunner] = {}
         # One graph memory pool for all of the node's regions (see
-        # ``PiecewiseAcceleratorGraphRunner``): its captured-memory footprint becomes
+        # ``PiecewiseCudaGraphRunner``): its captured-memory footprint becomes
         # the largest region's rather than the sum over regions.
         memory_pool = None
-        if configs and supports_accelerator_graphs(self._device):
-            backend = get_accelerator_graph_backend(self._device)
+        if configs and self.device_capability.graph_backend is not None:
+            backend = self.device_capability.graph_backend
             if backend.is_available():
                 memory_pool = backend.graph_pool_handle()
         for label, config in configs.items():
@@ -680,6 +687,7 @@ class Engine:
                 num_slots=submodule_mgmt.num_slots,
                 node_name=node_name,
                 memory_pool=memory_pool,
+                device_capability=self.device_capability,
             )
             runners[label] = runner
         return runners
@@ -1050,13 +1058,13 @@ class Engine:
             # thread gates on. Skipped during capture: you can't sync mid-capture.
             if (
                 _ENGINE_STEP_SYNC
-                and self._device.type in {"cuda", "xpu"}
-                and not self._device_module.is_current_stream_capturing()
+                and self.device_capability.is_accelerator
+                and not self.device_capability.is_capturing()
             ):
                 if self._enable_nvtx:
                     range_push("engine.await_outputs")
                 try:
-                    self._device_module.current_stream().synchronize()
+                    self.device_capability.current_stream().synchronize()
                 finally:
                     if self._enable_nvtx:
                         range_pop()
@@ -1116,7 +1124,7 @@ class Engine:
         # requests), and on the way out — see below.
         fence = (
             submodule_mgmt.needs_slot_fence
-            and self._device.type in {"cuda", "xpu"}
+            and self.device_capability.is_accelerator
         )
         slot_events: dict[int, Any] = {}
 
@@ -1140,7 +1148,7 @@ class Engine:
                     continue
                 launched = True
                 if fence:
-                    slot_events[slot] = self._device_module.Event()
+                    slot_events[slot] = self.device_capability.new_event()
                     slot_events[slot].record()
 
                 merged.update(self._collect_outputs(
@@ -1164,13 +1172,13 @@ class Engine:
         # always eager (never capturing), but the guard is kept for parity.
         if (
             _ENGINE_STEP_SYNC
-            and self._device.type in {"cuda", "xpu"}
-            and not self._device_module.is_current_stream_capturing()
+            and self.device_capability.is_accelerator
+            and not self.device_capability.is_capturing()
         ):
             if nvtx:
                 range_push("engine.await_outputs")
             try:
-                self._device_module.current_stream().synchronize()
+                self.device_capability.current_stream().synchronize()
             finally:
                 if nvtx:
                     range_pop()
@@ -1866,7 +1874,7 @@ class Engine:
 
         A batch that hasn't been through ``prepare_inputs`` has no token count
         yet, so only a batched capture can serve it — see
-        ``AcceleratorGraphRunner.select_batched_bucket``.
+        ``CudaGraphRunner.select_batched_bucket``.
         """
         submodule_mgmt = self._submodules[batch.node_name]
 
@@ -1998,9 +2006,9 @@ class Engine:
                 self.reset_pre_plan_for_batch(batch)
                 return False
             stream = cg_runner.plan_stream()
-            with self._device_module.stream(stream):
+            with self.device_capability.stream_context(stream):
                 self._runner.pre_plan(step)
-            batch.preplan_event = self._device_module.Event()
+            batch.preplan_event = self.device_capability.new_event()
             batch.preplan_event.record(stream)
             batch.preplanned_rids = tuple(batch.request_ids)
         finally:

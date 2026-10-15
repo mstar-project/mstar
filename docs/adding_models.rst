@@ -22,7 +22,7 @@ A model in ``mstar`` has several separate responsibilities:
   builds one object per declaration and binds it into the submodule and its layers. A
   node that declares no resources was called a "stateless" node in earlier versions.
 - **The engine** (``mstar/engine/engine.py``) is a single class that runs every node. It
-  compiles forwards, captures accelerator graphs, batches requests, and runs each step's
+  compiles forwards, captures CUDA graphs, batches requests, and runs each step's
   resource lifecycle (admit, plan, forward, commit). You never write an engine. Earlier
   versions required you to choose an engine type per node. That is no longer true. A
   node's capabilities now follow from the resources it declares.
@@ -244,7 +244,7 @@ sampling parameters. The engine no longer reads it directly. Pass its result int
    are recorded into the captured kernel launch, and every replay then reuses the values
    from capture time. No error is raised. Parameters that reach the sampler resource
    through ``SamplingReqConfig`` are stored in buffers whose addresses do not change
-   across replays, so they stay per-request and remain safe under accelerator graphs.
+   across replays, so they stay per-request and remain safe under CUDA graphs.
 
 Cross-request prefix reuse
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -453,7 +453,7 @@ appears in no spec, so it receives no resources:
    * - An encoder tower that attends within the segments of one packed forward
      - A ``RaggedAttentionSpec``, and nothing else. No ``KVSpec`` and no
        ``PositionSpec``: there is no cache to page and no counter to advance. Needed
-       only if the tower's attention must run inside an accelerator graph; see
+       only if the tower's attention must run inside a CUDA graph; see
        `Cacheless attention (encoder towers)`_.
    * - ViT, VAE or audio encoder, codec decoder, projection stage, combine stage
      - Usually nothing. Declare no spec that names the node, unless the node needs the
@@ -482,7 +482,7 @@ The forward looks up each sampler by key and calls ``.sample()`` on it::
    code   = engine_inputs.resources[CODE_PRED_SAMPLER].sample(request_ids, logits)
 
 Each resource owns its own buffers. The two parameter sets are therefore independent,
-per-request, and safe under accelerator graphs.
+per-request, and safe under CUDA graphs.
 
 .. _Cross-attention (encoder-decoder models):
 
@@ -586,10 +586,11 @@ There is no cache to read the layout off, so a label that carries no segment in 
 declaration cannot be attended: the forward raises, rather than silently reusing the
 previous step's plan. When the tower is captured as a piecewise region, that
 declaration lives in the region's ``declare_step``, and names no ``KVStep``. See
-``mstar/model/bagel/submodules.py``, region ``"vit_block_loop"``, and `Piecewise accelerator
+``mstar/model/bagel/submodules.py``, region ``"vit_block_loop"``, and `Piecewise CUDA
 graphs (capturing an inner loop)`_.
 
-BAGEL disables graph capture by default. The optional ViT region requires both
+BAGEL enables graph capture by default; its XPU deployment configs disable it.
+The optional ViT region requires both
 ``model_kwargs.accelerator_graph: true`` and ``MSTAR_VIT_ACCELERATOR_GRAPH=1``.
 See :doc:`models` and :doc:`environment_variables`.
 
@@ -692,7 +693,7 @@ methods are:
    ``engine_inputs.resources[key]``. See `Reaching your resources`_.
 
    The engine applies ``torch.compile`` to both ``forward`` and ``forward_batched``, for
-   every submodule. It also captures accelerator graphs for them when you declare capture
+   every submodule. It also captures CUDA graphs for them when you declare capture
    configs (see :ref:`Step 5 <step-5>`). To disable compilation for a submodule, set the
    class attribute ``disable_torch_compile = True``. Keep the compiled paths
    compile-friendly. If a helper must not be traced, because it uses data-dependent
@@ -731,7 +732,7 @@ methods are:
    the captured region. Both methods are defined on ``NodeSubmodule``, so any node can use
    them.
 
-Two more methods control batching and accelerator graphs: ``can_batch`` with
+Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_accelerator_graph_configs``. They are described in Step 5.
 
 .. _Step 4a — Declare the step:
@@ -820,7 +821,7 @@ captured shape, and uses the dense backend otherwise.
 ``piecewise_leases`` names the inner regions of this node that hold their own slot for
 this step. Such a region declares, plans and commits its own work. Any resource that the
 region owns must therefore be excluded from the outer declaration. See
-`Piecewise accelerator graphs (capturing an inner loop)`_.
+`Piecewise CUDA graphs (capturing an inner loop)`_.
 
 **Advanced ``KVStep`` fields.** These fields cover cases that the engine previously
 handled as special cases. BAGEL uses all of them, in
@@ -955,7 +956,7 @@ tensor along that parameter's shard dimension before copying it. For this reason
 
 .. _step-5:
 
-Step 5 — Continuous batching and accelerator graphs
+Step 5 — Continuous batching and CUDA graphs
 ---------------------------------------------------
 
 Continuous batching and accelerator graphs are the two main throughput optimizations.
@@ -980,7 +981,7 @@ into one GPU call. A submodule controls this behavior with three methods:
 expected to collate a batch. You can still disable batching for one node, or for specific
 walks, by returning ``False`` from ``can_batch`` in those cases.
 
-**Accelerator graphs.** A submodule declares the shapes it can capture in
+**CUDA graphs.** A submodule declares the shapes it can capture in
 ``get_accelerator_graph_configs(self, device, tp_world_size=1) -> list[AcceleratorGraphConfig]``.
 The default is an empty list, which means eager execution.
 ``AcceleratorGraphBackend`` in ``mstar/engine/accelerator_graph_backend.py`` is
@@ -990,7 +991,15 @@ an abstract interface for graph capture, streams, pools and capture recovery.
 ``torch.cuda.CUDAGraph`` and ``torch.xpu.XPUGraph``, respectively.
 To add another backend, implement the interface and register its device type
 in ``_GRAPH_BACKENDS``; the runners use that registry to check capture support.
-Declare configs only for devices whose kernels and resources support capture.
+``DeviceCapability.of(device)`` caches stream, event, synchronization, pinned-memory,
+and graph-backend operations for a device. The worker shares its capability with
+the engine and runners; staging utilities use the same cache.
+
+Models declare capture recipes without testing device types. Each resource's
+``can_capture()`` reports whether its planning and kernels support capture.
+Whole-forward and piecewise runners check the resources used by each recipe before
+allocating capture buffers. An unsupported recipe is reported as dropped, and
+``MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1`` makes it a startup failure.
 The graph-captured token sampler uses FlashInfer on CUDA and the per-row device
 RNG API in ``vllm-xpu-kernels`` on XPU. BAGEL declares the same decode and
 text-prefill capture recipes on both devices.
@@ -1083,7 +1092,7 @@ A decode step with guidance enabled and a decode step with guidance disabled dec
 different segments over the same token count. BAGEL's ``cg_key_info`` reports which of
 the two a batch is.
 
-Piecewise accelerator graphs (capturing an inner loop)
+Piecewise CUDA graphs (capturing an inner loop)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The configs above capture the whole ``forward_batched`` method of a submodule. The engine
@@ -1092,7 +1101,7 @@ then drives the replay, including sampling and output remapping.
 Sometimes you want to capture only one inner region of a forward, such as a transformer
 block loop, and keep the surrounding code in eager Python. The code before the region
 computes embeddings and assembles the sequence. The code after it applies the final norm
-and projection. A piecewise accelerator graph supports this.
+and projection. A piecewise CUDA graph supports this.
 
 A submodule enables piecewise capture by returning one or more configs from::
 
@@ -1718,7 +1727,7 @@ iteration. The step index is the engine's loop counter
 The ``dit`` node subclasses ``DenoiseLoopSubmodule`` (``denoise_loop.py``), which owns
 the engine contract — seeded initial noise, per-request schedules, equal-key request
 batching (``can_batch``), stacked ``forward_batched``, ``check_stop`` at the request's own
-step count, the ragged-attention ``declare_step`` and one accelerator graph bucket per
+step count, the ragged-attention ``declare_step`` and one CUDA-graph bucket per
 ``bucket_key`` with the Euler update inside the graph — and asks the model for:
 
 .. code-block:: python
@@ -1735,7 +1744,7 @@ step count, the ragged-attention ``declare_step`` and one accelerator graph buck
         def attention_segments(self, key): return (("main", self.num_tokens(key)),)
 
 ``bucket_key`` is whatever has to match for two rows to share a forward, and it is also
-the accelerator graph bucket key — shape, but equally a knob like whether CFG is on.
+the CUDA-graph bucket key — shape, but equally a knob like whether CFG is on.
 
 A multi-step scheduler that carries solver state between iterations (wan22's UniPC, with
 ``unipc_model_outputs`` and ``unipc_last_sample``) names it in ``SOLVER_STATE``; those

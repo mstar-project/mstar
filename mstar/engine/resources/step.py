@@ -30,7 +30,7 @@ class BucketKey:
     graph_walk: str
     bs: int
     num_tokens: int
-    # Matches additional_key_info in AcceleratorGraphConfig
+    # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
 
     def __str__(self) -> str:
@@ -117,7 +117,7 @@ class SubmoduleStep:
     # it gets this list
     segments: list[Segment] | None = None
 
-    # Matches additional_key_info in AcceleratorGraphConfig
+    # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
 
     _ctx: StepContext = None # set by the engine

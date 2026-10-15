@@ -5,7 +5,7 @@ import inspect
 import pytest
 import torch
 
-from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
+from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool, get_accelerator_graph_backend
 from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 
 
@@ -58,9 +58,10 @@ def test_region_outputs_are_copied_into_buffers_outside_the_pool(monkeypatch):
 
     monkeypatch.setattr(cgr, "capture_into_graph", fake_capture)
     warm = run()
-    graph, static = cgr.capture_with_static_outputs(run, warm, pool="shared", device="cpu", autocast_dtype=None)
+    pool = AcceleratorGraphPool("shared")
+    graph, static = cgr.capture_with_static_outputs(run, warm, pool=pool, device="cpu", autocast_dtype=None)
 
-    assert graph == "graph" and captured["pool"] == "shared"
+    assert graph == "graph" and captured["pool"] is pool
     assert set(static) == {"x", "y"}
     for name, value in static.items():
         assert torch.equal(value, produced[name])

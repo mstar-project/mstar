@@ -6,18 +6,18 @@ from mstar.engine.accelerator_graph_backend import (
     CUDAGraphBackend,
     XPUGraphBackend,
     get_accelerator_graph_backend,
-    supports_accelerator_graphs,
 )
 from mstar.engine.accelerator_graph_runner import (
     capture_into_graph,
     capture_with_static_outputs,
 )
+from mstar.utils.device import DeviceCapability
 
 
 def test_backend_rejects_non_accelerator_device():
     with pytest.raises(ValueError, match="unsupported"):
         get_accelerator_graph_backend(torch.device("cpu"))
-    assert not supports_accelerator_graphs(torch.device("cpu"))
+    assert DeviceCapability.of("cpu").graph_backend is None
 
 
 def test_backend_interface_requires_an_implementation():
@@ -49,7 +49,7 @@ def test_backend_dispatches_without_initializing_hardware(
     backend = get_accelerator_graph_backend(device)
     assert isinstance(backend, backend_type)
     assert backend.device == device
-    assert supports_accelerator_graphs(device)
+    assert DeviceCapability.of(device).graph_backend is not None
     assert not backend.is_available()
     assert backend.create_graph() is graph
 

@@ -34,6 +34,7 @@ from mstar.engine.resources import (
     StepContext,
     SubmoduleStep,
 )
+from mstar.utils.device import DeviceCapability
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
@@ -279,6 +280,7 @@ class _FakeExecEngine:
         self.launch_signals: list[str] = []
         self._runner = self
         self._device = torch.device("cpu")
+        self.device_capability = DeviceCapability.of(self._device)
         # the per-request path's slots; no fence, so no CUDA event is recorded
         self.piecewise_slots: list[int] = []
         self.run_slots: list[int] = []

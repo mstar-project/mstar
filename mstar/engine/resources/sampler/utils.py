@@ -27,6 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import sampler_slots
 
@@ -1097,7 +1098,7 @@ class AcceleratorGraphableSampler(BaseSampler):
     slot_idx_view: torch.Tensor | None = None
     ingraph_scatter: bool = False
 
-    # Set during graph capture, and used by the accelerator graph runner to determine
+    # Set during graph capture, and used by the cuda graph runner to determine
     # whether requests' seen token buffers should be synced post-replay
     applied_penalty_in_graph: bool = False
 
@@ -1182,7 +1183,7 @@ class Buffer:
     """Three-tier storage for one per-request scalar sampling parameter.
 
     - ``buf``     ``[max_bs]``   per-step tensor, sliced to ``padded_bs`` and read
-      by ``AcceleratorGraphableSampler`` (its address must stay stable across replays).
+      by ``CudaGraphableSampler`` (its address must stay stable across replays).
     - ``master``  ``[capacity]`` slot-indexed cache, one row per active request.
     """
     # ``[cg_slots, max_bs]``: one per-step row per double-buffer slot, so a
@@ -1386,7 +1387,7 @@ class SamplerBuffers:
     last_token: Buffer
 
     # TP communicator for the submodule that owns these buffers. Passed
-    # through ``slice_for_bs`` into every per-step ``AcceleratorGraphableSampler``
+    # through ``slice_for_bs`` into every per-step ``CudaGraphableSampler``
     # so its ``_broadcast_tokens`` aligns the sampled token across ranks.
     # Without this, ``sample`` would build a
     # sampler with ``tp_group=None``, the broadcast would silently no-op,
@@ -1492,10 +1493,7 @@ class SamplerBuffers:
         good. ``cg_slots`` double-buffers the per-step tensors so the sampler can
         pre-plan.
         """
-        pinned = (
-            device.type in {"cuda", "xpu"}
-            and getattr(torch, device.type).is_available()
-        )
+        pinned = DeviceCapability.of(device).pin_memory
         cap = max_batch_size
         if ingraph_scatter:
             cap = max(max_batch_size, slots if slots is not None else sampler_slots())
@@ -1864,7 +1862,7 @@ class SamplerBuffers:
         # fresh pinned tensor: the host allocator holds it until the copy lands
         device = self._slot_idx_gpu.device
         return torch.tensor(
-            keep, dtype=torch.bool, pin_memory=device.type in {"cuda", "xpu"},
+            keep, dtype=torch.bool, pin_memory=DeviceCapability.of(device).pin_memory,
         ).to(device, non_blocking=True)
 
     def scatter_offset(

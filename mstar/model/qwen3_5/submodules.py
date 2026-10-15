@@ -142,9 +142,6 @@ class LLMSubmodule(ARNodeSubmodule):
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
         """Decode, text prefill and vision prefill all capture."""
-        if device.type != "cuda":
-            return []
-
         def dummy(n: int) -> ARNodeInputs:
             return ARNodeInputs(
                 input_ids=torch.zeros(n, dtype=torch.long, device=device),
@@ -768,9 +765,6 @@ class VisionEncoderSubmodule(NodeSubmodule):
         merger after (it quarters the row count, which a region's output view
         cannot express). Batch size 1: one replay is one prompt's segments.
         """
-        if device.type != "cuda":
-            return {}
-
         hidden, head_dim = self.config.hidden_size, self.config.head_dim
 
         def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:

@@ -52,14 +52,14 @@ class AcceleratorGraphBackend(ABC):
     def create_graph(self) -> CapturedGraph: ...
 
     @abstractmethod
-    def graph_pool_handle(self) -> Any: ...
+    def graph_pool_handle(self) -> AcceleratorGraphPool: ...
 
     @abstractmethod
     def capture(
         self,
         graph: CapturedGraph,
         *,
-        pool: Any = None,
+        pool: AcceleratorGraphPool | None = None,
         stream: Any = None,
     ) -> AbstractContextManager: ...
 
@@ -79,7 +79,7 @@ class AcceleratorGraphBackend(ABC):
     def is_current_stream_capturing(self) -> bool: ...
 
     @abstractmethod
-    def recover_failed_capture(self, pool: Any, stream: Any) -> None:
+    def recover_failed_capture(self, pool: AcceleratorGraphPool, stream: Any) -> None:
         """Restore the prior stream and stop allocating into the capture pool."""
 
 
@@ -110,18 +110,18 @@ class _TorchGraphBackend(AcceleratorGraphBackend):
     def synchronize(self) -> None:
         torch.accelerator.synchronize(self.device)
 
-    def graph_pool_handle(self) -> Any:
+    def graph_pool_handle(self) -> AcceleratorGraphPool:
         return AcceleratorGraphPool(self._runtime.graph_pool_handle())
 
     def capture(
         self,
         graph: CapturedGraph,
         *,
-        pool: Any = None,
+        pool: AcceleratorGraphPool | None = None,
         stream: Any = None,
     ) -> AbstractContextManager:
         kwargs: dict[str, Any] = {
-            "pool": pool.handle if isinstance(pool, AcceleratorGraphPool) else pool,
+            "pool": None if pool is None else pool.handle,
         }
         if stream is not None:
             kwargs["stream"] = stream
@@ -145,11 +145,9 @@ class _TorchGraphBackend(AcceleratorGraphBackend):
     def is_current_stream_capturing(self) -> bool:
         return bool(self._runtime.is_current_stream_capturing())
 
-    def recover_failed_capture(self, pool: Any, stream: Any) -> None:
+    def recover_failed_capture(self, pool: AcceleratorGraphPool, stream: Any) -> None:
         self._runtime.set_stream(stream)
         self.synchronize()
-        if isinstance(pool, AcceleratorGraphPool):
-            pool = pool.handle
         end = getattr(torch._C, f"_{self.device_type}_endAllocateToPool", None)
         if end is None:
             return
@@ -157,7 +155,7 @@ class _TorchGraphBackend(AcceleratorGraphBackend):
         if index is None:
             index = self._runtime.current_device()
         try:
-            end(index, pool)
+            end(index, pool.handle)
         except RuntimeError:
             # The capture failed before the allocator started recording.
             pass
@@ -187,10 +185,6 @@ _GRAPH_BACKENDS: dict[str, type[AcceleratorGraphBackend]] = {
     "cuda": CUDAGraphBackend,
     "xpu": XPUGraphBackend,
 }
-
-
-def supports_accelerator_graphs(device: torch.device) -> bool:
-    return device.type in _GRAPH_BACKENDS
 
 
 def get_accelerator_graph_backend(

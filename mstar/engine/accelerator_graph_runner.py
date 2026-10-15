@@ -11,8 +11,6 @@ from mstar.distributed.communication import JointGroups
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
-    get_accelerator_graph_backend,
-    supports_accelerator_graphs,
 )
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
@@ -25,11 +23,18 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils import profiler
+from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+
+
+def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[str]:
+    if step is None:
+        return []
+    return sorted(key for key in step.steps if not resources[key].can_capture())
 
 
 def autocast_scope(dtype: torch.dtype | None, device_type: str):
@@ -106,8 +111,8 @@ def dummy_metadata(
     }
 
 
-def capture_into_graph(run, pool, device, autocast_dtype):
-    """Capture ``run`` into a new accelerator graph allocated from ``pool``.
+def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype):
+    """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
     Returns the graph and what ``run`` returned. A capture that fails part
     way leaves two things behind that would sink every later capture on the
@@ -123,7 +128,9 @@ def capture_into_graph(run, pool, device, autocast_dtype):
     before it compiles, which CUDA refuses during capture, so such a capture
     cannot succeed and would otherwise die with an unrelated error.
     """
-    backend = get_accelerator_graph_backend(torch.device(device))
+    backend = DeviceCapability.of(device).graph_backend
+    if backend is None:
+        raise ValueError(f"Accelerator graphs are unsupported on device {device!r}")
     prev_stream = backend.current_stream()
     graph = backend.create_graph()
     try:
@@ -132,17 +139,15 @@ def capture_into_graph(run, pool, device, autocast_dtype):
             with backend.capture(graph, pool=pool):
                 output = run()
     except BaseException:
-        if isinstance(pool, AcceleratorGraphPool):
-            pool.failed_graph = graph
+        pool.failed_graph = graph
         backend.recover_failed_capture(pool, prev_stream)
         raise
     backend.synchronize()
-    if isinstance(pool, AcceleratorGraphPool):
-        pool.failed_graph = None
+    pool.failed_graph = None
     return graph, output
 
 
-def capture_with_static_outputs(run, warm_outputs, pool, device, autocast_dtype):
+def capture_with_static_outputs(run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype):
     """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
 
     ``warm_outputs`` is what ``run`` returned on a warm-up call (``{name:
@@ -175,7 +180,7 @@ def capture_with_static_outputs(run, warm_outputs, pool, device, autocast_dtype)
 
 
 def fail_if_graphs_required(missing: list[str]) -> None:
-    """MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1 turns a dropped bucket into a startup
+    """MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
     failure, for deployments that would rather not come up than serve the
     eager path at 10-20x the latency."""
     required = os.environ.get("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "0")
@@ -278,6 +283,7 @@ class AcceleratorGraphRunner:
         joint_comm_group: JointGroups,
         num_slots: int,
         enable_nvtx: bool=False,
+        device_capability: DeviceCapability | None = None,
     ):
         self._submodule_name = submodule_name
         self._submodule = submodule
@@ -291,11 +297,8 @@ class AcceleratorGraphRunner:
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
-        self._graph_backend = (
-            get_accelerator_graph_backend(device)
-            if device is not None and supports_accelerator_graphs(device)
-            else None
-        )
+        self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
+        self._graph_backend = self._device_capability.graph_backend
         self._autocast_dtype = autocast_dtype
         self._enable_nvtx = enable_nvtx
 
@@ -306,9 +309,10 @@ class AcceleratorGraphRunner:
 
         self._buckets: dict[BucketKey, AcceleratorGraphBucket] = {}
 
-        self._memory_pool = None
+        self._memory_pool: AcceleratorGraphPool | None = None
         # buckets that failed to capture (here or on a peer rank) and run eagerly
         self.dropped_buckets: list[BucketKey] = []
+        self._blocked_buckets: list[BucketKey] = []
         # set by prepare_for_capture; capture reuses it rather than re-deriving
         self._prepared_slot_specs: list[CGSlotSpec] | None = None
 
@@ -399,13 +403,43 @@ class AcceleratorGraphRunner:
             slot_specs = self._get_slot_specs()
             # reverse sort based on batch size, then total tokens (largest first)
             slot_specs.sort(key=lambda s: (s.bs, s.num_tokens), reverse=True)
+            blocked_configs = set()
+            checked_configs = set()
+            for spec in slot_specs:
+                if spec.config_idx in checked_configs:
+                    continue
+                checked_configs.add(spec.config_idx)
+                rids = self._dummy_rows.handles(f"{spec.config_idx}_slot0", spec.bs)
+                step = self._submodule.declare_step(
+                    graph_walk=spec.bucket.graph_walk,
+                    request_ids=rids,
+                    inputs=spec.config.get_node_inputs(spec.bs, spec.num_tokens),
+                    slot_lease=SlotLease(slot=0, bucket=spec.bucket),
+                    per_request_info=dummy_metadata(rids, spec.bucket.graph_walk),
+                )
+                blocked = blocked_capture_resources(step, self._resources)
+                if blocked:
+                    logger.error(
+                        "Dropping accelerator graph config %s for %s: "
+                        "resources cannot capture: %s",
+                        spec.config_idx, self._submodule_name, blocked,
+                    )
+                    blocked_configs.add(spec.config_idx)
+            self._blocked_buckets = list(dict.fromkeys(
+                spec.bucket for spec in slot_specs if spec.config_idx in blocked_configs
+            ))
+            self.dropped_buckets = list(self._blocked_buckets)
+            slot_specs = [
+                spec for spec in slot_specs if spec.config_idx not in blocked_configs
+            ]
             max_seq_len = max((
                 spec.bucket.num_tokens for spec in slot_specs
             ), default=1)
-            self._step_runner.build_accelerator_graph_buffers(
-                slot_specs, max_bs=self.max_bs, max_seq_len=max_seq_len,
-                node_name=self._submodule_name,
-            )
+            if slot_specs:
+                self._step_runner.build_accelerator_graph_buffers(
+                    slot_specs, max_bs=self.max_bs, max_seq_len=max_seq_len,
+                    node_name=self._submodule_name,
+                )
             self._prepared_slot_specs = slot_specs
         return self._prepared_slot_specs
 
@@ -481,6 +515,7 @@ class AcceleratorGraphRunner:
         """Say loudly which buckets run eagerly. A dropped bucket is a silent
         10-20x latency cliff otherwise, and one failure used to take every
         later bucket with it."""
+        wanted = list(dict.fromkeys([*self._blocked_buckets, *wanted]))
         self.dropped_buckets = [key for key in wanted if key not in kept]
         if self.dropped_buckets:
             logger.error(
@@ -735,7 +770,7 @@ class AcceleratorGraphRunner:
         self, output, graph, static_inputs, static_input_keys,
         dummy_rids, dummy_metadata, config_idx,
     ) -> AcceleratorGraphSlot:
-        """Wrap one slot's capture artifacts into a AcceleratorGraphSlot."""
+        """Wrap one slot's capture artifacts into a CudaGraphSlot."""
         return AcceleratorGraphSlot(
             graph=graph,
             static_inputs=static_inputs,
@@ -1070,9 +1105,9 @@ class PiecewiseGraphKey(NamedTuple):
 
 
 class PiecewiseAcceleratorGraphRunner:
-    """Captures one inner callable of a submodule's forward as an accelerator graph.
+    """Captures one inner callable of a submodule's forward as a CUDA graph.
 
-    Where ``AcceleratorGraphRunner`` replays a whole ``forward_batched`` under engine
+    Where ``CudaGraphRunner`` replays a whole ``forward_batched`` under engine
     control, this captures a SUB-REGION — a transformer block loop, say —
     while the surrounding preamble stays eager and the submodule invokes
     ``run`` itself. The config supplies the callable, its static buffers, and
@@ -1096,18 +1131,16 @@ class PiecewiseAcceleratorGraphRunner:
         num_slots: int,
         joint_comm_group: JointGroups | None = None,
         node_name: str | None = None,
-        memory_pool=None,
+        memory_pool: AcceleratorGraphPool | None = None,
+        device_capability: DeviceCapability | None = None,
     ):
         self._label = label
         self._config = config
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
-        self._graph_backend = (
-            get_accelerator_graph_backend(device)
-            if device is not None and supports_accelerator_graphs(device)
-            else None
-        )
+        self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
+        self._graph_backend = self._device_capability.graph_backend
         self._autocast_dtype = autocast_dtype
         self._comm_group = joint_comm_group
         # scopes buffer allocation; `label` carries it but mangled with the region
@@ -1159,7 +1192,7 @@ class PiecewiseAcceleratorGraphRunner:
         return bool(self._graphs)
 
     def _dummy_key(self, shape: PiecewiseCaptureShape, slot: int) -> str:
-        """Padding rows are per slot, as in ``AcceleratorGraphRunner``: a slot's plan
+        """Padding rows are per slot, as in ``CudaGraphRunner``: a slot's plan
         and commit run against its own tail, so sharing rows between slots puts
         two graphs on one set of per-request state."""
         return f"{shape.bs}_{shape.total_tokens}_slot{slot}"
@@ -1175,10 +1208,25 @@ class PiecewiseAcceleratorGraphRunner:
     # ── Capture ─────────────────────────────────────────────────────────
 
     def prepare_for_capture(self) -> list:
-        """Claim this region's static buffers; see ``AcceleratorGraphRunner``."""
+        """Claim this region's static buffers; see ``CudaGraphRunner``."""
         if self._prepared_shapes is None:
-            self._size_slots()
             shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
+            if shapes and self._config.declare_step is not None:
+                shape = shapes[0]
+                step = self._config.declare_step(
+                    self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
+                    list(shape.seq_lens),
+                )
+                blocked = blocked_capture_resources(step, self._resources)
+                if blocked:
+                    logger.error(
+                        "Dropping piecewise accelerator graph config %s: "
+                        "resources cannot capture: %s", self._label, blocked,
+                    )
+                    self.dropped_shapes = [(s.bs, s.total_tokens) for s in shapes]
+                    shapes = []
+            if shapes:
+                self._size_slots()
             if shapes:
                 self._step_runner.build_accelerator_graph_buffers(
                     [

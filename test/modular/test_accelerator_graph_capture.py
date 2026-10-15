@@ -1,4 +1,4 @@
-"""Registration of captured accelerator graph buckets.
+"""Registration of captured CUDA graph buckets.
 
 A bucket's slots are double buffers of one shape: replay(N) runs on one while
 pre-plan(N+1) writes the other. So a bucket is only usable with all of its
@@ -20,6 +20,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     capture_into_graph,
@@ -66,7 +67,7 @@ class _FakeRunner:
         self._device = torch.device("cpu")
         self._graph_backend = SimpleNamespace(
             is_available=lambda: True,
-            graph_pool_handle=object,
+            graph_pool_handle=lambda: AcceleratorGraphPool(object()),
             memory_allocated=lambda: 0,
         )
         self._submodule_name = "node"
@@ -75,6 +76,7 @@ class _FakeRunner:
         self._fail = fail
         self._buckets = {}
         self._memory_pool = None
+        self._blocked_buckets = []
         self.barrier = _Group(peer_flags)
         self._comm_group = SimpleNamespace(
             tp_group=self.barrier, sp_group=self.barrier
@@ -91,7 +93,7 @@ class _FakeRunner:
     def _capture_one(self, spec):
         if (spec.bucket.graph_walk, spec.slot) in self._fail:
             raise RuntimeError("capture failed")
-        # stands in for the AcceleratorGraphSlot; identity is what the test checks
+        # stands in for the CudaGraphSlot; identity is what the test checks
         return f"{spec.bucket.graph_walk}:slot{spec.slot}"
 
     def _get_addtl_slot_specs(self, spec):
@@ -243,7 +245,7 @@ def test_seq_dim_picks_the_only_matching_dim_even_at_batch_size_one():
     ``batch_size`` here because `_seq_dim` no longer takes one — it just
     scans for ``seq_len``, so a coincidental dim-0 size never shadows the
     real seq dim. This is the case from the PR review comment on
-    accelerator_graph_runner.py:621."""
+    cuda_graph_runner.py:621."""
     value = torch.zeros(1, 512)
     assert AcceleratorGraphRunner._seq_dim(value, seq_len=512) == 1
 
@@ -346,7 +348,7 @@ def test_a_failed_capture_leaves_the_pool_and_stream_usable():
     recording to mempool_id") and the thread on the capture stream."""
     device = torch.device("cuda")
     x = torch.ones(8, device=device)
-    pool = torch.cuda.graph_pool_handle()
+    pool = AcceleratorGraphPool(torch.cuda.graph_pool_handle())
 
     def bad():
         # a pageable host-to-device copy is not permitted while capturing
@@ -395,7 +397,7 @@ def test_a_recompile_during_capture_fails_with_the_guard_that_broke():
         return t * n
 
     scale(x, 1)  # warm: compiled and cached for n == 1
-    pool = torch.cuda.graph_pool_handle()
+    pool = AcceleratorGraphPool(torch.cuda.graph_pool_handle())
 
     with pytest.raises(RuntimeError, match="recompile"):
         capture_into_graph(lambda: scale(x, 2), pool, device, None)
