@@ -209,7 +209,9 @@ def load_speech_tokenizer(tokenizer: nn.Module, path: str | Path) -> int:
         if op == "MatMul":
             value = value.t()
         if tuple(value.shape) != tuple(param.shape):
-            raise RuntimeError(f"speech tokenizer: {name} has shape {tuple(value.shape)}, expected {tuple(param.shape)}")
+            raise RuntimeError(
+                f"speech tokenizer: {name} has shape {tuple(value.shape)}, expected {tuple(param.shape)}"
+            )
         param.copy_(value)
     return len(params)
 
