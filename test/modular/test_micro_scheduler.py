@@ -1758,8 +1758,9 @@ def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
     sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
     sched.get_tensor = lambda uuid: uuid
 
+    # a merge takes only its own walk, so the continuing row is a prompt too
     merged = _next_batch(
-        sched, _Manager(["p0"], walks={"p0": "prefill"}), target=(NODE, WALK),
+        sched, _Manager(["p0"], walks={"p0": "prefill"}), target=(NODE, "prefill"),
         pre_existing_batch_size=1, pre_existing_seq_lens=seq_lens,
     )
 

@@ -1036,6 +1036,8 @@ class Engine:
                 # one object for all the step's rows: the per-row call would
                 # return an equal one each time (128 calls at a full decode
                 # batch, on the gpu thread before the launch)
+                # input_seq_lens stays empty: a uniform step is one token a
+                # row, which is what an unrecorded row is taken for
                 node_inputs = [uniform] * len(batch.request_ids)
                 batch.register_prepare_batch(node_inputs)
                 batch.prepared_rids = tuple(batch.request_ids)
