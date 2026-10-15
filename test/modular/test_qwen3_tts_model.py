@@ -1406,6 +1406,73 @@ def test_qwen3_tts_codec_without_watermark_leaves_audio_untouched():
     assert "watermark_stream" not in submodule.request_state("a")
 
 
+def test_qwen3_tts_codec_without_watermark_emits_the_same_bytes_through_the_engine():
+    """Watermark off, the engine's postprocess (batch tail included) emits byte
+    for byte what per-request ``postprocess`` alone does, which is all the
+    engine ran before the tail existed: two batched streams, ramp to final."""
+    from mstar.engine.engine import Engine
+    from mstar.model.qwen3_tts.qwen3_tts_model import _load_qwen3_tts_codec_classes
+
+    decoder_config_cls, decoder_cls, _ = _load_qwen3_tts_codec_classes()
+    config = _tiny_model_config()
+    config.codec = _tiny_codec_config(chunk_schedule=(1, 3, 8, 20, 5), chunk_frames=6)
+    torch.manual_seed(0)
+    decoder = decoder_cls(decoder_config_cls(**config.codec.decoder_kwargs())).eval()
+    _randomize_codec(decoder)
+    submodule = CodecSubmodule(decoder, config)
+    assert submodule.watermarker is None
+    codec = config.codec
+    rids = ["a", "b"]
+    streams = {}
+    for rid in rids:
+        stream = StreamBuffer(request_id=rid, edge_name="codec_tokens", from_partition="Talker",
+                              policy=ScheduledLeftContextChunkPolicy(codec.chunk_schedule, codec.chunk_frames,
+                                                                     codec.left_context_frames))
+        frames = torch.randint(0, 32, (48, 4))   # below the tiny talker's codec EOS (35)
+        for i in range(frames.shape[0]):
+            stream.pre_read_register(f"t{i}")
+            stream.put(f"t{i}", frames[i])
+        stream.signal_done()
+        streams[rid] = stream
+    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=submodule)})
+    engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={})
+    finals = 0
+    with torch.no_grad():
+        while all(stream.has_chunk_ready() for stream in streams.values()):
+            chunks = {rid: stream.pop_chunk() for rid, stream in streams.items()}
+            if any(chunk.data["data"] is None for chunk in chunks.values()):
+                break
+            items = [
+                submodule.prepare_inputs(
+                    "codec_chunk", SimpleNamespace(request_id=rid, rid_handle=rid),
+                    {"codec_tokens": [chunks[rid].data["data"].reshape(-1, 4)]},
+                    input_metadata=InputMetadata(stream_chunks={"codec_tokens": chunks[rid].info}),
+                )
+                for rid in rids
+            ]
+            finals += sum(item.kwargs["is_final"] for item in items)
+            out = submodule.forward_batched(
+                "codec_chunk", engine_inputs, **submodule.preprocess("codec_chunk", engine_inputs, items),
+            )
+            alone = {rid: {"audio_chunk": [out[rid]["audio_chunk"][0].clone()]} for rid in rids}
+            for rid, item in zip(rids, items, strict=True):
+                submodule.postprocess(rid, None, alone[rid], inputs=item)
+            failures = {}
+            batch = SimpleNamespace(
+                node_name="Codec", request_ids=rids, inputs=items,
+                per_request_info_wrapped={rid: None for rid in rids}, failed_requests=failures,
+                register_failure=failures.__setitem__, step_context=SimpleNamespace(graph_walk="codec_chunk"),
+            )
+            Engine._postprocess_batch(engine, batch, out)
+            assert not failures
+            for rid in rids:
+                got, want = out[rid]["audio_chunk"][0], alone[rid]["audio_chunk"][0]
+                assert got.dtype == want.dtype == torch.int16 and want.numel() > 0
+                assert got.numpy().tobytes() == want.numpy().tobytes()
+    assert finals == len(rids)
+    assert all("watermark_stream" not in submodule.request_state(rid) for rid in rids)
+
+
 def test_qwen3_tts_codec_watermark_streams_like_the_whole_utterance():
     """Two requests through the codec tail, chunk by chunk, against each
     request's offline watermark; the stream state goes with the request."""
