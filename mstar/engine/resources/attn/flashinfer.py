@@ -14,7 +14,7 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferPrefillWrapper,
     check_flashinfer_head_dim,
 )
-from mstar.engine.resources.base import GraphSlotKey
+from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.step import SlotLease, StepContext
@@ -39,7 +39,7 @@ class FlashInferManager(AttentionManager):
         # persistent, because constructing one allocates FlashInfer's own
         # workspaces and is far from free per step
         self._eager_plan_states: dict[EagerSlotKey, AttentionWrapper] = {}
-        self._cg_plan_states: dict[GraphSlotKey, AttentionWrapper] = {}
+        self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
 
         self._preplan_states: dict[str, AttentionWrapper] = {}
         self._preplanned = False
@@ -78,7 +78,7 @@ class FlashInferManager(AttentionManager):
         under-allocates the wrapper's fixed buffers and every later plan()
         call overruns them with a "runtime batch size" mismatch.
         """
-        key = GraphSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         wrapper = self._cg_plan_states.get(key)
         if wrapper is not None:
             return wrapper

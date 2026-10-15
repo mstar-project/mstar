@@ -21,8 +21,9 @@ if TYPE_CHECKING:
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
 
+# CG and cg_ mean "captured graph" across accelerator backends.
 @dataclass(frozen=True)
-class GraphSlotSpec:
+class CGSlotSpec:
     bucket: BucketKey
     slot: int
     # a whole forward's capture, or one piecewise region's
@@ -42,7 +43,7 @@ class GraphSlotSpec:
 
 
 @dataclass(frozen=True)
-class GraphSlotKey:
+class CGSlotKey:
     bucket: BucketKey
     slot: int
     label: str
@@ -356,7 +357,7 @@ class Resource(ABC):
     # Engine lifecycle
 
     def build_accelerator_graph_buffers(
-        self, slots: list[GraphSlotSpec],
+        self, slots: list[CGSlotSpec],
         max_bs: int, max_seq_len: int
     ) -> None:
         """Size whatever the captured replays will read.
