@@ -557,15 +557,22 @@ class BagelModel(Model):
         """Write ``parts`` out in order, and say whether the last is an attachment.
 
         ``sep`` opens a text run that follows an attachment: understanding's old
-        suffix supplied that newline, generation's did not.
+        suffix supplied that newline, generation's did not. Text that follows
+        another role's text starts on a new line.
         """
         body: list[str] = []
         after_attachment = False
+        role = None
         for part in parts:
             if part.modality == TEXT:
                 if part.text:
-                    body.append((sep if after_attachment else "") + part.text)
-                    after_attachment = False
+                    if after_attachment:
+                        body.append(sep + part.text)
+                    elif body and part.role != role:
+                        body.append("\n" + part.text)
+                    else:
+                        body.append(part.text)
+                    after_attachment, role = False, part.role
                 continue
             body.append(self.IMAGE_PLACEHOLDER)
             after_attachment = True
