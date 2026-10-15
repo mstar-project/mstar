@@ -397,7 +397,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 },
             ),
             capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            compile=False,
+            compile=True,
         )]
 
     def can_use_cuda_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
