@@ -28,11 +28,14 @@ def test_resource_owns_kernel_capture_support(device_type):
     from mstar.engine.resources.linear_attn.mamba2 import Mamba2Manager
     from mstar.engine.resources.sampler.resource import SamplerResource
 
-    for cls in (FlashInferManager, FlashInferRaggedManager, FlashInferCrossManager,
-                GDNManager, Mamba2Manager):
+    for cls in (FlashInferManager, FlashInferCrossManager, GDNManager, Mamba2Manager):
         resource = object.__new__(cls)
         resource._device = torch.device(device_type)
         assert resource.can_capture() is (device_type == "cuda")
+    if device_type == "cuda":
+        ragged = object.__new__(FlashInferRaggedManager)
+        ragged._device = torch.device(device_type)
+        assert ragged.can_capture()
     sampler = object.__new__(SamplerResource)
     sampler._device = torch.device(device_type)
     assert sampler.can_capture() is (device_type != "cpu")
