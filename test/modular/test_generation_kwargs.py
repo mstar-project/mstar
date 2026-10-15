@@ -1,7 +1,8 @@
 """The request boundary of the generation contract:
-null is unset, types are strict, ranges are checked once for every endpoint,
-length aliases fold into ``max_output_tokens``, unread keys are logged, and a
-refused request gets its status before a stream opens."""
+null is unset, a value is coerced only when it denotes exactly the knob's type,
+ranges are checked once for every endpoint, length aliases fold into
+``max_output_tokens``, unread keys are logged, and a refused request gets its
+status before a stream opens."""
 
 import asyncio
 import types
@@ -33,20 +34,25 @@ def test_in_contract_values_pass(kwargs):
 
 
 @pytest.mark.parametrize("kwargs, name", [
-    ({"temperature": "0.7"}, "temperature"),
     ({"temperature": -1}, "temperature"),
     ({"temperature": float("nan")}, "temperature"),
     ({"temperature": True}, "temperature"),
+    ({"temperature": "nan"}, "temperature"),
+    ({"temperature": ""}, "temperature"),
     ({"top_p": 0}, "top_p"),
     ({"top_p": 1.5}, "top_p"),
     ({"min_p": 2}, "min_p"),
     ({"repetition_penalty": 0}, "repetition_penalty"),
-    ({"top_k": 2.0}, "top_k"),
     ({"top_k": -1}, "top_k"),
+    ({"top_k": 5.5}, "top_k"),
+    ({"top_k": "5.5"}, "top_k"),
+    ({"top_k": "5e0"}, "top_k"),
+    ({"top_k": "five"}, "top_k"),
+    ({"top_k": True}, "top_k"),
+    ({"max_output_tokens": "0"}, "max_output_tokens"),
     ({"max_output_tokens": 0}, "max_output_tokens"),
-    ({"max_output_tokens": "100"}, "max_output_tokens"),
-    ({"seed": "7"}, "seed"),
     ({"seed": 2**64}, "seed"),
+    ({"seed": 1e20}, "seed"),
     ({"ignore_eos": "false"}, "ignore_eos"),
     ({"talker_top_p": 0}, "talker_top_p"),
     ({"thinker_temperature": -0.1}, "thinker_temperature"),
@@ -54,6 +60,27 @@ def test_in_contract_values_pass(kwargs):
 def test_out_of_contract_values_raise(kwargs, name):
     with pytest.raises(ValueError, match=name):
         normalize_generation_kwargs(kwargs)
+
+
+@pytest.mark.parametrize("kwargs, expected", [
+    ({"temperature": "0.7"}, {"temperature": 0.7}),
+    ({"talker_temperature": " 0.7 "}, {"talker_temperature": 0.7}),
+    ({"top_k": 2.0}, {"top_k": 2}),
+    ({"top_k": "5"}, {"top_k": 5}),
+    ({"top_k": " -0 "}, {"top_k": 0}),
+    ({"top_k": "5.0"}, {"top_k": 5}),
+    ({"code_predictor_top_k": "50"}, {"code_predictor_top_k": 50}),
+    ({"max_output_tokens": "100"}, {"max_output_tokens": 100}),
+    ({"max_tokens": "64"}, {"max_output_tokens": 64}),
+    ({"seed": "7"}, {"seed": 7}),
+    ({"seed": 42.0}, {"seed": 42}),
+    ({"seed": "9007199254740993.0"}, {"seed": 9007199254740993}),
+])
+def test_values_that_denote_the_knobs_type_are_coerced(kwargs, expected):
+    out = normalize_generation_kwargs(kwargs)
+    assert out == expected
+    # the type too: 2.0 == 2, but a float top_k is what the coercion removes
+    assert {k: type(v) for k, v in out.items()} == {k: type(v) for k, v in expected.items()}
 
 
 def test_length_aliases_fold_into_max_output_tokens_in_order():
@@ -216,6 +243,31 @@ def test_rust_bridge_carries_a_refusal_as_a_400_chunk():
     bridge._submit({"rid": "r1", "model_kwargs": {"seed": 2**64}})
     [frame] = sent
     assert (frame["t"], frame["modality"], frame["metadata"]) == ("chunk", "error", {"status": 400})
+
+
+def test_rust_bridge_passes_extras_to_the_coercing_check():
+    """The Rust frontend's extra map is verbatim; ``submit_request`` coerces it."""
+    from mstar.api_server.rust_frontend import RustFrontendBridge
+
+    async def no_chunks(rid):
+        return
+        yield
+
+    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+    sent, seen = [], []
+    bridge._send = sent.append
+    bridge.server = types.SimpleNamespace(
+        submit_request=lambda **kw: seen.append(normalize_generation_kwargs(kw["model_kwargs"])),
+        iter_result_chunks=no_chunks,
+    )
+
+    async def run():
+        bridge._submit({"rid": "r1", "model_kwargs": {"top_k": "5", "talker_temperature": "0.7"}})
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert seen == [{"top_k": 5, "talker_temperature": 0.7}]
+    assert sent == [{"t": "done", "rid": "r1"}]
 
 
 def test_checkpoint_defaults_read_both_greedy_spellings(tmp_path):

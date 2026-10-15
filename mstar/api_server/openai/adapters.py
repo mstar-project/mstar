@@ -24,7 +24,6 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,6 +32,7 @@ from typing import TYPE_CHECKING
 from mstar.api_server import media_io
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
+from mstar.utils.generation_kwargs import normalize_generation_kwargs
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
     from mstar.api_server.openai.protocol import (
@@ -860,30 +860,6 @@ _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
 _WORDS_MARKER = "<|startoflm|>"
 
 
-# sampling knobs the engine reads as numbers; a string there fails every
-# request batched with it, so they are checked before submission
-_NUMERIC_KWARGS = {
-    "temperature": float, "top_p": float, "min_p": float, "repetition_penalty": float,
-    "top_k": int, "max_output_tokens": int, "seed": int,
-}
-
-
-def _check_numeric_kwargs(mk: dict) -> dict:
-    """Coerce the known numeric ``model_kwargs`` to numbers, or raise ValueError."""
-    for key, kind in _NUMERIC_KWARGS.items():
-        value = mk.get(key)
-        if value is None or (kind is int and isinstance(value, int) and not isinstance(value, bool)):
-            continue
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            raise ValueError(f"{key} must be a number; got {value!r}") from None
-        if not math.isfinite(number) or (kind is int and not number.is_integer()):
-            raise ValueError(f"{key} must be a finite {kind.__name__}; got {value!r}")
-        mk[key] = kind(number)
-    return mk
-
-
 def _transcription_kwargs(req: TranscriptionRequest) -> dict:
     """Map the OpenAI transcription fields shared by every ASR model onto
     ``model_kwargs``. ``language`` / ``temperature`` / ``seed`` pass through
@@ -907,7 +883,8 @@ def _transcription_kwargs(req: TranscriptionRequest) -> dict:
         mk.setdefault("timestamps", "word")
     elif granularities or req.response_format in ("verbose_json", "srt", "vtt"):
         mk.setdefault("timestamps", "segment")
-    return _check_numeric_kwargs(mk)
+    # checked here too, so a bad knob is a 400 before a stream commits to a 200
+    return normalize_generation_kwargs(mk)
 
 
 class WhisperAdapter(OpenAIAdapter):
