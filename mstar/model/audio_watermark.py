@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -117,6 +118,19 @@ def import_audioseal():
             f"audio_watermark.enabled is true but the 'audioseal' package is not installed: {_INSTALL_HINT}"
         ) from exc
     return audioseal, no_compile
+
+
+@contextmanager
+def _no_tf32():
+    """Full fp32 convolutions and matmuls. A chunk and the whole utterance
+    convolve over different lengths, and TF32 rounds them apart by a few
+    int16 steps (the engine turns TF32 matmuls on process-wide)."""
+    matmul, cudnn = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = matmul, cudnn
 
 
 @dataclass
@@ -304,7 +318,7 @@ class AudioSealWatermarker:
         batch = audio.shape[0]
         self._install(self._stack(caches), batch)
         try:
-            with self._no_compile():
+            with self._no_compile(), _no_tf32():
                 gen = self.generator
                 hidden = gen.encoder(audio.unsqueeze(1))
                 hidden = gen.msg_processor(hidden, self._message.expand(batch, -1))

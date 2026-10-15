@@ -251,6 +251,25 @@ def test_pcm16_round_trip_matches_offline_within_one_step():
     assert (marked.int() - expected.int()).abs().max() <= 1
 
 
+def test_watermark_runs_without_tf32_and_restores_the_flags(monkeypatch):
+    """TF32 rounds a chunk and the whole utterance apart on GPU; the engine
+    turns TF32 matmuls on, so the generator must turn both kinds off."""
+    wmk = _watermarker()
+    seen = []
+    forward = wmk.generator.encoder.forward
+
+    def encoder(x):
+        seen.append((torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32))
+        return forward(x)
+
+    monkeypatch.setattr(wmk.generator.encoder, "forward", encoder)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", True)
+    wmk.apply([torch.zeros(320)], [WatermarkStream()])
+    assert seen == [(False, False)]
+    assert torch.backends.cuda.matmul.allow_tf32 and torch.backends.cudnn.allow_tf32
+
+
 def test_stream_refuses_chunks_after_its_final_one():
     wmk = _watermarker()
     stream = WatermarkStream()
