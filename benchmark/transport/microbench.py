@@ -20,6 +20,7 @@ import os
 import platform
 import socket
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -87,6 +88,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--duration", type=float, default=5.0, help="seconds per interference point")
     p.add_argument("--p99-budget-ms", type=float, default=1.0,
                    help="interference: report the largest burst whose extra p99 stays under this")
+    p.add_argument("--gpu-busy-ms", type=float, default=0.0,
+                   help="keep each process's default CUDA stream this many ms ahead with spin kernels, "
+                        "as a worker's next step is queued while it moves tensors (cuda devices only)")
     p.add_argument("--torch-threads", type=int, default=None,
                    help="torch intra-op threads in both roles (default: torch's, as M* workers keep). "
                         "On a busy host the pool's threads inflate host copies of 32K+ elements")
@@ -109,6 +113,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("--iters and --inflight must be >= 1, --warmup >= 0")
     if not hasattr(torch, args.dtype) or not isinstance(getattr(torch, args.dtype), torch.dtype):
         raise SystemExit(f"unknown dtype {args.dtype!r}")
+    if args.gpu_busy_ms < 0:
+        raise SystemExit("--gpu-busy-ms must be >= 0")
     if args.torch_threads is not None:
         if args.torch_threads < 1:
             raise SystemExit("--torch-threads must be >= 1")
@@ -243,6 +249,52 @@ class HostCopier:
         return out
 
 
+class GpuBusy:
+    """Spin kernels on the default stream, about ``ms`` queued at any time.
+
+    A worker moves step N's tensors while step N+1 is already queued on its
+    default stream, so anything that waits on that stream (a read whose event
+    is recorded there, a legacy-stream copy inside a transport) waits for it.
+    """
+
+    def __init__(self, device: str, ms: float):
+        self.device = torch.device(device)
+        self.ms = ms
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        if ms > 0 and self.device.type == "cuda":
+            self.cycles = self._calibrate()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def _calibrate(self) -> int:
+        with torch.cuda.device(self.device):
+            probe = 20_000_000
+            torch.cuda._sleep(probe // 10)
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            torch.cuda._sleep(probe)
+            end.record()
+            end.synchronize()
+            return int(probe * self.ms / start.elapsed_time(end))
+
+    def _run(self) -> None:
+        with torch.cuda.device(self.device):
+            prev = None
+            while not self._stop.is_set():
+                torch.cuda._sleep(self.cycles)
+                ev = torch.cuda.Event()
+                ev.record()
+                if prev is not None:
+                    prev.synchronize()
+                prev = ev
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+
 # -- sender ------------------------------------------------------------------------
 
 @dataclass
@@ -275,6 +327,7 @@ class Sender:
         self.dtype = getattr(torch, args.dtype)
         self.copier = HostCopier(args.device)
         self._held: deque = deque()
+        self.busy = GpuBusy(args.device, args.gpu_busy_ms)
 
     def _await(self, want, timeout_s: float = 30.0):
         """Messages until ``want(msg)`` returns something; stray ones are kept."""
@@ -599,6 +652,7 @@ class Sender:
 
     def close(self) -> None:
         self._ctl("stop")
+        self.busy.stop()
 
 
 # -- receiver ----------------------------------------------------------------------
@@ -614,6 +668,7 @@ class Receiver:
         self.t_recv: dict[str, float] = {}
         self.bg_received = 0
         self.pool_reader = None
+        self.busy = GpuBusy(args.receiver_device, args.gpu_busy_ms)
 
     def _send(self, msg) -> None:
         self.comm.send(SENDER, msg)
@@ -762,7 +817,8 @@ def render(results: dict) -> str:
     lines = [f"host {results['host']}  sender {results['sender_device']}  receiver {results['receiver_device']}"
              f"  inflight {results['inflight']}  mesh {results['mesh']}  mooncake {results.get('mooncake')}"
              f"  load {results['loadavg_start']:.1f} on {results['cpus']} cpus"
-             f"  torch threads {results['torch_threads']}", ""]
+             f"  torch threads {results['torch_threads']}"
+             + (f"  gpu busy {results['gpu_busy_ms']} ms" if results.get("gpu_busy_ms") else ""), ""]
     paths = results["paths"]
     names = [p for p in paths if paths[p].get("results")]
     if names:
@@ -819,7 +875,7 @@ def run_sender(args) -> dict:
         "mesh": type(sender.comm).__mro__[1].__name__, "paths": {},
         "torch": torch.__version__,
         "loadavg_start": os.getloadavg()[0], "cpus": os.cpu_count(),
-        "torch_threads": torch.get_num_threads(),
+        "torch_threads": torch.get_num_threads(), "gpu_busy_ms": args.gpu_busy_ms,
     }
     try:
         import importlib.metadata as md
