@@ -262,7 +262,7 @@ def _capture_thrown_away(capture: Callable[..., tuple[Any, Any]], what: str) -> 
     # shortcut: an executable graph's own memory (about 3 KiB a kernel) is
     # outside the allocator and not counted; measure it if capture eats the floor
     taken = None if graph is None else sum(
-        segment["total_size"] for segment in torch.cuda.memory_snapshot(pool, include_traces=False)
+        segment["total_size"] for segment in torch.cuda.memory_snapshot(pool)
     )
     del graph, outputs
     if taken is None:
