@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 15, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -2041,6 +2041,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.waypoint.config.html#mstar.model.waypoint.config.WaypointConfig.channels">(mstar.model.waypoint.config.WaypointConfig attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.chat_turns">chat_turns() (in module mstar.model.multimodal)</a>
+</li>
       <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest">ChatCompletionRequest (class in mstar.api_server.openai.protocol)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatMessage">ChatMessage (class in mstar.api_server.openai.protocol)</a>
@@ -6651,6 +6653,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatCompletionRequest.messages">messages (mstar.api_server.openai.protocol.ChatCompletionRequest attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.messages_from_parts">messages_from_parts() (in module mstar.model.multimodal)</a>
+</li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.MessageSource">MessageSource (class in mstar.utils.ipc_format)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ResultChunk.metadata">metadata (mstar.api_server.request_types.ResultChunk attribute)</a>
@@ -7371,6 +7375,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.api_server.openai.serving_chat.html#module-mstar.api_server.openai.serving_chat">module</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     mstar.api_server.openai.serving_images
 
@@ -7378,8 +7384,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.api_server.openai.serving_images.html#module-mstar.api_server.openai.serving_images">module</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     mstar.api_server.openai.serving_realtime
 
@@ -10192,6 +10196,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology">PartitionTopology (class in mstar.streaming.topology)</a>
 </li>
+      <li><a href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.Turn.parts">parts (mstar.model.multimodal.Turn attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.parts_from_modalities">parts_from_modalities() (in module mstar.model.multimodal)</a>
 </li>
       <li><a href="_autosummary/mstar.model.waypoint.config.html#mstar.model.waypoint.config.WaypointConfig.patch">patch (mstar.model.waypoint.config.WaypointConfig attribute)</a>
@@ -11674,10 +11680,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestComplete">RequestComplete (class in mstar.api_server.request_types)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestFailed">RequestFailed (class in mstar.api_server.request_types)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.RequestOffloading">RequestOffloading (class in mstar.engine.resources)</a>
 
       <ul>
@@ -12055,7 +12061,13 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.nemotron_duplex.components.rnnt.html#mstar.model.nemotron_duplex.components.rnnt.RnntJoint">RnntJoint (class in mstar.model.nemotron_duplex.components.rnnt)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ChatMessage.role">role (mstar.api_server.openai.protocol.ChatMessage attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.PromptPart.role">(mstar.model.multimodal.PromptPart attribute)</a>
 </li>
+        <li><a href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.Turn.role">(mstar.model.multimodal.Turn attribute)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.rollback_admit">rollback_admit() (mstar.engine.resources.base.Resource method)</a>
 
       <ul>
@@ -13856,6 +13868,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.T3Config.turbo">(mstar.model.chatterbox.config.T3Config class method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.Turn">Turn (class in mstar.model.multimodal)</a>
+</li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestComplete.tx_info">tx_info (mstar.api_server.request_types.RequestComplete attribute)</a>
 
       <ul>
@@ -14722,7 +14736,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 14, 2026.
+  Last updated on Oct 15, 2026.
   <br/>
 </p>
   </div>

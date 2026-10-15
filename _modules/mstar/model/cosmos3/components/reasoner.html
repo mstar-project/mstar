@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 15, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -952,10 +952,12 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">jinja2</span><span class="w"> </span><span class="kn">import</span> <span class="n">TemplateError</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">torchvision.transforms.v2</span><span class="w"> </span><span class="kn">import</span> <span class="n">InterpolationMode</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">torchvision.transforms.v2</span><span class="w"> </span><span class="kn">import</span> <span class="n">functional</span> <span class="k">as</span> <span class="n">tvF</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">Cosmos3MediaProcessorConfig</span><span class="p">,</span> <span class="n">Cosmos3ReasonerConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">messages_from_parts</span>
 
 <span class="n">IMAGE</span> <span class="o">=</span> <span class="s2">"image"</span>
 <span class="n">VIDEO</span> <span class="o">=</span> <span class="s2">"video"</span>
@@ -1248,26 +1250,25 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Render ordered prompt parts (text / image / video, as written) through</span>
 <span class="sd">    the checkpoint's chat template with the generation prompt appended.</span>
 <span class="sd">    Media parts become the template's single-token placeholders, which</span>
-<span class="sd">    ``expand_placeholders`` then grows."""</span>
-    <span class="n">content</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="sd">    ``expand_placeholders`` then grows. ``system_prompt`` leads only when the</span>
+<span class="sd">    client sent no system message of its own."""</span>
     <span class="k">for</span> <span class="n">part</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">:</span>
-        <span class="k">if</span> <span class="n">part</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"text"</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">part</span><span class="o">.</span><span class="n">text</span><span class="p">:</span>
-                <span class="n">content</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"text"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">:</span> <span class="n">part</span><span class="o">.</span><span class="n">text</span><span class="p">})</span>
-        <span class="k">elif</span> <span class="n">part</span><span class="o">.</span><span class="n">modality</span> <span class="ow">in</span> <span class="p">(</span><span class="n">IMAGE</span><span class="p">,</span> <span class="n">VIDEO</span><span class="p">):</span>
-            <span class="n">content</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"type"</span><span class="p">:</span> <span class="n">part</span><span class="o">.</span><span class="n">modality</span><span class="p">})</span>
-        <span class="k">else</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">part</span><span class="o">.</span><span class="n">modality</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"text"</span><span class="p">,</span> <span class="n">IMAGE</span><span class="p">,</span> <span class="n">VIDEO</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"the Cosmos3 reasoner has no encoder for </span><span class="si">{</span><span class="n">part</span><span class="o">.</span><span class="n">modality</span><span class="si">!r}</span><span class="s2"> inputs"</span><span class="p">)</span>
-    <span class="n">messages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-    <span class="k">if</span> <span class="n">system_prompt</span><span class="p">:</span>
-        <span class="n">messages</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"system"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">system_prompt</span><span class="p">})</span>
-    <span class="n">messages</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">content</span><span class="p">})</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">any</span><span class="p">(</span><span class="n">part</span><span class="o">.</span><span class="n">text</span> <span class="ow">or</span> <span class="n">part</span><span class="o">.</span><span class="n">modality</span> <span class="o">!=</span> <span class="s2">"text"</span> <span class="k">for</span> <span class="n">part</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="s2">"Cosmos3-Edge got a request with no text and no attachments; send a prompt, an image or a video"</span>
+        <span class="p">)</span>
+    <span class="n">messages</span> <span class="o">=</span> <span class="n">messages_from_parts</span><span class="p">(</span><span class="n">parts</span><span class="p">,</span> <span class="n">default_system</span><span class="o">=</span><span class="n">system_prompt</span> <span class="ow">or</span> <span class="kc">None</span><span class="p">)</span>
     <span class="n">kwargs</span> <span class="o">=</span> <span class="p">{}</span>
     <span class="k">if</span> <span class="n">enable_thinking</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">kwargs</span><span class="p">[</span><span class="s2">"enable_thinking"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">enable_thinking</span><span class="p">)</span>
     <span class="k">elif</span> <span class="ow">not</span> <span class="n">cfg</span><span class="o">.</span><span class="n">enable_thinking</span><span class="p">:</span>
         <span class="n">kwargs</span><span class="p">[</span><span class="s2">"enable_thinking"</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="k">return</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span><span class="n">messages</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">add_generation_prompt</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span><span class="n">messages</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">add_generation_prompt</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+    <span class="k">except</span> <span class="n">TemplateError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Cosmos3-Edge's chat template refused the chat: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span></div>
 
 </pre></div>
 
@@ -1316,7 +1317,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 14, 2026.
+  Last updated on Oct 15, 2026.
   <br/>
 </p>
   </div>

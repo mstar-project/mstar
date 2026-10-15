@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 15, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -663,7 +663,7 @@ protocol are untouched):</p>
 <blockquote>
 <div><dl>
 <dt>frontend -&gt; bridge:  {t:”submit”, rid, text, file_paths,</dt><dd><p>input_modalities, output_modalities, model_kwargs,
-streaming} | {t:”abort”, rid}</p>
+prompt_parts, streaming} | {t:”abort”, rid}</p>
 </dd>
 <dt>bridge -&gt; frontend:  {t:”chunk”, rid, modality, data(bin), metadata}</dt><dd><div class="line-block">
 <div class="line">{t:”err”, rid, msg} | {t:”done”, rid}</div>
@@ -672,9 +672,10 @@ streaming} | {t:”abort”, rid}</p>
 </dl>
 </div></blockquote>
 <p>The submit shape is <code class="docutils literal notranslate"><span class="pre">APIServer.submit_request</span></code>’s signature verbatim — the
-protocol was designed by flattening it. The bridge mesh lives in its own
-socket dir (private to the frontend/bridge pair), so entity names never
-collide with the conductor/worker mesh.</p>
+protocol was designed by flattening it. <code class="docutils literal notranslate"><span class="pre">prompt_parts</span></code> travels for a chat
+only, one map of <code class="docutils literal notranslate"><span class="pre">PromptPart</span></code>’s fields per part. The bridge mesh lives in
+its own socket dir (private to the frontend/bridge pair), so entity names
+never collide with the conductor/worker mesh.</p>
 <p>Opt-in: <code class="docutils literal notranslate"><span class="pre">mstar-serve</span> <span class="pre">--rust-frontend</span></code> replaces <code class="docutils literal notranslate"><span class="pre">uvicorn.run</span></code> with the
 <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary + this loop. Everything else in the process
 (preprocess worker, conductor spawn, tensor transport) is identical.</p>
@@ -873,7 +874,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 14, 2026.
+  Last updated on Oct 15, 2026.
   <br/>
 </p>
   </div>

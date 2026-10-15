@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 15, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -907,7 +907,8 @@ over the sampled frames and its grid with per-frame timestamps.</p>
 <dd><p>Render ordered prompt parts (text / image / video, as written) through
 the checkpoint’s chat template with the generation prompt appended.
 Media parts become the template’s single-token placeholders, which
-<code class="docutils literal notranslate"><span class="pre">expand_placeholders</span></code> then grows.</p>
+<code class="docutils literal notranslate"><span class="pre">expand_placeholders</span></code> then grows. <code class="docutils literal notranslate"><span class="pre">system_prompt</span></code> leads only when the
+client sent no system message of its own.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1069,7 +1070,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 14, 2026.
+  Last updated on Oct 15, 2026.
   <br/>
 </p>
   </div>

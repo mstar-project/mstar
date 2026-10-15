@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 15, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -934,14 +934,15 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    frontend -&gt; bridge:  {t:"submit", rid, text, file_paths,</span>
 <span class="sd">                          input_modalities, output_modalities, model_kwargs,</span>
-<span class="sd">                          streaming} | {t:"abort", rid}</span>
+<span class="sd">                          prompt_parts, streaming} | {t:"abort", rid}</span>
 <span class="sd">    bridge -&gt; frontend:  {t:"chunk", rid, modality, data(bin), metadata}</span>
 <span class="sd">                       | {t:"err", rid, msg} | {t:"done", rid}</span>
 
 <span class="sd">The submit shape is ``APIServer.submit_request``'s signature verbatim — the</span>
-<span class="sd">protocol was designed by flattening it. The bridge mesh lives in its own</span>
-<span class="sd">socket dir (private to the frontend/bridge pair), so entity names never</span>
-<span class="sd">collide with the conductor/worker mesh.</span>
+<span class="sd">protocol was designed by flattening it. ``prompt_parts`` travels for a chat</span>
+<span class="sd">only, one map of ``PromptPart``'s fields per part. The bridge mesh lives in</span>
+<span class="sd">its own socket dir (private to the frontend/bridge pair), so entity names</span>
+<span class="sd">never collide with the conductor/worker mesh.</span>
 
 <span class="sd">Opt-in: ``mstar-serve --rust-frontend`` replaces ``uvicorn.run`` with the</span>
 <span class="sd">``mstar-server`` binary + this loop. Everything else in the process</span>
@@ -962,6 +963,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">MsgpackCodec</span><span class="p">,</span>
     <span class="n">RustZMQCommunicator</span><span class="p">,</span>
 <span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">PromptPart</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -1048,12 +1050,14 @@ window.runMermaid = runMermaid;</script>
                            <span class="s2">"backend (unset MSTAR_TOKENIZER)"</span><span class="p">)</span>
             <span class="k">return</span>
         <span class="k">try</span><span class="p">:</span>
+            <span class="n">parts</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"prompt_parts"</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">server</span><span class="o">.</span><span class="n">submit_request</span><span class="p">(</span>
                 <span class="n">text</span><span class="o">=</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"text"</span><span class="p">),</span>
                 <span class="n">file_paths</span><span class="o">=</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"file_paths"</span><span class="p">)</span> <span class="ow">or</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">input_modalities</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"input_modalities"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">[]),</span>
                 <span class="n">output_modalities</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"output_modalities"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">]),</span>
                 <span class="n">model_kwargs</span><span class="o">=</span><span class="nb">dict</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"model_kwargs"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}),</span>
+                <span class="n">prompt_parts</span><span class="o">=</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">(</span><span class="o">**</span><span class="n">p</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">]</span> <span class="k">if</span> <span class="n">parts</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">streaming</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"streaming"</span><span class="p">,</span> <span class="kc">True</span><span class="p">)),</span>
                 <span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span>
             <span class="p">)</span>
@@ -1179,7 +1183,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 14, 2026.
+  Last updated on Oct 15, 2026.
   <br/>
 </p>
   </div>

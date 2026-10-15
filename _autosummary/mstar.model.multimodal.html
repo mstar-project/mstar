@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 15, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -642,12 +642,20 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.PromptPart"><code class="docutils literal notranslate"><span class="pre">PromptPart</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.PromptPart.index"><code class="docutils literal notranslate"><span class="pre">PromptPart.index</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.PromptPart.modality"><code class="docutils literal notranslate"><span class="pre">PromptPart.modality</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.PromptPart.role"><code class="docutils literal notranslate"><span class="pre">PromptPart.role</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.PromptPart.text"><code class="docutils literal notranslate"><span class="pre">PromptPart.text</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.Turn"><code class="docutils literal notranslate"><span class="pre">Turn</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.Turn.parts"><code class="docutils literal notranslate"><span class="pre">Turn.parts</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.Turn.role"><code class="docutils literal notranslate"><span class="pre">Turn.role</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.chat_turns"><code class="docutils literal notranslate"><span class="pre">chat_turns()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.check_attachments"><code class="docutils literal notranslate"><span class="pre">check_attachments()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.check_plan"><code class="docutils literal notranslate"><span class="pre">check_plan()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.find_media_spans"><code class="docutils literal notranslate"><span class="pre">find_media_spans()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.messages_from_parts"><code class="docutils literal notranslate"><span class="pre">messages_from_parts()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.parts_from_modalities"><code class="docutils literal notranslate"><span class="pre">parts_from_modalities()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.prefill_plan"><code class="docutils literal notranslate"><span class="pre">prefill_plan()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.split_around_spans"><code class="docutils literal notranslate"><span class="pre">split_around_spans()</span></code></a></li>
@@ -680,16 +688,22 @@ rendered prompt ever does.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.check_attachments" title="mstar.model.multimodal.check_attachments"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_attachments</span></code></a>(parts, counts)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.chat_turns" title="mstar.model.multimodal.chat_turns"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chat_turns</span></code></a>(parts)</p></td>
+<td><p>Group <code class="docutils literal notranslate"><span class="pre">parts</span></code> into turns, starting a new one at every role change.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.check_attachments" title="mstar.model.multimodal.check_attachments"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_attachments</span></code></a>(parts, counts)</p></td>
 <td><p>Fail loudly when the layout and the attachments that arrived disagree.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.check_plan" title="mstar.model.multimodal.check_plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_plan</span></code></a>(plan, spans, n_text)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.check_plan" title="mstar.model.multimodal.check_plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_plan</span></code></a>(plan, spans, n_text)</p></td>
 <td><p>Fail loudly when the rendered prompt disagrees with the plan.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.find_media_spans" title="mstar.model.multimodal.find_media_spans"><code class="xref py py-obj docutils literal notranslate"><span class="pre">find_media_spans</span></code></a>(input_ids, specs)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.find_media_spans" title="mstar.model.multimodal.find_media_spans"><code class="xref py py-obj docutils literal notranslate"><span class="pre">find_media_spans</span></code></a>(input_ids, specs)</p></td>
 <td><p>Locate every placeholder run in <code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, in token order.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.parts_from_modalities" title="mstar.model.multimodal.parts_from_modalities"><code class="xref py py-obj docutils literal notranslate"><span class="pre">parts_from_modalities</span></code></a>(input_modalities[, texts])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.messages_from_parts" title="mstar.model.multimodal.messages_from_parts"><code class="xref py py-obj docutils literal notranslate"><span class="pre">messages_from_parts</span></code></a>(parts[, default_system])</p></td>
+<td><p>One OpenAI-style message per turn of <code class="docutils literal notranslate"><span class="pre">parts</span></code>, for a chat template to take as is.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.parts_from_modalities" title="mstar.model.multimodal.parts_from_modalities"><code class="xref py py-obj docutils literal notranslate"><span class="pre">parts_from_modalities</span></code></a>(input_modalities[, ...])</p></td>
 <td><p>Rebuild the parts for a layout, filling the text slots from <code class="docutils literal notranslate"><span class="pre">texts</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.prefill_plan" title="mstar.model.multimodal.prefill_plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">prefill_plan</span></code></a>(parts, *[, leading_text])</p></td>
@@ -707,8 +721,11 @@ rendered prompt ever does.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.MediaSpan" title="mstar.model.multimodal.MediaSpan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MediaSpan</span></code></a>(modality, index, start, stop)</p></td>
 <td><p>A <code class="docutils literal notranslate"><span class="pre">&lt;|x_start|&gt;</span> <span class="pre">pad*</span> <span class="pre">&lt;|x_end|&gt;</span></code> run located in a tokenized prompt.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.PromptPart" title="mstar.model.multimodal.PromptPart"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PromptPart</span></code></a>(modality[, text, index])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.multimodal.PromptPart" title="mstar.model.multimodal.PromptPart"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PromptPart</span></code></a>(modality[, text, index, role])</p></td>
 <td><p>One element of a prompt, in request order.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.multimodal.Turn" title="mstar.model.multimodal.Turn"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Turn</span></code></a>(role, parts)</p></td>
+<td><p>The parts of consecutive messages of one role.</p></td>
 </tr>
 </tbody>
 </table>
@@ -754,17 +771,20 @@ itself, alongside the encoder output.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.multimodal.PromptPart">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.multimodal.</span></span><span class="sig-name descname"><span class="pre">PromptPart</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">modality</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">text</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">index</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/multimodal.html#PromptPart"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.multimodal.PromptPart" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.multimodal.</span></span><span class="sig-name descname"><span class="pre">PromptPart</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">modality</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">text</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">index</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">role</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/multimodal.html#PromptPart"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.multimodal.PromptPart" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>One element of a prompt, in request order.</p>
 <p><code class="docutils literal notranslate"><span class="pre">index</span></code> is the position within its own modality’s list, so a media part
-addresses <code class="docutils literal notranslate"><span class="pre">tensors[f&quot;{modality}_inputs&quot;][index]</span></code>.</p>
+addresses <code class="docutils literal notranslate"><span class="pre">tensors[f&quot;{modality}_inputs&quot;][index]</span></code>. <code class="docutils literal notranslate"><span class="pre">role</span></code> is the chat
+role of the message the part came from, <code class="docutils literal notranslate"><span class="pre">None</span></code> from entrypoints with no
+messages.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>modality</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>text</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>index</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>role</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -779,10 +799,58 @@ addresses <code class="docutils literal notranslate"><span class="pre">tensors[f
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.multimodal.PromptPart.role">
+<span class="sig-name descname"><span class="pre">role</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.multimodal.PromptPart.role" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.multimodal.PromptPart.text">
 <span class="sig-name descname"><span class="pre">text</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.multimodal.PromptPart.text" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.multimodal.Turn">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.multimodal.</span></span><span class="sig-name descname"><span class="pre">Turn</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">role</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">parts</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/multimodal.html#Turn"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.multimodal.Turn" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>The parts of consecutive messages of one role.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>role</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>parts</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.multimodal.PromptPart" title="mstar.model.multimodal.PromptPart"><em>PromptPart</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.multimodal.Turn.parts">
+<span class="sig-name descname"><span class="pre">parts</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.model.multimodal.PromptPart" title="mstar.model.multimodal.PromptPart"><span class="pre">PromptPart</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.multimodal.Turn.parts" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.multimodal.Turn.role">
+<span class="sig-name descname"><span class="pre">role</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.model.multimodal.Turn.role" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.multimodal.chat_turns">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.multimodal.</span></span><span class="sig-name descname"><span class="pre">chat_turns</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">parts</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/multimodal.html#chat_turns"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.multimodal.chat_turns" title="Link to this definition">#</a></dt>
+<dd><p>Group <code class="docutils literal notranslate"><span class="pre">parts</span></code> into turns, starting a new one at every role change.</p>
+<p>A part with no role is the user’s, so a request from an entrypoint with no
+messages renders as the one user turn it always did.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>parts</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.multimodal.PromptPart" title="mstar.model.multimodal.PromptPart"><em>PromptPart</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="#mstar.model.multimodal.Turn" title="mstar.model.multimodal.Turn"><em>Turn</em></a>]</p>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py function">
@@ -847,18 +915,41 @@ Indices run per modality, so the nth image span addresses the nth image.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.multimodal.messages_from_parts">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.multimodal.</span></span><span class="sig-name descname"><span class="pre">messages_from_parts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">parts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">default_system</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/multimodal.html#messages_from_parts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.multimodal.messages_from_parts" title="Link to this definition">#</a></dt>
+<dd><p>One OpenAI-style message per turn of <code class="docutils literal notranslate"><span class="pre">parts</span></code>, for a chat template to take as is.</p>
+<p>An attachment is an empty <code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">modality,</span> <span class="pre">modality:</span> <span class="pre">&quot;&quot;}</span></code> item: the
+template writes its placeholder there, in the turn it belongs to, and the
+tokenized prompt is scanned for it. <code class="docutils literal notranslate"><span class="pre">default_system</span></code> leads only when no
+part is a system message’s, wherever that message sits: a template writes
+every system message it is given, so both would reach the model.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>parts</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.multimodal.PromptPart" title="mstar.model.multimodal.PromptPart"><em>PromptPart</em></a><em>]</em>)</p></li>
+<li><p><strong>default_system</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.multimodal.parts_from_modalities">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.multimodal.</span></span><span class="sig-name descname"><span class="pre">parts_from_modalities</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input_modalities</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">texts</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/multimodal.html#parts_from_modalities"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.multimodal.parts_from_modalities" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.model.multimodal.</span></span><span class="sig-name descname"><span class="pre">parts_from_modalities</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input_modalities</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">texts</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">roles</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/multimodal.html#parts_from_modalities"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.multimodal.parts_from_modalities" title="Link to this definition">#</a></dt>
 <dd><p>Rebuild the parts for a layout, filling the text slots from <code class="docutils literal notranslate"><span class="pre">texts</span></code>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">input_modalities</span></code> is one entry per part, in order, and is the layout
 every consumer plans from. Rebuilding from it beats carrying a second copy
 of the ordering that could drift. Unfilled text slots carry <code class="docutils literal notranslate"><span class="pre">None</span></code>, which
-is enough to plan with.</p>
+is enough to plan with. <code class="docutils literal notranslate"><span class="pre">roles</span></code> is one per part, in the same order.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>input_modalities</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 <li><p><strong>texts</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.12)"><em>Iterable</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>roles</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.12)"><em>Iterable</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -969,12 +1060,20 @@ has nothing to embed. <a class="reference internal" href="#mstar.model.multimoda
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.PromptPart"><code class="docutils literal notranslate"><span class="pre">PromptPart</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.PromptPart.index"><code class="docutils literal notranslate"><span class="pre">PromptPart.index</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.PromptPart.modality"><code class="docutils literal notranslate"><span class="pre">PromptPart.modality</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.PromptPart.role"><code class="docutils literal notranslate"><span class="pre">PromptPart.role</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.PromptPart.text"><code class="docutils literal notranslate"><span class="pre">PromptPart.text</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.Turn"><code class="docutils literal notranslate"><span class="pre">Turn</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.Turn.parts"><code class="docutils literal notranslate"><span class="pre">Turn.parts</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.Turn.role"><code class="docutils literal notranslate"><span class="pre">Turn.role</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.chat_turns"><code class="docutils literal notranslate"><span class="pre">chat_turns()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.check_attachments"><code class="docutils literal notranslate"><span class="pre">check_attachments()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.check_plan"><code class="docutils literal notranslate"><span class="pre">check_plan()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.find_media_spans"><code class="docutils literal notranslate"><span class="pre">find_media_spans()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.messages_from_parts"><code class="docutils literal notranslate"><span class="pre">messages_from_parts()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.parts_from_modalities"><code class="docutils literal notranslate"><span class="pre">parts_from_modalities()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.prefill_plan"><code class="docutils literal notranslate"><span class="pre">prefill_plan()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.multimodal.split_around_spans"><code class="docutils literal notranslate"><span class="pre">split_around_spans()</span></code></a></li>
@@ -1011,7 +1110,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 14, 2026.
+  Last updated on Oct 15, 2026.
   <br/>
 </p>
   </div>
