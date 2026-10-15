@@ -8,6 +8,7 @@ reads freed memory.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
@@ -518,14 +519,14 @@ class _PinnedIndexStage:
         elif self._done is not None:
             self._done.synchronize()
 
-    def upload(self, name: str, values: list, dst: torch.Tensor) -> None:
+    def upload(self, name: str, values: np.ndarray, dst: torch.Tensor) -> None:
         n = len(values)
         buf = self._bufs.get(name)
         if buf is None or buf.shape[0] < n or buf.dtype != dst.dtype:
             buf = self._bufs[name] = torch.empty(
                 max(n, 64), dtype=dst.dtype, pin_memory=torch.cuda.is_available(),
             )
-        buf[:n].copy_(torch.as_tensor(values, dtype=dst.dtype))
+        buf.numpy()[:n] = values
         dst[:n].copy_(buf[:n], non_blocking=True)
 
     def end(self) -> None:
@@ -611,21 +612,17 @@ class GDNMixedWrapper(GDNWrapper):
         host_has_state: tuple[bool, ...],
     ):
         null = self._null_slot_id
-        rows = len(spans)
-        real_tokens = sum(spans)
-        tokens = max(self._max_num_tokens or 0, real_tokens)
+        span = np.asarray(spans, dtype=np.int64)
+        slot = np.asarray(host_slots, dtype=np.int64)
+        has = np.asarray(host_has_state, dtype=bool)
+        rows = len(span)
+        tokens = max(self._max_num_tokens or 0, int(span.sum()))
         bs = max(self._bs or 0, rows)
 
-        starts, pos = [], 0
-        for span in spans:
-            starts.append(pos)
-            pos += span
-        prefill_rows, decode_rows = [], []
-        for i, span in enumerate(spans):
-            if span == 1 and (host_has_state[i] or host_slots[i] == null):
-                decode_rows.append(i)
-            elif span > 0:
-                prefill_rows.append(i)
+        start = np.zeros(rows, dtype=np.int64)
+        np.cumsum(span[:-1], out=start[1:])
+        decode = (span == 1) & (has | (slot == null))
+        prefill_rows = np.flatnonzero((span > 0) & ~decode)
         cap = self._max_prefill_rows if self._cuda_graph else max(len(prefill_rows), 1)
         if len(prefill_rows) > cap:
             raise RuntimeError(
@@ -634,18 +631,23 @@ class GDNMixedWrapper(GDNWrapper):
             )
 
         # prompt tokens first, in row order; every other position after them
-        front = [t for i in prefill_rows for t in range(starts[i], starts[i] + spans[i])]
-        taken = set(front)
-        perm = front + [t for t in range(tokens) if t not in taken]
-        dec_src = [0] * bs
-        dec_dst = [tokens] * bs  # the scratch row past the step's tokens
-        dec_slots = [null] * bs
-        for i in decode_rows:
-            dec_src[i] = dec_dst[i] = starts[i]
-            dec_slots[i] = host_slots[i]
-        pre_spans = [spans[i] for i in prefill_rows] + [0] * (cap - len(prefill_rows))
-        pre_slots = [host_slots[i] for i in prefill_rows] + [null] * (cap - len(prefill_rows))
-        pre_has = [host_has_state[i] for i in prefill_rows] + [False] * (cap - len(prefill_rows))
+        front = np.concatenate(
+            [np.arange(start[i], start[i] + span[i]) for i in prefill_rows]
+            or [np.zeros(0, dtype=np.int64)]
+        )
+        rest = np.ones(tokens, dtype=bool)
+        rest[front] = False
+        perm = np.concatenate([front, np.flatnonzero(rest)])
+        dec_src = np.zeros(bs, dtype=np.int64)
+        dec_dst = np.full(bs, tokens, dtype=np.int64)  # the scratch row past the step's tokens
+        dec_slots = np.full(bs, null, dtype=np.int64)
+        dec_src[:rows] = np.where(decode, start, 0)
+        dec_dst[:rows] = np.where(decode, start, tokens)
+        dec_slots[:rows] = np.where(decode, slot, null)
+        pad = cap - len(prefill_rows)
+        pre_spans = span[prefill_rows].tolist() + [0] * pad
+        pre_slots = np.concatenate([slot[prefill_rows], np.full(pad, null)])
+        pre_has = np.concatenate([has[prefill_rows], np.zeros(pad, dtype=bool)])
 
         perm_buf = self._buf("perm", tokens, torch.int64)
         src_buf = self._buf("dec_src", bs, torch.int64)
