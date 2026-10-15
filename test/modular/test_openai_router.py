@@ -572,3 +572,67 @@ def test_speech_stream_pcm_has_no_wav_header(client_and_stub):
     r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True})
     assert r.headers["content-type"].startswith("audio/wav") and r.content[:4] == b"RIFF"
     assert r.content[44:] == _pcm([1, 2, 3])
+
+
+def test_speech_stream_format_audio_streams_without_stream_flag(client_and_stub):
+    # the OpenAI SDK sends stream_format, never stream
+    client, stub = client_and_stub
+    stub.model_name = "kokoro"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2])), _Chunk("audio", _pcm([3]))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm", "stream_format": "audio"})
+    assert r.status_code == 200 and r.headers["content-type"].startswith("audio/pcm")
+    assert r.content == _pcm([1, 2, 3])
+    assert stub.last_submit["streaming"] is True
+    assert "stream_format" not in stub.last_submit["model_kwargs"]
+
+
+def test_speech_stream_format_sse_sends_openai_audio_events(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "kokoro"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2])), _Chunk("audio", _pcm([3]))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "pcm", "stream_format": "sse"})
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
+    events = [json.loads(line[6:]) for line in r.text.splitlines() if line.startswith("data: ")]
+    assert [e["type"] for e in events] == ["speech.audio.delta", "speech.audio.delta", "speech.audio.done"]
+    assert b"".join(base64.b64decode(e["audio"]) for e in events[:-1]) == _pcm([1, 2, 3])
+    assert "stream_format" not in stub.last_submit["model_kwargs"]
+
+
+def test_speech_sse_closes_the_audio_stream_when_the_client_leaves():
+    from mstar.api_server.openai.serving_speech import _as_sse
+
+    closed = []
+
+    async def audio():
+        try:
+            yield b"\x01\x00"
+            yield b"\x02\x00"
+        finally:
+            closed.append(True)
+
+    async def leave_after_first_event():
+        events = _as_sse(audio())
+        await anext(events)
+        await events.aclose()
+
+    asyncio.run(leave_after_first_event())
+    assert closed == [True]
+
+
+def test_speech_refuses_an_unknown_stream_format(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "kokoro"
+    r = client.post("/v1/audio/speech", json={"input": "hi", "stream_format": "chunks"})
+    assert r.status_code == 400 and stub.last_submit is None
+
+
+def test_speech_stream_format_with_a_compressed_format_returns_one_body(client_and_stub):
+    # the OpenAI SDK's defaults (mp3 + sse): mp3 cannot stream, so it comes whole, not as a 400
+    pytest.importorskip("soundfile")
+    client, stub = client_and_stub
+    stub.model_name = "kokoro"
+    stub.next_chunks = [_Chunk("audio", _pcm(list(range(0, 24000, 7))))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": "flac", "stream_format": "sse"})
+    assert r.status_code == 200 and r.content[:4] == b"fLaC"
+    assert stub.last_submit["streaming"] is False
+    assert "stream_format" not in stub.last_submit["model_kwargs"]
