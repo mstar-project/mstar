@@ -733,7 +733,7 @@ class EarTTSTalker(nn.Module):
         block of codebooks. Returns ``[b, t, num_quantizers]`` in ``[0, codebook_size)``.
 
         ``noise`` (one ``(u, eps)`` pair per iteration, either entry None) lets the
-        caller draw the sampling noise ahead of the call, which is what a CUDA-graph
+        caller draw the sampling noise ahead of the call, which is what an accelerator graph
         capture of this loop needs; the schedule itself is fixed by the config and
         computed on the host (``maskgit_schedule``), so nothing here syncs.
         """

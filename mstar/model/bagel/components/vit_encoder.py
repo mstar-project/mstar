@@ -440,7 +440,7 @@ class BagelVisionTransformer(nn.Module):
         """The capturable tail: encoder block loop plus post-layernorm.
 
         Constant for a fixed token layout, so this is the region a piecewise
-        CUDA graph records. ``use_ragged`` selects the attention backend for
+        accelerator graph records. ``use_ragged`` selects the attention backend for
         the whole stack — see ``BagelViTAttention.attend``.
         """
         self.encoder.bind_step(use_ragged)

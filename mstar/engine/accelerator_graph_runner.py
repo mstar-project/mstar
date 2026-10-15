@@ -112,7 +112,7 @@ def dummy_metadata(
 
 
 def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype):
-    """Capture ``run`` into a new CUDA graph allocated from ``pool``.
+    """Capture ``run`` into a new accelerator graph allocated from ``pool``.
 
     Returns the graph and what ``run`` returned. A capture that fails part
     way leaves two things behind that would sink every later capture on the
@@ -180,7 +180,7 @@ def capture_with_static_outputs(run, warm_outputs, pool: AcceleratorGraphPool, d
 
 
 def fail_if_graphs_required(missing: list[str]) -> None:
-    """MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
+    """MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1 turns a dropped bucket into a startup
     failure, for deployments that would rather not come up than serve the
     eager path at 10-20x the latency."""
     required = os.environ.get("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "0")
@@ -770,7 +770,7 @@ class AcceleratorGraphRunner:
         self, output, graph, static_inputs, static_input_keys,
         dummy_rids, dummy_metadata, config_idx,
     ) -> AcceleratorGraphSlot:
-        """Wrap one slot's capture artifacts into a CudaGraphSlot."""
+        """Wrap one slot's capture artifacts into a AcceleratorGraphSlot."""
         return AcceleratorGraphSlot(
             graph=graph,
             static_inputs=static_inputs,
@@ -1105,9 +1105,9 @@ class PiecewiseGraphKey(NamedTuple):
 
 
 class PiecewiseAcceleratorGraphRunner:
-    """Captures one inner callable of a submodule's forward as a CUDA graph.
+    """Captures one inner callable of a submodule's forward as an accelerator graph.
 
-    Where ``CudaGraphRunner`` replays a whole ``forward_batched`` under engine
+    Where ``AcceleratorGraphRunner`` replays a whole ``forward_batched`` under engine
     control, this captures a SUB-REGION — a transformer block loop, say —
     while the surrounding preamble stays eager and the submodule invokes
     ``run`` itself. The config supplies the callable, its static buffers, and
@@ -1192,7 +1192,7 @@ class PiecewiseAcceleratorGraphRunner:
         return bool(self._graphs)
 
     def _dummy_key(self, shape: PiecewiseCaptureShape, slot: int) -> str:
-        """Padding rows are per slot, as in ``CudaGraphRunner``: a slot's plan
+        """Padding rows are per slot, as in ``AcceleratorGraphRunner``: a slot's plan
         and commit run against its own tail, so sharing rows between slots puts
         two graphs on one set of per-request state."""
         return f"{shape.bs}_{shape.total_tokens}_slot{slot}"
@@ -1208,7 +1208,7 @@ class PiecewiseAcceleratorGraphRunner:
     # ── Capture ─────────────────────────────────────────────────────────
 
     def prepare_for_capture(self) -> list:
-        """Claim this region's static buffers; see ``CudaGraphRunner``."""
+        """Claim this region's static buffers; see ``AcceleratorGraphRunner``."""
         if self._prepared_shapes is None:
             shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
             if shapes and self._config.declare_step is not None:

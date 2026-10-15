@@ -637,7 +637,7 @@ def test_openai_adapter_maps_speech_request():
 
 
 # --------------------------------------------------------------------------
-# CUDA-graph buckets (the capture functions run eagerly on CPU here)
+# Accelerator graph buckets (the capture functions run eagerly on CPU here)
 # --------------------------------------------------------------------------
 
 

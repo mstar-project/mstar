@@ -167,11 +167,11 @@ class WaypointConfig:
     reference_compat: bool = True
 
     # torch.compile the two outer regions (denoise pass, cache pass), matching
-    # the reference. Independent of CUDA graph capture and of FlexAttention,
+    # the reference. Independent of accelerator graph capture and of FlexAttention,
     # which stays compiled for correctness regardless.
     compile_dit: bool = True
 
-    # Attempt fixed-shape CUDA graph capture for encoder/DiT/decoder prime and
+    # Attempt fixed-shape accelerator graph capture for encoder/DiT/decoder prime and
     # rollout paths; disabled or failed capture falls back to eager forwards.
     accelerator_graph: bool = True
 
@@ -179,7 +179,7 @@ class WaypointConfig:
     seed_capture_sizes: tuple[tuple[int, int], ...] = ()
 
     # Also capture the one-time DiT prime/cache pass. Subordinate to
-    # cuda_graph: disabled serves prime through the compiled eager forward.
+    # accelerator_graph: disabled serves prime through the compiled eager forward.
     capture_dit_prime: bool = True
 
     # Rows carried per rollout step, one per resident world sharing the DiT

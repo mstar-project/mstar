@@ -272,14 +272,14 @@ def run_case(
     ) if capture else None
 
     # Static inputs padded to the bucket: replay writes the real prefix and
-    # leaves the tail alone, as `CudaGraphRunner._stage` does.
+    # leaves the tail alone, as `AcceleratorGraphRunner._stage` does.
     sx = torch.zeros(BUCKET_TOKENS, hidden, device=device, dtype=torch.bfloat16)
     dx = torch.zeros(1, hidden, device=device, dtype=torch.bfloat16)
 
     pre_graph = pre_out = dec_graph = None
     if capture:
         # Capture against a dummy request and hand its slot back, as
-        # `CudaGraphRunner` does with its `__cg_*` rows. Recording against a
+        # `AcceleratorGraphRunner` does with its `__cg_*` rows. Recording against a
         # real request would leave that request's first step looking like a
         # capture rather than a replay.
         dummy = "__cg_dummy__"

@@ -5,7 +5,7 @@ a few hundred mel frames. One Euler step launches several hundred kernels of
 a few microseconds each, so a solve (10 steps, guidance doubling the rows)
 is bound by kernel launches rather than by arithmetic, whatever the batch;
 the conformer encoder in front of it and the HiFT vocoder behind it have the
-same profile at chunk sizes. Capturing each stage as one CUDA graph per
+same profile at chunk sizes. Capturing each stage as one accelerator graph per
 input shape and replaying it removes that overhead.
 
 ``ShapeGraphs`` holds the mechanics: static input buffers per shape, capture

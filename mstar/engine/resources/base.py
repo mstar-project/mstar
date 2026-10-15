@@ -155,7 +155,7 @@ class Resource(ABC):
         return
 
     def ingest_capture_row(self, rid: str):
-        """Open a CUDA graph capture padding row; by default, as a request."""
+        """Open an accelerator graph capture padding row; by default, as a request."""
         self.ingest_request(rid, None)
 
     def remove_request(self, rid: str):
@@ -277,7 +277,7 @@ class Resource(ABC):
         return snapshot
 
     def reset_request(self, rid: str, free: bool=False):
-        """For clearing dummy RIDs during cuda graph capture"""
+        """For clearing dummy RIDs during accelerator graph capture"""
         return
 
     # Pre-planning
@@ -373,7 +373,7 @@ class Resource(ABC):
     def post_warmup_validate(self):
         """
         For, e.g., the KV cache to check that num_free_pages is identical
-        across TP ranks after cuda graph capture.
+        across TP ranks after accelerator graph capture.
 
         Raises an error (fails loudly) if invalid.
         """

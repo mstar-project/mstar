@@ -1526,7 +1526,7 @@ class Qwen3OmniModel(Model):
         # The vocoder is dominated by Conv1d/ConvTranspose1d at small channel
         # counts where cuDNN's default heuristic picks a sub-optimal algo.
         # benchmark=True autotunes per shape on the warm-up call, before
-        # CUDA-graph capture, so the chosen algo is baked into the graph.
+        # accelerator graph capture, so the chosen algo is baked into the graph.
         torch.backends.cudnn.benchmark = True
 
         code2wav_model = Qwen3OmniMoeCode2Wav(self.config.code2wav)

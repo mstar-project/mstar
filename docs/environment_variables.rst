@@ -60,7 +60,7 @@ Communication
        = base, ``conductor`` = base+1, ``worker_<rank>`` = base+100+rank).
    * - ``MSTAR_REQUIRE_ACCELERATOR_GRAPHS``
      - ``0``
-     - ``1`` makes a worker fail at startup when any CUDA graph bucket
+     - ``1`` makes a worker fail at startup when any accelerator graph bucket
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
@@ -316,7 +316,7 @@ Worker scheduling
        thread.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
-     - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
+     - The decode batch sizes a model captures as accelerator graphs (Qwen3.5 reads
        it; a model with its own ladder reads it the same way). A decode step
        runs at the smallest bucket that holds its rows, so the ladder bounds
        both the rows per step and the graph memory; narrow it (for example

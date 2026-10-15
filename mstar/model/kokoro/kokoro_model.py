@@ -83,7 +83,7 @@ class KokoroModel(Model):
         self.cache_dir = cache_dir
         self.local_dir = _resolve_snapshot(model_path_hf, cache_dir, METADATA_PATTERNS)
         self.config = KokoroModelConfig.from_pretrained(self.local_dir)
-        # Serving knobs (chunking targets, CUDA-graph buckets, batch caps) come
+        # Serving knobs (chunking targets, accelerator graph buckets, batch caps) come
         # from the deployment YAML's ``model_kwargs``; architecture fields stay
         # with the checkpoint.
         for name, value in config_overrides.items():

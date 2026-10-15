@@ -11,12 +11,12 @@
 #      - Maintains the Talker paged KV cache across 12 Hz decode steps.
 #      - Predicts codec group 0 with the Talker and groups 1-15 with the
 #        depth-wise CodePredictor.
-#      - Supports continuous batching and whole-forward decode CUDA Graphs
+#      - Supports continuous batching and whole-forward decode accelerator graphs
 #        (the CodePredictor depth loop is captured inside them), plus a
 #        piecewise graph covering that loop on eager paths like prefill.
 #   2. CodecSubmodule (STATELESS engine)
 #      - Receives buffered codec frames from the Talker partition.
-#      - Pads each window of the chunk ramp to its CUDA Graph capture bucket.
+#      - Pads each window of the chunk ramp to its accelerator graph capture bucket.
 #      - Runs the official speech-tokenizer decoder and trims overlap (and, for
 #        voice clones, the reference frames) before emitting 24 kHz PCM.
 #   3. RefEncoderSubmodule (no resources; Base voice clone only)
@@ -109,7 +109,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     # residual-code control flow, and recurrent routing in addition to the
     # transformer. It introduces graph breaks and showed no steady-state win
     # for this path. The whole decode forward (CodePredictor loop included) is
-    # still CUDA-graph captured.
+    # still accelerator graph captured.
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
@@ -159,7 +159,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     ) -> torch.Tensor:
         """Pack the input-carried minimum-length EOS flags for this batch.
 
-        CUDA Graph replay calls ``preprocess`` with capture-slot dummy request
+        accelerator graph replay calls ``preprocess`` with capture-slot dummy request
         ids, so looking up request state here would permanently observe a new
         request at frame zero. ``prepare_inputs`` runs with the real request and
         carries the dynamic flag as a tensor instead.
@@ -514,7 +514,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 torch.tensor(seq_lens, device=self.get_device()).cumsum(0) - 1
             )
 
-        # Materialize the persistent base mask before CUDA Graph capture. Only
+        # Materialize the persistent base mask before accelerator graph capture. Only
         # the per-request EOS flags need to cross the replay input boundary.
         self._get_suppress_mask()
         return {
@@ -571,7 +571,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         0; the CodePredictor's unrolled depth loop fills groups 1..N-1 through
         the ``code_predictor`` aux sampler. Both read their params from
         engine-owned static buffers, so this single path serves eager execution
-        and CUDA-graph capture alike (mirrors the Qwen3-Omni Talker).
+        and accelerator graph capture alike (mirrors the Qwen3-Omni Talker).
         """
         hidden = self.model(input_embeds, label="main")
         last_hidden = hidden.index_select(0, last_token_indices)
@@ -962,7 +962,7 @@ class CodecSubmodule(ARNodeSubmodule):
     Windows follow the model's ``ScheduledLeftContextChunkPolicy``: a ramp of
     small chunks, then ``chunk_frames`` new frames behind ``left_context_frames``
     of context (a voice clone's reference tail is the first window's context).
-    Each distinct window size is a CUDA-graph bucket; a shorter window is
+    Each distinct window size is an accelerator graph bucket; a shorter window is
     zero-padded up to the next bucket and trimmed after.
 
     The decoder's transformer needs the whole window, but the conv stack after
@@ -1054,7 +1054,7 @@ class CodecSubmodule(ARNodeSubmodule):
         Input arrives as ``[frames, code_groups]``. The official decoder wants
         ``[quantizers, frames]``; every request is padded to the smallest
         captured window that fits so the ramp's windows and the terminal tail
-        all replay CUDA graphs.
+        all replay accelerator graphs.
         """
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)

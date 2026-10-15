@@ -1098,7 +1098,7 @@ class AcceleratorGraphableSampler(BaseSampler):
     slot_idx_view: torch.Tensor | None = None
     ingraph_scatter: bool = False
 
-    # Set during graph capture, and used by the cuda graph runner to determine
+    # Set during graph capture, and used by the accelerator graph runner to determine
     # whether requests' seen token buffers should be synced post-replay
     applied_penalty_in_graph: bool = False
 
@@ -1183,7 +1183,7 @@ class Buffer:
     """Three-tier storage for one per-request scalar sampling parameter.
 
     - ``buf``     ``[max_bs]``   per-step tensor, sliced to ``padded_bs`` and read
-      by ``CudaGraphableSampler`` (its address must stay stable across replays).
+      by ``AcceleratorGraphableSampler`` (its address must stay stable across replays).
     - ``master``  ``[capacity]`` slot-indexed cache, one row per active request.
     """
     # ``[cg_slots, max_bs]``: one per-step row per double-buffer slot, so a
@@ -1387,7 +1387,7 @@ class SamplerBuffers:
     last_token: Buffer
 
     # TP communicator for the submodule that owns these buffers. Passed
-    # through ``slice_for_bs`` into every per-step ``CudaGraphableSampler``
+    # through ``slice_for_bs`` into every per-step ``AcceleratorGraphableSampler``
     # so its ``_broadcast_tokens`` aligns the sampled token across ranks.
     # Without this, ``sample`` would build a
     # sampler with ``tp_group=None``, the broadcast would silently no-op,

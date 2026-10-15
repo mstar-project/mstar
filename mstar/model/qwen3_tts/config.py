@@ -297,7 +297,7 @@ class Qwen3TTSCodecConfig:
 
         One pass per entry of ``lead_frames``: a stream that starts with that
         many context-only frames (a voice clone's reference tail). These are
-        the shapes the codec captures CUDA graphs for; any other window (a
+        the shapes the codec captures accelerator graphs for; any other window (a
         terminal flush, a shorter reference tail) pads up to the next one.
         """
         left = self.left_context_frames

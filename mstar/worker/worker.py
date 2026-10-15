@@ -3752,7 +3752,7 @@ class Worker:
                 )
 
         # Bound the load-time asymmetry between workers before any
-        # subgroup NCCL collective fires inside the per-bs CUDA-graph
+        # subgroup NCCL collective fires inside the per-bs accelerator graph
         # capture loop. Without this fence, a worker with a small model
         # (e.g. an 8B Talker) can finish loading, enter warmup, and hit
         # its first subgroup barrier while a worker with a 30B Thinker
@@ -3765,11 +3765,11 @@ class Worker:
         self.parallel_groups.barrier_all()
         self._verify_tp_async_sched_agrees()
 
-        # CUDA graph capture before entering the main loop
+        # accelerator graph capture before entering the main loop
         self.engine_manager.warmup_all()
 
         # Sync every worker before the main loop opens. Per-batch-size
-        # captures inside CudaGraphRunner are already barriered on the
+        # captures inside AcceleratorGraphRunner are already barriered on the
         # node-local TP group, but that doesn't bound the time between
         # ``warmup_and_capture`` returning and ``run()`` starting to
         # schedule. Without this fence, a TP leader can finish warmup
@@ -3792,7 +3792,7 @@ class Worker:
             "permanent generation", self.worker_id, gc.get_freeze_count(),
         )
 
-        # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
+        # Setup (weight load + warmup + accelerator graph capture) is complete. Tell
         # the conductor this worker is ready. The conductor blocks its main
         # loop until every worker reports in, so the API server only advertises
         # readiness once all workers can actually serve.

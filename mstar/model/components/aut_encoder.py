@@ -13,7 +13,7 @@ Windows are the attention's only structure, so the stack is packed varlen
 attention: every window is a segment, and any number of requests can be
 packed into one forward. On the engine it runs through the cacheless
 ``RaggedAttentionSpec`` resource, whose plan the runner builds outside the
-graph — which is what lets the block loop replay as a CUDA graph. Without a
+graph — which is what lets the block loop replay as an accelerator graph. Without a
 bound resource (CPU tests, standalone use) it falls back to SDPA per window.
 
 Parameter paths mirror HF's ``audio_tower.*`` (``Qwen3OmniMoeAudioEncoder``,

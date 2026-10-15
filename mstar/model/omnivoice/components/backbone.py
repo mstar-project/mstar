@@ -273,7 +273,7 @@ class OmniVoiceBackbone(nn.Module):
             self.model._fi_runner.plan(canvas.doc_lens, self.plan_dtype)
             fi._CTX["wrapper"] = self.model._fi_runner.wrapper
             fi._CTX["pos_ids"] = canvas.position_ids[0].to(torch.int32)
-            # CUDA-graph bucketing is not used here; M* has its own capture
+            # accelerator graph bucketing is not used here; M* has its own capture
             # machinery and reconciling the two is a separate piece of work.
             fi._CTX["doc_slots"] = None
             return fi._forward_logits(
