@@ -11,8 +11,9 @@ A deployment turns it on in its YAML ``model_kwargs``::
 The watermark is Meta's AudioSeal (MIT code and weights, ``pip install
 'mstar-ai[audioseal]'``): a 14.7M-parameter causal conv/LSTM generator whose
 output, the same length as its input, is added to the waveform. The matching
-detector gives a per-sample probability, so any clip of a few hundred ms is
-enough to check (``python -m mstar.model.audio_watermark detect out.wav``).
+detector gives a per-sample probability, so a part of the audio can be checked
+on its own; on Qwen3-TTS speech even a single 80 ms codec chunk is detected
+(``python -m mstar.model.audio_watermark detect out.wav``).
 
 Streaming. Audio leaves the engine in chunks, and a chunk-by-chunk watermark
 must equal the watermark of the whole utterance, or the boundaries click.

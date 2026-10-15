@@ -1476,7 +1476,7 @@ def test_qwen3_tts_codec_without_watermark_emits_the_same_bytes_through_the_engi
 def test_qwen3_tts_codec_watermark_streams_like_the_whole_utterance():
     """Two requests through the codec tail, chunk by chunk, against each
     request's offline watermark; the stream state goes with the request."""
-    from test.modular.test_audio_watermark import _speechlike, _watermarker
+    from test_audio_watermark import _speechlike, _watermarker
 
     watermarker = _watermarker(message=0xBEEF)
     submodule = CodecSubmodule(_FakeCodecDecoder(4), _tiny_model_config(), watermarker=watermarker)
