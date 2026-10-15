@@ -1,0 +1,515 @@
+"""VoxCPM2 model contract and two-partition streaming topology.
+
+VoxCPM2 (OpenBMB, Apache-2.0) is a tokenizer-free, diffusion-autoregressive
+TTS: a MiniCPM-4 base LM and a residual acoustic LM drive a local DiT that
+denoises one patch (4 frames, 160 ms) of continuous AudioVAE latents per
+step; the AudioVAE V2 decodes those latents straight to 48 kHz.
+
+Architecture (two asynchronous partitions):
+    Talker      - text (+ reference audio) prefill, then one latent patch per step
+    RefEncoder  - (voice cloning) AudioVAE encoder over the reference clip
+    VAEDecoder  - streamed latent windows -> 48 kHz PCM
+
+Streaming topology:
+    Talker --[latent_patches, ScheduledLeftContextChunkPolicy(schedule, chunk, ctx)]--> VAEDecoder
+
+``ctx`` covers the VAE decoder's causal receptive field, so streamed audio
+equals a whole decode of the same latents, sample for sample in count.
+
+Request modes (``process_prompt``), as the reference ``VoxCPM.generate``:
+    zero-shot      text only; voice design is a ``(description)`` text prefix
+    reference      ``ref_audio``: the clip isolated between ref tokens
+    continuation   ``ref_audio`` + ``ref_text``: reference prefix, then the
+                   transcript + clip that the model continues ("ultimate cloning")
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from mstar.communication.tensors import NameToTensorList
+from mstar.conductor.request_info import (
+    CurrentForwardConductorMetadata,
+    PartitionDefinition,
+    StreamingConnectionState,
+)
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    KVSpec,
+    NodeResourceSpec,
+    PagedKVConfig,
+    PositionConfig,
+    PositionSpec,
+)
+from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
+from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.voxcpm2.config import (
+    AUDIO_START_TOKEN,
+    BASE_ATTN,
+    BASE_KV,
+    BASE_POS,
+    MODE_REF_CONTINUATION,
+    MODE_REFERENCE,
+    MODE_ZERO_SHOT,
+    RES_ATTN,
+    RES_KV,
+    VoxCPM2Config,
+)
+from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
+from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+
+STREAM_EDGE = "latent_patches"
+# model_kwargs key: prompt patches leading a continuation's VAE stream
+STREAM_LEAD_KEY = "vae_stream_lead_patches"
+_CJK = re.compile(r"^[\u4e00-\u9fff]{2,}$")
+
+
+def _resolve_metadata(repo_id: str, cache_dir: str | None) -> str:
+    """Config + tokenizer only; workers fetch the weights in ``get_submodule``."""
+    if Path(repo_id).is_dir():
+        return repo_id
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(
+        repo_id=repo_id, cache_dir=cache_dir,
+        allow_patterns=["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"],
+    )
+
+
+def decoder_receptive_field_patches(config: VoxCPM2Config) -> int:
+    """Patches of left context a streamed window needs to equal a whole decode."""
+    from mstar.model.voxcpm2.components.audio_vae import CausalDecoder, decoder_receptive_field_frames
+
+    with torch.device("meta"):
+        decoder = CausalDecoder(config.audio_vae)
+    return math.ceil(decoder_receptive_field_frames(decoder) / config.patch_size)
+
+
+class VoxCPM2Model(Model):
+    """VoxCPM2 TTS: Talker + RefEncoder partition, streaming VAEDecoder partition.
+
+    Deployment knobs (YAML ``model_kwargs``):
+
+    * ``inference_timesteps`` (10): CFM steps per patch, fixed per server since
+      the decode graph is captured with it.
+    * ``stream_schedule`` ((1, 2, 4)), ``stream_chunk_patches`` (8): new patches
+      per VAE window, ramping up so the first audio leaves after one patch.
+    * ``stream_left_context_patches``: context per window; defaults to (and
+      may not be below) the decoder's receptive field.
+    """
+
+    MODES = {"zero_shot": MODE_ZERO_SHOT, "reference": MODE_REFERENCE, "continuation": MODE_REF_CONTINUATION}
+    REF_MIN_SECONDS = 0.5
+    REF_MAX_SECONDS = 60.0
+    PREFILL_INPUTS = ("text_inputs", "prompt_layout", "gen_params")
+    REF_ENCODER_INPUTS = ("audio_inputs", "prompt_layout")
+
+    def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any) -> None:
+        from transformers import LlamaTokenizerFast
+
+        self.model_path_hf = model_path_hf
+        self.cache_dir = cache_dir
+        self.local_dir = _resolve_metadata(model_path_hf, cache_dir)
+        self.config = VoxCPM2Config.from_pretrained(self.local_dir)
+        self.inference_timesteps = int(kwargs.get("inference_timesteps", self.config.inference_timesteps))
+        if self.inference_timesteps < 2:
+            # CFG-Zero* skips the first step, so one step would return the noise
+            raise ValueError("VoxCPM2 inference_timesteps must be at least 2")
+        self.stream_schedule = tuple(int(n) for n in kwargs.get("stream_schedule", (1, 2, 4)))
+        self.stream_chunk_patches = int(kwargs.get("stream_chunk_patches", 8))
+        needed = decoder_receptive_field_patches(self.config)
+        self.stream_left_context = int(kwargs.get("stream_left_context_patches", needed))
+        if self.stream_left_context < needed:
+            raise ValueError(
+                f"VoxCPM2 stream_left_context_patches={self.stream_left_context} is below the VAE "
+                f"decoder's {needed}-patch receptive field; streamed audio would differ from a whole decode"
+            )
+        if self.stream_chunk_patches <= 0 or any(n <= 0 for n in self.stream_schedule):
+            raise ValueError("VoxCPM2 stream chunk sizes must be positive")
+        if self.config.prompt_context_patches > self.stream_left_context:
+            raise ValueError("VoxCPM2 continuation lead exceeds the stream's left context")
+        # The reference tokenizer: the checkpoint's Llama tokenizer, with
+        # multi-character CJK tokens split into characters (``mask_multichar_chinese_tokens``).
+        self.tokenizer = LlamaTokenizerFast.from_pretrained(self.local_dir)
+        self._multichar_cjk = {tok for tok in self.tokenizer.get_vocab() if _CJK.match(tok)}
+        self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+
+    # -- tokenization -------------------------------------------------------
+
+    def tokenize(self, text: str) -> list[int]:
+        tokens = []
+        for token in self.tokenizer.tokenize(text):
+            clean = token.replace("\u2581", "")
+            tokens.extend(list(clean) if clean in self._multichar_cjk else [token])
+        return self.tokenizer.convert_tokens_to_ids(tokens)
+
+    # -- resources / graph --------------------------------------------------
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        def kv(stack) -> PagedKVConfig:
+            return PagedKVConfig(
+                num_layers=stack.num_hidden_layers,
+                num_kv_heads=stack.num_key_value_heads,
+                head_dim=stack.head_dim,
+                num_qo_heads=stack.num_attention_heads,
+                max_seq_len=self.config.max_length,
+                # 32k tokens: 64 requests of 500 tokens; about 1.2 GB for both LMs
+                max_num_pages=256,
+            )
+
+        nodes = {"Talker"}
+        return [
+            KVSpec(resource_key=BASE_KV, nodes=nodes, config=kv(self.config.lm)),
+            AttentionSpec(resource_key=BASE_ATTN, nodes=nodes, config=AttentionConfig(kv_cache=BASE_KV)),
+            # positions only: LongRoPE is applied from the model's own table
+            PositionSpec(resource_key=BASE_POS, nodes=nodes, config=PositionConfig(kv_cache=BASE_KV)),
+            KVSpec(resource_key=RES_KV, nodes=nodes, config=kv(self.config.residual)),
+            AttentionSpec(resource_key=RES_ATTN, nodes=nodes, config=AttentionConfig(kv_cache=RES_KV)),
+        ]
+
+    def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
+        def talker(input_names: list[str], loop: bool) -> GraphNode:
+            return GraphNode(
+                name="Talker",
+                input_names=input_names,
+                outputs=[
+                    GraphEdge(next_node="Talker", name="latent_patch") if loop else
+                    GraphEdge(next_node=EMPTY_DESTINATION, name="latent_patch", persist=True),
+                    StreamingGraphEdge(next_node="VAEDecoder", name=STREAM_EDGE, target_partition="VAEDecoder"),
+                ],
+            )
+
+        ref_encoder = GraphNode(
+            name="RefEncoder",
+            input_names=list(self.REF_ENCODER_INPUTS),
+            outputs=[GraphEdge(next_node="Talker", name="ref_patches")],
+        )
+        return {
+            "talker_prefill": talker(list(self.PREFILL_INPUTS), loop=False),
+            "talker_prefill_clone": Sequential([
+                ref_encoder, talker([*self.PREFILL_INPUTS, "ref_patches"], loop=False),
+            ]),
+            "talker_decode": Loop(
+                name="talker_decode_loop",
+                section=talker(["latent_patch"], loop=True),
+                max_iters=self.get_max_output_tokens(),
+                outputs=[],
+            ),
+            "vae_chunk": GraphNode(
+                name="VAEDecoder",
+                input_names=[STREAM_EDGE],
+                outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
+            ),
+        }
+
+    def get_partitions(self) -> list[PartitionDefinition]:
+        return [
+            PartitionDefinition(
+                name="Talker",
+                graph_walks={"talker_prefill", "talker_prefill_clone", "talker_decode"},
+                initial_walk="talker_prefill",
+                producer_partitions=[],
+            ),
+            PartitionDefinition(
+                name="VAEDecoder", graph_walks={"vae_chunk"}, initial_walk=None, producer_partitions=["Talker"],
+            ),
+        ]
+
+    def get_partition_topology(self) -> PartitionTopology:
+        schedule, chunk, context = self.stream_schedule, self.stream_chunk_patches, self.stream_left_context
+        return PartitionTopology(
+            partitions=["Talker", "VAEDecoder"],
+            connections=[Connection(
+                from_partition="Talker",
+                to_partition="VAEDecoder",
+                edge_name=STREAM_EDGE,
+                chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
+                    schedule=schedule, chunk=chunk, left_context=context,
+                ),
+            )],
+        )
+
+    # -- API preprocessing ----------------------------------------------------
+
+    def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
+        """A reference clip as 16 kHz mono float32, resampled as ``librosa.load`` does (soxr HQ)."""
+        import soundfile
+
+        rate = self.config.audio_vae.sample_rate
+        info = soundfile.info(filepath)
+        self._check_reference_seconds(info.frames / info.samplerate if info.samplerate else 0.0)
+        waveform, sample_rate = soundfile.read(filepath, dtype="float32", always_2d=True)
+        audio = waveform.mean(axis=1)
+        if sample_rate != rate:
+            import soxr
+
+            audio = soxr.resample(audio, sample_rate, rate, quality="HQ")
+        return TensorAndMetadata(
+            data=torch.from_numpy(audio).to(device), metadata={"sample_rate": rate, "num_channels": 1},
+        )
+
+    def _check_reference_seconds(self, seconds: float) -> None:
+        if not self.REF_MIN_SECONDS <= seconds <= self.REF_MAX_SECONDS:
+            raise ValueError(
+                f"VoxCPM2 reference clip is {seconds:.2f} s; it must be between "
+                f"{self.REF_MIN_SECONDS:g} and {self.REF_MAX_SECONDS:g} s"
+            )
+
+    @staticmethod
+    def _number(kwargs: dict, key: str, default, kind=float):
+        value = kwargs.get(key, default)
+        try:
+            value = kind(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"VoxCPM2 {key} must be a number, got {value!r}") from None
+        if not math.isfinite(value):
+            raise ValueError(f"VoxCPM2 {key} must be finite")
+        return value
+
+    def process_prompt(
+        self,
+        prompt: str | None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        tensors: NameToTensorList | None = None,
+        **kwargs: Any,
+    ) -> NameToTensorList | ProcessPromptOutput:
+        """Tokenize the request into ``text_inputs``, ``prompt_layout``
+        (``[mode, max_patches, min_len]``) and ``gen_params`` (``[cfg_value]``).
+
+        Voice design: ``instruct`` (or OpenAI's ``instructions``) becomes the
+        ``(description)`` prefix of the text, the reference's format.
+        """
+        text = re.sub(r"\s+", " ", (prompt or "").replace("\n", " ")).strip()
+        if not text:
+            raise ValueError("VoxCPM2 requires a non-empty text prompt")
+        if set(output_modalities) != {"audio"}:
+            raise ValueError("VoxCPM2 supports audio output only")
+        if "text" not in input_modalities or not set(input_modalities) <= {"text", "audio"}:
+            raise ValueError("VoxCPM2 takes text, plus at most one reference clip")
+        instruct = str(kwargs.get("instruct") or kwargs.get("instructions") or "").strip()
+        if instruct:
+            text = f"({instruct}){text}"
+        if "inference_timesteps" in kwargs and int(kwargs["inference_timesteps"]) != self.inference_timesteps:
+            raise ValueError(
+                f"VoxCPM2 serves inference_timesteps={self.inference_timesteps}; it is a deployment setting"
+            )
+        cfg_value = self._number(kwargs, "cfg_value", self.config.cfg_value)
+        if cfg_value < 0:
+            raise ValueError("VoxCPM2 cfg_value must be non-negative")
+        min_len = self._number(kwargs, "min_len", self.config.min_len, int)
+        max_len = self._number(
+            kwargs, "max_new_tokens", kwargs.get("max_len", self.config.max_len), int,
+        )
+        if min_len < 0 or not 1 <= max_len <= self.config.max_len:
+            raise ValueError(f"VoxCPM2 needs min_len >= 0 and 1 <= max_new_tokens <= {self.config.max_len}")
+
+        clips = (tensors or {}).get("audio_inputs", [])
+        ref_text = str(kwargs.get("ref_text") or "").strip()
+        if "audio" in input_modalities or clips:
+            if len(clips) != 1:
+                raise ValueError(f"VoxCPM2 clones a voice from exactly one reference clip, got {len(clips)}")
+            samples = int(clips[0].reshape(-1).shape[0])
+            self._check_reference_seconds(samples / self.config.audio_vae.sample_rate)
+            ref_patches = math.ceil(samples / self.config.ref_patch_samples)
+            mode = MODE_REF_CONTINUATION if ref_text else MODE_REFERENCE
+        else:
+            if ref_text:
+                raise ValueError("VoxCPM2 ref_text needs a ref_audio clip")
+            ref_patches = 0
+            mode = MODE_ZERO_SHOT
+
+        target_ids = self.tokenize(text)
+        ids = (self.tokenize(ref_text) if mode == MODE_REF_CONTINUATION else []) + target_ids
+        ids.append(AUDIO_START_TOKEN)
+        max_patches = self.config.max_patches(len(target_ids), max_len)
+        prompt_len = len(ids) + (ref_patches + 2 if mode != MODE_ZERO_SHOT else 0)
+        prompt_len += ref_patches if mode == MODE_REF_CONTINUATION else 0
+        if prompt_len + max_patches > self.config.max_length:
+            raise ValueError(
+                f"VoxCPM2 prompt of {prompt_len} positions plus up to {max_patches} patches exceeds "
+                f"the model's {self.config.max_length}-position context"
+            )
+        outputs = {
+            "text_inputs": [torch.tensor(ids, dtype=torch.long)],
+            "prompt_layout": [torch.tensor([mode, max_patches, min_len], dtype=torch.long)],
+            "gen_params": [torch.tensor([cfg_value], dtype=torch.float32)],
+        }
+        if mode == MODE_REF_CONTINUATION:
+            lead = min(self.config.prompt_context_patches, ref_patches)
+            return ProcessPromptOutput(outputs, {STREAM_LEAD_KEY: lead})
+        return outputs
+
+    # -- conductor state machine -------------------------------------------------
+
+    def get_initial_forward_pass_args(
+        self,
+        partition_name: str,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+        model_kwargs: dict | None = None,
+    ) -> ForwardPassArgs:
+        model_kwargs = model_kwargs or {}
+        if partition_name == "Talker":
+            clone = "audio" in input_modalities
+            walk = "talker_prefill_clone" if clone else "talker_prefill"
+            metadata = CurrentForwardConductorMetadata(
+                input_modalities=input_modalities, output_modalities=output_modalities,
+                graph_walk=walk, is_prefill=True,
+            )
+            routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
+            if clone:
+                routes += [(name, "RefEncoder") for name in self.REF_ENCODER_INPUTS]
+            inputs = []
+            for name, node in routes:
+                edge = GraphEdge(next_node=node, name=name)
+                edge.tensor_info = input_signals.get(name, [])
+                inputs.append(edge)
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=inputs,
+                unpersist_tensors=sum([edge.tensor_info for edge in inputs], start=[]),
+                request_done="audio" not in output_modalities,
+            )
+        if partition_name == "VAEDecoder":
+            lead = int(model_kwargs.get(STREAM_LEAD_KEY, 0))
+            return ForwardPassArgs(
+                full_metadata=CurrentForwardConductorMetadata(
+                    input_modalities=input_modalities, output_modalities=output_modalities,
+                    graph_walk="vae_chunk", is_prefill=False,
+                ),
+                inputs=[],
+                unpersist_tensors=[],
+                request_done="audio" not in output_modalities,
+                stream_lead_items={STREAM_EDGE: lead} if lead else {},
+            )
+        raise ValueError(f"Unknown VoxCPM2 partition: {partition_name!r}")
+
+    def get_partition_forward_pass_args(
+        self,
+        partition_name: str,
+        partition_metadata: CurrentForwardConductorMetadata,
+        persist_signals: dict[str, list[TensorPointerInfo]],
+        incoming_connections: list[StreamingConnectionState] | None = None,
+    ) -> ForwardPassArgs:
+        del incoming_connections
+        if partition_name == "Talker":
+            if partition_metadata.graph_walk in ("talker_prefill", "talker_prefill_clone"):
+                partition_metadata.graph_walk = "talker_decode"
+                partition_metadata.is_prefill = False
+                edge = GraphEdge(next_node="Talker", name="latent_patch")
+                edge.tensor_info = persist_signals.get("latent_patch", [])
+                return ForwardPassArgs(
+                    full_metadata=partition_metadata, inputs=[edge], unpersist_tensors=list(edge.tensor_info),
+                )
+            if partition_metadata.graph_walk == "talker_decode":
+                return ForwardPassArgs(
+                    full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True,
+                )
+            raise ValueError(f"Talker entered an unexpected graph walk: {partition_metadata.graph_walk!r}")
+        if partition_name == "VAEDecoder":
+            partition_metadata.graph_walk = "vae_chunk"
+            return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[])
+        raise ValueError(f"Unknown VoxCPM2 partition: {partition_name!r}")
+
+    # -- output ---------------------------------------------------------------------
+
+    def get_max_output_tokens(self, **model_kwargs: Any) -> int:
+        return int(model_kwargs.get("max_new_tokens", model_kwargs.get("max_len", self.config.max_len)))
+
+    def get_max_output_tokens_limit(self) -> int | None:
+        return self.config.max_len
+
+    def get_output_sample_rate(self, modality: str = "audio") -> int:
+        return self.config.output_sample_rate
+
+    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
+        """Raw little-endian PCM16 at 48 kHz."""
+        del request_kwargs
+        if modality != "audio":
+            raise ValueError(f"Unsupported VoxCPM2 output modality: {modality!r}")
+        if output.numel() == 0:
+            return b""
+        pcm = output.detach().cpu()
+        if pcm.is_floating_point():
+            pcm = (pcm.clamp(-1, 1) * 32767).to(torch.int16)
+        return pcm.contiguous().numpy().tobytes()
+
+    # -- worker-side construction ---------------------------------------------------
+
+    def _checkpoint_dir(self) -> str:
+        if (Path(self.local_dir) / "model.safetensors").is_file():
+            return self.local_dir
+        if Path(self.model_path_hf).is_dir():
+            raise FileNotFoundError(f"No model.safetensors in {self.model_path_hf}")
+        from huggingface_hub import snapshot_download
+
+        self.local_dir = snapshot_download(repo_id=self.model_path_hf, cache_dir=self.cache_dir)
+        return self.local_dir
+
+    def get_submodule(
+        self, node_name: str, device: str = "cpu", tp_group=None,
+        autocast_dtype: torch.dtype | None = None, sp_group=None,
+    ) -> NodeSubmodule | None:
+        del sp_group
+        if node_name not in ("Talker", "RefEncoder", "VAEDecoder"):
+            raise ValueError(f"Unknown VoxCPM2 node: {node_name!r}")
+        if node_name not in self._submodule_cache:
+            from mstar.model.voxcpm2 import submodules
+
+            checkpoint = self._checkpoint_dir()
+            if node_name == "Talker":
+                submodule = submodules.TalkerSubmodule(
+                    load_generator(self.config, checkpoint, device, autocast_dtype or torch.bfloat16, tp_group),
+                    self.config, self.inference_timesteps,
+                )
+            elif node_name == "RefEncoder":
+                submodule = submodules.RefEncoderSubmodule(load_audio_vae(self.config, checkpoint, device), self.config)
+            else:
+                submodule = submodules.VAEDecoderSubmodule(load_audio_vae(self.config, checkpoint, device), self.config)
+            self._submodule_cache[node_name] = submodule
+        return self._submodule_cache[node_name]
+
+
+def load_generator(config: VoxCPM2Config, checkpoint: str, device, dtype: torch.dtype, tp_group=None):
+    """Both LMs and the patch heads from ``model.safetensors``, every key accounted for."""
+    from mstar.model.loader.iterators import iter_safetensors_shards
+    from mstar.model.voxcpm2.components.talker import VoxCPM2Generator
+
+    with torch.device("meta"):
+        generator = VoxCPM2Generator(config, comm_group=tp_group)
+    generator = generator.to(dtype)
+    generator.to_empty(device=device)
+    loaded = generator.load_weights(iter_safetensors_shards(checkpoint, device=device))
+    missing = sorted(set(dict(generator.named_parameters())) - loaded)
+    if missing:
+        raise RuntimeError(f"VoxCPM2 checkpoint left {len(missing)} parameters unloaded, e.g. {missing[:5]}")
+    generator.materialize_buffers()
+    return generator.eval()
+
+
+def load_audio_vae(config: VoxCPM2Config, checkpoint: str, device):
+    """The fp32 AudioVAE from ``audiovae.safetensors`` / ``audiovae.pth``, weight norm folded."""
+    from mstar.model.voxcpm2.components.audio_vae import AudioVAE, fold_weight_norm
+
+    root = Path(checkpoint)
+    if (root / "audiovae.safetensors").is_file():
+        from safetensors.torch import load_file
+
+        state = load_file(str(root / "audiovae.safetensors"))
+    else:
+        state = torch.load(root / "audiovae.pth", map_location="cpu", weights_only=True)
+        state = state.get("state_dict", state)
+    vae = AudioVAE(config.audio_vae)
+    result = vae.load_state_dict(fold_weight_norm(state), strict=True)
+    del result
+    return vae.to(device=device, dtype=torch.float32).eval()

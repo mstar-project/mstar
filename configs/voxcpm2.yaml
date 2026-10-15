@@ -1,0 +1,14 @@
+# VoxCPM2 (openbmb/VoxCPM2): multilingual TTS at 48 kHz, voice design and cloning.
+# Talker (MiniCPM-4 base + residual LMs and the local DiT) and the RefEncoder
+# (AudioVAE encoder, cloning only) share a GPU with the streaming VAEDecoder.
+# The two LMs' KV (28 + 8 layers, 2 KV heads, head_dim 128) is about 36 KB per
+# position, so the default 256 pages of 128 positions take about 1.2 GB.
+model: "voxcpm2"
+max_seq_len: 8192
+node_groups:
+  - node_names: [RefEncoder, Talker]
+    ranks: [0]
+    graph_walks: [talker_prefill, talker_prefill_clone, talker_decode]
+  - node_names: [VAEDecoder]
+    ranks: [0]
+    graph_walks: [vae_chunk]

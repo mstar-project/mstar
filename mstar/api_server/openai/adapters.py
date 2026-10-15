@@ -662,6 +662,47 @@ class ChatterboxAdapter(OpenAIAdapter):
         )
 
 
+class VoxCPM2Adapter(OpenAIAdapter):
+    """VoxCPM2: multilingual TTS at 48 kHz, with voice design and cloning.
+
+    The mode follows from what the caller sends, as in the reference:
+    ``instructions`` (or ``instruct``) designs a voice from a description,
+    ``ref_audio`` clones one, and ``ref_audio`` + ``ref_text`` continues the
+    clip ("ultimate cloning"). ``ref_audio`` is a data URL or, when the server
+    allows remote media, an http(s) URL; paths on the server are refused.
+    ``voice`` is required by the OpenAI schema but VoxCPM2 has no named
+    voices, so it is dropped, as is ``speed``. ``seed`` fixes the diffusion
+    noise; ``cfg_value``, ``min_len`` and ``max_new_tokens`` (patches of
+    160 ms) pass through ``extra_body``.
+    """
+
+    supports_speech = True
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        instructions = mk.pop("instructions", None)
+        if instructions:
+            mk.setdefault("instruct", instructions)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+        file_paths = None
+        input_modalities = ["text"]
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            _refuse_server_path(ref_audio, upload_dir)
+            # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
+            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir, allow_remote=False)
+            file_paths = {"audio": [path]}
+            input_modalities = ["text", "audio"]
+        return SubmitArgs(
+            text=req.input,
+            file_paths=file_paths,
+            input_modalities=input_modalities,
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
 class Cosmos3Adapter(OpenAIAdapter):
     """NVIDIA Cosmos3: text-to-image and text/image-to-video generation.
 
@@ -1046,6 +1087,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "qwen3_tts_voicedesign": Qwen3TTSAdapter(),
     "qwen3_tts_base": Qwen3TTSAdapter(),
     "kokoro": KokoroAdapter(),
+    "voxcpm2": VoxCPM2Adapter(),
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),
     "cosmos3_edge": Cosmos3EdgeAdapter(),
