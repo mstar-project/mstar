@@ -33,11 +33,12 @@ import asyncio
 import base64
 from collections.abc import Callable
 
+import anyio
 from fastapi import HTTPException
 from fastapi.responses import Response
 
 from mstar.api_server import media_io
-from mstar.api_server.openai._util import release_unread, rid, sse
+from mstar.api_server.openai._util import error_type, release_unread, rid, sse
 from mstar.api_server.openai.protocol import VoiceCard, VoiceList
 from mstar.api_server.openai.speech_chunking import split_sentences
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
@@ -153,11 +154,11 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):
             body = _stream_pcm(api, submit, len(chunks), pending, first_iter, sample_rate,
                                with_wav_header=not raw_pcm, file_paths=args.file_paths)
             if stream_format == "sse":
-                return ReleasingStreamingResponse(
+                return _ClosingStreamingResponse(
                     _as_sse(body), release=release_unstarted,
                     media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
                 )
-            return ReleasingStreamingResponse(
+            return _ClosingStreamingResponse(
                 body, release=release_unstarted,
                 media_type="audio/pcm" if raw_pcm else "audio/wav", headers={"Cache-Control": "no-cache"},
             )
@@ -186,17 +187,38 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):
     return Response(content=audio_bytes, media_type=mime)
 
 
+class _ClosingStreamingResponse(ReleasingStreamingResponse):
+    """Closes its body iterator however the response ends. Starlette stops at
+    the failed or cancelled ``send`` when a client leaves mid-stream and leaves
+    the generator suspended at its ``yield``, so its release of the sentence
+    pieces still in flight would wait for garbage collection. A body that never
+    started is released by ``ReleasingStreamingResponse`` first, and closing it
+    afterwards runs nothing."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
+
+
 async def _as_sse(audio):
     """OpenAI's ``stream_format="sse"``: one ``speech.audio.delta`` per piece of
-    audio (base64, in ``response_format``), then ``speech.audio.done``."""
+    audio (base64, in ``response_format``), then ``speech.audio.done``. A failure
+    after the stream opened ends it with an ``error`` event instead of
+    ``speech.audio.done``: the 200 is already sent."""
     try:
         async for data in audio:
             yield sse({"type": "speech.audio.delta", "audio": base64.b64encode(data).decode("ascii")})
-        yield sse({"type": "speech.audio.done"})
+    except HTTPException as exc:
+        yield sse({"type": "error", "error": {
+            "message": str(exc.detail), "type": error_type(exc.status_code), "code": exc.status_code,
+        }})
+        return
     finally:
-        # A client that hangs up closes this generator only; closing ``audio``
-        # now runs its release of the pieces still in flight.
         await audio.aclose()
+    yield sse({"type": "speech.audio.done"})
 
 
 def _is_error(chunk) -> bool:
