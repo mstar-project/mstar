@@ -255,7 +255,8 @@ class RequestBridge:
             for i in range(1, max(1, int(req.n or 1))):
                 kwargs = dict(args.model_kwargs)
                 if seed is not None:
-                    kwargs["seed"] = int(seed) + i
+                    # an int64 seed wraps, as on the native route
+                    kwargs["seed"] = (int(seed) + i) % 2**63
                 submits.append(dataclasses.replace(args, model_kwargs=kwargs))
 
         rids = [self._submit(args, prefix="img") for args in submits]

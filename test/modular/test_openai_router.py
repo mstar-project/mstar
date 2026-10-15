@@ -125,6 +125,25 @@ def test_chat_text(client_and_stub):
     assert stub.last_submit["model_kwargs"]["max_output_tokens"] == 16
 
 
+@pytest.mark.parametrize("top_k", ["5", 5.0])
+def test_chat_extra_numeric_knob_is_coerced(client_and_stub, top_k):
+    from mstar.utils.generation_kwargs import normalize_generation_kwargs
+
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b"ok")]
+    submit = stub.submit_request
+    # the real submit_request normalizes; the stub only records
+    stub.submit_request = lambda **kw: submit(**{**kw, "model_kwargs": normalize_generation_kwargs(kw["model_kwargs"])})
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "bagel", "messages": [{"role": "user", "content": "hi"}], "top_k": top_k},
+    )
+    assert r.status_code == 200
+    got = stub.last_submit["model_kwargs"]["top_k"]
+    assert got == 5 and type(got) is int
+
+
 def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
@@ -139,7 +158,8 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
         },
     )
     assert r.status_code == 400
-    assert r.json()["error"]["type"] == "server_error"
+    # a refused input is the client's error, on every route
+    assert r.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_chat_audio_output(client_and_stub):
@@ -447,7 +467,9 @@ def test_images_edits_forwards_size(client_and_stub):
         data={"prompt": "make it neon", "size": "768x1024"},
     )
     assert resp.status_code == 200
-    assert stub.last_submit["model_kwargs"].get("size") == "768x1024"
+    # BAGEL reads width / height, so the adapter maps "WxH" onto them
+    mk = stub.last_submit["model_kwargs"]
+    assert (mk.get("width"), mk.get("height"), "size" in mk) == (768, 1024, False)
 
 
 def test_image_routes_report_validation_errors_as_400(client_and_stub):
@@ -467,6 +489,14 @@ def test_image_routes_report_validation_errors_as_400(client_and_stub):
         data={"prompt": "make it neon", "size": "big"},
     )
     assert resp.status_code == 400
+
+def test_images_n_below_one_is_400(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.submit_request = lambda **kw: pytest.fail("a refused n must not be submitted")
+    resp = client.post("/v1/images/generations", json={"model": "bagel", "prompt": "a cat", "n": 0})
+    assert resp.status_code == 400 and "n must be at least 1" in resp.json()["error"]["message"]
+
 
 def test_audio_voices_lists_model_voices(client_and_stub):
     client, stub = client_and_stub

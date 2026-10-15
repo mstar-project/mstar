@@ -17,13 +17,16 @@ async def create_images(api, model_name, adapter, req, raw_request=None):  # noq
     # diffusions instead). Seeded requests follow the reference seed contract:
     # image i uses seed + i, so image 0 is bit-identical to the same request
     # with n=1; unseeded requests draw independent per-request seeds.
-    n = max(1, int(getattr(req, "n", 1) or 1))
+    n = 1 if getattr(req, "n", None) is None else req.n
+    if n < 1:
+        raise ValueError(f"n must be at least 1; got {n}")
     seed = args.model_kwargs.get("seed")
     request_ids = []
     for i in range(n):
         model_kwargs = dict(args.model_kwargs)
         if seed is not None and i > 0:
-            model_kwargs["seed"] = int(seed) + i
+            # the conductor's seed is an int64: wrap as speech chunks do, never overflow
+            model_kwargs["seed"] = (int(seed) + i) % 2**63
         request_id = rid("img")
         api.submit_request(
             text=args.text,

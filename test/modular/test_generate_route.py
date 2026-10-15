@@ -42,3 +42,18 @@ def test_generate_does_not_mislabel_downstream_json_errors(monkeypatch):
 
     assert response.status_code == 500
     assert response.json()["detail"].startswith("downstream failure")
+
+
+def test_generate_returns_400_for_a_refused_request(monkeypatch):
+    """submit_request refuses bad input with a ValueError (a bad seed, an
+    unsupported modality); that is the client's fault, not a 500."""
+    class RefusingServer:
+        def submit_request(self, **kwargs):
+            raise ValueError("seed must fit in a signed 64-bit integer, got 18446744073709551616.")
+
+    monkeypatch.setattr(entrypoint, "api_server", RefusingServer())
+
+    response = TestClient(entrypoint.app).post("/generate")
+
+    assert response.status_code == 400
+    assert "64-bit" in response.json()["detail"]

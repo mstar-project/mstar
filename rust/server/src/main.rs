@@ -250,21 +250,17 @@ fn detail_error(status: u16, message: &str) -> Response {
     (code, Json(json!({"detail": message}))).into_response()
 }
 
-/// Turn a `Json` extractor rejection into FastAPI + pydantic's `422` +
-/// `{"detail": [{"loc", "msg", "type"}]}` shape, instead of axum's default
-/// `400` + `text/plain`, so a malformed/invalid body looks the same as the
-/// Python frontend's validation error. Handlers take
+/// Turn a `Json` extractor rejection into the Python frontend's answer to a
+/// schema-invalid body: `400` in the OpenAI envelope, like every other refused
+/// input (axum's default is `400` + `text/plain`). Handlers take
 /// `Result<Json<T>, JsonRejection>` and route the error through here.
-fn json_422(rej: JsonRejection) -> Response {
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        Json(json!({"detail": [{
-            "loc": ["body"],
-            "msg": rej.body_text(),
-            "type": "value_error",
-        }]})),
-    )
-        .into_response()
+fn json_400(rej: JsonRejection) -> Response {
+    error(400, &rej.body_text(), "invalid_request_error")
+}
+
+/// The OpenAI error `type` for a status: a 4xx is the client's, the rest ours.
+fn error_type(status: u16) -> &'static str {
+    if (400..500).contains(&status) { "invalid_request_error" } else { "server_error" }
 }
 
 /// Parse a form-field boolean the way FastAPI's `bool = Form(...)` does (pydantic
@@ -334,7 +330,7 @@ fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
 /// An SSE data event carrying an OpenAI error envelope (terminal mid-stream).
 fn sse_error_event(status: u16, msg: &str) -> Event {
     Event::default().data(
-        json!({"error": {"message": msg, "type": "server_error", "code": status}}).to_string(),
+        json!({"error": {"message": msg, "type": error_type(status), "code": status}}).to_string(),
     )
 }
 
@@ -369,7 +365,7 @@ async fn chat_completions(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Chat) {
         Ok(a) => a,
@@ -397,7 +393,7 @@ async fn chat_completions(
             &st.model_name, &request_id, chunks, st.sample_rate,
         ))
         .into_response(),
-        Err((status, msg)) => error(status, &msg, "server_error"),
+        Err((status, msg)) => error(status, &msg, error_type(status)),
     }
 }
 
@@ -537,7 +533,7 @@ async fn audio_speech(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Speech) {
         Ok(a) => a,
@@ -566,23 +562,31 @@ async fn audio_speech(
     }
 
     if req.stream.unwrap_or(false) {
-        // Open-ended WAV: streaming header, then PCM16 frames as they arrive.
-        // A backend error ends the byte stream (the connection closes
-        // mid-WAV, matching mstar's generator exception).
-        let header = media::wav_stream_header(st.sample_rate, 1);
-        let base = result_stream(&st, &args, &request_id, true);
-        let audio_only = base.filter_map(|item| async move {
+        // Look at the first item before committing to a 200, as the Python
+        // frontend does: a refused request (bad voice, bad knob) gets its status.
+        let mut base = result_stream(&st, &args, &request_id, true);
+        let first = match base.next().await {
+            Some(Out::Error { status, message }) => {
+                return error(status, &message, error_type(status))
+            }
+            first => first,
+        };
+        // Open-ended WAV (a streaming header, then PCM16 frames), or bare PCM.
+        // A later error aborts the body: the status is already sent, and a
+        // cleanly ended stream would pass for a complete answer.
+        let audio = futures::stream::iter(first).chain(base).filter_map(|item| async move {
             match item {
                 Out::Chunk(c) if c.modality == "audio" && !c.data.is_empty() => {
-                    Some(Ok::<Bytes, Infallible>(Bytes::from(c.data)))
+                    Some(Ok(Bytes::from(c.data)))
                 }
-                _ => None,
+                Out::Chunk(_) => None,
+                Out::Error { message, .. } => Some(Err(std::io::Error::other(message))),
             }
         });
-        let body = futures::stream::once(async move { Ok::<Bytes, Infallible>(Bytes::from(header)) })
-            .chain(audio_only);
+        let header = (fmt == "wav").then(|| Ok(Bytes::from(media::wav_stream_header(st.sample_rate, 1))));
+        let body = futures::stream::iter(header).chain(audio);
         return Response::builder()
-            .header("content-type", "audio/wav")
+            .header("content-type", if fmt == "wav" { "audio/wav" } else { "audio/pcm" })
             .header("cache-control", "no-cache")
             .body(Body::from_stream(body))
             .unwrap();
@@ -590,7 +594,7 @@ async fn audio_speech(
 
     let chunks = match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => chunks,
-        Err((status, msg)) => return error(status, &msg, "server_error"),
+        Err((status, msg)) => return error(status, &msg, error_type(status)),
     };
     let mut pcm: Vec<u8> = Vec::new();
     for c in &chunks {
@@ -613,7 +617,7 @@ async fn images_generations(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Images) {
         Ok(a) => a,
@@ -627,7 +631,10 @@ async fn images_generations(
     // matching serving_images.create_images. Seeded requests follow the seed
     // contract — image i uses seed + i (i > 0), so image 0 is bit-identical to
     // the same request with n=1; unseeded requests draw independent seeds.
-    let n = req.n.unwrap_or(1).max(1);
+    let n = req.n.unwrap_or(1);
+    if n < 1 {
+        return error(400, &format!("n must be at least 1; got {n}"), "invalid_request_error");
+    }
     let seed = base.model_kwargs.get("seed").and_then(Value::as_i64);
     let futs = (0..n).map(|i| {
         let mut args = base.clone();
@@ -644,7 +651,7 @@ async fn images_generations(
     for r in futures::future::join_all(futs).await {
         match r {
             Ok(chunks) => all.extend(chunks),
-            Err((status, msg)) => return error(status, &msg, "server_error"),
+            Err((status, msg)) => return error(status, &msg, error_type(status)),
         }
     }
     Json(images_response(all)).into_response()
@@ -658,7 +665,7 @@ async fn videos_generations(
 ) -> Response {
     let Json(req) = match payload {
         Ok(j) => j,
-        Err(e) => return json_422(e),
+        Err(e) => return json_400(e),
     };
     let adapter = match resolve(&st, Surface::Videos) {
         Ok(a) => a,
@@ -672,7 +679,7 @@ async fn videos_generations(
     let request_id = rid("vid");
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(videos_response(chunks)).into_response(),
-        Err((status, msg)) => error(status, &msg, "server_error"),
+        Err((status, msg)) => error(status, &msg, error_type(status)),
     }
 }
 
@@ -683,7 +690,8 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     };
     // Multipart (image file + prompt + passthrough fields), parsed manually so
     // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
-    let known = ["image", "prompt", "model", "n", "size", "response_format"];
+    // `size` is kept: the adapter maps "WxH" onto the model's width / height
+    let known = ["image", "prompt", "model", "n", "response_format"];
     let mut image_bytes: Option<Vec<u8>> = None;
     let mut image_filename: Option<String> = None;
     let mut prompt = String::new();
@@ -752,7 +760,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     let request_id = rid("img");
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(images_response(chunks)).into_response(),
-        Err((status, msg)) => error(status, &msg, "server_error"),
+        Err((status, msg)) => error(status, &msg, error_type(status)),
     }
 }
 
@@ -1000,12 +1008,20 @@ async fn generate_finish(
 
     schedule_upload_cleanup(&st.upload_dir, &args);
     if streaming {
-        let base = result_stream(&st, &args, &request_id, true);
-        let body = base.map(|item| {
+        let mut base = result_stream(&st, &args, &request_id, true);
+        // Wait for the first item, as the Python frontend's open_result_stream
+        // does: a refused request gets its real status, not a 200. A client
+        // that leaves meanwhile drops this future, and the stream's guard aborts.
+        let first = match base.next().await {
+            Some(Out::Error { status, message }) => return detail_error(status, &message),
+            first => first,
+        };
+        let body = futures::stream::iter(first).chain(base).map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),
-                Out::Error { message, .. } => {
-                    let mut s = json!({"error": message}).to_string();
+                // after the 200 is committed the status travels in-band
+                Out::Error { status, message } => {
+                    let mut s = json!({"error": message, "status": status}).to_string();
                     s.push('\n');
                     s.into_bytes()
                 }

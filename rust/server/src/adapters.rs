@@ -183,6 +183,24 @@ fn set_default(mk: &mut Map<String, Value>, key: &str, value: Value) {
     }
 }
 
+/// OpenAI `size` ("WxH") onto the model's `width` / `height`, as the Python
+/// adapters' `_size_kwargs`.
+fn size_kwargs(mk: &mut Map<String, Value>, size: Option<&str>) -> Result<(), String> {
+    let Some(size) = size.filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let parsed = size
+        .to_lowercase()
+        .split_once('x')
+        .and_then(|(w, h)| Some((w.trim().parse::<i64>().ok()?, h.trim().parse::<i64>().ok()?)));
+    let Some((width, height)) = parsed else {
+        return Err(format!("size must be 'WxH' (e.g. '1024x1024'); got {size:?}"));
+    };
+    set_default(mk, "width", Value::from(width));
+    set_default(mk, "height", Value::from(height));
+    Ok(())
+}
+
 /// The OpenAI-standard sampling fields → a model's `model_kwargs` keys.
 struct Sampling<'a> {
     temperature: Option<f64>,
@@ -410,6 +428,7 @@ impl Adapter {
         match self {
             Adapter::Bagel => {
                 let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+                size_kwargs(&mut mk, req.size.as_deref())?;
                 if let Some(seed) = req.seed {
                     set_default(&mut mk, "seed", Value::from(seed));
                 }
@@ -523,6 +542,12 @@ impl Adapter {
     ) -> Result<SubmitArgs, String> {
         match self {
             Adapter::Bagel => {
+                let mut extra_kwargs = extra_kwargs;
+                // a form field that parsed as JSON (e.g. "512") is still the size text
+                let size = extra_kwargs
+                    .remove("size")
+                    .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
+                size_kwargs(&mut extra_kwargs, size.as_deref())?;
                 let mut file_paths = BTreeMap::new();
                 file_paths.insert("image".to_string(), vec![image_path.to_string()]);
                 Ok(SubmitArgs {
