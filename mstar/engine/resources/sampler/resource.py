@@ -678,6 +678,12 @@ class SamplerResource(Resource):
                 apply_penalty=self._apply_penalty_this_step,
                 apply_filters=self._apply_filters_this_step,
             )
+        return self._sample_eager(request_ids, logits)
+
+    # Kept out of dynamo: the eager sampler looks up each row's config by request
+    # id, so a traced call guards on the ids and every new batch recompiles it.
+    @torch.compiler.disable
+    def _sample_eager(self, request_ids: list[str], logits: torch.Tensor) -> torch.Tensor:
         bufs = self._cg_buffers
         by_slot = bufs is not None and all(bufs.has_slot(rid) for rid in request_ids)
         slots = offsets = None
