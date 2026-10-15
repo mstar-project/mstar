@@ -305,8 +305,11 @@ class AudioSealWatermarker:
         lstm_from = self._lstm_offset
         out: list[list[torch.Tensor]] = [[] for _ in range(batch)]
         for i, tensor in enumerate(caches):
-            for b, part in enumerate(tensor.split(1, dim=1 if i >= lstm_from else 0)):
-                out[b].append(part)
+            lstm = i >= lstm_from
+            for b, part in enumerate(tensor.split(1, dim=1 if lstm else 0)):
+                # cuDNN's LSTM refuses a non-contiguous hx, which a batch-dim
+                # slice of [layers, batch, hidden] is, once the stream runs alone
+                out[b].append(part.contiguous() if lstm else part)
         return out
 
     # -- watermarking -------------------------------------------------------

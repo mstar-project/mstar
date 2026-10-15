@@ -237,6 +237,16 @@ def test_streams_batch_without_mixing():
         torch.testing.assert_close(torch.cat(out[k]), _library_offline(wmk, audio), atol=1e-5, rtol=0)
 
 
+def test_streams_leave_a_batch_with_contiguous_caches():
+    """A stream that ran in a batch can run alone next: cuDNN's LSTM (CUDA
+    only) refuses the non-contiguous hx a batch-dim slice would be."""
+    wmk = _watermarker()
+    streams = [WatermarkStream() for _ in range(3)]
+    wmk.apply([_speechlike(640, seed=s) for s in range(3)], streams)
+    for stream in streams:
+        assert all(cache.is_contiguous() for cache in stream.caches)
+
+
 def test_pcm16_round_trip_matches_offline_within_one_step():
     wmk = _watermarker()
     audio = _speechlike(1920, seed=6)
