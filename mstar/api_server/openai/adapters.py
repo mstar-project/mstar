@@ -710,11 +710,11 @@ class VoxCPM2Adapter(OpenAIAdapter):
         if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
             # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
             return media_io.resolve_media_ref(ref, upload_dir, allow_remote=False)[1]
-        import soundfile
-
         path = None
         try:
             _, path = media_io.save_base64(ref, "wav", "audio", upload_dir)
+            import soundfile
+
             soundfile.info(path)
             return path
         except Exception:  # noqa: BLE001 — not base64 audio the model can load

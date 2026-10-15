@@ -287,8 +287,8 @@ def test_postprocess_encodes_pcm16(model):
 
 
 def test_load_audio_resamples_to_16k_and_bounds_duration(model, tmp_path):
-    import soundfile
-
+    soundfile = pytest.importorskip("soundfile")
+    pytest.importorskip("soxr")
     path = tmp_path / "clip.wav"
     soundfile.write(path, torch.zeros(44100).numpy(), 44100)
     loaded = model.load_audio(str(path), "cpu")
@@ -528,11 +528,7 @@ def test_adapter_maps_voice_design_and_cloning(tmp_path):
     assert sa.input_modalities == ["text"] and sa.output_modalities == ["audio"]
     assert sa.model_kwargs == {"instruct": "a calm voice", "seed": 7, "cfg_value": 2.5}
 
-    wav = io.BytesIO()
-    import soundfile
-
-    soundfile.write(wav, torch.zeros(16000).numpy(), 16000, format="WAV")
-    data_url = "data:audio/wav;base64," + base64.b64encode(wav.getvalue()).decode()
+    data_url = "data:audio/wav;base64," + base64.b64encode(_wav_bytes()).decode()
     clone = adapter.speech_to_request(
         SpeechRequest(model="voxcpm2", input="hi", ref_audio=data_url, ref_text="words"), tmp_path,
     )
@@ -541,11 +537,16 @@ def test_adapter_maps_voice_design_and_cloning(tmp_path):
 
 
 def _wav_bytes() -> bytes:
-    import soundfile
+    """One second of 16 kHz silence, written with the standard library."""
+    import wave
 
-    wav = io.BytesIO()
-    soundfile.write(wav, torch.zeros(16000).numpy(), 16000, format="WAV")
-    return wav.getvalue()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(bytes(32000))
+    return buf.getvalue()
 
 
 @pytest.fixture
@@ -577,16 +578,25 @@ def test_adapter_refuses_every_server_path(media_dirs, ref):
     assert sorted(uploads.iterdir()) == before
 
 
-def test_adapter_takes_data_urls_bare_base64_and_gated_urls(media_dirs, monkeypatch):
+def _stored_reference(uploads: Path, ref: str) -> Path:
+    request = SpeechRequest(model="voxcpm2", input="hi", ref_audio=ref)
+    args = adapters.VoxCPM2Adapter().speech_to_request(request, uploads)
+    (path,) = args.file_paths["audio"]
+    assert Path(path).parent == uploads and Path(path).read_bytes() == _wav_bytes()
+    return Path(path)
+
+
+def test_adapter_takes_bare_base64_that_soundfile_opens(media_dirs):
+    pytest.importorskip("soundfile")
+    _stored_reference(media_dirs[0], base64.b64encode(_wav_bytes()).decode())
+
+
+def test_adapter_takes_data_urls_and_gated_urls(media_dirs, monkeypatch):
     from mstar.api_server import media_io
 
     uploads, _ = media_dirs
     adapter = adapters.VoxCPM2Adapter()
-    payload = base64.b64encode(_wav_bytes()).decode()
-    for ref in (payload, "data:audio/wav;base64," + payload):
-        args = adapter.speech_to_request(SpeechRequest(model="voxcpm2", input="hi", ref_audio=ref), uploads)
-        (path,) = args.file_paths["audio"]
-        assert Path(path).parent == uploads and Path(path).read_bytes() == _wav_bytes()
+    _stored_reference(uploads, "data:audio/wav;base64," + base64.b64encode(_wav_bytes()).decode())
     url = SpeechRequest(model="voxcpm2", input="hi", ref_audio="https://example.com/voice.wav")
     monkeypatch.delenv("MSTAR_ALLOW_REMOTE", raising=False)
     with pytest.raises(ValueError, match="Remote media fetch is disabled"):
