@@ -23,7 +23,7 @@ from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.submodule_base import InputMetadata
-from mstar.model.voxcpm2.components.audio_vae import AudioVAE, decoder_receptive_field_frames
+from mstar.model.voxcpm2.components.audio_vae import AudioVAE, CausalResidualUnit, decoder_receptive_field_frames
 from mstar.model.voxcpm2.components.talker import VoxCPM2Generator
 from mstar.model.voxcpm2.config import (
     AUDIO_START_TOKEN,
@@ -116,9 +116,12 @@ def _random_generator(config: VoxCPM2Config, seed: int = 0) -> VoxCPM2Generator:
     return generator.eval()
 
 
-def _random_vae(config: VoxCPM2Config, seed: int = 0) -> AudioVAE:
+def _random_vae(config: VoxCPM2Config, seed: int = 0, residual_gain: float = 0.1) -> AudioVAE:
     """Random weights scaled like a trained decoder's (unit-gain convs, Snake
-    alphas near 1), so fp32 rounding stays at rounding size through 30 layers."""
+    alphas near 1, quiet residual branches), so the output stays off the final
+    tanh's rails and sample equality is not met trivially by saturation. At
+    ``residual_gain`` 0.1 the farthest frames' influence is below float64
+    rounding; the receptive-field bound needs full-strength branches."""
     torch.manual_seed(seed)
     vae = AudioVAE(config.audio_vae)
     with torch.no_grad():
@@ -131,7 +134,14 @@ def _random_vae(config: VoxCPM2Config, seed: int = 0) -> AudioVAE:
                 param.normal_(0, 1 / math.sqrt(param.shape[1] * param.shape[2]))
             else:
                 param.normal_(0, 0.05)
+        for module in vae.modules():
+            if isinstance(module, CausalResidualUnit):
+                module.block[3].weight.mul_(residual_gain)
     return vae.eval()
+
+
+def _assert_unsaturated(audio: torch.Tensor) -> None:
+    assert (audio.abs() > 0.99).double().mean() < 0.02 and audio.std() > 0.1
 
 
 # -- contract --------------------------------------------------------------------
@@ -185,7 +195,7 @@ def test_receptive_field_bound_is_exact():
     """Perturbing latent frame k changes the audio of frames k .. k + rf and
     nothing later: the derived context is enough, and none of it is spare."""
     config = VoxCPM2Config.from_dict(TINY)
-    vae = _random_vae(config).double()
+    vae = _random_vae(config, residual_gain=1.0).double()
     rf = decoder_receptive_field_frames(vae.decoder)
     frames = 5 + rf + 6
     z = torch.randn(1, config.feat_dim, frames, dtype=torch.float64)
@@ -449,10 +459,26 @@ def test_streamed_audio_equals_a_whole_decode(model, num_patches):
         chunks = _stream_through(vae_node, patches, policy)
         whole = vae_node.vae.decode(patches.reshape(-1, config.feat_dim).t().unsqueeze(0))[0]
     streamed = torch.cat(chunks)
+    _assert_unsaturated(whole)
     assert streamed.numel() == whole.numel() == num_patches * config.patch_samples
     assert torch.equal(streamed, whole)   # float64: the windows reproduce it exactly
     # the first audio leaves after one patch
     assert chunks[0].numel() == config.patch_samples
+
+
+def test_stream_context_below_the_receptive_field_changes_the_audio(model):
+    config = model.config
+    vae_node = VAEDecoderSubmodule(_random_vae(config, residual_gain=1.0).double(), config)
+    torch.manual_seed(0)
+    # long enough that later windows start past patch 0 and the short context bites
+    patches = torch.randn(model.stream_left_context + 10, config.patch_size, config.feat_dim, dtype=torch.float64)
+    short = ScheduledLeftContextChunkPolicy(schedule=(1, 2, 4), chunk=8, left_context=model.stream_left_context - 1)
+    with torch.no_grad():
+        streamed = torch.cat(_stream_through(vae_node, patches, short))
+        whole = vae_node.vae.decode(patches.reshape(-1, config.feat_dim).t().unsqueeze(0))[0]
+    assert streamed.numel() == whole.numel()
+    # float64 windows with the full context are bit-exact, so any difference is the missing context
+    assert not torch.equal(streamed, whole)
 
 
 def test_streamed_continuation_skips_the_prompt_lead(model):
@@ -466,6 +492,7 @@ def test_streamed_continuation_skips_the_prompt_lead(model):
     with torch.no_grad():
         streamed = torch.cat(_stream_through(vae_node, patches, policy, lead=lead))
         whole = vae_node.vae.decode(torch.cat([lead, patches]).reshape(-1, 8).t().unsqueeze(0))[0]
+    _assert_unsaturated(whole)
     assert torch.equal(streamed, whole[3 * config.patch_samples:])
 
 
@@ -486,6 +513,7 @@ def test_vae_batches_windows_of_different_widths(model):
         for rid, (w, ctx) in windows.items():
             vae_node.postprocess(rid, None, out[rid], inputs=prepared[rid])
             alone = vae_node.vae.decode(w.reshape(-1, 8).t().unsqueeze(0))[0][ctx * config.patch_samples:]
+            _assert_unsaturated(alone)
             assert torch.equal(out[rid]["audio_chunk"][0], alone)
 
 
@@ -512,8 +540,59 @@ def test_adapter_maps_voice_design_and_cloning(tmp_path):
     assert Path(clone.file_paths["audio"][0]).is_file() and clone.model_kwargs["ref_text"] == "words"
 
 
-def test_adapter_refuses_server_paths(tmp_path):
-    with pytest.raises(ValueError, match="paths on the server are refused"):
+def _wav_bytes() -> bytes:
+    import soundfile
+
+    wav = io.BytesIO()
+    soundfile.write(wav, torch.zeros(16000).numpy(), 16000, format="WAV")
+    return wav.getvalue()
+
+
+@pytest.fixture
+def media_dirs(tmp_path):
+    """An upload dir holding a stored clip, and a server-only clip beside it (#411)."""
+    uploads, secret = tmp_path / "uploads", tmp_path / "secret"
+    uploads.mkdir()
+    secret.mkdir()
+    (uploads / "stored.wav").write_bytes(_wav_bytes())
+    (secret / "voice.wav").write_bytes(_wav_bytes())
+    (uploads / "link.wav").symlink_to(secret / "voice.wav")
+    return uploads, secret
+
+
+@pytest.mark.parametrize("ref", [
+    "{secret}/voice.wav", "{uploads}/stored.wav", "{uploads}/link.wav", "{uploads}/../secret/voice.wav",
+    "secret/voice.wav", "file://{secret}/voice.wav", "{secret}/missing.wav", "/etc/passwd", "//etc/passwd",
+    "secret", "ftp://example.com/voice.wav",
+])
+def test_adapter_refuses_every_server_path(media_dirs, ref):
+    """#411: no plain path, not even a stored upload, and every refusal reads the same."""
+    uploads, secret = media_dirs
+    before = sorted(uploads.iterdir())
+    with pytest.raises(ValueError, match="^server file paths are refused"):
         adapters.VoxCPM2Adapter().speech_to_request(
-            SpeechRequest(model="voxcpm2", input="hi", ref_audio="/etc/passwd"), tmp_path,
+            SpeechRequest(model="voxcpm2", input="hi", ref_audio=ref.format(uploads=uploads, secret=secret)),
+            uploads,
         )
+    assert sorted(uploads.iterdir()) == before
+
+
+def test_adapter_takes_data_urls_bare_base64_and_gated_urls(media_dirs, monkeypatch):
+    from mstar.api_server import media_io
+
+    uploads, _ = media_dirs
+    adapter = adapters.VoxCPM2Adapter()
+    payload = base64.b64encode(_wav_bytes()).decode()
+    for ref in (payload, "data:audio/wav;base64," + payload):
+        args = adapter.speech_to_request(SpeechRequest(model="voxcpm2", input="hi", ref_audio=ref), uploads)
+        (path,) = args.file_paths["audio"]
+        assert Path(path).parent == uploads and Path(path).read_bytes() == _wav_bytes()
+    url = SpeechRequest(model="voxcpm2", input="hi", ref_audio="https://example.com/voice.wav")
+    monkeypatch.delenv("MSTAR_ALLOW_REMOTE", raising=False)
+    with pytest.raises(ValueError, match="Remote media fetch is disabled"):
+        adapter.speech_to_request(url, uploads)
+    monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
+    monkeypatch.setattr(media_io, "save_remote_url", lambda ref, upload_dir: ("audio", str(upload_dir / "fetched.wav")))
+    assert adapter.speech_to_request(url, uploads).file_paths == {"audio": [str(uploads / "fetched.wav")]}
+    with pytest.raises(ValueError, match="base64 string"):
+        adapter.speech_to_request(SpeechRequest(model="voxcpm2", input="hi", ref_audio=["x"]), uploads)

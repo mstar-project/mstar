@@ -668,12 +668,13 @@ class VoxCPM2Adapter(OpenAIAdapter):
     The mode follows from what the caller sends, as in the reference:
     ``instructions`` (or ``instruct``) designs a voice from a description,
     ``ref_audio`` clones one, and ``ref_audio`` + ``ref_text`` continues the
-    clip ("ultimate cloning"). ``ref_audio`` is a data URL or, when the server
-    allows remote media, an http(s) URL; paths on the server are refused.
-    ``voice`` is required by the OpenAI schema but VoxCPM2 has no named
-    voices, so it is dropped, as is ``speed``. ``seed`` fixes the diffusion
-    noise; ``cfg_value``, ``min_len`` and ``max_new_tokens`` (patches of
-    160 ms) pass through ``extra_body``.
+    clip ("ultimate cloning"). ``ref_audio`` is a data URL, bare base64 audio
+    that soundfile (the model's loader) opens, or, when the server allows
+    remote media, an http(s) URL. A request cannot name a file on the server,
+    not even one under ``upload_dir``. ``voice`` is required by the OpenAI
+    schema but VoxCPM2 has no named voices, so it is dropped, as is ``speed``.
+    ``seed`` fixes the diffusion noise; ``cfg_value``, ``min_len`` and
+    ``max_new_tokens`` (patches of 160 ms) pass through ``extra_body``.
     """
 
     supports_speech = True
@@ -689,10 +690,7 @@ class VoxCPM2Adapter(OpenAIAdapter):
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            _refuse_server_path(ref_audio, upload_dir)
-            # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
-            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir, allow_remote=False)
-            file_paths = {"audio": [path]}
+            file_paths = {"audio": [self._reference_clip(ref_audio, upload_dir)]}
             input_modalities = ["text", "audio"]
         return SubmitArgs(
             text=req.input,
@@ -700,6 +698,31 @@ class VoxCPM2Adapter(OpenAIAdapter):
             input_modalities=input_modalities,
             output_modalities=["audio"],
             model_kwargs=mk,
+        )
+
+    @staticmethod
+    def _reference_clip(ref, upload_dir: Path) -> str:
+        """Every refusal is the same and accesses no client-named server file.
+        ``/etc/passwd`` is valid base64, so bare base64 is decoded into
+        ``upload_dir`` and kept only if soundfile opens it as audio."""
+        if not isinstance(ref, str):
+            raise ValueError(f"ref_audio must be a data URL or base64 string, got {type(ref).__name__}")
+        if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
+            # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
+            return media_io.resolve_media_ref(ref, upload_dir, allow_remote=False)[1]
+        import soundfile
+
+        path = None
+        try:
+            _, path = media_io.save_base64(ref, "wav", "audio", upload_dir)
+            soundfile.info(path)
+            return path
+        except Exception:  # noqa: BLE001 — not base64 audio the model can load
+            if path:
+                Path(path).unlink(missing_ok=True)
+        raise ValueError(
+            "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
+            "or base64 audio the model can decode"
         )
 
 
