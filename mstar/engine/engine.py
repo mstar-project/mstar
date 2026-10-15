@@ -643,9 +643,11 @@ class Engine:
             submodule_mgmt.piecewise_runners = captured
         if plan is not None:
             torch.cuda.empty_cache()
-            logger.info(
+            free = torch.cuda.mem_get_info(self._device)[0]
+            logger.log(
+                logging.WARNING if free < plan.floor else logging.INFO,
                 "CapturePlan[%s]: %.0f MiB free after capture, %.0f for the largest eager step",
-                self._device, torch.cuda.mem_get_info(self._device)[0] / 2**20, plan.floor / 2**20,
+                self._device, free / 2**20, plan.floor / 2**20,
             )
 
         fail_if_graphs_required([
@@ -732,9 +734,11 @@ class Engine:
         before = torch.cuda.memory_reserved(self._device)
         yield plan.buckets[pool]
         torch.cuda.empty_cache()
-        logger.info(
+        took = torch.cuda.memory_reserved(self._device) - before
+        logger.log(
+            logging.WARNING if took > plan.predicted[pool] else logging.INFO,
             "CapturePlan[%s] %s: capture took %.0f MiB, %.0f predicted", self._device, pool,
-            (torch.cuda.memory_reserved(self._device) - before) / 2**20, plan.predicted[pool] / 2**20,
+            took / 2**20, plan.predicted[pool] / 2**20,
         )
 
     def _build_piecewise_runners(
