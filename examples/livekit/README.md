@@ -75,7 +75,7 @@ Measured on one B200 with the three M\* servers, the LiveKit server, the agent a
 
 The two incomplete conversations are barge-ins LiveKit did not act on: the agent stayed `speaking` through the user's whole utterance and finished its reply. Across the stress runs every M\* request was torn down and none failed, and GPU memory stayed flat.
 
-"After endpointing" starts when the agent decides the user is done. About 0.68 s of each turn passes before that decision: the VAD's silence window, then Whisper's transcript, which LiveKit waits for. The VAD and `endpointing` settings in `agent.py` tune it. M\*'s own calls in a Kokoro turn are short: Whisper takes 0.10 s on 2.6 s of speech, Qwen3.5's first token takes 23 ms, and each sentence's first audio takes 36 ms (43 ms with Qwen3-TTS). These are p50 values from LiveKit's metrics. The rest is the LLM writing its first sentence, plus LiveKit's audio path.
+"After endpointing" starts when the agent decides the user is done. About 0.68 s of each turn passes before that decision: the VAD's silence window, then Whisper's transcript, which LiveKit waits for. The VAD and `endpointing` settings in `agent.py` tune it. M\*'s own calls in a Kokoro turn are short: Whisper takes 0.10 s on 2.6 s of speech, Qwen3.5's first token takes 24 ms, and each sentence's first audio takes 36 ms (37 ms with Qwen3-TTS). These are p50 values from LiveKit's metrics. The rest is the LLM writing its first sentence, plus LiveKit's audio path.
 
 ## Known limits
 
