@@ -50,9 +50,6 @@ class Mamba2Plan:
 
 
 class Mamba2Manager(LinearAttnManager):
-    def can_capture(self) -> bool:
-        return self._device.type == "cuda"
-
     def __init__(
         self,
         config: LinearAttnConfig,
