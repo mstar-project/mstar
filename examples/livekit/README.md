@@ -56,6 +56,18 @@ M\* serves one model per process, so the pipeline is three M\* servers. Turn det
 
 `participant.py` joins a room as a user, plays WAV utterances into its microphone in real time, and times the agent. It reads the agent's `lk.agent.state` attribute and both sides' transcripts.
 
+Any short spoken questions work as utterances (16-bit PCM WAV, any rate). To synthesize some with the Kokoro server, in a voice unlike the agent's:
+
+```bash
+mkdir -p utts && i=0
+for q in "What is the tallest mountain in the world?" "How far away is the moon?" \
+         "Tell me a fun fact about octopuses." "Why is the sky blue?"; do
+  i=$((i + 1))
+  curl -s localhost:8003/v1/audio/speech -H 'Content-Type: application/json' -o "utts/$i.wav" \
+    -d "{\"model\": \"kokoro\", \"input\": \"$q\", \"voice\": \"am_michael\", \"response_format\": \"wav\"}"
+done
+```
+
 ```bash
 python examples/livekit/participant.py --utterances 'utts/*.wav' --conversations 1 --turns 6
 python examples/livekit/participant.py --utterances 'utts/*.wav' --conversations 16 --scenario mix
