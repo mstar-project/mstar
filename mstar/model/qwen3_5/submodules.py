@@ -96,10 +96,7 @@ class LLMSubmodule(ARNodeSubmodule):
             "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,256,512,1024,2048,4096,8192",
         ).split(",")
     ]
-    # As wide as the mixed captures: the scheduler caps a step mixing walks at
-    # the smallest cap of the walks in it, so a narrower prefill ladder would
-    # cap every mixed step below the decode batch and split it.
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64, 128]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # A mixed step carries the decode batch beside its prompt rows, so its
     # captures run to the decode batch: one capped below it splits the batch.
     MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64, 128]

@@ -119,8 +119,8 @@ class FIFOBatchBuilder(BaseBatchBuilder):
     capture group per step.
 
     Under a combined walk a step of one walk takes that walk's cap and a mixed
-    step the smallest of the combined walk's and the caps of the walks present
-    in it; a walk with no row in the step does not cap it. Rows join in
+    step the combined walk's own, or with none the smallest of the caps of the
+    walks present in it; a walk with no row in the step does not cap it. Rows join in
     order; one whose walk would cap the step at or below the rows already in
     it is left out, and is first in line next step.
 
@@ -216,7 +216,9 @@ def _compose_walks(
         new_cap = cap
         if walk not in walks:
             mixed_cap = caps.get(request.graph_walk) if walks else None
-            new_cap = _min_cap(cap, caps.get(walk), mixed_cap)
+            # a mixed step: the combined walk's own cap where it has one,
+            # else the smallest of the walks present
+            new_cap = mixed_cap if mixed_cap is not None else _min_cap(cap, caps.get(walk))
         if new_cap is not None and new_cap <= n:
             left_out.add(rid)
             continue

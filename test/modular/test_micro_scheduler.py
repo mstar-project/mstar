@@ -1213,12 +1213,15 @@ def test_a_real_walk_target_takes_its_combined_walks_rows():
     assert set(batch.request_to_worker_graph) == {"p0", "d0"}
 
 
-def test_excluding_a_real_walk_excludes_its_combined_walk():
+def test_excluding_a_real_walk_excludes_only_that_walk():
+    """A chain on one walk yields to another walk of its combined walk: the
+    peek counts that walk's rows, and the yield-away takes them."""
     sched = _combined_scheduler(_Engine(max_bs=8))
     manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
 
-    assert not _has_ready(sched, manager, exclude_target=(NODE, "prefill"))
-    assert _next_batch(sched, manager, exclude_target=(NODE, WALK)) is None
+    assert _has_ready(sched, manager, exclude_target=(NODE, WALK))
+    batch = _next_batch(sched, manager, exclude_target=(NODE, WALK))
+    assert list(batch.request_to_worker_graph) == ["p0"] and batch.graph_walk == "prefill"
 
 
 def test_a_split_keeps_each_halfs_walks():
@@ -1261,9 +1264,10 @@ def test_a_follower_pop_is_all_or_none_across_walks():
 
 
 def test_a_walk_that_would_shrink_the_step_waits_its_turn():
-    """Six decode rows fit a decode step of 8; taking the prompt would cap the
+    """With no cap of its own, a mixed step takes the smallest of its walks'.
+    Six decode rows fit a decode step of 8; taking the prompt would cap the
     step at its walk's 2. It is left out, and runs first next step."""
-    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 2}))
+    sched = _combined_scheduler(_Engine(max_bs={WALK: 8, "prefill": 2}))
     rids = [f"d{i}" for i in range(3)] + ["p0"] + [f"d{i}" for i in range(3, 6)]
     manager = _Manager(rids, walks={"p0": "prefill"})
 
@@ -1275,6 +1279,19 @@ def test_a_walk_that_would_shrink_the_step_waits_its_turn():
     second = _next_batch(sched, manager)
     assert second.graph_walk == MIXED and len(second) == 2
     assert next(iter(second.request_to_worker_graph)) == "p0"
+
+
+def test_a_combined_walks_own_cap_overrides_its_walks():
+    """The combined walk's own cap (its own captures) bounds a mixed step, not
+    a smaller cap of one of the walks in it: the prompt joins the six."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 2}))
+    rids = [f"d{i}" for i in range(3)] + ["p0"] + [f"d{i}" for i in range(3, 6)]
+    manager = _Manager(rids, walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == MIXED and len(batch) == 7
+    assert (NODE, MIXED) not in sched.backlog
 
 
 def test_a_walk_joins_when_it_costs_nothing():
@@ -1335,38 +1352,48 @@ def test_a_one_walk_step_is_not_bound_by_its_row_cap():
     assert len(batch) == 3 and batch.graph_walk == "prefill"
 
 
-def test_a_merge_counts_the_continuing_rows_walk():
-    """Six continuing decode rows: a prompt joining them would make a mixed
-    step past its cap of 4, so it waits and has first claim next time."""
-    sched = _combined_scheduler(_Engine(max_bs={MIXED: 4, WALK: 8, "prefill": 8}))
-    assert sched.room_for_continuing((NODE, WALK)) == 8
+def test_a_merge_takes_only_its_own_walk():
+    """A speculation merge on the decode walk takes ready decode rows and
+    leaves a prompt on its queue, where the peek reports it for a yield."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}))
+    manager = _Manager(["p0", "d6"], walks={"p0": "prefill"})
 
-    merged = _next_batch(
-        sched, _Manager(["p0"], walks={"p0": "prefill"}),
-        target=(NODE, WALK), pre_existing_batch_size=6,
-    )
+    merged = _next_batch(sched, manager, target=(NODE, WALK), pre_existing_batch_size=6)
 
-    assert merged is None
-    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p0"]
-    assert sched.room_for_continuing((NODE, WALK)) == 3
+    assert list(merged.request_to_worker_graph) == ["d6"]
+    assert (NODE, MIXED) not in sched.backlog
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"p0"}
+    assert _has_ready(sched, manager, exclude_target=(NODE, WALK))
 
 
-def test_a_merge_at_its_walks_cap_parks_another_walks_rows():
-    """Continuing decode rows at the decode cap: the chain never yields for a
-    prompt of the same combined walk, so the merge parks it, and the next
-    merge's room leaves it a place."""
+def test_a_yield_away_leaves_the_chains_own_parked_rows():
+    """Decode rows parked under the combined walk beside a waiting prompt: a
+    yield-away from decode runs the prompt alone, not a mixed step, and the
+    decode rows stay parked for the chain's next merge."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}))
+    parked = _batch(["d0", "d1"], walk=MIXED)
+    parked.request_walks = {"d0": WALK, "d1": WALK}
+    sched.backlog[(NODE, MIXED)] = parked
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager, exclude_target=(NODE, WALK))
+
+    assert list(batch.request_to_worker_graph) == ["p0"] and batch.graph_walk == "prefill"
+    assert sorted(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["d0", "d1"]
+
+
+def test_a_full_merge_leaves_every_row_queued():
+    """Continuing rows at the decode cap: the merge pops nothing, another
+    walk's rows included, and the chain's room is its whole cap."""
     sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}))
     manager = _Manager(["p0", "d9"], walks={"p0": "prefill"})
 
-    merged = _next_batch(
-        sched, manager, target=(NODE, WALK), pre_existing_batch_size=8,
-    )
+    merged = _next_batch(sched, manager, target=(NODE, WALK), pre_existing_batch_size=8)
 
     assert merged is None
-    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p0"]
-    assert set(manager.queues["wg0"].get_ready_node_names()) == {"d9"}
-    assert sched.room_for_continuing((NODE, WALK)) == 7
-
+    assert not sched.backlog
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"p0", "d9"}
+    assert sched.room_for_continuing((NODE, WALK)) == 8
 
 
 def test_a_relabelled_step_routes_with_its_own_walks_outputs():

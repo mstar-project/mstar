@@ -1,6 +1,5 @@
 import functools
 import logging
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
@@ -227,13 +226,6 @@ class MicroScheduler:
         self._walks_of_key: dict[tuple[str, str], list[str]] = defaultdict(list)
         for (node, walk), combined in self.combined_walk_of.items():
             self._walks_of_key[(node, combined)].append(walk)
-        # A speculation chain merges only rows of its own real walk; another walk
-        # of its combined walk is another target, which the chain yields to.
-        self._spec_exact_walk = os.environ.get("MSTAR_SPEC_EXACT_WALK", "0") == "1"
-        # Measurement only: with this set, the flag follows the file's
-        # existence, so one server process can A/B both policies.
-        self._spec_exact_walk_file = os.environ.get("MSTAR_SPEC_EXACT_WALK_FILE")
-        self._spec_exact_walk_checked = 0.0
         self._max_bs: dict[tuple[str, str], int | None] = {}
         self._walk_caps_of_key: dict[tuple[str, str], dict[str, int | None]] = {}
         self._row_caps_of_key: dict[tuple[str, str], dict[str, int]] = {}
@@ -293,15 +285,6 @@ class MicroScheduler:
         self._last_resident_delta: int = -1
         # popped, not settled: a settled head can still fail to build, and its removals wait for its admit
         self._last_popped_tp_seq: int = -1
-
-    @property
-    def spec_exact_walk(self) -> bool:
-        if self._spec_exact_walk_file is not None:
-            now = time.monotonic()
-            if now - self._spec_exact_walk_checked > 0.25:
-                self._spec_exact_walk_checked = now
-                self._spec_exact_walk = os.path.exists(self._spec_exact_walk_file)
-        return self._spec_exact_walk
 
     @property
     def last_consumed_tp_seq(self) -> int:
@@ -558,20 +541,21 @@ class MicroScheduler:
             raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
         # a targeted merge's pre-existing rows are of the target's own walk
         pre_existing_walk = target[1] if target is not None and pre_existing_batch_size else None
-        exact = self.spec_exact_walk
-        # the runtime matches a real walk exactly, so the scan can take one
-        scan_target = target if exact and pre_existing_walk else None
-        scan_exclude = exclude_target if exact else None
+        # A speculation chain stays on its own real walk: its merge takes only
+        # that walk's rows, and a yield-away from it excludes only that walk.
+        # Another walk of the same combined walk is another target, which the
+        # chain yields to rather than folds in; steps mix walks only when the
+        # scheduler builds one fresh. The runtime matches a real walk exactly.
+        scan_target = target if pre_existing_walk else None
+        scan_exclude = exclude_target
         target = None if target is None else self._key(*target)
         exclude_target = None if exclude_target is None else self._key(*exclude_target)
         scan_target = scan_target or target
-        scan_exclude = scan_exclude or exclude_target
-        exact_walk = pre_existing_walk if exact else None
         if target is not None and self._room_left(
             target, pre_existing_walk, pre_existing_batch_size,
         ) == 0:
-            # the caller is full; only another walk's rows are worth popping
-            self._park_other_walks(request_state, target, pre_existing_walk)
+            # the caller is full: nothing of its walk to pop, and another
+            # walk's rows wait on their queues for the yield
             return None
         # scanned only once a step could take fresh rows
         ready: dict[tuple[str, str], list[ReadyNodeEntry]] | None = None
@@ -582,7 +566,10 @@ class MicroScheduler:
                 pre_existing_batch_size=pre_existing_batch_size,
                 capture_group_of=capture_group_of,
                 pre_existing_walk=pre_existing_walk,
-                exact_walk=exact_walk,
+                only_walk=pre_existing_walk,
+                # a yield-away runs the other walks: the chain's own rows
+                # parked under the combined walk wait for its next merge
+                skip_walk=scan_exclude[1] if scan_exclude is not None else None,
             )
 
         # A backlogged key goes first, oldest first, so a split set drains
@@ -608,28 +595,6 @@ class MicroScheduler:
         if rr_key is None or rr_key in keys:
             return None
         return schedule(rr_key, ready.get(rr_key, []))
-
-    def _park_other_walks(
-        self, request_state: RequestStateManager,
-        key: tuple[str, str], own_walk: str | None,
-    ) -> None:
-        """Backlog ``key``'s ready rows of walks other than ``own_walk``.
-
-        A chain at its walk's cap never yields for these (``has_ready_excluding``
-        sees one key), so parked, ``room_for_continuing`` gives them first claim.
-        """
-        if key not in self._walks_of_key:
-            return
-        # Excluded in the scan, not filtered after: own_walk's rows would
-        # otherwise each pay a `check_ready` only to be dropped here.
-        entries = self._scan_ready(
-            request_state, key, (key[0], own_walk) if own_walk else None,
-        ).get(key, [])
-        if not entries:
-            return
-        parked = self._assemble_batch(request_state, *key, entries)
-        if parked:
-            self._backlog(key, parked)
 
     def _scan_ready(
         self, request_state: RequestStateManager,
@@ -694,11 +659,13 @@ class MicroScheduler:
         pre_existing_batch_size: int,
         capture_group_of: int | None,
         pre_existing_walk: str | None = None,
-        exact_walk: str | None = None,
+        only_walk: str | None = None,
+        skip_walk: str | None = None,
     ) -> ScheduledBatch | None:
         """One step for ``node_walk`` out of its backlog and its ready
-        ``entries``, composed by the batch builder. With ``exact_walk``, rows
-        of any other walk stay where they are."""
+        ``entries``, composed by the batch builder. Under a combined walk,
+        backlogged rows of any walk but ``only_walk`` (a speculation merge),
+        or of ``skip_walk`` (a yield-away from that walk), stay parked."""
         remaining = self._room_left(node_walk, pre_existing_walk, pre_existing_batch_size)
         if remaining == 0:
             # The caller already holds a full batch. Assembling would pop these
@@ -718,10 +685,11 @@ class MicroScheduler:
             )
             if not backlogged:
                 backlogged = None  # every row failed
-            elif exact_walk is not None and backlogged.request_walks:
+            elif backlogged.request_walks and (only_walk or skip_walk) is not None:
                 blocked |= {
                     rid for rid in backlogged.request_to_worker_graph
-                    if backlogged.walk_of(rid) != exact_walk
+                    if (only_walk is not None and backlogged.walk_of(rid) != only_walk)
+                    or backlogged.walk_of(rid) == skip_walk
                 }
         walk_caps = self._walk_caps(node_walk)
 
@@ -1001,15 +969,6 @@ class MicroScheduler:
             k: v for k, v in self.backlog.items() if len(v) > 0
         }
 
-    def _walk_set_cap(self, key: tuple[str, str], walks: set[str]) -> int | None:
-        """The cap of a ``key`` step holding ``walks``: one walk's own, or for
-        a mixed step the smallest of the combined walk's and the caps of the
-        walks present, not of every walk the combined walk could hold."""
-        caps = [self._max_batch_size(key[0], walk) for walk in walks]
-        if len(walks) > 1:
-            caps.append(self._max_batch_size(*key))
-        return min((cap for cap in caps if cap is not None), default=None)
-
     def _walk_caps(self, key: tuple[str, str]) -> dict[str, int | None]:
         """``BatchBuildRequest.walk_caps`` for ``key``: its walk's cap, or a
         combined key's walks' caps and its own under its label."""
@@ -1118,16 +1077,12 @@ class MicroScheduler:
         key = self._key(*target)
         backlog = self.backlog.get(key)
         cap = self._max_batch_size(*target)
-        if self.spec_exact_walk and backlog is not None and backlog.request_walks:
-            # the chain's step takes only its own walk's backlog
+        if backlog is not None and backlog.request_walks:
+            # the chain's merge takes only its own walk's backlogged rows
             if cap is None:
                 return None
             own = sum(1 for r in backlog.request_walks.values() if r == target[1])
             return max(0, cap - own)
-        if backlog is not None and backlog.request_walks:
-            walks = set(backlog.request_walks.values())
-            if walks != {target[1]}:  # the step would mix walks
-                cap = self._walk_set_cap(key, walks | {target[1]})
         return self.batch_builder.room_for_continuing(cap, backlog)
 
     def has_ready_excluding(
@@ -1149,16 +1104,14 @@ class MicroScheduler:
         under `exclude_target` is left out like any other — the speculative
         merge takes that one before its own rids, so it needs no yield.
 
-        `exclude_target` is mapped to its scheduling key, so a ready row of
-        another walk under the same combined walk does not count either; a
-        merge with no room left parks it (`_park_other_walks`) instead.
+        Only `exclude_target`'s own real walk is excluded: a ready row of
+        another walk under the same combined walk is another target, which a
+        speculation chain on that walk never merges, so it counts.
         """
-        exact = self.spec_exact_walk and exclude_target is not None
-        exclude_walk = exclude_target[1] if exact else None
-        # exact: the runtime scan below takes the real walk as given
-        scan_exclude = exclude_target if exact else None
+        exclude_walk = exclude_target[1] if exclude_target is not None else None
+        # the runtime scan below takes the real walk as given
+        scan_exclude = exclude_target
         exclude_target = None if exclude_target is None else self._key(*exclude_target)
-        scan_exclude = scan_exclude or exclude_target
         if self._backlog_has_schedulable(exclude_target, exclude_walk):
             return True
 

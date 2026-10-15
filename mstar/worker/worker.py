@@ -4135,8 +4135,6 @@ class Worker:
                 speculation, yield_away_from_target = self._build_speculation(
                     pending, consecutive_spec_steps, fair,
                 )
-                if phase_period:
-                    _phase_record("mode.exact#", int(self.scheduler.spec_exact_walk))
                 if phase_period and pending is not None:
                     # How N+1 was chosen: the chain, a yield-away, or neither
                     # (the serial path below, which plans inline)
