@@ -1150,11 +1150,12 @@ def test_a_builder_that_loses_a_row_is_refused():
 MIXED = "mixed"
 
 
-def _combined_scheduler(engine: _Engine) -> MicroScheduler:
+def _combined_scheduler(engine: _Engine, mixes=None) -> MicroScheduler:
     return MicroScheduler(
         engine_manager=SimpleNamespace(get_engine=lambda name: engine),
         parallel_leader_nodes={NODE},
         combined_walk_of={(NODE, "prefill"): MIXED, (NODE, WALK): MIXED},
+        speculation_mixes_walks=mixes,
     )
 
 
@@ -1411,3 +1412,67 @@ def test_a_relabelled_step_routes_with_its_own_walks_outputs():
 
     assert batch.graph_walk == WALK
     assert list(batch.output_signals) == [f"out_{WALK}"]
+
+
+# --- speculation_mixes_walks: a chain that merges its combined walk's other walks
+
+
+@pytest.mark.parametrize("mixes", [{NODE: True}, {NODE: {WALK: True}}])
+def test_a_mixing_merge_takes_another_walks_rows(mixes):
+    """With the setting on for the decode walk, its merge takes a ready
+    prompt too, and the peek no longer counts the prompt as a reason to yield."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}), mixes)
+    manager = _Manager(["p0", "d6"], walks={"p0": "prefill"})
+
+    assert not _has_ready(sched, manager, exclude_target=(NODE, WALK))
+    merged = _next_batch(sched, manager, target=(NODE, WALK), pre_existing_batch_size=6)
+
+    assert sorted(merged.request_to_worker_graph) == ["d6", "p0"]
+    assert merged.request_walks == {"p0": "prefill", "d6": WALK}
+
+
+def test_mixing_is_per_walk():
+    """On for the prompt walk only: the decode chain still keeps to its own walk."""
+    sched = _combined_scheduler(
+        _Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}), {NODE: {"prefill": True}},
+    )
+    manager = _Manager(["p0", "d6"], walks={"p0": "prefill"})
+
+    merged = _next_batch(sched, manager, target=(NODE, WALK), pre_existing_batch_size=6)
+
+    assert list(merged.request_to_worker_graph) == ["d6"]
+    assert sched.speculation_mixes(NODE, "prefill") and not sched.speculation_mixes(NODE, WALK)
+
+
+def test_a_full_mixing_merge_parks_another_walks_rows():
+    """A mixing chain at its cap never yields for its combined walk's other
+    rows, so the merge parks them, and its next room leaves them a place."""
+    sched = _combined_scheduler(
+        _Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}), {NODE: {WALK: True}},
+    )
+    manager = _Manager(["p0", "d9"], walks={"p0": "prefill"})
+
+    merged = _next_batch(sched, manager, target=(NODE, WALK), pre_existing_batch_size=8)
+
+    assert merged is None
+    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p0"]
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"d9"}
+    assert sched.room_for_continuing((NODE, WALK)) == 7
+
+
+def test_a_mixing_yield_away_skips_the_whole_combined_walk():
+    sched = _combined_scheduler(_Engine(max_bs=8), {NODE: True})
+    manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
+
+    assert not _has_ready(sched, manager, exclude_target=(NODE, WALK))
+
+
+@pytest.mark.parametrize("mixes, error", [
+    ({"other": True}, "has no combined walk"),
+    ({NODE: {"nope": True}}, "in none of its combined walks"),
+    ({NODE: {WALK: "yes"}}, "is not a bool"),
+    ({NODE: 1}, "is not a bool"),
+])
+def test_a_bad_mixing_setting_is_refused(mixes, error):
+    with pytest.raises(ValueError, match=error):
+        _combined_scheduler(_Engine(max_bs=8), mixes)

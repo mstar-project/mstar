@@ -484,6 +484,7 @@ class Worker:
             self.engine_manager,
             parallel_leader_nodes=self.parallel_leader_nodes,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
+            speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
         )
 
         # Request ids are strings on the wire and ints (handles) inside this

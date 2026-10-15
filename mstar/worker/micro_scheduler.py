@@ -2,7 +2,7 @@ import functools
 import logging
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, NamedTuple
@@ -219,6 +219,7 @@ class MicroScheduler:
         max_consec_tp_follower_batches: int = 1,
         batch_builder_type: BatchBuilderType = BatchBuilderType.FIFO,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
+        speculation_mixes_walks: Mapping[str, Any] | None = None,
     ):
         self.engine_manager = engine_manager
         # (node, real walk) -> combined walk; scheduling keys use the combined one
@@ -226,6 +227,11 @@ class MicroScheduler:
         self._walks_of_key: dict[tuple[str, str], list[str]] = defaultdict(list)
         for (node, walk), combined in self.combined_walk_of.items():
             self._walks_of_key[(node, combined)].append(walk)
+        # (node, walk) whose speculation chain merges the other walks of its
+        # combined walk; see `speculation_mixes`
+        self._mixing_chains = self._parse_speculation_mixes_walks(
+            speculation_mixes_walks or {},
+        )
         self._max_bs: dict[tuple[str, str], int | None] = {}
         self._walk_caps_of_key: dict[tuple[str, str], dict[str, int | None]] = {}
         self._row_caps_of_key: dict[tuple[str, str], dict[str, int]] = {}
@@ -285,6 +291,43 @@ class MicroScheduler:
         self._last_resident_delta: int = -1
         # popped, not settled: a settled head can still fail to build, and its removals wait for its admit
         self._last_popped_tp_seq: int = -1
+
+    def _parse_speculation_mixes_walks(
+        self, setting: Mapping[str, Any],
+    ) -> frozenset[tuple[str, str]]:
+        """The serving config's ``speculation_mixes_walks``: per node, one bool
+        for every walk of its combined walks, or a mapping of walk -> bool."""
+        walks_of_node: dict[str, set[str]] = defaultdict(set)
+        for node, walk in self.combined_walk_of:
+            walks_of_node[node].add(walk)
+        on = set()
+        for node, value in setting.items():
+            if node not in walks_of_node:
+                raise ValueError(
+                    f"speculation_mixes_walks names {node!r}, which has no combined walk"
+                )
+            per_walk = value if isinstance(value, Mapping) else dict.fromkeys(walks_of_node[node], value)
+            for walk, mixes in per_walk.items():
+                if walk not in walks_of_node[node]:
+                    raise ValueError(
+                        f"speculation_mixes_walks names walk {walk!r} of {node!r}, "
+                        "which is in none of its combined walks"
+                    )
+                if not isinstance(mixes, bool):
+                    raise ValueError(
+                        f"speculation_mixes_walks for {node}/{walk}: {mixes!r} is not a bool"
+                    )
+                if mixes:
+                    on.add((node, walk))
+        return frozenset(on)
+
+    def speculation_mixes(self, node_name: str, graph_walk: str) -> bool:
+        """Whether a speculation chain on ``(node_name, graph_walk)`` merges
+        ready rows of the other walks of its combined walk. Off (the default),
+        the chain takes only its own walk's rows, and another walk's ready rows
+        make it yield; steps then mix walks only when the scheduler builds one
+        fresh, which plans inline."""
+        return (node_name, graph_walk) in self._mixing_chains
 
     @property
     def last_consumed_tp_seq(self) -> int:
@@ -541,21 +584,32 @@ class MicroScheduler:
             raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
         # a targeted merge's pre-existing rows are of the target's own walk
         pre_existing_walk = target[1] if target is not None and pre_existing_batch_size else None
-        # A speculation chain stays on its own real walk: its merge takes only
-        # that walk's rows, and a yield-away from it excludes only that walk.
-        # Another walk of the same combined walk is another target, which the
-        # chain yields to rather than folds in; steps mix walks only when the
-        # scheduler builds one fresh. The runtime matches a real walk exactly.
-        scan_target = target if pre_existing_walk else None
-        scan_exclude = exclude_target
+        # By default a speculation chain stays on its own real walk: its merge
+        # takes only that walk's rows, and a yield-away from it excludes only
+        # that walk. Another walk of the same combined walk is another target,
+        # which the chain yields to rather than folds in; steps mix walks only
+        # when the scheduler builds one fresh. A chain that mixes
+        # (`speculation_mixes`) merges and excludes its whole combined walk.
+        # The runtime matches a real walk exactly, and a combined one as a whole.
+        mixes = pre_existing_walk is not None and self.speculation_mixes(*target)
+        own_walk = None if mixes else pre_existing_walk
+        skip_walk = None
+        if exclude_target is not None and not self.speculation_mixes(*exclude_target):
+            skip_walk = exclude_target[1]
+        scan_target = target if own_walk else None
+        scan_exclude = exclude_target if skip_walk else None
         target = None if target is None else self._key(*target)
         exclude_target = None if exclude_target is None else self._key(*exclude_target)
         scan_target = scan_target or target
+        scan_exclude = scan_exclude or exclude_target
         if target is not None and self._room_left(
             target, pre_existing_walk, pre_existing_batch_size,
         ) == 0:
-            # the caller is full: nothing of its walk to pop, and another
-            # walk's rows wait on their queues for the yield
+            if mixes:
+                # the chain never yields for its combined walk's other rows,
+                # so park them: `room_for_continuing` gives them first claim
+                self._park_other_walks(request_state, target, pre_existing_walk)
+            # otherwise another walk's rows wait on their queues for the yield
             return None
         # scanned only once a step could take fresh rows
         ready: dict[tuple[str, str], list[ReadyNodeEntry]] | None = None
@@ -566,10 +620,10 @@ class MicroScheduler:
                 pre_existing_batch_size=pre_existing_batch_size,
                 capture_group_of=capture_group_of,
                 pre_existing_walk=pre_existing_walk,
-                only_walk=pre_existing_walk,
+                only_walk=own_walk,
                 # a yield-away runs the other walks: the chain's own rows
                 # parked under the combined walk wait for its next merge
-                skip_walk=scan_exclude[1] if scan_exclude is not None else None,
+                skip_walk=skip_walk,
             )
 
         # A backlogged key goes first, oldest first, so a split set drains
@@ -595,6 +649,23 @@ class MicroScheduler:
         if rr_key is None or rr_key in keys:
             return None
         return schedule(rr_key, ready.get(rr_key, []))
+
+    def _park_other_walks(
+        self, request_state: RequestStateManager,
+        key: tuple[str, str], own_walk: str,
+    ) -> None:
+        """Backlog ``key``'s ready rows of walks other than ``own_walk``, for a
+        mixing chain at its cap."""
+        if key not in self._walks_of_key:
+            return
+        # Excluded in the scan, not filtered after: own_walk's rows would
+        # otherwise each pay a `check_ready` only to be dropped here.
+        entries = self._scan_ready(request_state, key, (key[0], own_walk)).get(key, [])
+        if not entries:
+            return
+        parked = self._assemble_batch(request_state, *key, entries)
+        if parked:
+            self._backlog(key, parked)
 
     def _scan_ready(
         self, request_state: RequestStateManager,
@@ -1078,12 +1149,28 @@ class MicroScheduler:
         backlog = self.backlog.get(key)
         cap = self._max_batch_size(*target)
         if backlog is not None and backlog.request_walks:
+            walks = set(backlog.request_walks.values())
+            if self.speculation_mixes(*target):
+                # the chain's merge takes every backlogged row
+                if walks != {target[1]}:
+                    cap = self._walk_set_cap(key, walks | {target[1]})
+                return self.batch_builder.room_for_continuing(cap, backlog)
             # the chain's merge takes only its own walk's backlogged rows
             if cap is None:
                 return None
             own = sum(1 for r in backlog.request_walks.values() if r == target[1])
             return max(0, cap - own)
         return self.batch_builder.room_for_continuing(cap, backlog)
+
+    def _walk_set_cap(self, key: tuple[str, str], walks: set[str]) -> int | None:
+        """The cap of a mixed ``key`` step holding ``walks``, as the batch
+        builder composes one: the combined walk's own where it has one, else
+        the smallest of the walks present."""
+        own = self._max_batch_size(*key)
+        if own is not None:
+            return own
+        caps = [self._max_batch_size(key[0], walk) for walk in walks]
+        return min((cap for cap in caps if cap is not None), default=None)
 
     def has_ready_excluding(
         self,
@@ -1106,12 +1193,17 @@ class MicroScheduler:
 
         Only `exclude_target`'s own real walk is excluded: a ready row of
         another walk under the same combined walk is another target, which a
-        speculation chain on that walk never merges, so it counts.
+        speculation chain on that walk never merges, so it counts. A chain that
+        mixes (`speculation_mixes`) merges those, so its whole combined walk is
+        excluded.
         """
-        exclude_walk = exclude_target[1] if exclude_target is not None else None
-        # the runtime scan below takes the real walk as given
+        mixes = exclude_target is not None and self.speculation_mixes(*exclude_target)
+        exclude_walk = exclude_target[1] if exclude_target is not None and not mixes else None
+        # the runtime scan below takes the real walk as given, or the combined one
         scan_exclude = exclude_target
         exclude_target = None if exclude_target is None else self._key(*exclude_target)
+        if mixes:
+            scan_exclude = exclude_target
         if self._backlog_has_schedulable(exclude_target, exclude_walk):
             return True
 
