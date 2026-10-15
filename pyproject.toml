@@ -85,7 +85,7 @@ bagel = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow",
     "regex",
     "safetensors",
@@ -98,7 +98,7 @@ bagel = [
 bagel_xpu = [
     "einops",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow",
     "regex",
     "safetensors",
@@ -122,7 +122,7 @@ cosmos3 = [
     "fa3-fwd",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow",
     "safetensors",
     "torchvision",
@@ -137,7 +137,7 @@ qwen3_omni = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow",
     "regex",
     "qwen-omni-utils",
@@ -154,7 +154,7 @@ qwen3_tts = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "qwen-tts==0.1.1",
     "safetensors",
     "soundfile",  # reference-audio decoding for Base voice cloning
@@ -179,7 +179,7 @@ chatterbox = [
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "librosa",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "pyloudnorm",
     "resemble-perth",
     "safetensors",
@@ -197,7 +197,7 @@ orpheus = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "transformers",
 ]
@@ -205,7 +205,7 @@ orpheus = [
 pi05 = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "transformers",
     "triton",
@@ -213,7 +213,7 @@ pi05 = [
 
 vjepa2 = [
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "torchcodec",
 ]
@@ -263,7 +263,7 @@ flux2_klein = [
 vjepa2_ac = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "torchcodec",
 ]
@@ -273,7 +273,7 @@ asr = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "torchcodec==0.8.*",
     "transformers",
@@ -291,7 +291,7 @@ all = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow",
     "regex",
     "safetensors",

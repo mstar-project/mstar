@@ -70,6 +70,53 @@ class FutureAndPointers:
     rx_time: float | None = None # seconds
 
 
+#: Earlier Mooncake releases let any host that reaches the TCP data port read
+#: or write arbitrary process memory (CVE-2026-103764).
+MOONCAKE_PATCHED_VERSION = "0.3.12.post1"
+_MOONCAKE_DISTRIBUTIONS = (
+    "mooncake-transfer-engine",
+    "mooncake-transfer-engine-cuda13",
+    "mooncake-transfer-engine-non-cuda",
+)
+_mooncake_version_checked = False
+
+
+def _warn_if_mooncake_unpatched() -> None:
+    """Warn once per process if the installed Mooncake predates that fix.
+
+    The extras require a patched release, so this only fires where the
+    environment was built without resolving them (``--no-deps``, a prebuilt
+    image). The distributions install the same ``mooncake`` package, and a
+    replaced one can leave its metadata behind, so a patched one anywhere
+    keeps it quiet."""
+    global _mooncake_version_checked
+    if _mooncake_version_checked:
+        return
+    _mooncake_version_checked = True
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError:
+        return
+    from importlib.metadata import PackageNotFoundError, version
+    installed: list[tuple[str, Version]] = []
+    for dist in _MOONCAKE_DISTRIBUTIONS:
+        try:
+            installed.append((dist, Version(version(dist))))
+        except PackageNotFoundError:
+            continue
+        except InvalidVersion:
+            return
+    patched = Version(MOONCAKE_PATCHED_VERSION)
+    if installed and all(v < patched for _, v in installed):
+        logger.warning(
+            "Installed Mooncake (%s) predates %s: any host that can reach the "
+            "transfer engine's TCP data port can read or write this process's "
+            "memory (CVE-2026-103764). Upgrade it, and keep the TCP and RDMA "
+            "transports on a trusted network.",
+            ", ".join(f"{d} {v}" for d, v in installed), MOONCAKE_PATCHED_VERSION,
+        )
+
+
 # ---------------------------------------------------------------------------
 # TensorTransferEngine abstraction
 # ---------------------------------------------------------------------------
@@ -220,6 +267,7 @@ class MooncakeTransferEngine(TensorTransferEngine):
                 f"Failed to load mooncake: {detail}. "
                 "Install mooncake-transfer-engine or use SHM protocol."
             )
+        _warn_if_mooncake_unpatched()
 
         if protocol == CommProtocol.RDMA:
             transfer_device = ""
