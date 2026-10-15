@@ -991,9 +991,11 @@ an abstract interface for graph capture, streams, pools and capture recovery.
 ``torch.cuda.CUDAGraph`` and ``torch.xpu.XPUGraph``, respectively.
 To add another backend, implement the interface and register its device type
 in ``_GRAPH_BACKENDS``; the runners use that registry to check capture support.
-``DeviceCapability.of(device)`` caches stream, event, synchronization, pinned-memory,
-and graph-backend operations for a device. The worker shares its capability with
-the engine and runners; staging utilities use the same cache.
+``DeviceCapability.of(device)`` caches capability queries for a device: accelerator
+availability, pinned-memory support, the graph backend, and capture state. The
+worker shares its capability with the engine and runners; staging utilities use
+the same cache. Runtime operations use PyTorch directly: ``torch.Stream(device=...)``,
+``torch.Event(device=...)``, stream context managers, and ``torch.accelerator``.
 
 Models declare capture recipes without testing device types. Each resource's
 ``can_capture()`` reports whether its planning and kernels support capture.

@@ -142,8 +142,8 @@ class NoiseStager:
 
     def _record(self, index: int, event, device: torch.device) -> None:
         if event is None:
-            event = self._events[index] = DeviceCapability.of(device).new_event()
-        event.record(DeviceCapability.of(device).current_stream())
+            event = self._events[index] = torch.Event(device=device)
+        event.record(torch.accelerator.current_stream(device))
 
     def to_device(self, tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
         """``tensor`` on ``device``, copied from pinned memory without blocking.

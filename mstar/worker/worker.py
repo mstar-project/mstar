@@ -322,7 +322,8 @@ class Worker:
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
 
-        self.device_capability.set_device()
+        if self.device_capability.is_accelerator and self.device.index is not None:
+            torch.accelerator.set_device_index(self.device)
 
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mstar`` runs on
@@ -1796,7 +1797,8 @@ class Worker:
         It also applies mstar's torch config, because dynamo config is
         per-thread since torch 2.12 and this thread compiles.
         """
-        self.device_capability.set_device()
+        if self.device_capability.is_accelerator and self.device.index is not None:
+            torch.accelerator.set_device_index(self.device)
         apply_torch_config()
 
     @contextmanager
@@ -1893,7 +1895,7 @@ class Worker:
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
             execution_stream = (
-                self.device_capability.current_stream()
+                torch.accelerator.current_stream(self.device)
                 if self.device_capability.is_accelerator
                 else None
             )
@@ -1901,7 +1903,7 @@ class Worker:
             # time, and both are needed to tell a starved iter from a busy one.
             gpu_start = None
             if self._phase_period and execution_stream is not None:
-                gpu_start = self.device_capability.new_event(enable_timing=True)
+                gpu_start = torch.Event(device=self.device, enable_timing=True)
                 gpu_start.record(execution_stream)
             if self._phase_period:
                 # after prepare_inputs, which can drop rids — this is the row
@@ -1913,11 +1915,11 @@ class Worker:
                 outputs = engine.exec_and_postprocess(node_batch)
             if execution_stream is not None:
                 self._stage_host_rows(outputs)
-                event = self.device_capability.new_event()
+                event = torch.Event(device=self.device)
                 event.record(execution_stream)
                 node_batch.completion_event = event
                 if gpu_start is not None:
-                    gpu_end = self.device_capability.new_event(enable_timing=True)
+                    gpu_end = torch.Event(device=self.device, enable_timing=True)
                     gpu_end.record(execution_stream)
                     self._gpu_spans.append((gpu_start, gpu_end))
                     self._drain_gpu_spans()
@@ -2888,7 +2890,8 @@ class Worker:
                     batch_N.node_batch.completion_event.synchronize()
             else:
                 with self._span("worker.postprocess.device_sync"):
-                    self.device_capability.synchronize()
+                    if self.device_capability.is_available:
+                        torch.accelerator.synchronize(self.device)
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
@@ -3332,7 +3335,7 @@ class Worker:
         reused by the next step.
         """
         host: dict[str, torch.Tensor] = {}
-        with self.device_capability.stream_context(side):
+        with side:
             for index, (name, tensor) in enumerate(buffers.items()):
                 if not (
                     torch.is_tensor(tensor)
@@ -3421,7 +3424,7 @@ class Worker:
             return source, None
 
         if self._d2h_stream is None:
-            self._d2h_stream = self.device_capability.new_stream()
+            self._d2h_stream = torch.Stream(device=self.device)
         side = self._d2h_stream
         side.wait_event(completion_event)
 
@@ -3434,7 +3437,7 @@ class Worker:
 
         cpu_per_rid: dict = {}
         buffer_indices: dict[tuple[str, torch.dtype, int], int] = defaultdict(int)
-        with self.device_capability.stream_context(side):
+        with side:
             for rid, name_to_list in source.items():
                 if not isinstance(name_to_list, dict):
                     cpu_per_rid[rid] = name_to_list
