@@ -349,7 +349,7 @@ class AudioSealWatermarker:
                 results[i] = x[:0]
                 continue
             groups[whole].append((i, x[:whole], keep if final else whole))
-        for whole, members in groups.items():
+        for members in groups.values():
             audio = torch.stack([x for _, x, _ in members])
             caches = [streams[i].caches or self._fresh for i, _, _ in members]
             wm = self._watermark_frames(audio, caches)

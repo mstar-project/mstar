@@ -55,6 +55,7 @@ from mstar.engine.cuda_graph_config import (
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.model.audio_watermark import AudioSealWatermarker, WatermarkStream
 from mstar.model.qwen3_tts.components.conv_stack import causal_receptive_field_frames, conv_stack
 from mstar.model.qwen3_tts.components.snake import fuse_snake_activations
 from mstar.model.qwen3_tts.components.speaker_encoder import (
@@ -79,6 +80,7 @@ from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
@@ -983,10 +985,18 @@ class CodecSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
     CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
-    def __init__(self, decoder: torch.nn.Module, config: Qwen3TTSModelConfig):
+    def __init__(
+        self,
+        decoder: torch.nn.Module,
+        config: Qwen3TTSModelConfig,
+        watermarker: AudioSealWatermarker | None = None,
+    ):
         super().__init__()
         self.decoder = decoder
         self.config = config
+        # Opt-in (``audio_watermark`` in model_kwargs): marks each request's
+        # trimmed PCM in ``postprocess_batch_tail``; None leaves it untouched.
+        self.watermarker = watermarker
         # Base streams may lead with a full reference tail: capture those windows too.
         leads = (0, config.codec.left_context_frames) if config.supports_reference_audio else (0,)
         self.windows = config.codec.codec_windows(leads)
@@ -1095,7 +1105,10 @@ class CodecSubmodule(ARNodeSubmodule):
         # this one is postprocessed, so request state would be overwritten.
         return ARNodeInputs(
             tensor_inputs={"codec_tokens": codes.t().contiguous()},
-            kwargs={"frames": frames, "context": context, "conv_start": conv_start},
+            kwargs={
+                "frames": frames, "context": context, "conv_start": conv_start,
+                "is_final": chunk is not None and chunk.is_final,
+            },
         )
 
     def preprocess(
@@ -1212,6 +1225,36 @@ class CodecSubmodule(ARNodeSubmodule):
         logger.debug(
             "codec %s: emit frames %d..%d (%d samples)", request_id, context, frames, max(end - start, 0)
         )
+
+    def postprocess_batch_tail(
+        self,
+        request_ids: list[str],
+        outputs: BatchedModelOutput,
+        inputs: list[ARNodeInputs],
+    ) -> None:
+        """Watermark the step's trimmed chunks, one AudioSeal call per chunk
+        length. Each request's stream state lives in its request state, so
+        it goes when the request does."""
+        if self.watermarker is None:
+            return
+        rids, chunks, streams, finals = [], [], [], []
+        for request_id, item in zip(request_ids, inputs, strict=True):
+            out = outputs.get(request_id, {})
+            if "audio_chunk" not in out:
+                continue
+            state = self.request_state(request_id)
+            stream = state.get("watermark_stream")
+            if stream is None:
+                stream = WatermarkStream()
+                state.add("watermark_stream", stream)
+            rids.append(request_id)
+            chunks.append(out["audio_chunk"][0])
+            streams.append(stream)
+            finals.append(bool(item.kwargs.get("is_final", False)))
+        if not rids:
+            return
+        for request_id, marked in zip(rids, self.watermarker.apply_pcm16(chunks, streams, finals), strict=True):
+            outputs.get(request_id)["audio_chunk"][0] = marked
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Any mix of windows batches (``preprocess`` pads to the widest)."""

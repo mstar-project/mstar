@@ -1377,7 +1377,8 @@ def test_qwen3_tts_codec_postprocess_uses_its_own_pass_geometry():
     first = prepare(torch.ones(1, 4, dtype=torch.long), 0)
     second = prepare(torch.ones(4, 4, dtype=torch.long), 1)
     assert (first.kwargs, second.kwargs) == (
-        {"frames": 1, "context": 0, "conv_start": 0}, {"frames": 4, "context": 1, "conv_start": 0},
+        {"frames": 1, "context": 0, "conv_start": 0, "is_final": False},
+        {"frames": 4, "context": 1, "conv_start": 0, "is_final": False},
     )
 
     out_first = {"audio_chunk": [torch.arange(4)]}
@@ -1386,6 +1387,50 @@ def test_qwen3_tts_codec_postprocess_uses_its_own_pass_geometry():
     out_second = {"audio_chunk": [torch.arange(16)]}
     submodule.postprocess("request", None, out_second, inputs=second)
     assert out_second["audio_chunk"][0].tolist() == list(range(4, 16))
+
+
+def _codec_tail_step(submodule, chunks: dict[str, torch.Tensor], final: bool = False):
+    outputs = {rid: {"audio_chunk": [chunk]} for rid, chunk in chunks.items()}
+    inputs = [ARNodeInputs(kwargs={"is_final": final}) for _ in chunks]
+    submodule.postprocess_batch_tail(list(chunks), outputs, inputs)
+    return {rid: out["audio_chunk"][0] for rid, out in outputs.items()}
+
+
+def test_qwen3_tts_codec_without_watermark_leaves_audio_untouched():
+    submodule = CodecSubmodule(_FakeCodecDecoder(4), _tiny_model_config())
+    assert submodule.watermarker is None
+    chunk = torch.arange(-640, 640, dtype=torch.int16)
+    before = chunk.clone()
+    out = _codec_tail_step(submodule, {"a": chunk}, final=True)
+    assert out["a"] is chunk and torch.equal(out["a"], before)
+    assert "watermark_stream" not in submodule.request_state("a")
+
+
+def test_qwen3_tts_codec_watermark_streams_like_the_whole_utterance():
+    """Two requests through the codec tail, chunk by chunk, against each
+    request's offline watermark; the stream state goes with the request."""
+    from test.modular.test_audio_watermark import _speechlike, _watermarker
+
+    watermarker = _watermarker(message=0xBEEF)
+    submodule = CodecSubmodule(_FakeCodecDecoder(4), _tiny_model_config(), watermarker=watermarker)
+    pcm = {
+        rid: (_speechlike(4000, seed=s).clamp(-1, 1) * 32767).to(torch.int16)
+        for rid, s in (("a", 1), ("b", 2))
+    }
+    # chunk edges in samples (the tiny codec's 4-sample frames: ragged against 320)
+    edges = [0, 1280, 1300, 2560, 4000]
+    marked = {rid: [] for rid in pcm}
+    for i in range(len(edges) - 1):
+        step = {rid: audio[edges[i]:edges[i + 1]] for rid, audio in pcm.items()}
+        for rid, piece in _codec_tail_step(submodule, step, final=i == len(edges) - 2).items():
+            marked[rid].append(piece)
+    for rid, audio in pcm.items():
+        expected = (watermarker.offline(audio.float() / 32767).clamp(-1, 1) * 32767).to(torch.int16)
+        got = torch.cat(marked[rid])
+        assert got.shape == audio.shape and not torch.equal(got, audio)
+        assert (got.int() - expected.int()).abs().max() <= 1
+    submodule.cleanup_request("a")
+    assert "a" not in submodule.request_states
 
 
 def test_qwen3_tts_clone_reference_tail_is_the_first_windows_context():
@@ -1623,7 +1668,7 @@ def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
     assert packed.shape == (4, 4)
     assert packed[:, :2].t().tolist() == [[1, 2, 3, 4], [5, 6, 7, 8]]
     assert packed[:, 2:].count_nonzero().item() == 0
-    assert prepared.kwargs == {"frames": 2, "context": 1, "conv_start": 0}
+    assert prepared.kwargs == {"frames": 2, "context": 1, "conv_start": 0, "is_final": False}
     assert submodule.request_state("request")["codec_bucket"] == 4
 
     # A single frame lands in the first ramp bucket; too many frames is an error.

@@ -1437,6 +1437,24 @@ class Engine:
                     rid, batch.node_name, batch.step_context.graph_walk,
                 )
                 batch.register_failure(rid, error)
+        if type(submodule).postprocess_batch_tail is not NodeSubmodule.postprocess_batch_tail:
+            live = [
+                (rid, node_inputs)
+                for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True)
+                if rid not in batch.failed_requests
+            ]
+            if not live:
+                return
+            rids = [rid for rid, _ in live]
+            try:
+                submodule.postprocess_batch_tail(rids, outputs, [node_inputs for _, node_inputs in live])
+            except Exception as error:
+                logger.exception(
+                    "postprocess_batch_tail failed for requests %s (node=%s, walk=%s)",
+                    rids, batch.node_name, batch.step_context.graph_walk,
+                )
+                for rid in rids:
+                    batch.register_failure(rid, error)
 
     def exec_and_postprocess(
         self, batch: ExecutingBatch
