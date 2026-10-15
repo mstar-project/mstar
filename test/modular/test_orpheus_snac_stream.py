@@ -318,6 +318,27 @@ def test_no_context_geometry_captures_only_decodable_windows():
         assert audio.shape[-1] == cfg.additional_key_info * HOP
 
 
+@pytest.mark.parametrize("overrides", [
+    dict(snac_chunk_schedule=(1000,)),
+    dict(snac_chunk_frames=12),
+    dict(snac_left_context_frames=12),
+    dict(snac_right_context_frames=8, snac_chunk_schedule=(9,)),
+])
+def test_a_window_wider_than_supported_is_rejected(overrides):
+    """One capture per window size per batch size: a 1000-frame chunk would
+    capture 1000 window sizes, so the widest window is bounded."""
+    with pytest.raises(ValueError, match="at most 16"):
+        OrpheusModelConfig(**overrides)
+
+
+def test_the_widest_supported_window_bounds_the_captures():
+    config = OrpheusModelConfig(snac_chunk_frames=11)  # 3 + 2 + 11 frames
+    windows = config.snac_window_frames()
+    assert max(windows) <= 16 and len(windows) <= 16
+    configs = SNACDecoderSubmodule(_NeighbourDecoder(), config).get_cuda_graph_configs(torch.device("cpu"))
+    assert len(configs) == len(windows)
+
+
 @pytest.mark.parametrize("case", [3, 6, 25, "recorded"])
 def test_tiny_snac_stream_is_close_to_whole_decode(tiny, case):
     tokens = _tiny_case(tiny.config, case)

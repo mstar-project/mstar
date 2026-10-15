@@ -8,6 +8,12 @@ ATTN = "attn"
 SAMPLER = "sampler"
 ROPE = "rope"
 
+# SNAC captures one CUDA graph per window size at every capture batch size,
+# and every size from 1 frame up to the widest window occurs (final flushes),
+# so the widest window (left + right context + largest chunk) bounds startup
+# and graph memory.
+SNAC_MAX_WINDOW_FRAMES = 16
+
 @dataclass
 class OrpheusModelConfig:
     # Llama 3.2 3B architecture
@@ -54,7 +60,8 @@ class OrpheusModelConfig:
     # The first audio is 2 frames (the first chunk's 4 less its right
     # context); three 2-frame chunks then keep ahead of the listener until the
     # buffer covers a 4-frame chunk, at 32 streams too.
-    # Deployment YAML ``model_kwargs`` override these.
+    # Deployment YAML ``model_kwargs`` override these; left + right context
+    # plus the largest chunk may be at most ``SNAC_MAX_WINDOW_FRAMES``.
     snac_chunk_schedule: tuple[int, ...] = (4, 2, 2, 2)
     snac_chunk_frames: int = 4
     snac_left_context_frames: int = 3
@@ -88,6 +95,13 @@ class OrpheusModelConfig:
             raise ValueError(
                 "the first SNAC chunk must exceed snac_right_context_frames, "
                 "or it emits no audio"
+            )
+        widest = self.snac_left_context_frames + self.snac_right_context_frames \
+            + max((*self.snac_chunk_schedule, self.snac_chunk_frames))
+        if widest > SNAC_MAX_WINDOW_FRAMES:
+            raise ValueError(
+                f"SNAC left + right context plus the largest chunk is {widest} frames; "
+                f"at most {SNAC_MAX_WINDOW_FRAMES} are supported (one CUDA graph per window size)"
             )
 
     def snac_chunk_policy(self) -> ScheduledLeftContextChunkPolicy:
