@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import glob
 import json
-import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,11 +24,14 @@ from mstar.model.higgs_audio.config import HiggsAudioModelConfig
 from mstar.model.higgs_audio.higgs_audio_model import DEFAULT_SAMPLING as HIGGS_DEFAULT_SAMPLING
 from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
 from mstar.model.higgs_audio.higgs_audio_model import sampling_defaults as higgs_sampling_defaults
+from mstar.model.omnivoice.config import OmniVoiceConfig
+from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
 from mstar.model.qwen3_5.config import SAMPLER as QWEN3_5_SAMPLER
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_5.qwen3_5_model import sampling_defaults as qwen3_5_sampling_defaults
 from mstar.model.qwen3_omni.config import CODE_PRED_SAMPLER, TALKER_SAMPLER, THINKER_SAMPLER
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+from mstar.model.vjepa2.vjepa2_model import VJepa2Model
 from mstar.model.whisper.config import SAMPLER as WHISPER_SAMPLER
 from mstar.model.whisper.config import WhisperModelConfig
 from mstar.model.whisper.whisper_model import DEFAULT_SAMPLING as WHISPER_DEFAULT_SAMPLING
@@ -243,12 +245,6 @@ def test_higgs_enable_thinking_must_be_a_bool(bad):
 
 
 # ── omnivoice ───────────────────────────────────────────────────────────────
-
-sys.path.insert(0, ".")
-
-from mstar.model.omnivoice.config import OmniVoiceConfig  # noqa: E402
-from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel  # noqa: E402
-
 
 def _omnivoice_model() -> OmniVoiceModel:
     model = object.__new__(OmniVoiceModel)
@@ -568,11 +564,6 @@ def test_qwen3_omni_request_kwargs_spot_checks(omni_released):
 
 
 # ── vjepa2 ──────────────────────────────────────────────────────────────────
-
-sys.path.insert(0, ".")
-
-from mstar.model.vjepa2.vjepa2_model import VJepa2Model  # noqa: E402
-
 
 @pytest.fixture(scope="module")
 def vjepa2_masked():
