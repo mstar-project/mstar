@@ -974,7 +974,7 @@ def _to_tensor(
 # ---------------------------------------------------------------------------
 #
 # Reads top_k / top_p / temperature from preallocated device tensors so the
-# call can sit inside an accelerator graph capture region without syncing
+# call can sit inside a CUDA graph capture region without allocating, syncing,
 # or branching on CPU-side values. The full ``Sampler`` class is *not* graph
 # capturable (repetition-penalty state, ``@torch.compiler.disable``, the
 # device-context switch inside ``sample_tokens``), so the unrolled MTP loop uses
@@ -995,8 +995,7 @@ def sample_accelerator_graphable_gpu(
 ) -> torch.Tensor:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
-    XPU uses the released per-row device RNG API in ``vllm-xpu-kernels``.
-    CUDA routes through the fused Triton prep kernel (``fused_temperature_softmax``)
+    Routes through the fused Triton prep kernel (``fused_temperature_softmax``)
     so the CUDA-graph path can apply the same vLLM-style repetition penalty as
     the regular ``Sampler``, then samples with
     ``flashinfer.sampling.top_k_top_p_sampling_from_probs`` (``deterministic=True``
@@ -1079,7 +1078,7 @@ class AcceleratorGraphableSampler(BaseSampler):
     top_p_buf: torch.Tensor
     seed_buf: torch.Tensor
     offset_buf: torch.Tensor
-    # Repetition-penalty state for the graph path. ``None`` for submodules
+    # Repetition-penalty state for the CUDA-graph path. ``None`` for submodules
     # that don't opt into seen-token tracking (then ``apply_penalty`` is a no-op).
     rep_penalty_buf: torch.Tensor | None = None
     seen_tokens_buf: torch.Tensor | None = None  # [bs, V] bool
@@ -1143,7 +1142,7 @@ class AcceleratorGraphableSampler(BaseSampler):
             self.applied_penalty_in_graph = True
             # Record the (broadcast, TP-agreed) token in the seen-token buffer so
             # the next step penalises it. ``scatter_`` with a scalar value is
-            # graph capturable; advanced-index assignment
+            # CUDA-graph capturable; advanced-index assignment
             # (``buf[rows, codes] = True``) is not — it trips "operation not
             # permitted when stream is capturing".
             self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
@@ -1357,7 +1356,7 @@ class SamplerBuffers:
     repetition_penalty) is a ``Buffer`` owning a per-step slice and a slot-indexed
     master cache. The RNG ``offset`` is also a ``Buffer``
     but round-trips on the GPU with no CPU middleman: gathered from its slot
-    master before sampling, advanced in graph by the backend's Philox stride,
+    master before sampling, advanced in graph (``offset_buf += 1`` per sample),
     then scattered back to the master after replay — so a request's RNG stream
     follows its slot (batch-position invariant) and reproduces under a fixed
     seed. The optional ``seen_tokens`` ``MaskBuffer`` (allocated only when
@@ -1398,7 +1397,7 @@ class SamplerBuffers:
     tp_group: "CommGroup | None" = None  # noqa: F821
     # Per-request seen-token mask buffer for the repetition penalty. Present
     # only for submodules that opt in by declaring a vocab size (e.g. the
-    # Qwen3-Omni Talker). ``None`` => the graph path applies no penalty.
+    # Qwen3-Omni Talker). ``None`` => the CUDA-graph path applies no penalty.
     seen_tokens: "MaskBuffer | None" = None
     # Per-request min-p; allocated only for submodules whose spec enables it,
     # so every other node's captured sampler is unchanged.
@@ -1587,7 +1586,7 @@ class SamplerBuffers:
         """Double-and-copy the master buffers up to at least ``new_capacity``.
 
         Triggered when concurrently-registered requests exceed the current
-        master capacity. Per-step buffers (sized to the graph capture max_bs) are
+        master capacity. Per-step buffers (sized to the cuda-graph max_bs) are
         NOT resized — the gather only reads ``padded_bs`` rows from master.
 
         Host rows only, under the lock ``_write_master_row`` takes, so a plan-thread

@@ -1,4 +1,3 @@
-"""Device dispatch for graph execution and its worker output copies."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock

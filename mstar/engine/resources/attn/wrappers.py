@@ -1,8 +1,8 @@
 """FlashInfer utility wrappers for batched paged attention.
 
 Provides:
-- FlashInferPrefillWrapper: paged batched prefill, optional accelerator graph mode
-- FlashInferDecodeWrapper: paged batched decode, optional accelerator graph mode
+- FlashInferPrefillWrapper: batched prefill with paged KV cache, optional CUDA graph mode
+- FlashInferDecodeWrapper: batched decode with paged KV cache, optional CUDA graph mode
 
 CUDA graph mode requires:
 - Static buffer pointers passed at construction (qo_indptr_buf, paged_kv_indptr_buf, etc.)
@@ -60,10 +60,10 @@ class FlashInferPrefillWrapper:
         head_dim: dimension per head
         page_size: KV cache page size
         batch_size: required for CUDA graph mode (max requests in batch)
-        max_total_tokens: required for accelerator graph mode (max new tokens across batch)
+        max_total_tokens: required for CUDA graph mode (max total new tokens across batch)
         max_num_pages: required for CUDA graph mode (max pages across all requests)
         device: torch device
-        accelerator_graph: if True, pre-allocate static buffers for graph capture
+        use_cuda_graph: if True, pre-allocate static buffers for graph capture
     """
 
     def __init__(
@@ -217,7 +217,7 @@ class FlashInferDecodeWrapper:
         batch_size: required for CUDA graph mode (max requests in batch)
         max_num_pages: required for CUDA graph mode (max pages across all requests)
         device: torch device
-        accelerator_graph: if True, pre-allocate static buffers for graph capture
+        use_cuda_graph: if True, pre-allocate static buffers for graph capture
     """
 
     def __init__(

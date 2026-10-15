@@ -453,10 +453,10 @@ class Cosmos3Config:
     is_distilled: bool = False
     distilled_sigmas: tuple[float, ...] | None = None
 
-    # ----- accelerator graph capture (serving knobs) -----
-    # Capture fixed-shape denoise, prefill and reasoner decode steps.
-    # Set False to run all these steps eagerly. A nonempty
-    # COSMOS3_DISABLE_ACCELERATOR_GRAPH also disables capture.
+    # ----- denoise CUDA-graph capture (serving knobs) -----
+    # Capture the fixed-shape denoise step as a CUDA graph (the launch-bound-tier
+    # accelerator). Set False to serve the denoise loop eagerly. The env var
+    # COSMOS3_DISABLE_CUDA_GRAPH, when set, overrides this.
     accelerator_graph: bool = True
     # Only capture resolutions whose latent H*W is at or below this; larger tiers
     # (720p+, video) run eager+dense where the graph is net-slower. The env var

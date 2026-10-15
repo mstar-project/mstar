@@ -2077,8 +2077,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         so bake it once here and key it by latent shape; the per-prompt rotary
         positions, the latents and the timestep flow in as static-buffer inputs.
 
-        Set ``accelerator_graph: false`` in the deployment's model_kwargs or
-        ``COSMOS3_DISABLE_ACCELERATOR_GRAPH=1`` to skip capture and run eagerly.
+        Set ``COSMOS3_DISABLE_CUDA_GRAPH=1`` to skip capture and run the denoise
+        loop eagerly (escape hatch for a misbehaving driver, and an A/B switch).
         Set ``COSMOS3_GEN_CAPTURE_RES`` (e.g. ``"192x320,480x832"``, height x
         width) to override which resolutions are captured, and
         ``COSMOS3_GEN_CAPTURE_BS`` (e.g. ``"1,4,8"``) to also capture batched

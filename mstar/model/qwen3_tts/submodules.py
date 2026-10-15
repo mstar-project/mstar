@@ -2,7 +2,7 @@
 # NodeSubmodule wrappers for Qwen3-TTS
 # ---------------------------------------------------------------------------
 #
-# Three submodules cover the complete text-to-speech streaming pipeline:
+# Two submodules cover the complete text-to-speech streaming pipeline:
 #   1. TalkerSubmodule (KV_CACHE engine)
 #      - Builds the official prefill sequence for every 12 Hz variant:
 #        optional instruction turn, ChatML assistant role, codec language /
@@ -885,8 +885,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         """Capture the CodePredictor depth loop, sampling included.
 
         The whole-walk decode graph already covers this loop; this runner serves
-        the paths it can't — chiefly voice-clone prefill, which stays eager
-        because it also emits reference codec frames. It uses no
+        the paths it can't — chiefly ``talker_prefill``, which stays eager
+        because it is variable-length and runs once per request. It uses no
         paged KV cache: its frame-local cache is the engine's fixed-shape
         scratch pool.
         """

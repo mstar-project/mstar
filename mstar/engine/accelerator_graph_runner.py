@@ -118,7 +118,7 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype):
     way leaves two things behind that would sink every later capture on the
     same pool: the caching allocator keeps routing this thread's allocations
     into the pool (the next capture_begin fails with "already recording to
-    mempool_id"), and the graph context never switches the thread back off its
+    mempool_id"), and torch.cuda.graph never switches the thread back off its
     capture stream. Undo both before re-raising, so the buckets after a
     failed one still capture and the thread keeps running on the stream it
     came in on.
@@ -978,7 +978,7 @@ class AcceleratorGraphRunner:
     def _replay(self, lease: SlotLease) -> dict:
         slot = self.slot_for(lease)
         # The launch, not the GPU work: replay is async, so this range measures
-        # enqueue cost only. GPU-side duration comes from the device profiler.
+        # enqueue cost only. GPU-side duration comes from --cuda-graph-trace.
         if self._enable_nvtx:
             profiler.range_push(f"cg.replay.slot[{lease.slot}]")
         slot.graph.replay()

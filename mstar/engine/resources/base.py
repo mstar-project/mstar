@@ -89,7 +89,6 @@ class Resource(ABC):
         return set()
 
     def can_capture(self) -> bool:
-        """Whether this resource's planning and kernels support graph capture."""
         return True
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node

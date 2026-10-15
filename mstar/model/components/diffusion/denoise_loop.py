@@ -12,7 +12,7 @@ leaves the model-specific parts to a handful of hooks:
   equal-key request batching (can_batch)          request_inputs(fwd_info, inputs, key) -> {name: [..]}
   stacked preprocess / per-row outputs            num_tokens(key)               -> int
   stop after the request's own step count         denoise(engine_inputs, key, latents, timestep,
-  per-key accelerator graph buckets (Euler inside)       sigma, sigma_next, **cond) -> [B, L, C]
+  per-key CUDA-graph buckets (Euler inside)               sigma, sigma_next, **cond) -> [B, L, C]
   ragged-attention step declaration               capture_request_inputs(key, device) -> {name: [..]}
                                                   attention_segments(key) -> ((label, span), ...)
 

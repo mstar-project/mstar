@@ -1,4 +1,3 @@
-"""Runtime capability selection must not initialize accelerator hardware."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace

@@ -1,4 +1,4 @@
-"""Accelerator graph replay of S3Gen's flow solve, encoder and vocoder.
+"""CUDA-graph replay of S3Gen's stages: the flow solve, the flow encoder and the vocoder.
 
 The flow-matching estimator is 56 small transformer blocks of width 256 over
 a few hundred mel frames. One Euler step launches several hundred kernels of
@@ -41,7 +41,7 @@ Output = torch.Tensor | tuple[torch.Tensor, ...]
 
 @dataclass
 class _CapturedGraph:
-    graph: CapturedGraph
+    graph: CapturedGraph  # torch.cuda.CUDAGraph (or a stand-in with ``replay``)
     inputs: Tensors  # static buffers the graph reads
     output: Output  # static tensors the graph writes
 
@@ -53,7 +53,7 @@ def _clone(output: Output) -> Output:
 
 
 class ShapeGraphs:
-    """Replay ``fn(tensors, extra)`` from an accelerator graph per input shape.
+    """Replays ``fn(tensors, extra)`` from a captured CUDA graph per input shape.
 
     ``fn`` takes a dict of same-device tensors plus a tuple of hashable
     extras (step counts, flags) and returns a tensor or a tuple of tensors; it
@@ -154,11 +154,10 @@ class ShapeGraphs:
         return entry
 
     def _record(self, run: Callable[[], Output], device: torch.device):
-        """Warm ``run`` up on a side stream, then capture into the shared pool.
-
-        Warmup selects kernels twice before the first capture, once thereafter.
-        The engine's helper restores allocator and stream state after a failure.
-        """
+        """Warm ``run`` up on a side stream (cuBLAS/cuDNN pick their kernels;
+        twice before the very first capture), then capture it into the shared
+        pool with the engine's capture helper, which undoes a failed capture's
+        allocator and stream state."""
         backend = DeviceCapability.of(device).graph_backend
         index = device.index if device.index is not None else torch.accelerator.current_device_index()
         with torch.accelerator.device_index(index):

@@ -37,7 +37,6 @@ class XPUPagedPlan:
     causal: bool
 
     def copy_(self, other: "XPUPagedPlan") -> None:
-        """Refresh graph-stable plan buffers without changing their addresses."""
         for name in ("block_table", "cu_q", "host_kv_lens"):
             dst = getattr(self, name)
             src = getattr(other, name)
@@ -122,9 +121,6 @@ class XPUPagedAttentionManager(AttentionManager):
         views = kv_out.views
         max_blocks = max((len(view.page_idxs) for view in views), default=1)
         if graph_mode:
-            # Multimodal prefixes can exceed the model's text max_seq_len.
-            # A graph must keep room for any context the resident cache can
-            # hold, rather than resize its table when an image edit arrives.
             max_blocks = self._kv_config.max_num_pages
         block_table = [
             view.page_idxs
@@ -143,6 +139,7 @@ class XPUPagedAttentionManager(AttentionManager):
                 block_table, dtype=torch.int32, device=self._device,
             ),
             cu_q=torch.tensor(cu_q, dtype=torch.int32, device=self._device),
+            # vllm-xpu-kernels consumes KV lengths from host memory.
             host_kv_lens=torch.tensor(
                 kv_lens,
                 dtype=torch.int32,

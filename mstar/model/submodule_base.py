@@ -670,7 +670,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> NameToTensorList:
         """
         Pure tensor → NameToTensorList computation.
-        Supports compilation and accelerator graph capture.
+        Compilable + CUDA-graphable.
         """
         pass
 
@@ -787,11 +787,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return None
 
-    # Note: graph config types are imported only under TYPE_CHECKING to avoid a cycle.
+    # Note: do not import CudaGraphConfig; it causes a circular import situation
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
-        """Return graph captures supported by the active accelerator."""
         return []
 
     def get_piecewise_accelerator_graph_configs(
@@ -833,7 +832,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         batch: ExecutingBatch,
         model_inputs: list[NodeInputs],
     ) -> bool:
-        """Return True if this submodule supports accelerator graphs.
+        """Return True if this submodule supports CUDA graphs for ``batch``.
 
         Default: derives from ``get_cuda_graph_configs`` — if any declared
         config can replay for this batch's graph_walk, CUDA graphs are

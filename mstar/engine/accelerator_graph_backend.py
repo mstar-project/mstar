@@ -20,17 +20,10 @@ class CapturedGraph(Protocol):
 @dataclass
 class AcceleratorGraphPool:
     handle: Any
-    # XPU's host allocator cannot reopen a pool after its last graph dies.
-    # Keep a failed capture alive until a successful capture owns the pool.
     failed_graph: CapturedGraph | None = field(default=None, repr=False)
 
 
 class AcceleratorGraphBackend(ABC):
-    """Graph and stream operations required by the accelerator graph runners.
-
-    Implementations own their native graph API and capture recovery. Runners
-    do not need to know which runtime supplies those operations.
-    """
 
     def __init__(self, device: torch.device):
         self.device = device
@@ -80,11 +73,10 @@ class AcceleratorGraphBackend(ABC):
 
     @abstractmethod
     def recover_failed_capture(self, pool: AcceleratorGraphPool, stream: Any) -> None:
-        """Restore the prior stream and stop allocating into the capture pool."""
+        pass
 
 
 class _TorchGraphBackend(AcceleratorGraphBackend):
-    """Operations shared by PyTorch's CUDA and XPU graph runtimes."""
 
     def __init__(
         self,
@@ -157,12 +149,10 @@ class _TorchGraphBackend(AcceleratorGraphBackend):
         try:
             end(index, pool.handle)
         except RuntimeError:
-            # The capture failed before the allocator started recording.
             pass
 
 
 class CUDAGraphBackend(_TorchGraphBackend):
-    """Graph capture using the CUDA runtime."""
 
     def __init__(self, device: torch.device):
         super().__init__(device, device_type="cuda", runtime=torch.cuda)
@@ -172,7 +162,6 @@ class CUDAGraphBackend(_TorchGraphBackend):
 
 
 class XPUGraphBackend(_TorchGraphBackend):
-    """Graph capture using the Intel XPU runtime."""
 
     def __init__(self, device: torch.device):
         super().__init__(device, device_type="xpu", runtime=torch.xpu)

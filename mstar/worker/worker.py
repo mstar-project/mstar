@@ -533,7 +533,7 @@ class Worker:
         # erase the overlap. The side stream waits on
         # ``output.completion_event`` (recorded after GPU(N)) and then runs
         # an isolated D→H, so the main thread only blocks on the copy.
-        # Lazy-initialized — CPU workers never touch it.
+        # Lazy-initialized — workers without CUDA never touch it.
         self._d2h_stream: torch.Stream | None = None
         self._pinned_d2h_buffers: dict[
             tuple[str, torch.dtype, int], list[torch.Tensor]
@@ -3376,17 +3376,17 @@ class Worker:
         completion_event: torch.Event | None,
         request_ids: list[int] | None = None,
     ) -> tuple[dict[int, NameToTensorList], HostRows | None]:
-        """Side-stream D→H of every device tensor in ``outputs`` so the subsequent
+        """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
         don't trigger a default-stream sync. With same-thread async,
         GPU(N+1)'s kernels are already queued on default stream behind
         N's outputs by the time we get here — a default-stream sync would
         block waiting for N+1 to finish, defeating the overlap.
 
-        Returns per-rid outputs with the device tensors replaced by CPU
+        Returns per-rid outputs with the CUDA tensors replaced by CPU
         copies, plus ``HostRows`` when the submodule handed over row-addressed
-        buffers, for a batched stop check. Uses existing host buffers when
-        there's no completion event (CPU execution) or the device is unavailable.
+        buffers, for a batched stop check. Skipped (returns ``outputs`` unchanged) when there's no completion
+        event (CPU execution) or when CUDA is unavailable.
 
         AR engines emit small per-rid output dicts (sampled token + maybe
         a code) so the cost is negligible. If a future engine emits large
