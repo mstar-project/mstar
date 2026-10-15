@@ -141,6 +141,41 @@ class FlashInferPrefillWrapper:
             self.token_to_cache = None
 
         self._total_tokens = 0
+        # page-locked staging for an inline plan's host arrays (`_stage_pinned`)
+        self._pinned: dict[str, torch.Tensor] = {}
+        self._pinned_done = None
+
+    def _stage_pinned(self, qo_indptr, kv_indptr, last_page_len, kv_lens, indices):
+        """Copy the plan's host arrays into this wrapper's page-locked buffers,
+        once the previous plan's copies out of them have landed."""
+        if self._pinned_done is None:
+            self._pinned_done = torch.cuda.Event()
+        else:
+            # a plan or more back on this wrapper's slot: long since done
+            self._pinned_done.synchronize()
+        if kv_lens is None:
+            # FlashInfer's `get_seq_lens`, here so it is staged with the rest
+            kv_lens = (kv_indptr[1:] - kv_indptr[:-1] - 1).clamp_min(0) * self.page_size \
+                + last_page_len
+        out = []
+        for name, t in (
+            ("qo", qo_indptr), ("kv", kv_indptr), ("last", last_page_len),
+            ("lens", kv_lens), ("indices", indices),
+        ):
+            n = t.shape[0]
+            buf = self._pinned.get(name)
+            if buf is None or buf.shape[0] < n:
+                buf = self._pinned[name] = torch.empty(
+                    max(n, 2 * (buf.shape[0] if buf is not None else 0), 256),
+                    dtype=torch.int32, pin_memory=True,
+                )
+            view = buf[:n]
+            view.copy_(t)
+            out.append(view)
+        qo, kv, last, lens, idx = out
+        # keep the fast row iteration FlashInfer's `max(seq_lens)` relies on
+        from mstar.engine.resources.kv.plan import HostLens
+        return qo, kv, last, lens.as_subclass(HostLens), idx.shape[0]
 
     @torch.compiler.disable
     def plan(
@@ -151,6 +186,7 @@ class FlashInferPrefillWrapper:
         paged_kv_last_page_len: torch.Tensor,
         causal: bool = True,
         dtype: torch.dtype = torch.bfloat16,
+        kv_lens: torch.Tensor | None = None,
         **kwargs
     ):
         """Plan attention and compute KV write indices.
@@ -167,6 +203,24 @@ class FlashInferPrefillWrapper:
         per-token bookkeeping below.
         """
         self.dtype = dtype
+        if self.use_cuda_graph and paged_kv_indices.device.type != "cuda":
+            # A packed step plans inline on the gpu thread, behind the step
+            # still in flight on the same stream. A copy out of pageable host
+            # memory waits for that step to finish (and FlashInfer copies the
+            # indices blocking regardless), so the plan stalls for the whole
+            # of it. Stage every host array in this wrapper's own page-locked
+            # buffers and copy the indices into the captured buffer ourselves;
+            # FlashInfer's copy_ of that buffer onto itself is then a no-op.
+            qo_indptr, paged_kv_indptr, paged_kv_last_page_len, kv_lens, n = (
+                self._stage_pinned(
+                    qo_indptr, paged_kv_indptr, paged_kv_last_page_len,
+                    kv_lens, paged_kv_indices,
+                )
+            )
+            self._paged_kv_indices_buf[:n].copy_(
+                self._pinned["indices"][:n], non_blocking=True,
+            )
+            paged_kv_indices = self._paged_kv_indices_buf[:n]
         self.attn_wrapper.plan(
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
@@ -178,7 +232,13 @@ class FlashInferPrefillWrapper:
             page_size=self.page_size,
             causal=causal,
             q_data_type=dtype,
+            # host lengths, so plan neither rebuilds them nor copies pageable ones
+            seq_lens=kv_lens,
         )
+        if self._pinned_done is not None:
+            # every copy out of the staging buffers is issued: the next
+            # restage waits for them
+            self._pinned_done.record()
 
         # Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,
         # even if we're not in a cuda graph
