@@ -18,6 +18,8 @@ jobs:
       - name: Run Ruff
         # Use GitHub’s annotation format so lint errors show inline
         run: ruff check --output-format=github .
+      - name: Test the optional Mac runner
+        run: python -m unittest discover -s test/ci -v
   # The CPU-only engine/resource suite is listed in test/cpu-core.txt; other
   # modular tests import GPU backends during collection.
   cpu-core:
@@ -48,6 +50,9 @@ jobs:
           # BAGEL's CPU graph/KV tests import these model modules without
           # loading weights or requiring the CUDA-only BAGEL extras.
           python -m pip install einops regex transformers
+          # The Wan VAE decode tests build tiny random AutoencoderKLWan models
+          # (no weights); 0.39 is the release the decoder was verified on.
+          python -m pip install diffusers==0.39.0
           python -m pip check
       - name: Run CPU core tests
         env:
@@ -110,6 +115,7 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: cargo test --release --no-default-features
+      - run: cargo test --release --manifest-path rust/server/Cargo.toml
       - name: Build the Rust frontend (mstar-server)
         working-directory: rust/server
         run: cargo build --release
@@ -120,6 +126,8 @@ jobs:
           maturin build --release
           pip install target/wheels/*.whl
       - name: Interop tests (transport + arena + frontend)
+        env:
+          LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: |
           # pyyaml: the runtime tests reach mstar.model.base, which imports it
           pip install pytest pyzmq msgpack numpy pyyaml
@@ -129,4 +137,5 @@ jobs:
           pip install triton
           # the package itself, without its remaining (heavy) deps
           pip install --no-deps -e .
-          pytest test/rust/ -v
+          # the row store needs the columnar tensor store; cpu-core skips most of it
+          pytest test/rust/ test/modular/test_row_output_store.py -v
