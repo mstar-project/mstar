@@ -13,7 +13,7 @@ import logging
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
+from mstar.engine.resources.base import GraphSlotKey, GraphSlotSpec
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.linear_attn.wrappers import (
@@ -73,7 +73,7 @@ class GDNManager(LinearAttnManager):
 
         # See `build_accelerator_graph_buffers`.
         self._cg_max_bs = 0
-        self._cg_wrappers: dict[CGSlotKey, GDNWrapper] = {}
+        self._cg_wrappers: dict[GraphSlotKey, GDNWrapper] = {}
 
         # (label, is_decode) -> wrapper
         self._eager_wrappers: dict[tuple[str, bool], GDNWrapper] = {}
@@ -177,7 +177,7 @@ class GDNManager(LinearAttnManager):
             key, store = (label, is_decode), self._eager_wrappers
             bs, tok = None, None
         else:
-            key = CGSlotKey(lease.bucket, lease.slot, label)
+            key = GraphSlotKey(lease.bucket, lease.slot, label)
             store = self._cg_wrappers
             bs = max(self._cg_max_bs, lease.bucket.bs)
             tok = lease.bucket.num_tokens
@@ -307,7 +307,7 @@ class GDNManager(LinearAttnManager):
     # Engine lifecycle
 
     def build_accelerator_graph_buffers(
-        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
+        self, slots: list[GraphSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len
         # A floor under every capture wrapper's row count, so none reallocates

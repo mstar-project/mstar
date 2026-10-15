@@ -12,7 +12,7 @@ from collections.abc import Collection, Mapping
 from time import perf_counter
 from typing import Any
 
-from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.base import GraphSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
@@ -626,7 +626,7 @@ class StepRunner:
         return out
 
     def build_accelerator_graph_buffers(
-        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
+        self, slots: list[GraphSlotSpec], max_bs: int, max_seq_len: int,
         node_name: str | None = None,
     ) -> None:
         """resources preallocate the static buffers captured replays will read

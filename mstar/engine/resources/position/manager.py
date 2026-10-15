@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, fields
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, PublishedInfo, Resource
+from mstar.engine.resources.base import EngineResourceInfo, GraphSlotKey, PublishedInfo, Resource
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
@@ -107,10 +107,10 @@ class RopeManager(PositionManager):
         # rid -> tokens the prefix cache matched, until `admit`
         self._matched: dict[str, int] = {}
 
-        self._static_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
+        self._static_pos_ids: dict[GraphSlotKey, torch.Tensor] = {}
         # Host side of the same addressing, keyed the same way; see
         # `_pinned_pos_ids_buffer`.
-        self._pinned_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
+        self._pinned_pos_ids: dict[GraphSlotKey, torch.Tensor] = {}
         # plan label -> ids of this step on device
         # to buffer when capture; to fresh tensor when reager
         self._current_pos_ids: dict[str, torch.Tensor] = {}
@@ -125,7 +125,7 @@ class RopeManager(PositionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
-    def _static_buffer(self, key: CGSlotKey, num_tokens: int) -> torch.Tensor:
+    def _static_buffer(self, key: GraphSlotKey, num_tokens: int) -> torch.Tensor:
         """The captured-graph pos_ids buffer for one (bucket, slot, label).
 
         Built on the first plan for that key rather than up front: which labels
@@ -362,7 +362,7 @@ class RopeManager(PositionManager):
         return step.pos_ids.get(plan_label)
 
     def _pinned_pos_ids_buffer(
-        self, key: CGSlotKey, num_tokens: int,
+        self, key: GraphSlotKey, num_tokens: int,
     ) -> torch.Tensor:
         """Pinned host staging for one (bucket, slot, label)'s positions.
 
@@ -396,7 +396,7 @@ class RopeManager(PositionManager):
                 pos_ids.extend(range(start, start + to_compute))
         if lease is None:
             return torch.tensor(pos_ids, dtype=torch.long)
-        key = CGSlotKey(
+        key = GraphSlotKey(
             bucket=lease.bucket, slot=lease.slot, label=plan_label
         )
         buffer = self._pinned_pos_ids_buffer(key, lease.bucket.num_tokens)
@@ -417,7 +417,7 @@ class RopeManager(PositionManager):
                 pos_ids = pos_ids.to(self._device, non_blocking=True)
             return pos_ids
 
-        key = CGSlotKey(
+        key = GraphSlotKey(
             bucket=lease.bucket, slot=lease.slot, label=plan_label
         )
         buffer = self._static_buffer(key, lease.bucket.num_tokens)

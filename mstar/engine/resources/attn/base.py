@@ -158,7 +158,7 @@ class PlanCacheKey(NamedTuple):
 
 
 class EagerSlotKey(NamedTuple):
-    """One eager wrapper — the counterpart of ``CGSlotKey``, slotted for the
+    """One eager wrapper — the counterpart of ``GraphSlotKey``, slotted for the
     same reason (FlashInfer's plan stages into a pinned buffer per wrapper)."""
     label: str
     slot: int

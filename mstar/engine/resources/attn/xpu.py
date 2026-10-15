@@ -7,7 +7,7 @@ import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.base import CGSlotKey
+from mstar.engine.resources.base import GraphSlotKey
 from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
@@ -62,7 +62,7 @@ class XPUPagedAttentionManager(AttentionManager):
         self._device = device
         self._kv_config = kv_config
         self._current_plans: dict[str, XPUPagedPlan] = {}
-        self._cg_plans: dict[CGSlotKey, XPUPagedPlan] = {}
+        self._graph_plans: dict[GraphSlotKey, XPUPagedPlan] = {}
         self._preplan_states: dict[str, XPUPagedPlan] = {}
         self._preplanned = False
 
@@ -96,12 +96,12 @@ class XPUPagedAttentionManager(AttentionManager):
             if lease is None:
                 plan = new_plan
             else:
-                key = CGSlotKey(
+                key = GraphSlotKey(
                     bucket=lease.bucket, slot=lease.slot, label=label
                 )
-                plan = self._cg_plans.get(key)
+                plan = self._graph_plans.get(key)
                 if plan is None:
-                    self._cg_plans[key] = new_plan
+                    self._graph_plans[key] = new_plan
                     plan = new_plan
                 else:
                     plan.copy_(new_plan)

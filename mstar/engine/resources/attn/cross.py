@@ -18,8 +18,8 @@ from mstar.engine.resources.attn.config import (
 from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper
 from mstar.engine.resources.base import (
     AttentionResource,
-    CGSlotKey,
     EngineResourceInfo,
+    GraphSlotKey,
 )
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import (
@@ -97,11 +97,11 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._current_plan_states: dict[str, AttentionWrapper] = {}
         # persistent wrappers [we can keep eager ones]
         self._eager_plan_states: dict[EagerSlotKey, AttentionWrapper] = {}
-        self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
+        self._cg_plan_states: dict[GraphSlotKey, AttentionWrapper] = {}
 
         self._preplan_states: dict[str, AttentionWrapper] = {}
         self._preplanned = False
-        # wrapper key (plan label, or CGSlotKey under capture) -> fingerprint
+        # wrapper key (plan label, or GraphSlotKey under capture) -> fingerprint
         # of the last plan call made on that wrapper
         # NOTE: a little bit (very) sketchy should be refined; goal is to avoid
         # redundant plan comp. how to do the mapping to track is another issue
@@ -328,7 +328,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         ordinary label, more when the query plan combines labels. See
         ``FlashInferManager._cg_wrapper``."""
         if lease is not None:
-            key = CGSlotKey(
+            key = GraphSlotKey(
                 bucket=lease.bucket, slot=lease.slot, label=plan_label
             )
             wrapper = self._cg_plan_states.get(key)

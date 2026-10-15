@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
+from mstar.engine.resources.base import GraphSlotKey, GraphSlotSpec
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.linear_attn.mamba2_kernels import (
@@ -241,7 +241,7 @@ class Mamba2Manager(LinearAttnManager):
     # Engine lifecycle
 
     def build_accelerator_graph_buffers(
-        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
+        self, slots: list[GraphSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
@@ -253,4 +253,4 @@ class Mamba2Manager(LinearAttnManager):
 # kept for symmetry with gdn.py's per-(bucket, slot, label) wrapper stores; the
 # Mamba-2 plan owns no device buffers of its own (it narrows the pool's), so a
 # capture bucket needs nothing sized ahead
-_ = CGSlotKey, SlotLease
+_ = GraphSlotKey, SlotLease

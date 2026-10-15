@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
-class CGSlotSpec:
+class GraphSlotSpec:
     bucket: BucketKey
     slot: int
     # a whole forward's capture, or one piecewise region's
@@ -42,7 +42,7 @@ class CGSlotSpec:
 
 
 @dataclass(frozen=True)
-class CGSlotKey:
+class GraphSlotKey:
     bucket: BucketKey
     slot: int
     label: str
@@ -356,7 +356,7 @@ class Resource(ABC):
     # Engine lifecycle
 
     def build_accelerator_graph_buffers(
-        self, slots: list[CGSlotSpec],
+        self, slots: list[GraphSlotSpec],
         max_bs: int, max_seq_len: int
     ) -> None:
         """Size whatever the captured replays will read.

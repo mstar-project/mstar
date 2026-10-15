@@ -20,7 +20,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
-from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
+from mstar.engine.resources import BucketKey, GraphSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils import profiler
 from mstar.utils.device import DeviceCapability
@@ -314,7 +314,7 @@ class AcceleratorGraphRunner:
         self.dropped_buckets: list[BucketKey] = []
         self._blocked_buckets: list[BucketKey] = []
         # set by prepare_for_capture; capture reuses it rather than re-deriving
-        self._prepared_slot_specs: list[CGSlotSpec] | None = None
+        self._prepared_slot_specs: list[GraphSlotSpec] | None = None
 
         # (config_idx, tensor_key) → max-bucket static buffer. Lazily populated
         # by _intern_static_buffer on the first capture. Smaller-bucket captures
@@ -364,7 +364,7 @@ class AcceleratorGraphRunner:
 
     # ── Capture ─────────────────────────────────────────────────────────
 
-    def _get_slot_specs(self) -> list[CGSlotSpec]:
+    def _get_slot_specs(self) -> list[GraphSlotSpec]:
         specs = []
         for config_idx, config in enumerate(self._capture_configs):
             for bs in self._batch_sizes(config):
@@ -376,7 +376,7 @@ class AcceleratorGraphRunner:
                         num_tokens=num_tokens,
                     )
                     for slot in range(self._num_slots):
-                        specs.append(CGSlotSpec(
+                        specs.append(GraphSlotSpec(
                             bucket=bucket,
                             slot=slot,
                             config=config,
@@ -384,7 +384,7 @@ class AcceleratorGraphRunner:
                         ))
         return specs
 
-    def _get_addtl_slot_specs(self, spec: CGSlotSpec) -> list[CGSlotSpec]:
+    def _get_addtl_slot_specs(self, spec: GraphSlotSpec) -> list[GraphSlotSpec]:
         """The same capture, keyed under the config's other replay walks."""
         return [
             replace(spec, bucket=replace(spec.bucket, graph_walk=walk))
@@ -392,7 +392,7 @@ class AcceleratorGraphRunner:
             if walk != spec.config.capture_graph_walk
         ]
 
-    def prepare_for_capture(self) -> list[CGSlotSpec]:
+    def prepare_for_capture(self) -> list[GraphSlotSpec]:
         """Claim the static buffers this runner's captures will read.
 
         Split from the capture so every runner claims first: nodes share
@@ -462,7 +462,7 @@ class AcceleratorGraphRunner:
         # deferred to a whole bucket at a time: its slots are double buffers of
         # one shape, so a bucket holding only some of them would silently hand
         # pre-plan and replay the same buffers.
-        captured: dict[BucketKey, dict[int, tuple[CGSlotSpec, AcceleratorGraphSlot]]] = {}
+        captured: dict[BucketKey, dict[int, tuple[GraphSlotSpec, AcceleratorGraphSlot]]] = {}
         for spec in slot_specs:
             # every rank barriers once per spec, pass or fail — a rank that
             # stopped early here would leave the others waiting
@@ -527,7 +527,7 @@ class AcceleratorGraphRunner:
 
     def _buckets_captured_everywhere(
         self,
-        slot_specs: list[CGSlotSpec],
+        slot_specs: list[GraphSlotSpec],
         captured: Mapping[BucketKey, Mapping[int, Any]],
     ) -> set[BucketKey]:
         """The buckets every rank captured in full.
@@ -552,7 +552,7 @@ class AcceleratorGraphRunner:
         )
         return {key for key, ok in zip(order, agreed, strict=True) if ok}
 
-    def _register_slot(self, spec: CGSlotSpec, slot: AcceleratorGraphSlot) -> None:
+    def _register_slot(self, spec: GraphSlotSpec, slot: AcceleratorGraphSlot) -> None:
         bucket = self._buckets.get(spec.bucket)
         if bucket is None:
             bucket = self._buckets[spec.bucket] = AcceleratorGraphBucket(
@@ -582,7 +582,7 @@ class AcceleratorGraphRunner:
             (mem_after - mem_before) / (1024 ** 2),
         )
 
-    def _capture_one(self, spec: CGSlotSpec) -> AcceleratorGraphSlot:
+    def _capture_one(self, spec: GraphSlotSpec) -> AcceleratorGraphSlot:
         walk = spec.bucket.graph_walk
         config = spec.config
         dummy_rids = self._dummy_rows.ensure(
@@ -678,7 +678,7 @@ class AcceleratorGraphRunner:
             # now, since replay's padding rows address the sink page and slot.
             self._dummy_rows.reset(dummy_rids, free=True)
 
-    def _forward_for(self, spec: CGSlotSpec):
+    def _forward_for(self, spec: GraphSlotSpec):
         """The callable this bucket captures, compiled once per config.
 
         One wrapper per config rather than per capture: ``dynamic=False`` keys
@@ -1230,7 +1230,7 @@ class PiecewiseAcceleratorGraphRunner:
             if shapes:
                 self._step_runner.build_accelerator_graph_buffers(
                     [
-                        CGSlotSpec(
+                        GraphSlotSpec(
                             bucket=self._bucket(shape), slot=slot,
                             config=self._config,
                         )
