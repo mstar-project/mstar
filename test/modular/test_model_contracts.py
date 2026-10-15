@@ -120,21 +120,23 @@ def test_bagel_sampling_forwards_min_p_and_penalize_prompt():
     assert sampling.repetition_penalty == 1.05
 
 
-def test_bagel_unset_knobs_take_the_checkpoint_generation_config(tmp_path, monkeypatch):
-    (tmp_path / "generation_config.json").write_text(json.dumps({
-        "do_sample": True, "repetition_penalty": 1.05,
-        "temperature": 0.7, "top_p": 0.8, "top_k": 20,
-    }))
+def test_bagel_checkpoint_knob_values_are_ignored_but_do_sample_false_is_greedy(tmp_path, monkeypatch):
+    # BAGEL-7B-MoT ships Qwen2.5-7B-Instruct's file; its values are not BAGEL's recipe
+    qwen2_5 = {"do_sample": True, "repetition_penalty": 1.05, "temperature": 0.7, "top_p": 0.8, "top_k": 20}
     monkeypatch.setattr(
         bagel_mod, "hf_hub_download",
         lambda **kw: str(tmp_path / kw["filename"]),
     )
     model = _bagel_model()
+    (tmp_path / "generation_config.json").write_text(json.dumps(qwen2_5))
     model.sampling_defaults = model._load_sampling_defaults("repo", None)
+    assert model.sampling_defaults == BAGEL_CONFIG_DEFAULTS
     sampling = model.get_sampling_config("LLM", {"top_k": 5})
-    assert (sampling.temperature, sampling.top_p, sampling.top_k) == (0.7, 0.8, 5)
-    assert sampling.repetition_penalty == 1.05
+    assert (sampling.temperature, sampling.top_p, sampling.top_k) == (0.6, 1.0, 5)
     assert sampling.min_p == 0.0
+
+    (tmp_path / "generation_config.json").write_text(json.dumps({**qwen2_5, "do_sample": False}))
+    assert model._load_sampling_defaults("repo", None) == {**BAGEL_CONFIG_DEFAULTS, "temperature": 0.0}
 
 
 def test_bagel_no_generation_config_keeps_config_defaults(monkeypatch):
@@ -149,8 +151,7 @@ def test_bagel_no_generation_config_keeps_config_defaults(monkeypatch):
 def _bagel_stop(walk: str, loop_count: int, max_tokens: int, token: int = 5) -> set[str]:
     import torch
 
-    from mstar.model.bagel.submodules import LLMSubmodule
-    from mstar.model.higgs_audio.config import SAMPLER
+    from mstar.model.bagel.submodules import SAMPLER, LLMSubmodule
 
     llm = LLMSubmodule.__new__(LLMSubmodule)
     llm.eos_token_id = 9
@@ -407,6 +408,27 @@ def test_qwen3_omni_code_predictor_gets_no_penalty_and_refuses_one(omni_released
     asked = omni_released.get_request_resource_configs({}, {"code_predictor_repetition_penalty": 1.2})
     with pytest.raises(ValueError, match="repetition_penalty"):
         asked[CODE_PRED_SAMPLER].validate(spec)
+
+
+def test_qwen3_omni_checkpoint_min_p_turns_the_capability_on(tmp_path):
+    (tmp_path / "generation_config.json").write_text(json.dumps(
+        {**OMNI_GENERATION_CONFIG, "min_p": 0.05, "talker_min_p": 0.02}
+    ))
+    model = _omni_model(tmp_path)
+    text = SimpleNamespace(
+        num_hidden_layers=1, num_key_value_heads=1, num_attention_heads=1,
+        max_position_embeddings=8, vocab_size=16,
+    )
+    model.config = SimpleNamespace(
+        thinker_text=text, talker_text=text, thinker_head_dim=8, talker_head_dim=8,
+        code_predictor=SimpleNamespace(vocab_size=16),
+    )
+    specs = {s.resource_key: s for s in model.get_node_resources() if isinstance(s, SamplerSpec)}
+    assert specs[THINKER_SAMPLER].enable_min_p and specs[TALKER_SAMPLER].enable_min_p
+    assert not specs[CODE_PRED_SAMPLER].enable_min_p
+    # a plain request takes those defaults and is not refused
+    for key, config in model.get_request_resource_configs({}, {}).items():
+        config.validate(specs[key])
 
 
 @pytest.mark.parametrize("value", [0, 1.5, True, "100"])

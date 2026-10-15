@@ -1416,6 +1416,27 @@ def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
     assert configs[CODE_PRED_SAMPLER].seed != 99
 
 
+def test_qwen3_tts_checkpoint_min_p_turns_the_capability_on():
+    model = _make_model()
+    model._generation_defaults_cache = {
+        **model._generation_defaults(), "min_p": 0.05, "code_predictor_min_p": 0.1,
+    }
+    specs = {
+        spec.resource_key: spec for spec in model.get_node_resources()
+        if isinstance(spec, SamplerSpec)
+    }
+    assert specs[TALKER_SAMPLER].enable_min_p and specs[CODE_PRED_SAMPLER].enable_min_p
+    # a plain request takes those defaults and is not refused
+    for key, config in model.get_request_resource_configs({}).items():
+        config.validate(specs[key])
+    # without them the capability stays off
+    plain = {
+        spec.resource_key: spec for spec in _make_model().get_node_resources()
+        if isinstance(spec, SamplerSpec)
+    }
+    assert not plain[TALKER_SAMPLER].enable_min_p and not plain[CODE_PRED_SAMPLER].enable_min_p
+
+
 class _FakeCodecDecoder(torch.nn.Module):
     def __init__(self, upsample: int):
         super().__init__()

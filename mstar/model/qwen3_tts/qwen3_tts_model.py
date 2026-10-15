@@ -477,6 +477,8 @@ class Qwen3TTSModel(Model):
         Talker submodule owns it (overwritten every step)."""
         talker = self.config.talker
         cp = talker.code_predictor
+        # min_p is on where the checkpoint defaults it on, so that default is not refused
+        defaults = self._generation_defaults()
         talker_kv = PagedKVConfig(
             num_layers=talker.num_hidden_layers,
             num_kv_heads=talker.num_key_value_heads,
@@ -498,11 +500,13 @@ class Qwen3TTSModel(Model):
                 resource_key=TALKER_SAMPLER, nodes={"Talker"},
                 vocab_size=talker.vocab_size,
                 enable_repetion_penalty=True,
+                enable_min_p=bool(defaults.get("min_p")),
             ),
             SamplerSpec(
                 resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
                 vocab_size=cp.vocab_size,
                 enable_repetion_penalty=False,
+                enable_min_p=bool(defaults.get("code_predictor_min_p")),
             ),
         ]
 

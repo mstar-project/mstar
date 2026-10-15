@@ -68,7 +68,7 @@ class OrpheusModelConfig:
     snac_left_context_frames: int = 3
     snac_right_context_frames: int = 2
 
-    # Sampling defaults; the checkpoint's generation_config.json overrides them
+    # Sampling recipe; the checkpoint's generation_config.json is Llama's, so only do_sample is read
     temperature: float = 0.6
     top_p: float = 0.8
     top_k: int = 0

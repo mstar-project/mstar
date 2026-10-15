@@ -233,6 +233,8 @@ class Qwen3OmniModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
     def get_node_resources(self) -> list[NodeResourceSpec]:
+        # min_p is on where the checkpoint defaults it on, so that default is not refused
+        defaults = self._generation_defaults()
         thinker_kv = PagedKVConfig(
             num_layers=self.config.thinker_text.num_hidden_layers,
             num_kv_heads=self.config.thinker_text.num_key_value_heads,
@@ -292,18 +294,21 @@ class Qwen3OmniModel(Model):
                 nodes={"Thinker"},
                 vocab_size=self.config.thinker_text.vocab_size,
                 enable_repetion_penalty=True,
+                enable_min_p=bool(defaults.get("thinker_min_p")),
             ),
             SamplerSpec(
                 resource_key=TALKER_SAMPLER,
                 nodes={"Talker"},
                 vocab_size=self.config.talker_text.vocab_size,
                 enable_repetion_penalty=True,
+                enable_min_p=bool(defaults.get("talker_min_p")),
             ),
             SamplerSpec(
                 resource_key=CODE_PRED_SAMPLER,
                 nodes={"Talker"},
                 vocab_size=self.config.code_predictor.vocab_size,
                 enable_repetion_penalty=False,
+                enable_min_p=bool(defaults.get("code_predictor_min_p")),
             )
         ]
 

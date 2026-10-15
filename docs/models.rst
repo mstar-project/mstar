@@ -163,6 +163,16 @@ Notes
   GPU, and default tiles otherwise. ``python -m mstar.utils.fused_moe.tune``
   writes a table for the local GPU.
 - To add a new family, see :doc:`adding_models`.
+- Unset sampling knobs take the checkpoint's ``generation_config.json``, then the
+  model's config. BAGEL and Orpheus are the exception: their files are the
+  backbone's chat presets (Qwen2.5-7B-Instruct, Llama-3.2-3B), so only
+  ``do_sample: false`` is read and the recipes stay (BAGEL temperature 0.6,
+  top_k 0, top_p 1.0; Orpheus temperature 0.6, top_p 0.8).
+- Qwen3-Omni's Talker cap comes from ``talker_max_new_tokens``, 4096 on the
+  released checkpoint (it was 2048). Plain sampling keys target the Thinker on
+  every route; ``talker_*`` and ``code_predictor_*`` set the other stages.
+- Qwen3-TTS: ``talker_<knob>`` wins over a plain ``<knob>`` when a request
+  sends both.
 
 OmniVoice notes
 ~~~~~~~~~~~~~~~

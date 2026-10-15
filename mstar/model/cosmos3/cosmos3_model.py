@@ -418,6 +418,8 @@ class Cosmos3Model(Model):
                 resource_key=SAMPLER, nodes={REASONER_NODE},
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
+                # on when the checkpoint defaults it on, so that default is not refused
+                enable_min_p=bool(getattr(self, "_generation_defaults", {}).get("min_p")),
             ))
         if self.config.attention_backend == "dense_gen":
             specs.append(AttentionSpec(

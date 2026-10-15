@@ -407,7 +407,11 @@ class BagelModel(Model):
         self._image_gen_remote_handoff = False
 
     def _load_sampling_defaults(self, repo_id: str, cache_dir: str | None) -> dict:
-        """Config values, overridden by the checkpoint's ``generation_config.json``."""
+        """BAGEL's recipe from the config; ``generation_config.json`` can only turn sampling off.
+
+        BAGEL-7B-MoT ships Qwen2.5-7B-Instruct's file (0.7 / top_k 20 / top_p 0.8),
+        the backbone's chat preset, so its knob values are not read.
+        """
         defaults = {k: getattr(self.config, k) for k in SAMPLING_KEYS if hasattr(self.config, k)}
         try:
             path = hf_hub_download(
@@ -415,8 +419,7 @@ class BagelModel(Model):
             )
         except EntryNotFoundError:
             return defaults
-        checkpoint = load_generation_defaults(Path(path).parent)
-        defaults.update({k: v for k, v in checkpoint.items() if k in SAMPLING_KEYS})
+        defaults.update(load_generation_defaults(Path(path).parent, switch_only=True))
         return defaults
 
     @property
@@ -1621,6 +1624,7 @@ class BagelModel(Model):
                     metadata.graph_walk = DECODE
                     request_done = True
                 elif budget_spent:
+                    # think budget 1: no think decode, so the prefill token never enters the KV before image_gen
                     metadata.graph_walk = self._image_gen_walk
                 elif target == "text":
                     metadata.graph_walk = DECODE

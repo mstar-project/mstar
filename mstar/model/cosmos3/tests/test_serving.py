@@ -826,6 +826,15 @@ def test_min_p_refused_by_reasoner_node(contract_model, monkeypatch) -> None:
     _contract_sampler(contract_model, {"repetition_penalty": 1.2}).validate(spec)
 
 
+def test_checkpoint_min_p_turns_the_reasoner_capability_on(contract_model, monkeypatch) -> None:
+    monkeypatch.setattr(contract_model, "_reasoner_enabled", lambda: True)
+    contract_model._generation_defaults = {"min_p": 0.05}
+    spec = next(s for s in contract_model.get_node_resources() if s.resource_key == SAMPLER)
+    assert spec.enable_min_p
+    # a plain request takes that default and is not refused
+    _contract_sampler(contract_model, {}).validate(spec)
+
+
 def test_sampler_defaults(contract_model, tmp_path) -> None:
     cfg = _contract_sampler(contract_model, {})
     assert (cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p, cfg.repetition_penalty) == (

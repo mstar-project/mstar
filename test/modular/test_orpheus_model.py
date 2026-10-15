@@ -129,14 +129,16 @@ def test_bad_voice_is_a_value_error(voice):
         _model().process_prompt("hi", ["text"], ["audio"], voice=voice)
 
 
-def test_checkpoint_generation_config_overrides_config_defaults(tmp_path):
-    (tmp_path / "generation_config.json").write_text(json.dumps(
-        {"do_sample": True, "temperature": 0.7, "top_p": 0.9, "max_new_tokens": 9000}
-    ))
+def test_checkpoint_knob_values_are_ignored_but_do_sample_false_is_greedy(tmp_path):
+    # the file Orpheus ships is Llama-3.2-3B's chat preset, not Orpheus's recipe
+    llama = {"do_sample": True, "temperature": 0.6, "top_p": 0.9, "max_new_tokens": 9000}
+    (tmp_path / "generation_config.json").write_text(json.dumps(llama))
+    assert _checkpoint_sampling_defaults(str(tmp_path), None) == {}
+    (tmp_path / "generation_config.json").write_text(json.dumps({**llama, "do_sample": False}))
     defaults = _checkpoint_sampling_defaults(str(tmp_path), None)
-    assert defaults == {"temperature": 0.7, "top_p": 0.9}
+    assert defaults == {"temperature": 0.0}
     config = dataclasses.replace(OrpheusModelConfig(), **defaults)
-    assert (config.temperature, config.top_p, config.repetition_penalty) == (0.7, 0.9, 1.3)
+    assert (config.temperature, config.top_p, config.repetition_penalty) == (0.0, 0.8, 1.3)
 
 
 def test_unreachable_checkpoint_keeps_config_defaults(monkeypatch):

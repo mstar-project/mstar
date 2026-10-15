@@ -59,8 +59,12 @@ SAMPLING_KEYS = (
 
 
 def _checkpoint_sampling_defaults(model_path_hf: str, cache_dir: str | None) -> dict:
-    """The sampling knobs the checkpoint's generation_config.json sets; {} when
-    it is unreachable (the repo is gated)."""
+    """Greedy when the checkpoint's generation_config.json sets ``do_sample: false``;
+    {} when it is unreachable (the repo is gated).
+
+    The file is Llama-3.2-3B's chat preset (top_p 0.9), not Orpheus's recipe, so
+    its knob values are not read and the config's apply on every host.
+    """
     if not model_path_hf:
         return {}
     if Path(model_path_hf).is_dir():
@@ -75,8 +79,7 @@ def _checkpoint_sampling_defaults(model_path_hf: str, cache_dir: str | None) -> 
         except Exception as e:
             logger.warning("No generation_config.json for %s (%s); using config defaults", model_path_hf, e)
             return {}
-    defaults = load_generation_defaults(checkpoint_dir)
-    return {k: v for k, v in defaults.items() if k in SAMPLING_KEYS}
+    return load_generation_defaults(checkpoint_dir, switch_only=True)
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
