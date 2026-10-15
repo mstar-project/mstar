@@ -108,8 +108,9 @@ class OrpheusModelConfig:
 
         The schedule's windows and every final flush: the policy runs over
         each stream length until the windows repeat. The windows do not depend
-        on when tokens arrive, only on how many there are. A stream shorter
-        than a frame decodes one silent frame.
+        on when tokens arrive, only on how many there are. A window shorter
+        than a frame (a stream shorter than a frame, or a final flush holding
+        only the EOS token) decodes one silent frame, as in ``prepare_inputs``.
         """
         tpf = self.tokens_per_frame
         steady = self.snac_left_context_frames + self.snac_right_context_frames + self.snac_chunk_frames
@@ -121,5 +122,5 @@ class OrpheusModelConfig:
                 stride = policy.next_chunk_size(left)
                 policy.register_chunk(stride)
                 left -= stride
-            sizes.add(left // tpf)
+            sizes.add(max(left // tpf, 1))
         return sorted(sizes)

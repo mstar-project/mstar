@@ -303,6 +303,21 @@ def _tiny_case(config: OrpheusModelConfig, case) -> torch.Tensor:
     return _tokens(config, case, seed=10 + case, eos=True)
 
 
+def test_no_context_geometry_captures_only_decodable_windows():
+    """With no context, a final flush can hold only the EOS token. Its window
+    decodes as one frame, so no capture may be zero frames wide: SNAC's
+    convolutions reject an empty input during warm-up."""
+    config = OrpheusModelConfig(snac_chunk_schedule=(4,), snac_left_context_frames=0,
+                                snac_right_context_frames=0)
+    assert config.snac_window_frames() == [1, 2, 3, 4]
+    submodule = SNACDecoderSubmodule(_tiny_snac(), config)
+    for cfg in submodule.get_cuda_graph_configs(torch.device("cpu")):
+        assert cfg.additional_key_info == cfg.single_request_inputs.input_ids.shape[0] >= 1
+        codes = submodule.preprocess("snac_chunk", None, [cfg.single_request_inputs])
+        audio = submodule._decode(codes["codes_0"], codes["codes_1"], codes["codes_2"])
+        assert audio.shape[-1] == cfg.additional_key_info * HOP
+
+
 @pytest.mark.parametrize("case", [3, 6, 25, "recorded"])
 def test_tiny_snac_stream_is_close_to_whole_decode(tiny, case):
     tokens = _tiny_case(tiny.config, case)
