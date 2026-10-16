@@ -65,6 +65,9 @@ def _conductor(requests, drain_ttl_s=120.0):
     c._draining_deadlines = deque()
     c._early_reads_done_deadlines = deque()
     c._early_abort_deadlines = deque()
+    c._torn_down = {}
+    c._torn_down_deadlines = deque()
+    c._unsent_teardown = []
     c.waiting_queue = []
     c.enable_prof = False
     c.enable_nvtx = False
@@ -248,6 +251,124 @@ def test_abort_racing_ingest_discards_its_early_reads_done():
     c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
     c._ingest_request(_new_request("r1"))
     assert "r1" not in c._early_reads_done
+
+
+# ── late messages for a torn-down request ───────────────────────────────────
+
+def _complete_and_tear_down(c, rid):
+    c._process_request_done(rid)
+    c._handle_reads_done(ReadsDone(request_id=rid, entity_id=PREPROCESS))
+    assert rid not in c.requests
+
+
+def _admitting(c):
+    admitted = []
+    c._admit_request = lambda body: admitted.append(body.request_id)
+    return admitted
+
+
+def test_a_late_abort_does_not_drop_a_rerun_of_the_id():
+    """The API server sends an abort when a client disconnects as its answer
+    arrives, after the conductor already tore the request down. That abort
+    must not tombstone the id: a client re-running it would hang."""
+    c = _conductor({"r1": _request_data()})
+    admitted = _admitting(c)
+    _complete_and_tear_down(c, "r1")
+
+    c._abort_request("r1")
+    c._ingest_request(_new_request("r1"))
+    assert admitted == ["r1"]
+    assert "r1" not in c._early_abort_requests
+
+
+def test_a_late_reads_done_does_not_pre_ack_a_rerun():
+    """After a failure's barrier, the API server's own cleanup still sends a
+    READS_DONE. Kept as an early ACK, it would let a re-run of the id finish
+    its teardown without waiting for the preprocess worker's reads."""
+    c = _conductor({"r1": _request_data()})
+    c._fail_requests(FailRequests(errors={"r1": "boom"}))
+    for entity in ("w0", PREPROCESS):
+        c._handle_reads_done(ReadsDone(request_id="r1", entity_id=entity))
+    assert "r1" not in c.requests
+
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
+    assert "r1" not in c._early_reads_done
+    c._ingest_request(_new_request("r1"))
+    c.requests["r1"] = _request_data()  # what the dispatch registers
+    c._process_request_done("r1")
+    assert c.draining["r1"].expected_acks == {PREPROCESS}
+
+
+def test_a_queued_abort_s_reads_done_does_not_pre_ack_a_rerun():
+    """The data worker answers its own abort with a READS_DONE, which lands
+    after the conductor already dropped the queued request."""
+    c = _conductor({})
+    c.waiting_queue = [_new_request("r1")]
+    c._abort_request("r1")
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
+    assert "r1" not in c._early_reads_done
+    c._ingest_request(_new_request("r1"))
+    c.requests["r1"] = _request_data()
+    c._process_request_done("r1")
+    assert c.draining["r1"].expected_acks == {PREPROCESS}
+
+
+def test_a_late_abort_after_a_rejection_does_not_drop_a_rerun():
+    c = _conductor({})
+    admitted = _admitting(c)
+    c._ingest_request(_new_request("r1", {"seed": "abc"}))  # rejected with a 400
+    c._abort_request("r1")
+    c._ingest_request(_new_request("r1"))
+    assert admitted == ["r1"]
+
+
+def test_an_abort_for_an_id_never_seen_still_tombstones_it():
+    c = _conductor({})
+    admitted = _admitting(c)
+    c._abort_request("r1")
+    c._ingest_request(_new_request("r1"))
+    assert admitted == []
+    assert _remove_targets(c, "r1") == {PREPROCESS}
+
+
+def test_late_messages_after_an_abort_that_outran_its_ingest_spare_a_rerun():
+    """The abort outran NEW_REQUEST, so ingest dropped the request. The API
+    server's own release still sends a READS_DONE, and may send another abort,
+    after that; neither may drop or pre-ack a re-run of the id."""
+    c = _conductor({})
+    admitted = _admitting(c)
+    c._abort_request("r1")
+    c._ingest_request(_new_request("r1"))
+
+    c._abort_request("r1")
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
+    assert "r1" not in c._early_reads_done
+    c._ingest_request(_new_request("r1"))
+    assert admitted == ["r1"]
+    c.requests["r1"] = _request_data()
+    c._process_request_done("r1")
+    assert c.draining["r1"].expected_acks == {PREPROCESS}
+
+
+def test_an_abort_for_a_rerun_in_flight_tears_it_down():
+    c = _conductor({"r1": _request_data()})
+    _complete_and_tear_down(c, "r1")
+    c._ingest_request(_new_request("r1"))
+    c.requests["r1"] = _request_data()
+    c._abort_request("r1")
+    assert "r1" in c.draining
+
+
+def test_a_torn_down_id_is_forgotten_after_the_ttl():
+    c = _conductor({"r1": _request_data()}, drain_ttl_s=0.0)
+    admitted = _admitting(c)
+    _complete_and_tear_down(c, "r1")
+    c._sweep_expiry()
+    assert c._torn_down == {} and not c._torn_down_deadlines
+    # Past the window, an abort for the id is again taken as racing its ingest.
+    c._abort_request("r1")
+    c._ingest_request(_new_request("r1"))
+    assert admitted == []
 
 
 # ── ingest failures ─────────────────────────────────────────────────────────
