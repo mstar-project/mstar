@@ -557,38 +557,9 @@ class VJepa2Model(Model):
     # Model ABC: I/O
     # ------------------------------------------------------------------
 
-    def load_video(self, filepath: str, device: str) -> TensorAndMetadata:
-        """Decode a video file into ``[frames_per_clip, C, H, W]`` float in ``[0, 1]``.
-
-        Mirrors HuggingFace ``BaseVideoProcessor`` Path 2
-        (``video_processing_utils.py:294``): read metadata, compute the
-        uniform sample indices, and hand those indices to the decoder so
-        only the sampled frames are materialized.  For long clips this is
-        the difference between decoding 64 frames and decoding thousands
-        (= seconds, not minutes).
-
-        Device handling mirrors HF too: we don't pass a device to the
-        decoder (HF's decode path doesn't either; device placement happens
-        downstream in ``_prepare_input_videos``).  The ``device`` argument
-        here is kept for signature-compatibility with ``Model.load_video``
-        but is intentionally ignored — decode stays on CPU, later steps
-        move tensors to GPU as needed.
-        """
-        from torchcodec.decoders import VideoDecoder
-
+    def _sample_indices(self, total: int, filepath: str) -> list[int]:
+        """The frames ``load_video`` keeps out of ``total``."""
         target_frames = self.config.frames_per_clip
-        logger.info("load_video: opening %s", filepath)
-        decoder = VideoDecoder(filepath)
-        logger.info("load_video: decoder opened; reading metadata")
-
-        metadata_obj = getattr(decoder, "metadata", None)
-        total = None
-        if metadata_obj is not None:
-            total = getattr(metadata_obj, "num_frames", None)
-        if total is None:
-            total = len(decoder)
-        total = int(total)
-
         # ``frames_per_clip`` is an architectural config (also feeds
         # ``grid_depth`` for the predictor's attention mask) and must stay
         # at the trained value (64). For AC rollout requests the input
@@ -614,6 +585,53 @@ class VJepa2Model(Model):
             indices[-3:],
             step,
         )
+        return indices
+
+    def _load_video_pyav(self, filepath: str) -> TensorAndMetadata:
+        """``load_video`` where torchcodec cannot load (see ``Model.load_video``):
+        PyAV decodes every frame, then the same ones are kept."""
+        from mstar.model.components.video_io import decode_video_pyav
+
+        frames, metadata = decode_video_pyav(filepath)
+        indices = self._sample_indices(frames.shape[0], filepath)
+        metadata["sampled_indices"] = indices
+        metadata["original_num_frames"] = frames.shape[0]
+        return TensorAndMetadata(data=frames[indices].float() / 255.0, metadata=metadata)
+
+    def load_video(self, filepath: str, device: str) -> TensorAndMetadata:
+        """Decode a video file into ``[frames_per_clip, C, H, W]`` float in ``[0, 1]``.
+
+        Mirrors HuggingFace ``BaseVideoProcessor`` Path 2
+        (``video_processing_utils.py:294``): read metadata, compute the
+        uniform sample indices, and hand those indices to the decoder so
+        only the sampled frames are materialized.  For long clips this is
+        the difference between decoding 64 frames and decoding thousands
+        (= seconds, not minutes).
+
+        Device handling mirrors HF too: we don't pass a device to the
+        decoder (HF's decode path doesn't either; device placement happens
+        downstream in ``_prepare_input_videos``).  The ``device`` argument
+        here is kept for signature-compatibility with ``Model.load_video``
+        but is intentionally ignored — decode stays on CPU, later steps
+        move tensors to GPU as needed.
+        """
+        logger.info("load_video: opening %s", filepath)
+        try:
+            from torchcodec.decoders import VideoDecoder
+
+            decoder = VideoDecoder(filepath)
+        except (ImportError, RuntimeError, OSError):
+            return self._load_video_pyav(filepath)
+        logger.info("load_video: decoder opened; reading metadata")
+
+        metadata_obj = getattr(decoder, "metadata", None)
+        total = None
+        if metadata_obj is not None:
+            total = getattr(metadata_obj, "num_frames", None)
+        if total is None:
+            total = len(decoder)
+        total = int(total)
+        indices = self._sample_indices(total, filepath)
 
         get_at = getattr(decoder, "get_frames_at", None)
         if get_at is not None:

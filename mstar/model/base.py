@@ -568,11 +568,19 @@ class Model(ABC):
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
-        from torchcodec.decoders import VideoDecoder
+        try:
+            from torchcodec.decoders import VideoDecoder
 
-        decoder = VideoDecoder(filepath, device=device)
-        video = torch.stack([frame for frame in decoder]).float() / 255.0
-        return TensorAndMetadata(data=video, metadata=video_metadata_dict(decoder.metadata))
+            decoder = VideoDecoder(filepath, device=device)
+            video = torch.stack([frame for frame in decoder]).float() / 255.0
+            metadata = video_metadata_dict(decoder.metadata)
+        except (ImportError, RuntimeError, OSError):
+            # as in load_audio; PyAV ships its own FFmpeg
+            from mstar.model.components.video_io import decode_video_pyav
+
+            frames, metadata = decode_video_pyav(filepath)
+            video = frames.to(device).float() / 255.0
+        return TensorAndMetadata(data=video, metadata=metadata)
 
     @abstractmethod
     def postprocess(
