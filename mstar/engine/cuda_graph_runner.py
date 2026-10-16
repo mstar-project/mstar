@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import threading
@@ -98,6 +99,21 @@ def dummy_metadata(
             max_tokens=1,
         ) for rid in rids
     }
+
+
+# ROCm: buckets of up to this many tokens autotune their GEMMs over hipBLASLt
+# alone. Inductor's Triton templates win its benchmark there but lose in the
+# step (MI300X, Qwen3.5-9B at c4: 446 -> 521 tok/s), and win at 64 rows.
+_ROCM_ATEN_GEMM_MAX_TOKENS = 32
+
+
+def _gemm_backends(num_tokens: int):
+    """Inductor's GEMM backends while compiling a bucket of ``num_tokens``."""
+    if torch.version.hip is None or num_tokens > _ROCM_ATEN_GEMM_MAX_TOKENS:
+        return contextlib.nullcontext()
+    import torch._inductor.config as inductor_config
+
+    return inductor_config.patch(max_autotune_gemm_backends="ATEN")
 
 
 def capture_into_graph(run, pool, device, autocast_dtype):
@@ -610,7 +626,8 @@ class CudaGraphRunner:
             torch.cuda.set_device(self._device)
             torch.cuda.synchronize()
             for _ in range(self.NUM_WARMUP):
-                with autocast_scope(self._autocast_dtype):
+                # the first call compiles this bucket's shape
+                with autocast_scope(self._autocast_dtype), _gemm_backends(spec.num_tokens):
                     run_forward()
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the same shapes the first prepare did
