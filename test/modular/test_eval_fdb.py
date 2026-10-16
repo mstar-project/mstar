@@ -273,6 +273,35 @@ def test_malformed_replies_never_raise_their_content():
     assert res["status"] == "failed" and secret not in json.dumps(res)
 
 
+def test_retry_failed_matches_a_remote_judge_against_its_saved_identity(tmp_path, monkeypatch):
+    from benchmark.eval.suites.duplex_fdb import Judging, rejudge
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret-value")
+    monkeypatch.setattr(fdb_reference, "load_behavior", _behavior)
+
+    def post(url, body, headers, timeout):
+        return {"model": llm_judge.OPENAI_MODEL,
+                "choices": [{"message": {"content": '{"behaviour": ["C_RESUME"]}'}, "finish_reason": "stop"}]}
+
+    def judging():
+        (j,) = llm_judge.parse_judges(["gpt4o=openai"])
+        j.post = post
+        return Judging([j], "none")
+
+    t = {k: {"text": k, "chunks": []} for k in ("input", "clean_input", "output", "clean_output")}
+    rows = [{"id": f"a{i}", "ok": True, "category": "user_backchannel", "asr": t,
+             "overlap": {"timing": {"stop_intervals": [], "response_intervals": []}}} for i in range(2)]
+    first = rejudge(RunResult("fdb", "x", {"suite": {}}, {}, [duplex_fdb_repeat(rows)]).finalize(), judging())
+    first.repeats[0].requests[1]["labels"]["gpt4o"] = {"status": "failed", "label": None}
+    first.save(tmp_path / "r.json")
+    saved = RunResult.load(tmp_path / "r.json")
+    assert saved.config["suite"]["judges"][0]["base_url"] != llm_judge.OPENAI_URL  # redacted when saved
+    again = rejudge(saved, judging(), retry_failed=True)
+    assert [r["labels"]["gpt4o"]["status"] for r in again.repeats[0].requests] == ["valid", "valid"]
+    assert again.config["rejudged"][-1]["usage"]["gpt4o"]["requests"] == 1
+    assert "sk-test" not in json.dumps(again.to_dict())
+
+
 def test_api_judge_is_skipped_without_a_key_and_keys_never_reach_results(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     (j,) = llm_judge.parse_judges(["gpt4o=openai"])
@@ -415,6 +444,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         with wave.open(io.BytesIO(parts["files"]), "rb") as w:
             n = w.getnframes()
+        if n == 40000:  # a 2.5 s clip: the session the tests make fail
+            return self._json({"error": "overloaded"}, 503)
         frames = n // 1280
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
@@ -464,7 +495,7 @@ class _FakeASR:
         return {"text": f"{name} agent words", "chunks": [{"text": name, "timestamp": [0.1, 0.4]}]}
 
 
-def _dataset(tmp_path):
+def _dataset(tmp_path, failing_clean=None):
     rate = 16000
     t = np.arange(int(1.0 * rate)) / rate
     speech = (0.3 * np.sin(2 * np.pi * 300 * t)).astype(np.float32)
@@ -476,7 +507,8 @@ def _dataset(tmp_path):
             d.mkdir(parents=True)
             # user: 0 to 1 s, an event at 2 to 3 s (overlapping the agent), then silence to 4 s
             write_wav(d / "input.wav", np.concatenate([speech, silence, speech, silence]), rate)
-            write_wav(d / "clean_input.wav", np.concatenate([speech, silence, silence]), rate)
+            clean = speech[: rate // 2] if (cat, k) == failing_clean else silence  # 2.5 s: the fake server fails it
+            write_wav(d / "clean_input.wav", np.concatenate([speech, silence, clean]), rate)
             items.append(Item(id=f"{cat}-{k}", audio_path=str(d / "input.wav"), lang="en", extra={
                 "category": cat, "sample_id": f"{cat}/{k}", "clean_audio": "clean_input.wav",
                 "context_text": "Tell me about rain.", "event_text": "interrupt: and snow?" if "inter" in cat else "bg",
@@ -568,6 +600,21 @@ def test_fdb_suite_end_to_end_with_two_judges_agreement_and_rejudge(tmp_path, fa
     assert sem.summary["agreement.qwen.other.agreement"] == back.summary["agreement.qwen.other.agreement"]
     assert all("sem" not in r["labels"] for rp in sem.repeats for r in rp.requests)
 
+    # --retry-failed relabels only the failed pair, and only for the judge that labeled the file.
+    data = json.loads((tmp_path / "rejudged" / "fdb-fake-c2.json").read_text())
+    data["repeats"][1]["requests"][0]["labels"]["late"] = {"status": "failed", "label": None}
+    (tmp_path / "failed").mkdir()
+    (tmp_path / "failed" / "fdb-fake-c2.json").write_text(json.dumps(data))
+    main(["rejudge", str(tmp_path / "failed"), "--judge", f"late={fake_server}/b/v1", "--retry-failed",
+          "--out", str(tmp_path / "retried")])
+    ret = RunResult.load(tmp_path / "retried" / "fdb-fake-c2.json")
+    assert ret.config["rejudged"][-1]["usage"]["late"]["requests"] == 1
+    assert ret.repeats[1].requests[0]["labels"]["late"]["status"] == "valid"
+    assert ret.summary["agreement.other.late.agreement"]["mean"] == 1.0
+    with pytest.raises(SystemExit, match="not the judge that labeled"):
+        main(["rejudge", str(tmp_path / "failed"), "--judge", f"late={fake_server}/b/v1", "--judge-revision",
+              "late=r2", "--retry-failed", "--out", str(tmp_path / "retried2")])
+
     # Pooling files where one name means two different judges is refused.
     monkeypatch.setattr(llm_judge, "resolve", lambda j: (setattr(j, "model", "other-model"), j)[1])
     main(["rejudge", str(out / "fdb-fake-c2.json"), "--judge", f"other={fake_server}/b/v1",
@@ -583,6 +630,24 @@ def test_local_judge_discovery_sends_the_judge_key(fake_server, monkeypatch):
         llm_judge.resolve(j)
     monkeypatch.setenv("JUDGE_API_KEY", "k-123")
     assert llm_judge.resolve(j).model == "fake-judge"
+
+
+def test_a_failed_clean_session_keeps_the_overlap_session_timed(tmp_path, fake_server, monkeypatch):
+    from benchmark.eval.cli import main
+
+    monkeypatch.setattr(fdb_reference, "load_timing", _fake_timing)
+    monkeypatch.setattr(fdb_reference, "ParakeetASR", lambda device: _FakeASR())
+    monkeypatch.setattr(fdb_reference, "load_behavior", _behavior)
+    main(["run", "fdb", "--url", fake_server, "--data", str(_dataset(tmp_path, ("background_speech", 1))),
+          "--repeats", "1", "--warmup", "0", "--label", "fake", "--out", str(tmp_path / "out"),
+          "--judge", f"qwen={fake_server}/a/v1", "--semantic-judge", "none"])
+    r = RunResult.load(tmp_path / "out" / "fdb-fake-c1.json")
+    s = r.summary
+    assert s["errors"]["mean"] == 1 and s["all.pairs"]["mean"] == 3
+    assert s["all.timed_overlap_sessions"]["mean"] == 3 and s["background_speech.stop_latency_s"]["mean"] is not None
+    assert s["all.qwen.judged_pairs"]["mean"] == 2 and s["background_speech.qwen.judged_pairs"]["mean"] == 0
+    bad = next(row for row in r.repeats[0].requests if row["id"] == "background_speech-1")
+    assert (bad["ok"], bad["error"]) == (False, "clean: HTTP 503") and "asr" not in bad and "clean" not in bad
 
 
 def test_fdb_failed_controls_leave_semantic_ungraded(tmp_path, fake_server, monkeypatch):

@@ -130,6 +130,8 @@ def _judge_args(p) -> None:
                    help="judge to add: NAME=openai (needs OPENAI_API_KEY) or NAME=URL of a local endpoint")
     p.add_argument("--judge-revision", action="append", default=[], metavar="NAME=REV")
     p.add_argument("--semantic-judge", default="none", help="also regrade semantic A/F/U with this judge")
+    p.add_argument("--retry-failed", action="store_true",
+                   help="relabel only the pairs whose label from these (unchanged) judges failed")
     p.add_argument("--semantic-only", action="store_true",
                    help="only regrade semantic A/F/U with --semantic-judge; keep every judge's behavior labels")
     p.add_argument("--judge-concurrency", type=int, default=8)
@@ -316,7 +318,7 @@ def cmd_rejudge(args) -> None:
         raise SystemExit("no judge is available (see the skip reasons above)")
     out = Path(args.out)
     for path, result in zip(_result_paths(args.results), load_results(args.results), strict=True):
-        dst = rejudge(result, judging).save(out / path.name)
+        dst = rejudge(result, judging, args.retry_failed).save(out / path.name)
         print(f"wrote {dst}", file=sys.stderr)
     for name, u in judging.usage().items():
         print(f"[fdb] judge {name!r}: {u['requests']} requests ({u['retries']} transport retries), "

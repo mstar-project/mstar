@@ -107,7 +107,7 @@ def fdb_metrics(rows: list[dict[str, Any]], judges: list[str], semantic: bool) -
         members = rows if group == "all" else [r for r in rows if r.get("category") == group]
         if not members:
             continue
-        timed = [r for r in members if r.get("ok") and (r.get("overlap") or {}).get("timing")]
+        timed = [r for r in members if (r.get("overlap") or {}).get("timing")]
         out[f"{group}.pairs"] = len(members)
         out[f"{group}.timed_overlap_sessions"] = len(timed)
         for kind in ("stop", "response"):
@@ -213,19 +213,23 @@ class Judging:
         """Requests, transport retries and prompt and completion token counts, per judge."""
         return {j.name: dict(j.usage) for j in self.available}
 
-    def label(self, rows: list[dict[str, Any]]) -> None:
-        """Behavior labels from every available judge, and semantic outcomes, into ``rows``."""
+    def label(self, rows: list[dict[str, Any]], retry_failed: bool = False) -> None:
+        """Behavior labels from every available judge, and semantic outcomes, into ``rows``.
+        ``retry_failed`` relabels only the pairs whose label from that judge failed."""
         from benchmark.eval import fdb_reference, llm_judge
 
         if not self.available:
             return
         if self._behavior is None:
             self._behavior = fdb_reference.load_behavior()
-        transcripts = [r.get("asr") if assessable(r) else None for r in rows]
         for j in self.available if self.behavior else []:
-            for r, res in zip(rows, llm_judge.label_pairs(j, self._behavior, transcripts, self.concurrency),
-                              strict=True):
-                r.setdefault("labels", {})[j.name] = res
+            todo = [not retry_failed or (r.get("labels") or {}).get(j.name, {}).get("status") in (None, "failed")
+                    for r in rows]
+            transcripts = [r.get("asr") if t and assessable(r) else None for r, t in zip(rows, todo, strict=True)]
+            labels = llm_judge.label_pairs(j, self._behavior, transcripts, self.concurrency)
+            for r, t, res in zip(rows, todo, labels, strict=True):
+                if t:
+                    r.setdefault("labels", {})[j.name] = res
         if self.semantic is None:
             return
         if self._assets is None:
@@ -258,14 +262,24 @@ def _derived(metric: str) -> bool:
     return metric.split(".", 1)[0] in (*GROUPS, "agreement") and "." in metric
 
 
-def rejudge(result, judging: Judging):
+def rejudge(result, judging: Judging, retry_failed: bool = False):
     """Label a stored ``fdb`` results file with more judges (or again), from the transcripts
-    its rows hold: no server, no GPU. Judges of the same name are replaced."""
+    its rows hold: no server, no GPU. Judges of the same name are replaced, or with
+    ``retry_failed`` keep their labels and relabel only the pairs that failed."""
     if result.suite != "fdb":
         raise SystemExit(f"rejudge reads fdb results, not {result.suite!r}")
     suite_cfg = result.config.setdefault("suite", {})
     new = {j["name"]: j for j in judging.identity()["judges"]} if judging.behavior else {}
     old = suite_cfg.get("judges") or []
+    if retry_failed:
+        from benchmark.eval.schema import scrub
+
+        same = {o["name"]: o for o in old}
+        for name, ident in new.items():
+            # Stored identities were scrubbed when saved (a remote base_url is redacted), so compare like with like.
+            stored = {k: v for k, v in (same.get(name) or {}).items() if k != "skipped"}
+            if not stored or stored != {k: v for k, v in scrub(ident).items() if k != "skipped"}:
+                raise SystemExit(f"--retry-failed: judge {name!r} is not the judge that labeled this file")
     # A replaced judge keeps its place, so agreement keys keep their order across rejudges.
     suite_cfg["judges"] = [new.get(j["name"], j) for j in old] + [j for n, j in new.items()
                                                                   if n not in {o["name"] for o in old}]
@@ -279,11 +293,11 @@ def rejudge(result, judging: Judging):
     before = judging.usage()
     for rep in result.repeats:
         for r in rep.requests:
-            for name in new:
+            for name in new if not retry_failed else ():
                 (r.get("labels") or {}).pop(name, None)
             if regrade:
                 r.pop("semantic", None)
-        judging.label(rep.requests)
+        judging.label(rep.requests, retry_failed)
         # Every derived metric is recomputed from the rows; none of the old ones survive.
         kept = {k: v for k, v in rep.metrics.items() if not _derived(k)}
         rep.metrics = kept | fdb_metrics(rep.requests, names, judging.semantic is not None or bool(sem_cfg))
@@ -291,7 +305,7 @@ def rejudge(result, judging: Judging):
         suite_cfg["semantic"] = judging.identity()["semantic"]
     result.config.setdefault("rejudged", []).append(
         {"judges": sorted(new), "semantic": judging.semantic.name if judging.semantic else None,
-         "semantic_only": not judging.behavior,
+         "semantic_only": not judging.behavior, "retry_failed": retry_failed,
          "usage": {n: {k: v - before[n][k] for k, v in u.items()} for n, u in judging.usage().items()}})
     result.summary = {}
     return result.finalize()
@@ -372,19 +386,26 @@ class FDBSuite(Suite):
         a = self.args
         kwargs = {} if a.temperature is None else {"temperature": a.temperature}
         base = {"category": item.extra["category"], "sample_id": item.extra.get("sample_id")}
-        sessions = {}
+        sessions, failed = {}, None
         for variant, path in (("overlap", item.audio_path), ("clean", str(self._clean_path(item)))):
             try:
                 sessions[variant] = await generate_session(session, url, path, kwargs, a.timeout,
                                                            time.perf_counter())
             except SessionError as exc:
-                return error_row(item, f"{variant}: {exc.error}", exc.detail, **base, **exc.extra)
+                failed = error_row(item, f"{variant}: {exc.error}", exc.detail, **base, **exc.extra)
             except Exception as exc:  # noqa: BLE001 - every failure is an error row
-                return error_row(item, f"{variant}: {type(exc).__name__}", f"{type(exc).__name__}: {exc}", **base)
+                failed = error_row(item, f"{variant}: {type(exc).__name__}", f"{type(exc).__name__}: {exc}", **base)
+            if failed is not None:
+                break
         frame_s = a.frame_ms / 1000
-        row = {"id": item.id, "ok": True, "error": None, **base, "e2e_s": time.perf_counter() - t0,
-               "context_text": item.extra.get("context_text"), "event_text": item.extra.get("event_text"),
-               "event_s": item.extra.get("event_s"), "_sessions": sessions, "_item": item}
+        # A pair whose clean session failed is an error and is not judged, but its overlap session is
+        # still timed: the reference times each session on its own.
+        row = failed or {"id": item.id, "ok": True, "error": None, **base}
+        if not sessions:
+            return row
+        row |= {"e2e_s": time.perf_counter() - t0, "context_text": item.extra.get("context_text"),
+                "event_text": item.extra.get("event_text"), "event_s": item.extra.get("event_s"),
+                "_sessions": sessions, "_item": item}
         for variant, s in sessions.items():
             row[variant] = {"frames": s["frames"], "wall_ms_per_frame": 1000 * s["e2e_s"] / s["frames"],
                             "on_time": s["e2e_s"] <= s["frames"] * frame_s, "sample_rate": s["rate"]}
@@ -411,7 +432,7 @@ class FDBSuite(Suite):
         frame_s = self.args.frame_ms / 1000
         try:
             for r in rows:
-                if r["ok"]:
+                if "_sessions" in r:
                     self._score_pair(r, work / r["id"], frame_s, fdb_reference)
             self.judging.label(rows)
         finally:
@@ -423,7 +444,7 @@ class FDBSuite(Suite):
             "requests": len(rows),
             "errors": len(rows) - len(ok),
             **fdb_metrics(rows, [j.name for j in self.judging.available], self.judging.semantic is not None),
-            "timing_failed": sum(bool((r.get("overlap") or {}).get("timing_error")) for r in ok),
+            "timing_failed": sum(bool((r.get("overlap") or {}).get("timing_error")) for r in rows),
             "asr_failed": sum(bool(r.get("asr_error")) for r in ok),
             "wall_ms_per_frame_p50": stats.percentile(frames, 50),
             "wall_ms_per_frame_max": max(frames, default=None),
@@ -438,6 +459,8 @@ class FDBSuite(Suite):
         d.mkdir(parents=True, exist_ok=True)
         inputs = {"overlap": Path(item.audio_path), "clean": self._clean_path(item)}
         for variant, in_name, out_name in VARIANTS:
+            if variant not in sessions:
+                continue
             x, rate = read_wav(inputs[variant])
             if rate != RATE:
                 raise ValueError(f"{inputs[variant]}: expected {RATE} Hz")
@@ -457,7 +480,7 @@ class FDBSuite(Suite):
             segs = (v.get("timing") or {}).get("model_segments") or []
             v["boundary"] = {"playout_active_at_T": bool(segs) and segs[-1][1] >= t_s - EOF_TOLERANCE_S,
                              "audio_received_after_T": after}
-        if self._asr is not None:
+        if self._asr is not None and len(sessions) == len(VARIANTS):
             try:
                 r["asr"] = {k: self._asr.transcribe(d / f"{k}.wav", d / ".asr-stage")
                             for k in ("input", "clean_input", "output", "clean_output")}
