@@ -18,6 +18,10 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
+    "omnilingual_asr_ctc_300m": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
+    "omnilingual_asr_ctc_1b": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
+    "omnilingual_asr_ctc_3b": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
+    "omnilingual_asr_ctc_7b": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
@@ -82,6 +86,15 @@ HF_MODELS: dict[str, dict] = {
     # encoder + Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B) + EarTTS
     # (Gemma3 talker + RVQ codec). Single composite ``model.safetensors``.
     "nemotron_duplex": {"model_path_hf": "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B"},
+    # Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, 1,600+
+    # languages, no language code needed. Apache-2.0. Meta's own .pt files: v2
+    # from dl.fbaipublicfiles.com (pinned sha256), or v1 from the
+    # facebook/omniASR-CTC-* Hub repos with weights_version: v1 (config.py).
+    # No HF repo id: the size picks the checkpoint.
+    "omnilingual_asr_ctc_300m": {"model_path_hf": None, "size": "300m"},
+    "omnilingual_asr_ctc_1b": {"model_path_hf": None, "size": "1b"},
+    "omnilingual_asr_ctc_3b": {"model_path_hf": None, "size": "3b"},
+    "omnilingual_asr_ctc_7b": {"model_path_hf": None, "size": "7b"},
     # OmniVoice — masked-diffusion TTS, 600+ languages. A Qwen3-0.6B body read
     # bidirectionally over an 8-codebook canvas, plus the Higgs-Audio-v2 codec
     # shipped in the checkpoint's audio_tokenizer/ subfolder (~3.3 GB total).

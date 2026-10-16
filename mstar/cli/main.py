@@ -49,6 +49,10 @@ DEFAULT_CONFIGS: dict[str, str] = {
     # ASR (Beta, un-optimized) — audio in, transcript out.
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
+    "omnilingual_asr_ctc_300m": "omnilingual_asr_ctc_300m.yaml",
+    "omnilingual_asr_ctc_1b": "omnilingual_asr_ctc_1b.yaml",
+    "omnilingual_asr_ctc_3b": "omnilingual_asr_ctc_3b.yaml",
+    "omnilingual_asr_ctc_7b": "omnilingual_asr_ctc_7b.yaml",
     "wan22": "wan22.yaml",
     "waypoint": "waypoint.yaml",
     # Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B).
@@ -164,7 +168,7 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
-    if model in ("whisper_large", "higgs_audio"):
+    if model in ("whisper_large", "higgs_audio") or model.startswith("omnilingual_asr_ctc_"):
         lines.append("    res = client.generate(text=\"\", audio=\"speech.wav\", "
                      "input_modalities=(\"audio\",\"text\"))")
         lines.append("    print(res.text)  # transcript")
@@ -187,6 +191,11 @@ def _next_steps(model: str, host: str, port: int) -> str:
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a red cube\", size=\"320x192\")")
         if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a cat in a hat\", size=\"1024x1024\")")
+    if model.startswith("omnilingual_asr_ctc_"):
+        lines += ["", "  OpenAI-compatible:",
+                  "    from openai import OpenAI",
+                  f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")",
+                  f"    oai.audio.transcriptions.create(model=\"{model}\", file=open(\"speech.wav\", \"rb\")).text"]
     lines.append("")
     return "\n".join(lines)
 
