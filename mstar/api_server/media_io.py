@@ -173,9 +173,11 @@ def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
     None (leaving nothing behind) when it is not base64 or not loadable audio.
 
     ``decoder`` is the library the model's ``load_audio`` uses, ``"soundfile"``
-    or ``"torchcodec"``, and it opens the saved file the way the model will
-    (container header only). A path such as ``/etc/passwd`` is valid base64
-    too, so the alphabet cannot tell them apart; the decoder can.
+    or ``"torchcodec"``, and it opens the saved file the way the model will.
+    torchcodec decodes the clip, not just its header: some FFmpeg builds
+    parse a container header (MAT4, MAT5) they cannot decode. A path such as
+    ``/etc/passwd`` is valid base64 too, so the alphabet cannot tell them
+    apart; the decoder can.
     """
     try:
         _, path = save_base64(b64, "wav", "audio", upload_dir)
@@ -185,7 +187,7 @@ def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
         if decoder == "torchcodec":
             from torchcodec.decoders import AudioDecoder
 
-            AudioDecoder(path)
+            AudioDecoder(path).get_all_samples()
         else:
             import soundfile
 

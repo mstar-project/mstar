@@ -172,6 +172,40 @@ def test_omnivoice_refuses_audio_its_decoder_cannot_read(clip, dirs):
         adapters.OmniVoiceAdapter().speech_to_request(req, uploads)
 
 
+@pytest.mark.parametrize("decodes", [True, False])
+def test_omnivoice_refuses_audio_whose_header_opens_but_samples_do_not_decode(decodes, dirs, monkeypatch):
+    """Some FFmpeg builds open a MAT4 or MAT5 header and then fail on the first
+    frame. This stub decoder does the same, so the check runs without FFmpeg."""
+    import sys
+    import types
+
+    class AudioDecoder:
+        def __init__(self, source, **_):
+            open(source, "rb").close()
+
+        def get_all_samples(self):
+            if not decodes:
+                raise RuntimeError("decode_av_frame failed")
+            return object()
+
+    decoders = types.ModuleType("torchcodec.decoders")
+    decoders.AudioDecoder = AudioDecoder
+    package = types.ModuleType("torchcodec")
+    package.decoders = decoders
+    monkeypatch.setitem(sys.modules, "torchcodec", package)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    uploads, _ = dirs
+    before = set(uploads.iterdir())
+    req = SpeechRequest(input="hi", ref_audio=base64.b64encode(b"MATLAB 5.0 MAT-file").decode(), ref_text="hi")
+    if decodes:
+        (path,) = adapters.OmniVoiceAdapter().speech_to_request(req, uploads).file_paths["audio"]
+        assert path.startswith(str(uploads))
+    else:
+        with pytest.raises(ValueError, match=REFUSED):
+            adapters.OmniVoiceAdapter().speech_to_request(req, uploads)
+        assert set(uploads.iterdir()) == before
+
+
 @pytest.mark.parametrize("adapter", [adapters.Cosmos3Adapter, adapters.Wan22Adapter])
 def test_video_generation_conditioning_refuses_server_paths(adapter, dirs):
     uploads, secret = dirs
