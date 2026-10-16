@@ -357,6 +357,9 @@ def test_decoder_declares_context_span_only_on_encoder_walks():
         ("p", CONTEXT_LABEL, cfg.max_source_positions), ("d", CONTEXT_LABEL, 0),
     ]
     assert step.steps[CROSS_ATTN].causal is False and step.steps[KV_CACHE] is not None
+    # an encoder walk writes the context in preprocess, outside the prefill graph
+    assert step.steps[CROSS_KV_CACHE].eager_write is True
+    assert sub.declare_step(DECODE_WALK, ["d"], [decode_row]).steps[CROSS_KV_CACHE].eager_write is False
 
 
 def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
@@ -377,8 +380,14 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     plain = _fwd(2, "plain", language=EN, task=TRANSCRIBE, timestamps=False)
     row2 = sub.prepare_inputs(PREFILL_WALK, plain, {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE, NOTS])], **ctx})
     assert row2.tensor_inputs["ts_rules"].tolist() == inactive_state()
+    written = []
+    sub._write_context = written.append
     batch = sub.preprocess(PREFILL_WALK, _engine_inputs(["ts", "plain"]), [row, row2])
     assert batch["ts_rules"].shape == (2, 4)
+    # the context is written eagerly, both requests in segment order, and stays
+    # out of the forward's inputs (the prefill graph is sized by the prompt)
+    assert [t.shape for t in written] == [(2 * cfg.max_source_positions, cfg.d_model)]
+    assert "encoder_states" not in batch
 
     # a decode step takes the state routed with its token, never a host history
     routed = torch.tensor([1, 2, cfg.timestamp_begin + 2, cfg.vocab_size])
@@ -392,9 +401,15 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     outputs = {"new_token": [torch.tensor([5])], "ts_rules": [routed]}
     sub.postprocess("ts", None, outputs)
     assert outputs["text_inputs"] is outputs["new_token"] and outputs["ts_rules"] == [routed]
-    # the capture template carries the same row so the graph's input set is fixed
-    (decode_cfg,) = sub.get_cuda_graph_configs(torch.device("cpu"))
+    # the capture templates carry the same row so the graphs' input sets are fixed
+    decode_cfg, prefill_cfg = sub.get_cuda_graph_configs(torch.device("cpu"))
     assert decode_cfg.single_request_inputs.tensor_inputs["ts_rules"].tolist() == inactive_state()
+    (template,) = prefill_cfg.get_node_inputs(1, 4)
+    assert template.tensor_inputs["ts_rules"].tolist() == inactive_state()
+    assert template.tensor_inputs["encoder_states"].shape[0] == cfg.max_source_positions
+    # prompt buckets give every row 3 to 8 tokens
+    assert all(3 * bs <= n <= 8 * bs for bs in (1, 2, 32) for n in prefill_cfg.get_total_tokens(bs))
+    assert prefill_cfg.get_total_tokens(32) == [128]
     # language detection never applies the rules
     # timestamps=True on purpose: the detection walk must still decode with
     # the rules off, which is the guard rather than the metadata
@@ -864,8 +879,11 @@ def test_decoder_prefill_selects_each_request_last_row_itself():
     detect = sub.prepare_inputs(DETECT_LANGUAGE_WALK, fwd, {
         "text_inputs": [torch.tensor([SOT])], "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
     })
+    written = []
+    sub._write_context = written.append
     batch = sub.preprocess(DETECT_LANGUAGE_WALK, _engine_inputs(["a"]), [detect])
     assert batch["row_lens"].tolist() == [1] and batch["input_ids"].tolist() == [SOT]
+    assert [t.shape[0] for t in written] == [cfg.max_source_positions]
 
 
 

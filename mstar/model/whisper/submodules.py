@@ -18,7 +18,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
+from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.position.manager import PositionManager
@@ -55,6 +55,16 @@ from mstar.model.whisper.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _PromptPackedConfig(PackedCudaGraphConfig):
+    """Packed prompt buckets, kept only where a bucket gives every row 3 to 8
+    tokens: Whisper prompts are 3 or 4 tokens a request, so a sparser or denser
+    bucket would never be chosen, and fewer than one token a row can't be
+    captured at all."""
+
+    def get_total_tokens(self, bs: int) -> list[int]:
+        return [n for n in super().get_total_tokens(bs) if 3 * bs <= n <= 8 * bs]
 
 # Walks that run the encoder and hand the decoder its output.
 ENCODER_WALKS = (PREFILL_WALK, DETECT_LANGUAGE_WALK)
@@ -234,14 +244,19 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
     """
 
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
-    # Prefill isn't captured, so the engine's capture cap doesn't bound it and
-    # `can_batch` would take the whole ready set. A set too big for the context
-    # cache can't be admitted. With offload configured it evicts and retries,
-    # without it there is nothing to evict and the batch reforms identically.
+    # `can_batch` would otherwise take the whole ready set. A set too big for
+    # the context cache can't be admitted. With offload configured it evicts and
+    # retries, without it there is nothing to evict and the batch reforms
+    # identically.
     MAX_PREFILL_BATCH_SIZE = 32
+    # The prefill walk replays a graph over its prompt tokens (4 a request);
+    # these are packed prompt-token totals, kept where a bucket holds 3 to 8
+    # tokens a row (see `_PromptPackedConfig`).
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    PREFILL_TOKEN_BUCKETS = [4, 8, 16, 32, 64, 128]
     # See the encoder: dynamo recompiled the prefill walks per request id
-    # (a 1-2 s stall each, RTFx 158 at c=32 before the fix). Decode steps are
-    # graph replays and the prefill is four eager layers.
+    # (a 1-2 s stall each, RTFx 158 at c=32 before the fix). Decode and
+    # prefill steps are graph replays; the walks they don't cover run eagerly.
     disable_torch_compile = True
 
     def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig, tokenizer=None):
@@ -304,6 +319,32 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                     tensor_inputs={"ts_rules": torch.tensor(inactive_state(), device=device)},
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+            ),
+            # The prefill's prompt pass. Its encoder context (1500 tokens a
+            # request) is written eagerly in `preprocess` (`KVStep.eager_write`),
+            # so the graph is sized by the prompt alone. Eager, the prefill was
+            # four layers of launches plus the logit rules: ~15% of turbo's
+            # decoder steps at c=8 and a quarter of their host time.
+            _PromptPackedConfig(
+                capture_graph_walk=PREFILL_WALK,
+                make_node_input=lambda n: ARNodeInputs(
+                    input_ids=torch.zeros(n, dtype=torch.long, device=device),
+                    input_seq_len=n,
+                    tensor_inputs={
+                        # only its length is read (the context span); one
+                        # broadcast row, not 1500, per cached template row
+                        "encoder_states": torch.zeros(
+                            1, self.config.d_model,
+                            dtype=next(self.parameters()).dtype, device=device,
+                        ).expand(self.config.max_source_positions, -1),
+                        "ts_rules": torch.tensor(inactive_state(), device=device),
+                    },
+                ),
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                # per-request rows, not tokens; and capture alone is the win
+                input_seq_dims={"ts_rules": 0, "row_lens": 0},
+                compile=False,
             ),
         ]
 
@@ -475,8 +516,11 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 ATTN: AttentionStep(causal=True),
                 # The context stream: a real span on the prefill that writes
                 # it, zero afterwards. `commit` is what turns the prefill's
-                # reservation into resident pages the later steps read.
-                CROSS_KV_CACHE: KVStep(segments=context_segments),
+                # reservation into resident pages the later steps read. The
+                # write happens in `preprocess`, outside any graph.
+                CROSS_KV_CACHE: KVStep(
+                    segments=context_segments, eager_write=graph_walk in ENCODER_WALKS,
+                ),
                 CROSS_ATTN: AttentionStep(
                     segments=context_segments, causal=False,
                 ),
@@ -514,12 +558,18 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             # packed prefill: where each request's last token sits
             preprocessed["row_lens"] = torch.tensor([r.shape[0] for r in rows], dtype=torch.long, device=rows[0].device)
         if graph_walk in ENCODER_WALKS:
-            # Concatenated in segment order, which is how the context plan
-            # laid the requests' pages out.
-            preprocessed["encoder_states"] = torch.cat(
+            # Fill the context pages this step reserved, here rather than in the
+            # forward: the prefill graph is sized by the prompt, not by 1500
+            # encoder tokens a request (`KVStep.eager_write`). Concatenated in
+            # segment order, which is how the context plan laid the pages out;
+            # a replay's padding rows come after and are not written.
+            self._write_context(torch.cat(
                 [inp.tensor_inputs["encoder_states"] for inp in inputs], dim=0,
-            )
+            ))
         return preprocessed
+
+    def _write_context(self, encoder_states: torch.Tensor) -> None:
+        self.decoder.write_cross_kv(encoder_states)
 
     def _forward(
         self,
@@ -535,16 +585,17 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         pos: PositionManager = engine_inputs.resources[POS]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
 
-        if encoder_states is not None:
-            # prefill only: fills the context pages this step reserved, before
-            # the layers read them back
-            self.decoder.write_cross_kv(encoder_states)
-
+        # the prefill's context pages were filled in `preprocess`
+        del encoder_states
         input_embeds = self.decoder.embed(input_ids, pos.pos_ids("main"))
         hidden = self.decoder(input_embeds=input_embeds, label="main")
 
-        if graph_walk != DECODE_WALK:
-            # packed prefill: one hidden per request, at its last token.
+        if graph_walk == PREFILL_WALK:
+            # packed prefill: one hidden per request, at its last token, from
+            # the plan's offsets (a replay's row_lens buffer holds stale rows
+            # past the real ones). The prompt is several tokens a request.
+            hidden = engine_inputs.resources[ATTN].select_last_hidden(hidden)
+        elif graph_walk != DECODE_WALK:
             # Indexed from the rows themselves: a one-token prompt (language
             # detection) is planned as a decode step, whose attention wrapper
             # keeps no packed offsets to select by.

@@ -5,6 +5,7 @@ import threading
 from collections import Counter
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import torch
@@ -309,6 +310,9 @@ class KVPlanState:
     token_to_page: torch.Tensor
     token_to_cache: torch.Tensor
     total_tokens: int | None = None
+    # an eager-write state a pre-plan built on its own stream: the writer waits
+    # on it (the replay's plan-done wait comes after an eager write)
+    ready: Any = None
 
     def copy_(self, other: "KVPlanState", capture_len: int):
         """Stage a step's addressing into this captured state.
@@ -1464,8 +1468,11 @@ class KVManager(AttentionResource):
 
     def _setup_plan_states(
         self, plan_output: dict[str, KVPlanOutput],
-        ctx: StepContext, lease,
+        ctx: StepContext, lease, eager_write: bool = False,
     ):
+        if eager_write:
+            # written outside the graph (KVStep.eager_write): never staged
+            lease = None
         for label, indptrs in plan_output.items():
             if indptrs.is_decode and lease is not None:
                 # Straight into the captured buffers in one H2D per buffer:
@@ -1505,6 +1512,9 @@ class KVManager(AttentionResource):
                 static_state.copy_(plan_state, lease.bucket.num_tokens)
                 plan_state = static_state
                 self._staged_outputs[(lease.slot, label)] = indptrs
+            elif eager_write and ctx.is_preplan and plan_state.token_to_page.is_cuda:
+                plan_state.ready = torch.cuda.Event()
+                plan_state.ready.record()
             if ctx.is_preplan:
                 self._preplan_states[label] = plan_state
             else:
@@ -1893,7 +1903,7 @@ class KVManager(AttentionResource):
                 res = full
                 if self._plan_cache_mode and not pending:
                     self._remember_decode_plan(step, ctx, res)
-        self._setup_plan_states(res, ctx, ctx.slot_lease)
+        self._setup_plan_states(res, ctx, ctx.slot_lease, eager_write=step.eager_write)
         if self._is_readonly(step, ctx):
             self._readonly_plan = (self._readonly_key(step, ctx), res)
         if ctx.is_preplan:
@@ -2922,7 +2932,11 @@ class KVManager(AttentionResource):
         if label is None:
             label = self._default_label
         plan_state = self._current_plan_states[label]
-        n = plan_state.total_tokens
+        if plan_state.ready is not None:
+            torch.cuda.current_stream(k.device).wait_event(plan_state.ready)
+        # an eager write may carry only the real rows; the padding rows' tokens
+        # come last in the plan (on SINK_PAGE) and are skipped
+        n = min(plan_state.total_tokens, k.shape[0])
         return self.kv_cache.write_tokens(
             layer_idx=layer_idx,
             k=k[:n], v=v[:n],
