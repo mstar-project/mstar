@@ -2315,7 +2315,7 @@ class Worker:
             speculation.spec_id, success, list(dropped_rids),
             # Keeps these nodes off the ready queue while the step is in flight.
             node=batch.node_name if rid_to_wg else None,
-            wg_ids=list(rid_to_wg.values()),
+            wg_ids=Worker._wg_ids_of(batch) if rid_to_wg else [],
             scheduled_rids=list(rid_to_wg),
         )
         give_back = (
@@ -2847,10 +2847,19 @@ class Worker:
     # ------------------------------------------------------------------
     # Postprocessing
     # ------------------------------------------------------------------
-    def _set_in_flight_flag(self, batch: ScheduledBatch, value: bool) -> None:
+    @staticmethod
+    def _wg_ids_of(batch: ScheduledBatch) -> list[int]:
+        """``set_in_flight``'s worker graphs: one id for a step of one walk
+        (a node in a walk lives in one worker graph), else one per rid."""
         rid_to_wg = batch.request_to_worker_graph
+        if batch.request_walks or not rid_to_wg:
+            return list(rid_to_wg.values())
+        return [next(iter(rid_to_wg.values()))]
+
+    def _set_in_flight_flag(self, batch: ScheduledBatch, value: bool) -> None:
         self._graph_runtime.set_in_flight(
-            batch.node_name, list(rid_to_wg), list(rid_to_wg.values()), value,
+            batch.node_name, list(batch.request_to_worker_graph),
+            Worker._wg_ids_of(batch), value,
         )
 
     def _clear_in_flight_flag(self, batch: ScheduledBatch) -> None:

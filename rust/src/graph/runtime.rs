@@ -3623,15 +3623,18 @@ impl GraphRuntime {
         rids: Vec<u32>, wg_ids: Vec<u32>,
         in_flight: bool,
     ) -> PyResult<()> {
-        if rids.len() != wg_ids.len() {
+        // one id for the whole batch (a step of one walk), or one per rid
+        let one_wg = wg_ids.len() == 1;
+        if !one_wg && rids.len() != wg_ids.len() {
             return Err(PyValueError::new_err(
-                "set_in_flight: rids and wg_ids differ in length",
+                "set_in_flight: wg_ids is neither one id nor one per rid",
             ));
         }
         // (worker graph id -> its index, the node's index in it), for the
         // few distinct graphs a batch spans
         let mut resolved: Vec<(u32, WgIndex, NodeId)> = Vec::new();
-        for (rid, wg_id) in rids.into_iter().zip(wg_ids) {
+        for (i, rid) in rids.into_iter().enumerate() {
+            let wg_id = wg_ids[if one_wg { 0 } else { i }];
             let (wg, node_id) = match resolved.iter().find(|r| r.0 == wg_id) {
                 Some(&(_, wg, n)) => (wg, n),
                 None => {

@@ -336,6 +336,8 @@ class PythonGraphRuntime(GraphRuntime):
         self, node: str, rids: list[int], wg_ids: list[int],
         in_flight: bool,
     ):
+        if len(wg_ids) == 1:
+            wg_ids = wg_ids * len(rids)
         for rid, wg_id in zip(rids, wg_ids, strict=True):
             wgio = self._queues[wg_id].per_request_queues.get(rid)
             if wgio is not None:

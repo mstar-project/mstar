@@ -600,7 +600,8 @@ class GraphRuntime(ABC):
         self, node: str, rids: list[int], wg_ids: list[int],
         in_flight: bool,
     ):
-        """``rids[i]`` runs ``node`` in worker graph ``wg_ids[i]``."""
+        """``rids[i]`` runs ``node`` in worker graph ``wg_ids[i]``, or every
+        rid in ``wg_ids[0]`` when it holds one id."""
         pass
 
     @abstractmethod
