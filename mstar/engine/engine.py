@@ -1575,6 +1575,7 @@ class Engine:
                     rids,
                     node_name=batch.node_name,
                     graph_walk=batch.step_context.graph_walk,
+                    request_walks=batch.step_context.request_walks,
                 )
                 return batch.resource_publish_info
             # Returns rid -> {resource label -> published info}
@@ -1611,6 +1612,7 @@ class Engine:
             snaps, todo,
             node_name=batch.node_name,
             graph_walk=batch.step_context.graph_walk,
+            request_walks=batch.step_context.request_walks,
         )
         for rid in todo:
             per_key = published.get(rid) or {}

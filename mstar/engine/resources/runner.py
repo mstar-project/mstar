@@ -562,31 +562,41 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """``publish``, deferred: per rid the snapshot each publisher took.
 
         Finished by ``publish_from_snapshots`` for the rids that need it. A rid
-        with nothing to publish has no entry."""
+        with nothing to publish has no entry. Under a combined walk each rid
+        is snapshotted under its own walk (``request_walks``), as ``publish``
+        does: a publisher may key what it publishes on the walk."""
         order = self._sweep(self._node_publish_order, self._publish_order, node_name)
         if not order:
             return {}
-        # one call per publisher for the whole batch, then one dict per
-        # request that has anything to publish
-        columns = [
-            (key, self._resources[key].publish_snapshot_batch(
-                request_ids, node_name=node_name, graph_walk=graph_walk,
-            ))
-            for key in order
-        ]
+        if request_walks:
+            groups: dict[str, list[str]] = {}
+            for rid in request_ids:
+                groups.setdefault(request_walks.get(rid, graph_walk), []).append(rid)
+        else:
+            groups = {graph_walk: request_ids}
         out: dict[str, dict[str, Any]] = {}
-        for i, rid in enumerate(request_ids):
-            per_key: dict[str, Any] = {}
-            for key, snaps in columns:
-                snap = snaps[i]
-                if snap is not None:
-                    per_key[key] = snap
-            if per_key:
-                out[rid] = per_key
+        for walk, rids in groups.items():
+            # one call per publisher for the walk's rows, then one dict per
+            # request that has anything to publish
+            columns = [
+                (key, self._resources[key].publish_snapshot_batch(
+                    rids, node_name=node_name, graph_walk=walk,
+                ))
+                for key in order
+            ]
+            for i, rid in enumerate(rids):
+                per_key: dict[str, Any] = {}
+                for key, snaps in columns:
+                    snap = snaps[i]
+                    if snap is not None:
+                        per_key[key] = snap
+                if per_key:
+                    out[rid] = per_key
         return out
 
     def publish_from_snapshots(
@@ -595,17 +605,20 @@ class StepRunner:
         request_ids: list[str],
         node_name: str | None = None,
         graph_walk: str | None = None,
+        request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
-        """The published info of ``request_ids`` from their snapshots."""
+        """The published info of ``request_ids`` from their snapshots, each
+        under its own walk (see ``publish_snapshot``)."""
         out: dict[str, dict[str, PublishedInfo]] = {}
         for rid in request_ids:
             snaps = snapshots.get(rid)
             if not snaps:
                 continue
+            walk = request_walks.get(rid, graph_walk) if request_walks else graph_walk
             per_key: dict[str, PublishedInfo] = {}
             for key, snap in snaps.items():
                 info = self._resources[key].publish_from_snapshot(
-                    rid, snap, node_name=node_name, graph_walk=graph_walk,
+                    rid, snap, node_name=node_name, graph_walk=walk,
                 )
                 if info is not None:
                     per_key[key] = info
