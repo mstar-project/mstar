@@ -1031,6 +1031,36 @@ class HiggsAudioAdapter(OpenAIAdapter):
         )
 
 
+class OmnilingualASRAdapter(OpenAIAdapter):
+    """Omnilingual ASR CTC: speech-to-text in 1,600+ languages, no language code.
+
+    The model hears at most 40 s (the reference rejects longer clips), so the
+    route cuts longer uploads into windows of at most 40 s, each ending at the
+    quietest moment within 2 s of its boundary, and transcribes them in
+    parallel: a CTC model takes no conditioning text, so windows are
+    independent. A clip of 40 s or less is transcribed whole, exactly as the
+    reference does. ``language``, ``prompt`` and ``temperature`` have no
+    effect (argmax CTC decoding has nothing to condition or sample). There
+    are no timestamps: ``srt`` / ``vtt`` get one cue spanning the file and
+    ``verbose_json`` an empty segment list.
+    """
+
+    supports_transcriptions = True
+    max_audio_seconds = 40.0
+    long_form = "parallel"
+    # argmax decoding has no temperature to fall back to
+    compression_ratio_threshold = None
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio"],
+            output_modalities=["text"],
+            model_kwargs=_transcription_kwargs(req),
+        )
+
+
 # Only models with an OpenAI-standard surface are registered. Action/world-model
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
@@ -1056,6 +1086,10 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "wan22": Wan22Adapter(),
     "whisper_large": WhisperAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
+    "omnilingual_asr_ctc_300m": OmnilingualASRAdapter(),
+    "omnilingual_asr_ctc_1b": OmnilingualASRAdapter(),
+    "omnilingual_asr_ctc_3b": OmnilingualASRAdapter(),
+    "omnilingual_asr_ctc_7b": OmnilingualASRAdapter(),
     "flux2_klein": DiffusionImageAdapter(),
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
