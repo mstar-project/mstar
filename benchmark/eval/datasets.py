@@ -95,30 +95,34 @@ def _write_16k(audio_bytes: bytes, dst: Path) -> None:
     write_wav(dst, resample(x.mean(axis=1), int(rate), ASR_RATE), ASR_RATE)
 
 
-def _hf_rows(repo: str, config: str | None, split: str, limit: int):
-    from datasets import Audio, load_dataset
-
-    ds = load_dataset(repo, config, split=split, streaming=True)
-    ds = ds.cast_column("audio", Audio(decode=False))
-    for i, row in enumerate(ds):
-        if i >= limit:
-            break
-        yield row
-
-
 def build_librispeech(out: Path, split: str = "test.clean", limit: int = 200) -> Path:
-    """LibriSpeech (``openslr/librispeech_asr``), first ``limit`` utterances of a split."""
-    config, _, sub = split.partition(".")
+    """LibriSpeech (``openslr/librispeech_asr``), the first ``limit`` utterances of a split
+    (``test.clean``, ``test.other``, ``validation.clean``, ...), read from its parquet shards."""
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, hf_hub_download
+
+    repo = "openslr/librispeech_asr"
+    part, _, sub = split.partition(".")
     sub = sub or "clean"
-    if config in ("clean", "other"):  # "clean.test" style
-        config, sub = sub, config
-    items = []
+    if part in ("clean", "other"):  # "clean.test" style
+        part, sub = sub, part
+    prefix = f"{sub}/{part}/"
+    try:
+        shards = sorted(f for f in HfApi().list_repo_files(repo, repo_type="dataset")
+                        if f.startswith(prefix) and f.endswith(".parquet"))
+    except Exception:  # noqa: BLE001 - offline: the first shard may already be cached
+        shards = [f"{prefix}0000.parquet"]
+    items: list[Item] = []
     (out / "audio").mkdir(parents=True, exist_ok=True)
-    for row in _hf_rows("openslr/librispeech_asr", sub, config, limit):
-        dst = out / "audio" / f"{row['id']}.wav"
-        if not dst.exists():
-            _write_16k(row["audio"]["bytes"], dst)
-        items.append(Item(id=row["id"], text=row["text"], audio_path=str(dst), lang="en"))
+    for shard in shards:
+        table = pq.read_table(hf_hub_download(repo, shard, repo_type="dataset"), columns=["id", "text", "audio"])
+        for row in table.slice(0, limit - len(items)).to_pylist():
+            dst = out / "audio" / f"{row['id']}.wav"
+            if not dst.exists():
+                _write_16k(row["audio"]["bytes"], dst)
+            items.append(Item(id=row["id"], text=row["text"], audio_path=str(dst), lang="en"))
+        if len(items) >= limit:
+            break
     return save_manifest(items, out / "manifest.jsonl")
 
 

@@ -412,6 +412,38 @@ def test_asr_stream_errors_are_error_rows():
     assert rows["ok"]["ok"] and rows["ok"]["hyp"] == "hello" and rows["ok"]["first_text_s"] is not None
 
 
+def test_duplex_timing_censors_what_the_replay_did_not_observe():
+    from benchmark.eval.suites.duplex import timing_metrics
+
+    # agent still speaking at the end of a 3.4 s replay, barge-in at 3.0 s: not a yield
+    m = timing_metrics("interruption", [(1.0, 3.4)], None, 0.8, 3.0, 5.0, 2.0, duration_s=3.4)
+    assert m["agent_speaking_at_barge_in"] and m["yielded"] is None and m["yield_censored"]
+    assert "stop_latency_s" not in m and m["took_turn"] is True
+    # ... and a full yield window after the barge-in it is a failure, not censored
+    m = timing_metrics("interruption", [(1.0, 6.0)], None, 0.8, 3.0, 5.0, 2.0, duration_s=6.0)
+    assert m["yielded"] is False and "yield_censored" not in m
+    # an observed stop well before the end
+    m = timing_metrics("interruption", [(1.0, 3.4)], None, 0.8, 3.0, 5.0, 2.0, duration_s=8.0)
+    assert m["stop_latency_s"] == pytest.approx(0.4) and m["yielded"] is True
+    # no answer, but the clip ended inside the response window
+    m = timing_metrics("turn_taking", [], None, 2.0, None, 5.0, 2.0, duration_s=4.0)
+    assert m["took_turn"] is None and m["turn_censored"]
+    assert timing_metrics("turn_taking", [], None, 2.0, None, 5.0, 2.0, duration_s=9.0)["took_turn"] is False
+
+
+def test_custom_commands_and_error_rows_are_scrubbed():
+    from benchmark.eval.schema import scrub_argv
+
+    home = os.path.expanduser("~")
+    cmd = scrub_argv(["--serve-cmd", "env HF_TOKEN=abc vllm serve m --api-key k1 --host gpu.internal --token=t2"])[1]
+    for leaked in ("abc", "k1", "gpu.internal", "t2"):
+        assert leaked not in cmd
+    rows = [{"id": "a", "ok": False, "error": f"FileNotFoundError: {home}/x.wav via http://10.0.0.9:80/v1"}]
+    r = RunResult("asr", "x", {}, {}, [RepeatResult(0, 1.0, {"errors": 1}, rows)]).finalize()
+    err = r.to_dict()["repeats"][0]["requests"][0]["error"]
+    assert home not in err and "10.0.0.9" not in err and "~/x.wav" in err
+
+
 def test_tts_suite_end_to_end(tmp_path, fake_cmd):
     (tmp_path / "s.txt").write_text("one two three four\nSTALL here now please\nfive six\n")
     out = tmp_path / "out"

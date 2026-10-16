@@ -65,6 +65,10 @@ def user_events(item: Item, user_db: float) -> tuple[float | None, float | None]
     return speech_end, interrupt
 
 
+# A segment ending this close to the end of the replay may have been cut by the end, not by the agent.
+EOF_GUARD_S = 0.3
+
+
 def timing_metrics(
     category: str,
     agent_segs: list[tuple[float, float]],
@@ -73,14 +77,24 @@ def timing_metrics(
     interrupt: float | None,
     response_window_s: float,
     yield_window_s: float,
+    duration_s: float,
 ) -> dict[str, Any]:
-    """Per-item interaction-time metrics from the agent's speech segments."""
+    """Per-item interaction-time metrics from the agent's speech segments.
+
+    Outcomes the replay was too short to observe are ``None`` with a ``*_censored``
+    flag rather than counted either way: a turn not taken before the clip ended
+    inside the response window, or agent speech still running at the end of the
+    clip before the yield window had passed.
+    """
     out: dict[str, Any] = {}
     if speech_end is None:
         return out
     turn = next(((s, e) for s, e in agent_segs if e > speech_end), None)
     took = turn is not None and turn[0] - speech_end <= response_window_s
-    out["took_turn"] = took
+    if not took and duration_s - speech_end < response_window_s:
+        out["took_turn"], out["turn_censored"] = None, True
+    else:
+        out["took_turn"] = took
     out["response_latency_s"] = (turn[0] - speech_end) if took else None
     if first_text_s is not None and first_text_s >= speech_end:
         out["text_latency_s"] = first_text_s - speech_end
@@ -88,9 +102,14 @@ def timing_metrics(
         speaking = next(((s, e) for s, e in agent_segs if s <= interrupt < e), None)
         out["agent_speaking_at_barge_in"] = speaking is not None
         if speaking is not None:
-            stop = speaking[1] - interrupt
-            out["stop_latency_s"] = stop
-            out["yielded"] = stop <= yield_window_s
+            if speaking[1] < duration_s - EOF_GUARD_S:
+                stop = speaking[1] - interrupt
+                out["stop_latency_s"] = stop
+                out["yielded"] = stop <= yield_window_s
+            elif duration_s - interrupt >= yield_window_s:
+                out["yielded"] = False  # still talking when the clip ended, a full window after the barge-in
+            else:
+                out["yielded"], out["yield_censored"] = None, True
     return out
 
 
@@ -176,7 +195,7 @@ class DuplexSuite(Suite):
             "sample_rate": rate, "_audio": audio,
         }
         row |= timing_metrics(category, segs, first_text_s, speech_end, interrupt,
-                              a.response_window_s, a.yield_window_s)
+                              a.response_window_s, a.yield_window_s, len(audio) / rate)
         return row
 
     def score(self, items: list[Item], rows: list[dict[str, Any]], wall_s: float, audio_dir: Path | None) -> dict:
@@ -198,6 +217,7 @@ class DuplexSuite(Suite):
             "stop_latency_s_p50": stats.percentile([r.get("stop_latency_s") for r in applicable], 50),
             "yield_rate": _rate([r.get("yielded") for r in applicable]),
             "barge_in_applicable_rate": _rate([r.get("agent_speaking_at_barge_in") for r in bi]),
+            "censored": sum(bool(r.get("turn_censored") or r.get("yield_censored")) for r in ok),
             "wall_ms_per_frame_p50": stats.percentile([r["wall_ms_per_frame"] for r in ok], 50),
             "wall_ms_per_frame_max": max((r["wall_ms_per_frame"] for r in ok), default=None),
             "on_time_rate": _rate([r["on_time"] for r in ok]),

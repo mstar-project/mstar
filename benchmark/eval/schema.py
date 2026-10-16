@@ -68,6 +68,10 @@ class RunResult:
         d = asdict(self)
         # The one place everything passes before it is written: no addresses, secrets or home paths.
         d["config"], d["meta"] = scrub(d["config"]), scrub(d["meta"])
+        for rep in d["repeats"]:
+            for row in rep["requests"]:
+                if isinstance(row.get("error"), str):
+                    row["error"] = _scrub(row["error"])
         return {"schema": d.pop("schema"), **d}
 
     def save(self, path: str | Path) -> Path:
@@ -142,11 +146,16 @@ def redact_url(url: str | None) -> str | None:
     return urlunsplit((parts.scheme, host + (f":{port}" if port else ""), parts.path, "", ""))
 
 
-_SECRET = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|AUTH|CREDENTIAL|COOKIE|SESSION", re.IGNORECASE)
+_SECRET = re.compile(
+    r"TOKEN|SECRET|PASSW|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|AUTH|CREDENTIAL|COOKIE|SESSION", re.IGNORECASE
+)
 _URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]+")
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _URL_FLAGS = {"--url"}
 _PAIR_FLAGS = {"--serve-env", "--extra"}
+_CMD_FLAGS = {"--serve-cmd"}
+_HOST_FLAGS = {"--host", "--hostname", "--server", "--endpoint", "--address", "--addr"}
+_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _scrub(text: str) -> str:
@@ -175,20 +184,43 @@ def _pair(kv: str) -> str:
     return f"{k}{sep}{'<redacted>' if _SECRET.search(k) else _scrub(v)}"
 
 
+def _host(value: str) -> str:
+    return value if value in _LOCAL_HOSTS else "remote-host"
+
+
 def scrub_argv(argv: list[str]) -> list[str]:
-    """A command line for a results file: URLs, secret env values, addresses and home paths removed."""
+    """A command line for a results file, including any nested ``--serve-cmd``: values of
+    secret-looking flags and ``KEY=VALUE`` assignments, non-loopback hosts and URLs, IPv4
+    literals and home paths are removed."""
+    import shlex
+
     out: list[str] = []
     for i, arg in enumerate(argv):
         prev = argv[i - 1] if i else ""
         flag, eq, val = arg.partition("=")
-        if prev in _PAIR_FLAGS:
+        is_flag = flag.startswith("-")
+        if prev in _CMD_FLAGS:
+            arg = shlex.join(scrub_argv(shlex.split(arg)))
+        elif is_flag and flag in _CMD_FLAGS and eq:
+            arg = f"{flag}={shlex.join(scrub_argv(shlex.split(val)))}"
+        elif prev in _PAIR_FLAGS:
             arg = _pair(arg)
-        elif flag in _PAIR_FLAGS and eq:
+        elif is_flag and flag in _PAIR_FLAGS and eq:
             arg = f"{flag}={_pair(val)}"
+        elif prev.startswith("-") and "=" not in prev and _SECRET.search(prev):
+            arg = "<redacted>"
+        elif is_flag and eq and _SECRET.search(flag):
+            arg = f"{flag}=<redacted>"
         elif prev in _URL_FLAGS:
             arg = redact_url(arg) or arg
-        elif flag in _URL_FLAGS and eq:
+        elif is_flag and flag in _URL_FLAGS and eq:
             arg = f"{flag}={redact_url(val)}"
+        elif prev in _HOST_FLAGS:
+            arg = _host(arg)
+        elif is_flag and flag in _HOST_FLAGS and eq:
+            arg = f"{flag}={_host(val)}"
+        elif not is_flag and _ASSIGN.match(arg):
+            arg = _pair(arg)
         out.append(_scrub(arg))
     return out
 
