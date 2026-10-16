@@ -724,8 +724,8 @@ class CosyVoice3Model(Model):
         with torch.device("meta"):
             model = CosyVoice3LM(self.config.lm, comm_group=tp_group)
         materialize(model, device, autocast_dtype or self._lm_dtype)
+        model.keep_head_in_float32()  # before loading, so the checkpoint's head is not rounded through bfloat16
         model.load_weights((k, v.to(device)) for k, v in self._state_dict(self.config.llm_weights))
-        model.keep_head_in_float32()
         return LMSubmodule(model.eval(), self.config)
 
     def _create_flow_submodule(self, device: str):

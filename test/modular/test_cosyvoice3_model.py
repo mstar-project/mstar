@@ -561,6 +561,31 @@ def test_lm_head_stays_float32_under_the_engines_autocast():
     assert cast.dtype == torch.float32 and torch.equal(cast, plain)
 
 
+def test_lm_node_loads_the_checkpoint_head_without_rounding(model, monkeypatch):
+    """The head is float32 before the checkpoint streams in: a bfloat16 head
+    converted afterwards would keep only the bfloat16-rounded values."""
+    model.config = _tiny_config()
+    source = CosyVoice3LM(model.config.lm)
+    with torch.no_grad():
+        source.llm_decoder.weight.normal_(0, 0.1).add_(1.001)
+    lm = model.config.lm
+    q, kv = lm.num_attention_heads * lm.head_dim, lm.num_key_value_heads * lm.head_dim
+    checkpoint = {}
+    for name, value in source.state_dict().items():  # unfused, as llm.pt stores them
+        if ".qkv_proj." in name:
+            for part, chunk in zip(("q", "k", "v"), value.split([q, kv, kv]), strict=True):
+                checkpoint[name.replace(".qkv_proj.", f".{part}_proj.")] = chunk
+        elif ".gate_up_proj." in name:
+            for part, chunk in zip(("gate", "up"), value.chunk(2), strict=True):
+                checkpoint[name.replace(".gate_up_proj.", f".{part}_proj.")] = chunk
+        else:
+            checkpoint[name] = value
+    monkeypatch.setattr(model, "_state_dict", lambda name: checkpoint.items())
+    node = model._create_lm_submodule("cpu")
+    head = node.model.llm_decoder.weight
+    assert head.dtype == torch.float32 and torch.equal(head, source.llm_decoder.weight)
+
+
 def test_lm_prefill_layout_matches_the_reference():
     cfg = _tiny_config()
     lm = CosyVoice3LM(cfg.lm)
