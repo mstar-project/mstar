@@ -154,6 +154,9 @@ jobs:
 
       - name: Review
         if: steps.pre.outputs.run == 'true'
+        # Advisory: an API or action failure (bad key, outage, timeout) shows as
+        # a warning in the log, never as a red check on the PR.
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
