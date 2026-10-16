@@ -73,6 +73,20 @@ def frame_stats(ours: torch.Tensor, ref: torch.Tensor) -> dict:
     return s
 
 
+def mismatches(report, path: str = "") -> list[str]:
+    """Every point of ``report`` that differs from the reference: every flag
+    must be true, except that the rollout stops on its last chunk only."""
+    if path == ".check_stop_flags":
+        return [] if report == [False] * (len(report) - 1) + [True] else [path]
+    if isinstance(report, bool):
+        return [] if report else [path]
+    if isinstance(report, dict):
+        return [p for key, value in report.items() for p in mismatches(value, f"{path}.{key}")]
+    if isinstance(report, list):
+        return [p for i, value in enumerate(report) for p in mismatches(value, f"{path}[{i}]")]
+    return []
+
+
 def fwd_info(walk: str, md: dict, rid: int) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id=f"parity-{rid}", graph_walk=walk, fwd_index=0, random_seed=42, max_tokens=0,
@@ -243,6 +257,8 @@ def main():
     torch.save({"e2e_frames": e2e["frames"], "tf_frames": tf["frames"]}, out_dir / "mstar_frames.pt")
     (out_dir / "results.json").write_text(json.dumps(report, indent=2, default=str))
     print(json.dumps(report, indent=2, default=str))
+    if bad := mismatches(report):
+        raise SystemExit(f"parity FAILED at {len(bad)} point(s): {bad[:8]}")
 
 
 if __name__ == "__main__":

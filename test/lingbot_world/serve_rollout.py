@@ -120,6 +120,9 @@ def main() -> int:
         log.close()
     (args.out / "serve.json").write_text(json.dumps(report, indent=2, default=str))
     print(json.dumps({k: v for k, v in report.items() if k != "chunk_metadata"}, indent=2, default=str))
+    if not report.get("repeat_identical") or report.get("vs_oracle", {}).get("bit_exact") is False:
+        print("served rollout FAILED: the two runs differ or the frames differ from the oracle")
+        return 1
     return 0
 
 

@@ -50,11 +50,22 @@ def build_lingbot_dit(
             f"LingBot DiT checkpoint does not match the module: missing {sorted(missing)[:8]}, "
             f"unexpected {sorted(unexpected)[:8]}"
         )
+    loaded = set()
     for shard in sorted(set(weight_map.values())):
         with safe_open(os.path.join(dit_dir, shard), framework="pt", device="cpu") as f:
             for name in f.keys():
+                if name not in params:
+                    raise ValueError(f"LingBot DiT shard {shard} holds {name!r}, which the module does not have")
+                if weight_map[name] != shard:
+                    raise ValueError(
+                        f"LingBot DiT shard {shard} holds {name!r}, which the index puts in {weight_map[name]}"
+                    )
                 tensor = f.get_tensor(name)
                 if tuple(tensor.shape) != tuple(params[name].shape):
                     raise ValueError(f"{name}: checkpoint {tuple(tensor.shape)} vs module {tuple(params[name].shape)}")
                 params[name].data.copy_(tensor.to(torch.bfloat16))
+                loaded.add(name)
+    # the index can list a tensor its shard lacks; ``to_empty`` left that one uninitialized
+    if unloaded := set(params) - loaded:
+        raise ValueError(f"LingBot DiT checkpoint shards are missing {sorted(unloaded)[:8]}")
     return dit

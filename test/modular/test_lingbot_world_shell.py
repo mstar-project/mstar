@@ -180,3 +180,76 @@ def test_mstar_serve_knows_the_model():
 
     assert DEFAULT_CONFIGS["lingbot_world_1_3b"] == "lingbot_world_1_3b.yaml"
     assert Path(_resolve_config("lingbot_world_1_3b", None)).name == "lingbot_world_1_3b.yaml"
+
+
+def test_dit_loader_takes_each_tensor_only_from_its_indexed_shard(tmp_path):
+    """A shard that lacks an indexed tensor must fail the load, not leave it as
+    ``to_empty``'s uninitialized memory; a stale copy in another shard must not
+    overwrite or stand in for it."""
+    import json
+
+    from safetensors.torch import save_file
+
+    from mstar.model.lingbot_world.components.dit import LingBotCausalDiT
+    from mstar.model.lingbot_world.config import LingBotWorldConfig
+    from mstar.model.lingbot_world.weight_loader import build_lingbot_dit
+
+    cfg = LingBotWorldConfig(dim=12, ffn_dim=24, num_heads=1, num_layers=1, freq_dim=8, text_dim=8)
+    tensors = {name: torch.ones_like(p) for name, p in LingBotCausalDiT(cfg).named_parameters()}
+    weight_map = {name: "a.safetensors" for name in tensors}
+    weight_map["patch_embedding.bias"] = "b.safetensors"
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+    def write(a, b):
+        save_file(a, str(tmp_path / "a.safetensors"))
+        save_file(b, str(tmp_path / "b.safetensors"))
+
+    weight, bias = tensors.pop("patch_embedding.weight"), tensors.pop("patch_embedding.bias")
+    write({**tensors, "patch_embedding.weight": weight}, {"patch_embedding.bias": bias})
+    assert build_lingbot_dit(cfg, str(tmp_path), device="cpu").patch_embedding.weight.eq(1).all()
+
+    write(tensors, {"patch_embedding.bias": bias})
+    with pytest.raises(ValueError, match="missing.*patch_embedding.weight"):
+        build_lingbot_dit(cfg, str(tmp_path), device="cpu")
+    for stale in (weight, weight * 9):
+        write({**tensors, "patch_embedding.weight": weight},
+              {"patch_embedding.bias": bias, "patch_embedding.weight": stale})
+        with pytest.raises(ValueError, match="index puts in a.safetensors"):
+            build_lingbot_dit(cfg, str(tmp_path), device="cpu")
+    write(tensors, {"patch_embedding.bias": bias, "patch_embedding.weight": weight})
+    with pytest.raises(ValueError, match="index puts in a.safetensors"):
+        build_lingbot_dit(cfg, str(tmp_path), device="cpu")
+
+
+def test_the_parity_gate_fails_on_any_differing_point():
+    """Every flag in the parity report must hold, and the rollout must stop on
+    its last chunk only; anything else fails the run."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parents[1] / "lingbot_world" / "run_parity.py"
+    spec = importlib.util.spec_from_file_location("lingbot_run_parity", path)
+    run_parity = importlib.util.module_from_spec(spec)
+    precision = torch.get_float32_matmul_precision()
+    try:
+        spec.loader.exec_module(run_parity)
+    finally:
+        torch.set_float32_matmul_precision(precision)
+
+    report = {
+        "tokenizer_ids_equal": True, "text_embeds_tail_zero": True, "mask_equal": True,
+        "image": {"bit_exact": True, "max_abs": 0.0}, "dit_calls_bit_exact": {"x_in": True, "flow": True},
+        "e2e_chunks": [{"latent": {"bit_exact": True}, "frames": {"bit_exact": True}}] * 2,
+        "check_stop_flags": [False, False, True], "overshoot_vetoed": True, "dit_first_divergent_call": None,
+    }
+    assert run_parity.mismatches(report) == []
+    for key, value, point in [
+        ("text_embeds_tail_zero", False, ".text_embeds_tail_zero"),
+        ("dit_calls_bit_exact", {"x_in": True, "flow": False}, ".dit_calls_bit_exact.flow"),
+        ("e2e_chunks", [{"latent": {"bit_exact": True}, "frames": {"bit_exact": False}}],
+         ".e2e_chunks[0].frames.bit_exact"),
+        ("image", {"bit_exact": False, "shape_mismatch": [[1], [2]]}, ".image.bit_exact"),
+        ("check_stop_flags", [False, True, True], ".check_stop_flags"),
+        ("check_stop_flags", [False, False, False], ".check_stop_flags"),
+    ]:
+        assert run_parity.mismatches({**report, key: value}) == [point]
