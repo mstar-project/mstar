@@ -69,6 +69,9 @@ from mstar.streaming.topology import Connection, PartitionTopology, StreamingGra
 STREAM_EDGE = "latent_patches"
 # model_kwargs key: prompt patches leading a continuation's VAE stream
 STREAM_LEAD_KEY = "vae_stream_lead_patches"
+# the Talker's patch budget, settled while tokenizing; the conductor ends a
+# one-patch request after prefill, where the loop that would stop it is absent
+PATCH_BUDGET_KEY = "talker_patch_budget"
 _CJK = re.compile(r"^[\u4e00-\u9fff]{2,}$")
 
 
@@ -287,6 +290,14 @@ class VoxCPM2Model(Model):
             raise ValueError(f"VoxCPM2 {key} must be finite")
         return value
 
+    def _patch_cap(self, kwargs: dict) -> int:
+        """The request's patch cap: ``max_new_tokens``, else the standard
+        ``max_output_tokens``, else ``max_len``, else the model's."""
+        for key in ("max_new_tokens", "max_output_tokens", "max_len"):
+            if kwargs.get(key) is not None:
+                return self._number(kwargs, key, self.config.max_len, int)
+        return self.config.max_len
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -319,12 +330,7 @@ class VoxCPM2Model(Model):
         if cfg_value < 0:
             raise ValueError("VoxCPM2 cfg_value must be non-negative")
         min_len = self._number(kwargs, "min_len", self.config.min_len, int)
-        max_len = self._number(
-            kwargs,
-            "max_new_tokens",
-            kwargs.get("max_len", self.config.max_len),
-            int,
-        )
+        max_len = self._patch_cap(kwargs)
         if min_len < 0 or not 1 <= max_len <= self.config.max_len:
             raise ValueError(f"VoxCPM2 needs min_len >= 0 and 1 <= max_new_tokens <= {self.config.max_len}")
 
@@ -362,10 +368,10 @@ class VoxCPM2Model(Model):
             "prompt_layout": [torch.tensor([mode, max_patches, min_len], dtype=torch.long)],
             "gen_params": [torch.tensor([cfg_value], dtype=torch.float32)],
         }
+        metadata = {PATCH_BUDGET_KEY: max_patches}
         if mode == MODE_REF_CONTINUATION:
-            lead = min(self.config.prompt_context_patches, ref_patches)
-            return ProcessPromptOutput(outputs, {STREAM_LEAD_KEY: lead})
-        return outputs
+            metadata[STREAM_LEAD_KEY] = min(self.config.prompt_context_patches, ref_patches)
+        return ProcessPromptOutput(outputs, metadata)
 
     # -- conductor state machine -------------------------------------------------
 
@@ -386,6 +392,7 @@ class VoxCPM2Model(Model):
                 output_modalities=output_modalities,
                 graph_walk=walk,
                 is_prefill=True,
+                kwargs={PATCH_BUDGET_KEY: int(model_kwargs.get(PATCH_BUDGET_KEY, 0))},
             )
             routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
             if clone:
@@ -427,6 +434,10 @@ class VoxCPM2Model(Model):
         del incoming_connections
         if partition_name == "Talker":
             if partition_metadata.graph_walk in ("talker_prefill", "talker_prefill_clone"):
+                if partition_metadata.kwargs.get(PATCH_BUDGET_KEY) == 1:
+                    return ForwardPassArgs(
+                        full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True
+                    )
                 partition_metadata.graph_walk = "talker_decode"
                 partition_metadata.is_prefill = False
                 edge = GraphEdge(next_node="Talker", name="latent_patch")
@@ -452,7 +463,7 @@ class VoxCPM2Model(Model):
     # -- output ---------------------------------------------------------------------
 
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
-        return int(model_kwargs.get("max_new_tokens", model_kwargs.get("max_len", self.config.max_len)))
+        return self._patch_cap(model_kwargs)
 
     def get_max_output_tokens_limit(self) -> int | None:
         return self.config.max_len

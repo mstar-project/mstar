@@ -37,6 +37,7 @@ from mstar.model.voxcpm2.config import (
 )
 from mstar.model.voxcpm2.submodules import TALKER_LOOP, TalkerSubmodule, VAEDecoderSubmodule, build_prompt
 from mstar.model.voxcpm2.voxcpm2_model import (
+    PATCH_BUDGET_KEY,
     STREAM_EDGE,
     STREAM_LEAD_KEY,
     VoxCPM2Model,
@@ -265,20 +266,25 @@ def test_receptive_field_bound_is_exact():
     assert changed == list(range(5, 5 + rf + 1))
 
 
+def _prompt(model, *args, **kwargs) -> dict:
+    """``process_prompt``'s tensors; its metadata is checked separately."""
+    return model.process_prompt(*args, **kwargs).new_input_tensors
+
+
 def test_process_prompt_builds_each_reference_mode(model):
-    zero = model.process_prompt("hello  world\n", ["text"], ["audio"], seed=3, cfg_value=1.5)
+    zero = _prompt(model, "hello  world\n", ["text"], ["audio"], seed=3, cfg_value=1.5)
     assert zero["text_inputs"][0].tolist() == [10, 11, AUDIO_START_TOKEN]
     assert zero["prompt_layout"][0].tolist() == [MODE_ZERO_SHOT, 2 * 6 + 10, 2]
     assert zero["gen_params"][0].tolist() == [1.5]
 
-    design = model.process_prompt("hello", ["text"], ["audio"], instructions="warm")
+    design = _prompt(model, "hello", ["text"], ["audio"], instructions="warm")
     assert design["text_inputs"][0].tolist() == [15, AUDIO_START_TOKEN]  # "(warm)hello"
 
-    cjk = model.process_prompt("你好", ["text"], ["audio"])
+    cjk = _prompt(model, "你好", ["text"], ["audio"])
     assert cjk["text_inputs"][0].tolist() == [13, 14, AUDIO_START_TOKEN]  # split like the reference
 
     clip = torch.zeros(16000)  # 1 s: 7 patches of 2560 samples
-    ref = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
+    ref = _prompt(model, "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
     assert ref["prompt_layout"][0][0] == MODE_REFERENCE
     cont = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="world "
@@ -292,7 +298,38 @@ def test_process_prompt_builds_each_reference_mode(model):
     assert joined["text_inputs"][0].tolist() == [3, AUDIO_START_TOKEN]  # "worldhello"
     # max patches follow the target text only
     assert tensors["prompt_layout"][0].tolist() == [MODE_REF_CONTINUATION, 16, 2]
-    assert metadata == {STREAM_LEAD_KEY: 3}
+    assert metadata == {STREAM_LEAD_KEY: 3, PATCH_BUDGET_KEY: 16}
+
+
+@pytest.mark.parametrize(
+    "kwargs, cap",
+    [
+        ({}, 4096),
+        ({"max_len": 9}, 9),
+        ({"max_output_tokens": 3, "max_len": 9}, 3),
+        ({"max_new_tokens": 2, "max_output_tokens": 3}, 2),
+    ],
+)
+def test_patch_cap_reads_the_standard_and_model_knobs_in_one_order(model, kwargs, cap):
+    """``max_new_tokens``, then the standard ``max_output_tokens``, then ``max_len``,
+    the same in the conductor's cap and in the prompt's patch budget."""
+    assert model.get_max_output_tokens(**kwargs) == cap
+    tensors, metadata = model.process_prompt("hello world", ["text"], ["audio"], **kwargs)
+    budget = model.config.max_patches(2, cap)
+    assert tensors["prompt_layout"][0][1] == budget and metadata[PATCH_BUDGET_KEY] == budget
+
+
+@pytest.mark.parametrize("budget, done", [(1, True), (2, False)])
+def test_a_one_patch_request_ends_after_prefill(model, budget, done):
+    """Prefill has no loop for the Talker's stop to end, so a request whose
+    budget the prefill patch spends goes straight to done instead of a decode
+    step that would only veto itself."""
+    args = model.get_initial_forward_pass_args(
+        "Talker", ["text"], ["audio"], {}, model_kwargs={PATCH_BUDGET_KEY: budget}
+    )
+    nxt = model.get_partition_forward_pass_args("Talker", args.full_metadata, {"latent_patch": []})
+    assert nxt.request_done is done
+    assert nxt.full_metadata.graph_walk == ("talker_prefill" if done else "talker_decode")
 
 
 @pytest.mark.parametrize(
@@ -400,8 +437,8 @@ def _run(talker, plan, requests: dict, steps: int):
 
 def test_talker_batches_like_single_requests_and_follows_the_seed(model):
     talker, plan, reset = _talker(model)
-    a = model.process_prompt("hello world", ["text"], ["audio"])
-    b = model.process_prompt("hello hello hello", ["text"], ["audio"], cfg_value=3.0)
+    a = _prompt(model, "hello world", ["text"], ["audio"])
+    b = _prompt(model, "hello hello hello", ["text"], ["audio"], cfg_value=3.0)
     with torch.inference_mode():
         together = _run(talker, plan, {"a": (a, 5), "b": (b, 9)}, steps=4)
         reset()
@@ -441,28 +478,55 @@ def test_talker_clone_prefill_streams_the_prompt_tail_as_context(model):
 def test_talker_stops_like_the_reference_loop(model):
     """``i > min_len and stop`` on the step that produced patch i (kept), or the patch budget."""
     talker, _, _ = _talker(model)
-    request = model.process_prompt("hello", ["text"], ["audio"], max_new_tokens=6)
+    request = _prompt(model, "hello", ["text"], ["audio"], max_new_tokens=6)
     talker.prepare_inputs("talker_prefill", SimpleNamespace(rid_handle="r", request_id="r", random_seed=0), request)
 
-    def step(flag: int) -> set[str]:
-        outputs = {"stop_flag": [torch.tensor([flag])]}
-        talker.postprocess("r", None, outputs)
-        return talker.check_stop("r", None, outputs)
+    def step(flag: int, index: int) -> set[str]:
+        return talker.check_stop("r", None, {"stop_flag": [torch.tensor([flag, index])]})
 
-    assert [step(1) for _ in range(3)] == [set(), set(), set()]  # i = 0, 1, 2: not past min_len 2
-    assert step(1) == {TALKER_LOOP}  # i = 3
-    talker.request_state("r").add("generated", 0)
-    assert [step(0) for _ in range(6)][-2:] == [set(), {TALKER_LOOP}]  # budget of 6 patches
+    assert [step(1, i) for i in range(3)] == [set(), set(), set()]  # i = 0, 1, 2: not past min_len 2
+    assert step(1, 3) == {TALKER_LOOP}
+    assert [step(0, i) for i in range(6)][-2:] == [set(), {TALKER_LOOP}]  # budget of 6 patches
+
+
+def test_talker_stop_judges_each_step_by_its_own_patch_index(model):
+    """A speculative step postprocessed before the previous step's stop check
+    moves ``generated`` on; the check still counts the patches of its own step."""
+    talker, _, _ = _talker(model)
+    request = _prompt(model, "hello", ["text"], ["audio"], max_new_tokens=6)
+    talker.prepare_inputs("talker_prefill", SimpleNamespace(rid_handle="r", request_id="r", random_seed=0), request)
+    for _ in range(6):
+        talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 0])]})
+    assert talker.check_stop("r", None, {"stop_flag": [torch.tensor([0, 4])]}) == set()  # patch 5 of 6
+    assert talker.check_stop("r", None, {"stop_flag": [torch.tensor([1, 2])]}) == set()  # i = 2: not past min_len
 
 
 def test_talker_vetoes_steps_past_the_patch_budget(model):
     talker, _, _ = _talker(model)
-    request = model.process_prompt("hello", ["text"], ["audio"], max_new_tokens=2)
+    request = _prompt(model, "hello", ["text"], ["audio"], max_new_tokens=2)
     info = SimpleNamespace(rid_handle="r", request_id="r", random_seed=0)
     talker.prepare_inputs("talker_prefill", info, request)
+    talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 0])]})
     patch = torch.zeros(4, 8)
-    assert talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]}) is not None
+    first = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
+    assert first is not None and first.tensor_inputs["step_index"].tolist() == [1]
+    talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 1])]})
     assert talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]}) is None
+
+
+def test_talker_reprepares_a_refused_step_with_the_same_index_and_noise(model):
+    """A step whose admit was refused is prepared again: nothing ran, so it is
+    the same patch index and the same noise draw, and the budget is not spent."""
+    talker, _, _ = _talker(model)
+    request = _prompt(model, "hello", ["text"], ["audio"], max_new_tokens=2)
+    info = SimpleNamespace(rid_handle="r", request_id="r", random_seed=0)
+    talker.prepare_inputs("talker_prefill", info, request)
+    talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 0])]})
+    patch = torch.zeros(4, 8)
+    refused = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
+    retry = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
+    assert retry is not None and retry.tensor_inputs["step_index"].tolist() == [1]
+    assert torch.equal(retry.tensor_inputs["noise"], refused.tensor_inputs["noise"])
 
 
 def test_talker_noise_is_drawn_once_per_step(model):
@@ -486,6 +550,7 @@ def test_talker_declares_the_same_span_in_both_caches(model):
         "prev_patch",
         "noise",
         "cfg",
+        "step_index",
     }
 
 

@@ -263,7 +263,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                 generator=generator,
                 noise={},
                 drawn=0,
-                step=0,
                 generated=0,
                 max_patches=max_patches,
                 min_len=min_len,
@@ -281,6 +280,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                     "cond_patch": cond,
                     "noise": self._noise(state, 0),
                     "cfg": state["cfg"],
+                    "step_index": torch.zeros(1, dtype=torch.long, device=device),
                 },
                 kwargs={
                     "prompt_patches": ref[1][-self.config.prompt_context_patches :]
@@ -290,11 +290,12 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
         if graph_walk != "talker_decode":
             raise ValueError(f"Unknown VoxCPM2 Talker walk: {graph_walk!r}")
-        step = int(state["step"]) + 1
+        # Patches committed so far, advanced only by postprocess after a forward
+        # ran: a step whose admit was refused prepares the same index again.
+        step = int(state["generated"])
         if step >= int(state["max_patches"]):
             logger.debug("VoxCPM2 talker %s: skipping overshoot step %d", fwd_info.request_id, step)
             return None
-        state.add("step", step)
         prev = inputs["latent_patch"][0].to(device=device, dtype=self._dtype())
         return ARNodeInputs(
             input_seq_len=1,
@@ -302,6 +303,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 "prev_patch": prev.reshape(self.config.patch_size, self.config.feat_dim),
                 "noise": self._noise(state, step),
                 "cfg": state["cfg"],
+                "step_index": torch.full((1,), step, dtype=torch.long, device=device),
             },
         )
 
@@ -314,8 +316,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]
     ) -> dict[str, Any]:
         del engine_inputs
-        stack = {name: torch.stack([item.tensor_inputs[name] for item in inputs]) for name in ("noise", "cfg")}
+        stack = {
+            name: torch.stack([item.tensor_inputs[name] for item in inputs]) for name in ("noise", "cfg", "step_index")
+        }
         stack["cfg"] = stack["cfg"].reshape(-1)
+        stack["step_index"] = stack["step_index"].reshape(-1)
         if graph_walk == "talker_decode":
             stack["prev_patch"] = torch.stack([item.tensor_inputs["prev_patch"] for item in inputs])
             return stack
@@ -359,7 +364,10 @@ class TalkerSubmodule(ARNodeSubmodule):
 
     # -- forward -------------------------------------------------------------
 
-    def _run(self, graph_walk: str, noise, cfg, prev_patch=None, **prefill) -> tuple[torch.Tensor, torch.Tensor]:
+    def _run(
+        self, graph_walk: str, noise, cfg, step_index, prev_patch=None, **prefill
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del step_index
         if graph_walk == "talker_decode":
             return self.model.decode_step(prev_patch, noise, cfg, self.t_span())
         prefill.pop("prompt_patches", None)
@@ -375,20 +383,27 @@ class TalkerSubmodule(ARNodeSubmodule):
             stream = [*prompt_patches.unbind(0), patch]
         return {"latent_patch": [patch], "latent_patches": stream, "stop_flag": [stop]}
 
+    @staticmethod
+    def _stop_flags(stop_logits: torch.Tensor, step_index: torch.Tensor) -> torch.Tensor:
+        """``[rows, 2]``: the stop head's verdict and the index of the patch it
+        judged, so ``check_stop`` reads the step's own count even when a later
+        speculative step has already been postprocessed."""
+        return torch.stack([stop_logits.argmax(dim=-1), step_index], dim=-1)
+
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs: Any) -> NameToTensorList:
         prompt = kwargs.get("prompt_patches")
         patch, stop_logits = self._run(graph_walk, **kwargs)
-        stop = stop_logits.argmax(dim=-1)
-        return self._outputs(graph_walk, patch[0], stop[0:1], prompt[0] if prompt else None)
+        stop = self._stop_flags(stop_logits, kwargs["step_index"])
+        return self._outputs(graph_walk, patch[0], stop[0], prompt[0] if prompt else None)
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs: Any
     ) -> dict[str, NameToTensorList]:
         prompt = kwargs.get("prompt_patches") or [None] * len(engine_inputs.request_ids)
         patch, stop_logits = self._run(graph_walk, **kwargs)
-        stop = stop_logits.argmax(dim=-1)
+        stop = self._stop_flags(stop_logits, kwargs["step_index"])
         return {
-            rid: self._outputs(graph_walk, patch[i], stop[i : i + 1], prompt[i] if i < len(prompt) else None)
+            rid: self._outputs(graph_walk, patch[i], stop[i], prompt[i] if i < len(prompt) else None)
             for i, rid in enumerate(engine_inputs.request_ids)
         }
 
@@ -414,8 +429,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         if "stop_flag" not in outputs:
             return set()
         state = self.request_state(request_id)
-        generated = int(state.get("generated", 0))
-        stop = int(outputs["stop_flag"][0].reshape(-1)[0].item()) == 1
+        flag, index = (int(v) for v in outputs["stop_flag"][0].reshape(-1).tolist())
+        generated, stop = index + 1, flag == 1
         if (stop and generated - 1 > int(state["min_len"])) or generated >= int(state["max_patches"]):
             logger.debug("VoxCPM2 talker %s: stop after %d patches (head=%s)", request_id, generated, stop)
             return {TALKER_LOOP}
@@ -444,6 +459,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                         "prev_patch": torch.zeros(cfg.patch_size, cfg.feat_dim, dtype=dtype, device=device),
                         "noise": torch.zeros(cfg.feat_dim, cfg.patch_size, dtype=dtype, device=device),
                         "cfg": torch.full((1,), cfg.cfg_value, dtype=torch.float32, device=device),
+                        "step_index": torch.ones(1, dtype=torch.long, device=device),
                     },
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
