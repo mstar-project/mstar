@@ -187,7 +187,9 @@ def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
         if decoder == "torchcodec":
             from torchcodec.decoders import AudioDecoder
 
-            AudioDecoder(path).get_all_samples()
+            # Mono at a fixed rate: a small compressed upload can declare many
+            # channels at a high rate, and decoding it natively takes gigabytes.
+            AudioDecoder(path, sample_rate=16000, num_channels=1).get_all_samples()
         else:
             import soundfile
 

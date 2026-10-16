@@ -179,9 +179,12 @@ def test_omnivoice_refuses_audio_whose_header_opens_but_samples_do_not_decode(de
     import sys
     import types
 
+    opened = []
+
     class AudioDecoder:
-        def __init__(self, source, **_):
+        def __init__(self, source, **kwargs):
             open(source, "rb").close()
+            opened.append(kwargs)
 
         def get_all_samples(self):
             if not decodes:
@@ -204,6 +207,8 @@ def test_omnivoice_refuses_audio_whose_header_opens_but_samples_do_not_decode(de
         with pytest.raises(ValueError, match=REFUSED):
             adapters.OmniVoiceAdapter().speech_to_request(req, uploads)
         assert set(uploads.iterdir()) == before
+    # decoded size must not scale with the channel count or rate the clip declares
+    assert opened and all(kw.get("num_channels") == 1 and kw.get("sample_rate") for kw in opened)
 
 
 @pytest.mark.parametrize("adapter", [adapters.Cosmos3Adapter, adapters.Wan22Adapter])
