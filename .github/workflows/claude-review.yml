@@ -157,6 +157,10 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The job's own token (pull-requests: write, above). Without it the
+          # action tries to mint a Claude GitHub App token over OIDC, which needs
+          # `id-token: write` and the app installed, and fails before reviewing.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
             Read .github/review/review-prompt.md from the repository root and follow it
             exactly. It defines your trust boundary, your method, your reporting bar and
