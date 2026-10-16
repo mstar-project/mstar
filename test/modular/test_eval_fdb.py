@@ -190,6 +190,34 @@ def test_api_judge_is_skipped_without_a_key_and_keys_never_reach_results(monkeyp
         llm_judge.parse_judges(["a=openai"], ["b=rev"])
 
 
+def test_token_counts_are_kept_and_token_credentials_are_not():
+    from benchmark.eval.schema import scrub, scrub_env
+
+    cfg = scrub({"decoding": {"max_tokens": 512, "max_new_tokens": 8}, "tokens": "hf_abc", "HF_TOKENS": "hf_def",
+                 "API_TOKENS": 123456789, "max_tokens_secret": "x", "max_tokens": "hf_ghi"})
+    assert cfg["decoding"] == {"max_tokens": 512, "max_new_tokens": 8}
+    assert {cfg[k] for k in ("tokens", "HF_TOKENS", "API_TOKENS", "max_tokens_secret", "max_tokens")} == {"<redacted>"}
+    assert scrub_env({"HF_TOKENS": "hf_abc", "MSTAR_TOKENS": "1"}) == {"HF_TOKENS": "<redacted>",
+                                                                       "MSTAR_TOKENS": "<redacted>"}
+
+
+def test_semantic_replies_from_another_model_are_rejected():
+    assets = llm_judge.SemanticAssets(prompt="p", schema={}, controls=[{"sample_id": "s01", "output_asr_text": "ok"}],
+                                      expected={"s01": dict.fromkeys(llm_judge.AXES, "accept")})
+    axis = {"status": "accept", "reason": "r", "source": "output_asr_text", "quote": "ok"}
+    content = json.dumps({"assessments": [{"sample_id": "s01", "axes": dict.fromkeys(llm_judge.AXES, axis)}]})
+
+    def judge(model):
+        def post(url, body, headers, timeout):
+            return {"model": model, "choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
+        return llm_judge.Judge("j", "local", "http://127.0.0.1:1/v1", "m", post=post)
+
+    assert llm_judge.run_controls(judge("m"), assets)["passed"]
+    assert not llm_judge.run_controls(judge("other"), assets)["passed"]
+    graded = llm_judge.grade(judge("other"), assets, [{"sample_id": "p1", "output_asr_text": "ok"}])
+    assert graded["p1"]["relevance"] == {"status": "unresolved", "conversion": "batch response failed"}
+
+
 def test_load_behavior_reads_the_prompt_without_importing_the_file(tmp_path):
     src = tmp_path / "eval_behavior.py"
     src.write_text('''

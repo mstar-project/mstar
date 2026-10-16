@@ -253,12 +253,14 @@ def semantic_body(judge: Judge, assets: SemanticAssets, packets: list[dict[str, 
 
 def submit(judge: Judge, body: dict[str, Any]) -> dict[str, Any] | None:
     """The assessments object, retrying transport errors, non-stop finishes and unparseable
-    JSON; a parseable reply is final."""
+    JSON; a parseable reply is final, and a reply from another model is rejected."""
     for _ in range(MAX_ATTEMPTS):
         try:
             resp = judge.chat(body)
         except JudgeError:
             continue
+        if resp.get("model") != judge.model:
+            return None
         choice = resp["choices"][0]
         if choice.get("finish_reason") != "stop":
             continue

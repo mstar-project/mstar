@@ -181,8 +181,10 @@ def redact_url(url: str | None) -> str | None:
 
 
 _SECRET = re.compile(
-    r"TOKEN(?!S)|SECRET|PASSW|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|AUTH|CREDENTIAL|COOKIE|SESSION", re.IGNORECASE
+    r"TOKEN|SECRET|PASSW|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|AUTH|CREDENTIAL|COOKIE|SESSION", re.IGNORECASE
 )
+# Token counts (decoding settings), kept when their value is a number.
+_TOKEN_COUNT = re.compile(r"(max|min|num)_(new_|prompt_|output_)?tokens", re.IGNORECASE)
 # Keys whose values name a machine; their values are kept only when loopback.
 _HOSTLIKE = re.compile(r"HOST|ADDR|ENDPOINT|URL|URI|DOMAIN|PEER|(^|_)IP($|_)", re.IGNORECASE)
 _URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]+")
@@ -255,7 +257,9 @@ def scrub(obj: Any, host: bool = False) -> Any:
             if host and isinstance(k, str):  # under a host-like key, mapping keys can be hosts too
                 k = _value("HOST", k)
                 k = k if k not in out else f"{k}{i}"
-            out[k] = "<redacted>" if _SECRET.search(name) else scrub(v, host or bool(_HOSTLIKE.search(name)))
+            count = _TOKEN_COUNT.fullmatch(name) and isinstance(v, int) and not isinstance(v, bool)
+            secret = _SECRET.search(name) and not count
+            out[k] = "<redacted>" if secret else scrub(v, host or bool(_HOSTLIKE.search(name)))
         return out
     if isinstance(obj, (list, tuple)):
         return [scrub(v, host) for v in obj]
