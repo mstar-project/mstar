@@ -130,6 +130,7 @@ class Glm5NextPlainDecoderLayer(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, row: int | None = None,
         latents: torch.Tensor | None = None,
+        index_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """With ``row``, one query per request at that row of the step's block
         (``Glm5NextMLAAttention.forward_block_row``)."""
@@ -138,7 +139,8 @@ class Glm5NextPlainDecoderLayer(nn.Module):
         if row is None:
             hidden_states = self.self_attn(hidden_states)
         else:
-            hidden_states = self.self_attn.forward_block_row(hidden_states, row, latents)
+            hidden_states = self.self_attn.forward_block_row(
+                hidden_states, row, latents, index_rows)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
