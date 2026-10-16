@@ -17,8 +17,9 @@ Per turn it records ``turn_latency_s``: from the end of the user's speech to
 the agent's first audible audio, which is what a caller hears. It includes the
 agent's endpointing delay and the WebRTC path as well as STT, LLM and TTS.
 When the user talks over the agent (``bargein``, the last turn of ``cancel``),
-the agent's earlier audio must stop before the user is done, or the turn counts
-as a failed interruption; only audio after that stop counts as the reply.
+the agent must leave ``speaking`` and its earlier audio stop before the user is
+done, or the turn counts as a failed interruption; only audio after that stop
+counts as the reply.
 
     python examples/livekit/participant.py --utterances 'utts/*.wav' \\
         --conversations 8 --scenario mix --out results.jsonl
@@ -187,6 +188,15 @@ class Conversation:
             return None
         return self.voiced[i]
 
+    def left_speaking_by(self, t: float) -> float | None:
+        """When the agent's ``lk.agent.state`` last left "speaking" at or before
+        ``t`` (0.0 if it never spoke); None while it is still speaking at ``t``."""
+        prior = [s for s in self.states if s[0] <= t]
+        if prior and prior[-1][1] == "speaking":
+            return None
+        spoke = [i for i, (_, s) in enumerate(prior) if s == "speaking"]
+        return prior[spoke[-1] + 1][0] if spoke else 0.0
+
     async def wait_state(self, states: tuple[str, ...], after: float, timeout: float) -> float | None:
         end = time.monotonic() + timeout
         while True:
@@ -226,15 +236,20 @@ def make_token(key: str, secret: str, room: str, identity: str) -> str:
 
 async def turn(conv: Conversation, audio: np.ndarray, timeout: float, over_agent: bool = False) -> dict:
     """One user turn and the agent's reply. With ``over_agent`` the user talks
-    over the agent: its earlier audio must stop before the user is done (else
-    the interruption failed), and only audio after that stop is the reply."""
+    over the agent: it must leave "speaking" and its earlier audio stop before
+    the user is done (else the interruption failed), and only audio after that
+    stop is the reply."""
     start, end = await (await conv.say(audio))
     rec = {"user_start": start, "user_end": end}
     after = end
     if over_agent:
         # ``end`` can lie ahead by the source's queue; judge the stop once it has passed
         await asyncio.sleep(max(0.0, end + 0.25 - time.time()))
-        stopped = conv.stopped_after(start)
+        # A pause between the agent's phrases is no interruption: LiveKit marks
+        # one by leaving "speaking", so the stop is looked for from there, and
+        # an agent still speaking when the user is done was not interrupted.
+        left = conv.left_speaking_by(end)
+        stopped = None if left is None else conv.stopped_after(max(start, left))
         if stopped is not None:
             rec["interrupt_s"] = stopped - start
         if stopped is None or stopped >= end:
