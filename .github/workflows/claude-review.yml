@@ -251,14 +251,16 @@ jobs:
       # The summary is model output from untrusted input. It reaches the shell
       # only through an env var, and credential-shaped strings are redacted
       # before it's posted. --edit-last updates the bot's previous summary.
+      # Parsed with jq, not fromJSON(): a template error in `env` would fail
+      # the step outright, past continue-on-error.
       - name: Post the summary
         if: steps.review.outcome == 'success'
         id: post
         continue-on-error: true
         env:
-          SUMMARY: ${{ fromJSON(steps.review.outputs.structured_output).summary }}
+          OUTPUT: ${{ steps.review.outputs.structured_output }}
         run: |
-          printf '%s\n' "$SUMMARY" | sed -E \
+          printf '%s' "$OUTPUT" | jq -r '.summary // empty' | sed -E \
             -e 's/sk-ant-[A-Za-z0-9_-]+/[REDACTED]/g' \
             -e 's/(gh[opsur]_|github_pat_)[A-Za-z0-9_]{20,}/[REDACTED]/g' \
             -e 's/AKIA[0-9A-Z]{16}/[REDACTED]/g' \
