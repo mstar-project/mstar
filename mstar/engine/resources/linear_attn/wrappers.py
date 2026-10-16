@@ -5,14 +5,24 @@ their addresses, so they are sized to the bucket on first plan and never
 reallocated: a `torch.zeros` firing on a later, larger layout means a replay
 reads freed memory.
 """
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import torch
 
+logger = logging.getLogger(__name__)
+
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
 # as an explicit constexpr rather than autotuning it.
 _CONV_BLOCK_M = 8
+
+# ROCm: the largest captured prefill bucket that walks its tokens with the
+# recurrent kernel. Its cost grows with the longest row, ~1.3 us a token a
+# layer on MI300X (one 2048-token row: 2.7 ms against the chunked kernel's
+# 0.55), which a bucket bounds only by its token count; larger buckets stay
+# eager on the chunked kernel.
+_ROCM_RECURRENT_MAX_TOKENS = 512
 
 
 class GDNWrapper(ABC):
@@ -136,6 +146,12 @@ class GDNPrefillWrapper(GDNWrapper):
         # What this arch's chunked kernel reads as its packed state; the
         # manager picks it off the device capability.
         self._prefill_dtype = prefill_dtype
+        # AITER's chunked kernels build their schedule on the host, which
+        # capture forbids; see `_run_recurrent`.
+        self._recurrent = (
+            torch.version.hip is not None and cuda_graph and has_sink_state
+            and num_tokens <= _ROCM_RECURRENT_MAX_TOKENS
+        )
 
         self._rows_capacity = -1
         self._mask_capacity = -1
@@ -143,6 +159,7 @@ class GDNPrefillWrapper(GDNWrapper):
         self._mask: torch.Tensor | None = None
         self._plan_state: GDNPrefillPlan | None = None
         self._plan_borrowed = 0
+        self._aiter_schedule = None
 
         # Conv buffers
         self._batch_ptr: torch.Tensor | None = None
@@ -278,6 +295,20 @@ class GDNPrefillWrapper(GDNWrapper):
             num_rows=num_rows,
             token_mask=self._mask,
         )
+        # ROCm: AITER's VK kernel takes a chunk schedule built from the host
+        # spans, once here for every layer of the step. It refuses to run
+        # under capture, so it serves the eager walks only.
+        self._aiter_schedule = None
+        if (
+            torch.version.hip is not None and self._has_sink_state
+            and not self._recurrent
+        ):
+            from aiter.ops.triton.gated_delta_net import (
+                build_gated_delta_rule_prefill_metadata,
+            )
+            self._aiter_schedule = build_gated_delta_rule_prefill_metadata(
+                spans, cu_seqlens=self._plan_state.cu_seqlens, chunk_size=64,
+            )
 
     def run_conv(
         self,
@@ -318,8 +349,8 @@ class GDNPrefillWrapper(GDNWrapper):
         )
 
     def run(self, q, k, v, a, b, state, a_log, dt_bias):
-        from flashinfer.gdn_prefill import chunk_gated_delta_rule
-
+        if self._recurrent:
+            return self._run_recurrent(q, k, v, a, b, state, a_log, dt_bias)
         # The chunked kernel takes the decay and the learning rate already
         # formed, where the decode kernel takes `a`/`b` raw and forms them from
         # the same two weights. Keep the formula here so the paths agree.
@@ -327,6 +358,9 @@ class GDNPrefillWrapper(GDNWrapper):
             a.float() + dt_bias.float()
         )
         beta = torch.sigmoid(b.float())
+
+        if self._aiter_schedule is not None:
+            return self._run_aiter_vk(q, k, v, g, beta, state)
 
         slots = self._plan_state.slots.to(torch.int64)
 
@@ -380,19 +414,25 @@ class GDNPrefillWrapper(GDNWrapper):
         g = blank(g, (-1, 1))
         beta = blank(beta, (-1, 1))
 
-        out, final = chunk_gated_delta_rule(
-            q=q, k=k, v=v,
-            # FlashInfer wants the decay exponentiated; FLA's takes log space
-            g=torch.exp(g),
-            beta=beta,
-            scale=self._sm_scale,
-            initial_state=initial,
-            output_final_state=True,
-            cu_seqlens=self._plan_state.cu_seqlens,
-            # ignored by this kernel (see `qk_l2norm_in_kernel`); the caller
-            # has already normalised q and k
-            use_qk_l2norm_in_kernel=False,
-        )
+        if torch.version.hip is not None:
+            out, final = _chunk_gated_delta_rule_aiter(
+                q, k, v, g, beta, self._sm_scale, initial, self._plan_state.cu_seqlens,
+            )
+        else:
+            from flashinfer.gdn_prefill import chunk_gated_delta_rule
+            out, final = chunk_gated_delta_rule(
+                q=q, k=k, v=v,
+                # FlashInfer wants the decay exponentiated; FLA's takes log space
+                g=torch.exp(g),
+                beta=beta,
+                scale=self._sm_scale,
+                initial_state=initial,
+                output_final_state=True,
+                cu_seqlens=self._plan_state.cu_seqlens,
+                # ignored by this kernel (see `qk_l2norm_in_kernel`); the caller
+                # has already normalised q and k
+                use_qk_l2norm_in_kernel=False,
+            )
 
         if not self._has_sink_state:
             # Padding rows write to `ref_slot` the live row's own result, or with
@@ -405,6 +445,93 @@ class GDNPrefillWrapper(GDNWrapper):
             final = torch.where(live.view(-1, 1, 1, 1), final, padded)
         state.index_copy_(0, addr, final.to(state.dtype))
         return out[:real_len]
+
+    def _run_aiter_vk(self, q, k, v, g, beta, state):
+        """ROCm with a sink: AITER's VK kernel takes q/k at their own head
+        count and reads and writes the K-last pool in place by slot, so the
+        state is neither gathered, transposed nor scattered back."""
+        from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
+            chunk_gated_delta_rule_opt_vk,
+        )
+
+        plan = self._plan_state
+        addr = plan.slots.to(torch.int64)
+        # a fresh row starts from zeros, not from what its slot last held
+        state.index_copy_(0, addr, torch.where(
+            plan.has_state.view(-1, 1, 1, 1),
+            torch.index_select(state, 0, addr),
+            torch.zeros((), dtype=state.dtype, device=state.device),
+        ))
+
+        # The schedule covers exactly the real tokens plus the one `plan`
+        # hands each padding row, and the kernel checks the token count.
+        # The kernels address q/k as packed [T, H, D]; without the L2 norm they
+        # arrive as column views of the fused projection.
+        real_len, n = q.shape[0], self._plan_tokens
+        q, k, v, g, beta = (
+            _with_room(t[:n], self._plan_borrowed) if self._plan_borrowed
+            else t[:n].contiguous()
+            for t in (q, k, v, g, beta)
+        )
+        # The prebuilt HIP hidden-state kernel: per layer on MI300X it took
+        # 768 us at 4x2048 tokens where the Triton one took 1050 (job 465388),
+        # and the FlyDSL prepare stage takes 17-22% off at 2k-32k (465605).
+        out, _ = chunk_gated_delta_rule_opt_vk(
+            q=q.unsqueeze(0), k=k.unsqueeze(0), v=v.unsqueeze(0),
+            g=g.unsqueeze(0), beta=beta.unsqueeze(0), scale=self._sm_scale,
+            initial_state=state, output_final_state=True,
+            cu_seqlens=plan.cu_seqlens, state_dtype=state.dtype, use_exp2=False,
+            use_chunk_hip=True, use_prepare_flydsl=True,
+            prefill_metadata=self._aiter_schedule,
+            initial_state_indices=plan.slots, inplace_final_state=True,
+        )
+        out = out.squeeze(0)[:n]
+        return _with_room(out, real_len - n) if real_len > n else out
+
+    def _run_recurrent(self, q, k, v, a, b, state, a_log, dt_bias):
+        """ROCm, captured bucket: AITER's recurrent kernel, the one decode
+        runs, walks each row's tokens in turn. One program per row and head,
+        so no host schedule; correct for any span, slow only on long ones."""
+        from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
+            fused_rearrange_sigmoid_gated_delta_rule,
+        )
+
+        plan = self._plan_state
+        rows = plan.num_rows
+        addr = plan.slots[:rows].to(torch.int64)
+        # the kernel reads every row's slot, so a fresh row's must read as zeros
+        state.index_copy_(0, addr, torch.where(
+            plan.has_state.view(-1, 1, 1, 1),
+            torch.index_select(state, 0, addr),
+            torch.zeros((), dtype=state.dtype, device=state.device),
+        ))
+
+        # room for the token `plan` hands each padding row, as in `run`
+        real_len = q.shape[0]
+        q, k, v, a, b = (_with_room(t, rows) for t in (q, k, v, a, b))
+        n = q.shape[0]
+        qkv = torch.cat(
+            (q.reshape(n, -1), k.reshape(n, -1), v.reshape(n, -1)), dim=-1,
+        )
+
+        # In place, the kernel stores the state after token t to column t of a
+        # [rows, tokens] index and skips -1. Column 0 is also where it reads the
+        # initial state, so a row's slot goes there and at its last token.
+        cu = plan.cu_seqlens
+        slots = addr.to(torch.int32).view(-1, 1)
+        index = torch.full((rows, n), -1, dtype=torch.int32, device=q.device)
+        index[:, :1] = slots
+        index.scatter_(1, (cu[1:] - cu[:-1] - 1).view(-1, 1), slots)
+        out, _ = fused_rearrange_sigmoid_gated_delta_rule(
+            A_log=a_log, a=a, b=b, dt_bias=dt_bias, qkv=qkv,
+            key_dim=q.shape[1] * q.shape[2], value_dim=v.shape[1] * v.shape[2],
+            head_k_dim=q.shape[2], head_v_dim=v.shape[2],
+            scale=self._sm_scale, initial_state=state, inplace_final_state=True,
+            cu_seqlens=cu, ssm_state_indices=index,
+            # the caller has normalised q and k (see `qk_l2norm_in_kernel`)
+            use_qk_l2norm_in_kernel=False,
+        )
+        return out.reshape(n, v.shape[1], v.shape[2])[:real_len]
 
 
 @dataclass(frozen=True)
@@ -438,6 +565,10 @@ class GDNDecodeWrapper(GDNWrapper):
         )
 
         self._plan_state: GDNDecodePlan | None = None
+        # ROCm: AITER's FlyDSL kernel, until its first call fails; see
+        # `_run_flydsl`. It skips no slot, so it needs the sink.
+        self._flydsl = torch.version.hip is not None and null_slot_id >= 0
+        self._dt_bias_cast: dict[int, torch.Tensor] = {}
 
     # The cutlass decode kernel really does normalise in-kernel, which saves
     # the caller a norm + divide + two casts per q and k, per layer, per step.
@@ -472,6 +603,15 @@ class GDNDecodeWrapper(GDNWrapper):
         )
 
     def run(self, q, k, v, g, beta, state, a_log, dt_bias):
+        if self._flydsl:
+            try:
+                return self._run_flydsl(q, k, v, g, beta, state, a_log, dt_bias)
+            except (ImportError, OSError) as e:
+                # first call, in warmup: no FlyDSL, or a read-only JIT cache
+                logger.warning("FlyDSL GDN decode unavailable, using Triton: %s", e)
+                self._flydsl = False
+        if torch.version.hip is not None:
+            return self._run_aiter(q, k, v, g, beta, state, a_log, dt_bias)
         from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 
         # Uninitialized output: the kernel writes every row, except one whose
@@ -499,3 +639,75 @@ class GDNDecodeWrapper(GDNWrapper):
             use_qk_l2norm=self._qk_l2norm,
         )
         return out.squeeze(1)
+
+    def _run_flydsl(self, q, k, v, a, b, state, a_log, dt_bias):
+        """ROCm with a sink: AITER's FlyDSL decode, tuned for gfx942. It reads
+        q/k/v as the conv output's column views, so nothing is concatenated,
+        and updates the K-last pool in place by slot. Per layer on MI300X:
+        75 us at 64 rows where the Triton path takes 93 (job 465605)."""
+        from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
+
+        head_k_dim = q.shape[-1]
+        if self._sm_scale is not None and abs(self._sm_scale * head_k_dim ** 0.5 - 1) > 1e-6:
+            # the kernel's scale is fixed at 1/sqrt(head_k_dim)
+            self._flydsl = False
+            return self._run_aiter(q, k, v, a, b, state, a_log, dt_bias)
+        # It takes dt_bias in the activations' dtype. Qwen3.5's checkpoint
+        # stores it bf16 and `GatedDeltaNet` widens it to fp32, so there the
+        # cast back is exact.
+        key = dt_bias.data_ptr()
+        dt_bias_cast = self._dt_bias_cast.get(key)
+        if dt_bias_cast is None:
+            dt_bias_cast = self._dt_bias_cast[key] = dt_bias.to(q.dtype)
+        n = q.shape[0]
+        out = torch.empty(
+            (n, 1, v.shape[1], v.shape[2]), dtype=q.dtype, device=q.device,
+        )
+        # one token per row: the sequence axis is unsqueezed
+        flydsl_gdr_decode(
+            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
+            a.unsqueeze(1), b.unsqueeze(1), dt_bias_cast, a_log,
+            self._plan_state.slots.to(torch.int32), state, out,
+            use_qk_l2norm=self._qk_l2norm, need_shuffle_state=False,
+        )
+        return out.view(n, v.shape[1], v.shape[2])
+
+    def _run_aiter(self, q, k, v, a, b, state, a_log, dt_bias):
+        """ROCm: AITER's fused decode reads q/k/v packed, forms the decay and
+        the learning rate from `a`/`b` itself, and updates the K-last pool in
+        place by slot, skipping a -1 slot as FlashInfer's does."""
+        from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
+            fused_rearrange_sigmoid_gated_delta_rule,
+        )
+        n = q.shape[0]
+        # one token per row, so each row is its own sequence
+        if getattr(self, "_rows_cu", None) is None or self._rows_cu.numel() < n + 1:
+            self._rows_cu = torch.arange(max(n, self._bs or 0) + 1, dtype=torch.int32, device=q.device)
+        qkv = torch.cat((q.reshape(n, -1), k.reshape(n, -1), v.reshape(n, -1)), dim=-1)
+        out, _ = fused_rearrange_sigmoid_gated_delta_rule(
+            A_log=a_log, a=a.contiguous(), b=b.contiguous(), dt_bias=dt_bias, qkv=qkv,
+            key_dim=q.shape[1] * q.shape[2], value_dim=v.shape[1] * v.shape[2],
+            head_k_dim=q.shape[2], head_v_dim=v.shape[2],
+            scale=self._sm_scale, initial_state=state, inplace_final_state=True,
+            cu_seqlens=self._rows_cu[: n + 1], ssm_state_indices=self._plan_state.slots,
+            use_qk_l2norm_in_kernel=self._qk_l2norm,
+        )
+        return out.reshape(n, v.shape[1], v.shape[2])
+
+
+def _chunk_gated_delta_rule_aiter(q, k, v, g, beta, scale, initial_state, cu_seqlens):
+    """ROCm: AITER's Triton port of FLA's chunked kernel. It wants a batch dim,
+    one head count for q/k/v, the decay in log space and the state [N, H, K, V];
+    the pool is K-last, so the state goes in and comes back transposed."""
+    from aiter.ops.triton.gated_delta_net.gated_delta_rule import chunk_gated_delta_rule
+
+    rep = v.shape[1] // q.shape[1]
+    if rep > 1:
+        q, k = q.repeat_interleave(rep, dim=1), k.repeat_interleave(rep, dim=1)
+    out, final = chunk_gated_delta_rule(
+        q=q.unsqueeze(0).contiguous(), k=k.unsqueeze(0).contiguous(), v=v.unsqueeze(0).contiguous(),
+        g=g.unsqueeze(0).contiguous(), beta=beta.unsqueeze(0).contiguous(), scale=scale,
+        initial_state=initial_state.transpose(-1, -2).contiguous(), output_final_state=True,
+        cu_seqlens=cu_seqlens.long(), use_qk_l2norm_in_kernel=False,
+    )
+    return out.squeeze(0), final.transpose(-1, -2)
