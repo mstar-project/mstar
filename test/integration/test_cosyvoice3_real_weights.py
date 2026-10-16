@@ -50,7 +50,7 @@ def test_text_tokenizer_carries_the_trained_delimiter(model):
         tensors={"audio_inputs": [_clip(2.0)]},
         ref_text="A reference transcript.",
     )
-    assert (out["text_inputs"][0] == END_OF_PROMPT_ID).sum() == 1
+    assert (out.new_input_tensors["text_inputs"][0] == END_OF_PROMPT_ID).sum() == 1
 
 
 def test_reference_encoder_tokens_mel_and_xvector(model):

@@ -86,8 +86,9 @@ class CosyVoice3LM(nn.Module):
         ``text_ids`` being the prompt text and the text to speak, concatenated."""
         cfg = self.config
         device = text_ids.device
-        control = torch.tensor([cfg.sos_token, cfg.task_id_token], dtype=torch.long, device=device)
-        sos, task_id = self.speech_embedding(control).split(1, dim=0)
+        # rows of the table, not a lookup: an id tensor would be a copy from the host per request
+        table = self.speech_embedding.weight
+        sos, task_id = table[cfg.sos_token : cfg.sos_token + 1], table[cfg.task_id_token : cfg.task_id_token + 1]
         text = self.embed_tokens(text_ids)
         prompt = self.speech_embedding(prompt_speech_tokens.to(device, torch.long))
         return torch.cat([sos, text, task_id, prompt], dim=0)

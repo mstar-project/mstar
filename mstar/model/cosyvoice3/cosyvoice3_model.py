@@ -57,7 +57,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.chatterbox.chatterbox_model import (
     ChatterboxModel,
     _flag,
@@ -85,14 +85,15 @@ from mstar.model.cosyvoice3.config import (
 )
 from mstar.model.cosyvoice3.submodules import (
     AUDIO_CHUNK,
+    MAX_SPEECH_TOKENS,
     MEL,
     MEL_FINAL,
+    MIN_SPEECH_TOKENS,
     PREV_TOKEN,
     PROMPT_TOKENS,
     REF_AUDIO,
     SPEECH_TOKENS,
     TEXT_INPUTS,
-    TOKEN_LIMITS,
     VOICE_KEY,
 )
 from mstar.model.submodule_base import NodeSubmodule
@@ -106,6 +107,10 @@ TOKEN2WAV_PARTITION = "Token2Wav"
 
 _LM_KNOBS = ("temperature", "top_p", "top_k", "ras_window", "ras_tau", "ignore_eos")
 _FLOW_KNOBS = ("n_cfm_timesteps",)
+# settled by process_prompt and folded into model_kwargs, so the nodes read
+# them from step_metadata instead of from device tensors
+_LM_FACTS = (MIN_SPEECH_TOKENS, MAX_SPEECH_TOKENS, VOICE_KEY)
+_FLOW_FACTS = (VOICE_KEY,)
 
 # A clip quieter or shorter than these clones noise
 MIN_REFERENCE_SECONDS = 0.5
@@ -298,17 +303,17 @@ class CosyVoice3Model(Model):
         return edges
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        prefill = GraphNode(name=LM_NODE, input_names=[TEXT_INPUTS, TOKEN_LIMITS], outputs=self._lm_outputs(first=True))
+        prefill = GraphNode(name=LM_NODE, input_names=[TEXT_INPUTS], outputs=self._lm_outputs(first=True))
         prefill_voice = Sequential(
             [
                 GraphNode(
                     name=SPEAKER_ENCODER_NODE,
-                    input_names=[REF_AUDIO, VOICE_KEY],
+                    input_names=[REF_AUDIO],
                     outputs=[GraphEdge(next_node=LM_NODE, name=PROMPT_TOKENS)],
                 ),
                 GraphNode(
                     name=LM_NODE,
-                    input_names=[TEXT_INPUTS, TOKEN_LIMITS, PROMPT_TOKENS],
+                    input_names=[TEXT_INPUTS, PROMPT_TOKENS],
                     outputs=self._lm_outputs(first=True),
                 ),
             ]
@@ -323,7 +328,7 @@ class CosyVoice3Model(Model):
             [
                 GraphNode(
                     name=FLOW_NODE,
-                    input_names=[SPEECH_TOKENS, REF_AUDIO, VOICE_KEY],
+                    input_names=[SPEECH_TOKENS, REF_AUDIO],
                     outputs=[GraphEdge(next_node=HIFT_NODE, name=MEL), GraphEdge(next_node=HIFT_NODE, name=MEL_FINAL)],
                 ),
                 GraphNode(
@@ -464,7 +469,7 @@ class CosyVoice3Model(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs: Any,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         if not prompt or not prompt.strip():
             raise ValueError("CosyVoice3 requires a non-empty text prompt")
         if any(m not in ("text", "audio") for m in input_modalities):
@@ -505,16 +510,26 @@ class CosyVoice3Model(Model):
         if knobs["ignore_eos"] and knobs["max_new_tokens"] is not None:
             max_len = knobs["max_new_tokens"]
         min_len = min(int(text_ids.numel() * s.min_token_text_ratio), max_len)
-        return {
-            TEXT_INPUTS: [ids],
-            TOKEN_LIMITS: [torch.tensor([min_len, max(max_len, 1)], dtype=torch.long)],
-            REF_AUDIO: [wav],
-            VOICE_KEY: [voice_key_for(wav)],
-        }
+        return ProcessPromptOutput(
+            {TEXT_INPUTS: [ids], REF_AUDIO: [wav]},
+            {
+                MIN_SPEECH_TOKENS: min_len,
+                MAX_SPEECH_TOKENS: max(max_len, 1),
+                VOICE_KEY: int(voice_key_for(wav)[0]),
+            },
+        )
 
     # -----------------------------------------------------------------------
     # Conductor state machine
     # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _prompt_facts(model_kwargs: dict | None, keys) -> dict[str, Any]:
+        mk = model_kwargs or {}
+        missing = [k for k in keys if k not in mk]
+        if missing:
+            raise ValueError(f"CosyVoice3 request is missing {missing}, which process_prompt sets")
+        return {k: mk[k] for k in keys}
 
     @staticmethod
     def _step_metadata(metadata: CurrentForwardConductorMetadata, keys) -> dict[str, Any]:
@@ -540,15 +555,10 @@ class CosyVoice3Model(Model):
                 output_modalities=output_modalities,
                 graph_walk="prefill_voice" if zero_shot else "prefill",
                 is_prefill=True,
-                kwargs={k: knobs[k] for k in _LM_KNOBS},
+                kwargs={**{k: knobs[k] for k in _LM_KNOBS}, **self._prompt_facts(model_kwargs, _LM_FACTS)},
             )
-            names = [TEXT_INPUTS, TOKEN_LIMITS] + ([REF_AUDIO, VOICE_KEY] if zero_shot else [])
-            targets = {
-                TEXT_INPUTS: LM_NODE,
-                TOKEN_LIMITS: LM_NODE,
-                REF_AUDIO: SPEAKER_ENCODER_NODE,
-                VOICE_KEY: SPEAKER_ENCODER_NODE,
-            }
+            names = [TEXT_INPUTS] + ([REF_AUDIO] if zero_shot else [])
+            targets = {TEXT_INPUTS: LM_NODE, REF_AUDIO: SPEAKER_ENCODER_NODE}
             inputs = []
             for name in names:
                 edge = GraphEdge(next_node=targets[name], name=name)
@@ -558,9 +568,9 @@ class CosyVoice3Model(Model):
                 full_metadata=metadata,
                 inputs=inputs,
                 # the clip stays persisted for the flow node
-                unpersist_tensors=list(input_signals.get(TEXT_INPUTS, [])) + list(input_signals.get(TOKEN_LIMITS, [])),
+                unpersist_tensors=list(input_signals.get(TEXT_INPUTS, [])),
                 request_done=not wants_audio,
-                step_metadata=self._step_metadata(metadata, _LM_KNOBS),
+                step_metadata=self._step_metadata(metadata, _LM_KNOBS + _LM_FACTS),
             )
         if partition_name == TOKEN2WAV_PARTITION:
             metadata = CurrentForwardConductorMetadata(
@@ -568,27 +578,24 @@ class CosyVoice3Model(Model):
                 output_modalities=output_modalities,
                 graph_walk="token2wav",
                 is_prefill=False,
-                kwargs={k: knobs[k] for k in _FLOW_KNOBS},
+                kwargs={**{k: knobs[k] for k in _FLOW_KNOBS}, **self._prompt_facts(model_kwargs, _FLOW_FACTS)},
             )
             return ForwardPassArgs(
                 full_metadata=metadata,
                 inputs=self._voice_inputs(input_signals),
                 unpersist_tensors=[],
                 request_done=not wants_audio,
-                step_metadata=self._step_metadata(metadata, _FLOW_KNOBS),
+                step_metadata=self._step_metadata(metadata, _FLOW_KNOBS + _FLOW_FACTS),
             )
         raise ValueError(f"Unknown CosyVoice3 partition {partition_name!r}")
 
     @staticmethod
     def _voice_inputs(signals: dict[str, list[TensorPointerInfo]], with_tensors: bool = True) -> list[GraphEdge]:
-        """The reference clip and its key for the flow node: tensors with the
-        first chunk only, signal-only edges after (see Chatterbox's S3Gen)."""
-        inputs = []
-        for name in (REF_AUDIO, VOICE_KEY):
-            edge = GraphEdge(next_node=FLOW_NODE, name=name)
-            edge.tensor_info = list(signals.get(name, [])) if with_tensors else []
-            inputs.append(edge)
-        return inputs
+        """The reference clip for the flow node: the tensor with the first chunk
+        only, a signal-only edge after (see Chatterbox's S3Gen)."""
+        edge = GraphEdge(next_node=FLOW_NODE, name=REF_AUDIO)
+        edge.tensor_info = list(signals.get(REF_AUDIO, [])) if with_tensors else []
+        return [edge]
 
     def get_partition_forward_pass_args(
         self,
@@ -608,7 +615,7 @@ class CosyVoice3Model(Model):
                     full_metadata=partition_metadata,
                     inputs=[edge],
                     unpersist_tensors=list(edge.tensor_info),
-                    step_metadata=self._step_metadata(partition_metadata, _LM_KNOBS),
+                    step_metadata=self._step_metadata(partition_metadata, _LM_KNOBS + _LM_FACTS),
                 )
             if partition_metadata.graph_walk == "decode":
                 return ForwardPassArgs(
@@ -623,7 +630,7 @@ class CosyVoice3Model(Model):
                 full_metadata=partition_metadata,
                 inputs=self._voice_inputs(persist_signals, with_tensors=False),
                 unpersist_tensors=[],
-                step_metadata=self._step_metadata(partition_metadata, _FLOW_KNOBS),
+                step_metadata=self._step_metadata(partition_metadata, _FLOW_KNOBS + _FLOW_FACTS),
             )
         raise ValueError(f"Unknown CosyVoice3 partition {partition_name!r}")
 

@@ -27,6 +27,7 @@ import yaml
 
 from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
+from mstar.model.chatterbox.chatterbox_model import voice_key_for
 from mstar.model.cosyvoice3.components.dit import _SinusEmbedding, chunk_attention_mask
 from mstar.model.cosyvoice3.components.flow import CosyVoice3Flow, FlowRow, ReferenceVoice
 from mstar.model.cosyvoice3.components.hift import CausalHiFTGenerator, StreamState, stream_vocode
@@ -49,14 +50,17 @@ from mstar.model.cosyvoice3.cosyvoice3_model import LM_PARTITION, TOKEN2WAV_PART
 from mstar.model.cosyvoice3.submodules import (
     AUDIO_CHUNK,
     DECODE_LOOP,
+    HISTORY,
+    MAX_SPEECH_TOKENS,
     MEL,
     MEL_FINAL,
+    MIN_SPEECH_TOKENS,
     PREV_TOKEN,
     PROMPT_TOKENS,
     SPEECH_TOKENS,
     STEP_INDEX,
     TEXT_INPUTS,
-    TOKEN_LIMITS,
+    VOICE_KEY,
     FlowSubmodule,
     HiFTSubmodule,
     LMSubmodule,
@@ -222,27 +226,31 @@ def test_process_prompt_modes_and_token_limits(model):
     )
     tok = _Tokenizer()
     expected = torch.cat([tok(f"{SYSTEM_PROMPT}{END_OF_PROMPT}ref words"), tok("one two three")])
-    assert torch.equal(zero[TEXT_INPUTS][0], expected)
-    assert zero[TOKEN_LIMITS][0].tolist() == [6, 60]  # 2x and 20x the text's 3 tokens
-    assert zero["voice_key"][0].numel() == 1 and zero["ref_audio"][0].shape == clip.shape
+    assert set(zero.new_input_tensors) == {TEXT_INPUTS, "ref_audio"}
+    assert torch.equal(zero.new_input_tensors[TEXT_INPUTS][0], expected)
+    assert zero.new_input_tensors["ref_audio"][0].shape == clip.shape
+    # 2x and 20x the text's 3 tokens; the voice key is the clip's content hash
+    assert zero.metadata == {MIN_SPEECH_TOKENS: 6, MAX_SPEECH_TOKENS: 60, VOICE_KEY: int(voice_key_for(clip)[0])}
 
     cross = model.process_prompt("one two", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
-    assert torch.equal(cross[TEXT_INPUTS][0], torch.cat([tok(f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), tok("one two")]))
+    cross_ids = cross.new_input_tensors[TEXT_INPUTS][0]
+    assert torch.equal(cross_ids, torch.cat([tok(f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), tok("one two")]))
     assert model.resolve_mode({}, uploaded=True) == ("cross_lingual", None)
 
     instruct = model.process_prompt(
         "one", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, instruct="speak slowly"
     )
-    assert torch.equal(instruct[TEXT_INPUTS][0][:-1], tok(f"{SYSTEM_PROMPT} speak slowly{END_OF_PROMPT}"))
+    instruct_ids = instruct.new_input_tensors[TEXT_INPUTS][0]
+    assert torch.equal(instruct_ids[:-1], tok(f"{SYSTEM_PROMPT} speak slowly{END_OF_PROMPT}"))
 
     capped = model.process_prompt(
         "one two three", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, max_new_tokens=10
     )
-    assert capped[TOKEN_LIMITS][0].tolist() == [6, 10]
+    assert (capped.metadata[MIN_SPEECH_TOKENS], capped.metadata[MAX_SPEECH_TOKENS]) == (6, 10)
     forced = model.process_prompt(
         "one", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, max_new_tokens=100, ignore_eos=True
     )
-    assert forced[TOKEN_LIMITS][0].tolist() == [2, 100]
+    assert (forced.metadata[MIN_SPEECH_TOKENS], forced.metadata[MAX_SPEECH_TOKENS]) == (2, 100)
 
 
 @pytest.mark.parametrize(
@@ -286,7 +294,7 @@ def test_preset_voices_resolve_inside_voices_dir_only(tmp_path, monkeypatch):
     assert model.get_voices() == ["anna"]
     assert model.resolve_mode({"voice": "anna"}, uploaded=False) == ("zero_shot", "hello there")
     out = model.process_prompt("one two", ["text"], ["audio"], voice="anna")
-    assert out["ref_audio"][0].numel() == SR
+    assert out.new_input_tensors["ref_audio"][0].numel() == SR
     for name in ("../outside", "/etc/passwd", ".hidden", "a\\b"):
         with pytest.raises(ValueError, match="Invalid voice name"):
             model.process_prompt("one", ["text"], ["audio"], voice=name)
@@ -297,30 +305,36 @@ def test_preset_voices_resolve_inside_voices_dir_only(tmp_path, monkeypatch):
 
 
 def test_initial_and_partition_args_route_the_walks(model):
-    signals = {name: [f"ptr-{name}"] for name in (TEXT_INPUTS, TOKEN_LIMITS, "ref_audio", "voice_key")}
+    signals = {name: [f"ptr-{name}"] for name in (TEXT_INPUTS, "ref_audio")}
+    facts = {MIN_SPEECH_TOKENS: 3, MAX_SPEECH_TOKENS: 40, VOICE_KEY: 77}
     zero = model.get_initial_forward_pass_args(
-        LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs={"ref_text": "words"}
+        LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs={"ref_text": "words", **facts}
     )
     assert zero.full_metadata.graph_walk == "prefill_voice"
     routes = sorted((edge.next_node, edge.name) for edge in zero.inputs)
-    assert ("speaker_encoder", "ref_audio") in routes and ("llm", TEXT_INPUTS) in routes
+    assert routes == [("llm", TEXT_INPUTS), ("speaker_encoder", "ref_audio")]
     # the clip stays persisted for the flow node
-    assert set(zero.unpersist_tensors) == {f"ptr-{TEXT_INPUTS}", f"ptr-{TOKEN_LIMITS}"}
-    cross = model.get_initial_forward_pass_args(LM_PARTITION, ["text", "audio"], ["audio"], signals)
+    assert zero.unpersist_tensors == [f"ptr-{TEXT_INPUTS}"]
+    assert facts.items() <= zero.step_metadata.items()
+    cross = model.get_initial_forward_pass_args(LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs=facts)
     assert cross.full_metadata.graph_walk == "prefill"
     assert {edge.next_node for edge in cross.inputs} == {"llm"}
+    with pytest.raises(ValueError, match="process_prompt"):
+        model.get_initial_forward_pass_args(LM_PARTITION, ["text", "audio"], ["audio"], signals)
 
     decode = model.get_partition_forward_pass_args(LM_PARTITION, zero.full_metadata, {SPEECH_TOKENS: ["ptr-token"]})
     assert zero.full_metadata.graph_walk == "decode" and decode.inputs[0].name == PREV_TOKEN
     assert decode.unpersist_tensors == ["ptr-token"]
+    assert facts.items() <= decode.step_metadata.items()
     done = model.get_partition_forward_pass_args(LM_PARTITION, zero.full_metadata, {})
     assert done.request_done
 
-    t2w = model.get_initial_forward_pass_args(TOKEN2WAV_PARTITION, ["text", "audio"], ["audio"], signals)
+    t2w = model.get_initial_forward_pass_args(TOKEN2WAV_PARTITION, ["text", "audio"], ["audio"], signals, facts)
     assert t2w.full_metadata.graph_walk == "token2wav"
-    assert [edge.tensor_info for edge in t2w.inputs] == [["ptr-ref_audio"], ["ptr-voice_key"]]
+    assert [edge.tensor_info for edge in t2w.inputs] == [["ptr-ref_audio"]]
+    assert t2w.step_metadata[VOICE_KEY] == 77
     later = model.get_partition_forward_pass_args(TOKEN2WAV_PARTITION, t2w.full_metadata, signals)
-    assert all(edge.tensor_info == [] for edge in later.inputs)
+    assert all(edge.tensor_info == [] for edge in later.inputs) and later.step_metadata[VOICE_KEY] == 77
 
 
 def test_postprocess_encodes_pcm16(model):
@@ -500,8 +514,10 @@ def _lm(cfg: CosyVoice3Config, seed: int = 0):
     return LMSubmodule(lm, cfg), res
 
 
-def _info(rid: int, seed: int, **knobs):
+def _info(rid: int, seed: int, limits=(0, 30), **knobs):
     meta = {
+        MIN_SPEECH_TOKENS: limits[0],
+        MAX_SPEECH_TOKENS: limits[1],
         "temperature": 1.0,
         "top_p": 0.8,
         "top_k": 25,
@@ -517,7 +533,7 @@ def _info(rid: int, seed: int, **knobs):
 def _lm_run(sub, res, requests: dict, steps: int, **knobs) -> dict[int, list[int]]:
     """Prefill every request together, then batched decode steps until one stops."""
     rids = list(requests)
-    infos = {rid: _info(rid, requests[rid][1], **knobs) for rid in rids}
+    infos = {rid: _info(rid, requests[rid][1], limits=requests[rid][0]["limits"], **knobs) for rid in rids}
     engine = SimpleNamespace(request_ids=rids, resources={LM_ATTN: res.kv_attn})
     tokens: dict[int, list[int]] = {rid: [] for rid in rids}
     live = list(rids)
@@ -541,8 +557,10 @@ def _lm_run(sub, res, requests: dict, steps: int, **knobs) -> dict[int, list[int
 
 
 def _lm_request(text_len: int = 5, prompt: int = 4, limits=(0, 30)):
+    """A prefill's inputs; ``limits`` (min, max speech tokens) ride along for
+    ``_lm_run``, which puts them in the step metadata."""
     g = torch.Generator().manual_seed(text_len)
-    req = {TEXT_INPUTS: [torch.randint(0, 64, (text_len,), generator=g)], TOKEN_LIMITS: [torch.tensor(list(limits))]}
+    req = {TEXT_INPUTS: [torch.randint(0, 64, (text_len,), generator=g)], "limits": limits}
     if prompt:
         req[PROMPT_TOKENS] = [torch.randint(0, 40, (prompt,), generator=g)]
     return req
@@ -659,9 +677,9 @@ def test_lm_stops_on_any_control_id_or_the_length_cap():
 
 def _lm_prefill_then_decode(sub, res, limits, **knobs):
     """One request: prefill, postprocess, then one decode step on the prefill token."""
-    info = _info(0, 0, ras_window=0, **knobs)
+    info = _info(0, 0, limits=limits, ras_window=0, **knobs)
     engine = SimpleNamespace(request_ids=[0], resources={LM_ATTN: res.kv_attn})
-    tokens, inputs = [], _lm_request(limits=limits)
+    tokens, inputs = [], _lm_request()
     for walk in ("prefill", "decode"):
         prepared = sub.prepare_inputs(walk, info, inputs)
         res.plan([prepared.input_seq_len])
@@ -695,8 +713,8 @@ def test_lm_stop_judges_each_step_by_its_own_index():
     moved ``generated`` on; the cap still counts this step's tokens."""
     cfg = _tiny_config()
     sub, _ = _lm(cfg)
-    info = _info(4, 0)
-    sub.prepare_inputs("prefill", info, _lm_request(limits=(0, 4)))
+    info = _info(4, 0, limits=(0, 4))
+    sub.prepare_inputs("prefill", info, _lm_request())
     for _ in range(4):
         sub.postprocess(4, info, {SPEECH_TOKENS: [torch.tensor([5])]})
     out = {SPEECH_TOKENS: [torch.tensor([5])], STEP_INDEX: [torch.tensor([2])]}
@@ -728,6 +746,128 @@ def test_lm_ras_history_is_committed_once_per_step():
     assert state["history"].tolist() == [-1] * 10  # not committed until postprocess
     sub.postprocess(3, info, {SPEECH_TOKENS: [torch.tensor([4])]}, inputs=again)
     assert state["history"].tolist() == [-1] * 9 + [9] and state["generated"] == 1
+
+
+def _row_tensors_per_value(sub, info, seed, step, min_len, history, force_eos):
+    """The decode inputs as the node built them before it staged columns: one
+    device tensor per value per row, the knobs re-read from the metadata."""
+    meta = info.step_metadata
+    window = int(sub._knob(meta, "ras_window"))
+    threshold = float(window) * float(sub._knob(meta, "ras_tau")) if window > 0 else 0.0
+    ignore_eos = bool(meta.get("ignore_eos", False))
+    return {
+        HISTORY: history,
+        "force_eos": torch.tensor([force_eos]),
+        "seed": torch.tensor([seed], dtype=torch.long),
+        "step": torch.tensor([step], dtype=torch.long),
+        "temperature": torch.tensor([float(sub._knob(meta, "temperature"))]),
+        "top_p": torch.tensor([float(sub._knob(meta, "top_p"))]),
+        "top_k": torch.tensor([int(sub._knob(meta, "top_k"))], dtype=torch.long),
+        "threshold": torch.tensor([threshold]),
+        "block_sos": torch.tensor([step < min_len or ignore_eos]),
+        "block_stop": torch.tensor([ignore_eos]),
+    }
+
+
+def _stack_per_value(embeds, rows):
+    packed = {"input_embeds": torch.cat(embeds, dim=0)}
+    for key in rows[0]:
+        packed[key] = torch.stack([row[key] for row in rows]).reshape(len(rows), -1)
+    return packed
+
+
+def _assert_same_packed(new, old):
+    assert set(new) == set(old)
+    for key in old:
+        assert new[key].dtype == old[key].dtype and new[key].shape == old[key].shape, key
+        assert torch.equal(new[key], old[key]), key
+
+
+def test_lm_staged_columns_equal_the_per_value_tensors():
+    """Mixed knobs, prefill then decode, a re-prepared step, the wasted step
+    after a forced EOS, and the capture template rows: the packed inputs the
+    forward reads are the ones the per-value construction gave."""
+    cfg = _tiny_config()
+    sub, _ = _lm(cfg)
+    control = cfg.lm.speech_token_size + 2
+    # rid -> (seed, limits, knobs, token fed to each decode step)
+    rows = {
+        0: (11, (0, 30), {}, [5, 6, 7, 8]),
+        1: (2**64 - 5, (3, 30), {"temperature": 0.0, "top_k": 1}, [control, 9, 9, 9]),  # prefill token ends it
+        2: (2**63 - 1, (0, 1), {"top_p": 0.33, "ras_window": 0}, [4, 4, 4, 4]),  # budget spent at prefill
+        3: (7, (2, 30), {"ignore_eos": True, "temperature": 1.3, "ras_tau": 0.3}, [control, 3, 2, 1]),
+        4: (0, (5, 30), {"top_k": 128, "top_p": 1.0, "ras_window": 5, "temperature": 0.7}, [1, 1, 1, 1]),
+    }
+    infos = {rid: _info(rid, seed, limits=limits, **knobs) for rid, (seed, limits, knobs, _) in rows.items()}
+    ended: dict[int, bool] = {}
+
+    def check(walk, step_inputs):
+        prepared = [sub.prepare_inputs(walk, infos[rid], step_inputs[rid]) for rid in rows]
+        old_rows = []
+        for rid, inp in zip(rows, prepared, strict=True):
+            seed, (min_len, max_len), knobs, _ = rows[rid]
+            state = sub.request_state(rid)
+            force = False
+            if walk == "decode":
+                if rid not in ended:
+                    token = int(step_inputs[rid][PREV_TOKEN][0].item())
+                    stopped = not knobs.get("ignore_eos", False) and token >= cfg.lm.speech_token_size
+                    ended[rid] = stopped or int(state["generated"]) >= max_len
+                force = ended[rid]
+            old_rows.append(
+                _row_tensors_per_value(
+                    sub,
+                    infos[rid],
+                    seed & (2**63 - 1),
+                    int(state["generated"]),
+                    min_len,
+                    inp.tensor_inputs[HISTORY],
+                    force,
+                )
+            )
+        old = _stack_per_value([inp.input_embeds for inp in prepared], old_rows)
+        _assert_same_packed(sub.preprocess(walk, None, prepared), old)
+        return prepared
+
+    def commit(prepared):
+        for rid, inp in zip(rows, prepared, strict=True):
+            sub.postprocess(rid, infos[rid], {SPEECH_TOKENS: [torch.tensor([3])]}, inputs=inp)
+
+    with torch.no_grad():
+        commit(check("prefill", {rid: _lm_request(4 + rid, prompt=rid % 3) for rid in rows}))
+        for k in range(4):
+            step_inputs = {rid: {PREV_TOKEN: [torch.tensor([tokens[k]])]} for rid, (*_, tokens) in rows.items()}
+            prepared = check("decode", step_inputs)
+            if k == 1:
+                prepared = check("decode", step_inputs)  # re-driven before postprocess
+            commit(prepared)
+        assert ended == {0: False, 1: True, 2: True, 3: False, 4: False}
+
+        (graph,) = sub.get_cuda_graph_configs(torch.device("cpu"))
+        template = graph.single_request_inputs
+        per_value = {
+            HISTORY: torch.full((sub.window,), -1, dtype=torch.long),
+            "seed": torch.zeros(1, dtype=torch.long),
+            "step": torch.zeros(1, dtype=torch.long),
+            "temperature": torch.ones(1),
+            "top_p": torch.full((1,), 0.8),
+            "top_k": torch.full((1,), 25, dtype=torch.long),
+            "threshold": torch.ones(1),
+            "block_sos": torch.zeros(1, dtype=torch.bool),
+            "block_stop": torch.zeros(1, dtype=torch.bool),
+            "force_eos": torch.zeros(1, dtype=torch.bool),
+        }
+        dummies = graph.get_node_inputs(4, 4)
+        old = _stack_per_value([d.input_embeds for d in dummies], [per_value] * 4)
+        _assert_same_packed(sub.preprocess("decode", None, dummies), old)
+        # a padded replay batch: real rows, then the bucket's template rows
+        live = [sub.prepare_inputs("decode", infos[rid], {PREV_TOKEN: [torch.tensor([2])]}) for rid in (0, 1)]
+        padded = sub.preprocess("decode", None, [*live, *graph.get_node_inputs(2, 0)])
+        real = sub.preprocess("decode", None, live)
+        for key, value in real.items():
+            assert torch.equal(padded[key][:2], value), key
+            assert torch.equal(padded[key][2:], old[key][:2]), key
+        assert template.input_seq_len == 1
 
 
 def test_lm_declares_one_kv_segment_per_request_and_a_decode_capture():

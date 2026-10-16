@@ -32,8 +32,10 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -70,14 +72,13 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
 # Edge names (kept in sync with cosyvoice3_model.py)
 TEXT_INPUTS = "text_inputs"  # prompt text + text ids
-TOKEN_LIMITS = "token_limits"  # [min, max] speech tokens for this text
 REF_AUDIO = "ref_audio"  # 24 kHz mono reference clip
-VOICE_KEY = "voice_key"  # content hash of the clip
 PROMPT_TOKENS = "prompt_tokens"  # speech tokens of the clip (LM prompt)
 SPEECH_TOKENS = "speech_tokens"  # LM output, streamed to the flow
 PREV_TOKEN = "prev_token"
@@ -87,6 +88,11 @@ AUDIO_CHUNK = "audio_chunk"
 DECODE_LOOP = "decode_loop"
 STEP_INDEX = "lm_step"  # [1] the LM step that produced the token, for check_stop
 
+# Request facts process_prompt settles, carried in step_metadata
+MIN_SPEECH_TOKENS = "min_speech_tokens"
+MAX_SPEECH_TOKENS = "max_speech_tokens"
+VOICE_KEY = "voice_key"  # content hash of the clip
+
 PREFILL_WALKS = ("prefill", "prefill_voice")
 
 
@@ -94,6 +100,10 @@ def _rid(fwd_info: CurrentForwardPassInfo) -> int:
     if fwd_info.rid_handle == -1:
         raise ValueError(f"request {fwd_info.request_id!r} reached the worker without a rid handle")
     return fwd_info.rid_handle
+
+
+def _voice_key(fwd_info: CurrentForwardPassInfo) -> int:
+    return int((fwd_info.step_metadata or {})[VOICE_KEY])
 
 
 class ReferenceEncoder:
@@ -150,15 +160,16 @@ class SpeakerEncoderSubmodule(NodeSubmodule):
         self.cache = VoiceCache(config.voice_cache_size)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
-        del graph_walk, fwd_info, kwargs
+        del graph_walk, kwargs
         wav = inputs[REF_AUDIO][0].to(self.get_device(), torch.float32).reshape(-1)
-        key = int(inputs[VOICE_KEY][0].reshape(-1)[0].item())
-        return NodeInputs(tensor_inputs={REF_AUDIO: wav}, kwargs={VOICE_KEY: key})
+        return NodeInputs(tensor_inputs={REF_AUDIO: wav}, kwargs={VOICE_KEY: _voice_key(fwd_info)})
 
     def forward(self, graph_walk, engine_inputs, ref_audio: torch.Tensor, voice_key: int, **kwargs) -> NameToTensorList:
         del graph_walk, engine_inputs, kwargs
         tokens = self.cache.get(voice_key)
         if tokens is None:
+            # a new clip only: the token count is data-dependent, so the
+            # tokenizer reads its lengths back to the host
             tokens = self.encoder.tokens(ref_audio)
             self.cache.put(voice_key, tokens)
         return {PROMPT_TOKENS: [tokens]}
@@ -169,6 +180,29 @@ class SpeakerEncoderSubmodule(NodeSubmodule):
 # ===========================================================================
 
 HISTORY = "history"
+KNOBS = "knobs"
+STEP = "step"
+EOS_FLAG = "eos_flag"
+
+
+@dataclass(frozen=True, slots=True)
+class LMRequestKnobs:
+    """A request's sampling settings, resolved once at prefill."""
+
+    seed: int
+    temperature: float
+    top_p: float
+    top_k: int
+    threshold: float  # ras_window * ras_tau; 0 disables the redraw
+    ignore_eos: bool
+    min_len: int
+    max_len: int
+
+
+# The decode capture's template row
+CAPTURE_KNOBS = LMRequestKnobs(
+    seed=0, temperature=1.0, top_p=0.8, top_k=25, threshold=1.0, ignore_eos=False, min_len=0, max_len=1
+)
 
 
 class LMSubmodule(ARNodeSubmodule):
@@ -176,7 +210,10 @@ class LMSubmodule(ARNodeSubmodule):
     ``[sos | prompt text + text | task_id | prompt speech]`` per request, decode
     embeds the previous speech token. Sampling is ``ras_sample`` on float32
     logits, keyed by the request seed and step, so a decode batch replays one
-    captured graph per batch size."""
+    captured graph per batch size.
+
+    A row carries its sampling settings as host values; ``preprocess`` sends a
+    batch's columns to the device in one pinned copy per dtype."""
 
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
@@ -188,6 +225,10 @@ class LMSubmodule(ARNodeSubmodule):
         self.config = config
         self.lm = config.lm
         self.window = int(config.sampling.ras_window)
+        self._int_stager = PinnedStager(torch.long, numel=3 * self.MAX_BATCH_SIZE)
+        self._float_stager = PinnedStager(torch.float32, numel=3 * self.MAX_BATCH_SIZE)
+        self._bool_stager = PinnedStager(torch.bool, numel=2 * self.MAX_BATCH_SIZE)
+        self._eos_flags: dict[bool, torch.Tensor] = {}
 
     # -- request knobs -------------------------------------------------------
 
@@ -195,29 +236,26 @@ class LMSubmodule(ARNodeSubmodule):
         meta = step_metadata or {}
         return meta[key] if key in meta else getattr(self.config.sampling, key)
 
-    def _row_tensors(
-        self, fwd_info: CurrentForwardPassInfo, state, history: torch.Tensor, force_eos: bool = False
-    ) -> dict[str, torch.Tensor]:
-        device = self.get_device()
-        meta = fwd_info.step_metadata
-        step = int(state.get("generated", 0))
+    def _resolve_knobs(self, fwd_info: CurrentForwardPassInfo) -> LMRequestKnobs:
+        meta = fwd_info.step_metadata or {}
         window = int(self._knob(meta, "ras_window"))
-        threshold = float(window) * float(self._knob(meta, "ras_tau")) if window > 0 else 0.0
-        ignore_eos = bool((meta or {}).get("ignore_eos", False))
-        return {
-            HISTORY: history,
-            "force_eos": torch.tensor([force_eos], device=device),
-            "seed": torch.tensor([int(state["seed"])], dtype=torch.long, device=device),
-            "step": torch.tensor([step], dtype=torch.long, device=device),
-            "temperature": torch.tensor([float(self._knob(meta, "temperature"))], device=device),
-            "top_p": torch.tensor([float(self._knob(meta, "top_p"))], device=device),
-            "top_k": torch.tensor([int(self._knob(meta, "top_k"))], dtype=torch.long, device=device),
-            "threshold": torch.tensor([threshold], device=device),
-            # the reference's minimum length masks only id ``speech_token_size``
-            # (its ``sos``), so the other control ids can still end the decode
-            "block_sos": torch.tensor([step < int(state["min_len"]) or ignore_eos], device=device),
-            "block_stop": torch.tensor([ignore_eos], device=device),
-        }
+        return LMRequestKnobs(
+            seed=int(fwd_info.random_seed) & (2**63 - 1),
+            temperature=float(self._knob(meta, "temperature")),
+            top_p=float(self._knob(meta, "top_p")),
+            top_k=int(self._knob(meta, "top_k")),
+            threshold=float(window) * float(self._knob(meta, "ras_tau")) if window > 0 else 0.0,
+            ignore_eos=bool(meta.get("ignore_eos", False)),
+            min_len=int(meta[MIN_SPEECH_TOKENS]),
+            max_len=int(meta[MAX_SPEECH_TOKENS]),
+        )
+
+    def _eos_flag(self, value: bool) -> torch.Tensor:
+        """A shared ``[1]`` bool device tensor holding ``value``."""
+        flag = self._eos_flags.get(value)
+        if flag is None:
+            flag = self._eos_flags[value] = torch.full((1,), value, dtype=torch.bool, device=self.get_device())
+        return flag
 
     @torch.no_grad()
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> ARNodeInputs:
@@ -226,7 +264,6 @@ class LMSubmodule(ARNodeSubmodule):
         state = self.request_state(_rid(fwd_info))
         if graph_walk in PREFILL_WALKS:
             text_ids = inputs[TEXT_INPUTS][0].to(device, torch.long).reshape(-1)
-            limits = inputs[TOKEN_LIMITS][0].reshape(-1).tolist()
             prompt = (
                 inputs[PROMPT_TOKENS][0].to(device, torch.long).reshape(-1)
                 if inputs.get(PROMPT_TOKENS)
@@ -235,44 +272,84 @@ class LMSubmodule(ARNodeSubmodule):
             embeds = self.model.build_prefill_embeds(text_ids, prompt)
             state.add_all(
                 generated=0,
-                min_len=int(limits[0]),
-                max_len=int(limits[1]),
-                seed=int(fwd_info.random_seed) & (2**63 - 1),
+                knobs=self._resolve_knobs(fwd_info),
                 history=torch.full((max(self.window, 1),), -1, dtype=torch.long, device=device),
-                ended_at_prefill=None,
             )
+            state.remove(EOS_FLAG)
             history = state[HISTORY]
+            eos_flag = None
         elif graph_walk == "decode":
             token = inputs[PREV_TOKEN][0].to(device, torch.long).reshape(-1)[:1]
             embeds = self.model.embed_speech(token)
             # committed in postprocess, so a re-driven step does not add the token twice
             history = torch.cat([state[HISTORY][1:], token])
-            force_eos = self._ended_at_prefill(fwd_info, state, token)
+            eos_flag = self._ended_at_prefill(state, token)
         else:
             raise ValueError(f"Unknown LM walk {graph_walk!r}")
         return ARNodeInputs(
             input_embeds=embeds,
             input_seq_len=embeds.shape[0],
-            tensor_inputs=self._row_tensors(fwd_info, state, history, force_eos=graph_walk == "decode" and force_eos),
+            tensor_inputs={HISTORY: history},
+            kwargs={KNOBS: state[KNOBS], STEP: int(state["generated"]), EOS_FLAG: eos_flag},
         )
 
-    def _ended_at_prefill(self, fwd_info: CurrentForwardPassInfo, state, token: torch.Tensor) -> bool:
-        """Whether the prefill token already ended the request: a control id, or
-        the whole token budget. The prefill walk has no decode loop for
-        ``check_stop`` to end, so the first decode step runs anyway and is made
-        to sample EOS, which the flow drops and which ends the loop. Read once
-        per request (one host sync) and kept, so a re-prepared step agrees."""
-        if state["ended_at_prefill"] is None:
-            ignore_eos = bool((fwd_info.step_metadata or {}).get("ignore_eos", False))
-            stopped = not ignore_eos and int(token.item()) >= self.lm.speech_token_size
-            state.add("ended_at_prefill", stopped or int(state["generated"]) >= int(state["max_len"]))
-        return bool(state["ended_at_prefill"])
+    def _ended_at_prefill(self, state, token: torch.Tensor) -> torch.Tensor | None:
+        """Whether the prefill token already ended the request: a control id,
+        or the whole token budget. The prefill walk has no decode loop for
+        ``check_stop`` to end, so every decode step of such a request is made
+        to sample EOS, which the flow drops and which ends the loop on the
+        first one. Decided on the first decode step, whose input is the prefill
+        token, and kept, so a re-prepared or speculated step agrees. A ``[1]``
+        bool on the device (the token is never read back), or None for never."""
+        if EOS_FLAG not in state:
+            knobs: LMRequestKnobs = state[KNOBS]
+            if int(state["generated"]) >= knobs.max_len:
+                flag = self._eos_flag(True)
+            elif knobs.ignore_eos:
+                flag = None
+            else:
+                flag = token >= self.lm.speech_token_size
+            state.add(EOS_FLAG, flag)
+        return state[EOS_FLAG]
+
+    def _stage_columns(self, inputs: list[ARNodeInputs]) -> dict[str, torch.Tensor]:
+        """The batch's per-row sampling inputs, ``[B, 1]`` each, from three
+        non-blocking pinned copies (int64, float32, bool)."""
+        device = self.get_device()
+        n = len(inputs)
+        knobs: list[LMRequestKnobs] = [inp.kwargs[KNOBS] for inp in inputs]
+        steps = [inp.kwargs[STEP] for inp in inputs]
+        ints = np.array([[k.seed for k in knobs], steps, [k.top_k for k in knobs]], dtype=np.int64)
+        floats = np.array(
+            [[k.temperature for k in knobs], [k.top_p for k in knobs], [k.threshold for k in knobs]], dtype=np.float32
+        )
+        # the reference's minimum length masks only id ``speech_token_size``
+        # (its ``sos``), so the other control ids can still end the decode
+        flags = np.array(
+            [[s < k.min_len or k.ignore_eos for k, s in zip(knobs, steps, strict=True)], [k.ignore_eos for k in knobs]],
+            dtype=np.bool_,
+        )
+        columns = {}
+        for names, host, stager in (
+            (("seed", "step", "top_k"), ints, self._int_stager),
+            (("temperature", "top_p", "threshold"), floats, self._float_stager),
+            (("block_sos", "block_stop"), flags, self._bool_stager),
+        ):
+            dev = torch.empty(host.shape, dtype=stager.dtype, device=device)
+            stager.copy_(dev, host.reshape(-1))
+            columns.update({name: dev[i].view(n, 1) for i, name in enumerate(names)})
+        return columns
 
     def preprocess(self, graph_walk, engine_inputs, inputs: list[ARNodeInputs]) -> dict[str, Any]:
         del graph_walk, engine_inputs
-        packed: dict[str, Any] = {"input_embeds": torch.cat([inp.input_embeds for inp in inputs], dim=0)}
-        for key in inputs[0].tensor_inputs:
-            packed[key] = torch.stack([inp.tensor_inputs[key] for inp in inputs]).reshape(len(inputs), -1)
+        never = self._eos_flag(False)
+        flags = [inp.kwargs[EOS_FLAG] for inp in inputs]
+        packed: dict[str, Any] = {
+            "input_embeds": torch.cat([inp.input_embeds for inp in inputs], dim=0),
+            HISTORY: torch.stack([inp.tensor_inputs[HISTORY] for inp in inputs]),
+            "force_eos": torch.stack([never if flag is None else flag for flag in flags]),
+        }
+        packed.update(self._stage_columns(inputs))
         return packed
 
     def declare_step(
@@ -316,6 +393,11 @@ class LMSubmodule(ARNodeSubmodule):
         ids = torch.arange(logits.shape[-1], device=logits.device)[None, :]
         blocked = (block_sos & (ids == self.lm.sos_token)) | (block_stop & (ids >= self.lm.speech_token_size))
         blocked = torch.where(force_eos, ids != self.lm.eos_token, blocked)
+        # Not the engine sampler: RAS's draws are hashed from (seed, step, id) so
+        # a row's tokens do not depend on its batch, and it redraws a token
+        # repeated in the last W from the full distribution under a second noise
+        # stream, with per-row blocked ids. SamplerResource draws from a Philox
+        # stream per request and has no window or blocked ids.
         return ras_sample(
             logits,
             seed=seed.reshape(-1),
@@ -352,16 +434,16 @@ class LMSubmodule(ARNodeSubmodule):
             state.add(HISTORY, inputs.tensor_inputs[HISTORY])
 
     def check_stop(self, request_id, request_info, outputs) -> set[str]:
+        del request_info
         if SPEECH_TOKENS not in outputs:
             return set()
         token = int(outputs[SPEECH_TOKENS][0].reshape(-1)[0].item())
         # this step's own index, not ``generated``: a speculative next step may
         # already have been postprocessed
         generated = int(outputs[STEP_INDEX][0].reshape(-1)[0].item()) + 1
-        state = self.request_state(request_id)
-        ignore_eos = bool((request_info.step_metadata or {}).get("ignore_eos", False))
-        stopped = not ignore_eos and token >= self.lm.speech_token_size
-        if stopped or generated >= int(state["max_len"]):
+        knobs: LMRequestKnobs = self.request_state(request_id)[KNOBS]
+        stopped = not knobs.ignore_eos and token >= self.lm.speech_token_size
+        if stopped or generated >= knobs.max_len:
             return {DECODE_LOOP}
         return set()
 
@@ -378,18 +460,7 @@ class LMSubmodule(ARNodeSubmodule):
         del tp_world_size
         dtype = self.model.speech_embedding.weight.dtype
         width = max(self.window, 1)
-        tensor_inputs = {
-            HISTORY: torch.full((width,), -1, dtype=torch.long, device=device),
-            "seed": torch.zeros(1, dtype=torch.long, device=device),
-            "step": torch.zeros(1, dtype=torch.long, device=device),
-            "temperature": torch.ones(1, device=device),
-            "top_p": torch.full((1,), 0.8, device=device),
-            "top_k": torch.full((1,), 25, dtype=torch.long, device=device),
-            "threshold": torch.ones(1, device=device),
-            "block_sos": torch.zeros(1, dtype=torch.bool, device=device),
-            "block_stop": torch.zeros(1, dtype=torch.bool, device=device),
-            "force_eos": torch.zeros(1, dtype=torch.bool, device=device),
-        }
+        tensor_inputs = {HISTORY: torch.full((width,), -1, dtype=torch.long, device=device)}
         return [
             BatchedCudaGraphConfig(
                 capture_graph_walk="decode",
@@ -397,6 +468,7 @@ class LMSubmodule(ARNodeSubmodule):
                     input_embeds=torch.zeros(1, self.lm.hidden_size, dtype=dtype, device=device),
                     input_seq_len=1,
                     tensor_inputs=tensor_inputs,
+                    kwargs={KNOBS: CAPTURE_KNOBS, STEP: 0, EOS_FLAG: None},
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile=False,
@@ -467,9 +539,9 @@ class FlowSubmodule(NodeSubmodule):
         self.lookahead = config.flow.pre_lookahead_len
         self.chunk_tokens = config.flow.chunk_tokens
 
-    def _voice(self, inputs: NameToTensorList, state) -> ReferenceVoice:
+    def _voice(self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, state) -> ReferenceVoice:
         if inputs.get(REF_AUDIO):
-            key = int(inputs[VOICE_KEY][0].reshape(-1)[0].item())
+            key = _voice_key(fwd_info)
             voice = self.cache.get(key)
             if voice is None:
                 wav = inputs[REF_AUDIO][0].to(self.get_device(), torch.float32).reshape(-1)
@@ -525,7 +597,7 @@ class FlowSubmodule(NodeSubmodule):
         if raw is None or raw.numel() == 0:
             raw = state.get("raw", torch.zeros(0, dtype=torch.long, device=device))
         state.add("raw", raw)
-        voice = self._voice(inputs, state)
+        voice = self._voice(fwd_info, inputs, state)
         final = bool(kwargs.get("is_final_stream_chunk", False))
         tokens = filter_tokens(raw, self.config)
         meta = fwd_info.step_metadata or {}
