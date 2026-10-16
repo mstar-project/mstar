@@ -1,3 +1,15 @@
+# Copyright (c) 2026 OpenBMB.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: both LMs and the per-patch heads
+# fused into one module stepping one patch per call.
+#
+# Original file (OpenBMB/VoxCPM, src/voxcpm/model/voxcpm2.py) was released
+# under Apache-2.0, with the full license text available at
+# https://github.com/OpenBMB/VoxCPM/blob/main/LICENSE.
+#
+# This modified file is released under the same license.
+
 """The VoxCPM2 generator: both LMs plus the per-patch heads, as one module.
 
 One autoregressive step turns the previous latent patch into the next:

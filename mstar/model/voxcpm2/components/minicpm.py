@@ -1,3 +1,15 @@
+# Copyright (c) 2026 OpenBMB.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: the MiniCPM-4 stacks rebuilt on
+# M* components over a paged KV cache.
+#
+# Original file (OpenBMB/VoxCPM, src/voxcpm/modules/minicpm4/model.py) was
+# released under Apache-2.0, with the full license text available at
+# https://github.com/OpenBMB/VoxCPM/blob/main/LICENSE.
+#
+# This modified file is released under the same license.
+
 """MiniCPM-4 transformer stacks of VoxCPM2, built from the shared components.
 
 MiniCPM-4 (with ``use_mup`` off, as in VoxCPM2) is a Llama-style pre-norm

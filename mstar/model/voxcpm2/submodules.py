@@ -1,3 +1,16 @@
+# Copyright (c) 2026 OpenBMB.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: the reference generate loop
+# split into M* graph-node submodules with continuous batching and streamed
+# VAE windows.
+#
+# Original files (OpenBMB/VoxCPM, src/voxcpm/model/voxcpm2.py and
+# src/voxcpm/core.py) were released under Apache-2.0, with the full license
+# text available at https://github.com/OpenBMB/VoxCPM/blob/main/LICENSE.
+#
+# This modified file is released under the same license.
+
 # ---------------------------------------------------------------------------
 # NodeSubmodule wrappers for VoxCPM2
 # ---------------------------------------------------------------------------

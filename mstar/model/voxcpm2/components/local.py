@@ -1,3 +1,18 @@
+# Copyright (c) 2026 OpenBMB.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: the per-patch modules batched
+# over requests, with the CFM solve kept capturable in a CUDA graph.
+#
+# Original files (OpenBMB/VoxCPM, src/voxcpm/modules/locenc/local_encoder.py,
+# src/voxcpm/modules/locdit/local_dit_v2.py,
+# src/voxcpm/modules/locdit/unified_cfm.py and
+# src/voxcpm/modules/layers/scalar_quantization_layer.py) were released under
+# Apache-2.0, with the full license text available at
+# https://github.com/OpenBMB/VoxCPM/blob/main/LICENSE.
+#
+# This modified file is released under the same license.
+
 """VoxCPM2's per-patch modules: local encoder, local DiT, CFM solver, FSQ.
 
 Each LM step predicts one patch of ``patch_size`` latent frames. The local

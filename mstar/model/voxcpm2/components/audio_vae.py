@@ -1,3 +1,15 @@
+# Copyright (c) 2026 OpenBMB.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: weight norm folded at load, and
+# the decoder's receptive field derived for streamed windows.
+#
+# Original file (OpenBMB/VoxCPM, src/voxcpm/modules/audiovae/audio_vae_v2.py)
+# was released under Apache-2.0, with the full license text available at
+# https://github.com/OpenBMB/VoxCPM/blob/main/LICENSE.
+#
+# This modified file is released under the same license.
+
 """AudioVAE V2 of VoxCPM2: 16 kHz waveform -> 25 Hz latents -> 48 kHz waveform.
 
 A port of the reference ``AudioVAEV2`` (a DAC-style causal conv VAE with an
