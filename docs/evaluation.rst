@@ -154,7 +154,9 @@ provenance line, plus optional PNG charts of metrics against concurrency or rate
 
 ``rescore`` recomputes WER/CER from the transcripts a ``tts`` or ``asr`` results file
 already holds, with another normalizer, and records that it did; transcribing is the
-expensive part, so runs scored differently can be compared without a GPU::
+expensive part, so runs scored differently can be compared without a GPU. It refuses a
+file whose transcripts were redacted when written (they held an address or a home path),
+since it would score the redaction::
 
     python -m benchmark.eval rescore results/tts --data eval-data/fleurs_en/manifest.jsonl \
         --normalizer seedtts --out results/tts_seedtts

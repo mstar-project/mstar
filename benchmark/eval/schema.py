@@ -71,10 +71,7 @@ class RunResult:
         # The one place everything passes before it is written: no addresses, secrets or home paths.
         d["config"], d["meta"], d["label"] = scrub(d["config"]), scrub(d["meta"]), _scrub(d["label"])
         for rep in d["repeats"]:
-            # Transcripts and ids are scrubbed too; an address or home path in speech is rare,
-            # and a shared file must not carry one.
-            rep["requests"] = [{k: _scrub(v) if isinstance(v, str) else v for k, v in row.items()}
-                               for row in rep["requests"]]
+            rep["requests"] = [_scrub_row(row) for row in rep["requests"]]
         d["repeats"], d["summary"] = finite(d["repeats"]), finite(d["summary"])
         return {"schema": d.pop("schema"), **d}
 
@@ -105,6 +102,23 @@ class RunResult:
     @classmethod
     def load(cls, path: str | Path) -> RunResult:
         return cls.from_dict(json.loads(Path(path).read_text()))
+
+
+def _scrub_row(row: dict[str, Any]) -> dict[str, Any]:
+    """A request row as written: string fields (transcripts, errors) scrubbed, ids kept (they
+    are validated plain names that rescoring matches). Fields the scrubber changed are listed
+    in ``scrubbed`` so nothing downstream mistakes them for what the model said."""
+    out, changed = {}, []
+    for k, v in row.items():
+        if isinstance(v, str) and k != "id":
+            clean = _scrub(v)
+            if clean != v:
+                changed.append(k)
+            v = clean
+        out[k] = v
+    if changed:
+        out["scrubbed"] = sorted(set(changed) | set(row.get("scrubbed") or []))
+    return out
 
 
 def _json_default(obj: Any) -> Any:

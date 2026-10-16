@@ -32,6 +32,11 @@ def rescore(result: RunResult, items: list[Item], normalizer: str) -> RunResult:
             hyps = [r["hyp"] for r in rows]
         if not rows:
             continue
+        redacted = [r["id"] for r in rows if "hyp" in (r.get("scrubbed") or [])]
+        if redacted:
+            raise ValueError(f"{result.label}: transcripts of {redacted[:3]} were redacted when the results were "
+                             "written (they held an address or a home path); rescoring them would score the "
+                             "redaction, so rerun the suite with the new normalizer instead")
         missing = [r["id"] for r in rows if r["id"] not in by_id]
         if missing:
             raise ValueError(f"manifest lacks items {missing[:3]} from {result.label}")

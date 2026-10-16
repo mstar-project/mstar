@@ -162,11 +162,20 @@ def test_results_schema_roundtrip_and_validation(tmp_path):
         RunResult.from_dict({"schema": SCHEMA})
 
 
-def test_request_rows_are_scrubbed_when_written():
+def test_request_rows_are_scrubbed_when_written_and_rescore_refuses_redacted_transcripts(tmp_path):
+    from benchmark.eval.rescore import rescore
+
     home = os.path.expanduser("~")
-    rows = [{"id": "u1", "ok": True, "hyp": f"see {home}/private.wav at 10.24.6.8", "wer": 0.1}]
-    text = json.dumps(RunResult("asr", "x", {}, {}, [RepeatResult(0, 1.0, {}, rows)]).finalize().to_dict())
+    rows = [{"id": "u1", "ok": True, "hyp": f"see {home}/private.wav at 10.24.6.8", "wer": 0.0},
+            {"id": "u2", "ok": True, "hyp": "fine", "wer": 0.0}]
+    r = RunResult("asr", "x", {"suite": {}}, {}, [RepeatResult(0, 1.0, {"wer": 0.0}, rows)]).finalize()
+    d = r.to_dict()
+    text = json.dumps(d)
     assert home not in text and "10.24.6.8" not in text and "~/private.wav at <ip>" in text
+    assert d["repeats"][0]["requests"][0]["scrubbed"] == ["hyp"] and "scrubbed" not in d["repeats"][0]["requests"][1]
+    items = [Item("u1", text=f"see {home}/private.wav at 10.24.6.8"), Item("u2", text="fine")]
+    with pytest.raises(ValueError, match="redacted"):
+        rescore(RunResult.load(r.save(tmp_path / "r.json")), items, "basic")
 
 
 def test_results_always_save_with_non_finite_numbers(tmp_path):
@@ -230,7 +239,7 @@ def test_manifest_roundtrip_relative_paths(tmp_path):
     (tmp_path / "bad.jsonl").write_text('{"id": "a", "voice": "x"}\n')
     with pytest.raises(ValueError):
         load_manifest(tmp_path / "bad.jsonl")
-    for bad_id in ("/abs/source_audio", "../escape", "a/b", ".hidden", "x..y"):
+    for bad_id in ("/abs/source_audio", "../escape", "a/b", ".hidden", "x..y", "clip_10.24.6.8"):
         (tmp_path / "ids.jsonl").write_text(json.dumps({"id": bad_id, "text": "t"}) + "\n")
         with pytest.raises(ValueError, match="plain name"):
             load_manifest(tmp_path / "ids.jsonl")

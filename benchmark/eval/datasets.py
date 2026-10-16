@@ -36,9 +36,16 @@ ASR_RATE = 16000
 ITEM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 
 
+_IPV4_IN_ID = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+
+
 def check_id(item_id: str) -> str:
-    if not isinstance(item_id, str) or not ITEM_ID.fullmatch(item_id) or ".." in item_id:
-        raise ValueError(f"item id {item_id!r} must be a plain name (letters, digits, '.', '_', '-')")
+    """Ids are written to results files verbatim (rescoring matches them to the manifest), so
+    they are plain names without paths or address literals."""
+    if (not isinstance(item_id, str) or not ITEM_ID.fullmatch(item_id) or ".." in item_id
+            or _IPV4_IN_ID.search(item_id)):
+        raise ValueError(f"item id {item_id!r} must be a plain name (letters, digits, '.', '_', '-'; no paths "
+                         "or IP addresses)")
     return item_id
 
 
