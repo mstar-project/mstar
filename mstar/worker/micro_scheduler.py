@@ -127,6 +127,20 @@ class ScheduledBatch:
         return len(self.request_to_worker_graph)
 
 
+def _input_tokens(
+    edges: ColumnarEdgeSpecs, tensor_rows: Callable[[int], int],
+) -> dict[int, int]:
+    """Each rid's input rows for this node's step: the most any one of its input
+    edges carries (a prompt's token ids)."""
+    tokens: dict[int, int] = {}
+    start = 0
+    for rid, n in zip(edges.rids, edges.tensors_per_edge, strict=True):
+        rows = sum(tensor_rows(uuid) for uuid in edges.uuids[start:start + n])
+        start += n
+        tokens[rid] = max(tokens.get(rid, 1), rows)
+    return tokens
+
+
 class SchedulingType(Enum):
     ROUND_ROBIN = "round_robin"
     # TODO: priority. It used to key off a per-engine-type table, which no
@@ -158,9 +172,15 @@ class MicroScheduler:
         parallel_leader_nodes: set[str] | None = None,
         max_consec_tp_follower_batches: int = 1,
         batch_builder_type: BatchBuilderType = BatchBuilderType.FIFO,
+        max_step_tokens: Callable[[str, str], int | None] | None = None,
+        tensor_rows: Callable[[int], int] | None = None,
     ):
         self.engine_manager = engine_manager
         self.batch_builder = make_batch_builder(batch_builder_type)
+        # (node, walk) -> its step token budget or None; None here: no budgets
+        self.max_step_tokens = max_step_tokens
+        # tensor uuid -> its leading dim, to count a popped step's input tokens
+        self.tensor_rows = tensor_rows
         self.batch_number = 0
         # The graph runtime, installed by the worker. Interning and the
         # (walk, node) -> worker graph index both live there.
@@ -194,6 +214,11 @@ class MicroScheduler:
         self.backlog: dict[tuple[str, str], ScheduledBatch] = {}
 
         self.node_and_walk_to_last_batch_num = {}
+        # rid -> when a step budget first saw it, so the budget takes the oldest:
+        # the runtime's ready order can't say (the Rust one scans by handle, and
+        # handles are recycled)
+        self._first_seen: dict[int, int] = {}
+        self._seen_count = 0
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
         # Rids with a deferred remove; stop initiating new work for them.
@@ -478,7 +503,12 @@ class MicroScheduler:
         # rather than leaving the worker idle behind it. `exclude_target` is
         # only a fairness hint, and finishing a split set beats fairness.
         keys = [k for k in self.backlog if target is None or k == target]
-        rr_key = self._select_node_rr(ready)
+        # A walk with no room (no free state slot) takes nothing, so it stays the
+        # least recent; picked anyway, it would starve the walk that frees the room.
+        rr_key = self._select_node_rr({
+            key: rows for key, rows in ready.items()
+            if self._room_left(key, max_batch_size, pre_existing_batch_size) != 0
+        })
         if rr_key is not None and rr_key not in keys:
             keys.append(rr_key)
         for key in keys:
@@ -555,12 +585,37 @@ class MicroScheduler:
             if entries else None
         if backlogged is None and not fresh:
             return None
+        max_tokens, row_tokens = self._token_budget(node_walk, backlogged, fresh)
         return self._build_and_schedule(request_state, BatchBuildRequest(
             node_name=node_walk[0], graph_walk=node_walk[1],
             backlog=backlogged, fresh=fresh or None, blocked_rids=blocked,
             max_batch_size=remaining,
+            max_batch_tokens=max_tokens, row_tokens=row_tokens,
             capture_group_of=capture_group_of,
         ))
+
+    def _token_budget(
+        self, node_walk: tuple[str, str], *batches: ScheduledBatch | None,
+    ) -> tuple[int | None, dict[int, int]]:
+        """``node_walk``'s step token budget, None for none, and the input
+        tokens of each row of ``batches`` (its backlog and fresh rows), oldest
+        row first."""
+        if self.max_step_tokens is None or self.tensor_rows is None:
+            return None, {}
+        budget = self.max_step_tokens(*node_walk)
+        if budget is None:
+            return None, {}
+        batches = [batch for batch in batches if batch]
+        tokens: dict[int, int] = {}
+        for batch in batches:
+            tokens.update(_input_tokens(batch.input_edges, self.tensor_rows))
+        rids = [rid for batch in batches for rid in batch.request_to_worker_graph]
+        for rid in rids:
+            if rid not in self._first_seen:
+                self._first_seen[rid] = self._seen_count
+                self._seen_count += 1
+        rids.sort(key=self._first_seen.__getitem__)
+        return budget, {rid: tokens.get(rid, 1) for rid in rids}
 
     def _room_left(
         self, node_walk: tuple[str, str], max_batch_size: int | None,
@@ -955,6 +1010,7 @@ class MicroScheduler:
         self.failed_rids.discard(rid)
         self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
+        self._first_seen.pop(rid, None)
         self._drop_backlogged_rid(rid)
         self.clear_wire_rid(rid_str)
 
