@@ -392,7 +392,7 @@ class RingKVManager(AttentionResource):
 
     # `supports_preplan` stays the inherited False.
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int
     ) -> None:
         """No-op: every buffer a replay touches was allocated at ``build``,
@@ -406,20 +406,20 @@ class RingKVManager(AttentionResource):
         if self._sessions:
             raise RuntimeError(
                 f"ring KV {self.name!r} is still claimed by {sorted(self._sessions)} "
-                "after CUDA graph capture; a capture dummy rid was never reset, "
+                "after accelerator graph capture; a capture dummy rid was never reset, "
                 "and the session it holds is gone from the pool for good."
             )
         if len(self._free_sessions) != self.num_sessions:
             raise RuntimeError(
                 f"ring KV {self.name!r} has {len(self._free_sessions)} of "
-                f"{self.num_sessions} sessions free after CUDA graph capture; a session "
+                f"{self.num_sessions} sessions free after accelerator graph capture; a session "
                 "was zeroed and never returned to the pool, so the node has "
                 "silently lost concurrency."
             )
         if self._last_frames:
             raise RuntimeError(
                 f"ring KV {self.name!r} recorded committed frames "
-                f"({sorted(self._last_frames.items())}) during CUDA graph capture; "
+                f"({sorted(self._last_frames.items())}) during accelerator graph capture; "
                 "capture drives admit and plan but must never commit, and the "
                 "first real request will be refused at admit unless it happens to "
                 "declare the very next frame."

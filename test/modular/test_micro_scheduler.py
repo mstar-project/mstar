@@ -835,7 +835,7 @@ def _capture_group(split=True, captured=(WALK,)):
 
     runner = SimpleNamespace(captures_walk=lambda walk: walk in captured)
     engine = SimpleNamespace(_submodules={
-        NODE: SimpleNamespace(submodule=_Submodule(split), cuda_graph_runner=runner),
+        NODE: SimpleNamespace(submodule=_Submodule(split), accelerator_graph_runner=runner),
     })
     return Engine.capture_group(engine, NODE, WALK, 0, SimpleNamespace(guided=True))
 
@@ -1091,5 +1091,3 @@ def test_a_builder_that_loses_a_row_is_refused():
 
     with pytest.raises(AssertionError, match="dropped rows"):
         _next_batch(sched, _Manager(["r0", "r1", "r2"]))
-
-

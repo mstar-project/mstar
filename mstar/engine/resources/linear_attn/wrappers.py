@@ -24,10 +24,10 @@ class GDNWrapper(ABC):
         qk_l2norm: bool=True,
         num_tokens: int | None=None,
         bs: int | None=None,
-        cuda_graph: bool=False,
+        accelerator_graph: bool=False,
         null_slot_id: int = 0,
     ):
-        if cuda_graph and (num_tokens is None or bs is None):
+        if accelerator_graph and (num_tokens is None or bs is None):
             # Every capacity below is `max(this layout, the bucket)`; without
             # the bucket it degrades to the layout and reallocates.
             raise ValueError(
@@ -41,7 +41,7 @@ class GDNWrapper(ABC):
         self._null_slot_id = null_slot_id
         self._max_num_tokens = num_tokens
         self._bs = bs
-        self._cuda_graph = cuda_graph
+        self._accelerator_graph = accelerator_graph
         self._capacity = -1
         self._sm_scale = sm_scale
         self._qk_l2norm = qk_l2norm
@@ -119,7 +119,7 @@ class GDNPrefillWrapper(GDNWrapper):
         num_tokens: int | None=None,
         bs: int | None=None,
         has_sink_state: bool = True,
-        cuda_graph: bool=False,
+        accelerator_graph: bool=False,
         null_slot_id: int = 0,
     ):
         super().__init__(
@@ -129,7 +129,7 @@ class GDNPrefillWrapper(GDNWrapper):
             qk_l2norm=qk_l2norm,
             num_tokens=num_tokens,
             bs=bs,
-            cuda_graph=cuda_graph,
+            accelerator_graph=accelerator_graph,
             null_slot_id=null_slot_id,
         )
         self._has_sink_state = has_sink_state
@@ -163,7 +163,7 @@ class GDNPrefillWrapper(GDNWrapper):
             offsets.extend(range(chunks))
 
         needed = len(rows)
-        if self._cuda_graph:
+        if self._accelerator_graph:
             capacity = max(
                 needed, self._max_num_tokens // block + self._bs, 1,
             )
@@ -176,7 +176,7 @@ class GDNPrefillWrapper(GDNWrapper):
             self._offset_ptr = torch.zeros(capacity, **i32)
             self._capacity = capacity
 
-        pin = torch.cuda.is_available()
+        pin = torch.accelerator.is_available()
         self._batch_ptr.fill_(self._pad_slot_id)
         self._offset_ptr.fill_(self._pad_slot_id)
 
@@ -215,7 +215,7 @@ class GDNPrefillWrapper(GDNWrapper):
         # Sized to the bucket under capture, not to this layout: one bucket
         # replays at several row counts, and the first one planned is not
         # necessarily the widest.
-        capacity = max(num_rows, self._bs) if self._cuda_graph else num_rows
+        capacity = max(num_rows, self._bs) if self._accelerator_graph else num_rows
         if capacity > self._rows_capacity:
             self._cu_buffer = torch.zeros(
                 capacity + 1, dtype=torch.int64, device=self._device
@@ -230,7 +230,7 @@ class GDNPrefillWrapper(GDNWrapper):
         # a pageable temporary and stops being asynchronous
         self._cu_buffer[: len(cu)].copy_(
             torch.tensor(
-                cu, dtype=torch.int64, pin_memory=torch.cuda.is_available()
+                cu, dtype=torch.int64, pin_memory=torch.accelerator.is_available()
             ),
             non_blocking=True,
         )
@@ -238,7 +238,7 @@ class GDNPrefillWrapper(GDNWrapper):
     def _build_mask(
         self, total_tokens: int
     ):
-        if self._cuda_graph:
+        if self._accelerator_graph:
             # `+ _bs` covers the room `run` adds for the padding rows' tokens
             capacity = max(self._max_num_tokens + self._bs, total_tokens)
         else:
@@ -362,7 +362,7 @@ class GDNPrefillWrapper(GDNWrapper):
         # branching on their count would bake the wrong shape into every replay.
         real_len = q.shape[0]
         rows = (
-            self._plan_state.num_rows if self._cuda_graph else self._plan_borrowed
+            self._plan_state.num_rows if self._accelerator_graph else self._plan_borrowed
         )
         if rows:
             q, k, v, g, beta = (
@@ -423,7 +423,7 @@ class GDNDecodeWrapper(GDNWrapper):
         sm_scale: float | None=None,
         qk_l2norm: bool=True,
         bs: int | None=None,
-        cuda_graph: bool=False,
+        accelerator_graph: bool=False,
         null_slot_id: int = 0,
     ):
         super().__init__(
@@ -433,7 +433,7 @@ class GDNDecodeWrapper(GDNWrapper):
             qk_l2norm=qk_l2norm,
             num_tokens=bs,
             bs=bs,
-            cuda_graph=cuda_graph,
+            accelerator_graph=accelerator_graph,
             null_slot_id=null_slot_id,
         )
 

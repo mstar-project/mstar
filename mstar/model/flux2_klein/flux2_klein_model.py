@@ -92,7 +92,7 @@ class Flux2KleinModel(Model):
         compile: bool = True,
         compile_eager_rounding: bool = True,
         compile_exact_ops: bool | list[str] = False,
-        cuda_graph: bool = True,
+        accelerator_graph: bool = True,
         capture_sizes: list[list[int]] | None = None,
         capture_edit_sizes: list[list[int]] | None = None,
         capture_batch_sizes: list[int] | None = None,
@@ -115,7 +115,7 @@ class Flux2KleinModel(Model):
         self.compile_eager_rounding = bool(compile_eager_rounding)
         # True: every norm / activation class stays eager inside the compiled forward; a list picks classes
         self.compile_exact_ops = compile_exact_ops if isinstance(compile_exact_ops, list) else bool(compile_exact_ops)
-        self.cuda_graph = bool(cuda_graph)
+        self.accelerator_graph = bool(accelerator_graph)
         # Default capture: the model's native 1024x1024 text-to-image shape.
         self.capture_sizes = [tuple(int(v) for v in s) for s in (capture_sizes or [[1024, 1024]])]
         # Edit buckets: one reference image of the output size (an edit's default output size is its
@@ -429,7 +429,7 @@ class Flux2KleinModel(Model):
         return None
 
     def capture_buckets(self) -> list[tuple[str, Hashable]]:
-        if not self.cuda_graph:
+        if not self.accelerator_graph:
             return []
         text_len = self.config.text_encoder.max_sequence_length
         shapes: list[tuple[str, Hashable]] = [

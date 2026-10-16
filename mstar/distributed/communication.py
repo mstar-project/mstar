@@ -327,6 +327,8 @@ class WorkerParallelGroups:
         backend = dist.get_default_backend_for_device(device.type)
         if not self.any_parallelism:
             return
+        if device.type == "xpu":
+            backend = f"cpu:gloo,xpu:{backend}"
 
         dist.init_process_group(
             backend=backend,
@@ -345,13 +347,16 @@ class WorkerParallelGroups:
         rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
             rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
-            # Members only: with the default group bound to a device, a
-            # non-member's subgroup creation joins an ncclCommSplit that
-            # members never call for a gloo group, and blocks forever.
-            rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
-                ranks=list(rank_tuple), backend="gloo",
-                use_local_synchronization=True,
-            )
+            if device.type == "xpu":
+                rank_tuple_to_cpu_pg[rank_tuple] = rank_tuple_to_pg[rank_tuple]
+            else:
+                # Members only: with the default group bound to a device, a
+                # non-member's subgroup creation joins an ncclCommSplit that
+                # members never call for a gloo group, and blocks forever.
+                rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
+                    ranks=list(rank_tuple), backend="gloo",
+                    use_local_synchronization=True,
+                )
 
         seen: set[int] = set()
         for comm_group in (

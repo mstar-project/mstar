@@ -30,12 +30,12 @@ def _fake_transformer():
 def _dit_with_buckets(monkeypatch):
     monkeypatch.setenv("COSMOS3_GEN_CAPTURE_RES", "64x64")
     monkeypatch.setenv("COSMOS3_GEN_CAPTURE_VIDEO", "64x64x9")
-    monkeypatch.setenv("COSMOS3_DISABLE_PREFILL_CUDA_GRAPH", "1")
-    monkeypatch.delenv("COSMOS3_DISABLE_CUDA_GRAPH", raising=False)
+    monkeypatch.setenv("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH", "1")
+    monkeypatch.delenv("COSMOS3_DISABLE_ACCELERATOR_GRAPH", raising=False)
     sub = Cosmos3DiTSubmodule(
         transformer=_fake_transformer(), config=Cosmos3Config(compile_denoise=False), scheduler=None,
     )
-    configs = sub.get_cuda_graph_configs("cpu")
+    configs = sub.get_accelerator_graph_configs("cpu")
     return sub, configs
 
 

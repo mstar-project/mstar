@@ -116,7 +116,7 @@ class WaypointModel(Model):
         ae_path: str | None = None,
         reference_compat: bool | None = None,
         compile_dit: bool | None = None,
-        cuda_graph: bool | None = None,
+        accelerator_graph: bool | None = None,
         capture_dit_prime: bool | None = None,
         full_global_ring: bool | None = None,
         step_batch_size: int | None = None,
@@ -143,7 +143,7 @@ class WaypointModel(Model):
             key: value for key, value in {
                 "reference_compat": reference_compat,
                 "compile_dit": compile_dit,
-                "cuda_graph": cuda_graph,
+                "accelerator_graph": accelerator_graph,
                 "capture_dit_prime": capture_dit_prime,
                 "full_global_ring": full_global_ring,
                 "step_batch_size": step_batch_size,

@@ -1115,7 +1115,7 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
 
     assert submodule.disable_torch_compile is True
     assert submodule.can_batch(batch, model_inputs)
-    assert submodule.can_use_cuda_graphs(batch, model_inputs)
+    assert submodule.can_use_accelerator_graphs(batch, model_inputs)
     packed = submodule.preprocess(
         "talker_decode",
         ModelInputsFromEngine(
@@ -1127,7 +1127,7 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     assert packed["input_embeds"].shape == (2, 16)
     assert packed["last_token_indices"].tolist() == [0, 1]
     assert packed["suppress_eos"].tolist() == [True, True]
-    configs = {c.capture_graph_walk: c for c in submodule.get_cuda_graph_configs(torch.device("cpu"))}
+    configs = {c.capture_graph_walk: c for c in submodule.get_accelerator_graph_configs(torch.device("cpu"))}
     graph_config = configs["talker_decode"]
     assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
     assert graph_config.single_request_inputs.tensor_inputs[
@@ -1146,18 +1146,18 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
         node_name="Talker", step_context=_step_context("talker_prefill", ["a", "b"]),
         per_request_input_tensors={}, per_request_info=info,
     )
-    assert submodule.can_use_cuda_graphs(prefill_batch, model_inputs)
+    assert submodule.can_use_accelerator_graphs(prefill_batch, model_inputs)
     clone_batch = ExecutingBatch(
         node_name="Talker", step_context=_step_context("talker_prefill_clone", ["a", "b"]),
         per_request_input_tensors={}, per_request_info=info,
     )
-    assert not submodule.can_use_cuda_graphs(clone_batch, model_inputs)
+    assert not submodule.can_use_accelerator_graphs(clone_batch, model_inputs)
     # Residual sampling params live in per-request sampler buffers, so requests
     # that disagree about them still batch AND still replay the decode graph.
     # (They used to fall out of both.)
     info["b"].step_metadata["subtalker_sampling"] = {"temperature": 0.7}
     assert submodule.can_batch(batch, model_inputs)
-    assert submodule.can_use_cuda_graphs(batch, model_inputs)
+    assert submodule.can_use_accelerator_graphs(batch, model_inputs)
 
 
 def test_qwen3_tts_code_predictor_projects_wider_talker_inputs():
@@ -1682,7 +1682,7 @@ def test_qwen3_tts_streaming_policy_ramps_and_flushes_only_new_tail_audio():
     assert outputs["audio_chunk"][0].tolist() == list(range(8, 12))
 
 
-def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
+def test_qwen3_tts_codec_batches_and_declares_accelerator_graphs():
     config = _tiny_model_config()
     submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
     model_inputs = [
@@ -1699,7 +1699,7 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
     )
 
     assert submodule.can_batch(batch, model_inputs)
-    assert submodule.can_use_cuda_graphs(batch, model_inputs)
+    assert submodule.can_use_accelerator_graphs(batch, model_inputs)
     packed = submodule.preprocess(
         "codec_chunk",
         ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={}),
@@ -1708,7 +1708,7 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
     assert packed["codec_tokens"].shape == (2, 4, 4)
     assert packed["conv_start"].tolist() == [0, 0]   # inputs without geometry (capture) start at 0
     # One capture per window of the chunk ramp, keyed by the window.
-    graph_configs = submodule.get_cuda_graph_configs(torch.device("cpu"))
+    graph_configs = submodule.get_accelerator_graph_configs(torch.device("cpu"))
     assert [c.additional_key_info for c in graph_configs] == [1, 4, 5]
     for graph_config in graph_configs:
         assert graph_config.capture_graph_walk == "codec_chunk"
@@ -1738,7 +1738,7 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
 
     mixed = model_inputs + [ARNodeInputs(tensor_inputs={"codec_tokens": torch.ones(4, 1, dtype=torch.long)})]
     assert submodule.can_batch(batch, mixed)
-    assert submodule.can_use_cuda_graphs(batch, mixed)
+    assert submodule.can_use_accelerator_graphs(batch, mixed)
     packed = submodule.preprocess(
         "codec_chunk", ModelInputsFromEngine(request_ids=["a", "b", "c"], per_request_info={}), mixed,
     )

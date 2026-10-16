@@ -11,7 +11,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from functools import partial
+from functools import cached_property, partial
 from time import sleep
 
 import torch
@@ -54,6 +54,7 @@ from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetada
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.utils.containers import ParallelList, RecentSet
+from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -277,6 +278,10 @@ class Worker:
     # per-row stream polls; None (a bare instance) means unknown, so poll.
     _stream_buffer_rids: set[int] | None = None
 
+    @cached_property
+    def device_capability(self) -> DeviceCapability:
+        return DeviceCapability.of(self.device)
+
     def __init__(
         self,
         worker_id: str,
@@ -317,7 +322,7 @@ class Worker:
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
 
-        if self.device.type != "cpu" and self.device.index is not None:
+        if self.device_capability.is_accelerator and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
 
         # ``dist_init_method`` is normally provided by the conductor — it
@@ -409,6 +414,7 @@ class Worker:
             model=model,
             enable_nvtx=self.enable_nvtx,
             enable_prof=self.enable_prof,
+            device_capability=self.device_capability,
         )
 
         self.request_state = RequestStateManager(
@@ -528,7 +534,7 @@ class Worker:
         # ``output.completion_event`` (recorded after GPU(N)) and then runs
         # an isolated D→H, so the main thread only blocks on the copy.
         # Lazy-initialized — workers without CUDA never touch it.
-        self._d2h_stream: "torch.cuda.Stream | None" = None
+        self._d2h_stream: torch.Stream | None = None
         self._pinned_d2h_buffers: dict[
             tuple[str, torch.dtype, int], list[torch.Tensor]
         ] = defaultdict(list)
@@ -1791,7 +1797,7 @@ class Worker:
         It also applies mstar's torch config, because dynamo config is
         per-thread since torch 2.12 and this thread compiles.
         """
-        if self.device.type != "cpu" and self.device.index is not None:
+        if self.device_capability.is_accelerator and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
         apply_torch_config()
 
@@ -1890,14 +1896,14 @@ class Worker:
                 engine.reset_pre_plan_for_batch(node_batch)
             execution_stream = (
                 torch.accelerator.current_stream(self.device)
-                if self.device.type != "cpu"
+                if self.device_capability.is_accelerator
                 else None
             )
             # Device time of the step; the phase timers only see host submit
             # time, and both are needed to tell a starved iter from a busy one.
             gpu_start = None
             if self._phase_period and execution_stream is not None:
-                gpu_start = torch.Event(enable_timing=True)
+                gpu_start = torch.Event(device=self.device, enable_timing=True)
                 gpu_start.record(execution_stream)
             if self._phase_period:
                 # after prepare_inputs, which can drop rids — this is the row
@@ -1909,11 +1915,11 @@ class Worker:
                 outputs = engine.exec_and_postprocess(node_batch)
             if execution_stream is not None:
                 self._stage_host_rows(outputs)
-                event = torch.Event()
+                event = torch.Event(device=self.device)
                 event.record(execution_stream)
                 node_batch.completion_event = event
                 if gpu_start is not None:
-                    gpu_end = torch.Event(enable_timing=True)
+                    gpu_end = torch.Event(device=self.device, enable_timing=True)
                     gpu_end.record(execution_stream)
                     self._gpu_spans.append((gpu_start, gpu_end))
                     self._drain_gpu_spans()
@@ -2878,13 +2884,14 @@ class Worker:
 
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
-        if self.device.type != "cpu" and batch_N.batch.request_to_worker_graph:
+        if self.device_capability.is_accelerator and batch_N.batch.request_to_worker_graph:
             if batch_N.node_batch.completion_event is not None:
                 with self._span("worker.postprocess.event_sync"):
                     batch_N.node_batch.completion_event.synchronize()
             else:
                 with self._span("worker.postprocess.device_sync"):
-                    torch.accelerator.synchronize(self.device)
+                    if self.device_capability.is_available:
+                        torch.accelerator.synchronize(self.device)
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
@@ -3280,7 +3287,11 @@ class Worker:
         slot = self._host_rows_slot = (self._host_rows_slot + 1) % _HOST_ROWS_RING
         host: dict[str, torch.Tensor] = {}
         for index, (name, tensor) in enumerate(buffers.items()):
-            if not (torch.is_tensor(tensor) and tensor.is_cuda):
+            if not (
+                torch.is_tensor(tensor)
+                and self.device_capability.is_accelerator
+                and tensor.device.type == self.device.type
+            ):
                 host[name] = tensor
                 continue
             buf = self._get_pinned_d2h_buffer(
@@ -3312,7 +3323,7 @@ class Worker:
 
 
     def _d2h_batched(
-        self, buffers: dict, side: torch.cuda.Stream,
+        self, buffers: dict, side: torch.Stream,
     ) -> dict[str, torch.Tensor]:
         """One device-to-host copy per named buffer, landed before this returns.
 
@@ -3324,9 +3335,12 @@ class Worker:
         reused by the next step.
         """
         host: dict[str, torch.Tensor] = {}
-        with torch.cuda.stream(side):
+        with side:
             for index, (name, tensor) in enumerate(buffers.items()):
-                if not (torch.is_tensor(tensor) and tensor.is_cuda):
+                if not (
+                    torch.is_tensor(tensor)
+                    and tensor.device.type == self.device.type
+                ):
                     host[name] = tensor
                     continue
                 buf = self._get_pinned_d2h_buffer(
@@ -3359,7 +3373,7 @@ class Worker:
     def _prematerialize_for_check_stop(
         self,
         outputs: "BatchedModelOutput",
-        completion_event: torch.cuda.Event | None,
+        completion_event: torch.Event | None,
         request_ids: list[int] | None = None,
     ) -> tuple[dict[int, NameToTensorList], HostRows | None]:
         """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
@@ -3394,7 +3408,10 @@ class Worker:
             # staged by the gpu thread behind the step; the caller has waited
             # on the completion event, so the rows are here
             return _LazyPerRid(landed.buffers, list(landed.request_ids)), landed
-        if not torch.cuda.is_available() or completion_event is None:
+        if (
+            completion_event is None
+            or not self.device_capability.is_available
+        ):
             if outputs.check_stop_buffers is not None and row_rids is not None:
                 # host tensors already (a CPU device): only the re-keying
                 host = outputs.check_stop_buffers
@@ -3407,7 +3424,7 @@ class Worker:
             return source, None
 
         if self._d2h_stream is None:
-            self._d2h_stream = torch.cuda.Stream(device=self.device)
+            self._d2h_stream = torch.Stream(device=self.device)
         side = self._d2h_stream
         side.wait_event(completion_event)
 
@@ -3420,7 +3437,7 @@ class Worker:
 
         cpu_per_rid: dict = {}
         buffer_indices: dict[tuple[str, torch.dtype, int], int] = defaultdict(int)
-        with torch.cuda.stream(side):
+        with side:
             for rid, name_to_list in source.items():
                 if not isinstance(name_to_list, dict):
                     cpu_per_rid[rid] = name_to_list
@@ -3432,7 +3449,7 @@ class Worker:
                         continue
                     new_list = []
                     for t in tensors:
-                        if torch.is_tensor(t) and t.is_cuda:
+                        if torch.is_tensor(t) and t.device.type == self.device.type:
                             # by size class, not shape: a per-shape count gives two shapes in one class the same buffer
                             key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
                             idx = buffer_indices[key]

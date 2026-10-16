@@ -136,7 +136,7 @@ def main():
     device = torch.device("cuda")
     model = Flux2KleinModel(
         model_path_hf=args.repo, attention_backend="sdpa", compile=args.compile,
-        compile_exact_ops=["norms"] if args.exact_ops else False, vae_compile=args.vae_compile, cuda_graph=False,
+        compile_exact_ops=["norms"] if args.exact_ops else False, vae_compile=args.vae_compile, accelerator_graph=False,
         capture_sizes=[[args.height, args.width]],
     )
     model.set_config(Flux2KleinConfig.from_snapshot(resolve_snapshot_dir(args.repo)))

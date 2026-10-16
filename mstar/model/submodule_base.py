@@ -28,8 +28,8 @@ class HostRows(NamedTuple):
 
 
 if TYPE_CHECKING:
-    from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
-    from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+    from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
+    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
@@ -435,7 +435,7 @@ class ModelInputsFromEngine:
     # by the engine, spread in at execute time (like ``cache_manager`` /
     # ``sampler``). Empty when the submodule opts into no piecewise graphs or
     # capture failed. See ``NodeSubmodule.get_piecewise_cuda_graph_configs``.
-    piecewise_runners: dict[str, "PiecewiseCudaGraphRunner"] = field(default_factory=dict)
+    piecewise_runners: dict[str, "PiecewiseAcceleratorGraphRunner"] = field(default_factory=dict)
 
     # The batch's per-request states, injected by the engine (None on paths
     # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
@@ -788,12 +788,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         return None
 
     # Note: do not import CudaGraphConfig; it causes a circular import situation
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1
+    ) -> list[AcceleratorGraphConfig]:
         return []
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Return the piecewise CUDA graph configs this submodule opts into.
 
         ``autocast_dtype`` is the engine's autocast dtype — passed so a config's
@@ -825,9 +827,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return {}
 
-    def can_use_cuda_graphs(
-        self, batch: ExecutingBatch,
-        model_inputs: list[NodeInputs]
+    def can_use_accelerator_graphs(
+        self,
+        batch: ExecutingBatch,
+        model_inputs: list[NodeInputs],
     ) -> bool:
         """Return True if this submodule supports CUDA graphs for ``batch``.
 
@@ -849,12 +852,18 @@ class NodeSubmodule(torch.nn.Module, ABC):
         Subclasses can override to reject on batch shape / metadata (e.g.
         codec submodules that need homogeneous frame counts).
         """
-        if not hasattr(self, "_cached_cuda_graph_walks"):
+        if not hasattr(self, "_cached_accelerator_graph_walks"):
+            device = next(
+                (tensor.device for tensor in self.parameters()),
+                torch.device("cpu"),
+            )
             walks: set[str] = set()
-            for cfg in self.get_cuda_graph_configs(device=torch.device("cpu"), tp_world_size=1):
+            for cfg in self.get_accelerator_graph_configs(
+                device=device, tp_world_size=1
+            ):
                 walks.update(cfg.replay_graph_walks)
-            self._cached_cuda_graph_walks = walks
-        return batch.graph_walk in self._cached_cuda_graph_walks
+            self._cached_accelerator_graph_walks = walks
+        return batch.graph_walk in self._cached_accelerator_graph_walks
 
     def postprocess(
         self, request_id: str,
@@ -1007,5 +1016,3 @@ class ARNodeSubmodule(NodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
         pass
-
-
