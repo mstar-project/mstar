@@ -1,8 +1,13 @@
-"""CPU-side planning tests for the XPU paged-attention resource."""
+"""Planning and graph replay tests for the XPU paged-attention resource."""
 
 import pytest
 import torch
 
+from mstar.engine.accelerator_graph_config import (
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+    PiecewisePackedConfig,
+)
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -19,9 +24,10 @@ from mstar.engine.resources import (
 from mstar.engine.resources.attn import xpu as xpu_attention
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.xpu import XPUPagedAttentionManager
-from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.base import CGSlotSpec, EngineResourceInfo
 from mstar.engine.resources.kv.plan import KVPlanOutput, SequenceView
 from mstar.engine.resources.sampler.utils import _rng_offset_stride
+from mstar.model.submodule_base import NodeInputs
 
 
 def _kv_config() -> PagedKVConfig:
@@ -227,3 +233,141 @@ def test_xpu_graph_plan_supports_context_past_text_sequence_limit():
     assert not plan.block_table[0, len(pages):].any()
     assert plan.host_kv_lens.tolist() == [length]
     assert plan.max_k == config.max_num_pages * config.page_size
+
+
+def _register_graph_bucket(manager, bucket, *, packed, piecewise=False):
+    if piecewise:
+        config = PiecewisePackedConfig(
+            total_tokens=[bucket.num_tokens],
+            capture_batch_sizes=[bucket.bs],
+            capture_fn=lambda inp: {},
+            make_static_inputs=lambda shape: {},
+        )
+    elif packed:
+        config = PackedAcceleratorGraphConfig(
+            capture_graph_walk=bucket.graph_walk,
+            capture_token_lengths=[bucket.num_tokens],
+            capture_batch_sizes=[bucket.bs],
+            make_node_input=lambda n: NodeInputs(input_seq_len=n),
+        )
+    else:
+        config = BatchedAcceleratorGraphConfig(
+            capture_graph_walk=bucket.graph_walk,
+            capture_batch_sizes=[bucket.bs],
+            single_request_inputs=NodeInputs(input_seq_len=1),
+        )
+    manager.build_accelerator_graph_buffers(
+        [CGSlotSpec(bucket=bucket, slot=0, config=config)],
+        max_bs=bucket.bs,
+        max_seq_len=bucket.num_tokens,
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "capture_lengths", "replay_lengths"),
+    [(16, [8, 8], [13, 3]), (2, [1, 1], [2, 0])],
+)
+@pytest.mark.parametrize("recipe", ["packed", "piecewise", "unregistered"])
+def test_packed_graph_query_bound_covers_uneven_replans(
+    num_tokens, capture_lengths, replay_lengths, recipe,
+):
+    manager = _manager()
+    bucket = BucketKey(graph_walk="prefill_text", bs=2, num_tokens=num_tokens)
+    if recipe != "unregistered":
+        _register_graph_bucket(
+            manager, bucket, packed=True, piecewise=recipe == "piecewise",
+        )
+    lease = SlotLease(slot=0, bucket=bucket)
+
+    def plan_lengths(lengths):
+        views = [
+            SequenceView(
+                rid, "main", list(range(1, (n + 3) // 4 + 1)),
+                length=n, to_compute=n,
+            )
+            for rid, n in enumerate(lengths)
+        ]
+        manager.plan(AttentionStep(causal=True), _ctx(views, lease))
+
+    plan_lengths(capture_lengths)
+    captured = manager._current_plans["main"]
+    addresses = tuple(
+        getattr(captured, name).data_ptr()
+        for name in ("block_table", "cu_q", "host_kv_lens")
+    )
+    assert captured.max_q == num_tokens
+    plan_lengths(replay_lengths)
+    replayed = manager._current_plans["main"]
+    assert replayed is captured
+    assert replayed.max_q == num_tokens
+    assert replayed.cu_q.tolist() == [0, replay_lengths[0], sum(replay_lengths)]
+    assert tuple(
+        getattr(replayed, name).data_ptr()
+        for name in ("block_table", "cu_q", "host_kv_lens")
+    ) == addresses
+
+
+def test_batched_decode_graph_keeps_single_token_query_bound():
+    manager = _manager()
+    bucket = BucketKey(graph_walk="decode", bs=2, num_tokens=2)
+    _register_graph_bucket(manager, bucket, packed=False)
+    views = [
+        SequenceView(rid, "main", [1], length=3, to_compute=1)
+        for rid in (1, 2)
+    ]
+    manager.plan(AttentionStep(causal=True), _ctx(views, SlotLease(slot=0, bucket=bucket)))
+    assert manager._current_plans["main"].max_q == 1
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is unavailable")
+def test_xpu_packed_attention_graph_replays_uneven_queries():
+    reason = xpu_attention._xpu_paged_unavailable_reason()
+    if reason is not None:
+        pytest.skip(reason)
+    device = torch.device("xpu:0")
+    config = PagedKVConfig(
+        num_layers=1, num_kv_heads=2, head_dim=64,
+        max_seq_len=1024, max_num_pages=64, page_size=16, num_qo_heads=4,
+    )
+    manager = XPUPagedAttentionManager("kv", device, config)
+    eager = XPUPagedAttentionManager("kv", device, config)
+    bucket = BucketKey(graph_walk="prefill_text", bs=2, num_tokens=512)
+    _register_graph_bucket(manager, bucket, packed=True)
+    lease = SlotLease(slot=0, bucket=bucket)
+    generator = torch.Generator().manual_seed(777)
+    q = torch.randn(512, 4, 64, generator=generator).to(device, torch.bfloat16)
+    cache = torch.randn(64, 2, 16, 2, 64, generator=generator).to(device, torch.bfloat16)
+
+    def views_for(lengths):
+        views = []
+        next_page = 1
+        for rid, length in enumerate(lengths):
+            pages = (length + config.page_size - 1) // config.page_size
+            views.append(SequenceView(
+                rid, "main", list(range(next_page, next_page + pages)),
+                length=length, to_compute=length,
+            ))
+            next_page += pages
+        return views
+
+    manager.plan(
+        AttentionStep(causal=True), _ctx(views_for([256, 256]), lease),
+    )
+    manager.run(q, label="main", kv_cache_layer=cache)
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        captured_output = manager.run(q, label="main", kv_cache_layer=cache)
+
+    for lengths in ([504, 8], [8, 504], [407, 5]):
+        views = views_for(lengths)
+        manager.plan(AttentionStep(causal=True), _ctx(views, lease))
+        eager.plan(AttentionStep(causal=True), _ctx(views))
+        total = sum(lengths)
+        expected = eager.run(q[:total], label="main", kv_cache_layer=cache)
+        captured_output.fill_(float("nan"))
+        graph.replay()
+        torch.xpu.synchronize()
+        actual = captured_output[:total]
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
