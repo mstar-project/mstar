@@ -156,6 +156,10 @@ def _preprocess_video(
 class VJepa2Model(Model):
     """V-JEPA 2 model (encoder + optional predictor)."""
 
+    PREPROCESS_ONLY_KWARGS = (
+        "actions", "states", "extrinsics", "context_mask", "target_mask", "goal_hidden",
+    )
+
     PREFILL_VIDEO = "prefill_video"
     PREFILL_VIDEO_ENCODER_ONLY = "prefill_video_encoder_only"
     PREFILL_VIDEO_ROLLOUT = "prefill_video_rollout"

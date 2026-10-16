@@ -208,3 +208,41 @@ def test_runner_clear_preplan_reaches_every_resource() -> None:
     runner.clear_preplan()
     assert kv.events[-1] == "clear" and attn.events[-1] == "clear"
     assert runner.plan(_step("a")) == {"kv": "fresh", "attn": "fresh"}
+
+
+class _Counting(_Blind):
+    """Records admits as well, the way a real resource re-sweeps its rows."""
+
+    def admit(self, step, ctx):
+        self.events.append("pre_admit" if ctx.is_preplan else "admit")
+        return super().admit(step, ctx)
+
+
+def test_admit_of_a_pre_admitted_step_skips_the_resources_that_sweep_covered() -> None:
+    kv, attn = _Counting(), _Counting(deps=("kv",))
+    runner = StepRunner({"kv": kv, "attn": attn})
+    staged = _step("a", preplan=True)
+    assert runner.pre_admit(staged).ok
+    runner.pre_plan(staged)
+
+    # the same step reaches the GPU thread: nothing to admit again
+    live = _step("a")
+    assert runner.admit(live).ok
+    assert kv.events == ["pre_admit", "pre_plan"]
+    assert attn.events == ["pre_admit", "pre_plan"]
+    assert runner.plan(live) == {"kv": "staged", "attn": "staged"}
+
+    # the next step of the same shape was not pre-admitted: a full sweep
+    assert runner.admit(_step("a")).ok
+    assert kv.events[-1] == "admit" and attn.events[-1] == "admit"
+
+
+def test_admit_of_a_foreign_step_still_sweeps_everything() -> None:
+    kv, attn = _Counting(), _Counting(deps=("kv",))
+    runner = StepRunner({"kv": kv, "attn": attn})
+    staged = _step("a", preplan=True)
+    assert runner.pre_admit(staged).ok
+    runner.pre_plan(staged)
+    assert runner.admit(_step("b", span=17, slot=None)).ok
+    assert kv.events == ["pre_admit", "pre_plan", "clear", "admit"]
+    assert attn.events == ["pre_admit", "pre_plan", "clear", "admit"]

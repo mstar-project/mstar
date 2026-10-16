@@ -25,6 +25,7 @@ from mstar.api_server.request_types import (
     ResultTensors,
 )
 from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
+from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
@@ -87,6 +88,15 @@ def _video_frame_metadata(
         "frame_index": frame_index,
         "frame_count": frame_count,
     }
+@dataclass
+class InlineToken:
+    """One request's value out of a RESULT_TOKENS frame, queued behind the
+    tensor results so sequences keep arrival order."""
+    request_id: str
+    value: int
+    loop_indices: NestedLoopIndices | None
+    modality: str
+
 
 
 def _preprocess_loop(**kwargs):
@@ -129,6 +139,8 @@ class PreprocessWorker:
         self.output_queue = queue.Queue()
         self.profile_queue = queue.Queue()
         self.stop_event = threading.Event()
+        # Wakes the thread's idle wait: every producer below signals it.
+        self.wakeup = EventWakeup()
 
         self.per_request_reading_tensors = {}
         self.output_loop_idxs: dict[str, NameToLoopIndices] = {}
@@ -165,6 +177,7 @@ class PreprocessWorker:
                 reads_done_queue=self.reads_done_queue,
                 discard_tensor_queue=self.discard_tensor_queue,
                 stop_event=self.stop_event,
+                wakeup=self.wakeup,
                 communicator=self.communicator,
                 tensor_manager=self.tensor_manager,
                 model=model,
@@ -175,10 +188,18 @@ class PreprocessWorker:
         )
         self.thread.start()
 
+    def _signal(self):
+        """End the thread's idle wait: new work is queued. getattr: tests
+        build this facade without its constructor."""
+        wakeup = getattr(self, "wakeup", None)
+        if wakeup is not None:
+            wakeup.signal()
+
     def new_request(self, input: PreprocessInput):
         self.output_loop_idxs[input.request_id] = {}
         self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
+        self._signal()
 
     def abort_request(self, request_id: str):
         # Forward the abort to the conductor and begin draining our own reads
@@ -187,6 +208,7 @@ class PreprocessWorker:
         # REMOVE_REQUEST, so a worker still reading them can't be unlinked
         # out from under it. Drop only the main-thread bookkeeping here.
         self.abort_request_queue.put(request_id)
+        self._signal()
         self.output_loop_idxs.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
@@ -198,6 +220,7 @@ class PreprocessWorker:
         when delivery was abandoned (TTL, client gone) and the ACK must wait
         for any in-flight read."""
         self.reads_done_queue.put((request_id, drained))
+        self._signal()
         self.output_loop_idxs.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
@@ -220,6 +243,34 @@ class PreprocessWorker:
             input.request_id,  self.per_request_reading_tensors[input.request_id]
         )
         self.result_tensor_input_queue.put(input)
+        self._signal()
+
+    def new_result_token(
+        self, request_id: str, value: int,
+        loop_indices: NestedLoopIndices | None, signal: str, modality: str,
+        wake: bool = True,
+    ):
+        """A value that rode inline: same accounting as a result tensor, no
+        transport read and nothing to ack. ``wake=False`` queues without
+        ending the thread's idle wait: a frame's caller hands over every
+        request's value first and calls ``wake`` once."""
+        if request_id not in self.output_loop_idxs:
+            logger.debug("Late token for cleaned-up request %s dropped", request_id)
+            return
+        if loop_indices is not None:
+            self.output_loop_idxs[request_id][signal] = loop_indices.max(
+                self.output_loop_idxs[request_id].get(signal, None)
+            )
+        self.per_request_reading_tensors[request_id] += 1
+        self.result_tensor_input_queue.put(
+            InlineToken(request_id, value, loop_indices, modality)
+        )
+        if wake:
+            self._signal()
+
+    def wake(self):
+        """End the thread's idle wait after a batch of ``wake=False`` puts."""
+        self._signal()
 
     def discard_result_tensors(self, input: ResultTensors):
         """Ack and drop result tensors for an already-removed request.
@@ -228,6 +279,7 @@ class PreprocessWorker:
         producing worker gets its TENSOR_RECEIVED ack and frees the buffers.
         """
         self.discard_tensor_queue.put(input)
+        self._signal()
 
     def has_pending_tensors(self, request_id: str):
         return self.per_request_reading_tensors.get(request_id, 0) > 0
@@ -297,11 +349,13 @@ class PreprocessWorker:
 
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
+        self._signal()
         self.output_loop_idxs.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
     def shutdown(self):
         self.stop_event.set()
+        self._signal()
         if self.thread.is_alive():
             self.thread.join()
 
@@ -357,6 +411,7 @@ class PreprocessWorkerThread:
         enable_prof: bool=False,
         model_config: dict | None = None,
         enable_nvtx: bool=False,
+        wakeup: EventWakeup | None = None,
     ):
         # keying a stream needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no stream
@@ -401,6 +456,12 @@ class PreprocessWorkerThread:
         # Owned by PreprocessWorker (main thread); used only from this thread.
         self.communicator = communicator
         self.tensor_manager = tensor_manager
+        # Set by the producers (queue puts, shutdown) and by finished tensor
+        # reads; run() blocks on the communicator's poll with it instead of
+        # sleeping and sweeping the queues. None keeps the sleep (tests built
+        # with a bare communicator).
+        self.wakeup = wakeup
+        self.idle_wait_ms = 20
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -531,6 +592,8 @@ class PreprocessWorkerThread:
 
         self.request_model_kwargs[input.request_id] = model_kwargs
         self.request_output_state[input.request_id] = RequestOutputState()
+        preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
+        conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
             message_type=ConductorMessageType.NEW_REQUEST,
             body=NewRequestConductor(
@@ -539,7 +602,7 @@ class PreprocessWorkerThread:
                 initial_input_modalities=input.input_modalities,
                 initial_output_modalities=input.output_modalities,
                 input_metadata=input_metadata,
-                model_kwargs=model_kwargs
+                model_kwargs=conductor_kwargs
             ),
         )
         self.communicator.send("conductor", msg)
@@ -655,10 +718,14 @@ class PreprocessWorkerThread:
         self, result: ResultTensors
     ):
         result.graph_edge.name = f"{result.modality}_output"
-        self.tensor_manager.start_read_tensors(
+        futures = self.tensor_manager.start_read_tensors(
             request_id=result.request_id,
             graph_edges=[result.graph_edge],
         )
+        wakeup = getattr(self, "wakeup", None)
+        if wakeup is not None and futures:
+            # a finished read ends the idle wait, so the chunk goes out at once
+            wakeup.register_futures(futures)
         if result.request_id not in self.tensor_uuid_to_metadata_per_request:
             self.tensor_uuid_to_metadata_per_request[result.request_id] = {}
         state = self.request_output_state.setdefault(
@@ -669,6 +736,36 @@ class PreprocessWorkerThread:
                 tensor_info.uuid] = result.metadata
             state.order[tensor_info.uuid] = (state.next_sequence, result.loop_indices)
             state.next_sequence += 1
+
+    def _emit_inline_token(self, item: InlineToken) -> None:
+        """Detokenize a value that arrived inline and queue its chunk."""
+        request_id = item.request_id
+        state = self.request_output_state.setdefault(
+            request_id, RequestOutputState()
+        )
+        sequence = state.next_sequence
+        state.next_sequence += 1
+        try:
+            tensor = torch.tensor([item.value], dtype=torch.int64)
+            postprocessed = self.model.postprocess(
+                tensor, item.modality,
+                request_kwargs=self.request_model_kwargs.get(request_id),
+            )
+            self._queue_completed_output(
+                request_id,
+                sequence,
+                ResultChunk(
+                    request_id=request_id,
+                    modality=item.modality,
+                    data=postprocessed,
+                    metadata={},
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — must reach the client
+            self._fail_request(
+                request_id, exc, f"{item.modality} output postprocessing",
+                sequence=sequence,
+            )
 
     def _queue_completed_output(
         self,
@@ -878,11 +975,28 @@ class PreprocessWorkerThread:
         self.tensor_manager.force_cleanup_request(request_id)
         self._drop_request_state(request_id)
 
+    def _idle_wait(self):
+        """How a pass that found nothing waits: on the communicator's poll,
+        ended by a message, a producer's signal or a finished read, with
+        ``idle_wait_ms`` as the backstop; or a 1 ms sleep when the thread has
+        no wakeup or its communicator cannot poll one."""
+        # getattr: teardown tests build a thread without its constructor
+        wakeup = getattr(self, "wakeup", None)
+        comm = getattr(self, "communicator", None)
+        register = getattr(comm, "register_event_for_poll", None)
+        wait = getattr(comm, "wait_for_work", None)
+        if wakeup is None or not callable(register) or not callable(wait):
+            return lambda: time.sleep(0.001)
+        register(wakeup)
+        idle_ms = getattr(self, "idle_wait_ms", 20)
+        return lambda: wait(idle_ms)
+
     def run(self):
         # A thread told to stop before it starts (teardown tests build one with
         # only its queues) has nothing to warm up.
         if not self.stop_event.is_set():
             warm_up_model(getattr(self, "model", None))
+        idle_wait = self._idle_wait()
         while not self.stop_event.is_set():
             did_work = False
             try:
@@ -895,6 +1009,12 @@ class PreprocessWorkerThread:
                 while not self.result_tensor_queue.empty():
                     did_work = True
                     result = self.result_tensor_queue.get()
+                    if isinstance(result, InlineToken):
+                        # Nothing to read or ack: postprocess in place, in
+                        # arrival order with the tensor results.
+                        if result.request_id not in self._draining_rids:
+                            self._emit_inline_token(result)
+                        continue
                     # Draining for teardown: don't start new reads — ack the
                     # tensors back so the producing worker can free its buffers.
                     if result.request_id in self._draining_rids:
@@ -960,7 +1080,7 @@ class PreprocessWorkerThread:
                 logger.exception("PreprocessWorkerThread error")
 
             if not did_work:
-                time.sleep(0.001)
+                idle_wait()
 
         # Stopping, and nothing will send the RemoveRequest for what is still
         # tracked (the conductor is gone or going), so drop it here rather than

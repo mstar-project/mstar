@@ -65,7 +65,7 @@ class _RecordingResource:
 def _pool(resource, rids_per_key):
     pool = DummyRowPool(
         prefix="node",
-        step_runner=SimpleNamespace(ingest_request=lambda rid: None),
+        step_runner=SimpleNamespace(ingest_capture_row=lambda rid: None),
         resources={"kv": resource},
     )
     for key, bs in rids_per_key.items():
@@ -128,7 +128,7 @@ def test_capture_spans_come_back_to_the_arena():
         kv.ingest_request(rid)
     pool = DummyRowPool(
         prefix="a",
-        step_runner=SimpleNamespace(ingest_request=lambda rid: None),
+        step_runner=SimpleNamespace(ingest_capture_row=lambda rid: None),
         resources={"kv": kv},
     )
     pool._held["0_slot0"] = list(rids)
@@ -181,7 +181,7 @@ def test_freed_pages_are_reusable_by_a_real_request(page_size):
     _admit(kv, ["__cg_a_0__"], [page_size * 6])
     pool = DummyRowPool(
         prefix="a",
-        step_runner=SimpleNamespace(ingest_request=lambda rid: None),
+        step_runner=SimpleNamespace(ingest_capture_row=lambda rid: None),
         resources={"kv": kv},
     )
     pool._held["0_slot0"] = ["__cg_a_0__"]

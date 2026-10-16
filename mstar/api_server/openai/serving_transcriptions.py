@@ -59,7 +59,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from mstar.api_server import media_io
-from mstar.api_server.openai._util import SSE_DONE, rid, sse
+from mstar.api_server.openai._util import SSE_DONE, error_type, rid, sse
 from mstar.api_server.openai.adapters import Transcript
 
 _TIMED_FORMATS = ("verbose_json", "srt", "vtt")
@@ -528,9 +528,10 @@ async def _parallel(api, adapter, req, windows: list[Window], inflight: set[str]
 
 
 def _error_event(message: str, status: int | None) -> str:
+    status = status or 500
     return sse({
         "type": "error",
-        "error": {"message": message, "type": "server_error", "code": status or 500},
+        "error": {"message": message, "type": error_type(status), "code": status},
     })
 
 

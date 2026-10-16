@@ -88,8 +88,8 @@ def test_wrapped_head_dispatches_on_schedule_tp():
 
 
 def test_seqs_round_trip_through_pickle():
-    """TP messages travel as pickled dataclasses over ZMQ, so the tags have to
-    survive that specific path — not a dict round trip."""
+    """The ZMQ wire is typed msgpack; this pins that the TP dataclasses also
+    pickle with their tags intact, rather than as a dict round trip."""
     import pickle
 
     msg = ScheduleTPNode(

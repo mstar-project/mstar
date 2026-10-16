@@ -262,6 +262,37 @@ def test_a_remote_destination_gets_input_signals(tmp_path):
     assert got[PEER][0].body.request_info.fwd_index == 2
 
 
+def test_data_extensions_survive_rust_frame_splicing(tmp_path):
+    import numpy as np
+
+    mesh = _Mesh(
+        tmp_path, outs=[("out", "remote", False)],
+        remote=[{"wg_id": 1, "graph_walks": [WALK],
+                 "nodes": ["remote"], "dyn_loops": []}],
+    )
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1)
+    fwd = CurrentForwardPassInfo(
+        request_id="r1", graph_walk=WALK, fwd_index=0, random_seed=0,
+        max_tokens=8, partition_name="default",
+        step_metadata={
+            "shape": (2, 3), "size": torch.Size([2, 3]), "dtype": torch.float16,
+            "tags": {"a", "b"}, "mask": np.arange(6).reshape(2, 3),
+            "mapping": {(1, "x"): frozenset({2, 3})},
+        },
+    )
+    got = mesh.run(rid, uuids=[1], request_infos=[
+        (rid, encode_field(fwd, CurrentForwardPassInfo)),
+    ])[PEER][0].body.request_info.step_metadata
+    assert got["shape"] == (2, 3)
+    assert got["dtype"] is torch.float16
+    assert type(got["size"]) is torch.Size
+    assert got["size"] == torch.Size([2, 3])
+    assert got["tags"] == {"a", "b"}
+    assert got["mapping"] == {(1, "x"): frozenset({2, 3})}
+    np.testing.assert_array_equal(got["mask"], fwd.step_metadata["mask"])
+
+
 def test_a_persist_signal_rides_the_worker_graphs_done(tmp_path):
     """Buffered, not sent immediately: a persist signal must not race the
     message that announces it."""
@@ -298,8 +329,8 @@ def test_the_profiling_trio_splices_into_three_fields(tmp_path):
     """One blob holding [rx, tx, timings]; Rust splits it.
 
     encode_fields, not encode: a bare list has no wire tag, so encode would
-    PICKLE the payload -- which Rust cannot splice and a Rust peer cannot
-    decode.
+    wrap the payload in a data envelope, which Rust cannot splice into
+    separate fields.
     """
     from mstar.profile.format import GraphTiming, RxInfo, TxInfo
 
