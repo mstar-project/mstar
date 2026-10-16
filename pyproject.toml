@@ -175,6 +175,8 @@ kokoro = [
 # Chatterbox / Chatterbox-Turbo: resemble-perth (MIT) carries the PerTh
 # watermark network applied to every output; pyloudnorm normalises Turbo's
 # reference clip like the reference package. Both are imported lazily.
+# resemble-perth 1.0.1 (the latest) imports pkg_resources, which setuptools 82
+# removed; without it the package hides its watermarker.
 chatterbox = [
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
@@ -183,6 +185,7 @@ chatterbox = [
     "pyloudnorm",
     "resemble-perth",
     "safetensors",
+    "setuptools<82",
     "tokenizers",
     "torchcodec",
     "transformers",
