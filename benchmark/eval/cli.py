@@ -87,6 +87,15 @@ def _add_report(sub) -> None:
     p.add_argument("--title", default=None)
 
 
+def _add_rescore(sub) -> None:
+    p = sub.add_parser("rescore", allow_abbrev=False,
+                       help="recompute WER/CER from stored transcripts with another normalizer")
+    p.add_argument("results", nargs="+", help="tts or asr results JSON files or directories")
+    p.add_argument("--data", required=True, help="the manifest the run used (references)")
+    p.add_argument("--normalizer", required=True)
+    p.add_argument("--out", required=True, help="directory for the rescored files")
+
+
 def _add_data(sub) -> None:
     p = sub.add_parser("data", allow_abbrev=False, help="build a dataset manifest")
     kinds = p.add_subparsers(dest="kind", required=True)
@@ -114,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     _add_run(sub)
     _add_report(sub)
+    _add_rescore(sub)
     _add_data(sub)
     return parser
 
@@ -203,6 +213,24 @@ def cmd_report(args) -> None:
         print(f"wrote {args.chart}", file=sys.stderr)
 
 
+def cmd_rescore(args) -> None:
+    from benchmark.eval.report import load_results
+    from benchmark.eval.rescore import rescore
+
+    items = datasets.load_manifest(args.data)
+    out = Path(args.out)
+    for path, result in zip(_result_paths(args.results), load_results(args.results), strict=True):
+        dst = rescore(result, items, args.normalizer).save(out / path.name)
+        print(f"wrote {dst}", file=sys.stderr)
+
+
+def _result_paths(paths: list[str]) -> list[Path]:
+    files: list[Path] = []
+    for p in map(Path, paths):
+        files += sorted(p.glob("*.json")) if p.is_dir() else [p]
+    return files
+
+
 def cmd_data(args) -> None:
     out = Path(args.out).expanduser()
     if args.kind == "librispeech":
@@ -233,5 +261,7 @@ def main(argv: list[str] | None = None) -> None:
         cmd_run(args)
     elif args.command == "report":
         cmd_report(args)
+    elif args.command == "rescore":
+        cmd_rescore(args)
     else:
         cmd_data(args)

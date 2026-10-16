@@ -48,6 +48,30 @@ def test_label_agreement_matches_cohens_kappa():
     assert stats.label_agreement(["x"], ["x"])["kappa"] == 1.0
 
 
+def test_whisper_normalizers_keep_parenthesized_speech():
+    pytest.importorskip("transformers")
+    name, norm = text_metrics.get_normalizer("whisper_basic")
+    assert name == "whisper_basic"
+    assert norm("Ions (since atoms [mostly] lose one)").split() == "ions since atoms mostly lose one".split()
+
+
+def test_rescore_recomputes_stored_transcripts(tmp_path):
+    items = [Item("a", text="Hello (big) world", lang="en"), Item("b", text="good day", lang="en")]
+    save_manifest(items, tmp_path / "m.jsonl")
+    rows = [{"id": "a", "ok": True, "hyp": "hello, big world!"}, {"id": "b", "ok": False, "error": "HTTP 500"}]
+    r = RunResult("asr", "x", {"suite": {"normalizer": "whisper_en"}}, {},
+                  [RepeatResult(0, 1.0, {"wer": 0.9, "errors": 1}, rows)]).finalize()
+    r.save(tmp_path / "in" / "asr-x-c1.json")
+    from benchmark.eval.cli import main
+
+    main(["rescore", str(tmp_path / "in"), "--data", str(tmp_path / "m.jsonl"), "--normalizer", "basic",
+          "--out", str(tmp_path / "out")])
+    back = RunResult.load(tmp_path / "out" / "asr-x-c1.json")
+    assert back.summary["wer"]["mean"] == pytest.approx(2 / 5)  # the failed request still counts: 2 deletions
+    assert back.config["suite"]["normalizer"] == "basic"
+    assert back.config["rescored"] == [{"from": "whisper_en", "to": "basic"}]
+
+
 def test_edit_counts_and_corpus_wer():
     c = text_metrics.edit_counts("a b c d".split(), "a c d e".split())
     assert (c.substitutions, c.deletions, c.insertions, c.reference_len) == (0, 1, 1, 4)
@@ -429,6 +453,9 @@ def test_duplex_timing_censors_what_the_replay_did_not_observe():
     m = timing_metrics("turn_taking", [], None, 2.0, None, 5.0, 2.0, duration_s=4.0)
     assert m["took_turn"] is None and m["turn_censored"]
     assert timing_metrics("turn_taking", [], None, 2.0, None, 5.0, 2.0, duration_s=9.0)["took_turn"] is False
+    # a reply after the take-turn window is late, but its latency is still measured
+    m = timing_metrics("turn_taking", [(10.0, 11.0)], None, 2.0, None, 5.0, 2.0, duration_s=14.0)
+    assert m["took_turn"] is False and m["response_latency_s"] == pytest.approx(8.0)
 
 
 def test_custom_commands_hosts_and_ipv6_never_reach_results():
@@ -446,6 +473,8 @@ def test_custom_commands_hosts_and_ipv6_never_reach_results():
     assert env == {"MSTAR_ZMQ_TCP_HOST": "<host>", "MSTAR_SERVER_HOST": "<host>", "MSTAR_ADDR": "127.0.0.1",
                    "PYTHONPATH": "~/a:~/b", "note": "at 07:02:51"}
     assert scrub_argv(["--serve-env", "MSTAR_ZMQ_TCP_HOST=gpu.internal"])[1] == "MSTAR_ZMQ_TCP_HOST=<host>"
+    nested = scrub_argv(["--extra", 'metadata={"api_key": "sk-x", "endpoint": "gpu.internal", "voice": "af"}'])[1]
+    assert "sk-x" not in nested and "gpu.internal" not in nested and '"voice": "af"' in nested
 
 
 def test_tts_suite_end_to_end(tmp_path, fake_cmd):

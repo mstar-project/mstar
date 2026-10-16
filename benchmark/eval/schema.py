@@ -220,7 +220,15 @@ def describe_command(cmd: list[str] | str | None) -> str | None:
 
 def _pair(kv: str) -> str:
     k, sep, v = kv.partition("=")
-    return f"{k}{sep}{_value(k, v)}" if sep else _scrub(kv)
+    if not sep:
+        return _scrub(kv)
+    try:
+        nested = json.loads(v)
+    except ValueError:
+        nested = None
+    if isinstance(nested, (dict, list)):  # --extra 'k={"api_key": ...}': scrub the structure, not the text
+        return f"{k}=<redacted>" if _SECRET.search(k) else f"{k}={json.dumps(scrub(nested))}"
+    return f"{k}{sep}{_value(k, v)}"
 
 
 def _host(value: str) -> str:

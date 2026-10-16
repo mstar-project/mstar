@@ -16,10 +16,16 @@ Normalizers:
   back to ``whisper_basic`` when its spelling table cannot be loaded, and says
   so in the returned name.
 * ``whisper_basic``: Whisper's ``BasicTextNormalizer`` (language agnostic).
+
+Both Whisper normalizers delete text inside brackets and parentheses, which
+they treat as non-speech annotations. Here the bracket characters are removed
+first and their content kept: a TTS input's parenthetical is read aloud, so
+dropping it from the reference would score a correct reading as insertions.
 """
 
 from __future__ import annotations
 
+import re
 import string
 import unicodedata
 from collections.abc import Callable, Sequence
@@ -94,10 +100,17 @@ def _seedtts(text: str) -> str:
     return " ".join(text.translate(_SEEDTTS_DROP).lower().split())
 
 
+_BRACKETS = re.compile(r"[()\[\]{}<>]")
+
+
+def _keep_bracketed(fn: Callable[[str], str]) -> Callable[[str], str]:
+    return lambda text: fn(_BRACKETS.sub(" ", text))
+
+
 def _whisper_basic() -> Callable[[str], str]:
     from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
-    return BasicTextNormalizer()
+    return _keep_bracketed(BasicTextNormalizer())
 
 
 def _whisper_en() -> Callable[[str], str]:
@@ -108,7 +121,7 @@ def _whisper_en() -> Callable[[str], str]:
 
     path = hf_hub_download("openai/whisper-large-v3", "normalizer.json")
     with open(path, encoding="utf-8") as f:
-        return EnglishTextNormalizer(json.load(f))
+        return _keep_bracketed(EnglishTextNormalizer(json.load(f)))
 
 
 def get_normalizer(name: str) -> tuple[str, Callable[[str], str]]:

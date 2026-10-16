@@ -74,6 +74,7 @@ class TTSSuite(Suite):
             "seed": a.seed,
             "asr_judge": None if a.asr_judge == "none" else f"whisper:{a.asr_judge}",
             "normalizer": self.normalizer_name,
+            "judge_language": a.judge_language,
             "error_unit": "auto (CER for zh/ja/ko/th, WER otherwise)",
             "sim_judge": None if a.sim_judge == "none" else f"wavlm-sv:{a.sim_judge}",
             "mos_judge": "utmos22_strong" if a.mos else None,

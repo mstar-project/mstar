@@ -95,7 +95,8 @@ def timing_metrics(
         out["took_turn"], out["turn_censored"] = None, True
     else:
         out["took_turn"] = took
-    out["response_latency_s"] = (turn[0] - speech_end) if took else None
+    # The latency of every observed reply counts, however slow; the window only decides took_turn.
+    out["response_latency_s"] = (turn[0] - speech_end) if turn is not None else None
     if first_text_s is not None and first_text_s >= speech_end:
         out["text_latency_s"] = first_text_s - speech_end
     if category == "interruption" and interrupt is not None:
