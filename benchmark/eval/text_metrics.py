@@ -48,8 +48,10 @@ class EditCounts:
 
     @property
     def rate(self) -> float | None:
+        """Errors per reference token; None when the reference normalizes to nothing (its
+        insertions still count in the corpus rate)."""
         if self.reference_len == 0:
-            return None if self.errors == 0 else float("inf")
+            return None
         return self.errors / self.reference_len
 
     def __add__(self, other: EditCounts) -> EditCounts:

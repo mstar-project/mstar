@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import struct
 import subprocess
@@ -81,7 +80,10 @@ def test_edit_counts_and_corpus_wer():
     assert rate == pytest.approx(2 / 6)  # corpus rate, not the mean of 0.25 and 0.5
     assert [p.rate for p in per] == [0.25, 0.5]
     assert text_metrics.edit_counts([], []).rate is None
-    assert text_metrics.edit_counts([], ["x"]).rate == math.inf
+    assert text_metrics.edit_counts([], ["x"]).rate is None  # per utterance; the corpus rate counts it
+    rate, per = text_metrics.error_rate(["uh", "hello world"], ["yes", "hello world"],
+                                        normalize=lambda t: "" if t == "uh" else t)
+    assert rate == pytest.approx(0.5) and [p.rate for p in per] == [None, 0.0]
 
 
 def test_cer_for_character_languages_and_normalizers():
@@ -141,7 +143,7 @@ def test_energy_vad_segments():
 def _result(label, conc, values, suite="tts"):
     reps = [RepeatResult(i, 1.0, {"requests": 4, "ttfa_ms_p50": v, "wer": 0.01 * (i + 1)}) for i, v in
             enumerate(values)]
-    meta = {"git": {"commit": "abcdef1234567", "dirty": False}, "host": {"gpus": [{"name": "NVIDIA B200"}]}}
+    meta = {"git": {"commit": "abcdef1234567", "dirty": False}, "machine": {"gpus": [{"name": "NVIDIA B200"}]}}
     return RunResult(suite, label, {"load": {"mode": "closed", "concurrency": conc}, "repeats": len(values)},
                      meta, reps).finalize()
 
@@ -158,6 +160,13 @@ def test_results_schema_roundtrip_and_validation(tmp_path):
     assert validate({"schema": "x"})[0].startswith("schema is")
     with pytest.raises(ValueError):
         RunResult.from_dict({"schema": SCHEMA})
+
+
+def test_results_always_save_with_non_finite_numbers(tmp_path):
+    rows = [{"id": "a", "ok": True, "wer": float("inf"), "utmos": float("nan")}]
+    r = RunResult("tts", "x", {}, {}, [RepeatResult(0, 1.0, {"wer": float("nan"), "errors": 0}, rows)]).finalize()
+    back = RunResult.load(r.save(tmp_path / "r.json"))
+    assert back.repeats[0].requests[0]["wer"] is None and back.repeats[0].metrics["wer"] is None
 
 
 def test_redact_url_keeps_only_loopback():
@@ -475,6 +484,9 @@ def test_custom_commands_hosts_and_ipv6_never_reach_results():
     assert scrub_argv(["--serve-env", "MSTAR_ZMQ_TCP_HOST=gpu.internal"])[1] == "MSTAR_ZMQ_TCP_HOST=<host>"
     nested = scrub_argv(["--extra", 'metadata={"api_key": "sk-x", "endpoint": "gpu.internal", "voice": "af"}'])[1]
     assert "sk-x" not in nested and "gpu.internal" not in nested and '"voice": "af"' in nested
+    listed = scrub({"extra": {"routing": {"hosts": ["gpu-private.internal:9000", {"name": "b.internal"}]}}})
+    assert "internal" not in json.dumps(listed)
+    assert "internal" not in scrub_argv(["--extra", 'routing={"hosts": ["gpu-private.internal:9000"]}'])[1]
 
 
 def test_tts_suite_end_to_end(tmp_path, fake_cmd):

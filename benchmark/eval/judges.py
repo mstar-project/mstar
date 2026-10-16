@@ -111,10 +111,10 @@ class MosJudge:
         self.model = torch.hub.load(hub_ref, "utmos22_strong", trust_repo=True).to(self.device).eval()
         self.torch = torch
 
-    def score(self, clip: tuple[np.ndarray, int]) -> float:
+    def score(self, clip: tuple[np.ndarray, int]) -> float | None:
         x = resample(clip[0], clip[1], RATE)
         if len(x) < RATE // 10:
-            return float("nan")
+            return None  # too short to score
         wav = self.torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).unsqueeze(0).to(self.device)
         with self.torch.inference_mode():
             return float(self.model(wav, RATE).item())

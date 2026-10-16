@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import math
 import os
 import platform
 import re
@@ -72,6 +73,7 @@ class RunResult:
             for row in rep["requests"]:
                 if isinstance(row.get("error"), str):
                     row["error"] = _scrub(row["error"])
+        d["repeats"], d["summary"] = finite(d["repeats"]), finite(d["summary"])
         return {"schema": d.pop("schema"), **d}
 
     def save(self, path: str | Path) -> Path:
@@ -150,7 +152,7 @@ _SECRET = re.compile(
     r"TOKEN|SECRET|PASSW|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|AUTH|CREDENTIAL|COOKIE|SESSION", re.IGNORECASE
 )
 # Keys whose values name a machine; their values are kept only when loopback.
-_HOSTLIKE = re.compile(r"HOST|ADDR|ENDPOINT|URL|URI|DOMAIN|SERVER|PEER|(^|_)IP($|_)", re.IGNORECASE)
+_HOSTLIKE = re.compile(r"HOST|ADDR|ENDPOINT|URL|URI|DOMAIN|PEER|(^|_)IP($|_)", re.IGNORECASE)
 _URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]+")
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _IPV6 = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
@@ -194,14 +196,32 @@ def scrub_env(env: dict[str, str]) -> dict[str, str]:
     return {k: _value(k, str(v)) for k, v in sorted(env.items())}
 
 
-def scrub(obj: Any) -> Any:
-    """Recursively scrub a config or metadata tree (secret and host-like keys by name)."""
+def scrub(obj: Any, host: bool = False) -> Any:
+    """Recursively scrub a config or metadata tree. Values under secret-looking keys are
+    dropped; everything under a host-like key (including lists and nested objects) is
+    treated as a host."""
     if isinstance(obj, dict):
-        return {k: (_value(k, v) if isinstance(k, str) and isinstance(v, str) else
-                    "<redacted>" if isinstance(k, str) and _SECRET.search(k) else scrub(v)) for k, v in obj.items()}
+        out = {}
+        for k, v in obj.items():
+            name = k if isinstance(k, str) else ""
+            out[k] = "<redacted>" if _SECRET.search(name) else scrub(v, host or bool(_HOSTLIKE.search(name)))
+        return out
     if isinstance(obj, (list, tuple)):
-        return [scrub(v) for v in obj]
-    return _scrub(obj) if isinstance(obj, str) else obj
+        return [scrub(v, host) for v in obj]
+    if isinstance(obj, str):
+        return _value("HOST", obj) if host else _scrub(obj)
+    return obj
+
+
+def finite(obj: Any) -> Any:
+    """JSON-safe numbers: NaN and infinities become null (a results file must always save)."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [finite(v) for v in obj]
+    return obj
 
 
 def describe_command(cmd: list[str] | str | None) -> str | None:
@@ -348,7 +368,7 @@ def collect_metadata(repo: str | Path | None = None, server: dict[str, Any] | No
             pass
     return {
         "git": git_info(repo),
-        "host": {
+        "machine": {
             "gpus": gpu_info(),
             "cpu": _cpu_model(),
             "cpu_count": os.cpu_count(),
