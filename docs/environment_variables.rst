@@ -42,12 +42,11 @@ Communication
      - How messages are encoded on every communicator edge (see
        :func:`mstar.communication.codec.default_codec`). ``msgpack``: the
        typed encoding in :mod:`mstar.communication.wire`, language-neutral
-       so an edge can terminate in a Rust process. ``pickle``: the old
-       Python-only wire, kept for bisecting a wire problem. Both ends of an
-       edge must agree, so this is all-or-nothing for a mesh -- one process
-       set differently cannot talk to its peers. ``pickle`` is incompatible
-       with the Rust graph runtime, which builds its frames as typed
-       msgpack; that pairing fails at startup rather than mixing wires.
+       so an edge can terminate in a Rust process. ``pickle`` is no longer
+       supported and fails at startup. Loosely typed metadata uses data-only
+       extensions instead of pickle. Upgrade all processes in a deployment
+       together: older processes cannot decode the new extensions, and
+       updated processes reject legacy pickle messages and metadata.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a
@@ -237,6 +236,13 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_MAX_BODY_MB``
      - ``128``
      - Request body limit (multipart uploads included).
+   * - ``MSTAR_TOKENIZE_PARALLEL``
+     - ``1``
+     - When a long prompt is encoded as parallel chunks, set
+       ``TOKENIZERS_PARALLELISM=true`` for the process first: the Rust
+       tokenizer only uses its thread pool while that variable reads true,
+       and serving environments often export it false. ``0`` leaves the
+       variable as it is (the chunked encode then runs serially).
    * - ``MSTAR_TOKENIZER``
      - unset
      - Path to a HuggingFace ``tokenizer.json`` enabling frontend
@@ -295,10 +301,102 @@ Worker scheduling
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
        thread.
+   * - ``MSTAR_DECODE_BUCKETS``
+     - ``1,2,4,8,16,32,48,64,96,128``
+     - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
+       it; a model with its own ladder reads it the same way). A decode step
+       runs at the smallest bucket that holds its rows, so the ladder bounds
+       both the rows per step and the graph memory; narrow it (for example
+       ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
+       former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
+       Qwen3.5 alone.
+   * - ``MSTAR_LAZY_PUBLISH``
+     - ``1``
+     - Publish resource state (KV pages, positions) only for the requests
+       whose frame or completion carries it: ``finalize_batch`` keeps a
+       cheap per-request snapshot and the worker finishes it on demand.
+       ``0`` builds the full publication for every request on every step,
+       the old behaviour; it was a quarter of the GPU thread's host time at
+       batch 32 in a decode loop that never reads it.
    * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
        other ready work.
+   * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
+     - ``32,64,128,256,512,1024,2048,4096,8192``
+     - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
+       graph (one per bucket and batch size). A prompt past the top bucket
+       prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
+       spends 78 ms of wall time on 36 ms of kernels. The default now reaches
+       8192; narrow it to save graph memory and capture time, or extend it.
+   * - ``MSTAR_KV_CHAIN_LAZY_STEPS``
+     - ``1``
+     - How many decode steps of sampled ids the KV manager holds back before
+       it extends the requests' prefix chains (the per-page keys the prefix
+       cache is indexed by), one extend per request per batch of steps instead
+       of one per step. The per-request Python of that extension was 0.3 to
+       0.4 ms a step at 128 rows. A page key then appears up to that many
+       steps late and a later commit indexes it, as the single-request path
+       already allows; a request that finishes in between may leave its last
+       page unindexed. The default ``1`` extends on every step: ``16``
+       measured as noise at c64/c128 on 0.8B (the extension is a small part
+       of the stop check's tail).
+   * - ``MSTAR_KV_PINNED_INDPTRS``
+     - ``0``
+     - The KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,
+       kv_indices, last_page_len) into a ring of page-locked host buffers and
+       the decode wrapper copies the indices straight into its captured
+       device buffer from there, so the copies FlashInfer's ``plan`` issues
+       are really asynchronous. From pageable memory the driver stages each
+       one and FlashInfer makes the indices copy blocking. Measured neutral
+       to slightly negative at c32-c128 on 0.8B (the event bookkeeping per
+       take costs about what it saves), so it is off by default.
+   * - ``MSTAR_KV_PLAN_CACHE``
+     - ``0``
+     - The KV manager plans a captured decode step off the previous step's
+       plan when the batch is the same rows in the same order and nothing
+       but that step's commit touched the streams: every length is one
+       more, pages change only where a row crossed a page boundary, and the
+       five FlashInfer index arrays come from numpy instead of a per-row
+       Python pass. The first version measured a loss at c64/c128 on 0.8B
+       (batches change every step or two there, and a hit still rebuilt the
+       views); the reworked path keeps the views lazy and is off by default
+       until measured. ``0`` plans every step from the streams. ``2`` runs
+       both and logs a difference, for checking a run.
+   * - ``MSTAR_DEVICE_LOOPBACK``
+     - ``1``
+     - Whether a decode node may keep its loop-back token on the device:
+       the sampler writes each request's last token to a slot-addressed
+       master and the next step reads its input ids from it, so the worker
+       routes the signal with no tensor (no per-request store, hold or
+       cleanup per step). Only nodes that declare the read
+       (``reads_device_loopback``: Qwen3.5 decode) and only when the sampler
+       has graph buffers; the sampler keeps the masters for those nodes
+       alone, so a node that takes its tokens on the host (Whisper's
+       decoder) no longer pays the eager-step master write, a small
+       synchronous host-to-device copy per step. ``0`` keeps every node on
+       the per-request tensor path.
+   * - ``MSTAR_INGRAPH_DECODE_ROPE``
+     - ``0``
+     - A captured decode step builds its rotary tables inside the graph from
+       the position resource's planned positions instead of staging them.
+       Experiment knob, measured and gated on its own.
+   * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
+     - ``0``
+     - The captured sampler gathers its RNG offsets from the slot masters
+       and scatters the advanced offsets and the sampled tokens back inside
+       the graph, so a replayed decode step issues none of those launches on
+       the gpu thread afterwards (each one is a GIL release the main thread's
+       postprocess wins). Padding rows then address a trash master row and
+       the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` concurrent
+       requests (default 4096, a hard cap with this on). Only with the device
+       loop-back on. An experiment knob; measure before turning it on.
+   * - ``MSTAR_RUST_SEND_TIMING``
+     - unset
+     - ``1`` makes the Rust runtime print, every 500 calls, how long the
+       worker's per-step send spends in its own work against the whole call
+       (which includes taking the GIL back when the send had to release it).
+       A diagnostic for the host-overhead work; off by default.
    * - ``MSTAR_SPEC_PEEK_FOR_FAIRNESS``
      - ``1``
      - Yield the speculation chain only when another (node, walk) is
