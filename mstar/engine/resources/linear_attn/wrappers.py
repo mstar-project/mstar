@@ -143,6 +143,7 @@ class GDNPrefillWrapper(GDNWrapper):
         self._mask: torch.Tensor | None = None
         self._plan_state: GDNPrefillPlan | None = None
         self._plan_borrowed = 0
+        self._aiter_schedule = None
 
         # Conv buffers
         self._batch_ptr: torch.Tensor | None = None
@@ -278,6 +279,17 @@ class GDNPrefillWrapper(GDNWrapper):
             num_rows=num_rows,
             token_mask=self._mask,
         )
+        # ROCm: AITER's VK kernel takes a chunk schedule built from the host
+        # spans, once here for every layer of the step. It refuses to run
+        # under capture, so ROCm prefill runs eagerly.
+        self._aiter_schedule = None
+        if torch.version.hip is not None and self._has_sink_state:
+            from aiter.ops.triton.gated_delta_net import (
+                build_gated_delta_rule_prefill_metadata,
+            )
+            self._aiter_schedule = build_gated_delta_rule_prefill_metadata(
+                spans, cu_seqlens=self._plan_state.cu_seqlens, chunk_size=64,
+            )
 
     def run_conv(
         self,
@@ -325,6 +337,9 @@ class GDNPrefillWrapper(GDNWrapper):
             a.float() + dt_bias.float()
         )
         beta = torch.sigmoid(b.float())
+
+        if self._aiter_schedule is not None:
+            return self._run_aiter_vk(q, k, v, g, beta, state)
 
         slots = self._plan_state.slots.to(torch.int64)
 
@@ -409,6 +424,48 @@ class GDNPrefillWrapper(GDNWrapper):
             final = torch.where(live.view(-1, 1, 1, 1), final, padded)
         state.index_copy_(0, addr, final.to(state.dtype))
         return out[:real_len]
+
+    def _run_aiter_vk(self, q, k, v, g, beta, state):
+        """ROCm with a sink: AITER's VK kernel takes q/k at their own head
+        count and reads and writes the K-last pool in place by slot, so the
+        state is neither gathered, transposed nor scattered back."""
+        from aiter.ops.triton.gated_delta_net.gated_delta_rule import (
+            chunk_gated_delta_rule_opt_vk,
+        )
+
+        plan = self._plan_state
+        addr = plan.slots.to(torch.int64)
+        # a fresh row starts from zeros, not from what its slot last held
+        state.index_copy_(0, addr, torch.where(
+            plan.has_state.view(-1, 1, 1, 1),
+            torch.index_select(state, 0, addr),
+            torch.zeros((), dtype=state.dtype, device=state.device),
+        ))
+
+        # The schedule covers exactly the real tokens plus the one `plan`
+        # hands each padding row, and the kernel checks the token count.
+        # The kernels address q/k as packed [T, H, D]; without the L2 norm they
+        # arrive as column views of the fused projection.
+        real_len, n = q.shape[0], self._plan_tokens
+        q, k, v, g, beta = (
+            _with_room(t[:n], self._plan_borrowed) if self._plan_borrowed
+            else t[:n].contiguous()
+            for t in (q, k, v, g, beta)
+        )
+        # The prebuilt HIP hidden-state kernel: per layer on MI300X it took
+        # 768 us at 4x2048 tokens where the Triton one took 1050 (job 465388),
+        # and the FlyDSL prepare stage takes 17-22% off at 2k-32k (465605).
+        out, _ = chunk_gated_delta_rule_opt_vk(
+            q=q.unsqueeze(0), k=k.unsqueeze(0), v=v.unsqueeze(0),
+            g=g.unsqueeze(0), beta=beta.unsqueeze(0), scale=self._sm_scale,
+            initial_state=state, output_final_state=True,
+            cu_seqlens=plan.cu_seqlens, state_dtype=state.dtype, use_exp2=False,
+            use_chunk_hip=True, use_prepare_flydsl=True,
+            prefill_metadata=self._aiter_schedule,
+            initial_state_indices=plan.slots, inplace_final_state=True,
+        )
+        out = out.squeeze(0)[:n]
+        return _with_room(out, real_len - n) if real_len > n else out
 
 
 @dataclass(frozen=True)
