@@ -20,10 +20,33 @@ class CapturedGraph(Protocol):
 @dataclass
 class AcceleratorGraphPool:
     handle: Any
+
+    def on_failure(self, graph: CapturedGraph) -> None:
+        pass
+
+    def on_success(self) -> None:
+        pass
+
+
+@dataclass
+class XPUGraphPool(AcceleratorGraphPool):
+    # XPU cannot reopen a pool after its last graph is destroyed. Retain a
+    # failed capture until a successful graph owns the pool; CUDA needs no hold.
     failed_graph: CapturedGraph | None = field(default=None, repr=False)
+
+    def on_failure(self, graph: CapturedGraph) -> None:
+        self.failed_graph = graph
+
+    def on_success(self) -> None:
+        self.failed_graph = None
 
 
 class AcceleratorGraphBackend(ABC):
+    """Graph and stream operations required by the accelerator graph runners.
+
+    Implementations own their native graph API and capture recovery. Runners
+    do not need to know which runtime supplies those operations.
+    """
 
     def __init__(self, device: torch.device):
         self.device = device
@@ -168,6 +191,9 @@ class XPUGraphBackend(_TorchGraphBackend):
 
     def create_graph(self) -> CapturedGraph:
         return self._runtime.XPUGraph()
+
+    def graph_pool_handle(self) -> AcceleratorGraphPool:
+        return XPUGraphPool(self._runtime.graph_pool_handle())
 
 
 _GRAPH_BACKENDS: dict[str, type[AcceleratorGraphBackend]] = {

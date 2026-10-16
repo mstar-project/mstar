@@ -12,6 +12,11 @@ from mstar.engine.accelerator_graph_backend import (
 
 
 class DeviceCapability:
+    """Query one device's capabilities without initializing its hardware.
+
+    Runtime operations use PyTorch's generic stream, event, and accelerator
+    APIs directly. Kernel dispatch remains with the resource that owns it.
+    """
 
     def __init__(self, device: torch.device):
         self.device = torch.device(device)

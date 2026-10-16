@@ -299,7 +299,7 @@ class FlashInferDecodeWrapper:
         """
         n_req = paged_kv_indptr.shape[0] - 1
         if (
-            self.use_accelerator_graph and paged_kv_indices.device.type != "cuda"
+            self.accelerator_graph and paged_kv_indices.device.type != "cuda"
             and paged_kv_indices.is_pinned()
         ):
             # FlashInfer copies host indices with a blocking copy; page-locked

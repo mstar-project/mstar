@@ -1,3 +1,9 @@
+import gc
+import weakref
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -51,6 +57,52 @@ def test_backend_dispatches_without_initializing_hardware(
     assert DeviceCapability.of(device).graph_backend is not None
     assert not backend.is_available()
     assert backend.create_graph() is graph
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
+def test_runner_retains_failed_graphs_only_for_xpu(monkeypatch, device_type):
+    device = torch.device(device_type, 0)
+    backend = get_accelerator_graph_backend(device)
+    monkeypatch.setattr(backend._runtime, "graph_pool_handle", object, raising=False)
+    pool = backend.graph_pool_handle()
+    graphs = []
+
+    class Graph:
+        pass
+
+    def create_graph():
+        graph = Graph()
+        graphs.append(weakref.ref(graph))
+        return graph
+
+    stream = object()
+    monkeypatch.setattr(backend, "create_graph", create_graph)
+    monkeypatch.setattr(backend, "current_stream", lambda: stream)
+    monkeypatch.setattr(backend, "capture", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(backend, "synchronize", lambda: None)
+    recovery = Mock()
+    monkeypatch.setattr(backend, "recover_failed_capture", recovery)
+    monkeypatch.setattr(
+        DeviceCapability, "of", lambda device: SimpleNamespace(graph_backend=backend),
+    )
+
+    def fails():
+        raise RuntimeError("capture interrupted")
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="capture interrupted"):
+            capture_into_graph(fails, pool, device, None)
+        gc.collect()
+        assert (graphs[-1]() is not None) == (device_type == "xpu")
+    assert graphs[0]() is None
+    assert recovery.call_count == 2
+    recovery.assert_called_with(pool, stream)
+
+    graph, output = capture_into_graph(lambda: 7, pool, device, None)
+    gc.collect()
+    assert graphs[-2]() is None
+    assert graphs[-1]() is graph
+    assert output == 7
 
 
 @pytest.mark.parametrize("backend_type", [CUDAGraphBackend, XPUGraphBackend])
@@ -109,13 +161,18 @@ def test_runner_capture_recovers_after_failed_capture(graph_device):
     for _ in range(2):
         with pytest.raises(RuntimeError, match="capture interrupted"):
             capture_into_graph(fails, pool, graph_device, None)
+        if graph_device.type == "xpu":
+            assert pool.failed_graph is not None
+        else:
+            assert not hasattr(pool, "failed_graph")
     assert backend.current_stream() == stream
 
     graph, output = capture_into_graph(lambda: value * 2, pool, graph_device, None)
     value.fill_(3)
     graph.replay()
     backend.synchronize()
-    assert pool.failed_graph is None, "successful capture must release the failed graph"
+    if graph_device.type == "xpu":
+        assert pool.failed_graph is None, "successful capture must release the failed graph"
     torch.testing.assert_close(output.cpu(), torch.full((8,), 6.0))
 
 

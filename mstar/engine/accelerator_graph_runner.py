@@ -32,6 +32,7 @@ DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
 def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[str]:
+    """Return resource keys that prevent capture of the declared step."""
     if step is None:
         return []
     return sorted(key for key in step.steps if not resources[key].can_capture())
@@ -139,11 +140,11 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype):
             with backend.capture(graph, pool=pool):
                 output = run()
     except BaseException:
-        pool.failed_graph = graph
+        pool.on_failure(graph)
         backend.recover_failed_capture(pool, prev_stream)
         raise
     backend.synchronize()
-    pool.failed_graph = None
+    pool.on_success()
     return graph, output
 
 
