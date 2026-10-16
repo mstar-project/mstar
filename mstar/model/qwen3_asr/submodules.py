@@ -42,6 +42,8 @@ from mstar.model.qwen3_asr.config import (
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -342,12 +344,14 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         new_tokens = self._forward(graph_walk, engine_inputs, input_ids, input_embeds)
-        return {
-            rid: {"new_token": [new_tokens[i:i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        # Row i is request i: one clone and one D2H copy per step instead of
+        # one per request.
+        return BatchedModelOutput(
+            row_outputs={"new_token": new_tokens},
+            check_stop_buffers={"new_token": new_tokens},
+        )
 
     def postprocess(
         self,
@@ -373,3 +377,37 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         if (not ignore_eos and token in self.config.stop_token_ids) or decoded >= request_info.max_tokens:
             return {DECODE_LOOP}
         return set()
+
+    def check_stop_batched(
+        self,
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+    ) -> dict[str, set[str]] | None:
+        """``check_stop`` for every request off one ``tolist``."""
+        tokens = host_rows.buffers.get("new_token")
+        if not torch.is_tensor(tokens) or tokens.dim() == 0:
+            return None
+        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
+        rows = host_rows.request_ids
+        if len(rows) >= len(request_ids) and all(
+            a == b for a, b in zip(request_ids, rows, strict=False)
+        ):
+            pairs = zip(request_ids, values, strict=False)
+        else:
+            row_of = {rid: i for i, rid in enumerate(rows)}
+            pairs = (
+                (rid, values[i]) for rid in request_ids
+                if (i := row_of.get(rid)) is not None and i < len(values)
+            )  # no row, no output: the per-request path skips it too
+        stop_ids = self.config.stop_token_ids
+        stops: dict[str, set[str]] = {}
+        for rid, token in pairs:
+            info = request_infos[rid]
+            if info.graph_walk != DECODE_WALK:
+                continue
+            if (
+                token in stop_ids and not info.resource_configs[SAMPLER].ignore_eos
+            ) or info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1 >= info.max_tokens:
+                stops[rid] = {DECODE_LOOP}
+        return stops

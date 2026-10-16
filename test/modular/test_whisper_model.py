@@ -25,7 +25,7 @@ from mstar.model.components.audio_features import (  # noqa: E402
     sinusoid_positions,
 )
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs  # noqa: E402
+from mstar.model.submodule_base import ARNodeInputs, HostRows, ModelInputsFromEngine, NodeInputs  # noqa: E402
 from mstar.model.whisper.components.decoder import WhisperDecoderModel  # noqa: E402
 from mstar.model.whisper.components.encoder import WhisperEncoderModel  # noqa: E402
 from mstar.model.whisper.config import (  # noqa: E402
@@ -518,6 +518,44 @@ def test_decoder_check_stop_honors_eos_max_tokens_and_position_table():
     # 4 prompt + 1 first token + 443 decoded fill the 448-slot table
     assert sub.check_stop("r", info(DECODE_WALK, 441), word) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 442), word) == {"decode_loop"}
+
+
+def test_decoder_check_stop_batched_agrees_with_per_request():
+    cfg = _tiny_config()
+    sub = _decoder_submodule(cfg)
+
+    def info(walk, decoded, handle, max_tokens=444, ignore_eos=False):
+        return type("I", (), {
+            "graph_walk": walk, "max_tokens": max_tokens, "rid_handle": handle,
+            "resource_configs": {"sampler": type("C", (), {"ignore_eos": ignore_eos})()},
+            "dynamic_loop_iter_counts": {"decode_loop": decoded},
+        })()
+
+    for handle in range(6):
+        sub.request_state(handle).add("prompt_len", 4)
+    # rows in forward order, plus two padding rows a replay leaves at the end
+    tokens = torch.tensor([EOT, 1234, EOT, 1234, 1234, EOT, 0, 0])
+    row_rids = ("eos", "word", "ignored", "budget", "table", "prefill")
+    infos = {
+        "eos": info(DECODE_WALK, 0, 0),                       # stops
+        "word": info(DECODE_WALK, 0, 1),                      # keeps going
+        "ignored": info(DECODE_WALK, 0, 2, ignore_eos=True),  # EOS ignored
+        "budget": info(DECODE_WALK, 3, 3, max_tokens=4),      # out of budget
+        "table": info(DECODE_WALK, 442, 4),                   # position table full
+        "prefill": info(PREFILL_WALK, 0, 5),                  # never stops the loop
+    }
+    check = ["prefill", "table", "budget", "ignored", "word", "eos"]  # not forward order
+    batched = sub.check_stop_batched(check, infos, HostRows(row_rids, {"new_token": tokens}))
+    per_request = {}
+    for i, rid in enumerate(row_rids):
+        got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
+        if got:
+            per_request[rid] = got
+    assert batched == per_request == {
+        "eos": {"decode_loop"}, "budget": {"decode_loop"}, "table": {"decode_loop"},
+    }
+    # no token buffer: the engine falls back to the per-request path
+    assert sub.check_stop_batched(["eos"], infos, HostRows(("eos",), {})) is None
 
 
 # --------------------------------------------------------------------------

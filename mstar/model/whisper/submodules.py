@@ -27,6 +27,8 @@ from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -612,7 +614,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         audio_frames: torch.Tensor | None = None,
         row_lens: torch.Tensor | None = None,
         **kwargs,
-    ) -> dict[str, NameToTensorList]:
+    ) -> dict[str, NameToTensorList] | BatchedModelOutput:
         if graph_walk == ALIGN_WALK:
             (rid,) = engine_inputs.request_ids
             return {rid: {"word_tokens": [self._align(input_ids, encoder_states, int(audio_frames.reshape(-1)[0]))]}}
@@ -624,12 +626,14 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             ts_rules=ts_rules,
             row_lens=row_lens,
         )
-        out: dict[str, NameToTensorList] = {}
-        for i, rid in enumerate(engine_inputs.request_ids):
-            out[rid] = {"new_token": [new_tokens[i:i + 1]]}
-            if next_rules is not None:
-                out[rid]["ts_rules"] = [next_rules[i]]
-        return out
+        # Row i is request i: the engine clones each batch tensor once and hands
+        # out row views, and the stop check reads the tokens off one D2H copy,
+        # instead of a clone and a copy per request per step. A ``ts_rules``
+        # row arrives as [1, k]; ``prepare_inputs`` flattens it.
+        rows = {"new_token": new_tokens}
+        if next_rules is not None:
+            rows["ts_rules"] = next_rules
+        return BatchedModelOutput(row_outputs=rows, check_stop_buffers={"new_token": new_tokens})
 
     def postprocess(
         self,
@@ -665,3 +669,42 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 decoded_tokens >= request_info.max_tokens or positions_left <= 0:
             return {DECODE_LOOP}
         return set()
+
+    def check_stop_batched(
+        self,
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+    ) -> dict[str, set[str]] | None:
+        """``check_stop`` for every request off one ``tolist``."""
+        tokens = host_rows.buffers.get("new_token")
+        if not torch.is_tensor(tokens) or tokens.dim() == 0:
+            return None
+        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
+        rows = host_rows.request_ids
+        if len(rows) >= len(request_ids) and all(
+            a == b for a, b in zip(request_ids, rows, strict=False)
+        ):
+            pairs = zip(request_ids, values, strict=False)
+        else:
+            row_of = {rid: i for i, rid in enumerate(rows)}
+            pairs = (
+                (rid, values[i]) for rid in request_ids
+                if (i := row_of.get(rid)) is not None and i < len(values)
+            )  # no row, no output: the per-request path skips it too
+        eos = self.config.eos_token_id
+        max_positions = self.config.max_target_positions
+        stops: dict[str, set[str]] = {}
+        for rid, token in pairs:
+            info = request_infos[rid]
+            if info.graph_walk != DECODE_WALK:
+                continue  # prefill and language detection never stop the loop
+            decoded_tokens = info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
+            prompt_len = self.request_state(info.rid_handle).get("prompt_len", 0)
+            if (
+                (token == eos and not info.resource_configs[SAMPLER].ignore_eos)
+                or decoded_tokens >= info.max_tokens
+                or max_positions - prompt_len - 1 - decoded_tokens <= 0
+            ):
+                stops[rid] = {DECODE_LOOP}
+        return stops

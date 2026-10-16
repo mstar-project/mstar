@@ -33,7 +33,7 @@ from mstar.model.qwen3_asr.config import (  # noqa: E402
 from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel  # noqa: E402
 from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import HostRows, ModelInputsFromEngine  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -322,6 +322,39 @@ def test_llm_check_stop():
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 9, max_tokens=10), word) == {"decode_loop"}
+
+
+def test_llm_check_stop_batched_agrees_with_per_request():
+    cfg = _tiny_config()
+    sub = _llm_submodule(cfg)
+
+    def info(walk, decoded, max_tokens=4096, ignore_eos=False):
+        return type("I", (), {"graph_walk": walk, "max_tokens": max_tokens,
+                              "resource_configs": {"sampler": type("C", (), {"ignore_eos": ignore_eos})()},
+                              "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
+
+    # rows in forward order, plus a padding row a replay leaves at the end
+    tokens = torch.tensor([IM_END, 1234, EOT, IM_END, 1234, IM_END, 0])
+    row_rids = ("im_end", "word", "eot", "ignored", "budget", "prefill")
+    infos = {
+        "im_end": info(DECODE_WALK, 0),
+        "word": info(DECODE_WALK, 0),
+        "eot": info(DECODE_WALK, 0),
+        "ignored": info(DECODE_WALK, 0, ignore_eos=True),
+        "budget": info(DECODE_WALK, 9, max_tokens=10),
+        "prefill": info(PREFILL_WALK, 0),
+    }
+    check = list(reversed(row_rids))  # not forward order
+    batched = sub.check_stop_batched(check, infos, HostRows(row_rids, {"new_token": tokens}))
+    per_request = {}
+    for i, rid in enumerate(row_rids):
+        got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
+        if got:
+            per_request[rid] = got
+    assert batched == per_request == {
+        "im_end": {"decode_loop"}, "eot": {"decode_loop"}, "budget": {"decode_loop"},
+    }
+    assert sub.check_stop_batched(["word"], infos, HostRows(("word",), {})) is None
 
 
 # --------------------------------------------------------------------------
