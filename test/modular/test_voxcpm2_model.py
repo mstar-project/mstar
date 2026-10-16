@@ -706,6 +706,20 @@ def test_adapter_refuses_every_server_path(media_dirs, ref):
     assert sorted(uploads.iterdir()) == before
 
 
+def test_adapter_reports_a_failed_fetch_as_a_bad_request(tmp_path, monkeypatch):
+    """urllib refuses a redirect to ``file://`` with an HTTPError; like any
+    failed fetch it is the request's fault, not a server error."""
+    import urllib.error
+
+    def refuse(*args, **kwargs):
+        raise urllib.error.HTTPError("http://example.test/clip.wav", 302, "redirect to file://", None, None)
+
+    monkeypatch.setattr(adapters.media_io, "resolve_media_ref", refuse)
+    request = SpeechRequest(model="voxcpm2", input="hi", ref_audio="http://example.test/clip.wav")
+    with pytest.raises(ValueError, match="could not fetch ref_audio"):
+        adapters.VoxCPM2Adapter().speech_to_request(request, tmp_path)
+
+
 def _stored_reference(uploads: Path, ref: str) -> Path:
     request = SpeechRequest(model="voxcpm2", input="hi", ref_audio=ref)
     args = adapters.VoxCPM2Adapter().speech_to_request(request, uploads)
