@@ -527,6 +527,21 @@ def test_repeats_survive_server_keepalive_expiry_during_scoring(tmp_path, monkey
     assert [rep.metrics["errors"] for rep in r.repeats] == [0, 0, 0]
 
 
+def test_cli_refuses_abbreviated_flags_and_labels_never_carry_paths(tmp_path, fake_cmd):
+    from benchmark.eval.cli import build_parser
+
+    for argv in (["run", "tts", "--serve-cm", "x", "--data", "d"], ["run", "tts", "--serve-cm=x", "--data", "d"],
+                 ["run", "tts", "--ur", "http://h", "--data", "d"], ["report", "r", "--metric", "wer"]):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(argv)
+    (tmp_path / "s.txt").write_text("one two\n")
+    home = os.path.expanduser("~")
+    _run_cli(["run", "tts", "--serve-cmd", fake_cmd, "--data", str(tmp_path / "s.txt"), "--repeats", "1",
+              "--warmup", "0", "--asr-judge", "none", "--model-name", f"{home}/models/kokoro", "--out", str(tmp_path)])
+    r = RunResult.load(tmp_path / "tts-kokoro-c1.json")
+    assert r.label == "kokoro" and home not in json.dumps(r.to_dict())
+
+
 def test_tts_suite_records_http_errors(tmp_path, fake_cmd):
     (tmp_path / "s.txt").write_text("one two\n")
     _run_cli(["run", "tts", "--serve-cmd", fake_cmd, "--data", str(tmp_path / "s.txt"), "--repeats", "1",

@@ -67,7 +67,7 @@ class RunResult:
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         # The one place everything passes before it is written: no addresses, secrets or home paths.
-        d["config"], d["meta"] = scrub(d["config"]), scrub(d["meta"])
+        d["config"], d["meta"], d["label"] = scrub(d["config"]), scrub(d["meta"]), _scrub(d["label"])
         for rep in d["repeats"]:
             for row in rep["requests"]:
                 if isinstance(row.get("error"), str):

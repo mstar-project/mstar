@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 import shlex
 import signal
 import sys
@@ -42,10 +43,10 @@ def _ints(s: str) -> list[int]:
 
 
 def _add_run(sub) -> None:
-    run = sub.add_parser("run", help="run a suite against a server")
+    run = sub.add_parser("run", allow_abbrev=False, help="run a suite against a server")
     suites = run.add_subparsers(dest="suite", required=True)
     for name, cls in SUITES.items():
-        p = suites.add_parser(name, help=cls.help)
+        p = suites.add_parser(name, allow_abbrev=False, help=cls.help)
         srv = p.add_argument_group("server (one of --url / --serve)")
         g = srv.add_mutually_exclusive_group(required=True)
         g.add_argument("--url", help="base URL of a running server")
@@ -77,7 +78,7 @@ def _add_run(sub) -> None:
 
 
 def _add_report(sub) -> None:
-    p = sub.add_parser("report", help="markdown table and charts from results files")
+    p = sub.add_parser("report", allow_abbrev=False, help="markdown table and charts from results files")
     p.add_argument("results", nargs="+", help="results JSON files or directories")
     p.add_argument("--md", default=None, help="write the table here (default: stdout)")
     p.add_argument("--chart", default=None, help="PNG path for a sweep chart")
@@ -87,17 +88,18 @@ def _add_report(sub) -> None:
 
 
 def _add_data(sub) -> None:
-    p = sub.add_parser("data", help="build a dataset manifest")
+    p = sub.add_parser("data", allow_abbrev=False, help="build a dataset manifest")
     kinds = p.add_subparsers(dest="kind", required=True)
-    ls = kinds.add_parser("librispeech", help="LibriSpeech (CC BY 4.0)")
+    ls = kinds.add_parser("librispeech", allow_abbrev=False, help="LibriSpeech (CC BY 4.0)")
     ls.add_argument("--split", default="test.clean")
-    fl = kinds.add_parser("fleurs", help="FLEURS (CC BY 4.0)")
+    fl = kinds.add_parser("fleurs", allow_abbrev=False, help="FLEURS (CC BY 4.0)")
     fl.add_argument("--lang", default="en_us")
     fl.add_argument("--split", default="test")
-    st = kinds.add_parser("seedtts", help="Seed-TTS-eval zero-shot set (research use)")
+    st = kinds.add_parser("seedtts", allow_abbrev=False, help="Seed-TTS-eval zero-shot set (research use)")
     st.add_argument("--locale", default="en", choices=["en", "zh"])
     st.add_argument("--archive", default=None, help="local seedtts_testset.tar (skips the download)")
-    dx = kinds.add_parser("duplex-synth", help="turn-taking and barge-in clips from an ASR manifest")
+    dx = kinds.add_parser("duplex-synth", allow_abbrev=False,
+                          help="turn-taking and barge-in clips from an ASR manifest")
     dx.add_argument("--from", dest="source", required=True, help="16 kHz ASR manifest (e.g. librispeech)")
     dx.add_argument("--gap-s", type=float, default=2.5, help="pause before the barge-in")
     for k in (ls, fl, st, dx):
@@ -106,7 +108,8 @@ def _add_data(sub) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m benchmark.eval", description=__doc__,
+    # No abbreviated flags anywhere: results scrub argv by exact flag name (--serve-cmd, --serve-env, ...).
+    parser = argparse.ArgumentParser(prog="python -m benchmark.eval", description=__doc__, allow_abbrev=False,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     _add_run(sub)
@@ -150,7 +153,8 @@ def cmd_run(args) -> list[Path]:
     suite = cls(args)
     suite.check_items(items)
     points = _points(args)
-    label = args.label or args.model_name
+    label = args.label or Path(args.model_name).name
+    file_label = re.sub(r"[^\w.-]+", "_", label)
     out = Path(args.out)
     config = {
         "data": {"path": Path(args.data).name, "items": len(items), "limit": args.limit,
@@ -159,7 +163,7 @@ def cmd_run(args) -> list[Path]:
     }
     if args.serve or args.serve_cmd:
         server = ManagedServer(args.serve or "custom", args.serve_config, extra_args=args.serve_arg,
-                               env=_kv(args.serve_env), log_path=out / f"server-{label}.log",
+                               env=_kv(args.serve_env), log_path=out / f"server-{file_label}.log",
                                startup_timeout_s=args.startup_timeout,
                                command=shlex.split(args.serve_cmd) if args.serve_cmd else None,
                                python=args.serve_python)
@@ -171,9 +175,9 @@ def cmd_run(args) -> list[Path]:
         for spec in points:
             tag = spec.describe().replace("=", "").replace("/", "per").replace(",", "_")
             result = run_point(suite, server.url, items, spec, args.repeats, args.warmup, label, config, meta,
-                               audio_dir=out / "audio" / f"{label}-{tag}", save_audio=args.save_audio,
-                               error_log=out / f"errors-{args.suite}-{label}-{tag}.log")
-            path = result.save(out / f"{args.suite}-{label}-{tag}.json")
+                               audio_dir=out / "audio" / f"{file_label}-{tag}", save_audio=args.save_audio,
+                               error_log=out / f"errors-{args.suite}-{file_label}-{tag}.log")
+            path = result.save(out / f"{args.suite}-{file_label}-{tag}.json")
             written.append(path)
             print(f"wrote {path}", file=sys.stderr)
     return written
