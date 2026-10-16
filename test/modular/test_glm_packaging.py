@@ -25,6 +25,7 @@ def _extras(path: Path) -> dict:
 def test_the_glm_extra_installs_what_the_models_import():
     glm = {Requirement(raw).name: Requirement(raw) for raw in _extras(ROOT / "pyproject.toml")["glm"]}
     assert {"flashinfer-python", "huggingface-hub", "safetensors", "transformers", "triton"} <= set(glm)
-    assert str(glm["flashinfer-python"].specifier) == ">=0.6.14"
+    # check_flashinfer's floor, which long context refuses below
+    assert str(glm["flashinfer-python"].specifier) == ">=0.6.18"
     for alias in ("mstar-serve", "mstar-project"):
         assert _extras(ROOT / "packaging" / "aliases" / alias / "pyproject.toml")["glm"] == ["mstar-ai[glm]"]
