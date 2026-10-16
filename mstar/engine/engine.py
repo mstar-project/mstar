@@ -1308,6 +1308,8 @@ class Engine:
             # the submodule indexes this by step id, not by real rid
             per_request_states=LazyRequestStates(submodule, rids),
             captured=lease is not None,
+            # `inputs` is padded after the real rows under a lease
+            real_seq_len=sum(inp.input_seq_len for inp in inputs[:len(request_ids)]),
             step=step,
             per_request_input_metadata=batch.per_request_input_metadata,
         )

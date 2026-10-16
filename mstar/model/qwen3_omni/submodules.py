@@ -597,8 +597,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
-        # Warmup and capture pass no request states; their routing is dummy.
-        self.model.maybe_log_expert_load(synthetic=engine_inputs.per_request_states is None)
+        self.model.maybe_log_expert_load(synthetic=engine_inputs.synthetic)
         device = self.get_device()
         # Concatenate across requests
         input_embeds = torch.cat([
@@ -654,10 +653,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     extra_inputs[f"deepstack_{i}"] = t
 
         if self.model.mask_padding:
-            # A replay stages these real rows at the head of the bucket; the
-            # captured MoE skips the rest. A fill kernel, so no H2D copy.
+            # Real rows lead the bucket; the captured MoE skips the rest.
+            # A fill kernel, so no H2D copy.
+            num_valid = engine_inputs.real_seq_len
+            if num_valid is None:
+                num_valid = input_embeds.shape[0]
             extra_inputs["num_valid_tokens"] = torch.full(
-                (1,), input_embeds.shape[0], dtype=torch.int64, device=device,
+                (1,), num_valid, dtype=torch.int64, device=device,
             )
 
         return {
