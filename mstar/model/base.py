@@ -59,8 +59,14 @@ class PrefixStream(NamedTuple):
 
 
 def video_metadata_dict(metadata_obj) -> dict:
-    # torchcodec>=0.9 reports pixel_aspect_ratio as a Fraction, which the wire codec rejects.
-    return {k: float(v) if isinstance(v, Fraction) else v for k, v in asdict(metadata_obj).items()}
+    """A video metadata dataclass as plain Python values for the wire codec,
+    which rejects torchcodec>=0.9's Fraction pixel_aspect_ratio and numpy
+    (transformers' sampled frame indices)."""
+    def plain(value):
+        if isinstance(value, Fraction):
+            return float(value)
+        return value.tolist() if hasattr(value, "tolist") else value
+    return {k: plain(v) for k, v in asdict(metadata_obj).items()}
 
 
 _wg_id_counter = itertools.count(1 << 20)
