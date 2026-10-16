@@ -117,6 +117,36 @@ def test_gif_first_frame_past_the_screen_is_counted(tmp_path, no_decode, monkeyp
         read_image(_gif(tmp_path / "wide.gif", 16, [64]))
 
 
+def test_refused_image_reaches_the_client_as_a_400(tmp_path, no_decode):
+    """The preprocess loop answers whatever ``_process_input`` raises with
+    ``_fail_request``: a refused image becomes a 400 error chunk that states
+    the limit, not the server path."""
+    import queue
+
+    from mstar.api_server.data_worker import PreprocessWorkerThread
+    from mstar.api_server.request_types import PreprocessInput
+
+    path = _png(tmp_path / "upload-name.png", 30_000, 30_000, rows=0)
+    wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    wt.out_queue = queue.Queue()
+    wt.in_flight_requests = set()
+    wt.request_output_state = {}
+    wt.device = "cpu"
+    wt.model = types.SimpleNamespace(load_image=lambda p, device: Model.load_image(None, p, device))
+    request = PreprocessInput(
+        request_id="r1", text="describe it", file_paths={"image": [path]},
+        input_modalities=["image", "text"], output_modalities=["text"], model_kwargs={},
+    )
+    with pytest.raises(ValueError) as info:
+        wt._process_input(request)
+    wt._fail_request("r1", info.value, "preprocessing")
+    chunk = wt.out_queue.get_nowait()
+    assert chunk.modality == "error"
+    assert chunk.metadata["status"] == 400
+    assert b"the limit is" in chunk.data
+    assert b"upload-name" not in chunk.data
+
+
 def test_unreadable_image_is_a_client_error_without_the_path(tmp_path):
     path = tmp_path / "secret-name.png"
     path.write_bytes(b"not an image")
