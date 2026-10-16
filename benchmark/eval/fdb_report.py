@@ -115,9 +115,11 @@ def render_chart(results: list[RunResult], path: str | Path, judge: str | None =
                 label = "n/a" if v.get("mean") is None else f"{v['mean']:.2f}"
                 ax.text(x, (v.get("mean") or 0) + (v.get("std") or 0) + 0.03, label, ha="center", fontsize=7)
         ax.set_xticks(range(len(cats)), [c.replace("_", "\n") for c in cats], fontsize=8)
+        tops = [(r.summary.get(f"{c}.{k}_latency_s") or {}) for c in cats for k in ("stop", "response")]
+        ax.set_ylim(0, 1.3 * max([(t.get("mean") or 0) + (t.get("std") or 0) for t in tops] + [0.1]))
         ax.set_ylabel("seconds (pooled intervals)")
         ax.set_title(f"{r.label}: stop and response latency")
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=8, ncol=2, loc="upper center")
         ax.grid(axis="y", alpha=0.3)
         ax = row[1]
         j = judge or next(iter(judges_of(r)), None)
