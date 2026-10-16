@@ -467,6 +467,7 @@ class Qwen3ASRModel(Model):
         with torch.device("meta"):
             llm = Qwen3DenseLM(
                 self.config.text, attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE, comm_group=tp_group,
+                fused_qk_norm_rope=True,
             )
         if autocast_dtype is not None:
             llm = llm.to(autocast_dtype)

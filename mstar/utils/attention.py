@@ -198,6 +198,84 @@ def fused_qk_norm_rope(x, w_norm, pos, eps, rope_theta):
 
 
 # ============================================================================
+# Per-head q/k RMSNorm + 1D RoPE for q and k together, in place, behind a
+# custom op. Same math as ``_qk_norm_rope_kernel``; one launch covers every q
+# and k head (grid M x (H_q + H_kv)). The custom op keeps inductor from
+# functionalizing the kernel's writes into strided slices of the qkv
+# projection itself: in Qwen3-ASR's compiled decoder graph, its
+# triton_kernel_wrapper_mutation path for the bare kernel built an as_strided
+# over a compacted copy of k and read past its end (torch 2.12).
+# ============================================================================
+
+@triton.jit
+def _qk_pair_norm_rope_kernel(
+    Q_ptr, K_ptr, WQ_ptr, WK_ptr, Pos_ptr,
+    q_eps, k_eps, rope_theta,
+    sq_m, sq_h, sk_m, sk_h,
+    H_Q: tl.constexpr,
+    D: tl.constexpr,
+    HALF_D: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    if pid_h < H_Q:
+        base = Q_ptr + pid_m * sq_m + pid_h * sq_h
+        w_ptr = WQ_ptr
+        eps = q_eps
+    else:
+        base = K_ptr + pid_m * sk_m + (pid_h - H_Q) * sk_h
+        w_ptr = WK_ptr
+        eps = k_eps
+
+    offs_half = tl.arange(0, HALF_D)
+    x_first = tl.load(base + offs_half).to(tl.float32)
+    x_second = tl.load(base + offs_half + HALF_D).to(tl.float32)
+
+    sumsq = tl.sum(x_first * x_first, axis=0) + tl.sum(x_second * x_second, axis=0)
+    inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
+    x_first = x_first * inv_rms * tl.load(w_ptr + offs_half).to(tl.float32)
+    x_second = x_second * inv_rms * tl.load(w_ptr + offs_half + HALF_D).to(tl.float32)
+
+    pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
+    inv_freq = tl.exp(-tl.log(rope_theta) * (offs_half.to(tl.float32) * 2.0 / D))
+    angle = pos * inv_freq
+    cos = tl.cos(angle)
+    sin = tl.sin(angle)
+
+    tl.store(base + offs_half, (x_first * cos - x_second * sin).to(Q_ptr.dtype.element_ty))
+    tl.store(base + offs_half + HALF_D, (x_second * cos + x_first * sin).to(Q_ptr.dtype.element_ty))
+
+
+@torch.library.custom_op("mstar::qk_norm_rope_inplace", mutates_args={"q", "k"})
+def qk_norm_rope_inplace(
+    q: torch.Tensor, k: torch.Tensor,
+    q_weight: torch.Tensor, k_weight: torch.Tensor, pos_ids: torch.Tensor,
+    q_eps: float, k_eps: float, rope_theta: float,
+) -> None:
+    """RMSNorm each head of q ([M, H_q, D]) and k ([M, H_kv, D]) by its own
+    weight, then rotate both by ``pos_ids[:M]`` (non-interleaved RoPE over the
+    full head dim), in place. The head dim must be contiguous; the token and
+    head strides are free, so q and k can be slices of one qkv projection."""
+    num_tokens, num_q_heads, head_dim = q.shape
+    assert k.shape[0] == num_tokens and k.shape[2] == head_dim and head_dim % 2 == 0
+    assert q.stride(2) == 1 and k.stride(2) == 1 and q.dtype == k.dtype
+    if num_tokens == 0:
+        return
+    _qk_pair_norm_rope_kernel[(num_tokens, num_q_heads + k.shape[1])](
+        q, k, q_weight, k_weight, pos_ids,
+        q_eps, k_eps, rope_theta,
+        q.stride(0), q.stride(1), k.stride(0), k.stride(1),
+        H_Q=num_q_heads, D=head_dim, HALF_D=head_dim // 2,
+        num_warps=4, num_stages=1,
+    )
+
+
+@qk_norm_rope_inplace.register_fake
+def _qk_norm_rope_inplace_fake(q, k, q_weight, k_weight, pos_ids, q_eps, k_eps, rope_theta) -> None:
+    return None
+
+
+# ============================================================================
 # RoPE from position ids (no QK-norm, in-place).
 #
 # Like ``flashinfer.rope.apply_rope_pos_ids_inplace`` but works for any dtype
