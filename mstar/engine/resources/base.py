@@ -366,6 +366,11 @@ class Resource(ABC):
         # thing that came to mind
         return
 
+    def after_capture(self):
+        """Called once every runner has captured: undo what capture's dummy
+        rows left in storage that requests will be handed next."""
+        return
+
     def post_warmup_validate(self):
         """
         For, e.g., the KV cache to check that num_free_pages is identical
