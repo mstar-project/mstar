@@ -184,6 +184,21 @@ class WorkerGraphIO:
     def clear(self):
         self.wg_state_registry.clear()
 
+    def is_idle(self) -> bool:
+        """No node holds an input or is in flight, and no loop is mid-run:
+        the state a pass leaves behind once the graph completes and resets."""
+        if self.wg_state_registry._num_completed_entities:
+            return False
+        for node in self.nodes.values():
+            if (node._in_flight or node.ready_signals.ready_names
+                    or node.ready_next_iter.ready_names
+                    or node.speculative_signals.ready_names):
+                return False
+        return all(
+            loop.curr_iter == 0 and not loop._ingested_external_inputs
+            for loop in self.loops.values()
+        )
+
     def register_communication_info(self, communication_manager, request_id: int):
         for loop in self.loops.values():
             loop.register_communication_info(

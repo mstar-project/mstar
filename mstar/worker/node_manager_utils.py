@@ -15,6 +15,7 @@ from mstar.graph.base import (
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.model.base import WorkerGraph
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.utils.ipc_format import InputSignals
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +211,8 @@ class PerRequestInfo:
     stream_buffers_by_consumer: dict[str, dict[str, StreamBuffer]] = field(default_factory=dict)
     # edges whose final chunk a built step consumed; a returned chunk leaves again
     ended_streams: set[str] = field(default_factory=set)
+    # conductor inputs for a walk the stream has not moved this partition into
+    parked_inputs: list[InputSignals] = field(default_factory=list)
     per_partition_info: dict[str, PerPartitionInfo] = field(default_factory=dict)
 
 
