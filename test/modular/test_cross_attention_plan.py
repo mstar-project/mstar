@@ -37,10 +37,11 @@ class _RecordingWrapper:
     """Stands in for FlashInferPrefillWrapper; records how it was built."""
 
     built: list[dict] = []
+    kind = "prefill"
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        type(self).built.append(kwargs)
+        type(self).built.append({**kwargs, "kind": self.kind})
 
     def plan(self, **kwargs):
         # a real CUDA-graph wrapper raises here when the row count exceeds the
@@ -53,10 +54,17 @@ class _RecordingWrapper:
             )
 
 
+class _RecordingDecodeWrapper(_RecordingWrapper):
+    """Stands in for FlashInferDecodeWrapper (rows of one query token)."""
+
+    kind = "decode"
+
+
 @pytest.fixture(autouse=True)
 def _stub_wrapper(monkeypatch):
     _RecordingWrapper.built = []
     monkeypatch.setattr(cross_mod, "FlashInferPrefillWrapper", _RecordingWrapper)
+    monkeypatch.setattr(cross_mod, "FlashInferDecodeWrapper", _RecordingDecodeWrapper)
     # WorkspacePool allocates this many MB per (label, slot)
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
 
@@ -165,3 +173,19 @@ def test_the_eager_wrapper_is_unsized():
 
     (built,) = _RecordingWrapper.built
     assert "batch_size" not in built
+
+
+def test_one_token_rows_plan_the_decode_kernel_and_longer_rows_the_prefill_kernel():
+    """A decoder's cross attention queries one token per request every step;
+    a prompt prefill queries several."""
+    rids = ("r0", "r1")
+    for to_compute, kind in ((1, "decode"), (3, "prefill")):
+        _RecordingWrapper.built = []
+        query = {"main": _plan_output([
+            SequenceView(request_id=rid, label="main", page_idxs=[9], length=4,
+                         to_compute=to_compute)
+            for rid in rids
+        ])}
+        _manager().plan(AttentionStep(causal=False), _ctx(rids, query))
+        (built,) = _RecordingWrapper.built
+        assert built["kind"] == kind
