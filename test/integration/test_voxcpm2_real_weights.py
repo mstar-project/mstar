@@ -11,6 +11,7 @@ fp32. The teacher-forced check also needs CUDA.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 
@@ -23,6 +24,15 @@ FIXTURES = Path(__file__).resolve().parents[1] / "voxcpm2"
 # recording GPU; the margin covers another GPU's rounding amplified by the CFM
 MEDIAN_REL_L2 = 1e-5
 WORST_REL_L2 = 1e-3
+
+
+def _helper(module: str):
+    """A helper module from ``test/voxcpm2``, loaded by path: ``import test``
+    can find the standard library's ``test`` package instead of this tree."""
+    spec = importlib.util.spec_from_file_location(f"voxcpm2_{module}", FIXTURES / f"{module}.py")
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
 
 
 def _find_snapshot() -> Path | None:
@@ -51,9 +61,7 @@ def model():
 
 @pytest.fixture(scope="module")
 def prompts() -> dict:
-    from test.voxcpm2.official_prompts import OFFICIAL_PROMPTS
-
-    return OFFICIAL_PROMPTS
+    return _helper("official_prompts").OFFICIAL_PROMPTS
 
 
 @pytest.fixture(scope="module")
@@ -97,7 +105,8 @@ def test_vae_stream_equals_a_whole_decode(model, design):
     receptive field does not. Bit equality depends on the CPU thread count
     (1e-15 at 1 to 4 threads, 0 at 8), the short context is off by about 6e-7."""
     from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
-    from test.voxcpm2.streaming import stream_through
+
+    stream_through = _helper("streaming").stream_through
 
     patches = design["patches"][:14].double()
     node = _vae_node(model, torch.float64)
@@ -121,7 +130,8 @@ def test_teacher_forced_fp32_steps_match_the_reference(model, prompts, design, m
     from mstar.model.components import norm
     from mstar.model.voxcpm2.components.local import cfm_t_span
     from mstar.model.voxcpm2.voxcpm2_model import load_generator
-    from test.voxcpm2.fake_resources import bind_dense_resources
+
+    bind_dense_resources = _helper("fake_resources").bind_dense_resources
 
     # mstar::rms_norm runs fp32 inputs in bf16 on CUDA
     monkeypatch.setattr(

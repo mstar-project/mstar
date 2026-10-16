@@ -9,6 +9,7 @@ chunk policy stitch to exactly a whole decode, in length and in samples.
 from __future__ import annotations
 
 import base64
+import importlib.util
 import io
 import json
 import math
@@ -44,10 +45,23 @@ from mstar.model.voxcpm2.voxcpm2_model import (
     decoder_receptive_field_patches,
 )
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
-from test.voxcpm2.fake_resources import bind_dense_resources
-from test.voxcpm2.streaming import stream_through
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "voxcpm2.yaml"
+HELPERS = Path(__file__).resolve().parents[1] / "voxcpm2"
+
+
+def _helper(module: str):
+    """A helper module from ``test/voxcpm2``, loaded by path: ``import test``
+    can find the standard library's ``test`` package instead of this tree."""
+    spec = importlib.util.spec_from_file_location(f"voxcpm2_{module}", HELPERS / f"{module}.py")
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+bind_dense_resources = _helper("fake_resources").bind_dense_resources
+stream_through = _helper("streaming").stream_through
+
 FACTORS = [1.0 + 0.25 * i for i in range(8)]
 FP64_ROUNDING = 1e-13  # float64 streams differ from a whole decode by up to about 6e-15 on some CPUs, 0 on others
 TINY = {
