@@ -588,16 +588,14 @@ def test_graph_walks_and_resources():
     loop = walks[DECODE_WALK]
     loop_node = loop.section
     assert set(loop_node.input_names) == {"text_inputs", "ts_rules"}
-    # the token loops back (persisted for the align walk) and reaches the
-    # client once, through the loop's accumulated output
-    assert {e.name for e in loop_node.outputs if e.next_node == DECODER_NODE} == {
-        "new_token", "text_inputs", "ts_rules"
-    }
-    assert not any(e.next_node == EMIT_TO_CLIENT for e in loop_node.outputs)
-    assert [(e.name, e.next_node, e.output_modality, e.persist) for e in loop.accumulated_outputs] == [
-        ("new_token", EMIT_TO_CLIENT, "text", True),
+    # the token and its rule state loop back (kept on the device by slot) and
+    # the token goes to the client inline each step; nothing accumulates (the
+    # align walk reads the tokens the decoder recorded)
+    assert {e.name for e in loop_node.outputs if e.next_node == DECODER_NODE} == {"text_inputs", "ts_rules"}
+    assert [(e.name, e.output_modality, e.persist) for e in loop_node.outputs if e.next_node == EMIT_TO_CLIENT] == [
+        ("text_inputs", "text", False),
     ]
-    assert [e.persist for e in loop_node.outputs if e.name == "new_token"] == [False]
+    assert not loop.accumulated_outputs
     assert model.nodes == [ENCODER_NODE, DECODER_NODE]
     specs = model.get_node_resources()
     kv = {s.resource_key: s for s in specs if isinstance(s, KVSpec)}
@@ -942,3 +940,46 @@ def test_the_resolution_under_test_matches_the_worker():
     engine = (root / "mstar/engine/engine.py").read_text()
     assert "preplan_enabled = self.enable_pre_plan" in engine
     assert 'os.environ.get("MSTAR_PRE_PLAN_SPEC"' not in engine
+
+
+
+def test_decode_tokens_are_recorded_for_the_align_walk_until_the_stop():
+    """The decode loop no longer persists its tokens: the stop check records
+    them per request, and nothing past the step that stopped the loop (a
+    speculative step) joins the transcript the align walk teacher-forces."""
+    cfg = _tiny_config()
+    sub = _decoder_submodule(cfg)
+    sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
+    sub.request_state(9).add("language", EN)
+    sub.request_state(9).add("prompt_len", 4)
+    info = type("I", (), {
+        "graph_walk": DECODE_WALK, "max_tokens": 100, "rid_handle": 9,
+        "resource_configs": {"sampler": type("C", (), {"ignore_eos": False})()},
+        "dynamic_loop_iter_counts": {},
+    })()
+    for token in (11, 12, EOT, 13):
+        sub.check_stop_batched(["r"], {"r": info}, HostRows(["r"], {"new_token": torch.tensor([[token]])}))
+        info.dynamic_loop_iter_counts["decode_loop"] = info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
+    assert sub.request_state(9).get("decoded") == [11, 12, EOT]
+    row = sub.prepare_inputs(ALIGN_WALK, _fwd(9), {
+        "transcript": [torch.tensor([10])],  # the persisted first token
+        "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
+        "audio_frames": [torch.tensor([cfg.num_frames])],
+    })
+    assert row.input_ids.tolist() == [SOT, EN, TRANSCRIBE, NOTS, 10, 11, 12, EOT]
+
+
+def test_decode_loopback_contract(monkeypatch):
+    from mstar.model.whisper.config import SAMPLER
+
+    cfg = _tiny_config()
+    sub = _decoder_submodule(cfg)
+    sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
+    sub.node_resources = {SAMPLER: type("S", (), {"has_slot_masters": True})()}
+    assert sub.device_loopback_signals(DECODE_WALK) == frozenset({"text_inputs", "ts_rules"})
+    assert sub.device_loopback_signals(PREFILL_WALK) == frozenset()
+    assert sub.inline_client_signals(DECODE_WALK) == {"text_inputs": "new_token"}
+    row = sub.prepare_inputs(DECODE_WALK, _fwd(1), {}, has_loopback=True)
+    assert row.input_ids is None and row.input_seq_len == 1
+    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
+    assert sub.device_loopback_signals(DECODE_WALK) == frozenset()

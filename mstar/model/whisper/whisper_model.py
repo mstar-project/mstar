@@ -324,28 +324,20 @@ class WhisperModel(Model):
                 name=DECODER_NODE,
                 input_names=["text_inputs", "ts_rules"],
                 outputs=[
-                    # The token loops back to the node, which does not list it
-                    # as an input, so it only lands in the loop's accumulated
-                    # cache. The client gets the transcript in one message when
-                    # the loop ends instead of one message per token.
-                    GraphEdge(next_node=DECODER_NODE, name="new_token"),
-                    GraphEdge(
-                        next_node=DECODER_NODE,
-                        name="text_inputs",
-                    ),
-                    # the rule state advanced by this step's token
-                    GraphEdge(
-                        next_node=DECODER_NODE,
-                        name="ts_rules",
-                    ),
+                    # The sampled token loops back as the next input and goes to
+                    # the client; the rule state it advanced loops back too. The
+                    # node keeps both on the device by sampler slot and the
+                    # worker sends the batch's tokens inline, one frame a step,
+                    # so a decode step stores no tensor per request (the client
+                    # joins the text chunks; the align walk reads the tokens the
+                    # decoder recorded, see `check_stop_batched`).
+                    GraphEdge(next_node=DECODER_NODE, name="text_inputs"),
+                    GraphEdge(next_node=DECODER_NODE, name="ts_rules"),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                 ],
             ),
             max_iters=self.get_max_output_tokens(),
             outputs=[],
-            # persisted as well, the align walk needs the whole transcript
-            accumulated_outputs=[
-                GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text", persist=True),
-            ],
         )
 
         align = GraphNode(
@@ -471,8 +463,9 @@ class WhisperModel(Model):
             metadata.is_prefill = False
             metadata.graph_walk = DECODE_WALK
         elif metadata.graph_walk == DECODE_WALK and word_timestamps:
-            # The loop is done. Align the transcript (every generated token
-            # is still persisted) against the persisted encoder output.
+            # The loop is done. Align the transcript (the persisted first token
+            # here, the rest recorded on the decoder) against the persisted
+            # encoder output.
             metadata.graph_walk = ALIGN_WALK
             inputs = [
                 self._edge(DECODER_NODE, "encoder_states", persist_signals.get("encoder_states", [])),

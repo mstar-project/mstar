@@ -416,6 +416,27 @@ class SamplerResource(Resource):
         loop-back needs. False on an eager-only node or with the knob off."""
         return self._cg_buffers is not None and self._keep_last_token
 
+    def loopback_slots(self, request_ids: list[str]) -> torch.Tensor:
+        """Each row's slot-master index for this step, in row order: the
+        planned slot's static index row under a lease (padding rows hold the
+        trash row; a captured graph may read and write by it, since it is
+        re-uploaded every step), else the requests' slots. For a node that
+        keeps per-request loop-back state of its own beside the last token.
+        Call after ``plan``."""
+        bufs = self._cg_buffers
+        if bufs is None:
+            raise RuntimeError("device loop-back needs the sampler's slot masters")
+        if self._cg_sampler is not None and self._step_slot is not None:
+            cg_slot, padded_bs = self._step_slot
+            return bufs._slot_idx_gpu[cg_slot, :padded_bs]
+        return bufs._slots_of(request_ids)
+
+    @property
+    def slot_capacity(self) -> int:
+        """Rows a by-slot table needs: every slot index the masters can hand
+        out, the trash row included."""
+        return self._cg_buffers._master_capacity + 1
+
     def loopback_tokens(self, request_ids: list[str]) -> torch.Tensor:
         """The last sampled token of each row of this step, as its input ids,
         read on the device. Under a slot lease the planned slot's index row
