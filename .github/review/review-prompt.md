@@ -80,14 +80,13 @@ Keep the body to one short paragraph that names the triggering inputs or state; 
 **Summary comment.** Post it last with `gh pr comment <PR number> --edit-last --body '<summary>'`, so each run updates the same comment rather than adding another. If that fails because you have no earlier comment on the PR, rerun it without `--edit-last`. Your final response is not posted anywhere. Omit any empty section.
 
 ```markdown
-### Automated review (<mode>)
+### Automated review
 
 <One or two sentences on what the PR does, from the code. If that differs from the description, say so.>
 
 **Findings:** <N> inline (<count by priority>), or `none`. <Any finding that couldn't be anchored, in the inline format above, with its `path:line`.>
 
-#### Description
-- <inaccuracy or gap>
+<Problems with the PR description, as plain sentences: inaccuracies first, then what's missing.>
 
 #### Questions
 - <question, and what the answer would change>
