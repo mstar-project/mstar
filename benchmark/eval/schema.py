@@ -22,6 +22,7 @@ recomputed later without rerunning.
 from __future__ import annotations
 
 import datetime as _dt
+import ipaddress
 import json
 import math
 import os
@@ -171,10 +172,11 @@ _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 def _ipv6(m: re.Match) -> str:
     text = m.group(0)
-    # Clock times ("07:02:51") look like IPv6; a real address has "::" or a hex letter.
-    if text in _LOCAL_HOSTS or not ("::" in text or re.search(r"[A-Fa-f]", text)):
+    try:  # clock times ("07:02:51") match the pattern but are not addresses
+        addr = ipaddress.IPv6Address(text)
+    except ValueError:
         return text
-    return "<ip>"
+    return text if addr.is_loopback else "<ip>"
 
 
 def _scrub(text: str) -> str:

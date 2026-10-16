@@ -135,13 +135,27 @@ Results and reports
 Each results file (``schema: "mstar-eval/1"``) has ``config`` (everything that decides
 the numbers: data slice, load, repeats, request fields, judges), ``meta`` (git commit
 and dirty flag, GPUs, driver, Python/torch/CUDA versions, ``MSTAR_*`` environment, the
-server's ``/v1/models`` identity and launch settings), ``repeats`` (per-repeat metrics
-and per-request rows) and ``summary`` (mean, std, min, max, n per metric). Remote
-server addresses are redacted.
+server's ``/v1/models`` identity and launch settings, the CLI command and flag names),
+``repeats`` (per-repeat metrics and per-request rows) and ``summary`` (mean, std, min,
+max, n per metric).
+
+Results files are meant to be shared, so they never carry addresses, secrets or home
+paths: values under secret-looking keys are dropped, host-like keys keep only loopback
+values, a ``--serve-cmd`` is recorded as its program and a fingerprint, and raw command
+lines are not recorded. A failed request keeps only an error category (``HTTP 503``, an
+exception type); the server's message and the exception text go to
+``<out>/errors-<suite>-<label>-<load>.log`` next to the server log.
 
 ``report`` turns any set of files into one markdown table per suite, headed by a
 provenance line, plus optional PNG charts of metrics against concurrency or rate.
 ``--metrics`` picks the columns. For a PR, paste the table and link the chart.
+
+``rescore`` recomputes WER/CER from the transcripts a ``tts`` or ``asr`` results file
+already holds, with another normalizer, and records that it did; transcribing is the
+expensive part, so runs scored differently can be compared without a GPU::
+
+    python -m benchmark.eval rescore results/tts --data eval-data/fleurs_en/manifest.jsonl \
+        --normalizer seedtts --out results/tts_seedtts
 
 Adding a suite
 --------------

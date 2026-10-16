@@ -177,6 +177,9 @@ def test_redact_url_keeps_only_loopback():
     assert redact_url(f"http://127.0.0.1:8000/{home}/x/10.42.0.7") == "http://127.0.0.1:8000/~/x/<ip>"
     from benchmark.eval.schema import scrub
     assert scrub({"endpoint": "http://127.0.0.1:1/routes/10.42.0.7"}) == {"endpoint": "http://127.0.0.1:1/routes/<ip>"}
+    full = "2001:1234:5678:9012:3456:7890:1234:5678"
+    assert full not in redact_url(f"http://127.0.0.1:8000/routes/{full}")
+    assert scrub({"note": f"{full} at 07:02:51, ::1"}) == {"note": "<ip> at 07:02:51, ::1"}
 
 
 def test_render_table_mean_std_and_provenance(tmp_path):
