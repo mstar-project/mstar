@@ -5,6 +5,8 @@ convention (``samples // hop``), padding/trimming to the 30 s window, the
 sinusoidal position table, and the FFmpeg-free file loader.
 """
 
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -88,3 +90,17 @@ def test_load_audio_file_decodes_and_resamples(tmp_path):
     assert abs(wave.numel() - 16_000) <= 16
     sf.write(tmp_path / "b.wav", stereo[:, :1], 16_000)
     assert load_audio_file(str(tmp_path / "b.wav")).numel() == 8000
+
+
+def test_model_load_audio_without_torchcodec(tmp_path, monkeypatch):
+    # torchcodec's CUDA-linked wheels fail to import on ROCm; libsndfile takes over
+    sf = pytest.importorskip("soundfile")
+    from mstar.model.base import Model
+
+    t = np.arange(8000) / 8000.0
+    sf.write(tmp_path / "a.wav", np.sin(2 * np.pi * 440 * t).astype(np.float32), 8000)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+    out = Model.load_audio(None, str(tmp_path / "a.wav"), "cpu")
+    assert out.data.dtype == torch.float32 and out.data.dim() == 1
+    assert abs(out.data.numel() - 16_000) <= 16
+    assert out.metadata == dict(sample_rate=16000, num_channels=1)
