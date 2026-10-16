@@ -476,3 +476,46 @@ def test_request_kwargs_are_checked_before_the_conductor_reads_them():
     assert cfgs["sampler"].temperature == 0.5 and cfgs["sampler"].ignore_eos is True
     with pytest.raises(ValueError, match="top_p"):
         model.get_request_resource_configs({}, {"top_p": "abc"})
+
+
+def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device(monkeypatch):
+    """A decode step routes one signal, the sampled token: back to the LLM and to
+    the client. With slot masters the node keeps the loop-back on the device and
+    the worker sends the batch's tokens inline, so the step stores no tensor per
+    request and nothing accumulates for the end of the loop."""
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+    from mstar.model.qwen3_asr.config import SAMPLER
+
+    model = _make_model()
+    decode = model.get_graph_walk_graphs()[DECODE_WALK]
+    assert [(e.next_node, e.name) for e in decode.section.outputs] == [
+        (LLM_NODE, "text_inputs"), (EMIT_TO_CLIENT, "text_inputs"),
+    ]
+    assert not decode.accumulated_outputs
+
+    cfg = _tiny_config()
+    sub = _llm_submodule(cfg)
+    sub.node_resources = {SAMPLER: type("S", (), {"has_slot_masters": True})()}
+    assert sub.device_loopback_signals(DECODE_WALK) == frozenset({"text_inputs"})
+    assert sub.device_loopback_signals(PREFILL_WALK) == frozenset()
+    assert sub.inline_client_signals(DECODE_WALK) == {"text_inputs": "new_token"}
+    assert sub.inline_client_signals(PREFILL_WALK) == {}
+    # a loop-back row brings no ids; preprocess reads them off the sampler
+    row = sub.prepare_inputs(DECODE_WALK, None, {}, has_loopback=True)
+    assert row.input_ids is None and row.input_seq_len == 1
+    assert sub.uniform_row_inputs(DECODE_WALK, has_loopback=True).input_seq_len == 1
+    routed = sub.prepare_inputs(DECODE_WALK, None, {"text_inputs": [torch.tensor([7])]})
+    sampler = type("S", (), {"loopback_tokens": staticmethod(lambda rids: torch.tensor([11, 12, 13]))})()
+    ids = sub.preprocess(DECODE_WALK, ModelInputsFromEngine(
+        request_ids=["a", "b", "c"], per_request_info={}, resources={SAMPLER: sampler},
+    ), [row, routed, row])["input_ids"]
+    assert ids.tolist() == [11, 7, 13], "a row whose last step ran elsewhere brings its token"
+    # without slot masters (or MSTAR_DEVICE_LOOPBACK=0) the tensor path stays
+    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
+    assert sub.device_loopback_signals(DECODE_WALK) == frozenset()
+    # the per-request stop check reads the decode signal
+    info = type("I", (), {
+        "graph_walk": DECODE_WALK, "dynamic_loop_iter_counts": {}, "max_tokens": 100,
+        "resource_configs": {SAMPLER: type("C", (), {"ignore_eos": False})()},
+    })()
+    assert sub.check_stop("a", info, {"text_inputs": [torch.tensor([next(iter(cfg.stop_token_ids))])]})

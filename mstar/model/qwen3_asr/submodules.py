@@ -55,6 +55,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    device_loopback_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -299,6 +300,9 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
     # Prefill and decode are graph replays. The compiled path only served the
     # uncaptured shapes and recompiled per request id (see the encoder).
     disable_torch_compile = True
+    # The decode walk reads its last token off the sampler's slot masters and
+    # its client token rides inline (see ``device_loopback_signals``).
+    reads_device_loopback = True
 
     def __init__(self, llm: Qwen3DenseLM, config: Qwen3ASRModelConfig):
         super().__init__()
@@ -351,6 +355,10 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> ARNodeInputs:
+        if graph_walk == DECODE_WALK and kwargs.get("has_loopback") and self._device_loopback():
+            # one token per row, read off the sampler's slot master in
+            # `preprocess`; the routed signal is empty here
+            return ARNodeInputs(input_seq_len=1)
         device = self.get_device()
         token_ids = inputs["text_inputs"][0].to(device).reshape(-1)
         if graph_walk == DECODE_WALK:
@@ -384,6 +392,25 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
             },
         )
 
+    def uniform_row_inputs(self, graph_walk: str, has_loopback: bool = False) -> ARNodeInputs | None:
+        # the loop-back decode row above, built once for the step's rows
+        if graph_walk == DECODE_WALK and has_loopback and self._device_loopback():
+            return ARNodeInputs(input_seq_len=1)
+        return None
+
+    def _device_loopback(self) -> bool:
+        return device_loopback_enabled() and self.node_resources[SAMPLER].has_slot_masters
+
+    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        if graph_walk == DECODE_WALK and self._device_loopback():
+            return frozenset({"text_inputs"})
+        return frozenset()
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        # the decode loop's client edge carries the token the stop check
+        # already has on the host; prefill's new_token edge is persisted
+        return {"text_inputs": "new_token"} if graph_walk == DECODE_WALK else {}
+
     def preprocess(
         self,
         graph_walk: str,
@@ -391,6 +418,19 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         if graph_walk == DECODE_WALK:
+            if any(inp.input_ids is None for inp in inputs):
+                # device loop-back: every row is its request's last sampled
+                # token, read by slot (padding rows read slot 0)
+                sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+                ids = sampler.loopback_tokens(engine_inputs.request_ids)
+                # rows whose last step ran elsewhere brought their token
+                routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]
+                if routed:
+                    ids.index_copy_(
+                        0, torch.tensor(routed, device=ids.device),
+                        torch.cat([inputs[i].input_ids for i in routed]).to(ids.dtype),
+                    )
+                return {"input_ids": ids}
             return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
         return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs], dim=0)}
 
@@ -433,9 +473,11 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
     ) -> BatchedModelOutput:
         new_tokens = self._forward(graph_walk, engine_inputs, input_ids, input_embeds)
         # Row i is request i: one clone and one D2H copy per step instead of
-        # one per request.
+        # one per request. A decode step's token is its loop's one signal
+        # (`text_inputs`); prefill's is the persisted first token.
+        signal = "text_inputs" if graph_walk == DECODE_WALK else "new_token"
         return BatchedModelOutput(
-            row_outputs={"new_token": new_tokens},
+            row_outputs={signal: new_tokens},
             check_stop_buffers={"new_token": new_tokens},
         )
 
@@ -455,9 +497,10 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if request_info.graph_walk != DECODE_WALK or "new_token" not in outputs:
+        tokens = outputs.get("text_inputs") or outputs.get("new_token")
+        if request_info.graph_walk != DECODE_WALK or not tokens:
             return set()
-        token = outputs["new_token"][0].item()
+        token = tokens[0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         decoded = request_info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
         if (not ignore_eos and token in self.config.stop_token_ids) or decoded >= request_info.max_tokens:
