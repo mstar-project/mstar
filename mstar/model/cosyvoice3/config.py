@@ -213,8 +213,8 @@ class CosyVoice3Config:
     # Mel frames of left context the streaming vocoder re-runs before the new
     # frames (0 = the whole history, the reference's O(N^2) re-vocode).
     hift_context_frames: int = 64
-    # Flow estimator precision ("float32", "bfloat16", "float16"); the Euler
-    # state stays float32.
-    flow_estimator_dtype: str = "float32"
+    # Flow estimator precision ("bfloat16", "float32", "float16"); the Euler
+    # state stays float32. "float32" is the reference's precision.
+    flow_estimator_dtype: str = "bfloat16"
     flow_max_batch_size: int = 8
     hift_max_batch_size: int = 8

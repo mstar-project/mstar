@@ -833,6 +833,28 @@ def test_flow_node_solves_without_tf32_and_restores_the_engine_setting(monkeypat
         torch.backends.cudnn.allow_tf32 = prior[1]
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "dtype"),
+    [
+        ({}, torch.bfloat16),
+        ({"flow_estimator_dtype": "float32"}, torch.float32),
+        ({"flow_estimator_dtype": "fp32"}, torch.float32),
+    ],
+)
+def test_flow_estimator_is_bfloat16_unless_the_deployment_asks_for_float32(tmp_path, monkeypatch, kwargs, dtype):
+    monkeypatch.setattr(CosyVoice3Model, "_build_text_tokenizer", lambda self: _Tokenizer())
+    model = CosyVoice3Model(model_path_hf=str(tmp_path), **kwargs)
+    model.config.flow = _tiny_config().flow
+    checkpoint = CosyVoice3Flow(model.config.flow).state_dict()
+    monkeypatch.setattr(model, "_state_dict", lambda name: checkpoint.items())
+    monkeypatch.setattr(model, "_reference_encoder", lambda device: None)
+    flow = model._create_flow_submodule("cpu").flow
+    assert {p.dtype for p in flow.decoder.estimator.parameters()} == {dtype}
+    assert {p.dtype for p in flow.input_embedding.parameters()} == {torch.float32}
+    with pytest.raises(ValueError, match="Unknown dtype"):
+        CosyVoice3Model(model_path_hf=str(tmp_path), flow_estimator_dtype="int8")
+
+
 # -- HiFT -----------------------------------------------------------------------------
 
 

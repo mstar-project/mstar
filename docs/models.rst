@@ -218,6 +218,20 @@ Kokoro notes
   voices for a picker: the bundled voices whose G2P extra is installed on the server
   (a request for one of the others gets a 400 with the ``pip install`` hint).
 
+CosyVoice3 notes
+----------------
+
+- Install with ``pip install -e '.[cosyvoice3]'`` and serve with
+  ``mstar serve cosyvoice3 --gpus 0``. Every request clones a voice: a
+  ``ref_audio`` clip (with its transcript in ``ref_text`` for zero-shot
+  cloning) or a preset from ``voices_dir`` (see ``configs/cosyvoice3.yaml``).
+  ``instructions`` carries a style instruction. Output is 24 kHz.
+- The flow's DiT estimator runs in bfloat16 by default; the Euler state, the
+  rest of the flow and the HiFT vocoder stay float32 (HiFT's F0 predictor
+  float64).
+  ``model_kwargs: {flow_estimator_dtype: float32}`` in the deployment YAML runs
+  the estimator at the reference's precision instead, at lower throughput.
+
 Qwen3-TTS notes
 ---------------
 
