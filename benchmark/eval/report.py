@@ -130,6 +130,7 @@ def render_chart(results: list[RunResult], metrics: list[str], path: str | Path,
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib import ticker
 
     headers = {c.metric: (c.header, c.scale) for cols in COLUMNS.values() for c in cols}
     fig, axes = plt.subplots(1, len(metrics), figsize=(4.6 * len(metrics), 3.8), squeeze=False)
@@ -155,6 +156,11 @@ def render_chart(results: list[RunResult], metrics: list[str], path: str | Path,
         means = [s["mean"] * scale for r in results if (s := r.summary.get(metric) or {}).get("mean")]
         if means and min(means) > 0 and max(means) / min(means) > 20:  # lines an order of magnitude apart
             ax.set_yscale("log")
+            ax.yaxis.set_major_locator(ticker.LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
+            ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{v:g}"))
+            ax.yaxis.set_minor_formatter(ticker.NullFormatter())
+        else:
+            ax.set_ylim(bottom=0)  # differences read at their true size
         ax.grid(alpha=0.3)
     axes[0][0].legend(fontsize=8)
     fig.suptitle(title or provenance(results), fontsize=9)

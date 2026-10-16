@@ -171,7 +171,12 @@ def test_results_always_save_with_non_finite_numbers(tmp_path):
 
 def test_redact_url_keeps_only_loopback():
     assert redact_url("http://127.0.0.1:8000") == "http://127.0.0.1:8000"
-    assert redact_url("http://10.1.2.3:9000/x?k=1") == "http://remote-host:9000/x"
+    assert redact_url("http://10.1.2.3:9000/x?k=1") == "http://remote-host:9000"
+    assert redact_url("https://gpu.internal:8443/home/alice/serving") == "https://remote-host:8443"
+    home = os.path.expanduser("~")
+    assert redact_url(f"http://127.0.0.1:8000/{home}/x/10.42.0.7") == "http://127.0.0.1:8000/~/x/<ip>"
+    from benchmark.eval.schema import scrub
+    assert scrub({"endpoint": "http://127.0.0.1:1/routes/10.42.0.7"}) == {"endpoint": "http://127.0.0.1:1/routes/<ip>"}
 
 
 def test_render_table_mean_std_and_provenance(tmp_path):

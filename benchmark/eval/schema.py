@@ -146,8 +146,11 @@ def redact_url(url: str | None) -> str | None:
     except ValueError:
         return "<url>"
     host = parts.hostname or ""
-    host = host if host in _LOCAL_HOSTS else "remote-host"
-    return urlunsplit((parts.scheme, host + (f":{port}" if port else ""), parts.path, "", ""))
+    if host not in _LOCAL_HOSTS:  # a remote URL keeps only its scheme and port
+        return urlunsplit((parts.scheme, "remote-host" + (f":{port}" if port else ""), "", "", ""))
+    path = _HOME.sub("~", parts.path.replace(os.path.expanduser("~"), "~"))
+    path = _IPV6.sub(_ipv6, _IPV4.sub(lambda m: m.group(0) if m.group(0) in _LOCAL_HOSTS else "<ip>", path))
+    return urlunsplit((parts.scheme, host + (f":{port}" if port else ""), path, "", ""))
 
 
 _SECRET = re.compile(
