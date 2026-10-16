@@ -47,6 +47,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``nvidia/Cosmos3-Super-Text2Image-4Step`` / ``…-Image2Video-4Step``
      - 4-step distilled Super task checkpoints (guidance baked in, fixed-sigma
        stochastic sampler); TP=2 deployments.
+   * - ``cosyvoice3``
+     - ``FunAudioLLM/Fun-CosyVoice3-0.5B-2512``
+     - Zero-shot voice-cloning TTS: Qwen2-0.5B speech-token LM with RAS sampling,
+       DiT flow-matching decoder and causal HiFT vocoder, streamed in chunks.
+       Clones from a preset or an uploaded clip. 24 kHz.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
