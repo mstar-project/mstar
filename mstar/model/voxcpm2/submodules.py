@@ -123,8 +123,8 @@ def build_prompt(
         raise ValueError(f"unknown VoxCPM2 prompt mode {mode}")
     token_ids = torch.cat(pieces)
     audio_pos = torch.cat(audio_pos)
-    text_mask = torch.ones(token_ids.shape[0], dtype=torch.bool, device=device)
-    text_mask[audio_pos] = False
+    # index_fill_, not ``text_mask[audio_pos] = False``: that copies the scalar H2D, a sync
+    text_mask = torch.ones(token_ids.shape[0], dtype=torch.bool, device=device).index_fill_(0, audio_pos, False)
     return token_ids, text_mask, torch.cat(audio), audio_pos
 
 
