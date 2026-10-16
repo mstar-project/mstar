@@ -162,6 +162,13 @@ def test_results_schema_roundtrip_and_validation(tmp_path):
         RunResult.from_dict({"schema": SCHEMA})
 
 
+def test_request_rows_are_scrubbed_when_written():
+    home = os.path.expanduser("~")
+    rows = [{"id": "u1", "ok": True, "hyp": f"see {home}/private.wav at 10.24.6.8", "wer": 0.1}]
+    text = json.dumps(RunResult("asr", "x", {}, {}, [RepeatResult(0, 1.0, {}, rows)]).finalize().to_dict())
+    assert home not in text and "10.24.6.8" not in text and "~/private.wav at <ip>" in text
+
+
 def test_results_always_save_with_non_finite_numbers(tmp_path):
     rows = [{"id": "a", "ok": True, "wer": float("inf"), "utmos": float("nan")}]
     r = RunResult("tts", "x", {}, {}, [RepeatResult(0, 1.0, {"wer": float("nan"), "errors": 0}, rows)]).finalize()
@@ -223,6 +230,10 @@ def test_manifest_roundtrip_relative_paths(tmp_path):
     (tmp_path / "bad.jsonl").write_text('{"id": "a", "voice": "x"}\n')
     with pytest.raises(ValueError):
         load_manifest(tmp_path / "bad.jsonl")
+    for bad_id in ("/abs/source_audio", "../escape", "a/b", ".hidden", "x..y"):
+        (tmp_path / "ids.jsonl").write_text(json.dumps({"id": bad_id, "text": "t"}) + "\n")
+        with pytest.raises(ValueError, match="plain name"):
+            load_manifest(tmp_path / "ids.jsonl")
 
 
 def test_closed_loop_caps_in_flight_and_keeps_order():

@@ -17,7 +17,7 @@ from typing import Any
 
 import aiohttp
 
-from benchmark.eval.datasets import Item
+from benchmark.eval.datasets import Item, check_id
 
 
 class Suite:
@@ -39,6 +39,7 @@ class Suite:
 
     def check_items(self, items: list[Item]) -> None:
         for it in items:
+            check_id(it.id)
             missing = [f for f in self.requires if not getattr(it, f)]
             if missing:
                 raise ValueError(f"suite {self.name!r}: item {it.id!r} lacks {missing}")

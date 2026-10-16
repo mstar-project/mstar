@@ -71,9 +71,10 @@ class RunResult:
         # The one place everything passes before it is written: no addresses, secrets or home paths.
         d["config"], d["meta"], d["label"] = scrub(d["config"]), scrub(d["meta"]), _scrub(d["label"])
         for rep in d["repeats"]:
-            for row in rep["requests"]:
-                if isinstance(row.get("error"), str):
-                    row["error"] = _scrub(row["error"])
+            # Transcripts and ids are scrubbed too; an address or home path in speech is rare,
+            # and a shared file must not carry one.
+            rep["requests"] = [{k: _scrub(v) if isinstance(v, str) else v for k, v in row.items()}
+                               for row in rep["requests"]]
         d["repeats"], d["summary"] = finite(d["repeats"]), finite(d["summary"])
         return {"schema": d.pop("schema"), **d}
 

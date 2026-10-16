@@ -86,7 +86,9 @@ manifest (a ``.txt`` file of sentences also works for ``tts``)::
     {"id": "1089-134686-0000", "text": "...", "audio_path": "audio/1089-134686-0000.wav", "lang": "en"}
 
 ``ref_audio`` and ``ref_text`` add a voice-clone prompt; ``extra`` carries suite
-fields (duplex ``category``, ``speech_end_s``, ``interrupt_s``). Builders:
+fields (duplex ``category``, ``speech_end_s``, ``interrupt_s``). An ``id`` names the
+item's saved audio, so it must be a plain name (letters, digits, ``.``, ``_``, ``-``).
+Builders:
 
 .. list-table::
    :header-rows: 1

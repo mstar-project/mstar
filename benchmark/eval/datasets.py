@@ -25,12 +25,21 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import tarfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 ASR_RATE = 16000
+# Item ids name output files (``<audio_dir>/<id>.wav``), so they are plain names: no paths.
+ITEM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
+
+
+def check_id(item_id: str) -> str:
+    if not isinstance(item_id, str) or not ITEM_ID.fullmatch(item_id) or ".." in item_id:
+        raise ValueError(f"item id {item_id!r} must be a plain name (letters, digits, '.', '_', '-')")
+    return item_id
 
 
 @dataclass
@@ -64,7 +73,7 @@ def load_manifest(path: str | Path, limit: int | None = None) -> list[Item]:
                 if row.get(key) and not os.path.isabs(row[key]):
                     row[key] = str(root / row[key])
             items.append(Item(**row))
-    ids = [it.id for it in items]
+    ids = [check_id(it.id) for it in items]
     if len(set(ids)) != len(ids):
         raise ValueError(f"{path}: duplicate item ids")
     return items[:limit] if limit else items
