@@ -51,6 +51,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "higgs_audio": "higgs_audio.yaml",
     "wan22": "wan22.yaml",
     "waypoint": "waypoint.yaml",
+    "lingbot_world_1_3b": "lingbot_world_1_3b.yaml",
     # Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B).
     "nemotron_duplex": "nemotron_duplex.yaml",
     "flux2_klein": "flux2_klein.yaml",

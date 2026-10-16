@@ -172,7 +172,7 @@ The GPU model families depend on:
 
 - **FlashInfer** (``flashinfer-python``) — paged attention and continuous batching for the
   autoregressive backbones (every model with a ``KV_CACHE`` node runs attention through it).
-- **flash-attn** — used by Qwen3-Omni. **Not installed by any extra**; install it separately
+- **flash-attn** — used by Qwen3-Omni and LingBot-World. **Not installed by any extra**; install it separately
   (see `flash-attn (Qwen3-Omni)`_).
 - **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
   extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).

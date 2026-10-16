@@ -1,0 +1,110 @@
+"""Configuration for LingBot-World-V2 causal-fast (camera-controlled world model).
+
+The architecture values are facts of the ``robbyant/lingbot-world-v2-*-causal-fast``
+checkpoints (the reference repo's ``wan/configs/wan_i2v_*.py``), hardcoded so that
+constructing the model never touches the network. The DiT is a Wan2.1-layout I2V
+transformer (16-channel Wan2.1 VAE latents + 4 mask + 16 image-latent channels in)
+with per-block Plucker camera injection, run block-causally over chunks of latent
+frames against a rolling self-attention KV cache with attention-sink frames.
+
+The sampling knobs are the reference's ``generate.py`` / ``run_fast.sh`` defaults:
+4 distilled steps per chunk at fixed indices into a 1000-step shifted schedule,
+re-noising between steps, then one t=0 pass over the clean chunk to commit its K/V.
+"""
+
+from dataclasses import dataclass
+
+LINGBOT_VARIANT_1_3B = "1.3b_causal_fast"
+LINGBOT_VARIANT_14B = "14b_causal_fast"
+
+# The 1.3B repo ships the DiT only; T5, the VAE and the tokenizer come from the
+# 14B repo (reference README, ``--assets_dir``).
+LINGBOT_HF_REPOS = {
+    LINGBOT_VARIANT_1_3B: "robbyant/lingbot-world-v2-1.3b-causal-fast",
+    LINGBOT_VARIANT_14B: "robbyant/lingbot-world-v2-14b-causal-fast",
+}
+LINGBOT_ASSETS_REPO = "robbyant/lingbot-world-v2-14b-causal-fast"
+
+# Diffusers-format copies of the shared components, which mstar already loads
+# for other models. The parity harness checks they equal the LingBot assets.
+WAN21_VAE_DIFFUSERS_REPO = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+UMT5_DIFFUSERS_REPO = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+
+
+@dataclass
+class LingBotWorldConfig:
+    variant: str = LINGBOT_VARIANT_1_3B
+
+    # DiT (reference wan_i2v_1_3B.py)
+    dim: int = 1536
+    ffn_dim: int = 8960
+    num_heads: int = 12
+    num_layers: int = 30
+    freq_dim: int = 256
+    text_dim: int = 4096
+    in_dim: int = 36
+    out_dim: int = 16
+    patch_size: tuple[int, int, int] = (1, 2, 2)
+    eps: float = 1e-6
+    text_len: int = 512
+    # Plucker rays: origin + direction per pixel, folded 8x8 into each latent cell.
+    control_dim: int = 6
+    # RoPE tables cover this many latent frames; the rollout cannot run past it.
+    rope_max_frames: int = 1024
+
+    # Wan2.1 VAE
+    vae_z_dim: int = 16
+    vae_stride: tuple[int, int, int] = (4, 8, 8)
+
+    # Causal-fast sampling (reference generate.py / run_fast.sh)
+    chunk_size: int = 4  # latent frames per chunk
+    local_attn_size: int = 18  # latent frames of self-attention K/V kept, sink included
+    sink_size: int = 6  # leading latent frames never evicted
+    timesteps_index: tuple[int, ...] = (0, 250, 500, 750)
+    num_train_timesteps: int = 1000
+    sample_shift: float = 5.0
+
+    # Request geometry. The output aspect follows the conditioning image and the
+    # area is height*width, as in the reference; intrinsics are given at 480x832.
+    default_height: int = 480
+    default_width: int = 832
+    intrinsics_height: int = 480
+    intrinsics_width: int = 832
+    video_fps: int = 16
+    max_chunks: int = 255  # rope_max_frames // chunk_size
+
+    # The reference decodes in fp32. bf16 is faster on cuDNN >= 9.16 but is not
+    # the reference's numerics.
+    vae_decode_fp32: bool = True
+    vae_decode_channels_last: bool = False
+
+    @property
+    def head_dim(self) -> int:
+        return self.dim // self.num_heads
+
+    @property
+    def frames_per_chunk(self) -> int:
+        """Video frames a mid-stream chunk decodes to (the first chunk has 3 fewer)."""
+        return self.chunk_size * self.vae_stride[0]
+
+
+def lingbot_world_1_3b() -> LingBotWorldConfig:
+    return LingBotWorldConfig(variant=LINGBOT_VARIANT_1_3B)
+
+
+def lingbot_world_14b() -> LingBotWorldConfig:
+    """Reference wan_i2v_A14B.py. Declared for the plan; not exercised yet."""
+    return LingBotWorldConfig(
+        variant=LINGBOT_VARIANT_14B,
+        dim=5120,
+        ffn_dim=13824,
+        num_heads=40,
+        num_layers=40,
+        sample_shift=10.0,
+    )
+
+
+LINGBOT_CONFIGS = {
+    LINGBOT_VARIANT_1_3B: lingbot_world_1_3b,
+    LINGBOT_VARIANT_14B: lingbot_world_14b,
+}

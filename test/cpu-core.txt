@@ -18,6 +18,7 @@ test/modular/test_waypoint_packaging.py
 test/modular/test_waypoint_reference_compat.py
 test/modular/test_waypoint_benchmark_videos.py
 test/modular/test_waypoint_live_server_benchmark.py
+test/modular/test_lingbot_world_shell.py
 test/modular/test_flex_attention_resource.py
 test/modular/test_ring_kv_resource.py
 test/modular/test_cuda_graph_capture.py
