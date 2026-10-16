@@ -8,6 +8,7 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     VocabParallelEmbedding,
 )
+from mstar.model.glm52.components.fp8_linear import Fp8ParallelGatedMLP, dense_fp8_block
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
 from mstar.model.glm52.config import Glm52ModelConfig
 
@@ -40,14 +41,21 @@ def build_rmsnorm(config: Glm52ModelConfig) -> RMSNorm:
 
 
 def build_dense_mlp(
-    config: Glm52ModelConfig, comm_group: CommGroup | None = None
-) -> ParallelGatedMLP:
+    config: Glm52ModelConfig, comm_group: CommGroup | None = None,
+    reduce_results: bool = True,
+) -> ParallelGatedMLP | Fp8ParallelGatedMLP:
+    block = dense_fp8_block(config)
+    if block is not None:
+        return Fp8ParallelGatedMLP(
+            config.hidden_size, config.intermediate_size, block, comm_group=comm_group,
+            reduce_results=reduce_results)
     return ParallelGatedMLP(
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
         comm_group=comm_group,
         activation=config.hidden_act,
         bias=False,
+        reduce_results=reduce_results,
     )
 
 
@@ -57,8 +65,10 @@ def is_moe_layer(config: Glm52ModelConfig, layer_idx: int) -> bool:
 
 
 def build_mlp_for_layer(
-    config: Glm52ModelConfig, layer_idx: int, comm_group: CommGroup | None = None
+    config: Glm52ModelConfig, layer_idx: int, comm_group: CommGroup | None = None,
+    reduce_results: bool = True,
 ):
+    """``reduce_results=False``: the FFN returns this rank's partial, unreduced."""
     if is_moe_layer(config, layer_idx):
-        return Glm52SparseMoeBlock(config, comm_group=comm_group)
-    return build_dense_mlp(config, comm_group=comm_group)
+        return Glm52SparseMoeBlock(config, comm_group=comm_group, reduce_results=reduce_results)
+    return build_dense_mlp(config, comm_group=comm_group, reduce_results=reduce_results)
