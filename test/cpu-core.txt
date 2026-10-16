@@ -3,6 +3,7 @@ test/modular/test_resource_runner.py
 test/modular/test_admit_failure_handling.py
 test/modular/test_micro_scheduler.py
 test/modular/test_worker_drain.py
+test/modular/test_worker_node_metadata.py
 test/modular/test_profiler_nvtx.py
 test/modular/test_ragged_attention_cpu.py
 test/modular/test_rid_handles.py
@@ -128,3 +129,11 @@ test/modular/test_glm52_step_tokens.py
 test/modular/test_kv_correct_len.py
 test/modular/test_kv_host_plan.py
 test/modular/test_piecewise_dummy_rows.py
+test/modular/test_kda_resource.py
+test/modular/test_loader_pread.py
+test/modular/test_loader_stacked_matcher.py
+test/modular/test_recurrent_rank_symmetry.py
+test/modular/test_recurrent_rollback.py
+test/modular/test_recurrent_slot_blocks.py
+test/modular/test_tp_follower_refusal.py
+test/modular/test_worker_runtime_metadata.py
