@@ -18,6 +18,14 @@ General questions are welcome too — a plain issue or an email to <atindra@cs.s
 3. Run `ruff check .` (CI enforces it).
 4. Open a PR against `main`. It runs CI and gets a review before merging.
 
+### Automated review
+
+A bot posts an advisory review when a contributor (the team, or anyone who has had a PR merged here) opens a non-draft PR, from a fork or not. It checks the invariants in [AGENTS.md](AGENTS.md) — the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables — and cites them by number. It is not a merge gate and a maintainer still reviews your PR. It doesn't rerun on every push: someone with write access to the repo can comment `/review` for a re-review, or `/review thorough` for the thorough mode. Reply to disagree; apply the `skip-ai-review` label to turn the automatic review off for a PR. Details in [.github/review/](.github/review/).
+
+### AI-assisted contributions
+
+These are welcome, with two conditions: read [AGENTS.md](AGENTS.md) first (point your agent at it, or symlink it to whatever filename your tooling expects), and say in the PR description that AI assistance was used, which tests you ran, and what the results were. You need to understand and be able to defend every line you submit.
+
 ### Optional Mac checks
 
 On **Apple Silicon macOS**, you can check your current worktree before
