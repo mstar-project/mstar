@@ -46,11 +46,13 @@ from mstar.model.cosyvoice3.config import (
 from mstar.model.cosyvoice3.cosyvoice3_model import LM_PARTITION, TOKEN2WAV_PARTITION, CosyVoice3Model
 from mstar.model.cosyvoice3.submodules import (
     AUDIO_CHUNK,
+    DECODE_LOOP,
     MEL,
     MEL_FINAL,
     PREV_TOKEN,
     PROMPT_TOKENS,
     SPEECH_TOKENS,
+    STEP_INDEX,
     TEXT_INPUTS,
     TOKEN_LIMITS,
     FlowSubmodule,
@@ -288,6 +290,8 @@ def test_preset_voices_resolve_inside_voices_dir_only(tmp_path, monkeypatch):
             model.process_prompt("one", ["text"], ["audio"], voice=name)
     with pytest.raises(ValueError, match="presets"):
         model.process_prompt("one", ["text"], ["audio"], voice="bob")
+    with pytest.raises(ValueError, match="presets"):  # past NAME_MAX: the filesystem refuses the lookup
+        model.process_prompt("one", ["text"], ["audio"], voice="a" * 300)
 
 
 def test_initial_and_partition_args_route_the_walks(model):
@@ -365,6 +369,19 @@ def test_adapter_refuses_server_paths_and_leaves_nothing_behind(tmp_path, ref):
     with pytest.raises(ValueError, match="server file paths are refused"):
         adapters.CosyVoice3Adapter().speech_to_request(_speech(ref_audio=ref), upload)
     assert not upload.exists() or not any(upload.iterdir())
+
+
+def test_adapter_reports_a_failed_fetch_as_a_bad_request(tmp_path, monkeypatch):
+    """urllib refuses a redirect to ``file://`` with an HTTPError; like any
+    failed fetch it is the request's fault, not a server error."""
+    import urllib.error
+
+    def refuse(*args, **kwargs):
+        raise urllib.error.HTTPError("http://example.test/clip.wav", 302, "redirect to file://", None, None)
+
+    monkeypatch.setattr(adapters.media_io, "resolve_media_ref", refuse)
+    with pytest.raises(ValueError, match="could not fetch ref_audio"):
+        adapters.CosyVoice3Adapter().speech_to_request(_speech(ref_audio="http://example.test/clip.wav"), tmp_path)
 
 
 def test_adapter_refuses_a_file_under_the_upload_dir(tmp_path):
@@ -591,6 +608,54 @@ def test_lm_stops_on_any_control_id_or_the_length_cap():
     _fixed_logits(sub, favourite=5, second=6)
     with torch.no_grad():
         assert _lm_run(sub, res, {2: (_lm_request(limits=(0, 4)), 0)}, steps=40, ras_window=0)[2] == [5] * 4
+
+
+def _lm_prefill_then_decode(sub, res, limits, **knobs):
+    """One request: prefill, postprocess, then one decode step on the prefill token."""
+    info = _info(0, 0, ras_window=0, **knobs)
+    engine = SimpleNamespace(request_ids=[0], resources={LM_ATTN: res.kv_attn})
+    tokens, inputs = [], _lm_request(limits=limits)
+    for walk in ("prefill", "decode"):
+        prepared = sub.prepare_inputs(walk, info, inputs)
+        res.plan([prepared.input_seq_len])
+        out = sub.forward_batched(walk, engine, **sub.preprocess(walk, engine, [prepared]))[0]
+        sub.postprocess(0, info, out, inputs=prepared)
+        tokens.append(int(out[SPEECH_TOKENS][0]))
+        inputs = {PREV_TOKEN: out[PREV_TOKEN]}
+    return tokens, sub.check_stop(0, info, out)
+
+
+def test_lm_a_request_ended_by_its_prefill_token_adds_no_speech():
+    """The prefill walk has no decode loop to stop, so the decode step after a
+    prefill stop token (or a spent budget) runs, samples EOS, which the flow
+    drops, and ends the loop."""
+    cfg = _tiny_config()
+    sub, res = _lm(cfg)
+    with torch.no_grad():
+        _fixed_logits(sub, favourite=cfg.lm.speech_token_size + 7, second=5)
+        assert _lm_prefill_then_decode(sub, res, (0, 30)) == ([47, cfg.lm.eos_token], {DECODE_LOOP})
+        for limits, knobs in (((0, 1), {}), ((0, 1), {"ignore_eos": True})):
+            res.reset()
+            _fixed_logits(sub, favourite=5, second=6)
+            assert _lm_prefill_then_decode(sub, res, limits, **knobs) == ([5, cfg.lm.eos_token], {DECODE_LOOP})
+        res.reset()
+        assert _lm_prefill_then_decode(sub, res, (0, 30)) == ([5, 5], set())
+    assert filter_tokens(torch.tensor([5, cfg.lm.eos_token]), cfg).tolist() == [5]
+
+
+def test_lm_stop_judges_each_step_by_its_own_index():
+    """A speculative next step postprocessed before this step's stop check has
+    moved ``generated`` on; the cap still counts this step's tokens."""
+    cfg = _tiny_config()
+    sub, _ = _lm(cfg)
+    info = _info(4, 0)
+    sub.prepare_inputs("prefill", info, _lm_request(limits=(0, 4)))
+    for _ in range(4):
+        sub.postprocess(4, info, {SPEECH_TOKENS: [torch.tensor([5])]})
+    out = {SPEECH_TOKENS: [torch.tensor([5])], STEP_INDEX: [torch.tensor([2])]}
+    assert sub.check_stop(4, info, out) == set()  # token 3 of 4
+    out[STEP_INDEX] = [torch.tensor([3])]
+    assert sub.check_stop(4, info, out) == {DECODE_LOOP}
 
 
 def test_lm_ras_breaks_a_repeating_favourite():

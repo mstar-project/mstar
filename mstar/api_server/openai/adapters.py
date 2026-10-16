@@ -672,7 +672,10 @@ def _uploaded_ref_audio(ref, upload_dir: Path) -> str:
     if not isinstance(ref, str):
         raise ValueError(f"ref_audio must be a data URL or base64 audio, got {type(ref).__name__}")
     if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
-        return media_io.resolve_media_ref(ref, upload_dir, allow_remote=False)[1]
+        try:
+            return media_io.resolve_media_ref(ref, upload_dir, allow_remote=False)[1]
+        except OSError as exc:  # urllib's URLError and HTTPError (a refused redirect too), timeouts
+            raise ValueError(f"could not fetch ref_audio: {exc}") from exc
     try:
         _, path = media_io.save_base64(ref, "wav", "audio", upload_dir)
     except ValueError:

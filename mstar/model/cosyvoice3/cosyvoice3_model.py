@@ -396,7 +396,11 @@ class CosyVoice3Model(Model):
             raise ValueError(f"Invalid voice name {voice!r}")
         for ext in ("", ".wav", ".flac", ".mp3", ".ogg", ".m4a"):
             path = self.voices_dir / f"{voice}{ext}"
-            if path.is_file() and path.suffix != ".txt":
+            try:
+                found = path.is_file() and path.suffix != ".txt"
+            except OSError:  # a name the filesystem refuses, e.g. longer than NAME_MAX
+                found = False
+            if found:
                 text = path.with_suffix(".txt")
                 return path, text.read_text(encoding="utf-8").strip() if text.is_file() else None
         available = sorted({p.stem for p in self.voices_dir.iterdir() if p.is_file() and p.suffix != ".txt"})
