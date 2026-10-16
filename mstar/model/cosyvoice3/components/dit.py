@@ -82,7 +82,7 @@ class TimestepEmbedding(nn.Module):
         self.time_mlp = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        return self.time_mlp(self.time_embed(t).to(t.dtype))
+        return self.time_mlp(self.time_embed(t).to(self.time_mlp[0].weight.dtype))
 
 
 class CausalConvPositionEmbedding(nn.Module):
@@ -240,10 +240,16 @@ class DiT(nn.Module):
     ) -> torch.Tensor:
         """``x, mu, cond``: ``[B, 80, T]``; ``mask``: ``[B, 1, T, T]`` attention
         mask (``chunk_attention_mask``; bool, or 0/1 in any float dtype);
-        ``t``: ``[B]``; ``spks``: ``[B, 80]``."""
+        ``t``: ``[B]``; ``spks``: ``[B, 80]``.
+
+        Runs in the weights' dtype and returns the inputs' dtype; ``t`` keeps
+        its own precision through the sinusoid, so a bfloat16 estimator is fed
+        the solve's float32 time grid, not a rounded one."""
+        out_dtype, dtype = x.dtype, self.proj_out.weight.dtype
+        x, mu, cond, spks = (v.to(dtype) for v in (x, mu, cond, spks))
         keep = mask if mask.dtype == torch.bool else mask > 0.5
         # a padded query row: its last-row key mask is the row's valid frames
-        row_keep = keep[:, 0, -1, :].unsqueeze(-1).to(x.dtype)
+        row_keep = keep[:, 0, -1, :].unsqueeze(-1).to(dtype)
         x, mu, cond = x.transpose(1, 2), mu.transpose(1, 2), cond.transpose(1, 2)
         if t.ndim == 0:
             t = t.repeat(x.shape[0])
@@ -252,4 +258,4 @@ class DiT(nn.Module):
         freqs = self.rotary_freqs(h.shape[1])
         for block in self.transformer_blocks:
             h = block(h, temb, keep, row_keep, freqs)
-        return self.proj_out(self.norm_out(h, temb)).transpose(1, 2)
+        return self.proj_out(self.norm_out(h, temb)).transpose(1, 2).to(out_dtype)

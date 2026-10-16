@@ -737,7 +737,7 @@ class CosyVoice3Model(Model):
         flow.load_weights((k, v.to(device)) for k, v in self._state_dict(self.config.flow_weights))
         dtype = _parse_dtype(self.config.flow_estimator_dtype)
         if dtype != torch.float32:
-            flow.decoder.set_estimator_dtype(dtype)
+            flow.set_estimator_dtype(dtype)
         return FlowSubmodule(flow.eval(), self._reference_encoder(device), self.config)
 
     def _create_hift_submodule(self, device: str):

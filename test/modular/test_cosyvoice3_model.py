@@ -27,7 +27,7 @@ import yaml
 
 from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
-from mstar.model.cosyvoice3.components.dit import chunk_attention_mask
+from mstar.model.cosyvoice3.components.dit import _SinusEmbedding, chunk_attention_mask
 from mstar.model.cosyvoice3.components.flow import CosyVoice3Flow, FlowRow, ReferenceVoice
 from mstar.model.cosyvoice3.components.hift import CausalHiFTGenerator, StreamState, stream_vocode
 from mstar.model.cosyvoice3.components.lm import CosyVoice3LM
@@ -858,6 +858,16 @@ def test_flow_estimator_is_bfloat16_unless_the_deployment_asks_for_float32(tmp_p
     assert torch.equal(
         estimator.rotary_freqs(2000), CosyVoice3Flow(model.config.flow).decoder.estimator.rotary_freqs(2000)
     )
+    # the time embedding's sinusoid sees the solve's float32 time grid, not a rounded one
+    seen = []
+    sinus = _SinusEmbedding.forward
+    monkeypatch.setattr(_SinusEmbedding, "forward", lambda self, t: seen.append(t.clone()) or sinus(self, t))
+    tokens = torch.randint(0, 40, (12,), generator=torch.Generator().manual_seed(0))
+    (mel,) = flow.solve_rows([FlowRow(_voice(model.config, 5), tokens, 12, final=True, streaming=True)], 3)
+    grid = flow.decoder.time_grid(3, torch.device("cpu"), torch.float32, meanflow=False)[:-1]
+    assert [t.dtype for t in seen] == [torch.float32] * 3
+    assert torch.equal(torch.stack([t[0] for t in seen]), grid)
+    assert mel.dtype == torch.float32 and torch.isfinite(mel).all()
     with pytest.raises(ValueError, match="Unknown dtype"):
         CosyVoice3Model(model_path_hf=str(tmp_path), flow_estimator_dtype="int8")
 

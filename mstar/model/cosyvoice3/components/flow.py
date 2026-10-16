@@ -121,6 +121,13 @@ class CosyVoice3Flow(nn.Module):
     def dtype(self) -> torch.dtype:
         return self.input_embedding.weight.dtype
 
+    def set_estimator_dtype(self, dtype: torch.dtype) -> None:
+        """Run the DiT estimator in ``dtype``. The solve keeps passing it float32
+        state and time steps, which the DiT casts itself (the time step only
+        after its sinusoid), so ``CausalConditionalCFM``'s own input casts stay
+        off."""
+        self.decoder.estimator.to(dtype)
+
     def project_speaker(self, embedding: torch.Tensor) -> torch.Tensor:
         return self.spk_embed_affine_layer(F.normalize(embedding, dim=1))
 
