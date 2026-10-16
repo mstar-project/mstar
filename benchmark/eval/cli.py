@@ -312,6 +312,9 @@ def cmd_rejudge(args) -> None:
     for path, result in zip(_result_paths(args.results), load_results(args.results), strict=True):
         dst = rejudge(result, judging).save(out / path.name)
         print(f"wrote {dst}", file=sys.stderr)
+    for name, u in judging.usage().items():
+        print(f"[fdb] judge {name!r}: {u['requests']} requests ({u['retries']} transport retries), "
+              f"{u['prompt']} prompt and {u['completion']} completion tokens", file=sys.stderr)
 
 
 def cmd_agreement(args) -> None:

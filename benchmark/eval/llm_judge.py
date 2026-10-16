@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -50,6 +52,12 @@ LOCAL_BEHAVIOR_DECODING = {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "min_p
 SEMANTIC_DECODING = {"temperature": 0.0, "top_p": 1.0, "max_tokens": 32768, "seed": 1}
 SEMANTIC_BATCH = 8
 MAX_ATTEMPTS = 3
+# Rate limits and server errors are retried at the transport with the same seed and exponential
+# backoff, so they never use up the official loop's seed attempts.
+RETRY_HTTP = {408, 409, 429, 500, 502, 503, 504}
+TRANSPORT_RETRIES = 6
+BACKOFF_S = 2.0
+BACKOFF_MAX_S = 60.0
 ACCEPTABLE_OUTCOMES = ["Apply the supplied rubric."]
 
 
@@ -70,6 +78,9 @@ class Judge:
     timeout_s: float = 900.0
     retry_sleep_s: float = 1.0
     post: Callable[[str, dict, dict], dict] | None = field(default=None, repr=False)
+    sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
+    usage: dict[str, int] = field(default_factory=lambda: {"requests": 0, "retries": 0, "prompt": 0, "completion": 0})
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def available(self) -> bool:
@@ -94,13 +105,33 @@ class Judge:
         return headers
 
     def chat(self, body: dict[str, Any]) -> dict[str, Any]:
-        try:
-            return (self.post or _post)(f"{self.base_url}/chat/completions", body, self.headers(), self.timeout_s)
-        except urllib.error.HTTPError as exc:
-            # The status is enough; a body or message could echo the request headers.
-            raise JudgeError(f"HTTP {exc.code}") from None
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            raise JudgeError(type(exc).__name__) from None
+        for attempt in range(TRANSPORT_RETRIES + 1):
+            wait = min(BACKOFF_MAX_S, BACKOFF_S * 2**attempt) * (0.5 + random.random())
+            try:
+                resp = (self.post or _post)(f"{self.base_url}/chat/completions", body, self.headers(), self.timeout_s)
+            except urllib.error.HTTPError as exc:
+                # The status is enough; a body or message could echo the request headers.
+                error, retry = f"HTTP {exc.code}", exc.code in RETRY_HTTP
+                after = (exc.headers or {}).get("Retry-After")
+                if retry and after and after.replace(".", "", 1).isdigit():
+                    wait = min(BACKOFF_MAX_S, float(after))
+            except (urllib.error.URLError, OSError) as exc:
+                error, retry = type(exc).__name__, True
+            except ValueError as exc:  # an unparseable body is the reply's problem, not the transport's
+                raise JudgeError(type(exc).__name__) from None
+            else:
+                u = resp.get("usage") or {}
+                with self._lock:
+                    self.usage["requests"] += 1
+                    self.usage["prompt"] += int(u.get("prompt_tokens") or 0)
+                    self.usage["completion"] += int(u.get("completion_tokens") or 0)
+                return resp
+            if not retry or attempt == TRANSPORT_RETRIES:
+                raise JudgeError(error)
+            with self._lock:
+                self.usage["retries"] += 1
+            self.sleep(wait)
+        raise AssertionError("unreachable")
 
 
 def _post(url: str, body: dict, headers: dict, timeout_s: float) -> dict:

@@ -175,6 +175,44 @@ def test_behavior_label_follows_the_official_retry_loop():
     assert "temperature" not in llm_judge.behavior_body(api, _behavior(), t)  # official: model defaults
 
 
+def test_transport_retries_rate_limits_with_backoff_and_counts_usage():
+    import email.message
+    import urllib.error
+
+    calls, sleeps = [], []
+
+    def http_error(code, retry_after=None):
+        headers = email.message.Message()
+        if retry_after:
+            headers["Retry-After"] = retry_after
+        return urllib.error.HTTPError("u", code, "x", headers, None)
+
+    def post(url, body, headers, timeout):
+        calls.append(body["seed"])
+        if len(calls) == 1:
+            raise http_error(429, "7")
+        if len(calls) == 2:
+            raise urllib.error.URLError("reset")
+        return {"model": "m", "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+                "choices": [{"message": {"content": '{"behaviour": ["C_RESUME"]}'}, "finish_reason": "stop"}]}
+
+    judge = llm_judge.Judge("j", "local", "http://127.0.0.1:1/v1", "m", post=post, sleep=sleeps.append)
+    t = {k: {"text": k, "chunks": []} for k in ("input", "clean_input", "output", "clean_output")}
+    res = llm_judge.behavior_label(judge, _behavior(), t, sleep=lambda s: None)
+    # Same seed throughout: transport retries do not use up the official loop's attempts.
+    assert (res["status"], res["seed"], calls) == ("valid", 1, [1, 1, 1])
+    assert sleeps[0] == 7.0 and len(sleeps) == 2
+    assert judge.usage == {"requests": 1, "retries": 2, "prompt": 100, "completion": 5}
+
+    def bad(url, body, headers, timeout):
+        raise http_error(400)
+
+    no_retry = llm_judge.Judge("j", "local", "http://127.0.0.1:1/v1", "m", post=bad, sleep=sleeps.append)
+    with pytest.raises(llm_judge.JudgeError, match="HTTP 400"):
+        no_retry.chat({"seed": 1})
+    assert no_retry.usage["retries"] == 0
+
+
 def test_api_judge_is_skipped_without_a_key_and_keys_never_reach_results(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     (j,) = llm_judge.parse_judges(["gpt4o=openai"])
@@ -443,7 +481,8 @@ def test_fdb_suite_end_to_end_with_two_judges_agreement_and_rejudge(tmp_path, fa
     back = RunResult.load(tmp_path / "rejudged" / "fdb-fake-c2.json")
     assert back.summary["agreement.other.late.agreement"]["mean"] == 1.0
     assert back.summary["agreement.qwen.other.agreement"]["mean"] == pytest.approx(1 / 3)
-    assert back.config["rejudged"] == [{"judges": ["late"], "semantic": None}]
+    (entry,) = back.config["rejudged"]
+    assert (entry["judges"], entry["semantic"], entry["usage"]["late"]["requests"]) == (["late"], None, 6)
     assert back.summary["user_interruption.stop_latency_s"] == s["user_interruption.stop_latency_s"]
     assert back.config["suite"]["semantic"]["identity"]["model"] == "fake-judge"
     assert back.config["suite"]["semantic"]["decoding"]["max_tokens"] == 32768  # a count, not a secret

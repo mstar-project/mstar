@@ -208,6 +208,10 @@ class Judging:
                    "controls": self._controls}
         return {"judges": [j.identity() for j in self.judges], "semantic": sem}
 
+    def usage(self) -> dict[str, dict[str, int]]:
+        """Requests, transport retries and prompt and completion token counts, per judge."""
+        return {j.name: dict(j.usage) for j in self.available}
+
     def label(self, rows: list[dict[str, Any]]) -> None:
         """Behavior labels from every available judge, and semantic outcomes, into ``rows``."""
         from benchmark.eval import fdb_reference, llm_judge
@@ -271,6 +275,7 @@ def rejudge(result, judging: Judging):
         suite_cfg["semantic"] = sem_cfg = None
     regrade = judging.semantic is not None or sem_cfg is None
     names = [j["name"] for j in suite_cfg["judges"] if not j.get("skipped")]
+    before = judging.usage()
     for rep in result.repeats:
         for r in rep.requests:
             for name in new:
@@ -284,7 +289,8 @@ def rejudge(result, judging: Judging):
     if judging.semantic is not None:
         suite_cfg["semantic"] = judging.identity()["semantic"]
     result.config.setdefault("rejudged", []).append(
-        {"judges": sorted(new), "semantic": judging.semantic.name if judging.semantic else None})
+        {"judges": sorted(new), "semantic": judging.semantic.name if judging.semantic else None,
+         "usage": {n: {k: v - before[n][k] for k, v in u.items()} for n, u in judging.usage().items()}})
     result.summary = {}
     return result.finalize()
 
@@ -355,6 +361,7 @@ class FDBSuite(Suite):
             "timing": self._timing.record if self._timing else None,
             "asr": self._asr.id if self._asr else a.asr,
             **self.judging.identity(),
+            "judge_usage": self.judging.usage(),
         }
 
     async def request(
