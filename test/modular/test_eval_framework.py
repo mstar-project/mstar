@@ -392,6 +392,7 @@ def test_metadata_never_carries_addresses_secrets_or_home(tmp_path, monkeypatch)
                                       "HF_TOKEN=hf_secret", "--extra=api_key=sk-1", "--serve-config", f"{home}/c.yaml"])
     monkeypatch.setenv("MSTAR_ZMQ_TCP_HOST", "10.9.8.7")
     meta = collect_metadata(server={"env": {"HF_TOKEN": "hf_secret"}, "url": "http://u:p@127.0.0.1:1/?k=v"})
+    assert meta["cli"] == {"command": "run", "flags": ["--extra", "--serve-config", "--serve-env", "--url"]}
     r = RunResult("tts", "x", {"suite": {"extra": {"authorization": "Bearer t"}}}, meta, []).finalize()
     text = json.dumps(r.to_dict())
     for leaked in ("10.1.2.3", "10.9.8.7", "hf_secret", "sk-1", "Bearer t", home, "u:p@", "k=v"):
@@ -490,6 +491,10 @@ def test_custom_commands_hosts_and_ipv6_never_reach_results():
     for extra in ('hosts=["gpu-private.internal:9000"]', 'hosts={"gpu-private.internal": 9000, "b.internal": 1}'):
         assert "internal" not in scrub_argv(["--extra", extra])[1]
     assert "internal" not in json.dumps(scrub({"extra": {"hosts": {"gpu-private.internal": 9000, "b.internal": 1}}}))
+    mixed = scrub({"hosts": ["tcp://gpu-a.internal:9000 gpu-b.internal:9001"], "url": "http://127.0.0.1:8000/v1",
+                   "peer": "127.0.0.1:9000", "endpoint": "tcp://gpu-a.internal:9000"})
+    assert mixed == {"hosts": ["<host>"], "url": "http://127.0.0.1:8000/v1", "peer": "127.0.0.1:9000",
+                     "endpoint": "tcp://remote-host:9000"}
 
 
 def test_tts_suite_end_to_end(tmp_path, fake_cmd):

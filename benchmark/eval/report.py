@@ -147,8 +147,14 @@ def render_chart(results: list[RunResult], metrics: list[str], path: str | Path,
         ax.set_xlabel("arrival rate (req/s)" if open_loop else "concurrency")
         ax.set_ylabel(header)
         ax.set_title(header)
+        xs = sorted({x_value(r) for r in results})
         if not open_loop:
             ax.set_xscale("log", base=2)
+        ax.set_xticks(xs, [f"{x:g}" for x in xs])
+        ax.minorticks_off()
+        means = [s["mean"] * scale for r in results if (s := r.summary.get(metric) or {}).get("mean")]
+        if means and min(means) > 0 and max(means) / min(means) > 20:  # lines an order of magnitude apart
+            ax.set_yscale("log")
         ax.grid(alpha=0.3)
     axes[0][0].legend(fontsize=8)
     fig.suptitle(title or provenance(results), fontsize=9)

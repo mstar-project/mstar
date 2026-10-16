@@ -8,7 +8,7 @@ writes one file per point. Layout (``schema: "mstar-eval/1"``)::
       "schema": "mstar-eval/1",
       "suite": "tts", "label": "kokoro", "created_at": "2026-10-16T07:00:00Z",
       "config": {...},       # everything that decides the numbers (dataset, n, load, judges, seed)
-      "meta": {...},         # git commit, GPU, driver, versions, MSTAR_* env, server, argv
+      "meta": {...},         # git commit, GPU, driver, versions, MSTAR_* env, server, CLI flags
       "repeats": [{"index": 0, "wall_s": 12.3, "metrics": {...}, "requests": [...]}, ...],
       "summary": {"<metric>": {"mean": .., "std": .., "min": .., "max": .., "n": 3}, ...}
     }
@@ -187,10 +187,24 @@ def _value(key: str, value: str) -> str:
     if _SECRET.search(key):
         return "<redacted>"
     if _HOSTLIKE.search(key):
-        if "://" in value:
-            return _scrub(value)
-        return value if all(v in _LOCAL_HOSTS for v in re.split(r"[,\s]+", value.strip()) if v) else "<host>"
+        parts = [v for v in re.split(r"[,\s]+", value.strip()) if v]
+        if len(parts) == 1 and "://" in parts[0]:
+            return redact_url(parts[0]) or "<host>"  # loopback kept; credentials and queries dropped
+        if all(_is_local(v) and "://" not in v for v in parts):
+            return value
+        return "<host>"
     return _scrub(value)
+
+
+def _is_local(value: str) -> bool:
+    """A loopback host, ``host:port`` or URL."""
+    if "://" in value:
+        try:
+            return (urlsplit(value).hostname or "") in _LOCAL_HOSTS
+        except ValueError:
+            return False
+    host, _, port = value.rpartition(":")
+    return value in _LOCAL_HOSTS or (port.isdigit() and host.strip("[]") in _LOCAL_HOSTS)
 
 
 def scrub_env(env: dict[str, str]) -> dict[str, str]:
@@ -360,6 +374,16 @@ def served_models(url: str) -> list[str] | None:
         return None
 
 
+def cli_shape(argv: list[str]) -> dict[str, Any]:
+    """The command and the names of the flags given, never their values: everything that
+    decides the numbers is in the structured (and scrubbed) ``config``, and raw values
+    (forwarded server args, inline commands, URLs) are where secrets and hosts hide."""
+    words = [a for a in argv[1:3] if not a.startswith("-")]
+    command = words[:2] if words[:1] == ["run"] else words[:1]
+    flags = sorted({a.split("=", 1)[0] for a in argv[1:] if a.startswith("--")})
+    return {"command": " ".join(command), "flags": flags}
+
+
 def collect_metadata(repo: str | Path | None = None, server: dict[str, Any] | None = None) -> dict[str, Any]:
     """Where and how the numbers were produced. No hostnames, IPs or home paths."""
     repo = repo or Path(__file__).resolve().parents[2]
@@ -388,5 +412,5 @@ def collect_metadata(repo: str | Path | None = None, server: dict[str, Any] | No
         },
         "env": scrub_env({k: v for k, v in os.environ.items() if k.startswith("MSTAR_")}),
         "server": server or {},
-        "argv": scrub_argv(sys.argv),
+        "cli": cli_shape(sys.argv),
     }
