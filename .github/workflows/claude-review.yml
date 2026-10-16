@@ -3,10 +3,9 @@ name: Claude Review
 # Advisory LLM review of contributors' PRs. Not a merge gate. Rules live in AGENTS.md;
 # the reviewer's operating instructions are in .github/review/review-prompt.md.
 #
-# Why pull_request_target: a plain `pull_request` trigger withholds secrets from
-# fork PRs, so the reviewer would silently never run for outside contributors --
-# exactly the people it is for. pull_request_target runs with secrets, and always
-# uses the workflow file and the base tree from `main`, never the PR's version.
+# It runs only on request, from a PR comment. issue_comment runs with secrets
+# (so fork PRs can be reviewed) and always uses the workflow file and the base
+# tree from `main`, never the PR's version.
 #
 # The safety rules that come with that, and that must hold for any edit here:
 #
@@ -21,26 +20,17 @@ name: Claude Review
 #   4. Write permission is pull-requests only, and mutation tools are disabled,
 #      so the worst case for a prompt injection is a bad comment.
 
-# Who can trigger it: GitHub author_association OWNER, MEMBER, COLLABORATOR or
-# CONTRIBUTOR, i.e. the team plus anyone who has had a PR merged here. First-time
-# contributors and strangers get no automatic review (cost, spam); a maintainer
-# can still comment /review on their PR.
+# Who can trigger it: a commenter whose GitHub author_association is OWNER,
+# MEMBER, COLLABORATOR or CONTRIBUTOR, i.e. the team plus anyone who has had a
+# PR merged here. A maintainer can comment /review on a first-timer's PR.
 #
-# When it runs:
-#   - light, once, when a contributor opens, reopens or readies a non-draft PR;
-#   - light, when a contributor comments `/review` on a PR (re-review after pushes);
-#   - thorough, when a contributor comments `/review thorough`, or someone with
-#     triage access applies the `ai-review-thorough` label.
-# Pushes don't trigger a review on their own; comment /review for that.
+# When it runs (nothing runs on open or on push):
+#   - light, when a contributor comments exactly `/review` on a PR;
+#   - thorough, when a contributor comments exactly `/review thorough`.
 #
-# issue_comment also runs with secrets and the default branch's workflow file,
-# so the same four rules hold. The comment body is only matched by the `if`
-# below, never passed to a shell.
+# The comment body is only matched by the `if` below, never passed to a shell.
 
 on:
-  pull_request_target:
-    # `labeled` is for on-demand thorough reviews; other labels are filtered out below.
-    types: [opened, reopened, ready_for_review, labeled]
   issue_comment:
     types: [created]
 
@@ -54,21 +44,13 @@ jobs:
     # rather than a silently skipped job. It also means a fork that *does* set
     # the key gets reviews, which is how you test changes to this workflow.
     if: >-
-      (github.event_name == 'pull_request_target' &&
-       !github.event.pull_request.draft &&
-       !contains(github.event.pull_request.labels.*.name, 'skip-ai-review') &&
-       ((github.event.action == 'labeled' && github.event.label.name == 'ai-review-thorough') ||
-        (github.event.action != 'labeled' &&
-         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association))))
-      ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       (github.event.comment.body == '/review' || github.event.comment.body == '/review thorough') &&
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.comment.author_association))
+      github.event.issue.pull_request &&
+      (github.event.comment.body == '/review' || github.event.comment.body == '/review thorough') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.comment.author_association)
     # Job-level, so an unrelated PR comment (which still starts a workflow run
     # that this `if` skips) can never cancel a review in progress.
     concurrency:
-      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: claude-review-${{ github.event.issue.number }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -91,17 +73,17 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # The PR's number, refs and title, the same way for both triggers (an
-      # issue_comment event doesn't carry the PR's head or base). The title is
-      # untrusted; it only ever reaches the prompt.
+      # The PR's number, refs and title (an issue_comment event doesn't carry
+      # the PR's head or base). The title is untrusted; it only ever reaches
+      # the prompt.
       - name: Resolve the PR
         if: steps.pre.outputs.run == 'true'
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
-          THOROUGH: ${{ (github.event.action == 'labeled' || github.event.comment.body == '/review thorough') && 'true' || 'false' }}
+          PR: ${{ github.event.issue.number }}
+          THOROUGH: ${{ github.event.comment.body == '/review thorough' && 'true' || 'false' }}
         run: |
           gh api "repos/$REPO/pulls/$PR" > pr.json
           {

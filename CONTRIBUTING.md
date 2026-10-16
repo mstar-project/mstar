@@ -20,7 +20,7 @@ General questions are welcome too — a plain issue or an email to <atindra@cs.s
 
 ### Automated review
 
-A bot posts an advisory review when a contributor (the team, or anyone who has had a PR merged here) opens a non-draft PR. It checks the invariants in [AGENTS.md](AGENTS.md) — the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables — and cites them by number. It is not a merge gate and a maintainer still reviews your PR. It doesn't rerun on every push: comment `/review` for a re-review, or `/review thorough` for the thorough mode. Reply to disagree; apply the `skip-ai-review` label to turn the automatic review off for a PR. Details in [.github/review/](.github/review/).
+Comment `/review` on your PR to get an advisory review from a bot, or `/review thorough` for the thorough mode; only contributors (the team, or anyone who has had a PR merged here) can trigger it. It checks the invariants in [AGENTS.md](AGENTS.md) — the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables — and cites them by number. It is not a merge gate and a maintainer still reviews your PR. It doesn't run on its own, on open or on push: comment `/review` again for a re-review. Reply to disagree. Details in [.github/review/](.github/review/).
 
 ### AI-assisted contributions
 

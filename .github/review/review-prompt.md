@@ -57,7 +57,7 @@ Ask a question when its answer decides whether something is a defect and the cod
 
 ## Modes
 
-**light** runs automatically on every non-draft PR. Report P0 to P2, description problems, and only the questions that could turn into a P0 or P1. On a diff over about 4,000 lines, review the files most likely to hold a defect and name the ones you skipped.
+**light** runs when a contributor comments `/review`. Report P0 to P2, description problems, and only the questions that could turn into a P0 or P1. On a diff over about 4,000 lines, review the files most likely to hold a defect and name the ones you skipped.
 
 **thorough** runs on request. Report everything, including P3 and design questions. Follow the change across layers, and cover the whole diff.
 
