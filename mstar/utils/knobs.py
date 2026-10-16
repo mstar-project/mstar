@@ -49,7 +49,7 @@ def kv_chain_lazy_steps() -> int:
 
 
 def kv_plan_cache() -> int:
-    """``MSTAR_KV_PLAN_CACHE`` (default 1): the KV manager plans a leased
+    """``MSTAR_KV_PLAN_CACHE`` (default 0): the KV manager plans a leased
     decode step from the previous step's plan when the batch is the same
     rows in the same order and nothing but that step's commit touched the
     streams: lengths advance by one, pages change only where a row crossed
@@ -61,7 +61,7 @@ def kv_plan_cache() -> int:
 
 
 def kv_pinned_indptrs() -> bool:
-    """``MSTAR_KV_PINNED_INDPTRS`` (default 1): the KV plan writes FlashInfer's
+    """``MSTAR_KV_PINNED_INDPTRS`` (default 0): the KV plan writes FlashInfer's
     index arrays (qo_indptr, kv_indptr, kv_indices, last_page_len) into a
     ring of page-locked host buffers, and the decode wrapper copies the
     indices straight into its captured device buffer from there. The copies
