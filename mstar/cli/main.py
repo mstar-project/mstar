@@ -197,7 +197,10 @@ def _serve(args: argparse.Namespace) -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
 
     who = getpass.getuser() if hasattr(getpass, "getuser") else "mstar"
-    socket_prefix = args.socket_path_prefix or f"/tmp/mstar_{who}/"
+    # One directory per port: every server binds the same socket names
+    # (conductor.ipc, worker_0.ipc, ...), so two servers sharing a prefix take
+    # over each other's inboxes.
+    socket_prefix = args.socket_path_prefix or f"/tmp/mstar_{who}_{args.port}/"
     upload_dir = args.upload_dir or f"/tmp/mstar_uploads_{who}/"
 
     argv = [
