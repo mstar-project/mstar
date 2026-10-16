@@ -185,7 +185,8 @@ def test_vjepa2_refuses_sampled_frames_over_the_budget_before_decoding(monkeypat
     from mstar.model.vjepa2.vjepa2_model import VJepa2Model
 
     pulled = []
-    _fake_torchcodec(monkeypatch, pulled, _Metadata(num_frames=1000, height=4096, width=4096))
+    _fake_torchcodec(monkeypatch, pulled, _Metadata(num_frames=1000, height=64, width=64))
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(64 * 64 * 63))
     model = object.__new__(VJepa2Model)
     model.config = types.SimpleNamespace(frames_per_clip=64)
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
