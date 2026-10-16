@@ -69,6 +69,7 @@ MEL = "mel"  # newly settled mel frames
 MEL_FINAL = "mel_final"  # [1] bool: the stream has ended
 AUDIO_CHUNK = "audio_chunk"
 DECODE_LOOP = "decode_loop"
+STEP_INDEX = "lm_step"  # [1] the LM step that produced the token, for check_stop
 
 PREFILL_WALKS = ("prefill", "prefill_voice")
 
@@ -178,7 +179,9 @@ class LMSubmodule(ARNodeSubmodule):
         meta = step_metadata or {}
         return meta[key] if key in meta else getattr(self.config.sampling, key)
 
-    def _row_tensors(self, fwd_info: CurrentForwardPassInfo, state, history: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _row_tensors(
+        self, fwd_info: CurrentForwardPassInfo, state, history: torch.Tensor, force_eos: bool = False
+    ) -> dict[str, torch.Tensor]:
         device = self.get_device()
         meta = fwd_info.step_metadata
         step = int(state.get("generated", 0))
@@ -187,6 +190,7 @@ class LMSubmodule(ARNodeSubmodule):
         ignore_eos = bool((meta or {}).get("ignore_eos", False))
         return {
             HISTORY: history,
+            "force_eos": torch.tensor([force_eos], device=device),
             "seed": torch.tensor([int(state["seed"])], dtype=torch.long, device=device),
             "step": torch.tensor([step], dtype=torch.long, device=device),
             "temperature": torch.tensor([float(self._knob(meta, "temperature"))], device=device),
@@ -219,6 +223,7 @@ class LMSubmodule(ARNodeSubmodule):
                 max_len=int(limits[1]),
                 seed=int(fwd_info.random_seed) & (2**63 - 1),
                 history=torch.full((max(self.window, 1),), -1, dtype=torch.long, device=device),
+                ended_at_prefill=None,
             )
             history = state[HISTORY]
         elif graph_walk == "decode":
@@ -226,13 +231,26 @@ class LMSubmodule(ARNodeSubmodule):
             embeds = self.model.embed_speech(token)
             # committed in postprocess, so a re-driven step does not add the token twice
             history = torch.cat([state[HISTORY][1:], token])
+            force_eos = self._ended_at_prefill(fwd_info, state, token)
         else:
             raise ValueError(f"Unknown LM walk {graph_walk!r}")
         return ARNodeInputs(
             input_embeds=embeds,
             input_seq_len=embeds.shape[0],
-            tensor_inputs=self._row_tensors(fwd_info, state, history),
+            tensor_inputs=self._row_tensors(fwd_info, state, history, force_eos=graph_walk == "decode" and force_eos),
         )
+
+    def _ended_at_prefill(self, fwd_info: CurrentForwardPassInfo, state, token: torch.Tensor) -> bool:
+        """Whether the prefill token already ended the request: a control id, or
+        the whole token budget. The prefill walk has no decode loop for
+        ``check_stop`` to end, so the first decode step runs anyway and is made
+        to sample EOS, which the flow drops and which ends the loop. Read once
+        per request (one host sync) and kept, so a re-prepared step agrees."""
+        if state["ended_at_prefill"] is None:
+            ignore_eos = bool((fwd_info.step_metadata or {}).get("ignore_eos", False))
+            stopped = not ignore_eos and int(token.item()) >= self.lm.speech_token_size
+            state.add("ended_at_prefill", stopped or int(state["generated"]) >= int(state["max_len"]))
+        return bool(state["ended_at_prefill"])
 
     def preprocess(self, graph_walk, engine_inputs, inputs: list[ARNodeInputs]) -> dict[str, Any]:
         del graph_walk, engine_inputs
@@ -273,6 +291,7 @@ class LMSubmodule(ARNodeSubmodule):
         threshold,
         block_sos,
         block_stop,
+        force_eos,
     ) -> torch.Tensor:
         hidden = self.model.hidden(input_embeds, label=LM_LABEL)
         if graph_walk in PREFILL_WALKS:
@@ -280,6 +299,7 @@ class LMSubmodule(ARNodeSubmodule):
         logits = self.model.logits(hidden)
         ids = torch.arange(logits.shape[-1], device=logits.device)[None, :]
         blocked = (block_sos & (ids == self.lm.sos_token)) | (block_stop & (ids >= self.lm.speech_token_size))
+        blocked = torch.where(force_eos, ids != self.lm.eos_token, blocked)
         return ras_sample(
             logits,
             seed=seed.reshape(-1),
@@ -294,11 +314,16 @@ class LMSubmodule(ARNodeSubmodule):
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
         tokens = self._forward(graph_walk, engine_inputs, **kwargs)
-        return {SPEECH_TOKENS: [tokens.reshape(-1)[:1]]}
+        return {SPEECH_TOKENS: [tokens.reshape(-1)[:1]], STEP_INDEX: [kwargs["step"].reshape(-1)[:1].clone()]}
 
     def forward_batched(self, graph_walk, engine_inputs, **kwargs) -> dict[str, NameToTensorList]:
         tokens = self._forward(graph_walk, engine_inputs, **kwargs).reshape(-1)
-        return {rid: {SPEECH_TOKENS: [tokens[i : i + 1]]} for i, rid in enumerate(engine_inputs.request_ids)}
+        # a copy: under graph replay ``step`` is the static input the next step overwrites
+        steps = kwargs["step"].reshape(-1).clone()
+        return {
+            rid: {SPEECH_TOKENS: [tokens[i : i + 1]], STEP_INDEX: [steps[i : i + 1]]}
+            for i, rid in enumerate(engine_inputs.request_ids)
+        }
 
     def postprocess(self, request_id, request_info, outputs, inputs: NodeInputs | None = None, **kwargs) -> None:
         del request_info, kwargs
@@ -314,10 +339,13 @@ class LMSubmodule(ARNodeSubmodule):
         if SPEECH_TOKENS not in outputs:
             return set()
         token = int(outputs[SPEECH_TOKENS][0].reshape(-1)[0].item())
+        # this step's own index, not ``generated``: a speculative next step may
+        # already have been postprocessed
+        generated = int(outputs[STEP_INDEX][0].reshape(-1)[0].item()) + 1
         state = self.request_state(request_id)
         ignore_eos = bool((request_info.step_metadata or {}).get("ignore_eos", False))
         stopped = not ignore_eos and token >= self.lm.speech_token_size
-        if stopped or int(state.get("generated", 0)) >= int(state["max_len"]):
+        if stopped or generated >= int(state["max_len"]):
             return {DECODE_LOOP}
         return set()
 
@@ -344,6 +372,7 @@ class LMSubmodule(ARNodeSubmodule):
             "threshold": torch.ones(1, device=device),
             "block_sos": torch.zeros(1, dtype=torch.bool, device=device),
             "block_stop": torch.zeros(1, dtype=torch.bool, device=device),
+            "force_eos": torch.zeros(1, dtype=torch.bool, device=device),
         }
         return [
             BatchedCudaGraphConfig(
