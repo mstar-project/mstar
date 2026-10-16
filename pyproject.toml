@@ -73,6 +73,13 @@ audio = [
     "soundfile",
 ]
 
+# Optional: the opt-in AudioSeal watermark on generated speech
+# (``audio_watermark`` in a deployment's model_kwargs; MIT code and weights).
+# 0.3 may change the streaming layers mstar.model.audio_watermark drives.
+audioseal = [
+    "audioseal>=0.2,<0.3",
+]
+
 # Optional: serve a deployment as a NVIDIA Dynamo backend
 # (python -m mstar.integrations.dynamo). Nothing outside
 # mstar/integrations/dynamo/ imports these.

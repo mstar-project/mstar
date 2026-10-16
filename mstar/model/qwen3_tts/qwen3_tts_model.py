@@ -66,6 +66,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.audio_watermark import AudioSealWatermarker, AudioWatermarkConfig, import_audioseal
 from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
@@ -383,6 +384,12 @@ class Qwen3TTSModel(Model):
         # codec decoder's dtype. float32 reproduces the reference decoder
         # bit for bit; bfloat16 roughly halves the codec's GPU time.
         self.codec_dtype = codec_dtype(kwargs.get("codec_dtype", "float32"))
+        # Server-init knob: opt-in AudioSeal watermark on the codec's output
+        # (``mstar.model.audio_watermark``). Checked here so a missing package
+        # fails the server at startup, not at the first request.
+        self.audio_watermark = AudioWatermarkConfig.parse(kwargs.get("audio_watermark"))
+        if self.audio_watermark.enabled:
+            import_audioseal()
 
         # The lightweight API-side object needs config and tokenizer only.
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
@@ -1179,7 +1186,9 @@ class Qwen3TTSModel(Model):
         decoder.eval()
         if self.codec_dtype != torch.float32:
             decoder.to(dtype=self.codec_dtype)
-        return CodecSubmodule(decoder, self.config)
+        watermark = getattr(self, "audio_watermark", AudioWatermarkConfig())
+        watermarker = AudioSealWatermarker.build(watermark, device) if watermark.enabled else None
+        return CodecSubmodule(decoder, self.config, watermarker=watermarker)
 
     def _create_ref_encoder_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
