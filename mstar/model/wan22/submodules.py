@@ -588,6 +588,12 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
     via ``torch.cuda.mem_get_info``; ``config.vae_decode_tiling`` /
     ``WAN22_VAE_DECODE_TILING`` force either path; the chosen path is logged per
     request. The tiled/untiled numeric gap is priced by the tiled-vs-untiled test.
+
+    With ``config.vae_decode_fast`` the untiled path runs the shared Wan VAE
+    decoder (``mstar.model.components.wan_vae``) instead of ``vae.decode``:
+    the same per-latent decoder calls from an empty cache, on channels-last
+    weights and activations, compiled. The engine still never wraps the
+    forward; only the decoder's steady-state call is compiled.
     """
 
     disable_torch_compile = True
@@ -605,6 +611,15 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
         # ``_create_submodule`` before any submodule is constructed.
         self.vae = vae.to(self._decode_dtype())
         self._record_fp32_islands()
+        self._fast_step = None
+        if config.vae_decode_fast:
+            from mstar.model.components import wan_vae
+
+            # Before the compile traces the decoder; this VAE instance is the
+            # decoder node's own.
+            wan_vae.to_channels_last(self.vae)
+            self._fast_step = wan_vae.DecoderStep(self.vae, compile=True)
+            logger.info("Wan2.2 VAE decode: untiled path on the shared Wan VAE decoder (channels-last, compiled)")
 
     def _decode_dtype(self):
         # TODO: pull conv3d-dtype resolution into a common helper shared with
@@ -721,6 +736,12 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
             )
             if tiled:
                 video = vae.tiled_decode(latents, return_dict=False)[0]
+            elif self._fast_step is not None:
+                from mstar.model.components import wan_vae
+
+                video = wan_vae.decode_causal(
+                    vae, latents, wan_vae.new_feat_cache(vae), self._fast_step, clip_start=True,
+                )
             else:
                 video = vae.decode(latents, return_dict=False)[0]
             # Quantize to 8-bit at the worker boundary (see class docstring).

@@ -180,6 +180,9 @@ class DecoderStep:
     def __call__(self, x: torch.Tensor, feat_cache: list, first_chunk: bool = False) -> torch.Tensor:
         if not self.compiled or first_chunk or any(isinstance(t, str) for t in feat_cache):
             return self._decoder(x, feat_cache=feat_cache, feat_idx=[0], first_chunk=first_chunk)
+        # A slice of a clip keeps the clip's batch stride, which the compiled
+        # graph guards on: without this, every new clip length recompiles.
+        x = _compact(x)
         if x.dtype == torch.bfloat16:
             key = (tuple(x.shape), x.stride(), _cache_signature(feat_cache))
             if key not in self._warmed:

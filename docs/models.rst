@@ -756,10 +756,16 @@ corrector's ``last_sample``) is carried on the denoise loop's own edges, so it
 travels with the request rather than living in a scheduler object on one rank.
 Requests are therefore independent and the loop is resumable across ranks.
 
-**Nothing is accelerated by default.** wan22 serves the DiT eager: no
-``torch.compile``, no CUDA-graph capture, no continuous batching, no component
-offload, and the VAE decode is always tiled (which bounds its workspace so the
-untiled conv3d cannot OOM a 32 GiB card).
+**What is accelerated by default.** The DiT runs under ``torch.compile``
+(``compile_dit``) and the untiled VAE decode runs the shared Wan VAE decoder,
+channels-last and compiled (``vae_decode_fast``; set it to ``false`` under the
+yaml's ``model_kwargs`` for stock ``vae.decode``). Both compile on first use:
+the DiT once per resolution, frame count and CFG setting, the VAE decode once
+per resolution, so the first request at a new size is slower. The VAE decode
+tiles only when free VRAM at decode time is short of the untiled estimate
+(the ``auto`` policy; ``WAN22_VAE_DECODE_TILING`` forces a path), which keeps the untiled conv3d from OOMing a
+32 GiB card. No CUDA-graph capture, no continuous batching (one request per
+step) and no component offload.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------
