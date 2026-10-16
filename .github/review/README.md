@@ -1,14 +1,14 @@
 # Automated PR review
 
-An advisory LLM reviewer runs on contributors' non-draft PRs. It posts each finding as an inline comment, tagged P0-P3, plus one summary comment that covers the PR description and any open questions, and it updates that summary on each run. It is not a merge gate and does not submit GitHub reviews.
+An advisory LLM reviewer runs on non-draft PRs, including PRs from forks. It posts each finding as an inline comment, tagged P0-P3, plus one summary comment that covers the PR description and any open questions, and it updates that summary on each run. It is not a merge gate and does not submit GitHub reviews.
 
-"Contributor" means GitHub's author association `OWNER`, `MEMBER`, `COLLABORATOR` or `CONTRIBUTOR`: the team, plus anyone who has had a PR merged here. First-time contributors get no automatic review; a contributor can comment `/review` on their PR to run one.
+Only someone with write access to this repo can trigger it; the workflow checks the triggering user's actual permission. A PR opened by someone without write access gets no automatic review, but anyone with write access can comment `/review` on it.
 
 | Trigger | Mode |
 | --- | --- |
-| A contributor opens, reopens or marks ready a non-draft PR | `light` (P0-P2), once |
-| A contributor comments exactly `/review` on a PR | `light`, e.g. to re-review after pushes |
-| A contributor comments exactly `/review thorough`, or someone with triage access applies the `ai-review-thorough` label | `thorough` (also P3 improvements and design questions) |
+| Someone with write access opens, reopens or marks ready a non-draft PR | `light` (P0-P2), once |
+| Someone with write access comments exactly `/review` on a PR | `light`, e.g. to re-review after pushes |
+| Someone with write access comments exactly `/review thorough`, or applies the `ai-review-thorough` label | `thorough` (also P3 improvements and design questions) |
 
 Pushes don't trigger a review on their own. The `skip-ai-review` label turns off the automatic run; an explicit `/review` still runs.
 
@@ -67,7 +67,7 @@ Even then, prefer keeping it advisory: a non-deterministic check shouldn't have 
 
 ## Cost control
 
-Current levers, roughly in order of effect: only contributors' PRs are reviewed automatically, once per PR rather than per push (re-reviews are on request with `/review`); draft PRs are skipped; `concurrency` cancels a run superseded by a newer one on the same PR; in light mode, diffs over about 4,000 lines are triaged rather than covered in full; `--max-turns 40` caps a runaway session. The model is pinned to Opus in the workflow; drop to Sonnet if cost matters more than recall and replay shows it catching the same defects.
+Current levers, roughly in order of effect: only people with write access can trigger a review, once per PR rather than per push (re-reviews are on request with `/review`); draft PRs are skipped; `concurrency` cancels a run superseded by a newer one on the same PR; in light mode, diffs over about 4,000 lines are triaged rather than covered in full; `--max-turns 40` caps a runaway session. The model is pinned to Opus in the workflow; drop to Sonnet if cost matters more than recall and replay shows it catching the same defects.
 
 ## Threat model
 

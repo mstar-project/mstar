@@ -1,11 +1,11 @@
 name: Claude Review
 
-# Advisory LLM review of contributors' PRs. Not a merge gate. Rules live in AGENTS.md;
+# Advisory LLM review of PRs. Not a merge gate. Rules live in AGENTS.md;
 # the reviewer's operating instructions are in .github/review/review-prompt.md.
 #
 # Why pull_request_target: a plain `pull_request` trigger withholds secrets from
-# fork PRs, so the reviewer would silently never run for outside contributors --
-# exactly the people it is for. pull_request_target runs with secrets, and uses
+# fork PRs, so the reviewer could never review a fork's code. pull_request_target
+# runs with secrets, and uses
 # the workflow file from the PR's *base branch*, never the PR's version. For a PR
 # into main that is main's; for a stacked PR it is the base branch's copy, which
 # may be old or missing (then use /review, which always runs main's).
@@ -27,16 +27,17 @@ name: Claude Review
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
 
-# Who can trigger it: GitHub author_association OWNER, MEMBER, COLLABORATOR or
-# CONTRIBUTOR, i.e. the team plus anyone who has had a PR merged here. First-time
-# contributors and strangers get no automatic review (cost, spam); a maintainer
-# can still comment /review on their PR.
+# Who can trigger it: only someone with write access to this repo (write,
+# maintain or admin), checked against their actual permission in the preflight.
+# The PR itself can come from anywhere, forks included. A PR opened by someone
+# without write access gets no automatic review; anyone with write access can
+# comment /review on it.
 #
-# When it runs:
-#   - light, once, when a contributor opens, reopens or readies a non-draft PR;
-#   - light, when a contributor comments `/review` on a PR (re-review after pushes);
-#   - thorough, when a contributor comments `/review thorough`, or someone with
-#     triage access applies the `ai-review-thorough` label.
+# When it runs (the actor must have write access in every case):
+#   - light, once, when they open, reopen or ready a non-draft PR;
+#   - light, when they comment `/review` on a PR (re-review after pushes);
+#   - thorough, when they comment `/review thorough`, or apply the
+#     `ai-review-thorough` label.
 # Pushes don't trigger a review on their own; comment /review for that.
 #
 # issue_comment also runs with secrets and the default branch's workflow file,
@@ -63,18 +64,20 @@ jobs:
     # preflight below, which is the same protection and visible in the log
     # rather than a silently skipped job. It also means a fork that *does* set
     # the key gets reviews, which is how you test changes to this workflow.
+    #
+    # This only filters events cheaply. Who may trigger a run is decided by the
+    # preflight's permission check (author_association can't tell write access
+    # from read: a COLLABORATOR may have read only).
     if: >-
       (github.event_name == 'pull_request_target' &&
        !github.event.pull_request.draft &&
        !contains(github.event.pull_request.labels.*.name, 'skip-ai-review') &&
-       ((github.event.action == 'labeled' && github.event.label.name == 'ai-review-thorough') ||
-        (github.event.action != 'labeled' &&
-         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association))))
+       (github.event.action != 'labeled' || github.event.label.name == 'ai-review-thorough'))
       ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
        (github.event.comment.body == '/review' || github.event.comment.body == '/review thorough') &&
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.comment.author_association))
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     # Job-level, so an unrelated PR comment (which still starts a workflow run
     # that this `if` skips) can never cancel a review in progress.
     concurrency:
@@ -92,18 +95,28 @@ jobs:
     steps:
       # Secrets can't be tested in a job-level `if`, so short-circuit here
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
-      # failing a check on every PR.
+      # failing a check on every PR. Then the gate on who may trigger a run:
+      # the actor (who opened, readied, labeled or commented) needs write
+      # access. Anyone else exits green with a notice.
       - name: Preflight
         id: pre
         env:
           KEY_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          ACTOR: ${{ github.actor }}
         run: |
           if [ "$KEY_SET" != "true" ]; then
             echo "::warning::ANTHROPIC_API_KEY is not set; skipping the review."
             echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          perm=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission 2> /dev/null || echo none)
+          case "$perm" in
+            admin|maintain|write)
+              echo "run=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::notice::$ACTOR has '$perm' access, not write; only people with write access can trigger a review."
+              echo "run=false" >> "$GITHUB_OUTPUT" ;;
+          esac
 
       # Tell the commenter their /review was picked up; a comment-triggered run
       # is otherwise invisible from the PR.
@@ -224,11 +237,6 @@ jobs:
           # action tries to mint a Claude GitHub App token over OIDC, which needs
           # `id-token: write` and the app installed, and fails before reviewing.
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          # The action refuses an issue_comment from anyone without write access
-          # to the repo, which would make /review a silent no-op for outside
-          # contributors. The job's `if` already limits who can trigger a run,
-          # and the model's only write path is comments (rule 4).
-          allowed_non_write_users: "*"
           prompt: |
             Read .github/review/review-prompt.md from the repository root and follow it
             exactly. It defines your trust boundary, your method, your reporting bar and
