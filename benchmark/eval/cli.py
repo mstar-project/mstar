@@ -85,7 +85,8 @@ def _add_report(sub) -> None:
     p.add_argument("--chart-metrics", default=None, help="comma-separated metrics for the chart")
     p.add_argument("--metrics", default=None, help="comma-separated table columns (metric names)")
     p.add_argument("--title", default=None)
-    p.add_argument("--chart-judge", default=None, help="fdb: judge whose label shares the chart shows")
+    p.add_argument("--chart-judge", default=None,
+                   help="fdb: comma-separated judges whose label shares the chart shows (default: all)")
 
 
 def _add_rescore(sub) -> None:
@@ -241,7 +242,8 @@ def cmd_report(args) -> None:
         else:
             print(table)
         if args.chart:
-            fdb_report.render_chart(results, args.chart, args.chart_judge, args.title)
+            judges = args.chart_judge.split(",") if args.chart_judge else None
+            fdb_report.render_chart(results, args.chart, judges, args.title)
             print(f"wrote {args.chart}", file=sys.stderr)
         return
     known = {c.metric: c for cols in COLUMNS.values() for c in cols}

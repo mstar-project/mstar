@@ -234,6 +234,30 @@ def test_transport_retries_rate_limits_with_backoff_and_counts_usage():
     assert seeds == [1]
 
 
+def test_truncated_responses_are_retried_on_the_same_seed():
+    import http.client
+
+    for caller in ("behavior", "semantic"):
+        seeds = []
+        content = ('{"behaviour": ["C_RESUME"]}' if caller == "behavior"
+                   else '{"assessments": []}')
+
+        def post(url, body, headers, timeout, seeds=seeds, content=content):
+            seeds.append(body.get("seed"))
+            if len(seeds) == 1:
+                raise http.client.IncompleteRead(b"partial", 10)
+            return {"model": "m", "choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
+
+        judge = llm_judge.Judge("j", "local", "http://127.0.0.1:1/v1", "m", post=post, sleep=lambda s: None)
+        if caller == "behavior":
+            t = {k: {"text": k, "chunks": []} for k in ("input", "clean_input", "output", "clean_output")}
+            res = llm_judge.behavior_label(judge, _behavior(), t, sleep=lambda s: None)
+            assert (res["status"], res["seed"], seeds) == ("valid", 1, [1, 1])
+        else:
+            assert llm_judge.submit(judge, {"seed": 1}) == {"assessments": []} and seeds == [1, 1]
+        assert judge.usage["retries"] == 1
+
+
 def test_malformed_replies_never_raise_their_content():
     secret = "Bearer SYNTHETIC-VALUE"
 

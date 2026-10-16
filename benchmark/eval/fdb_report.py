@@ -91,19 +91,21 @@ def render(results: list[RunResult]) -> str:
     return "\n".join(out)
 
 
-def render_chart(results: list[RunResult], path: str | Path, judge: str | None = None,
+def render_chart(results: list[RunResult], path: str | Path, judges: list[str] | None = None,
                  title: str | None = None) -> Path:
-    """Per-category stop and response latency (mean +- std over repeats) and the label shares
-    of one judge (default: the first), one row of panels per results file."""
+    """Per-category stop and response latency (mean +- std over repeats), then the label
+    shares of each judge (default: every judge of the run), one row of panels per file."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     cats = [g for g in GROUPS if g != "all"]
-    fig, axes = plt.subplots(len(results), 2, figsize=(12, 4.2 * len(results)), squeeze=False)
+    per_row = [judges or judges_of(r) or [None] for r in results]
+    cols = 1 + max(len(js) for js in per_row)
+    fig, axes = plt.subplots(len(results), cols, figsize=(6 * cols, 4.2 * len(results)), squeeze=False)
     colors = {"C_RESPOND": "#4C72B0", "C_RESUME": "#55A868", "C_UNCERTAIN_HANDLING": "#DD8452", "C_UNKNOWN": "#C44E52"}
-    for row, r in zip(axes, results, strict=True):
+    for row, r, js in zip(axes, results, per_row, strict=True):
         ax = row[0]
         width = 0.38
         for k, (kind, color) in enumerate((("stop", "#8172B3"), ("response", "#937860"))):
@@ -121,25 +123,27 @@ def render_chart(results: list[RunResult], path: str | Path, judge: str | None =
         ax.set_title(f"{r.label}: stop and response latency")
         ax.legend(fontsize=8, ncol=2, loc="upper center")
         ax.grid(axis="y", alpha=0.3)
-        ax = row[1]
-        j = judge or next(iter(judges_of(r)), None)
-        if j is None:
+        for ax in row[len(js) + 1:]:
             ax.set_axis_off()
-            ax.text(0.5, 0.5, "no judge labels", ha="center")
-            continue
-        bottoms = [0.0] * len(cats)
-        for lab in C_LABELS:
-            vals = [100 * ((r.summary.get(f"{c}.{j}.{lab}") or {}).get("mean") or 0) for c in cats]
-            ax.bar(range(len(cats)), vals, 0.6, bottom=bottoms, color=colors[lab], label=SHORT[lab])
-            for i, (v, b) in enumerate(zip(vals, bottoms, strict=True)):
-                if v >= 6:
-                    ax.text(i, b + v / 2, f"{v:.0f}%", ha="center", va="center", fontsize=7, color="white")
-            bottoms = [b + v for b, v in zip(bottoms, vals, strict=True)]
-        ax.set_xticks(range(len(cats)), [c.replace("_", "\n") + f"\n(want {DESIRED[c]})" for c in cats], fontsize=8)
-        ax.set_ylim(0, 100)
-        ax.set_ylabel("% of judged pairs")
-        ax.set_title(f"{r.label}: behavior labels (judge {j})")
-        ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.0, 1.0))
+        for ax, j in zip(row[1:], js, strict=False):
+            if j is None:
+                ax.set_axis_off()
+                ax.text(0.5, 0.5, "no judge labels", ha="center")
+                continue
+            bottoms = [0.0] * len(cats)
+            for lab in C_LABELS:
+                vals = [100 * ((r.summary.get(f"{c}.{j}.{lab}") or {}).get("mean") or 0) for c in cats]
+                ax.bar(range(len(cats)), vals, 0.6, bottom=bottoms, color=colors[lab], label=SHORT[lab])
+                for i, (v, b) in enumerate(zip(vals, bottoms, strict=True)):
+                    if v >= 6:
+                        ax.text(i, b + v / 2, f"{v:.0f}%", ha="center", va="center", fontsize=7, color="white")
+                bottoms = [b + v for b, v in zip(bottoms, vals, strict=True)]
+            ax.set_xticks(range(len(cats)), [c.replace("_", "\n") + f"\n(want {DESIRED[c]})" for c in cats],
+                          fontsize=8)
+            ax.set_ylim(0, 100)
+            ax.set_ylabel("% of judged pairs")
+            ax.set_title(f"{r.label}: behavior labels (judge {j})")
+        row[len(js)].legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.0, 1.0))
     fig.suptitle(title or provenance(results), fontsize=9)
     fig.tight_layout()
     path = Path(path)

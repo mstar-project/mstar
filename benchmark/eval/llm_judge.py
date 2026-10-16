@@ -27,6 +27,7 @@ the run is not graded (a rubric check, not a measure of judge accuracy).
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import random
@@ -127,7 +128,7 @@ class Judge:
                     if float(after) > RETRY_AFTER_MAX_S:
                         raise TransportError(error) from None
                     wait = float(after)  # a minimum, so never shortened
-            except (urllib.error.URLError, OSError) as exc:
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:  # incl. truncated bodies
                 error, retry = type(exc).__name__, True
             except ValueError as exc:  # an unparseable body is the reply's problem, not the transport's
                 raise JudgeError(type(exc).__name__) from None
