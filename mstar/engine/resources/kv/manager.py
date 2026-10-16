@@ -464,6 +464,15 @@ class KVManager(AttentionResource):
             PinnedIndexRing() if kv_pinned_indptrs() and torch.cuda.is_available() else None
         )
         self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
+        # A read-only step (every segment span 0, e.g. a decoder attending an
+        # encoder context it wrote at prefill) plans the same as the last one
+        # while its segments are the same and nothing touched the streams:
+        # (key, plan), bumped like `_plan_epoch` plus by any commit that wrote.
+        self._readonly_epoch = 0
+        self._readonly_plan: tuple | None = None
+        # (slot, label) -> the plan output whose state that slot's static
+        # buffers hold, so a reused plan skips re-staging them
+        self._staged_outputs: dict[tuple, KVPlanOutput] = {}
         self._current_plan_states: dict[str, KVPlanState] = {}
         self.reset_default_cursors()
 
@@ -1464,6 +1473,7 @@ class KVManager(AttentionResource):
                     lease.bucket.num_tokens,
                     pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
                 )
+                self._staged_outputs[(lease.slot, label)] = indptrs
                 if ctx.is_preplan:
                     self._preplan_states[label] = plan_state
                 else:
@@ -1481,6 +1491,7 @@ class KVManager(AttentionResource):
                 static_state = self._static_plan_state(lease.slot, label)
                 static_state.copy_(plan_state, lease.bucket.num_tokens)
                 plan_state = static_state
+                self._staged_outputs[(lease.slot, label)] = indptrs
             if ctx.is_preplan:
                 self._preplan_states[label] = plan_state
             else:
@@ -1495,10 +1506,44 @@ class KVManager(AttentionResource):
             views=views,
         )
 
+    @staticmethod
+    def _is_readonly(step: KVStep, ctx: StepContext) -> bool:
+        return (
+            not ctx.is_preplan and not ctx.capture and bool(step.segments)
+            and not step.pre_forks and not step.post_forks
+            and all(seg.span == 0 for seg in step.segments)
+        )
+
+    def _readonly_key(self, step: KVStep, ctx: StepContext) -> tuple:
+        lease = ctx.slot_lease
+        return (
+            tuple(step.segments), lease.bucket if lease is not None else None,
+            self._plan_epoch, self._readonly_epoch,
+        )
+
+    def _reuse_readonly_plan(self, step: KVStep, ctx: StepContext) -> "KVPlanOutputs | None":
+        """The last read-only step's plan, when this step is the same read-only
+        step over untouched streams. Its views and indptrs are reused as they
+        are, and a slot whose static buffers already hold it is not re-staged."""
+        cached = self._readonly_plan
+        if cached is None or not self._is_readonly(step, ctx) or cached[0] != self._readonly_key(step, ctx):
+            return None
+        res = cached[1]
+        lease = ctx.slot_lease
+        if lease is not None and all(
+            self._staged_outputs.get((lease.slot, label)) is out for label, out in res.items()
+        ):
+            for label in res:
+                self._current_plan_states[label] = self._static_plan_state(lease.slot, label)
+        else:
+            self._setup_plan_states(res, ctx, lease)
+        return res
+
     def _touch_plan_cache(self, rid: str | None = None) -> None:
         """A stream of ``rid`` (any stream, when None) changed other than by a
         commit: the plan cache no longer describes the streams if it holds
         that request."""
+        self._readonly_epoch += 1
         cache = self._decode_plan_cache
         if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
@@ -1795,6 +1840,10 @@ class KVManager(AttentionResource):
             # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
 
+        reused = self._reuse_readonly_plan(step, ctx)
+        if reused is not None:
+            return reused
+
         # Forks run ahead of the views, which record length and generation;
         # staging only reads what the fork will land.
         if ctx.is_preplan:
@@ -1832,6 +1881,8 @@ class KVManager(AttentionResource):
                 if self._plan_cache_mode and not pending:
                     self._remember_decode_plan(step, ctx, res)
         self._setup_plan_states(res, ctx, ctx.slot_lease)
+        if self._is_readonly(step, ctx):
+            self._readonly_plan = (self._readonly_key(step, ctx), res)
         if ctx.is_preplan:
             self._preplan_key = self._plan_key(step, ctx)
             self._preplanned = True
@@ -1892,6 +1943,8 @@ class KVManager(AttentionResource):
                 self._plan_epoch += 1
         if not step.commit:
             self._plan_epoch += 1
+        if any(seg.span for seg in step.segments):
+            self._readonly_epoch += 1
         # the index only sees real rows of a non-capture step; checked once
         index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread

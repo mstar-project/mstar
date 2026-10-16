@@ -106,6 +106,12 @@ class FlashInferCrossManager(CrossAttentionManager):
         # NOTE: a little bit (very) sketchy should be refined; goal is to avoid
         # redundant plan comp. how to do the mapping to track is another issue
         self._plan_keys: dict[Any, PlanCacheKey] = {}
+        # wrapper key -> (context plan output, request ids, qo_indptr) of the
+        # last plan on that wrapper. The context's KV manager hands back the
+        # same plan object while the context streams are untouched (a
+        # read-only step's plan is reused), so the same object over the same
+        # query rows plans to the same arrays: skip building them.
+        self._plan_inputs: dict[Any, tuple] = {}
 
         self._kv_config = kv_config
         self._wrapper_kv_kwargs = dict(
@@ -159,18 +165,26 @@ class FlashInferCrossManager(CrossAttentionManager):
             self._preplanned = False
             return
 
-        context_views = self._context_views(ctx)
+        context_out = self._context_output(ctx)
+        context_views = None
         # a preplan leases a different cg slot, so its wrappers and workspaces
         # are disjoint from the ones the in-flight forward reads
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
         for plan_label, packing in self._query_packings(step, ctx).items():
-            indptrs = self._build_indptrs(packing, context_views, plan_label)
             state_key, wrapper = self._wrapper_for(
-                plan_label, lease, num_rows=indptrs.qo_indptr.shape[0] - 1,
+                plan_label, lease, num_rows=packing.qo_indptr.shape[0] - 1,
                 slot=ctx.slot,
             )
+            inputs = (tuple(packing.request_ids), tuple(packing.qo_indptr.tolist()))
+            last = self._plan_inputs.get(state_key)
+            if last is not None and last[0] is context_out and last[1:] == inputs:
+                plan_states[plan_label] = wrapper
+                continue
+            if context_views is None:
+                context_views = {view.request_id: view for view in context_out.views}
+            indptrs = self._build_indptrs(packing, context_views, plan_label)
 
             # The context pages are immutable once written, so between steps
             # only the query side moves; when neither moved the whole plan is
@@ -191,6 +205,7 @@ class FlashInferCrossManager(CrossAttentionManager):
                     **indptrs.to_kwargs_dict()
                 )
                 self._plan_keys[state_key] = plan_key
+            self._plan_inputs[state_key] = (context_out, *inputs)
             plan_states[plan_label] = wrapper
 
         self._preplanned = ctx.is_preplan
@@ -200,11 +215,10 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._preplanned = False
         self._preplan_states = {}
 
-    def _context_views(self, ctx: StepContext) -> dict[str, SequenceView]:
-        """context stream of each request in batch by request id
-
-        key by request rather than zip with query view because not
-        necessarily same length"""
+    def _context_output(self, ctx: StepContext):
+        """The context label's KV plan output (its views are each request's
+        context stream; key by request rather than zip with the query rows,
+        which need not line up)."""
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(
             self._kv_cache_name
         )
@@ -218,7 +232,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             "that attends the context must declare a zero-span segment on "
             f"that label. planned: {sorted(plan_outputs)}"
         )
-        return {view.request_id: view for view in kv_out.views}
+        return kv_out
 
     def _query_packings(
         self, step: AttentionStep, ctx: StepContext
