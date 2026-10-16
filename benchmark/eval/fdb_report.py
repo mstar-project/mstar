@@ -105,8 +105,8 @@ def render_chart(results: list[RunResult], path: str | Path, judge: str | None =
             ax.bar(xs, [v.get("mean") or 0 for v in s], width, yerr=[v.get("std") or 0 for v in s], capsize=3,
                    color=color, label=f"{kind} latency")
             for x, v in zip(xs, s, strict=True):
-                if v.get("mean") is not None:
-                    ax.text(x, v["mean"] + (v.get("std") or 0) + 0.03, f"{v['mean']:.2f}", ha="center", fontsize=7)
+                label = "n/a" if v.get("mean") is None else f"{v['mean']:.2f}"
+                ax.text(x, (v.get("mean") or 0) + (v.get("std") or 0) + 0.03, label, ha="center", fontsize=7)
         ax.set_xticks(range(len(cats)), [c.replace("_", "\n") for c in cats], fontsize=8)
         ax.set_ylabel("seconds (pooled intervals)")
         ax.set_title(f"{r.label}: stop and response latency")

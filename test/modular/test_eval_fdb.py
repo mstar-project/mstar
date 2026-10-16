@@ -111,6 +111,8 @@ def test_window_cuts_or_pads_to_the_input_length_and_native_text_stops_at_T():
     assert len(y) == 8000 and after
     y, after = duplex_fdb.window(pcm, 22050, 24000)
     assert len(y) == 24000 and not after and np.all(y[17000:] == 0)
+    tail_silent = (np.r_[np.ones(11025), np.zeros(11025)].astype("<i2") * 1000).tobytes()
+    assert duplex_fdb.window(tail_silent, 22050, 12000)[1] is False  # only the idle tail of the last frame
     assert duplex_fdb.native_text(["<s>", "Hi", " there", "<pad>", " late"], 0.08, 0.3) == "Hi there"
 
 

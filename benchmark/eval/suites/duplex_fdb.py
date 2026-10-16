@@ -62,6 +62,8 @@ VARIANTS = (("overlap", "input", "output"), ("clean", "clean_input", "clean_outp
 SEMANTIC_AXES = (*AXES, "joint")
 # Model speech ending this close to T counts as still playing at the cutoff (sglang-omni's EOF tolerance).
 EOF_TOLERANCE_S = 0.05
+# Output after T below this peak (-40 dBFS) is the codec's idle floor, not more reply.
+SILENCE_PEAK = 0.01
 
 
 # --- metric definitions (pure, unit tested) ---------------------------------------------------
@@ -132,10 +134,11 @@ def fdb_metrics(rows: list[dict[str, Any]], judges: list[str], semantic: bool) -
 
 def window(pcm: bytes, rate: int, n: int) -> tuple[np.ndarray, bool]:
     """The output over ``[0, T]`` at 16 kHz with exactly ``n`` samples (cut or padded with
-    silence), and whether any audio came after T."""
+    silence), and whether the model produced audible output after T. The last frame usually
+    runs past T (the input is not a whole number of frames); its silence does not count."""
     y = resample(pcm16_to_float(pcm), rate, RATE)
-    after = len(y) > n
-    y = y[:n] if after else np.concatenate([y, np.zeros(n - len(y), dtype=np.float32)])
+    after = len(y) > n and float(np.abs(y[n:]).max()) > SILENCE_PEAK
+    y = y[:n] if len(y) >= n else np.concatenate([y, np.zeros(n - len(y), dtype=np.float32)])
     return y, after
 
 
