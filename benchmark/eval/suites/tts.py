@@ -23,7 +23,7 @@ import aiohttp
 from benchmark.eval import judges, stats
 from benchmark.eval.audio import parse_wav_header, pcm16_to_float, playback_stalls, read_wav, write_wav
 from benchmark.eval.datasets import Item
-from benchmark.eval.suites.base import Suite, data_url, error_row, parse_extra
+from benchmark.eval.suites.base import Suite, data_url, error_row, exception_row, parse_extra
 from benchmark.eval.text_metrics import error_rate, get_normalizer
 
 ENGINES = ("mstar", "vllm-omni", "sglang-omni")
@@ -113,7 +113,7 @@ class TTSSuite(Suite):
             timeout = aiohttp.ClientTimeout(total=a.timeout, sock_read=a.timeout)
             async with session.post(f"{url}/v1/audio/speech", json=body, timeout=timeout) as resp:
                 if resp.status != 200:
-                    return error_row(item, f"HTTP {resp.status}: {(await resp.text())[:200]}")
+                    return error_row(item, f"HTTP {resp.status}", await resp.text())
                 async for chunk in resp.content.iter_any():
                     now = time.perf_counter() - t0
                     if not header_done:
@@ -121,7 +121,7 @@ class TTSSuite(Suite):
                         fmt = parse_wav_header(bytes(prefix))
                         if fmt is None:
                             if len(prefix) > 4096:
-                                return error_row(item, "response is not a WAV stream")
+                                return error_row(item, "not a WAV stream", repr(bytes(prefix[:64])))
                             continue
                         rate, channels, header_done = fmt.sample_rate, fmt.channels, True
                         chunk = bytes(prefix[fmt.data_offset :])
@@ -133,7 +133,7 @@ class TTSSuite(Suite):
                     pcm.extend(chunk)
                     timeline.append((now, (len(pcm) // (2 * channels) - before) / rate))
         except Exception as exc:  # noqa: BLE001 - every failure is an error row
-            return error_row(item, f"{type(exc).__name__}: {exc}")
+            return exception_row(item, exc)
         e2e = time.perf_counter() - t0
         audio = pcm16_to_float(bytes(pcm), channels)
         audio_s = len(audio) / rate

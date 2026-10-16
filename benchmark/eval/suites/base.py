@@ -53,8 +53,15 @@ class Suite:
         raise NotImplementedError
 
 
-def error_row(item: Item, error: str, **extra: Any) -> dict[str, Any]:
-    return {"id": item.id, "ok": False, "error": error[:300], **extra}
+def error_row(item: Item, error: str, detail: str | None = None, **extra: Any) -> dict[str, Any]:
+    """A failed request. ``error`` is a fixed category (``HTTP 503``, an exception type, ...)
+    and is all a results file keeps; ``detail`` (server bodies, exception text, which can
+    carry addresses, paths or reflected input) goes only to the run's local error log."""
+    return {"id": item.id, "ok": False, "error": error, "_detail": detail, **extra}
+
+
+def exception_row(item: Item, exc: BaseException) -> dict[str, Any]:
+    return error_row(item, type(exc).__name__, f"{type(exc).__name__}: {exc}")
 
 
 def data_url(path: str) -> str:

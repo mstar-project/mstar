@@ -38,7 +38,7 @@ import numpy as np
 from benchmark.eval import stats
 from benchmark.eval.audio import pcm16_to_float, read_wav, speech_segments, write_wav
 from benchmark.eval.datasets import Item
-from benchmark.eval.suites.base import Suite, error_row
+from benchmark.eval.suites.base import Suite, error_row, exception_row
 
 CATEGORIES = ("turn_taking", "interruption")
 
@@ -154,15 +154,16 @@ class DuplexSuite(Suite):
             timeout = aiohttp.ClientTimeout(total=a.timeout)
             async with session.post(f"{url}/generate", data=form, timeout=timeout) as resp:
                 if resp.status != 200:
-                    return error_row(item, f"HTTP {resp.status}: {(await resp.text())[:200]}")
+                    return error_row(item, f"HTTP {resp.status}", await resp.text())
                 async for raw in resp.content:
                     line = raw.strip()
                     if not line:
                         continue
                     msg = json.loads(line)
-                    if "error" in msg or msg.get("modality") == "error":
-                        return error_row(item, f"stream error: {str(msg)[:200]}")
                     data = base64.b64decode(msg["data"]) if msg.get("data") else b""
+                    if "error" in msg or msg.get("modality") == "error":
+                        detail = f"{msg.get('error', '')} {data.decode('utf-8', 'replace')}"
+                        return error_row(item, "stream error", detail)
                     if msg.get("modality") == "text":
                         token = data.decode("utf-8", "replace")
                         if first_frame_wall is None:
@@ -175,7 +176,7 @@ class DuplexSuite(Suite):
                         rate = int((msg.get("metadata") or {}).get("sample_rate", rate))
                         pcm.extend(data)
         except Exception as exc:  # noqa: BLE001 - every failure is an error row
-            return error_row(item, f"{type(exc).__name__}: {exc}")
+            return exception_row(item, exc)
         e2e = time.perf_counter() - t0
         if frames == 0:
             return error_row(item, "no frames", e2e_s=e2e)

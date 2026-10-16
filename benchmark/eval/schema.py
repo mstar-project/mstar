@@ -149,8 +149,12 @@ def redact_url(url: str | None) -> str | None:
 _SECRET = re.compile(
     r"TOKEN|SECRET|PASSW|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|AUTH|CREDENTIAL|COOKIE|SESSION", re.IGNORECASE
 )
+# Keys whose values name a machine; their values are kept only when loopback.
+_HOSTLIKE = re.compile(r"HOST|ADDR|ENDPOINT|URL|URI|DOMAIN|SERVER|PEER|(^|_)IP($|_)", re.IGNORECASE)
 _URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]+")
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_IPV6 = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
+_HOME = re.compile(r"/(?:home|Users)/[^/\s'\"]+")
 _URL_FLAGS = {"--url"}
 _PAIR_FLAGS = {"--serve-env", "--extra"}
 _CMD_FLAGS = {"--serve-cmd"}
@@ -158,30 +162,65 @@ _HOST_FLAGS = {"--host", "--hostname", "--server", "--endpoint", "--address", "-
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
+def _ipv6(m: re.Match) -> str:
+    text = m.group(0)
+    # Clock times ("07:02:51") look like IPv6; a real address has "::" or a hex letter.
+    if text in _LOCAL_HOSTS or not ("::" in text or re.search(r"[A-Fa-f]", text)):
+        return text
+    return "<ip>"
+
+
 def _scrub(text: str) -> str:
-    """Home paths to ``~``, non-loopback URLs and IPv4 literals redacted."""
-    text = text.replace(os.path.expanduser("~"), "~")
+    """Home paths (anyone's) to ``~``; non-loopback URLs, IPv4 and IPv6 literals redacted."""
+    text = _HOME.sub("~", text.replace(os.path.expanduser("~"), "~"))
     text = _URL.sub(lambda m: redact_url(m.group(0)) or "", text)
-    return _IPV4.sub(lambda m: m.group(0) if m.group(0) in _LOCAL_HOSTS else "<ip>", text)
+    text = _IPV4.sub(lambda m: m.group(0) if m.group(0) in _LOCAL_HOSTS else "<ip>", text)
+    return _IPV6.sub(_ipv6, text)
+
+
+def _value(key: str, value: str) -> str:
+    """A ``key=value`` setting's value as a results file may keep it."""
+    if _SECRET.search(key):
+        return "<redacted>"
+    if _HOSTLIKE.search(key):
+        if "://" in value:
+            return _scrub(value)
+        return value if all(v in _LOCAL_HOSTS for v in re.split(r"[,\s]+", value.strip()) if v) else "<host>"
+    return _scrub(value)
 
 
 def scrub_env(env: dict[str, str]) -> dict[str, str]:
-    """Environment for a results file: values of secret-looking keys are dropped."""
-    return {k: ("<redacted>" if _SECRET.search(k) else _scrub(str(v))) for k, v in sorted(env.items())}
+    """Environment for a results file: secret values dropped, non-loopback hosts redacted."""
+    return {k: _value(k, str(v)) for k, v in sorted(env.items())}
 
 
 def scrub(obj: Any) -> Any:
-    """Recursively scrub a config or metadata tree; values under secret-looking keys are dropped."""
+    """Recursively scrub a config or metadata tree (secret and host-like keys by name)."""
     if isinstance(obj, dict):
-        return {k: ("<redacted>" if isinstance(k, str) and _SECRET.search(k) else scrub(v)) for k, v in obj.items()}
+        return {k: (_value(k, v) if isinstance(k, str) and isinstance(v, str) else
+                    "<redacted>" if isinstance(k, str) and _SECRET.search(k) else scrub(v)) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [scrub(v) for v in obj]
     return _scrub(obj) if isinstance(obj, str) else obj
 
 
+def describe_command(cmd: list[str] | str | None) -> str | None:
+    """A custom server command for a results file: its program and a fingerprint, never its
+    text (shell wrappers, inline exports and engine flags can hold secrets and hostnames)."""
+    import hashlib
+    import shlex
+
+    if not cmd:
+        return None
+    tokens = shlex.split(cmd) if isinstance(cmd, str) else list(cmd)
+    program = next((t for t in tokens if t != "env" and not _ASSIGN.match(t)), "")
+    digest = hashlib.sha256(shlex.join(tokens).encode()).hexdigest()[:12]
+    return f"<command {os.path.basename(program)} sha256:{digest}>"
+
+
 def _pair(kv: str) -> str:
     k, sep, v = kv.partition("=")
-    return f"{k}{sep}{'<redacted>' if _SECRET.search(k) else _scrub(v)}"
+    return f"{k}{sep}{_value(k, v)}" if sep else _scrub(kv)
 
 
 def _host(value: str) -> str:
@@ -189,21 +228,21 @@ def _host(value: str) -> str:
 
 
 def scrub_argv(argv: list[str]) -> list[str]:
-    """A command line for a results file, including any nested ``--serve-cmd``: values of
-    secret-looking flags and ``KEY=VALUE`` assignments, non-loopback hosts and URLs, IPv4
+    """A command line for a results file: ``--serve-cmd`` values become a fingerprint; values
+    of secret-looking flags and ``KEY=VALUE`` assignments, non-loopback hosts and URLs, IP
     literals and home paths are removed."""
-    import shlex
-
     out: list[str] = []
     for i, arg in enumerate(argv):
         prev = argv[i - 1] if i else ""
         flag, eq, val = arg.partition("=")
         is_flag = flag.startswith("-")
         if prev in _CMD_FLAGS:
-            arg = shlex.join(scrub_argv(shlex.split(arg)))
-        elif is_flag and flag in _CMD_FLAGS and eq:
-            arg = f"{flag}={shlex.join(scrub_argv(shlex.split(val)))}"
-        elif prev in _PAIR_FLAGS:
+            out.append(describe_command(arg))
+            continue
+        if is_flag and flag in _CMD_FLAGS and eq:
+            out.append(f"{flag}={describe_command(val)}")
+            continue
+        if prev in _PAIR_FLAGS:
             arg = _pair(arg)
         elif is_flag and flag in _PAIR_FLAGS and eq:
             arg = f"{flag}={_pair(val)}"

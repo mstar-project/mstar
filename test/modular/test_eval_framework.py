@@ -407,8 +407,8 @@ def test_asr_stream_errors_are_error_rows():
     item = Item("u", text="hello", audio_path=__file__)
     rows = {k: asyncio.run(suite.request(Session(v), "http://x", 0, item, time.perf_counter()))
             for k, v in events.items()}
-    assert not rows["error_after_delta"]["ok"] and "boom" in rows["error_after_delta"]["error"]
-    assert not rows["no_done"]["ok"] and "transcript.text.done" in rows["no_done"]["error"]
+    assert rows["error_after_delta"]["error"] == "stream error" and "boom" in rows["error_after_delta"]["_detail"]
+    assert rows["no_done"]["error"] == "incomplete stream" and not rows["no_done"]["ok"]
     assert rows["ok"]["ok"] and rows["ok"]["hyp"] == "hello" and rows["ok"]["first_text_s"] is not None
 
 
@@ -431,17 +431,21 @@ def test_duplex_timing_censors_what_the_replay_did_not_observe():
     assert timing_metrics("turn_taking", [], None, 2.0, None, 5.0, 2.0, duration_s=9.0)["took_turn"] is False
 
 
-def test_custom_commands_and_error_rows_are_scrubbed():
-    from benchmark.eval.schema import scrub_argv
+def test_custom_commands_hosts_and_ipv6_never_reach_results():
+    from benchmark.eval.schema import describe_command, scrub, scrub_argv
 
-    home = os.path.expanduser("~")
-    cmd = scrub_argv(["--serve-cmd", "env HF_TOKEN=abc vllm serve m --api-key k1 --host gpu.internal --token=t2"])[1]
-    for leaked in ("abc", "k1", "gpu.internal", "t2"):
-        assert leaked not in cmd
-    rows = [{"id": "a", "ok": False, "error": f"FileNotFoundError: {home}/x.wav via http://10.0.0.9:80/v1"}]
-    r = RunResult("asr", "x", {}, {}, [RepeatResult(0, 1.0, {"errors": 1}, rows)]).finalize()
-    err = r.to_dict()["repeats"][0]["requests"][0]["error"]
-    assert home not in err and "10.0.0.9" not in err and "~/x.wav" in err
+    for cmd in ("env HF_TOKEN=abc vllm serve m --api-key k1 --host gpu.internal --token=t2",
+                "bash -lc 'export HF_TOKEN=abc; exec vllm serve m --host gpu.internal --api-key k1'"):
+        out = scrub_argv(["--serve-cmd", cmd])[1]
+        assert out == describe_command(cmd) and out.startswith("<command ")
+        for leaked in ("abc", "k1", "gpu.internal", "t2"):
+            assert leaked not in out
+    assert describe_command("env A=1 vllm serve x").startswith("<command vllm sha256:")
+    env = scrub({"MSTAR_ZMQ_TCP_HOST": "gpu.internal", "MSTAR_SERVER_HOST": "2001:db8::42",
+                 "MSTAR_ADDR": "127.0.0.1", "PYTHONPATH": "/home/someone/a:/Users/x/b", "note": "at 07:02:51"})
+    assert env == {"MSTAR_ZMQ_TCP_HOST": "<host>", "MSTAR_SERVER_HOST": "<host>", "MSTAR_ADDR": "127.0.0.1",
+                   "PYTHONPATH": "~/a:~/b", "note": "at 07:02:51"}
+    assert scrub_argv(["--serve-env", "MSTAR_ZMQ_TCP_HOST=gpu.internal"])[1] == "MSTAR_ZMQ_TCP_HOST=<host>"
 
 
 def test_tts_suite_end_to_end(tmp_path, fake_cmd):
@@ -481,13 +485,57 @@ def test_open_loop_run_records_dispatch_lateness_and_reports(tmp_path, fake_cmd,
     assert "| label | load | n | TTFA p50 (ms) | arrival late p99 (s) |" in out and "| open | 40 req/s | 4 |" in out
 
 
+KEEPALIVE_SERVER = r'''
+import struct, sys
+from aiohttp import web
+
+def header(rate=24000):
+    fmt = struct.pack("<4sIHHIIHH", b"fmt ", 16, 1, 1, rate, rate * 2, 2, 16)
+    return b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE" + fmt + b"data" + struct.pack("<I", 0xFFFFFFFF)
+
+async def health(request):
+    return web.json_response({"status": "healthy"})
+
+async def speech(request):
+    await request.json()
+    return web.Response(body=header() + b"\x10\x00" * 2400, content_type="audio/wav")
+
+app = web.Application()
+app.add_routes([web.get("/health", health), web.post("/v1/audio/speech", speech)])
+# Idle keep-alive connections are closed after 0.3 s, like uvicorn after 5 s.
+web.run_app(app, host="127.0.0.1", port=int(sys.argv[1]), keepalive_timeout=0.3, print=None)
+'''
+
+
+def test_repeats_survive_server_keepalive_expiry_during_scoring(tmp_path, monkeypatch):
+    from benchmark.eval.suites.tts import TTSSuite
+
+    script = tmp_path / "keepalive_server.py"
+    script.write_text(KEEPALIVE_SERVER)
+    score = TTSSuite.score
+
+    def slow_score(self, *a, **k):
+        time.sleep(0.8)  # judges run between repeats, longer than the server keeps idle connections
+        return score(self, *a, **k)
+
+    monkeypatch.setattr(TTSSuite, "score", slow_score)
+    (tmp_path / "s.txt").write_text("a b\nc d\ne f\nf g\n")
+    _run_cli(["run", "tts", "--serve-cmd", f"{sys.executable} {script} {{port}}", "--data", str(tmp_path / "s.txt"),
+              "--concurrency", "4", "--repeats", "3", "--warmup", "4", "--asr-judge", "none", "--label", "ka",
+              "--out", str(tmp_path)])
+    r = RunResult.load(tmp_path / "tts-ka-c4.json")
+    assert [rep.metrics["errors"] for rep in r.repeats] == [0, 0, 0]
+
+
 def test_tts_suite_records_http_errors(tmp_path, fake_cmd):
     (tmp_path / "s.txt").write_text("one two\n")
     _run_cli(["run", "tts", "--serve-cmd", fake_cmd, "--data", str(tmp_path / "s.txt"), "--repeats", "1",
               "--warmup", "0", "--voice", "bad", "--asr-judge", "none", "--label", "bad", "--out", str(tmp_path)])
     r = RunResult.load(tmp_path / "tts-bad-c1.json")
     row = r.repeats[0].requests[0]
-    assert not row["ok"] and row["error"].startswith("HTTP 400") and r.summary["errors"]["mean"] == 1
+    assert not row["ok"] and row["error"] == "HTTP 400" and r.summary["errors"]["mean"] == 1
+    assert "_detail" not in row  # the server's body goes to the local log only
+    assert "bad voice" in (tmp_path / "errors-tts-bad-c1.log").read_text()
 
 
 def test_asr_suite_end_to_end(tmp_path, fake_cmd):
@@ -502,6 +550,7 @@ def test_asr_suite_end_to_end(tmp_path, fake_cmd):
               "--warmup", "0", "--normalizer", "basic", "--label", "fake", "--out", str(tmp_path / "out")])
     r = RunResult.load(tmp_path / "out" / "asr-fake-c1.json")
     assert r.summary["wer"]["mean"] == pytest.approx(1 / 5) and r.summary["wer"]["std"] == 0
+    assert not (tmp_path / "out" / "errors-asr-fake-c1.log").exists()
     assert r.repeats[0].requests[0]["audio_s"] == pytest.approx(0.5)
     assert r.summary["rtfx"]["mean"] > 0 and r.config["suite"]["normalizer"] == "basic"
 

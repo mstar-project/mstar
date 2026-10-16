@@ -19,7 +19,7 @@ import aiohttp
 
 from benchmark.eval import stats
 from benchmark.eval.datasets import Item
-from benchmark.eval.suites.base import Suite, error_row, parse_extra
+from benchmark.eval.suites.base import Suite, error_row, exception_row, parse_extra
 from benchmark.eval.text_metrics import error_rate, get_normalizer
 
 
@@ -87,7 +87,7 @@ class ASRSuite(Suite):
             timeout = aiohttp.ClientTimeout(total=a.timeout)
             async with session.post(f"{url}/v1/audio/transcriptions", data=form, timeout=timeout) as resp:
                 if resp.status != 200:
-                    return error_row(item, f"HTTP {resp.status}: {(await resp.text())[:200]}")
+                    return error_row(item, f"HTTP {resp.status}", await resp.text())
                 if a.stream:
                     text = None
                     async for raw in resp.content:
@@ -97,18 +97,18 @@ class ASRSuite(Suite):
                         ev = json.loads(line[5:])
                         kind = ev.get("type")
                         if kind == "error" or "error" in ev:
-                            return error_row(item, f"stream error: {str(ev.get('error', ev))[:200]}")
+                            return error_row(item, "stream error", line)
                         if kind == "transcript.text.delta":
                             first = first or time.perf_counter() - t0
                         elif kind == "transcript.text.done":
                             text = ev.get("text", "")
                     if text is None:
                         # Deltas alone are not a transcript: the server never said it finished.
-                        return error_row(item, "stream ended without transcript.text.done")
+                        return error_row(item, "incomplete stream", "no transcript.text.done event")
                 else:
                     text = (await resp.json()).get("text", "")
         except Exception as exc:  # noqa: BLE001 - every failure is an error row
-            return error_row(item, f"{type(exc).__name__}: {exc}")
+            return exception_row(item, exc)
         e2e = time.perf_counter() - t0
         if item.id not in self._durations:
             self._durations[item.id] = audio_seconds(item.audio_path)

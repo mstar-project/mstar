@@ -171,7 +171,8 @@ def cmd_run(args) -> list[Path]:
         for spec in points:
             tag = spec.describe().replace("=", "").replace("/", "per").replace(",", "_")
             result = run_point(suite, server.url, items, spec, args.repeats, args.warmup, label, config, meta,
-                               audio_dir=out / "audio" / f"{label}-{tag}", save_audio=args.save_audio)
+                               audio_dir=out / "audio" / f"{label}-{tag}", save_audio=args.save_audio,
+                               error_log=out / f"errors-{args.suite}-{label}-{tag}.log")
             path = result.save(out / f"{args.suite}-{label}-{tag}.json")
             written.append(path)
             print(f"wrote {path}", file=sys.stderr)
