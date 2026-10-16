@@ -7,10 +7,10 @@ import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.base import CGSlotKey
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
 from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs
-from mstar.engine.resources.step import StepContext
+from mstar.engine.resources.step import BucketKey, StepContext
 
 
 @functools.cache
@@ -63,11 +63,30 @@ class XPUPagedAttentionManager(AttentionManager):
         self._kv_config = kv_config
         self._current_plans: dict[str, XPUPagedPlan] = {}
         self._cg_plans: dict[CGSlotKey, XPUPagedPlan] = {}
+        self._batched_buckets: set[BucketKey] = set()
         self._preplan_states: dict[str, XPUPagedPlan] = {}
         self._preplanned = False
 
     def depends_on(self):
         return {self._kv_cache_name}
+
+    def build_accelerator_graph_buffers(
+        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
+    ) -> None:
+        # Graph configs import resources, so defer this import.
+        from mstar.engine.accelerator_graph_config import (
+            AcceleratorGraphConfigType,
+            PiecewiseConfigType,
+        )
+
+        del max_bs, max_seq_len
+        self._batched_buckets.update(
+            spec.bucket for spec in slots
+            if spec.config.get_config_type() in (
+                AcceleratorGraphConfigType.BASIC_BATCHED,
+                PiecewiseConfigType.BATCHED,
+            )
+        )
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         self.reset_default_cursors()
@@ -90,8 +109,15 @@ class XPUPagedAttentionManager(AttentionManager):
         )
         plan_states.clear()
         for label, kv_out in plan_outputs.items():
+            # Only fixed-length batched recipes can use the dummy row's bound.
+            # Packed replays may put every query in one request.
+            max_q = (
+                lease.bucket.num_tokens
+                if lease is not None and lease.bucket not in self._batched_buckets
+                else None
+            )
             new_plan = self._build_plan(
-                kv_out, step.causal, graph_mode=lease is not None
+                kv_out, step.causal, graph_mode=lease is not None, max_q=max_q,
             )
             if lease is None:
                 plan = new_plan
@@ -118,6 +144,7 @@ class XPUPagedAttentionManager(AttentionManager):
 
     def _build_plan(
         self, kv_out: KVPlanOutput, causal: bool, graph_mode: bool,
+        max_q: int | None = None,
     ) -> XPUPagedPlan:
         views = kv_out.views
         max_blocks = max((len(view.page_idxs) for view in views), default=1)
@@ -148,7 +175,10 @@ class XPUPagedAttentionManager(AttentionManager):
                 dtype=torch.int32,
                 device=self._device if graph_mode else None,
             ),
-            max_q=max((view.to_compute for view in views), default=0),
+            max_q=(
+                max_q if max_q is not None
+                else max((view.to_compute for view in views), default=0)
+            ),
             max_k=(
                 self._kv_config.max_num_pages * self._kv_config.page_size
                 if graph_mode

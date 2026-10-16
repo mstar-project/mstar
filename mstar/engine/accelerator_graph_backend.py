@@ -32,6 +32,8 @@ class AcceleratorGraphPool:
 class XPUGraphPool(AcceleratorGraphPool):
     # XPU cannot reopen a pool after its last graph is destroyed. Retain a
     # failed capture until a successful graph owns the pool; CUDA needs no hold.
+    # TODO: Remove this hold once the minimum supported PyTorch version fixes
+    # XPU graph pool reuse: https://github.com/pytorch/pytorch/issues/198794.
     failed_graph: CapturedGraph | None = field(default=None, repr=False)
 
     def on_failure(self, graph: CapturedGraph) -> None:
