@@ -122,14 +122,18 @@ SOUNDFILE_ONLY = [
 ]
 
 
-def _clip(fmt, endian, subtype):
+def _clip(fmt, endian, subtype, rate=None, seconds=0.5):
     sf = pytest.importorskip("soundfile")
     if fmt not in sf.available_formats():
         pytest.skip(f"this libsndfile cannot write {fmt}")
-    rate = 48000 if subtype == "OPUS" else 24000
-    tone = 0.3 * np.sin(2 * np.pi * 440 * np.arange(rate // 2) / rate)
+    rate = rate or (48000 if subtype == "OPUS" else 24000)
+    n = max(1, int(rate * seconds))
+    tone = 0.3 * np.sin(2 * np.pi * 440 * np.arange(n) / rate)
     buf = io.BytesIO()
-    sf.write(buf, tone.astype(np.float32), rate, format=fmt, subtype=subtype, endian=endian)
+    try:
+        sf.write(buf, tone.astype(np.float32), rate, format=fmt, subtype=subtype, endian=endian)
+    except Exception as exc:  # noqa: BLE001 — e.g. Opus has no 44.1 kHz mode
+        pytest.skip(f"this libsndfile cannot write {fmt} at {rate} Hz: {exc}")
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -176,27 +180,23 @@ def test_omnivoice_refuses_audio_its_decoder_cannot_read(clip, dirs):
 def test_omnivoice_refuses_audio_whose_header_opens_but_samples_do_not_decode(decodes, dirs, monkeypatch):
     """Some FFmpeg builds open a MAT4 or MAT5 header and then fail on the first
     frame. This stub decoder does the same, so the check runs without FFmpeg."""
-    import sys
     import types
 
-    opened = []
+    decoded = []
 
     class AudioDecoder:
         def __init__(self, source, **kwargs):
             open(source, "rb").close()
-            opened.append(kwargs)
+            self.kwargs = kwargs
+            self.metadata = types.SimpleNamespace(sample_rate=24000)
 
         def get_all_samples(self):
+            decoded.append(self.kwargs)
             if not decodes:
                 raise RuntimeError("decode_av_frame failed")
             return object()
 
-    decoders = types.ModuleType("torchcodec.decoders")
-    decoders.AudioDecoder = AudioDecoder
-    package = types.ModuleType("torchcodec")
-    package.decoders = decoders
-    monkeypatch.setitem(sys.modules, "torchcodec", package)
-    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    _stub_torchcodec(monkeypatch, AudioDecoder)
     uploads, _ = dirs
     before = set(uploads.iterdir())
     req = SpeechRequest(input="hi", ref_audio=base64.b64encode(b"MATLAB 5.0 MAT-file").decode(), ref_text="hi")
@@ -208,7 +208,100 @@ def test_omnivoice_refuses_audio_whose_header_opens_but_samples_do_not_decode(de
             adapters.OmniVoiceAdapter().speech_to_request(req, uploads)
         assert set(uploads.iterdir()) == before
     # decoded size must not scale with the channel count or rate the clip declares
-    assert opened and all(kw.get("num_channels") == 1 and kw.get("sample_rate") for kw in opened)
+    assert decoded and all(kw.get("num_channels") == 1 and kw.get("sample_rate") for kw in decoded)
+
+
+def _stub_torchcodec(monkeypatch, decoder_cls):
+    import sys
+    import types
+
+    decoders = types.ModuleType("torchcodec.decoders")
+    decoders.AudioDecoder = decoder_cls
+    package = types.ModuleType("torchcodec")
+    package.decoders = decoders
+    monkeypatch.setitem(sys.modules, "torchcodec", package)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+
+
+@pytest.mark.parametrize("rate", [None, 0, 1, 7999])
+def test_omnivoice_refuses_a_clip_below_the_rate_floor_before_decoding(rate, dirs, monkeypatch):
+    """The rate comes from the header; nothing is decoded, so a 1 Hz clip cannot
+    expand 16,000x on its way to the probe's 16 kHz. Stub decoder, no FFmpeg."""
+    import types
+
+    decoded = []
+
+    class AudioDecoder:
+        def __init__(self, source, **kwargs):
+            self.metadata = types.SimpleNamespace(sample_rate=rate)
+
+        def get_all_samples(self):
+            decoded.append(True)
+            return object()
+
+    _stub_torchcodec(monkeypatch, AudioDecoder)
+    uploads, _ = dirs
+    before = set(uploads.iterdir())
+    req = SpeechRequest(input="hi", ref_audio=base64.b64encode(b"RIFF....WAVEfmt " + bytes(64)).decode(), ref_text="hi")
+    with pytest.raises(ValueError, match=REFUSED):
+        adapters.OmniVoiceAdapter().speech_to_request(req, uploads)
+    assert decoded == [] and set(uploads.iterdir()) == before
+
+
+@pytest.mark.parametrize("rate", [1, 4000, 7999])
+def test_omnivoice_refuses_a_low_rate_wav_without_decoding_it(rate, dirs, monkeypatch):
+    """Real torchcodec: 64 KB of 1 Hz PCM would decode to 2 GB at 16 kHz."""
+    decoder = _audio_decoder()
+    import torchcodec.decoders
+
+    decodes = []
+
+    class Spy(decoder):
+        def get_all_samples(self, *args, **kwargs):
+            decodes.append(True)
+            return super().get_all_samples(*args, **kwargs)
+
+    monkeypatch.setattr(torchcodec.decoders, "AudioDecoder", Spy)
+    uploads, _ = dirs
+    before = set(uploads.iterdir())
+    seconds = 32000 / rate  # 32,000 samples, 64 KB of PCM16
+    req = SpeechRequest(input="hi", ref_audio=_clip("WAV", "FILE", None, rate=rate, seconds=seconds), ref_text="hi")
+    with pytest.raises(ValueError, match=REFUSED):
+        adapters.OmniVoiceAdapter().speech_to_request(req, uploads)
+    assert decodes == [] and set(uploads.iterdir()) == before
+
+
+@pytest.mark.parametrize("rate", [1, 7999])
+def test_qwen3_tts_refuses_a_clip_below_the_rate_floor(rate, dirs):
+    uploads, _ = dirs
+    before = set(uploads.iterdir())
+    clip = _clip("WAV", "FILE", None, rate=rate, seconds=32000 / rate)
+    req = SpeechRequest(input="hi", ref_audio=clip, ref_text="hi")
+    with pytest.raises(ValueError, match=REFUSED):
+        adapters.Qwen3TTSAdapter().speech_to_request(req, uploads)
+    assert set(uploads.iterdir()) == before
+
+
+RATES = [8000, 16000, 24000, 44100, 48000]
+
+
+@pytest.mark.parametrize("rate", RATES)
+@pytest.mark.parametrize("clip", FFMPEG_READS)
+def test_omnivoice_accepts_clips_at_common_rates(clip, rate, dirs):
+    uploads, _ = dirs
+    _audio_decoder()
+    req = SpeechRequest(input="hi", ref_audio=_clip(*clip, rate=rate), ref_text="hi")
+    (path,) = adapters.OmniVoiceAdapter().speech_to_request(req, uploads).file_paths["audio"]
+    assert path.startswith(str(uploads))
+
+
+@pytest.mark.parametrize("rate", RATES)
+@pytest.mark.parametrize("clip", FFMPEG_READS + SOUNDFILE_ONLY)
+def test_qwen3_tts_accepts_clips_at_common_rates(clip, rate, dirs):
+    uploads, _ = dirs
+    req = SpeechRequest(input="hi", ref_audio=_clip(*clip, rate=rate), ref_text="hi")
+    (path,) = adapters.Qwen3TTSAdapter().speech_to_request(req, uploads).file_paths["audio"]
+    assert path.startswith(str(uploads))
 
 
 @pytest.mark.parametrize("adapter", [adapters.Cosmos3Adapter, adapters.Wan22Adapter])

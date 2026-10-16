@@ -168,6 +168,13 @@ def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tup
     return modality_hint, str(path)
 
 
+# Telephone band, the lowest rate speech is recorded or coded at. A clip below it
+# is not a voice reference, and resampling it up to the probe's or the model's
+# rate multiplies its decoded size by that ratio (a 64 KB WAV at 1 Hz is 2 GB at
+# 16 kHz).
+MIN_REF_AUDIO_SAMPLE_RATE = 8000
+
+
 def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
     """Persist bare base64 that ``decoder`` opens as audio; return its path, or
     None (leaving nothing behind) when it is not base64 or not loadable audio.
@@ -175,9 +182,10 @@ def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
     ``decoder`` is the library the model's ``load_audio`` uses, ``"soundfile"``
     or ``"torchcodec"``, and it opens the saved file the way the model will.
     torchcodec decodes the clip, not just its header: some FFmpeg builds
-    parse a container header (MAT4, MAT5) they cannot decode. A path such as
-    ``/etc/passwd`` is valid base64 too, so the alphabet cannot tell them
-    apart; the decoder can.
+    parse a container header (MAT4, MAT5) they cannot decode. A clip whose
+    header rate is below ``MIN_REF_AUDIO_SAMPLE_RATE`` is refused before any
+    decode. A path such as ``/etc/passwd`` is valid base64 too, so the alphabet
+    cannot tell them apart; the decoder can.
     """
     try:
         _, path = save_base64(b64, "wav", "audio", upload_dir)
@@ -187,17 +195,23 @@ def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
         if decoder == "torchcodec":
             from torchcodec.decoders import AudioDecoder
 
+            _require_ref_audio_rate(AudioDecoder(path).metadata.sample_rate)
             # Mono at a fixed rate: a small compressed upload can declare many
             # channels at a high rate, and decoding it natively takes gigabytes.
             AudioDecoder(path, sample_rate=16000, num_channels=1).get_all_samples()
         else:
             import soundfile
 
-            soundfile.info(path)
+            _require_ref_audio_rate(soundfile.info(path).samplerate)
     except Exception:  # noqa: BLE001 — not loadable here, so the model cannot load it either
         Path(path).unlink(missing_ok=True)
         return None
     return path
+
+
+def _require_ref_audio_rate(rate: int | None) -> None:
+    if not rate or rate < MIN_REF_AUDIO_SAMPLE_RATE:
+        raise ValueError(f"reference audio at {rate} Hz is below {MIN_REF_AUDIO_SAMPLE_RATE} Hz")
 
 
 def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[str, str]:
