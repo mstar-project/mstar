@@ -222,13 +222,21 @@ def _compose_walks(
         if new_cap is not None and new_cap <= n:
             left_out.add(rid)
             continue
-        if row_caps and len(walks | {walk}) > 1 and any(
-            counts.get(w, 0) + (w == walk) > row_caps[w]
-            for w in walks | {walk} if w in row_caps
-        ):
-            # the step would mix walks past one's row cap
-            left_out.add(rid)
-            continue
+        if row_caps and walks:
+            if walk not in walks:
+                # the row makes the step mix walks: every walk's rows count
+                over = any(
+                    counts.get(w, 0) + (w == walk) > row_caps[w]
+                    for w in (*walks, walk) if w in row_caps
+                )
+            else:
+                # already mixed or not, only this walk's count moves
+                cap_w = row_caps.get(walk)
+                over = len(walks) > 1 and cap_w is not None and counts[walk] + 1 > cap_w
+            if over:
+                # the step would mix walks past one's row cap
+                left_out.add(rid)
+                continue
         walks.add(walk)
         counts[walk] = counts.get(walk, 0) + 1
         cap = new_cap
