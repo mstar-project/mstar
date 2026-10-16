@@ -198,6 +198,17 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        request reaches the pod (Run:AI serves a workload at
        ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
        every route. Empty by default, so a direct deployment is unaffected.
+   * - ``MSTAR_MAX_IMAGE_PIXELS``
+     - ``89478485``
+     - Pixels one request image may decode to (every frame of an animated
+       GIF counts), checked from the header before decoding; larger images
+       get a 400. Applies behind either frontend. Pillow refuses images over
+       twice its own limit (about 179M pixels) whatever this is set to.
+   * - ``MSTAR_MAX_VIDEO_PIXELS``
+     - ``1073741824``
+     - Pixels one request video may decode to, summed over the frames the
+       model's loader keeps (about 39 s of 720p30); the decode stops with a
+       400 once it passes the limit. Applies behind either frontend.
 
 Serving (Rust frontend)
 -----------------------

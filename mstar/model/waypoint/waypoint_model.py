@@ -60,6 +60,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.media_limits import check_image_size
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.waypoint.config import (
     WAYPOINT_VARIANT_360P,
@@ -481,6 +482,7 @@ class WaypointModel(Model):
         round trip through the request would round twice on the way there."""
         import torchvision
 
+        check_image_size(filepath)
         img = torchvision.io.decode_image(
             filepath, mode=torchvision.io.ImageReadMode.RGB
         ).to(device)  # uint8 [3, H, W]
