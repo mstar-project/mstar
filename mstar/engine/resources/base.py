@@ -14,19 +14,20 @@ from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, Resou
 if TYPE_CHECKING:
     # the config reaches back here through the submodule base, so keep the
     # import out of module exec
-    from mstar.engine.cuda_graph_config import (
-        CudaGraphConfig,
-        PiecewiseCudaGraphConfig,
+    from mstar.engine.accelerator_graph_config import (
+        AcceleratorGraphConfig,
+        PiecewiseAcceleratorGraphConfig,
     )
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
 
+# CG and cg_ mean "captured graph" across accelerator backends.
 @dataclass(frozen=True)
 class CGSlotSpec:
     bucket: BucketKey
     slot: int
     # a whole forward's capture, or one piecewise region's
-    config: CudaGraphConfig | PiecewiseCudaGraphConfig
+    config: AcceleratorGraphConfig | PiecewiseAcceleratorGraphConfig
     config_idx: int | None = None
 
     @property
@@ -87,6 +88,10 @@ class Resource(ABC):
 
     def depends_on(self) -> set[str]:
         return set()
+
+    def can_capture(self) -> bool:
+        """Whether this resource's planning and kernels support graph capture."""
+        return True
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
@@ -151,7 +156,7 @@ class Resource(ABC):
         return
 
     def ingest_capture_row(self, rid: str):
-        """Open a CUDA graph capture padding row; by default, as a request."""
+        """Open an accelerator graph capture padding row; by default, as a request."""
         self.ingest_request(rid, None)
 
     def remove_request(self, rid: str):
@@ -273,7 +278,7 @@ class Resource(ABC):
         return snapshot
 
     def reset_request(self, rid: str, free: bool=False):
-        """For clearing dummy RIDs during cuda graph capture"""
+        """For clearing dummy RIDs during accelerator graph capture"""
         return
 
     # Pre-planning
@@ -351,7 +356,7 @@ class Resource(ABC):
 
     # Engine lifecycle
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec],
         max_bs: int, max_seq_len: int
     ) -> None:
@@ -369,7 +374,7 @@ class Resource(ABC):
     def post_warmup_validate(self):
         """
         For, e.g., the KV cache to check that num_free_pages is identical
-        across TP ranks after cuda graph capture.
+        across TP ranks after accelerator graph capture.
 
         Raises an error (fails loudly) if invalid.
         """

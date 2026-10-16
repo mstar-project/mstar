@@ -20,12 +20,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from mstar.engine.cuda_graph_config import (
+from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewisePackedConfig,
 )
-from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.resources import (
     AttentionStep,
     BucketKey,
@@ -111,7 +111,7 @@ def wrapper(**overrides) -> RaggedPrefillWrapper:
 
 def graph_wrapper() -> RaggedPrefillWrapper:
     return wrapper(
-        max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, use_cuda_graph=True
+        max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True
     )
 
 
@@ -249,7 +249,7 @@ def test_graph_mode_priming_survives_a_small_first_plan():
 
 def test_graph_mode_requires_bucket_bounds():
     with pytest.raises(AssertionError, match="max_num_segments required"):
-        wrapper(use_cuda_graph=True)
+        wrapper(accelerator_graph=True)
 
 
 # --- the resource ----------------------------------------------------------
@@ -384,7 +384,7 @@ def test_cg_wrapper_is_sized_by_the_config_not_the_first_plan():
     w = mgr._current_plan_states["main"]
     assert w.max_num_segments == 2 * 3
     assert w.max_total_tokens == MAX_TOKENS
-    assert w.use_cuda_graph
+    assert w.accelerator_graph
 
 
 def test_cg_wrapper_is_per_bucket_slot_and_label():
@@ -447,7 +447,7 @@ def test_preplan_promotes_on_the_next_plan():
 def test_preplan_requires_a_capture_slot():
     """Eager wrappers share one workspace per label with the in-flight forward."""
     mgr = manager()
-    with pytest.raises(AssertionError, match="preplan requires a cuda graph step"):
+    with pytest.raises(AssertionError, match="preplan requires a captured graph step"):
         mgr.plan(step(8), ctx(["r0"], is_preplan=True))
 
 
@@ -492,7 +492,7 @@ def piecewise_runner(mgr, capture_fn):
             steps={ATTN: AttentionStep(causal=False)},
         )
 
-    runner = PiecewiseCudaGraphRunner(
+    runner = PiecewiseAcceleratorGraphRunner(
         label="encoder_block_loop",
         config=PiecewisePackedConfig(
             capture_fn=capture_fn,

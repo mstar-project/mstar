@@ -236,7 +236,7 @@ def main(argv: list[str] | None = None) -> None:
     exit_code = 0
     try:
         # Same gate the native server binds behind: every worker has loaded
-        # weights, warmed up, and captured CUDA graphs.
+        # weights, warmed up, and captured accelerator graphs.
         server.finalize_setup()
         serve(server, model_name, args)
     except KeyboardInterrupt:

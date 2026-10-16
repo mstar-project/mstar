@@ -104,7 +104,7 @@ class _Stub(Resource):
         )
         return self._final_published
 
-    def build_cuda_graph_buffers(self, slots, max_bs, max_seq_len):
+    def build_accelerator_graph_buffers(self, slots, max_bs, max_seq_len):
         self.calls.append(f"cg_buffers:{len(slots)}:{max_bs}:{max_seq_len}")
 
 
@@ -405,18 +405,18 @@ def test_admit_retrieve_short_circuits_on_failure():
     assert sampler.calls == [], "the sweep stops at the first failure"
 
 
-def test_build_cuda_graph_buffers_reaches_every_resource():
+def test_build_accelerator_graph_buffers_reaches_every_resource():
     """No node map: the sweep stays global, as it was before scoping."""
     kv, sampler = _Stub("kv"), _Stub("sampler")
     runner = StepRunner({"kv": kv, "sampler": sampler})
 
-    runner.build_cuda_graph_buffers(slots=[object(), object()], max_bs=8, max_seq_len=64)
+    runner.build_accelerator_graph_buffers(slots=[object(), object()], max_bs=8, max_seq_len=64)
 
     assert kv.calls == ["cg_buffers:2:8:64"]
     assert sampler.calls == ["cg_buffers:2:8:64"]
 
 
-def test_build_cuda_graph_buffers_is_scoped_to_the_capturing_node():
+def test_build_accelerator_graph_buffers_is_scoped_to_the_capturing_node():
     """A node's capture must not size a resource it never plans against.
 
     Buffers are allocated per node at warmup; letting one node's slot count and
@@ -429,13 +429,52 @@ def test_build_cuda_graph_buffers_is_scoped_to_the_capturing_node():
         node_resources={"llm": ["kv", "sampler"], "codec": ["other"]},
     )
 
-    runner.build_cuda_graph_buffers(
+    runner.build_accelerator_graph_buffers(
         slots=[object(), object()], max_bs=8, max_seq_len=64, node_name="llm",
     )
 
     assert kv.calls == ["cg_buffers:2:8:64"]
     assert sampler.calls == ["cg_buffers:2:8:64"]
     assert other.calls == [], "another node's resource was sized by this capture"
+
+
+@pytest.mark.parametrize("variant", ["gdn", "mamba2"])
+def test_graph_buffer_sizing_reaches_recurrent_and_linear_attention(variant):
+    """Real resources must override the runner's hook after API renames."""
+    import torch
+
+    from mstar.engine.resources.base import EngineResourceInfo
+    from mstar.engine.resources.linear_attn.base import LinearAttnManager
+    from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
+    from mstar.engine.resources.recurrent.config import (
+        DeltaNetGeometry,
+        Mamba2Geometry,
+        RecurrentStateConfig,
+        RecurrentStateSpec,
+    )
+    from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+
+    geometry = (
+        DeltaNetGeometry(2, 2, 16, 16, 4)
+        if variant == "gdn" else Mamba2Geometry(2, 16, 16, 1, 4)
+    )
+    device = torch.device("cpu")
+    spec = RecurrentStateSpec(
+        "state", {"llm"},
+        RecurrentStateConfig(num_layers=1, blocks=geometry.to_blocks(), max_slots=4),
+    )
+    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=device))
+    manager = LinearAttnManager.build(
+        LinearAttnSpec("linear", {"llm"}, LinearAttnConfig("state", LinearAttnVariant(variant))),
+        EngineResourceInfo(device=device, dependencies={"state": spec}),
+    )
+    runner = StepRunner({"state": pool, "linear": manager})
+
+    for size in (8, 2, 16):
+        runner.build_accelerator_graph_buffers([], max_bs=size, max_seq_len=64)
+        expected = max(size, 8)
+        assert pool._cg_max_bs == expected
+        assert manager._cg_max_bs == expected
 
 
 # --- the step envelope -----------------------------------------------------

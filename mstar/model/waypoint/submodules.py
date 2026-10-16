@@ -4,7 +4,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
+from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.resources import AttentionStep, RingKVStep, SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.waypoint.components.dit import WaypointDiT
@@ -154,7 +154,7 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
                 decode_latent, mode="max-autotune-no-cudagraphs",
                 fullgraph=False, dynamic=False,
             )
-            if config.cuda_graph else decode_latent
+            if config.accelerator_graph else decode_latent
         )
 
     def bind_node_resources(self, resources: dict) -> None:
@@ -510,16 +510,16 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     # capture
     # ------------------------------------------------------------------
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """Both walks, as optional captures.
 
         Prime's inputs are the rollout template with ``noise`` renamed, so it
         reuses the pool the rollout graph already sized.
         """
         del tp_world_size  # no sharded nodes; the ring and the mask do not shard
-        if not self.config.cuda_graph:
+        if not self.config.accelerator_graph:
             return []
         dtype = self.dit.dtype
         frame = (1, 1, *self.config.latent_shape)
@@ -561,7 +561,7 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         configs = []
         for walk, latent_key in walks:
             single_request_inputs = template(latent_key)
-            configs.append(BatchedCudaGraphConfig(
+            configs.append(BatchedAcceleratorGraphConfig(
                 capture_graph_walk=walk,
                 single_request_inputs=single_request_inputs,
                 capture_batch_sizes=batch_sizes,
@@ -700,11 +700,11 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         """Native ``pixel_size`` plus ``seed_capture_sizes``; one bucket each."""
         return tuple(sorted({self.pixel_size, *self.config.seed_capture_sizes}))
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         del tp_world_size
-        if not self.config.cuda_graph:
+        if not self.config.accelerator_graph:
             return []
         configs = []
         for h, w in self._capture_hw:
@@ -712,7 +712,7 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
                 (self.config.temporal_compression, h, w, 3),
                 dtype=self.ae_dtype, device=device,
             )
-            configs.append(BatchedCudaGraphConfig(
+            configs.append(BatchedAcceleratorGraphConfig(
                 capture_graph_walk=PRIME_WALK,
                 single_request_inputs=NodeInputs(
                     tensor_inputs={"image": image},

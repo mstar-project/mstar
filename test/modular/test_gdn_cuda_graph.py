@@ -258,7 +258,7 @@ def run_case(
     shape = shape or SMALL
     hidden = shape["hidden"]
     pool, manager = build(device, shape)
-    manager.build_cuda_graph_buffers([], max_bs=1, max_seq_len=BUCKET_TOKENS)
+    manager.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=BUCKET_TOKENS)
     stack = Stack(pool, manager, device, shape)
     if repo is not None:
         load_real_weights(stack, repo)
@@ -272,14 +272,14 @@ def run_case(
     ) if capture else None
 
     # Static inputs padded to the bucket: replay writes the real prefix and
-    # leaves the tail alone, as `CudaGraphRunner._stage` does.
+    # leaves the tail alone, as `AcceleratorGraphRunner._stage` does.
     sx = torch.zeros(BUCKET_TOKENS, hidden, device=device, dtype=torch.bfloat16)
     dx = torch.zeros(1, hidden, device=device, dtype=torch.bfloat16)
 
     pre_graph = pre_out = dec_graph = None
     if capture:
         # Capture against a dummy request and hand its slot back, as
-        # `CudaGraphRunner` does with its `__cg_*` rows. Recording against a
+        # `AcceleratorGraphRunner` does with its `__cg_*` rows. Recording against a
         # real request would leave that request's first step looking like a
         # capture rather than a replay.
         dummy = "__cg_dummy__"
@@ -345,7 +345,7 @@ def bisect_layers(spans=(14, 9), seed: int = 0) -> None:
     shape = SMALL
     hidden = shape["hidden"]
     pool, manager = build(device, shape)
-    manager.build_cuda_graph_buffers([], max_bs=1, max_seq_len=BUCKET_TOKENS)
+    manager.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=BUCKET_TOKENS)
     stack = Stack(pool, manager, device, shape)
 
     pre_lease = SlotLease(

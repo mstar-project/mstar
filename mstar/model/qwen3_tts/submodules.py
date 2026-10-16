@@ -2,7 +2,7 @@
 # NodeSubmodule wrappers for Qwen3-TTS
 # ---------------------------------------------------------------------------
 #
-# Two submodules cover the complete text-to-speech streaming pipeline:
+# Three submodules cover the complete text-to-speech streaming pipeline:
 #   1. TalkerSubmodule (KV_CACHE engine)
 #      - Builds the official prefill sequence for every 12 Hz variant:
 #        optional instruction turn, ChatML assistant role, codec language /
@@ -11,12 +11,12 @@
 #      - Maintains the Talker paged KV cache across 12 Hz decode steps.
 #      - Predicts codec group 0 with the Talker and groups 1-15 with the
 #        depth-wise CodePredictor.
-#      - Supports continuous batching and whole-forward decode CUDA Graphs
+#      - Supports continuous batching and whole-forward decode accelerator graphs
 #        (the CodePredictor depth loop is captured inside them), plus a
 #        piecewise graph covering that loop on eager paths like prefill.
 #   2. CodecSubmodule (STATELESS engine)
 #      - Receives buffered codec frames from the Talker partition.
-#      - Pads each window of the chunk ramp to its CUDA Graph capture bucket.
+#      - Pads each window of the chunk ramp to its accelerator graph capture bucket.
 #      - Runs the official speech-tokenizer decoder and trims overlap (and, for
 #        voice clones, the reference frames) before emitting 24 kHz PCM.
 #   3. RefEncoderSubmodule (no resources; Base voice clone only)
@@ -43,14 +43,14 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    CudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
-    PiecewiseCudaGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
@@ -109,7 +109,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     # residual-code control flow, and recurrent routing in addition to the
     # transformer. It introduces graph breaks and showed no steady-state win
     # for this path. The whole decode forward (CodePredictor loop included) is
-    # still CUDA-graph captured.
+    # still accelerator graph captured.
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
@@ -159,7 +159,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     ) -> torch.Tensor:
         """Pack the input-carried minimum-length EOS flags for this batch.
 
-        CUDA Graph replay calls ``preprocess`` with capture-slot dummy request
+        accelerator graph replay calls ``preprocess`` with capture-slot dummy request
         ids, so looking up request state here would permanently observe a new
         request at frame zero. ``prepare_inputs`` runs with the real request and
         carries the dynamic flag as a tensor instead.
@@ -514,7 +514,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 torch.tensor(seq_lens, device=self.get_device()).cumsum(0) - 1
             )
 
-        # Materialize the persistent base mask before CUDA Graph capture. Only
+        # Materialize the persistent base mask before accelerator graph capture. Only
         # the per-request EOS flags need to cross the replay input boundary.
         self._get_suppress_mask()
         return {
@@ -571,7 +571,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         0; the CodePredictor's unrolled depth loop fills groups 1..N-1 through
         the ``code_predictor`` aux sampler. Both read their params from
         engine-owned static buffers, so this single path serves eager execution
-        and CUDA-graph capture alike (mirrors the Qwen3-Omni Talker).
+        and accelerator graph capture alike (mirrors the Qwen3-Omni Talker).
         """
         hidden = self.model(input_embeds, label="main")
         last_hidden = hidden.index_select(0, last_token_indices)
@@ -824,9 +824,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         del graph_walk
         return self.MAX_BATCH_SIZE
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """Capture fixed one-token Talker decode batches and packed prefills,
         sampling included.
 
@@ -847,14 +847,14 @@ class TalkerSubmodule(ARNodeSubmodule):
                 tensor_inputs={"suppress_eos": torch.ones(1, dtype=torch.bool, device=device)},
             )
 
-        prefill = PackedCudaGraphConfig(
+        prefill = PackedAcceleratorGraphConfig(
             capture_graph_walk="talker_prefill",
             capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
             make_node_input=prefill_input,
             capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
             compile=False,
         )
-        return [prefill, BatchedCudaGraphConfig(
+        return [prefill, BatchedAcceleratorGraphConfig(
             capture_graph_walk="talker_decode",
             single_request_inputs=ARNodeInputs(
                 input_embeds=torch.zeros(
@@ -876,17 +876,17 @@ class TalkerSubmodule(ARNodeSubmodule):
             compile=True,
         )]
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self,
         device: torch.device,
         autocast_dtype: torch.dtype,
         tp_world_size: int = 1,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Capture the CodePredictor depth loop, sampling included.
 
         The whole-walk decode graph already covers this loop; this runner serves
-        the paths it can't — chiefly ``talker_prefill``, which stays eager
-        because it is variable-length and runs once per request. It uses no
+        the paths it can't — chiefly voice-clone prefill, which stays eager
+        because it also emits reference codec frames. It uses no
         paged KV cache: its frame-local cache is the engine's fixed-shape
         scratch pool.
         """
@@ -934,7 +934,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
         }
 
-    def can_use_cuda_graphs(
+    def can_use_accelerator_graphs(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
         """Replay the whole decode graph or a packed prefill; sampling params
@@ -943,7 +943,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             batch, model_inputs
         ):
             return False
-        return super().can_use_cuda_graphs(batch, model_inputs)
+        return super().can_use_accelerator_graphs(batch, model_inputs)
 
 
 # ===========================================================================
@@ -962,7 +962,7 @@ class CodecSubmodule(ARNodeSubmodule):
     Windows follow the model's ``ScheduledLeftContextChunkPolicy``: a ramp of
     small chunks, then ``chunk_frames`` new frames behind ``left_context_frames``
     of context (a voice clone's reference tail is the first window's context).
-    Each distinct window size is a CUDA-graph bucket; a shorter window is
+    Each distinct window size is an accelerator graph bucket; a shorter window is
     zero-padded up to the next bucket and trimmed after.
 
     The decoder's transformer needs the whole window, but the conv stack after
@@ -1054,7 +1054,7 @@ class CodecSubmodule(ARNodeSubmodule):
         Input arrives as ``[frames, code_groups]``. The official decoder wants
         ``[quantizers, frames]``; every request is padded to the smallest
         captured window that fits so the ramp's windows and the terminal tail
-        all replay CUDA graphs.
+        all replay accelerator graphs.
         """
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)
@@ -1248,13 +1248,13 @@ class CodecSubmodule(ARNodeSubmodule):
         buckets.discard(None)
         return max(buckets) if buckets else None
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """Capture every window of the chunk schedule for all batch buckets."""
         del tp_world_size
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="codec_chunk",
                 replay_graph_walks=["codec_chunk"],
                 single_request_inputs=ARNodeInputs(
@@ -1277,7 +1277,7 @@ class CodecSubmodule(ARNodeSubmodule):
             for window in self.windows
         ]
 
-    def can_use_cuda_graphs(
+    def can_use_accelerator_graphs(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
         return (
@@ -1288,7 +1288,7 @@ class CodecSubmodule(ARNodeSubmodule):
                 in {(self.config.codec.num_quantizers, window) for window in self.windows}
                 for item in model_inputs
             )
-            and super().can_use_cuda_graphs(batch, model_inputs)
+            and super().can_use_accelerator_graphs(batch, model_inputs)
         )
 
 

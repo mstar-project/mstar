@@ -200,7 +200,7 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     cleared = []
     fake = SimpleNamespace(
         _enable_nvtx=False,
-        _submodules={"dit": SimpleNamespace(cuda_graph_runner=None)},
+        _submodules={"dit": SimpleNamespace(accelerator_graph_runner=None)},
         _runner=SimpleNamespace(clear_preplan=lambda: cleared.append(True)),
     )
     fake.reset_pre_plan_for_batch = Engine.reset_pre_plan_for_batch.__get__(fake)

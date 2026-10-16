@@ -26,8 +26,8 @@ class CommGroup:
         self.group_members = group_members
         self.world_size = len(group_members)
         self.device_group = None
-        # gloo twin of ``device_group``, for object collectives (workspace
-        # rendezvous) that should not go through NCCL
+        # Gloo group for CPU object collectives (workspace rendezvous).
+        # XPU shares a mixed CPU/XPU process group with device tensors.
         self.cpu_group = None
         self.initialized = False
         # see ``init_allreduce_fusion``
@@ -305,7 +305,7 @@ class WorkerParallelGroups:
         self, init_method="tcp://127.0.0.1:29500",
         device: torch.device | None = None,
     ):
-        """Initialize the NCCL world group and per-node parallel subgroups.
+        """Initialize world and per-node parallel process groups.
 
         Every worker calls ``dist.init_process_group`` when *any* worker
         in the run participates in TP or SP (``self.any_parallelism``) —
@@ -327,6 +327,8 @@ class WorkerParallelGroups:
         backend = dist.get_default_backend_for_device(device.type)
         if not self.any_parallelism:
             return
+        if device.type == "xpu":
+            backend = f"cpu:gloo,xpu:{backend}"
 
         dist.init_process_group(
             backend=backend,
@@ -345,13 +347,17 @@ class WorkerParallelGroups:
         rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
             rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
-            # Members only: with the default group bound to a device, a
-            # non-member's subgroup creation joins an ncclCommSplit that
-            # members never call for a gloo group, and blocks forever.
-            rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
-                ranks=list(rank_tuple), backend="gloo",
-                use_local_synchronization=True,
-            )
+            if device.type == "xpu":
+                # A Gloo-only subgroup cannot inherit an XPU device binding.
+                rank_tuple_to_cpu_pg[rank_tuple] = rank_tuple_to_pg[rank_tuple]
+            else:
+                # Members only: with the default group bound to a device, a
+                # non-member's subgroup creation joins an ncclCommSplit that
+                # members never call for a gloo group, and blocks forever.
+                rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
+                    ranks=list(rank_tuple), backend="gloo",
+                    use_local_synchronization=True,
+                )
 
         seen: set[int] = set()
         for comm_group in (
@@ -451,7 +457,7 @@ class WorkerParallelGroups:
         initialized in ``init_dist``). Otherwise calls ``dist.barrier()``
         on the default global process group, syncing participating and
         non-participating workers alike. Used where every rank must be
-        ready before proceeding — e.g. between CUDA-graph warmup and the
+        ready before proceeding — e.g. between accelerator graph warmup and the
         worker's main loop, so an instance leader can't send a
         ``ScheduleTPNode`` to a follower that's still inside
         ``engine.warmup``.

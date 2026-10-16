@@ -7,7 +7,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
@@ -40,18 +44,18 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
                     input_seq_len=1
                 ),
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill",
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=lambda n: ARNodeInputs(
@@ -236,9 +240,9 @@ class SNACDecoderSubmodule(NodeSubmodule):
     def _num_frames(self) -> int:
         return self.config.snac_window_tokens // (4 * self.config.tokens_per_frame)
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """Declare the SNAC decode capture.
         """
         # One streaming window is ``snac_window_tokens`` raw tokens
@@ -252,7 +256,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             input_seq_len=tokens_per_window
         )
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="snac_chunk",
                 single_request_inputs=dummy,
                 capture_batch_sizes=[1, 2, 4, 8, 16]
@@ -362,6 +366,6 @@ class SNACDecoderSubmodule(NodeSubmodule):
         codes_2 = c2.reshape(mf.shape[0], -1)
         return codes_0, codes_1, codes_2
 
-    def can_use_cuda_graphs(self, batch, model_inputs):
-        return super().can_use_cuda_graphs(batch, model_inputs) \
+    def can_use_accelerator_graphs(self, batch, model_inputs):
+        return super().can_use_accelerator_graphs(batch, model_inputs) \
             and self.can_batch(batch, model_inputs)

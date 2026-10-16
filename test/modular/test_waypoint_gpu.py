@@ -455,7 +455,7 @@ def captured():
 
     static_latent = torch.zeros(1, 1, *config.latent_shape, dtype=DTYPE, device=DEVICE)
 
-    # One pool for both graphs, as ``CudaGraphRunner`` does, and rollout first:
+    # One pool for both graphs, as ``AcceleratorGraphRunner`` does, and rollout first:
     # its five forwards are a superset of prime's one, so the pool is sized once
     # and prime reuses the blocks rollout freed.
     pool = torch.cuda.graphs.graph_pool_handle()

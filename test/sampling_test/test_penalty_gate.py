@@ -30,13 +30,13 @@ VOCAB = 64
 
 
 class _RecordingSampler:
-    """Stands in for the CudaGraphableSampler a plan hands back."""
+    """Stands in for the AcceleratorGraphableSampler a plan hands back."""
 
     def __init__(self):
         self.synced = 0
         self.sampled_with: list[bool] = []
 
-    def sync_seen_token_masks(self, seen_masks):
+    def sync_seen_token_masks(self, seen_masks, keep=None):
         self.synced += 1
 
     def sample(self, request_ids, logits, apply_penalty=False):
@@ -46,6 +46,8 @@ class _RecordingSampler:
 
 class _RecordingBuffers:
     """Stands in for SamplerBuffers, recording just what the gate controls."""
+
+    ingraph_scatter = False
 
     def __init__(self):
         self.sampler = _RecordingSampler()
@@ -67,8 +69,11 @@ class _RecordingBuffers:
     def sampler_for(self, padded_bs, cg_slot):
         return self.sampler
 
-    def scatter_offset(self, cg_slot=0):
+    def scatter_offset(self, cg_slot=0, keep=None):
         self.offset_scatters += 1
+
+    def keep_mask(self, keep):
+        return None if keep is None else torch.tensor(keep, dtype=torch.bool)
 
     def register_request(self, rid, sampling_config):
         pass
@@ -83,7 +88,7 @@ def _resource(*, capable: bool = True) -> SamplerResource:
         enable_repetion_penalty=capable,
         device=torch.device("cpu"),
     )
-    # Skip build_cuda_graph_buffers: the real buffers would allocate a
+    # Skip build_accelerator_graph_buffers: the real buffers would allocate a
     # [capacity, VOCAB] mask, and the gate is what's under test, not the copies.
     res._cg_buffers = _RecordingBuffers()
     return res

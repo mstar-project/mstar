@@ -54,7 +54,7 @@ IMAGE_INPUTS, REF_LATENTS, IMAGE_OUTPUT = "image_inputs", "ref_latents", "image_
 @dataclass(frozen=True)
 class KleinShape:
     """What a klein denoise step's shape is: the latent token grid, the (fixed) text
-    length and the reference-image grids. Requests batch, and CUDA-graph buckets key, on it."""
+    length and the reference-image grids. Requests batch, and accelerator graph buckets key, on it."""
 
     grid: tuple[int, int]                       # (h, w) latent tokens of the generated image
     text_len: int

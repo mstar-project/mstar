@@ -11,7 +11,7 @@ Nodes, and the resources each declares (``NemotronDuplexModel.get_node_resources
     audio_codec        (none)                    RVQ codes -> 22.05 kHz PCM, per-request left context
 
 Both autoregressive nodes keep their whole state in engine resources and capture
-their decode step as a CUDA graph; the encoder and the codec run eager.
+their decode step as an accelerator graph; the encoder and the codec run eager.
 """
 from __future__ import annotations
 
@@ -25,7 +25,10 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+)
 from mstar.engine.resources import (
     AttentionStep,
     KVStep,
@@ -87,10 +90,10 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     """
 
     # No torch.compile: the per-layer resource cursors are compile-disabled
-    # and the decode step is a CUDA graph replay, which is where the time goes.
+    # and the decode step is an accelerator graph replay, which is where the time goes.
     disable_torch_compile = True
 
-    # Decode batch sizes captured as CUDA graphs: one row per live session per
+    # Decode batch sizes captured as accelerator graphs: one row per live session per
     # 80 ms tick. The recurrent pool holds a slot per row (padding rows take
     # one transiently), so the model's pool sizing covers the largest bucket.
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
@@ -104,9 +107,9 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """Capture the frame-synchronous decode step.
 
         ``prepare_inputs`` is host-only and ``preprocess`` (embedding + AddFusion)
@@ -126,7 +129,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             kwargs={"mode": _MODE_FRAME},
         )
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=frame,
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
@@ -458,7 +461,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     one token per label. The MoG / MaskGIT sampling is internal (not the
     engine's categorical sampler); its noise is drawn per row, with the row's
     own seeded generator, in ``preprocess`` -- so a session's speech does not
-    depend on its batch mates and the whole step is a CUDA graph replay for
+    depend on its batch mates and the whole step is an accelerator graph replay for
     all-decode batches.
     """
 
@@ -484,7 +487,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     def warmup(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(cond [P, H], uncond [P, H], prev_codes [Q])`` of the speaker warm-up.
         Computed once per speaker, under the serving autocast (bf16 on CUDA) no
-        matter who asks first: the CUDA-graph capture's first preprocess runs
+        matter who asks first: the accelerator graph capture's first preprocess runs
         outside the engine's autocast scope, and a warm-up computed there
         differs in the last bits from one computed under it -- enough to move
         a session's first frame (the talker's frame-0 decision is a knife-edge)."""
@@ -586,15 +589,15 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     def can_batch(self, batch, model_inputs) -> bool:
         return True
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """Capture the steady-state step (one token per label per session).
         ``preprocess`` (text conditioning, noise, warm-up assembly) runs eagerly
         before the graph; the captured region is the 2N-row backbone over the
         pool and the MaskGIT sampling loop."""
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="talker_decode",
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.tensor([self.config.text_pad_id], dtype=torch.long, device=device),

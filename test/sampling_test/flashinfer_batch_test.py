@@ -7,7 +7,7 @@ at different positions (padding the rest with random distractor rows), and check
 its sampled token never changes.
 
 Two paths are checked:
-  - ``sample_cuda_graphable_gpu`` — mstar's path (fused softmax → flashinfer).
+  - ``sample_accelerator_graphable_gpu`` — mstar's path (fused softmax → flashinfer).
   - raw ``flashinfer...top_k_top_p_sampling_from_probs`` on **fixed pre-computed
     probs**, skipping the fused kernel entirely.
 
@@ -22,7 +22,7 @@ Requires a GPU + flashinfer.
 
 import torch
 
-from mstar.engine.resources.sampler.utils import sample_cuda_graphable_gpu
+from mstar.engine.resources.sampler.utils import sample_accelerator_graphable_gpu
 
 DEV = "cuda"
 V = 2048
@@ -33,7 +33,7 @@ TOP_K, TOP_P, TEMP = 50, 1.0, 1.0
 def _mstar_sample(logits_rows, seeds, offsets):
     """mstar path: fused_temperature_softmax → flashinfer, on raw logits."""
     bs = logits_rows.shape[0]
-    return sample_cuda_graphable_gpu(
+    return sample_accelerator_graphable_gpu(
         logits_rows,
         temperature=torch.full((bs,), TEMP, device=DEV),
         top_k=torch.full((bs,), TOP_K, dtype=torch.int32, device=DEV),
@@ -117,7 +117,7 @@ def main() -> int:
         print("needs CUDA")
         return 2
     rc = 0
-    rc |= _batch_invariance("mstar sample_cuda_graphable_gpu", _mstar_sample, _logits_row)
+    rc |= _batch_invariance("mstar sample_accelerator_graphable_gpu", _mstar_sample, _logits_row)
     rc |= _batch_invariance("raw flashinfer from_probs", _raw_flashinfer_sample, _probs_row)
     rc |= test_offset_determinism()
     print("\nPASS" if rc == 0 else "\nFAIL")

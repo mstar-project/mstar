@@ -27,6 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import sampler_slots
 
@@ -973,14 +974,14 @@ def _to_tensor(
 # ---------------------------------------------------------------------------
 #
 # Reads top_k / top_p / temperature from preallocated device tensors so the
-# call can sit inside a CUDA graph capture region without allocating, syncing,
+# call can sit inside an accelerator graph capture region without syncing
 # or branching on CPU-side values. The full ``Sampler`` class is *not* graph
 # capturable (repetition-penalty state, ``@torch.compiler.disable``, the
 # device-context switch inside ``sample_tokens``), so the unrolled MTP loop uses
 # this narrower path. ``deterministic=True`` disables the CPU-RNG-seeded path that
 # FlashInfer would otherwise take.
 
-def sample_cuda_graphable_gpu(
+def sample_accelerator_graphable_gpu(
     logits: torch.Tensor,
     temperature: torch.Tensor,
     top_k: torch.Tensor,
@@ -994,7 +995,8 @@ def sample_cuda_graphable_gpu(
 ) -> torch.Tensor:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
-    Routes through the fused Triton prep kernel (``fused_temperature_softmax``)
+    XPU uses the released per-row device RNG API in ``vllm-xpu-kernels``.
+    CUDA routes through the fused Triton prep kernel (``fused_temperature_softmax``)
     so the CUDA-graph path can apply the same vLLM-style repetition penalty as
     the regular ``Sampler``, then samples with
     ``flashinfer.sampling.top_k_top_p_sampling_from_probs`` (``deterministic=True``
@@ -1027,39 +1029,57 @@ def sample_cuda_graphable_gpu(
         output is int32; we cast to int64 so the caller can index
         ``nn.Embedding`` modules (which require int64 indices) directly.
     """
-    import flashinfer
+    if logits.device.type == "xpu":
+        with torch.xpu.device(logits.device):
+            return _sample_xpu(
+                logits, temperature, top_k, top_p,
+                rep_penalty if apply_penalty else 1.0,
+                seen_tokens if apply_penalty else None,
+                run_greedy=True,
+                top_k_zero_count=None,
+                seed=seed,
+                rand_offset=offset,
+                min_p=min_p,
+            )
+    elif logits.device.type == "cuda":
+        import flashinfer
 
-    with torch.cuda.device(logits.device):
-        probs = fused_temperature_softmax(
-            logits, temperature,
-            penalty=rep_penalty if apply_penalty else None,
-            seen_mask=seen_tokens if apply_penalty else None,
-            include_greedy=True,
+        with torch.cuda.device(logits.device):
+            probs = fused_temperature_softmax(
+                logits, temperature,
+                penalty=rep_penalty if apply_penalty else None,
+                seen_mask=seen_tokens if apply_penalty else None,
+                include_greedy=True,
+            )
+            if min_p is not None:
+                probs = apply_min_p(probs, min_p)
+            top_k = torch.where(top_k > 0, top_k, logits.shape[1])
+            # NOTE: this is NOT batch-invariant. FlashInfer reads only row 0's seed
+            # and offset and folds the row index into philox, so identical (probs,
+            # seed, offset) yield different tokens at different batch positions.
+            # Sampling is thus reproducible only within a fixed batch layout; under
+            # continuous batching (shifting positions) a request's stream is not.
+            # Measured in test/sampling_test/flashinfer_batch_test.py.
+            samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, top_k, top_p, deterministic=True,
+                seed=seed, offset=offset,
+            )
+        return samples.to(torch.int64)
+    else:
+        raise ValueError(
+            f"Graph-captured sampling is unsupported on {logits.device.type!r}; "
+            "expected 'cuda' or 'xpu'."
         )
-        if min_p is not None:
-            probs = apply_min_p(probs, min_p)
-        top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-        # NOTE: this is NOT batch-invariant. FlashInfer reads only row 0's seed
-        # and offset and folds the row index into philox, so identical (probs,
-        # seed, offset) yield different tokens at different batch positions.
-        # Sampling is thus reproducible only within a fixed batch layout; under
-        # continuous batching (shifting positions) a request's stream is not.
-        # Measured in test/sampling_test/flashinfer_batch_test.py.
-        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            probs, top_k, top_p, deterministic=True,
-            seed=seed, offset=offset,
-        )
-    return samples.to(torch.int64)
 
 
 @dataclass
-class CudaGraphableSampler(BaseSampler):
+class AcceleratorGraphableSampler(BaseSampler):
     temperature_buf: torch.Tensor
     top_k_buf: torch.Tensor
     top_p_buf: torch.Tensor
     seed_buf: torch.Tensor
     offset_buf: torch.Tensor
-    # Repetition-penalty state for the CUDA-graph path. ``None`` for submodules
+    # Repetition-penalty state for the graph path. ``None`` for submodules
     # that don't opt into seen-token tracking (then ``apply_penalty`` is a no-op).
     rep_penalty_buf: torch.Tensor | None = None
     seen_tokens_buf: torch.Tensor | None = None  # [bs, V] bool
@@ -1079,7 +1099,7 @@ class CudaGraphableSampler(BaseSampler):
     slot_idx_view: torch.Tensor | None = None
     ingraph_scatter: bool = False
 
-    # Set during graph capture, and used by the cuda graph runner to determine
+    # Set during graph capture, and used by the accelerator graph runner to determine
     # whether requests' seen token buffers should be synced post-replay
     applied_penalty_in_graph: bool = False
 
@@ -1104,7 +1124,7 @@ class CudaGraphableSampler(BaseSampler):
     ):
         if self.ingraph_scatter:
             self.gather_in_graph()
-        codes = sample_cuda_graphable_gpu(
+        codes = sample_accelerator_graphable_gpu(
             logits, self.temperature_buf,
             self.top_k_buf, self.top_p_buf,
             self.seed_buf, self.offset_buf,
@@ -1113,7 +1133,7 @@ class CudaGraphableSampler(BaseSampler):
             seen_tokens=self.seen_tokens_buf,
             min_p=self.min_p_buf,
         )
-        self.offset_buf += 1
+        self.offset_buf.add_(_rng_offset_stride(logits.device.type, logits.shape[-1]))
         codes = self._broadcast_tokens(codes)
         if self.last_token_buf is not None:
             self.last_token_buf.copy_(codes)
@@ -1123,7 +1143,7 @@ class CudaGraphableSampler(BaseSampler):
             self.applied_penalty_in_graph = True
             # Record the (broadcast, TP-agreed) token in the seen-token buffer so
             # the next step penalises it. ``scatter_`` with a scalar value is
-            # CUDA-graph capturable; advanced-index assignment
+            # graph capturable; advanced-index assignment
             # (``buf[rows, codes] = True``) is not — it trips "operation not
             # permitted when stream is capturing".
             self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
@@ -1164,7 +1184,7 @@ class Buffer:
     """Three-tier storage for one per-request scalar sampling parameter.
 
     - ``buf``     ``[max_bs]``   per-step tensor, sliced to ``padded_bs`` and read
-      by ``CudaGraphableSampler`` (its address must stay stable across replays).
+      by ``AcceleratorGraphableSampler`` (its address must stay stable across replays).
     - ``master``  ``[capacity]`` slot-indexed cache, one row per active request.
     """
     # ``[cg_slots, max_bs]``: one per-step row per double-buffer slot, so a
@@ -1337,7 +1357,7 @@ class SamplerBuffers:
     repetition_penalty) is a ``Buffer`` owning a per-step slice and a slot-indexed
     master cache. The RNG ``offset`` is also a ``Buffer``
     but round-trips on the GPU with no CPU middleman: gathered from its slot
-    master before sampling, advanced in graph (``offset_buf += 1`` per sample),
+    master before sampling, advanced in graph by the backend's Philox stride,
     then scattered back to the master after replay — so a request's RNG stream
     follows its slot (batch-position invariant) and reproduces under a fixed
     seed. The optional ``seen_tokens`` ``MaskBuffer`` (allocated only when
@@ -1368,7 +1388,7 @@ class SamplerBuffers:
     last_token: Buffer
 
     # TP communicator for the submodule that owns these buffers. Passed
-    # through ``slice_for_bs`` into every per-step ``CudaGraphableSampler``
+    # through ``slice_for_bs`` into every per-step ``AcceleratorGraphableSampler``
     # so its ``_broadcast_tokens`` aligns the sampled token across ranks.
     # Without this, ``sample`` would build a
     # sampler with ``tp_group=None``, the broadcast would silently no-op,
@@ -1378,7 +1398,7 @@ class SamplerBuffers:
     tp_group: "CommGroup | None" = None  # noqa: F821
     # Per-request seen-token mask buffer for the repetition penalty. Present
     # only for submodules that opt in by declaring a vocab size (e.g. the
-    # Qwen3-Omni Talker). ``None`` => the CUDA-graph path applies no penalty.
+    # Qwen3-Omni Talker). ``None`` => the graph path applies no penalty.
     seen_tokens: "MaskBuffer | None" = None
     # Per-request min-p; allocated only for submodules whose spec enables it,
     # so every other node's captured sampler is unchanged.
@@ -1474,7 +1494,7 @@ class SamplerBuffers:
         good. ``cg_slots`` double-buffers the per-step tensors so the sampler can
         pre-plan.
         """
-        pinned = torch.cuda.is_available() and device.type == "cuda"
+        pinned = DeviceCapability.of(device).pin_memory
         cap = max_batch_size
         if ingraph_scatter:
             cap = max(max_batch_size, slots if slots is not None else sampler_slots())
@@ -1567,7 +1587,7 @@ class SamplerBuffers:
         """Double-and-copy the master buffers up to at least ``new_capacity``.
 
         Triggered when concurrently-registered requests exceed the current
-        master capacity. Per-step buffers (sized to the cuda-graph max_bs) are
+        master capacity. Per-step buffers (sized to the graph capture max_bs) are
         NOT resized — the gather only reads ``padded_bs`` rows from master.
 
         Host rows only, under the lock ``_write_master_row`` takes, so a plan-thread
@@ -1810,7 +1830,7 @@ class SamplerBuffers:
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
 
-    def sampler_for(self, padded_bs: int, cg_slot: int) -> "CudaGraphableSampler":
+    def sampler_for(self, padded_bs: int, cg_slot: int) -> "AcceleratorGraphableSampler":
         """A sampler bound to ``cg_slot``'s per-step buffer views (zero-copy).
         Valid regardless of when the buffers are (re)gathered into.
 
@@ -1820,7 +1840,7 @@ class SamplerBuffers:
         key = (padded_bs, cg_slot)
         sampler = self._samplers.get(key)
         if sampler is None:
-            sampler = CudaGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
+            sampler = AcceleratorGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
             self._samplers[key] = sampler
         sampler.applied_penalty_in_graph = False
         return sampler
@@ -1843,7 +1863,7 @@ class SamplerBuffers:
         # fresh pinned tensor: the host allocator holds it until the copy lands
         device = self._slot_idx_gpu.device
         return torch.tensor(
-            keep, dtype=torch.bool, pin_memory=device.type == "cuda",
+            keep, dtype=torch.bool, pin_memory=DeviceCapability.of(device).pin_memory,
         ).to(device, non_blocking=True)
 
     def scatter_offset(

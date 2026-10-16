@@ -1,8 +1,7 @@
 """NoiseStager: the pinned-staging path must match the pageable one exactly, and must
 never let a buffer be rewritten while its copy is still in flight.
 
-The CPU cases run anywhere. The pinned/async cases need CUDA, since there is nothing
-to pin and nothing to overlap without it.
+The CPU cases run anywhere. The pinned/async cases run on CUDA and XPU.
 """
 
 from __future__ import annotations
@@ -16,8 +15,13 @@ sys.path.insert(0, ".")
 
 from mstar.model.components.diffusion.noise import NoiseStager  # noqa: E402
 
-CUDA = torch.cuda.is_available()
-cuda_only = pytest.mark.skipif(not CUDA, reason="requires CUDA")
+
+@pytest.fixture(params=["cuda", "xpu"])
+def accelerator_device(request):
+    runtime = getattr(torch, request.param)
+    if not runtime.is_available():
+        pytest.skip(f"{request.param} is unavailable")
+    return torch.device(request.param, 0)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -48,39 +52,34 @@ def test_to_device_on_cpu_is_a_plain_copy():
     assert out.device.type == "cpu" and torch.equal(out, src)
 
 
-def test_dtype_mismatch_is_rejected():
+def test_dtype_mismatch_is_rejected(accelerator_device):
     stager = NoiseStager(torch.bfloat16)
-    if not CUDA:
-        pytest.skip("the check guards the CUDA path")
     with pytest.raises(ValueError, match="holds"):
-        stager.to_device(torch.randn(8, dtype=torch.float32), torch.device("cuda"))
+        stager.to_device(torch.randn(8, dtype=torch.float32), accelerator_device)
 
 
-@cuda_only
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_staged_copy_equals_the_pageable_copy(dtype):
+def test_staged_copy_equals_the_pageable_copy(dtype, accelerator_device):
     """What the engine would have got from ``tensor.to(device)``, byte for byte."""
     stager = NoiseStager(dtype)
-    device = torch.device("cuda")
+    device = accelerator_device
     for shape in ((4096, 128), (1, 128, 64, 64), (7,)):
         src = torch.randn(shape).to(dtype)
         staged = stager.to_device(src, device)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize(device)
         assert staged.shape == src.shape and staged.dtype == dtype
         assert torch.equal(staged.cpu(), src), f"staged copy differs for {shape}"
 
 
-@cuda_only
-def test_non_contiguous_input_is_staged_correctly():
+def test_non_contiguous_input_is_staged_correctly(accelerator_device):
     stager = NoiseStager(torch.float32)
     src = torch.randn(16, 32).t()  # non-contiguous view
-    staged = stager.to_device(src, torch.device("cuda"))
-    torch.cuda.synchronize()
+    staged = stager.to_device(src, accelerator_device)
+    torch.accelerator.synchronize(accelerator_device)
     assert torch.equal(staged.cpu(), src)
 
 
-@cuda_only
-def test_a_buffer_is_not_rewritten_while_its_copy_is_in_flight():
+def test_a_buffer_is_not_rewritten_while_its_copy_is_in_flight(accelerator_device):
     """The ring must wrap only onto buffers whose copy has retired.
 
     Issue more copies than the ring is deep, with distinct contents, and check every
@@ -89,31 +88,29 @@ def test_a_buffer_is_not_rewritten_while_its_copy_is_in_flight():
     """
     depth = 3
     stager = NoiseStager(torch.float32, depth=depth)
-    device = torch.device("cuda")
+    device = accelerator_device
     sources = [torch.full((1 << 18,), float(i)) for i in range(depth * 4)]
     staged = [stager.to_device(s, device) for s in sources]
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize(device)
     for i, (out, src) in enumerate(zip(staged, sources, strict=True)):
         assert torch.equal(out.cpu(), src), f"copy {i} saw a rewritten staging buffer"
 
 
-@cuda_only
-def test_growth_preserves_in_flight_copies():
+def test_growth_preserves_in_flight_copies(accelerator_device):
     """A copy issued before a grow must still land: _grow synchronises first."""
     stager = NoiseStager(torch.float32, depth=2, numel=16)
-    device = torch.device("cuda")
+    device = accelerator_device
     small = torch.full((16,), 1.0)
     first = stager.to_device(small, device)
     big = torch.full((1 << 20,), 2.0)          # forces _grow
     second = stager.to_device(big, device)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize(device)
     assert torch.equal(first.cpu(), small), "a pre-grow copy was lost"
     assert torch.equal(second.cpu(), big)
 
 
-@cuda_only
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_randn_to_device_matches_an_inline_draw(dtype):
+def test_randn_to_device_matches_an_inline_draw(dtype, accelerator_device):
     """Drawing with ``out=`` into the pinned buffer must not perturb the RNG stream.
 
     This is the gate on the host-memcpy-skipping path: if ``out=`` consumed the
@@ -122,48 +119,45 @@ def test_randn_to_device_matches_an_inline_draw(dtype):
     """
     shape = (1, 128, 16, 16)
     stager = NoiseStager(dtype)
-    staged = stager.randn_to_device(shape, seed=99, device=torch.device("cuda"))
-    torch.cuda.synchronize()
+    staged = stager.randn_to_device(shape, seed=99, device=accelerator_device)
+    torch.accelerator.synchronize(accelerator_device)
     inline = torch.randn(shape, generator=torch.Generator(device="cpu").manual_seed(99), dtype=dtype)
     assert torch.equal(staged.cpu(), inline), "out= draw diverged from the inline draw"
 
 
-@cuda_only
-def test_randn_to_device_equals_todays_pack_then_copy():
+def test_randn_to_device_equals_todays_pack_then_copy(accelerator_device):
     """The whole point, end to end: for layout-only post-processing, packing after
     the staged copy gives exactly what packing before a pageable copy gave."""
     from mstar.model.components.diffusion.image_io import pack_latents
 
     shape, seed, dtype = (1, 128, 16, 16), 4242, torch.bfloat16
-    device = torch.device("cuda")
+    device = accelerator_device
     today = pack_latents(
         torch.randn(shape, generator=torch.Generator(device="cpu").manual_seed(seed), dtype=dtype)
     )[0].to(device)
     staged = pack_latents(NoiseStager(dtype).randn_to_device(shape, seed, device))[0]
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize(device)
     assert staged.shape == today.shape
     assert torch.equal(staged, today), "packing on the device changed the seeded noise"
 
 
-@cuda_only
-def test_randn_to_device_respects_the_ring():
+def test_randn_to_device_respects_the_ring(accelerator_device):
     stager = NoiseStager(torch.float32, depth=2)
-    device = torch.device("cuda")
+    device = accelerator_device
     drawn = [stager.randn_to_device((1024,), seed=i, device=device) for i in range(8)]
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize(device)
     for i, got in enumerate(drawn):
         want = torch.randn((1024,), generator=torch.Generator(device="cpu").manual_seed(i))
         assert torch.equal(got.cpu(), want), f"draw {i} saw a rewritten staging buffer"
 
 
-@cuda_only
-def test_stage_all_covers_a_seed_set():
+def test_stage_all_covers_a_seed_set(accelerator_device):
     stager = NoiseStager(torch.bfloat16)
-    device = torch.device("cuda")
+    device = accelerator_device
     seeds = {"latents": torch.randn(64, 8).to(torch.bfloat16),
              "solver": torch.randn(4, 8).to(torch.bfloat16)}
     out = stager.stage_all(seeds, device)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize(device)
     assert set(out) == set(seeds)
     for name, tensor in seeds.items():
         assert torch.equal(out[name].cpu(), tensor)

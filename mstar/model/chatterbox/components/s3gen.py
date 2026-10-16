@@ -82,7 +82,7 @@ class S3Gen(nn.Module):
             config.cfm, ConditionalDecoder(config.estimator, meanflow=config.meanflow),
         )
         self.vocoder = HiFTGenerator(config.hift)
-        # optional CUDA-graph replay of the solve, the encoder and the vocoder (``enable_graphs``)
+        # optional accelerator graph replay of the solve, encoder and vocoder (``enable_graphs``)
         self.solver: SolveGraphs | None = None
         self.encoder_graphs: EncoderGraphs | None = None
         self.vocoder_graphs: VocoderGraphs | None = None
@@ -125,7 +125,7 @@ class S3Gen(nn.Module):
     ) -> "SolveGraphs | None":
         """Replay the flow solve (one graph per rows x frames x steps), the
         token encoder (per rows x token bucket) and the vocoder (per exact
-        length) from CUDA graphs; ``stages`` picks which."""
+        length) from accelerator graphs; ``stages`` picks which."""
         self.solver = SolveGraphs(self.solve, rows=rows, max_graphs=max_graphs) if "solve" in stages else None
         self.encoder_graphs = (
             EncoderGraphs(self.flow_encoder, rows=rows, token_bucket=token_bucket, max_graphs=max_graphs)

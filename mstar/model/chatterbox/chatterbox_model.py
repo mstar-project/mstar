@@ -20,7 +20,7 @@ Walks and partitions::
 Classifier-free guidance is two KV streams per request (``main`` with the
 text, ``uncond`` with the text embeddings zeroed) packed into one attention
 plan, so a CFG decode step is one forward over 2B rows; ``cfg_weight`` is a
-per-request tensor input, so decode replays a single captured CUDA graph per
+per-request tensor input, so decode replays a single captured accelerator graph per
 batch size and guidance mode. Turbo has no guidance.
 
 The reference implementation (``chatterbox/tts.py``, ``chatterbox/tts_turbo.py``)
@@ -78,6 +78,7 @@ from mstar.model.chatterbox.loader import resolve_snapshot
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import FixedChunkPolicy, RampChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +218,7 @@ class ChatterboxModel(Model):
             if s3gen_graphs:
                 raise ValueError("s3gen_graphs and s3gen_compile are alternatives; enable one of them")
             # compile was asked for explicitly, graphs are the default: compile wins
-            logger.info("s3gen_compile requested: the S3Gen CUDA graphs are off for this deployment")
+            logger.info("s3gen_compile requested: S3Gen accelerator graphs are off for this deployment")
             self.config.s3gen_graphs = False
         if self.config.s3gen_graphs:
             if self.config.s3gen_frame_bucket <= 0:
@@ -933,7 +934,7 @@ class ChatterboxModel(Model):
                 rows=_graph_rows(self.config.s3gen_max_batch_size), stages=self._graph_stages,
                 token_bucket=max(1, self.config.s3gen_frame_bucket // self.config.s3gen.token_mel_ratio),
             )
-            if solver is not None and torch.device(device).type == "cuda":
+            if solver is not None and DeviceCapability.of(device).graph_backend is not None:
                 self._warm_solve_graphs(s3gen, solver, builtin.prompt_feat.shape[1])
         return S3GenSubmodule(
             s3gen.eval(), self._s3_tokenizer(device), self.config,

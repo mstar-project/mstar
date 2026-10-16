@@ -126,6 +126,9 @@ class DenseAttentionManager(AttentionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
+    def can_capture(self) -> bool:
+        return False
+
     @property
     def requires_kv_write(self) -> bool:
         return False
