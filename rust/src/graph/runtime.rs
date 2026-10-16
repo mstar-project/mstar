@@ -1299,8 +1299,11 @@ pub struct RouteOut {
 pub struct Completion {
     pub partition: String,
     pub node_name: String,
-    /// Per rid: the walk it completed in, and that walk's worker graph.
+    /// Per rid: the walk it completed in, and that walk's worker graph. Only
+    /// filled for a step of several walks; every rid of a one-walk step takes
+    /// `walk_default`.
     pub rid_walk: FxHashMap<u32, (Option<Sym>, WgIndex)>,
+    pub walk_default: (Option<Sym>, WgIndex),
     pub routing: FxHashMap<u32, Vec<RoutedEdge>>,
     /// Per rid: the persist signals, taken BEFORE the fanout, as Python's
     /// `to_conductor` is. Persist is orthogonal to routing: every rank reports
@@ -2421,9 +2424,10 @@ impl GraphRuntime {
         // Per walk: its worker graph, the node there, the graph, the walk, and
         // the local worker graphs live in it (the done-sweep below intersects
         // each request's registered graphs with these).
-        let walk_names = input.walks.clone().unwrap_or_else(|| vec![input.graph_walk.clone()]);
+        let one_walk = [input.graph_walk.clone()];
+        let walk_names: &[String] = input.walks.as_deref().unwrap_or(&one_walk);
         let mut ctxs = Vec::with_capacity(walk_names.len());
-        for walk_name in &walk_names {
+        for walk_name in walk_names {
             let Some(wg) = self.owner_of(&input.node_name, walk_name) else {
                 return Err(PyValueError::new_err(format!(
                     "no worker graph for node {:?} in walk {:?}",
@@ -2439,14 +2443,16 @@ impl GraphRuntime {
                 .unwrap_or_default();
             ctxs.push((wg, node, self.graphs[wg as usize].clone(), walk_sym, walk_wgs));
         }
-        let rid_walk_idx = input.rid_walk_idx.clone().unwrap_or_else(|| vec![0; input.rids.len()]);
-        if rid_walk_idx.len() != input.rids.len()
-            || rid_walk_idx.iter().any(|&w| w as usize >= ctxs.len())
-        {
-            return Err(PyValueError::new_err(
-                "complete_and_route_batch: rid_walk_idx must index walks, one per rid",
-            ));
+        // None: every rid ran the one walk, which needs no per-rid index
+        let rid_walk_idx: Option<&[u32]> = input.rid_walk_idx.as_deref();
+        if let Some(idx) = rid_walk_idx {
+            if idx.len() != input.rids.len() || idx.iter().any(|&w| w as usize >= ctxs.len()) {
+                return Err(PyValueError::new_err(
+                    "complete_and_route_batch: rid_walk_idx must index walks, one per rid",
+                ));
+            }
         }
+        let several_walks = ctxs.len() > 1;
         let signals: Vec<Option<Sym>> = input
             .output_signals
             .iter()
@@ -2488,10 +2494,12 @@ impl GraphRuntime {
         let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
 
         for (i, &rid) in input.rids.iter().enumerate() {
-            let ctx = &ctxs[rid_walk_idx[i] as usize];
+            let ctx = &ctxs[rid_walk_idx.map_or(0, |idx| idx[i] as usize)];
             let (wg, node, g, walk_sym, walk_wgs) = (ctx.0, ctx.1, &ctx.2, ctx.3, &ctx.4);
             let walk = walk_sym.unwrap_or_default();
-            rid_walk.insert(rid, (walk_sym, wg));
+            if several_walks {
+                rid_walk.insert(rid, (walk_sym, wg));
+            }
             // Slice this rid's uuids back out of the flat, rid-major layout.
             let mut by_signal: FxHashMap<Sym, Vec<TensorRef>> =
                 FxHashMap::default();
@@ -3013,6 +3021,7 @@ impl GraphRuntime {
                 partition: input.partition.clone(),
                 node_name: input.node_name.clone(),
                 rid_walk,
+                walk_default: (ctxs[0].3, ctxs[0].0),
                 routing,
                 persist,
                 completed_wgs,
@@ -3456,7 +3465,7 @@ impl GraphRuntime {
             }
         }
         for (rid, edges) in c.routing {
-            let (walk, wg) = c.rid_walk.get(&rid).copied().unwrap_or((None, 0));
+            let (walk, wg) = c.rid_walk.get(&rid).copied().unwrap_or(c.walk_default);
             let g = self.graphs[wg as usize].clone();
             // What the receiver needs to put a sharded arrival back together.
             // Python stamps both in fanout_graph_edges, on the sending side.

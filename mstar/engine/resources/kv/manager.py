@@ -618,7 +618,9 @@ class KVManager(AttentionResource):
         ):
             return
         walks = self._keyed_walks.get(segment.label)
-        if walks is not None and ctx.walk_of(segment.request_id) not in walks:
+        if walks is not None and (
+            ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
+        ) not in walks:
             # another walk wrote this span (an edit's image, say), which the keys do not describe
             stream.chain = None
             return
@@ -844,6 +846,8 @@ class KVManager(AttentionResource):
         rows_of: dict[str, list] = {}
         page_size = self.config.page_size
         lookup = self._chain_lookup
+        # a step of one walk keys every row alike
+        step_key = (node_name, walk_of) if isinstance(walk_of, str) else None
         with self._lock:
             for rid in request_ids:
                 # the label and buffer name do not change over a request's
@@ -852,10 +856,10 @@ class KVManager(AttentionResource):
                 per_rid = lookup.get(rid)
                 if per_rid is None:
                     per_rid = lookup[rid] = {}
-                walk = walk_of if isinstance(walk_of, str) else walk_of(rid)
-                key = (node_name, walk)
+                key = step_key or (node_name, walk_of(rid))
                 entry = per_rid.get(key)
                 if entry is None:
+                    walk = key[1]
                     label = self._keyed_label(rid, node_name, walk)
                     tensor = (
                         (self._overrides[rid].prefix_decode or {}).get(label)

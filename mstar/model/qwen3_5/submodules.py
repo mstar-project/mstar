@@ -477,10 +477,10 @@ class LLMSubmodule(ARNodeSubmodule):
                 for rid, inp in zip(request_ids, inputs, strict=True)
             }
 
-        row_walks = [inp.graph_walk or graph_walk for inp in inputs]
         kept_rids = None
         if graph_walk != "decode":
             # decode rows, and the last prefill, keep their token through `postprocess`
+            row_walks = [inp.graph_walk or graph_walk for inp in inputs]
             info = per_request_info or {}
             kept_rids = frozenset(
                 rid for rid, walk in zip(request_ids, row_walks, strict=True)

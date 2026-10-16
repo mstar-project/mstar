@@ -466,9 +466,13 @@ class MicroScheduler:
             if not self._check_ready(node_name, rid, fwd_info,  allow_reload=False):
                 return None
 
-        rows = RequestWalks(request_ids, walks, walk_idx) if walks \
-            else RequestWalks(request_ids, [graph_walk], [0] * len(request_ids))
-        popped = self.runtime.pop_walk_rids(node_name, rows, check_ready=True)
+        # one walk: the plain pop, with no per-rid walk index to build
+        popped = (
+            self.runtime.pop_walk_rids(
+                node_name, RequestWalks(request_ids, walks, walk_idx), check_ready=True,
+            ) if walks
+            else self.runtime.pop_rids(node_name, graph_walk, request_ids, check_ready=True)
+        )
         if popped is None:
             return None
         rids = popped.wg_ids.keys
@@ -1132,6 +1136,10 @@ class MicroScheduler:
             only_other = node_walk == exclude_target and exclude_walk is not None
             if node_walk == exclude_target and not only_other:
                 continue
+            if only_other and (
+                set(batch.request_walks.values()) if batch.request_walks else {batch.graph_walk}
+            ) == {exclude_walk}:
+                continue  # every row is of the excluded walk
             for rid in batch.request_to_worker_graph:
                 if only_other and batch.walk_of(rid) == exclude_walk:
                     continue

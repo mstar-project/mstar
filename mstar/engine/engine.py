@@ -795,9 +795,11 @@ class Engine:
                     batch=batch, model_inputs=node_inputs
                 )
                 return
+        # a step of one walk probes (or not) for every row alike
+        step_probes = not mixed and walk in keyed_walks
         for i, rid in enumerate(batch.request_ids):
             row_walk = walk_of(rid) if mixed else walk
-            probe_prefix = row_walk in keyed_walks
+            probe_prefix = (row_walk in keyed_walks) if mixed else step_probes
             try:
                 req_inputs = prepare(
                     graph_walk=row_walk,

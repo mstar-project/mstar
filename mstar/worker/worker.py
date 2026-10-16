@@ -2231,8 +2231,10 @@ class Worker:
             rid: InputMetadata(stream_chunks=chunks) for rid in request_ids
             if (chunks := self._stream_chunks_for(rid, spec_node, per_request_inputs[rid]))
         } if self._streams_possible() else {}
-        label, request_walks = self.scheduler.label_for(
-            spec_node, request_walks or dict.fromkeys(request_ids, spec_target.graph_walk),
+        # rows of one walk (the usual chain) need no per-row map
+        label, request_walks = (
+            self.scheduler.label_for(spec_node, request_walks) if request_walks
+            else (spec_target.graph_walk, {})
         )
         spec_batch = ScheduledBatch(
             node_name=spec_node,
@@ -2454,7 +2456,8 @@ class Worker:
 
         if not continuing:
             return None
-        spec_walks = dict.fromkeys(prep.ready_rids, graph_walk)
+        # fresh rows of another walk (a mixing chain): rid -> walk
+        other_walks: dict[int, str] = {}
 
         # Merge in fresh rids whose spec-target node is ready right now
         # Speculation only consumes work compatible with the spec target. In
@@ -2497,7 +2500,9 @@ class Worker:
                 new_request_to_worker_graph[rid] = (
                     fresh_batch.request_to_worker_graph[rid]
                 )
-                spec_walks[rid] = fresh_batch.walk_of(rid)
+                walk = fresh_batch.walk_of(rid)
+                if walk != graph_walk:
+                    other_walks[rid] = walk
 
         logger.debug("Speculating: %s %s", spec_node_name, continuing)
         return self._assemble_speculation(
@@ -2505,7 +2510,10 @@ class Worker:
             new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, continuing,
             is_same_node=speculating_same_node, spec_id=prep.spec_id,
-            request_walks=spec_walks,
+            # a per-row map only when the step mixes walks
+            request_walks={
+                **dict.fromkeys(new_request_to_worker_graph, graph_walk), **other_walks,
+            } if other_walks else None,
         )
 
     def _thread_outputs_to_speculative(
