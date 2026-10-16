@@ -487,7 +487,7 @@ class LMSubmodule(ARNodeSubmodule):
 def filter_tokens(raw: torch.Tensor, config: CosyVoice3Config) -> torch.Tensor:
     """The tokens the reference hands the flow: speech ids only (control ids
     end the stream), and no run of more than ``max_silent_tokens`` silent
-    tokens (the LM still saw them)."""
+    tokens (the LM still saw them). ``raw`` is a host tensor."""
     tokens = raw[raw < config.lm.speech_token_size]
     if tokens.numel() == 0:
         return tokens
@@ -538,6 +538,10 @@ class FlowSubmodule(NodeSubmodule):
         self.ratio = config.flow.token_mel_ratio
         self.lookahead = config.flow.pre_lookahead_len
         self.chunk_tokens = config.flow.chunk_tokens
+        # one copy per row: a ring of two batches never waits on a copy still in flight
+        self._token_stager = PinnedStager(
+            torch.long, numel=config.max_speech_tokens, depth=2 * config.flow_max_batch_size
+        )
 
     def _voice(self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, state) -> ReferenceVoice:
         if inputs.get(REF_AUDIO):
@@ -593,13 +597,19 @@ class FlowSubmodule(NodeSubmodule):
         rid = _rid(fwd_info)
         state = self.request_state(rid)
         chunks = inputs.get(SPEECH_TOKENS) or []
-        raw = chunks[0].to(device, torch.long).reshape(-1) if chunks and chunks[0] is not None else None
+        raw = chunks[0] if chunks and chunks[0] is not None else None
         if raw is None or raw.numel() == 0:
-            raw = state.get("raw", torch.zeros(0, dtype=torch.long, device=device))
+            raw = state.get("raw", torch.zeros(0, dtype=torch.long))
+        else:
+            # The one host sync of a flow step: the stream delivers the tokens
+            # on the device, and how many settle depends on their values.
+            raw = raw.reshape(-1).to("cpu", torch.long)
         state.add("raw", raw)
         voice = self._voice(fwd_info, inputs, state)
         final = bool(kwargs.get("is_final_stream_chunk", False))
-        tokens = filter_tokens(raw, self.config)
+        kept = filter_tokens(raw, self.config)
+        tokens = torch.empty(kept.shape, dtype=torch.long, device=device)
+        self._token_stager.copy_(tokens, kept.numpy())
         meta = fwd_info.step_metadata or {}
         return NodeInputs(
             tensor_inputs={SPEECH_TOKENS: tokens},
@@ -635,7 +645,9 @@ class FlowSubmodule(NodeSubmodule):
                 state.add("settled", dict(rows)[i].settle)
             if final:
                 state.add("done", True)
-            out.append({MEL: [new], MEL_FINAL: [torch.tensor([final], device=new.device)]})
+            # on the host: HiFT reads it to plan its emit, and a colocated HiFT
+            # gets this very tensor
+            out.append({MEL: [new], MEL_FINAL: [torch.tensor([final])]})
         return out
 
     def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
@@ -684,7 +696,9 @@ class HiFTSubmodule(NodeSubmodule):
         del graph_walk, kwargs
         device = self.get_device()
         mel = inputs[MEL][0].to(device, self.hift.conv_pre.weight.dtype)
-        final = bool(inputs[MEL_FINAL][0].reshape(-1)[0].item())
+        # a host tensor when the flow node shares this worker; a device read
+        # only when the two are placed apart
+        final = bool(inputs[MEL_FINAL][0].reshape(-1)[0])
         return NodeInputs(tensor_inputs={MEL: mel}, kwargs={"rid": _rid(fwd_info), "final": final})
 
     def _vocode(self, rid: int, mel: torch.Tensor, final: bool) -> torch.Tensor:

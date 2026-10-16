@@ -51,6 +51,7 @@ from mstar.model.chatterbox.components.s3gen_cfm import CausalConditionalCFM
 from mstar.model.chatterbox.loader import load_component
 from mstar.model.cosyvoice3.components.dit import DiT, chunk_attention_mask
 from mstar.model.cosyvoice3.config import FlowConfig
+from mstar.utils.h2d import PinnedStager
 
 
 @dataclass
@@ -112,6 +113,7 @@ class CosyVoice3Flow(nn.Module):
         generator = torch.Generator().manual_seed(config.noise_seed)
         noise = torch.randn(1, config.output_size, config.noise_frames, generator=generator)
         self.register_buffer("noise", noise, persistent=False)
+        self._row_stager = PinnedStager(torch.long)
 
     @property
     def device(self) -> torch.device:
@@ -159,29 +161,31 @@ class CosyVoice3Flow(nn.Module):
             prompt = row.voice.prompt_tokens.to(device, torch.long)
             seqs.append(torch.cat([prompt, row.tokens[:used].to(device, torch.long)]))
             valid_tokens.append(prompt.numel() + row.settle)
-        lens = torch.tensor([s.numel() for s in seqs], device=device)
+        batch = len(rows)
+        valid_frames = [v * ratio for v in valid_tokens]
+        # every per-row count is known here: one copy for the lot
+        counts = torch.empty(3, batch, dtype=torch.long, device=device)
+        self._row_stager.copy_(counts, [s.numel() for s in seqs] + valid_frames + [row.streaming for row in rows])
+        lens, valid, streaming = counts[0], counts[1], counts[2] != 0
         tokens = nn.utils.rnn.pad_sequence(seqs, batch_first=True)
         width = tokens.shape[1]
         in_row = torch.arange(width, device=device)[None, :] < lens[:, None]
         emb = self.input_embedding(tokens.clamp_min(0)) * in_row.unsqueeze(-1).to(dtype)
         mu = self.pre_lookahead_layer(emb).repeat_interleave(ratio, dim=1).transpose(1, 2)
 
-        valid = torch.tensor(valid_tokens, device=device) * ratio
-        total = int(valid.max())
+        total = max(valid_frames)
         if total > cfg.noise_frames:
             raise ValueError(f"the flow noise covers {cfg.noise_frames} frames; this solve needs {total}")
         mu = mu[:, :, :total].contiguous()
-        batch = len(rows)
         cond = torch.zeros(batch, cfg.output_size, total, device=device, dtype=dtype)
         for i, row in enumerate(rows):
             feat = row.voice.prompt_feat.to(device, dtype)
             cond[i, :, : feat.shape[0]] = feat.transpose(0, 1)
         spks = self.project_speaker(torch.stack([row.voice.embedding.to(device, dtype) for row in rows]))
-        streaming = torch.tensor([row.streaming for row in rows], device=device)
         mask = chunk_attention_mask(valid, total, cfg.dit.static_chunk_size, streaming)
         noise = self.noise[:, :, :total].to(device, dtype).expand(batch, -1, -1).contiguous()
         mel = self.decoder.solve(mu, mask, spks, cond, noise, n_timesteps or cfg.cfm.n_timesteps)
-        return [mel[i, :, row.voice.num_prompt_tokens * ratio : int(valid[i])] for i, row in enumerate(rows)]
+        return [mel[i, :, row.voice.num_prompt_tokens * ratio : valid_frames[i]] for i, row in enumerate(rows)]
 
     # ------------------------------------------------------------------
     # Weights

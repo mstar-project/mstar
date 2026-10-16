@@ -870,6 +870,43 @@ def test_lm_staged_columns_equal_the_per_value_tensors():
         assert template.input_seq_len == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_lm_steps_and_flow_solve_issue_no_host_sync_on_cuda():
+    """Preparing LM steps (prefill, a decode forced to EOS by a prefill stop,
+    a plain decode) and a flow solve neither read the device back nor copy
+    from pageable memory: CUDA's sync debug mode raises on either."""
+    cfg = _tiny_config()
+    sub, _ = _lm(cfg)
+    dev = torch.device("cuda")
+    sub = sub.to(dev)
+    info = _info(0, 5)
+    request = {TEXT_INPUTS: [torch.arange(5, device=dev)], "limits": (0, 30)}
+    sampled = torch.tensor([3], device=dev)
+    fed = [torch.tensor([t], device=dev) for t in (cfg.lm.eos_token, 4)]
+    flow = _random_flow(cfg).to(dev)
+    voice = _voice(cfg, 10)
+    voice = ReferenceVoice(voice.prompt_tokens.to(dev), voice.prompt_feat.to(dev), voice.embedding.to(dev))
+    tokens = torch.randint(3, 40, (60,), device=dev)
+    rows = [FlowRow(voice, tokens, 50, final=False, streaming=True), FlowRow(voice, tokens[:31], 31, True, False)]
+    mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        with torch.no_grad():
+            prefill = sub.prepare_inputs("prefill", info, request)
+            sub.preprocess("prefill", None, [prefill])
+            sub.postprocess(0, info, {SPEECH_TOKENS: [sampled]}, inputs=prefill)
+            packed = []
+            for token in fed:
+                step = sub.prepare_inputs("decode", info, {PREV_TOKEN: [token]})
+                packed.append(sub.preprocess("decode", None, [step]))
+                sub.postprocess(0, info, {SPEECH_TOKENS: [sampled]}, inputs=step)
+            flow.solve_rows(rows, 2)
+    finally:
+        torch.cuda.set_sync_debug_mode(mode)
+    # the first decode step's input is the prefill token, here EOS: every decode step is forced
+    assert [p["force_eos"].tolist() for p in packed] == [[[True]], [[True]]]
+
+
 def test_lm_declares_one_kv_segment_per_request_and_a_decode_capture():
     cfg = _tiny_config()
     sub, _ = _lm(cfg)
