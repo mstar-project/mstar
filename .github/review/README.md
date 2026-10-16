@@ -6,9 +6,9 @@ An advisory LLM reviewer runs on contributors' non-draft PRs, including PRs from
 
 | Trigger | Mode |
 | --- | --- |
-| A contributor's non-draft PR is opened, reopened or marked ready | `light` (P0-P2), once |
+| A contributor's non-draft PR is opened, reopened or marked ready | `light` (P0-P2, effort `high`), once |
 | Someone with write access comments exactly `/review` on a PR | `light`, e.g. to re-review after pushes |
-| Someone with write access comments exactly `/review thorough`, or applies the `ai-review-thorough` label | `thorough` (also P3 improvements and design questions) |
+| Someone with write access comments exactly `/review thorough`, or applies the `ai-review-thorough` label | `thorough` (also P3 improvements and design questions; effort `xhigh`) |
 
 Pushes don't trigger a review on their own. The `skip-ai-review` label turns off the automatic run; an explicit `/review` still runs.
 
@@ -67,7 +67,7 @@ Even then, prefer keeping it advisory: a non-deterministic check shouldn't have 
 
 ## Cost control
 
-Current levers, roughly in order of effect: only contributors' PRs are reviewed automatically, once per PR rather than per push; re-reviews are on request with `/review`, which takes write access; draft PRs are skipped; `concurrency` cancels a run superseded by a newer one on the same PR; in light mode, diffs over about 4,000 lines are triaged rather than covered in full; `--max-turns 40` caps a runaway session. The model is pinned to Opus in the workflow; drop to Sonnet if cost matters more than recall and replay shows it catching the same defects.
+Current levers, roughly in order of effect: only contributors' PRs are reviewed automatically, once per PR rather than per push; re-reviews are on request with `/review`, which takes write access; draft PRs are skipped; `concurrency` cancels a run superseded by a newer one on the same PR; in light mode, diffs over about 4,000 lines are triaged rather than covered in full; `--max-turns 40` caps a runaway session. The model is pinned to Opus in the workflow, at effort `high` for light reviews and `xhigh` for thorough ones (Claude Code's default without `--effort` is medium); lowering light to `medium` is the next cost lever. Drop to Sonnet if cost matters more than recall and replay shows it catching the same defects.
 
 ## Threat model
 

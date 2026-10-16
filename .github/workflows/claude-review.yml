@@ -87,7 +87,7 @@ jobs:
       group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     permissions:
       contents: read
       pull-requests: write
@@ -154,7 +154,13 @@ jobs:
           {
             echo "head_sha=$(jq -r .head.sha pr.json)"
             echo "head_repo=$(jq -r .head.repo.full_name pr.json)"
-            if [ "$THOROUGH" = "true" ]; then echo "mode=thorough"; else echo "mode=light"; fi
+            # Mode sets the prompt's reporting bar and the reasoning effort.
+            # Without --effort, Claude Code uses its default for Opus (medium).
+            if [ "$THOROUGH" = "true" ]; then
+              echo "mode=thorough"; echo "effort=xhigh"; echo "timeout=45"
+            else
+              echo "mode=light"; echo "effort=high"; echo "timeout=25"
+            fi
             delim="TITLE_$(openssl rand -hex 8)"
             echo "title<<$delim"; jq -r .title pr.json; echo "$delim"
           } >> "$GITHUB_OUTPUT"
@@ -237,7 +243,7 @@ jobs:
         # Advisory: an API or action failure (bad key, outage, out of turns,
         # timeout) never turns the PR's check red; the last step reports it.
         continue-on-error: true
-        timeout-minutes: 25
+        timeout-minutes: ${{ fromJSON(steps.pr.outputs.timeout || '25') }}
         uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -259,6 +265,7 @@ jobs:
           # which redacts secrets. The summary comes back as structured output.
           claude_args: |
             --model claude-opus-5-5
+            --effort ${{ steps.pr.outputs.effort }}
             --max-turns 40
             --allowedTools "mcp__github_inline_comment__create_inline_comment"
             --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch
