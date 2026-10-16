@@ -40,6 +40,7 @@ from mstar.model.qwen3_omni.config import (
     CODE_PRED_SAMPLER,
     TALKER_ATTN,
     TALKER_KV,
+    TALKER_LAST_PREFILL_TOKENS,
     TALKER_POS,
     TALKER_SAMPLER,
     THINKER_ATTN,
@@ -1590,7 +1591,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     TALKER_PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
     # Fixed assistant prefix per request: pad*4 + bos + projected_thinker = 6.
-    TALKER_LAST_PREFILL_TOKENS_PER_REQ = 6
+    TALKER_LAST_PREFILL_TOKENS_PER_REQ = TALKER_LAST_PREFILL_TOKENS
     TALKER_LAST_PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     def get_cuda_graph_configs(

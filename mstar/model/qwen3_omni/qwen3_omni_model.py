@@ -28,6 +28,7 @@ Text-only mode:
     partition runs.  Talker and Code2Wav are idle.
 """
 
+import itertools
 import logging
 from pathlib import Path
 
@@ -53,6 +54,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.kv.config import SPECULATIVE_DECODE_TOKENS
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
@@ -72,6 +74,7 @@ from mstar.model.qwen3_omni.config import (
     CODE_PRED_SAMPLER,
     TALKER_ATTN,
     TALKER_KV,
+    TALKER_LAST_PREFILL_TOKENS,
     TALKER_POS,
     TALKER_SAMPLER,
     THINKER_ATTN,
@@ -1224,6 +1227,57 @@ class Qwen3OmniModel(Model):
             result["pixel_values_videos"].append(vid_out["pixel_values_videos"])
 
         return result
+
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], **kwargs,
+    ) -> dict:
+        """What ``thinker_kv`` and ``talker_kv`` hold for a request, the Thinker's decode aside.
+
+        Each attachment's walk writes its encoder's tokens between two
+        sentinels the text spans no longer carry. The Talker writes every
+        Thinker prefill row but the system turn, then its assistant prefix,
+        then decodes up to ``talker_max_output_tokens``, which ``max_tokens``
+        does not bound, so all of it is prompt.
+        """
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+            _get_feat_extract_output_lengths,
+        )
+
+        del input_modalities
+        cfg = self.config
+        merge = cfg.vision.spatial_merge_size
+        segments = tensors["text_inputs"]
+        grids = [*tensors.get("image_grid_thw", []), *tensors.get("video_grid_thw", [])]
+        thinker = sum(len(span) for span in segments)
+        thinker += sum(int(grid.prod()) // merge ** 2 + 2 for grid in grids)
+        thinker += sum(
+            int(_get_feat_extract_output_lengths(seqlen)) + 2
+            for seqlen in tensors.get("audio_seqlens", [])
+        )
+        slots = {
+            "prompt_slots": {THINKER_KV: {"main": thinker}, TALKER_KV: {"main": 0}},
+            "decode_labels": {THINKER_KV: ["main"], TALKER_KV: []},
+        }
+        if "audio" not in output_modalities:
+            return slots
+        # the turns `ThinkerSubmodule._get_talker_text_mask` cuts: a system or
+        # assistant turn closed by a later ``<|im_start|>`` in the same span
+        dropped = 0
+        for span in segments:
+            starts = (span == cfg.im_start_token_id).nonzero(as_tuple=True)[0].tolist()
+            for start, end in itertools.pairwise(starts):
+                if int(span[start + 1]) in (cfg.system_token_id, cfg.assistant_token_id):
+                    dropped += end - start
+        # `check_stop` allows the bound's steps (one when the bound is under 1), and one more step is
+        # speculated past them. The loop's max_iters (`get_max_output_tokens()`) caps that, with no step past it.
+        talker_steps = max(self._get_max_talker_output_tokens(**kwargs), 1)
+        talker_decode = min(talker_steps + SPECULATIVE_DECODE_TOKENS, self.get_max_output_tokens())
+        slots["prompt_slots"][TALKER_KV]["main"] = thinker - dropped + TALKER_LAST_PREFILL_TOKENS + talker_decode
+        return slots
+
+    def kv_counted(self) -> frozenset[str]:
+        return frozenset({THINKER_KV, TALKER_KV})
 
     # -----------------------------------------------------------------------
     # Model ABC: postprocess

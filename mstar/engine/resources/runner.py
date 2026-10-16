@@ -100,6 +100,12 @@ class StepRunner:
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
+        # Likewise the page trails a TP leader reads on every step it sends. Only a pool in a
+        # debug run keeps one, so outside one the sweep is empty.
+        self._trail_order = [
+            key for key in self._order if self._resources[key].page_trail() is not None
+        ]
+        self._node_trail_order = self._per_node(node_resources, self._trail_order)
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
@@ -136,6 +142,38 @@ class StepRunner:
             self._resources[key].apply_cached_prefix(
                 rid, node_name, graph_walk, inputs, matched_len,
             )
+
+    def cached_prefix_pages(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+    ) -> dict[str, list[int]]:
+        """Each resource's pages for the agreed length, by resource key."""
+        out = {}
+        for key in self._sweep(self._node_order, self._order, node_name):
+            pages = self._resources[key].cached_prefix_pages(
+                rid, node_name, graph_walk, matched_len,
+            )
+            if pages is not None:
+                out[key] = pages
+        return out
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+        pages: dict[str, list[int]],
+    ) -> bool:
+        """Take rank 0's hit on every resource; False until all of them hold it."""
+        ready = True
+        for key in self._sweep(self._node_order, self._order, node_name):
+            ready &= self._resources[key].adopt_cached_prefix(
+                rid, node_name, graph_walk, matched_len, pages.get(key),
+            )
+        return ready
+
+    def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
+        """Each resource's trail of page allocations, by resource key."""
+        return {
+            key: self._resources[key].page_trail()
+            for key in self._sweep(self._node_trail_order, self._trail_order, node_name)
+        }
 
     def prefix_chain_keys(self, node_name: str | None) -> list[str]:
         """The node's resources with a prefix cache open right now. Empty in

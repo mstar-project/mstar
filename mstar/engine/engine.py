@@ -54,7 +54,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
 )
 from mstar.profile.worker import ExecTimings
-from mstar.utils.ipc_format import OffloadDelta
+from mstar.utils.ipc_format import OffloadDelta, PrefixHit
 from mstar.utils.profiler import (
     PHASE_PERIOD,
     mark,
@@ -282,6 +282,10 @@ class ExecutingBatch:
     # this step reports the partition done
     stream_partition_done_rids: set[str] = field(default_factory=set)
 
+    # Rank 0 of a TP node: each request's cached prefix, decided as the step was sent to
+    # the followers. Prepare applies exactly this, though a commit since may hold more.
+    cached_prefix: dict[int, int] | None = None
+
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
@@ -494,6 +498,7 @@ class Engine:
                             spec.nodes, relevant_nodes
                         )
                     ),
+                    nodes=frozenset(relevant_nodes),
                     dependencies={
                         key: specs_by_key[key] for key in spec.depends_on()
                     },
@@ -697,6 +702,7 @@ class Engine:
                 self._keyed_walks.setdefault(node, set()).update(
                     stream.walk for stream in by_label.values()
                 )
+        keyed: list[str] = []
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
                 config = specs_by_key[key].config
@@ -723,20 +729,25 @@ class Engine:
             })
             if not opened or not declared.get(key):
                 continue
+            keyed.append(key)
             nodes = ", ".join(sorted(specs_by_key[key].nodes))
             for label in declared[key]:
                 logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
-            if not resource.supports_eviction:
-                # a hit allocates only the prompt's tail, so admission no longer
-                # bounds how many requests decode at once
-                logger.warning(
-                    "KV %s: prefix cache on with cpu_offload_pages 0: a decode "
-                    "step that finds nothing to evict holds its requests until "
-                    "they time out. Set max_concurrent_requests to the pool's "
-                    "pages over the pages one request needs. cpu_offload_pages "
-                    "gives the worker a victim, but one that shares most of its "
-                    "prompt frees little",
-                    key,
+        for node in set().union(*(specs_by_key[key].nodes for key in keyed)):
+            pools = sorted(key for key in keyed if node in specs_by_key[key].nodes)
+            # Above one rank the gate reserves the whole prompt, so a cut hit takes nothing the gate didn't count.
+            if len(pools) > 1 and node not in self._tp_leader_nodes | self._tp_follower_nodes:
+                raise ValueError(
+                    f"{node} keys prompts in more than one KV pool ({', '.join(pools)}): its "
+                    "steps cut every pool's prefix to the shortest hit, so a pool that admitted "
+                    "a request on a longer one would take the difference fresh, past the room "
+                    "it checked"
+                )
+            if len({specs_by_key[key].config.page_size for key in pools}) > 1:
+                raise ValueError(
+                    f"{node} keys prompts in KV pools of different page sizes ({', '.join(pools)}): "
+                    "its steps cut every pool's prefix to the shortest hit, which has to end on a "
+                    "page boundary in each. Give the pools one page_size."
                 )
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
@@ -880,6 +891,63 @@ class Engine:
                     rid, batch.node_name, walk, per_rid, keys=keys,
                 )
 
+    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, PrefixHit]:
+        """Rank 0's hits for a step it is about to send its TP followers, by wire id.
+
+        Probed as the step is scheduled, so the followers can take the same pages before
+        they build it. A miss is decided too: ``prepare_inputs`` applies the batch's
+        lengths, where a probe after this rank's next commit could hit.
+        """
+        node, walk = batch.node_name, batch.graph_walk
+        if walk not in self._keyed_walks.get(node, ()):
+            return {}
+        hits = {}
+        batch.cached_prefix = {}
+        for rid in batch.request_ids:
+            matched = self._runner.resolve_cached_prefix(rid, node, walk)
+            batch.cached_prefix[rid] = matched
+            # asked on a miss too: a pool that matched more cuts its lease to the agreed length
+            pages = self._runner.cached_prefix_pages(rid, node, walk, matched)
+            if matched > 0:
+                hits[self._graph_runtime.get_rid_string(rid)] = PrefixHit(matched, pages)
+        return hits
+
+    def adopt_cached_prefix(
+        self, node_name: str, graph_walk: str, hits: dict[str, PrefixHit],
+    ) -> bool:
+        """A TP follower takes rank 0's hits before it builds the step.
+
+        False until every page is here: a request this rank has not ingested yet, or
+        pages its own commit of an earlier step has not indexed yet.
+        """
+        ready = True
+        for wire_rid, hit in hits.items():
+            rid = self._graph_runtime.get_rid_handle(wire_rid)
+            if rid is None:
+                ready = False
+                continue
+            ready &= self._runner.adopt_cached_prefix(
+                rid, node_name, graph_walk, hit.tokens, hit.pages,
+            )
+        return ready
+
+    def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
+        """Rank 0's trail of page allocations per pool, to send with a step."""
+        return self._runner.page_trails(node_name)
+
+    def check_page_trails(
+        self, node_name: str, graph_walk: str, tp_seq: int, trails: dict[str, tuple[int, int]],
+    ) -> None:
+        """On a TP follower, raise if a pool has not allocated the pages rank 0 had when it
+        sent this step. Page ids would differ from here on, and a sharded prefill gathers
+        cache slots across ranks."""
+        for pool, mine in self._runner.page_trails(node_name).items():
+            if trails.get(pool, mine) != mine:
+                raise RuntimeError(
+                    f"KV {pool}: this rank's page allocations {mine} (count, hash) differ from "
+                    f"rank 0's {trails[pool]} before {node_name}/{graph_walk}, tp seq {tp_seq}"
+                )
+
     def _skip_cached_prefix(
         self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,
     ) -> NodeInputs:
@@ -896,8 +964,14 @@ class Engine:
             "for prefix reuse, but that walk places positions of its own"
         )
         if inputs.tensor_inputs or inputs.kwargs or inputs.resource_step_info:
+            # rank 0 probes a TP step as it schedules it: give back what it held
+            self._runner.apply_cached_prefix(rid, batch.node_name, walk, inputs, 0)
             return inputs
-        matched = self._runner.resolve_cached_prefix(rid, batch.node_name, walk)
+        decided = batch.cached_prefix
+        if decided is not None and rid in decided:
+            matched = decided[rid]
+        else:
+            matched = self._runner.resolve_cached_prefix(rid, batch.node_name, walk)
         self._runner.apply_cached_prefix(
             rid, batch.node_name, walk, inputs, matched,
         )

@@ -163,6 +163,28 @@ class HiggsAudioModel(Model):
             )
         }
 
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], **kwargs,
+    ) -> dict:
+        """What the prefill walks write to ``main``: both text spans and the
+        audio embeddings spliced between them.
+
+        A chunk counts at the embeddings the encoder keeps of its mel frames
+        (`encoder_output_length`), about an eighth of them, not at the mel
+        length the request carries.
+        """
+        del input_modalities, output_modalities, kwargs
+        text = sum(span.numel() for span in tensors["text_inputs"])
+        audio = sum(
+            self.config.encoder_output_length(int(mel_len))
+            for mel_len in tensors["audio_feature_lens"][0].tolist()
+        )
+        return {"prompt_slots": {KV_CACHE: {"main": text + audio}}, "decode_labels": {KV_CACHE: ["main"]}}
+
+    def kv_counted(self) -> frozenset[str]:
+        return frozenset({KV_CACHE})
+
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
     # -------------------------------------------------------------------

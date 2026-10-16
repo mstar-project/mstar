@@ -192,6 +192,12 @@ class _Engine:
     reload_request = Engine.reload_request
     take_resident_delta = Engine.take_resident_delta
 
+    def decide_cached_prefix(self, batch):
+        return {}
+
+    def page_trails(self, node_name):
+        return {}
+
     def __init__(self, role: str = "leader"):
         """``role`` is this rank's part for ``"node"``: ``leader`` (rank 0 of a
         sharded node — decides and journals), ``follower`` (another rank of one —
@@ -635,6 +641,16 @@ def test_the_broadcast_carries_the_leaders_moves():
     # naming rank 0's would replay against the wrong requests
     assert _entries(body.resident_delta) == [("wire-victim", True)]
     assert body.request_ids == ["wire-r0"]
+
+
+def test_the_broadcast_carries_the_leaders_page_trails():
+    """Without them a follower has nothing to compare, and skips the check without a word."""
+    leader = _Leader(followers=("rank1",))
+    leader.engine.page_trails = lambda node_name: {"kv": (2, 7)}
+
+    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+
+    assert leader.sent[0][1].body.page_trails == {"kv": (2, 7)}
 
 
 def test_every_follower_gets_the_same_moves_in_its_own_queue():

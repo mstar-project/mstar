@@ -36,6 +36,11 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
 
 
+def conv_out_len(length: torch.Tensor | int, stride: int) -> torch.Tensor | int:
+    # kernel 3, padding 1: floor((L + 2 - 3) / stride) + 1
+    return (length - 1) // stride + 1
+
+
 class FSMNAttention(nn.Module):
     """Multi-head attention whose value path also feeds a depthwise FSMN
     memory block; the two are summed at the output."""
@@ -123,23 +128,18 @@ class AudioEncoderV2(nn.Module):
     def _non_pad_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
         return torch.arange(max_len, device=lengths.device)[None, :] < lengths[:, None]
 
-    @staticmethod
-    def _conv_out_len(length: torch.Tensor | int, stride: int) -> torch.Tensor | int:
-        # kernel 3, padding 1: floor((L + 2 - 3) / stride) + 1
-        return (length - 1) // stride + 1
-
     def forward(self, mel: torch.Tensor, mel_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """``mel [B, n_mels, T]`` (padded) + lengths -> ``[B, T // 4, n_state]``
         hidden states and their lengths."""
         T = mel.shape[-1]
         mask = self._non_pad_mask(mel_len, T).unsqueeze(1)
         x = F.gelu(self.conv1(mel * mask))
-        x_len = self._conv_out_len(mel_len, 2)
-        x_slen = self._conv_out_len(T, 2)
+        x_len = conv_out_len(mel_len, 2)
+        x_slen = conv_out_len(T, 2)
         mask = self._non_pad_mask(x_len, x_slen).unsqueeze(1)
         x = F.gelu(self.conv2(x * mask))
-        x_len = self._conv_out_len(x_len, 2)
-        x_slen = self._conv_out_len(x_slen, 2)
+        x_len = conv_out_len(x_len, 2)
+        x_slen = conv_out_len(x_slen, 2)
         mask = self._non_pad_mask(x_len, x_slen).unsqueeze(1)  # [B, 1, T']
         x = x.permute(0, 2, 1)
         mask_pad = mask.transpose(1, 2).to(x.dtype)  # [B, T', 1]

@@ -176,7 +176,7 @@ def test_eviction_stops_when_no_leaf_is_left():
 
 
 def _one_entry_per_indexed_page(index: PrefixIndex) -> None:
-    entries = Counter(page for _, page in index._leaves)
+    entries = Counter(page for *_, page in index._leaves)
     assert set(entries) <= set(index.pages()), (
         f"the heap still names pages the index let go of: "
         f"{sorted(set(entries) - set(index.pages()))}"
@@ -232,3 +232,21 @@ def test_a_page_already_indexed_cannot_take_a_second_key():
 
     with pytest.raises(AssertionError, match=f"page {page} indexed under .* while it is still indexed under"):
         index.insert(b"second key", page)
+
+
+# ── what eviction can reach ─────────────────────────────────────────────
+
+
+def test_a_held_page_keeps_every_page_above_it_out_of_the_evictable_set():
+    arena = _arena()
+    index = PrefixIndex(arena)
+    pages = _chain(index, arena)
+    assert index.evictable() == set(pages.values())
+
+    # a request holds C, so B and A stay behind it however cold they are
+    arena.retain([pages["C"]])
+
+    assert index.evictable() == {pages["D"]}, (
+        "the evictable set took in pages only the index holds that eviction cannot reach"
+    )
+    assert index.evict(len(pages)) == 1, "eviction freed other than what was counted"

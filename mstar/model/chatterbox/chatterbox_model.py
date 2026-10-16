@@ -60,6 +60,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.chatterbox.components.audio_frontend import resample, trim_silence
+from mstar.model.chatterbox.components.s3_tokenizer import conv_out_len
 from mstar.model.chatterbox.config import (
     COND_LABEL,
     S3_SR,
@@ -354,6 +355,47 @@ class ChatterboxModel(Model):
             ),
             T3_KV: KVReqConfig(needed_labels=labels),
         }
+
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], **kwargs,
+    ) -> dict:
+        """What T3's prefill writes to each stream: the conditioning rows, the
+        text and the speech BOS (twice where T3 repeats it).
+
+        Turbo's conditioning carries the reference's raw S3 tokens rather than
+        a fixed perceiver output, so `t3.cond_len`, which counts them at the
+        tokenizer's cap, holds only for the builtin voice; an uploaded clip
+        writes `_reference_tokens`.
+        """
+        del input_modalities, output_modalities
+        t3 = self.config.t3
+        bos = 2 if t3.duplicate_bos_in_prefill else 1
+        prompt = t3.cond_len + tensors[TEXT_INPUTS][0].numel() + bos
+        if not t3.use_perceiver_resampler and REF_AUDIO in tensors:
+            prompt += self._reference_tokens(tensors[REF_AUDIO][0]) - t3.speech_cond_prompt_len
+        knobs = self.resolve_generation_kwargs(kwargs)
+        labels = [COND_LABEL, UNCOND_LABEL] if knobs["cfg_weight"] > 0 else [COND_LABEL]
+        return {
+            "prompt_slots": {T3_KV: dict.fromkeys(labels, prompt)},
+            "decode_labels": {T3_KV: labels},
+        }
+
+    def _reference_tokens(self, wav: torch.Tensor) -> int:
+        """S3 tokens `VoiceEncoderSubmodule.condition` makes of the 24 kHz ``wav``.
+
+        It tokenizes the clip resampled to 16 kHz and trimmed to
+        ``enc_cond_seconds``, a token per four mel hops, at most
+        ``speech_cond_prompt_len`` of them.
+        """
+        samples = min(
+            -(-wav.numel() * S3_SR // self.config.sample_rate), round(self.config.enc_cond_seconds * S3_SR),
+        )
+        frames = min(samples // self.config.s3_tokenizer.hop_size, 4 * self.config.t3.speech_cond_prompt_len)
+        return conv_out_len(conv_out_len(frames, 2), 2)
+
+    def kv_counted(self) -> frozenset[str]:
+        return frozenset({T3_KV})
 
     def resolve_generation_kwargs(self, model_kwargs: dict | None) -> dict[str, Any]:
         """Every public knob, defaulted from the variant's generation config.

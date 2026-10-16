@@ -62,6 +62,8 @@ class EngineResourceInfo:
     kv_dtype: torch.dtype = torch.bfloat16
     # Whether this logical resource has consumers in another worker instance.
     needs_remote_transfer: bool = True
+    # the spec's nodes this worker runs, since under CFG parallel other workers run the rest
+    nodes: "frozenset[str] | None" = None
     # the specs this one named in `depends_on`, by resource key
     dependencies: "Mapping[str, NodeResourceSpec]" = field(
         default_factory=dict
@@ -127,6 +129,26 @@ class Resource(ABC):
     ) -> None:
         """Take this step's sampled tokens, so what was generated can be keyed."""
         return
+
+    def cached_prefix_pages(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+    ) -> list[int] | None:
+        """What holds the request's first ``matched_len`` tokens here, for rank 0 to
+        send the TP followers; None where this resource holds nothing for it."""
+        return None
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+        pages: list[int] | None = None,
+    ) -> bool:
+        """On a TP follower, take the prefix rank 0 matched (``pages`` are rank 0's).
+        False until this rank holds it too."""
+        return True
+
+    def page_trail(self) -> tuple[int, int] | None:
+        """How many page allocations this resource has made and a hash of their pages in
+        order, for a TP follower to check against rank 0's; None where it keeps no trail."""
+        return None
 
     @property
     def keys_prefix_chains(self) -> bool:

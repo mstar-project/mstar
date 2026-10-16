@@ -53,6 +53,7 @@ test/modular/test_mamba2_resource.py
 test/modular/test_streams.py
 test/modular/test_batched_model_output.py
 test/modular/test_qwen3_5_check_stop_batched.py
+test/modular/test_kv_prefix_tp.py
 test/modular/test_model_registration.py
 test/modular/test_lazy_publish.py
 test/modular/test_collect_outputs_fast_path.py
@@ -82,3 +83,4 @@ test/modular/test_kv_decode_plan_cache.py
 test/modular/test_kv_pinned_index_ring.py
 test/modular/test_kv_plan_host_lens.py
 test/modular/test_sampler_trash_row.py
+test/modular/test_nemotron_duplex_kv_slots.py

@@ -1532,6 +1532,9 @@ class Worker:
         # nothing. Each gets its own copy because each pops as it replays.
         engine = self.engine_manager.get_engine(node_batch.node_name)
         resident_delta = engine.take_resident_delta(node_batch.node_name)
+        # rank 0's prefix-cache hits: the followers take the same pages before they build it
+        prefix_hits = engine.decide_cached_prefix(node_batch)
+        page_trails = engine.page_trails(node_batch.node_name)
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
@@ -1551,6 +1554,8 @@ class Worker:
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
                         resident_delta=resident_delta.copy(),
+                        prefix_hits=prefix_hits,
+                        page_trails=page_trails,
                     )
                 )
             )
@@ -2359,9 +2364,16 @@ class Worker:
         max_continuing = self.scheduler.room_for_continuing(spec_target)
 
         # Removes, aborts and failures are filtered here; prep_spec_rids
-        # assumes that.
+        # assumes that. So is a rid the target node isn't ready to run, since its admit
+        # would refuse the whole batch. Readiness goes last because it can reload a request
+        # or lease its hit.
+        partition = self.request_state.get_partition_for_node(spec_node_name)
         candidates = [
-            r for r in batch_N.request_to_worker_graph if not self._is_tearing_down(r)
+            r for r in batch_N.request_to_worker_graph
+            if not self._is_tearing_down(r)
+            and (speculating_same_node or self.scheduler.check_ready(
+                spec_node_name, r, self.request_state.get_fwd_info(r, partition),
+            ))
         ]
         # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, StreamingEdge]] = []

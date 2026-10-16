@@ -298,7 +298,16 @@ class MicroScheduler:
         head = self.peek_tp_follow()
         if head is None:
             return True
-        return self._apply_delta_from_message(head)
+        if not self._apply_delta_from_message(head):
+            return False
+        if not head.prefix_hits and not head.page_trails:
+            return True
+        engine = self.engine_manager.get_engine(head.node_name)
+        # before the hits are adopted: a rank whose pages differ may never come to hold them
+        engine.check_page_trails(head.node_name, head.graph_walk, head.spec_seq, head.page_trails)
+        # rank 0's prefix-cache hits too: built without them, the step would run
+        # tokens rank 0 skips
+        return engine.adopt_cached_prefix(head.node_name, head.graph_walk, head.prefix_hits)
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
@@ -349,7 +358,7 @@ class MicroScheduler:
                     )
                 return None
             fwd_info = request_state.get_fwd_info(rid, node_partition)
-            if not self._check_ready(node_name, rid, fwd_info,  allow_reload=False):
+            if not self.check_ready(node_name, rid, fwd_info,  allow_reload=False):
                 return None
 
         popped = self.runtime.pop_rids(
@@ -518,7 +527,7 @@ class MicroScheduler:
                 fwd_info = request_state.get_fwd_info(rid, node_partition)
                 # check if the node is ready on the engine level
                 # (e.g., for AR, whether the kv cache is read in)
-                if not self._check_ready(spec.node_name, rid, fwd_info):
+                if not self.check_ready(spec.node_name, rid, fwd_info):
                     continue
                 ready.setdefault((spec.node_name, spec.graph_walk), []).append(
                     ReadyNodeEntry(rid, wg_id, spec.graph_walk)
@@ -655,7 +664,7 @@ class MicroScheduler:
                 break
             if rid in waiting:
                 continue
-            if not self._check_ready(
+            if not self.check_ready(
                 batch.node_name, rid,
                 request_state.get_fwd_info(rid, node_partition),
             ):
@@ -908,11 +917,11 @@ class MicroScheduler:
                 fwd_info = request_state.get_fwd_info(
                     rid, node_partition
                 )
-                if self._check_ready(spec.node_name, rid, fwd_info):
+                if self.check_ready(spec.node_name, rid, fwd_info):
                     return True
         return False
 
-    def _check_ready(
+    def check_ready(
         self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
         allow_reload: bool=True
     ) -> bool:

@@ -53,6 +53,7 @@ Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import torch
@@ -113,6 +114,7 @@ from mstar.model.cosmos3.submodules import (
     Cosmos3VAEDecoderSubmodule,
     Cosmos3VAEEncoderSubmodule,
     Cosmos3VisionEncoderSubmodule,
+    resolve_sound_frames,
 )
 from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
 from mstar.streaming.chunk_policy import FixedChunkPolicy
@@ -372,6 +374,82 @@ class Cosmos3Model(Model):
         return {
             KV_CACHE: KVReqConfig(needed_labels=[COND_LABEL, UNCOND_LABEL]),
         }
+
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], page_sizes: dict[str, int], **kwargs,
+    ) -> dict:
+        """Each guidance branch's peak: its text prefix plus the span a denoise step writes.
+
+        Every denoise step allocates its whole generation span (video, sound or
+        action tokens) on each live branch without committing it, and nothing
+        decodes, so a count of the prompt alone admits a request whose first
+        step finds no page. A kv-mode window also holds the committed context
+        the schedule keeps (`_kv_window_peak`).
+        """
+        prompts = tensors["text_inputs"]
+        if "text" in output_modalities:
+            return {
+                "prompt_slots": {KV_CACHE: {REASONER_LABEL: len(prompts[0])}},
+                "decode_labels": {KV_CACHE: [REASONER_LABEL]},
+            }
+        p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
+        vae = self.config.vae
+        patch = self.config.latent_patch_size
+        per_frame = (
+            math.ceil(p["height"] // vae.scale_factor_spatial / patch)
+            * math.ceil(p["width"] // vae.scale_factor_spatial / patch)
+        )
+        frames = p["num_frames"]
+        latent_frames = 1 if frames == 1 else 1 + (frames - 1) // vae.scale_factor_temporal
+        if p.get("window_mode") is not None:
+            # windows are denoised one at a time, so count a window, not the whole clip
+            latent_frames = min(p["window_latent_units"], p["total_latent_units"])
+        span = latent_frames * per_frame
+        if p.get("generate_sound"):
+            span += resolve_sound_frames(p, self.config.sound_sample_rate, self.config.sound_latent_fps)[1]
+        if p.get("action_mode") is not None:
+            span += p["action_chunk_size"]
+        def peak(prompt: int) -> int:
+            if p.get("window_mode") != "kv":
+                return prompt + span
+            return self._kv_window_peak(p, per_frame, prompt, page_sizes[KV_CACHE])
+
+        # uncond is always opened (`get_request_resource_configs`), so it gets a count, 0 without guidance
+        uncond = peak(len(prompts[1])) if p["guidance_scale"] != 1.0 else 0
+        return {
+            "prompt_slots": {KV_CACHE: {COND_LABEL: peak(len(prompts[0])), UNCOND_LABEL: uncond}},
+            "decode_labels": {KV_CACHE: []},
+        }
+
+    @staticmethod
+    def _kv_window_peak(p: dict, per_frame: int, prompt: int, page_size: int) -> int:
+        """The most a kv-mode branch holds at once: its prompt, the context its
+        commits kept, and the window a denoise step writes on top.
+
+        The pool releases context past the horizon only in whole pages, and
+        never the page the prompt ends in (`KVManager._release_oldest_locked`),
+        so what a commit keeps depends on where the prompt and each commit end
+        in a page.
+        """
+        schedule = WindowSchedule(
+            p["total_latent_units"], p["window_latent_units"],
+            context_units=p["context_latent_units"], overlap_units=p["overlap_latent_units"],
+        )
+        policy = schedule.retention(per_frame, prompt)
+        stored, peak = prompt, 0
+        for plan in schedule.windows():
+            peak = max(peak, stored + (plan.end - plan.start) * per_frame)
+            stored += (plan.commit_end - plan.commit_start) * per_frame
+            if policy is None:
+                continue
+            excess = stored - policy.protected_prefix - policy.context_budget
+            releasable = stored // page_size - -(-policy.protected_prefix // page_size)
+            stored -= max(0, min(excess // page_size, releasable)) * page_size
+        return peak
+
+    def kv_counted(self) -> frozenset[str]:
+        return frozenset({KV_CACHE})
 
     def get_sampling_config(self, node_name: str, model_kwargs: dict | None = None):
         """The reasoner's sampling knobs: OpenAI-standard ``temperature`` /

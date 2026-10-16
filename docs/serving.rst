@@ -207,7 +207,7 @@ them by that name:
    resources:
      kv_cache:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
-                                # prefix_cache, prefix_cache_salt
+                                # prefix_cache, prefix_cache_salt, prefix_cache_tp
      talker_attn:
        flashinfer_backend: fa2  # also: backend (flashinfer / dense)
      vit_attn:                  # a cacheless (ragged) attention resource
@@ -222,17 +222,24 @@ no longer read. It raises an error with a message describing the migration.
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
 ``prefix_cache_salt`` keeps two otherwise identical deployments off each other's
 cached pages. A single request opts out by sending ``prefix_cache=False``, which
-travels with its other ``model_kwargs``.
+travels with its other ``model_kwargs``. Above one rank the cache stays off unless
+``prefix_cache_tp: true`` is set as well: rank 0 then decides each hit and the other
+ranks adopt it. A request is then admitted on its whole prompt, and gives back the pages
+it finds cached when its prefill is sent. ``prefix_cache_tp`` can't be combined with
+``cpu_offload_pages``, and the cache's nodes must run on one TP group, with no replicas and
+no walks placed on other ranks. Loading fails otherwise.
 
-A cached prompt no longer reserves its pages, so the pool no longer limits how many
-requests are admitted. It has to hold the decode of every request allowed to run at once,
-and a decode step that finds no free page holds its requests until they time out.
-``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
-pool's pages divided by the pages one request needs, prompt and output together, is a
-safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. An offload
-frees only the device pages no other running request reads, though, so a request that
-shares most of its prompt frees little. Offload helps a pool that runs short now and then.
-It doesn't replace the cap.
+The pool admits a request only once the pages it can take fit beside what the running
+requests may still take. A request can take its prompt, less the pages it finds cached, and
+up to ``max_tokens`` of decode, so a running request never runs out of pages. A request that
+sends no ``max_tokens`` reserves as far as the model's decode loop runs, so a client that
+sends a tight one fits more requests at once. A request that doesn't fit waits, and none
+passes one that asked earlier, so short requests never starve a long one. A request the
+model counts that could not fit even alone fails at once. Every model with a paged pool
+counts what each request holds there, and the server refuses at load one that does not.
+``max_concurrent_requests`` is still an optional cap on top. ``cpu_offload_pages`` lets a
+full pool move a request to the host. An offload frees only the device pages no other
+running request reads, so a request that shares most of its prompt frees little.
 
 **Single GPU.** Everything on rank 0:
 

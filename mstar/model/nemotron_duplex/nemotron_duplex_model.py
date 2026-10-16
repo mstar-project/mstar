@@ -421,11 +421,15 @@ class NemotronDuplexModel(Model):
         stt = self.config.stt
         return stt.num_frames(int(self.max_session_s * stt.sample_rate))
 
+    @property
+    def talker_stream_positions(self) -> int:
+        """The speaker warm-up, every frame of the longest session and the final PAD."""
+        return self.TALKER_WARMUP_POSITIONS + self.max_session_frames + 1
+
     def talker_kv_pages(self, page_size: int) -> int:
         """Pages for DEFAULT_MAMBA_SLOTS sessions of max_session_frames, both CFG streams."""
-        positions = self.TALKER_WARMUP_POSITIONS + self.max_session_frames + 1
         # + 1 for the pool's sink page
-        return self.DEFAULT_MAMBA_SLOTS * 2 * -(-positions // page_size) + 1
+        return self.DEFAULT_MAMBA_SLOTS * 2 * -(-self.talker_stream_positions // page_size) + 1
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
         # One text token per audio frame, so the audio fixes the length and
@@ -523,6 +527,31 @@ class NemotronDuplexModel(Model):
             # every talker session reads both of its streams
             TALKER_KV: KVReqConfig(needed_labels=["main", "uncond"]),
         }
+
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], **kwargs,
+    ) -> dict:
+        """What a session writes to each pool.
+
+        ``nano_kv`` holds the system prompt, then one frame per step, and ``max_tokens``
+        counts the frames. Each talker stream reserves all of `talker_stream_positions`
+        as its prompt. Counted through ``max_tokens``, each stream would take one page more
+        than its share, and the pool would admit fewer sessions than its pages hold.
+        """
+        from mstar.model.nemotron_duplex.submodules import NemotronHLLMSubmodule
+
+        del input_modalities, output_modalities, kwargs
+        ids = NemotronHLLMSubmodule._prompt_ids(tensors)
+        prompt = 0 if ids is None else ids.numel()
+        talker = self.talker_stream_positions
+        return {
+            "prompt_slots": {NANO_KV: {"main": prompt}, TALKER_KV: {"main": talker, "uncond": talker}},
+            "decode_labels": {NANO_KV: ["main"]},
+        }
+
+    def kv_counted(self) -> frozenset[str]:
+        return frozenset({NANO_KV, TALKER_KV})
 
     # -------------------------------------------------------------------
     # Graph walks. Text path is live; audio walks are Phase 6 (see design note).

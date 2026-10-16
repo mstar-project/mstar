@@ -534,6 +534,30 @@ class Pi05Model(Model):
         text_ids = self.tokenizer.encode_prompt(full_prompt)
         return {"text_inputs": [text_ids]}
 
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], **kwargs,
+    ) -> dict:
+        """What the LLM's ``main`` holds: the camera tokens, the prompt, and the action chunk.
+
+        The prompt tensor under-counts twice: SigLIP expands each camera to a
+        fixed grid of tokens on the worker, and every ``action_gen`` step writes
+        ``action_horizon`` slots past the prefix that it never commits, but that
+        admit still gives pages. Nothing decodes.
+        """
+        del input_modalities, output_modalities, kwargs
+        cfg = self.config
+        # each uploaded file is one camera, its own CxHxW tensor (`Model.load_image`), and the encoder writes them all
+        cameras = len(tensors.get("image_inputs") or ())
+        main = (
+            cameras * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
+            + tensors["text_inputs"][0].shape[0] + cfg.action_horizon
+        )
+        return {"prompt_slots": {LLM_KV: {"main": main}}, "decode_labels": {LLM_KV: []}}
+
+    def kv_counted(self) -> frozenset[str]:
+        return frozenset({LLM_KV})
+
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "action":
             return output.detach().to(torch.float32).cpu().numpy().tobytes()

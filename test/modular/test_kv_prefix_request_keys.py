@@ -16,6 +16,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import numpy as np
+import soundfile
 import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
@@ -24,9 +26,11 @@ from mstar.conductor.conductor import Conductor
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
-from mstar.model.base import PrefixStream, ProcessPromptOutput
+from mstar.model.base import Model, PrefixStream, ProcessPromptOutput
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
+from mstar.model.whisper.config import WhisperModelConfig
+from mstar.model.whisper.whisper_model import WhisperModel
 
 PAGE_SIZE = 16
 PROMPT = list(range(100))
@@ -63,11 +67,12 @@ class _Model:
 
     def __init__(
         self, declares: bool = True, metadata: dict | None = None,
-        decode_walk: str | None = None,
+        decode_walk: str | None = None, slots: dict | None = None,
     ):
         self._declares = declares
         self._metadata = metadata
         self._decode_walk = decode_walk
+        self._slots = slots or {}
 
     def prefix_key_streams(self):
         if not self._declares:
@@ -86,6 +91,9 @@ class _Model:
                 max_num_pages=64, page_size=128,
             ),
         )]
+
+    def kv_slots(self, *args, **kwargs):
+        return self._slots
 
     def process_prompt(self, *args, **kwargs):
         tensors = {"text_inputs": [torch.tensor(PROMPT, dtype=torch.long)]}
@@ -111,15 +119,8 @@ def _deployment(page_size: int = PAGE_SIZE) -> dict:
 
 
 def _apply_chain(cfg, key: str, model_kwargs: dict | None) -> None:
-    """One config's share of the conductor's loop over a request's chains."""
-    kwargs = model_kwargs or {}
-    cfg.apply_conductor_config(
-        seed=1,
-        prefix_keys=(kwargs.get("prefix_keys") or {}).get(key),
-        prefix_tail=(kwargs.get("prefix_tail") or {}).get(key),
-        prefix_decode=(kwargs.get("prefix_decode") or {}).get(key),
-        prefix_cache=kwargs.get("prefix_cache"),
-    )
+    """One config's share of the conductor's stamp over a request's configs."""
+    Conductor._stamp_resource_configs({key: cfg}, model_kwargs, seed=1, max_tokens=None)
 
 
 def _handed_over(model_kwargs: dict, key: str = "kv") -> KVReqConfig:
@@ -267,6 +268,33 @@ def test_a_clients_prefix_keys_never_reach_process_prompt():
     )
 
 
+def test_a_clients_page_counts_never_reach_the_conductor():
+    # a model that stamps nothing leaves the client's own counts standing
+    worker = _worker(_Model(metadata=None), _deployment())
+
+    kwargs = _run(worker, {
+        "prompt_slots": {"kv": {"main": 1}}, "decode_labels": {"kv": []},
+    })
+
+    assert not {"prompt_slots", "decode_labels"} & set(kwargs), (
+        "a client's own count of its pages would reach the cache that admits by it"
+    )
+
+
+def test_the_pool_admits_by_kv_slots_whatever_process_prompt_returns():
+    counted = {"prompt_slots": {"kv": {"main": len(PROMPT)}}, "decode_labels": {"kv": ["main"]}}
+    worker = _worker(_Model(
+        metadata={"prompt_slots": {"kv": {"main": 1}}, "decode_labels": {"kv": []}}, slots=counted,
+    ), _deployment())
+
+    kwargs = _run(worker)
+
+    assert {name: kwargs[name] for name in counted} == counted, (
+        "a count process_prompt returned stood in for the model's kv_slots, so "
+        "the pool admitted the request by a second channel"
+    )
+
+
 # ── the metadata fold ───────────────────────────────────────────────────
 
 
@@ -344,15 +372,16 @@ class _SamplerOnlyModel(_Model):
         return {"sampler": SamplingReqConfig()}
 
 
-def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
+def _conductor_configs(
+    model, model_kwargs: dict | None = None, max_tokens: int | None = None,
+) -> dict:
     """The configs a request is opened with, as the conductor resolves them:
-    the model's own, a default for anything it declared a stream for, and then
-    each handed its own chain."""
+    the model's own, a default for anything it declared a stream for or any
+    cache, and then each stamped with its own chain and counts."""
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model), model_kwargs, {},
+        SimpleNamespace(model=model, _kv_cache_keys=Model.paged_kv_keys(model)), model_kwargs, {},
     )
-    for key, cfg in configs.items():
-        _apply_chain(cfg, key, model_kwargs)
+    Conductor._stamp_resource_configs(configs, model_kwargs, seed=1, max_tokens=max_tokens)
     return configs
 
 
@@ -377,4 +406,50 @@ def test_orpheus_is_handed_a_config_for_the_stream_it_declares():
     assert set(orpheus.prefix_key_streams()) <= set(configs), (
         "orpheus returns a sampler config alone, so the resource it declared "
         "a stream for had nothing to carry its chain"
+    )
+
+
+# ── max_tokens on every kv cache ─────────────────────────────────────────
+
+
+class _StubFeatureExtractor:
+    """A silent 30 s window's features, the length the real extractor pads to."""
+
+    sampling_rate = 16000
+
+    def __call__(self, audio, sampling_rate, return_tensors):
+        del audio, sampling_rate, return_tensors
+        return {"input_features": [torch.zeros(128, 3000)]}
+
+
+def test_whisper_hands_each_cache_what_it_will_hold(monkeypatch, tmp_path):
+    # here, not at the top: api_uploads imports this module's stubs
+    from api_uploads import decode_uploads
+
+    decode_uploads(monkeypatch)
+    whisper = WhisperModel.__new__(WhisperModel)
+    whisper.config = WhisperModelConfig(
+        lang_to_id={"<|en|>": 50259}, task_to_id={"transcribe": 50360},
+    )
+    whisper.feature_extractor = _StubFeatureExtractor()
+    clip = tmp_path / "clip.wav"
+    soundfile.write(clip, np.zeros(16000), 16000, subtype="PCM_16")
+    worker = _worker(whisper, None)
+    worker._process_input(PreprocessInput(
+        request_id="r0", text="", file_paths={"audio": [str(clip)]},
+        input_modalities=["audio", "text"], output_modalities=["text"], model_kwargs={},
+    ))
+
+    configs = _conductor_configs(whisper, worker.communicator.sent[-1].body.model_kwargs, max_tokens=444)
+
+    handed = {
+        key: (configs[key].max_tokens, configs[key].prompt_slots, configs[key].decode_labels)
+        for key in ("kv_cache", "cross_kv_cache")
+    }
+    assert handed == {
+        "kv_cache": (444, {"main": 4}, ["main"]),
+        "cross_kv_cache": (444, {"main": 1500}, []),
+    }, (
+        "the conductor's stamp left whisper's caches without the count and the "
+        "growth they are admitted by"
     )

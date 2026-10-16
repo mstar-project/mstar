@@ -311,6 +311,24 @@ class WhisperModel(Model):
             step_metadata={"is_prefill": False},
         )
 
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], **kwargs,
+    ) -> dict:
+        del input_modalities, output_modalities, kwargs
+        return {
+            # the decoder's stream grows by what it decodes; the audio
+            # context is the whole 30 s window, written once
+            "prompt_slots": {
+                KV_CACHE: {"main": len(tensors["text_inputs"][0])},
+                CROSS_KV_CACHE: {CONTEXT_LABEL: self.config.max_source_positions},
+            },
+            "decode_labels": {KV_CACHE: ["main"], CROSS_KV_CACHE: []},
+        }
+
+    def kv_counted(self) -> frozenset[str]:
+        return frozenset({KV_CACHE, CROSS_KV_CACHE})
+
     # -------------------------------------------------------------------
     # Model ABC: prompt processing
     # -------------------------------------------------------------------

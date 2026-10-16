@@ -1112,3 +1112,25 @@ class VJepa2ACModel(VJepa2Model):
             ac_predictor_config=ac_predictor_config,
             **kwargs,
         )
+
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], **kwargs,
+    ) -> dict:
+        """What the rollout walk writes to ``main``, the only walk that opens it.
+
+        No prompt tensor is that long: each of the ``rollout_horizon`` steps
+        writes a frame's spatial tokens behind its action and state (and
+        extrinsics) tokens, and nothing decodes after the loop.
+        """
+        del tensors, input_modalities, output_modalities
+        main = 0
+        if self._initial_walk(kwargs) in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING):
+            # capped as get_initial_forward_pass_args caps it, since the loop stops there
+            horizon = min(int(kwargs["rollout_horizon"]), self.config.max_rollout_horizon)
+            cond_tokens = 3 if self.config.ac_predictor.use_extrinsics else 2
+            main = horizon * (self.config.grid_size ** 2 + cond_tokens)
+        return {"prompt_slots": {KV_CACHE: {"main": main}}, "decode_labels": {KV_CACHE: []}}
+
+    def kv_counted(self) -> frozenset[str]:
+        return frozenset({KV_CACHE})

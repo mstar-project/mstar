@@ -6,14 +6,14 @@ KV resource and of every resource planned against it. Anything left out of that
 fold is a way for one deployment to match pages another one wrote.
 
 The other half is where the cache stays shut: above one rank, because the ranks
-walk their indexes independently and would match different lengths; and for a
+walk their indexes independently and would match different lengths (unless the
+deployment sets prefix_cache_tp, and rank 0 decides each hit); and for a
 model that names no checkpoint, until the deployment sets a salt, because two
 builds that differ only in their weights would share every key.
 
-Where it opens, the engine says so, and warns a cache with no host pages: a
-cached prompt reserves none of its pages, so nothing bounds how many requests
-decode at once, and with nothing to offload a full pool holds them until they
-time out.
+Where it opens, the engine says so. It refuses a node that keys prompts in two
+pools: the node's steps cut both to the shorter hit, so the other pool would take
+pages it admitted the request without.
 """
 
 from __future__ import annotations
@@ -37,10 +37,6 @@ from mstar.model.base import PrefixStream
 
 KV = "kv"
 ROPE = "rope"
-
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="the host pool pins its memory"
-)
 
 
 class _StubTransfer:
@@ -95,6 +91,14 @@ class _Declaring(_Model):
         return {KV: {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}}
 
 
+
+class _KeyingTwo(_Model):
+    """Keys ``main`` on two KV resources from the same node's text walk."""
+
+    def prefix_key_streams(self):
+        stream = PrefixStream("text_inputs", "ids", "prefill_text", "decode")
+        return {KV: {"main": stream}, "kv2": {"main": stream}}
+
 def _checkpoint(root, config: bytes) -> str:
     root.mkdir()
     (root / "config.json").write_bytes(config)
@@ -102,14 +106,14 @@ def _checkpoint(root, config: bytes) -> str:
     return str(root)
 
 
-def _kv(dtype=torch.float32, **overrides) -> KVManager:
+def _kv(dtype=torch.float32, name=KV, **overrides) -> KVManager:
     cfg = dict(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
         max_num_pages=16, page_size=16,
     )
     cfg.update(overrides)
     return KVManager(
-        cfg=PagedKVConfig(**cfg), name=KV, joint_comm_group=None,
+        cfg=PagedKVConfig(**cfg), name=name, joint_comm_group=None,
         transfer_engine_info=None, device=torch.device("cpu"), dtype=dtype,
     )
 
@@ -192,6 +196,17 @@ def test_a_rank_above_one_never_opens_its_index():
     )
 
 
+def test_an_opted_in_rank_above_one_opens_its_index_but_never_probes_it():
+    """With prefix_cache_tp rank 0 decides each hit and the other ranks adopt it
+    (test_kv_prefix_tp.py), so a follower's index opens but answers no probe."""
+    kv = _kv(prefix_cache_tp=True)
+    kv._world_size, kv._rank, kv._follower = 2, 1, True
+
+    _root(kv=kv)
+
+    assert kv._index is not None and kv._prefix_root is not None
+
+
 def test_a_deployment_can_turn_the_cache_off():
     kv = _kv(prefix_cache=False)
 
@@ -267,31 +282,20 @@ def _said_at_load(caplog, kv, model) -> tuple[list[str], list[str]]:
     )
 
 
-@requires_cuda
-def test_a_keyed_node_with_host_pages_says_what_opened_and_no_more(caplog):
-    info, warnings = _said_at_load(
-        caplog, _kv(prefix_cache_salt="deployment", cpu_offload_pages=4), _Declaring(),
-    )
+def test_a_node_that_keys_two_pools_is_refused_at_load():
+    engine = Engine.__new__(Engine)
+    engine._tp_leader_nodes = engine._tp_follower_nodes = set()
+    engine._resources = {
+        KV: _kv(prefix_cache_salt="deployment"),
+        "kv2": _kv(name="kv2", prefix_cache_salt="deployment"),
+    }
+    specs = {
+        key: KVSpec(resource_key=key, nodes={"LLM"}, config=kv.config)
+        for key, kv in engine._resources.items()
+    }
 
-    assert len(info) == 1 and "main" in info[0] and "LLM" in info[0], (
-        "the cache opened without saying which label it keys on which node"
-    )
-    assert warnings == [], "a cache with host pages to offload to was warned it had none"
-
-
-def test_a_keyed_node_without_host_pages_is_warned_its_decode_can_hold(caplog):
-    info, warnings = _said_at_load(caplog, _kv(prefix_cache_salt="deployment"), _Declaring())
-
-    assert len(info) == 1 and "main" in info[0] and "LLM" in info[0], (
-        "the cache opened without saying which label it keys on which node"
-    )
-    assert len(warnings) == 1 and "cpu_offload_pages" in warnings[0], (
-        "a cache with nothing to offload opened without saying a full pool "
-        "holds its decode until the requests time out"
-    )
-    assert "max_concurrent_requests" in warnings[0], (
-        "the warning names one way out of a full pool and not the other"
-    )
+    with pytest.raises(ValueError, match="more than one KV pool"):
+        engine._open_prefix_caches(specs, _KeyingTwo())
 
 
 @pytest.mark.parametrize("overrides, model", [
