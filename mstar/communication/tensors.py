@@ -3,6 +3,7 @@ import hashlib
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import time
@@ -198,6 +199,41 @@ class AsyncMooncakeReader:
         self._executor.shutdown(wait=True)
 
 
+#: Mooncake's wheel per CUDA major. All of them install the same ``mooncake``
+#: package; the default one is built for CUDA 12.
+_MOONCAKE_WHEELS = {
+    "12": "mooncake-transfer-engine",
+    "13": "mooncake-transfer-engine-cuda13",
+}
+
+
+def _mooncake_install_hint(err: BaseException | None, torch_cuda: str | None) -> str:
+    """Say which Mooncake wheel loads next to this torch build."""
+    major = torch_cuda.split(".")[0] if torch_cuda else None
+    want = _MOONCAKE_WHEELS.get(major) if major else "mooncake-transfer-engine-non-cuda"
+    missing = re.search(r"libcudart\.so\.(\d+)", str(err))
+    if want is None or missing is None:
+        if want and isinstance(err, ModuleNotFoundError) and (err.name or "").startswith("mooncake"):
+            return f"Install {want} or use SHM protocol."
+        return "Install mooncake-transfer-engine or use SHM protocol."
+    needed = missing.group(1)
+    if needed == major:
+        fix = (
+            "`pip install nvidia-cuda-runtime-cu12`"
+            if needed == "12"
+            else f"put libcudart.so.{needed} on the library path"
+        )
+        return f"torch is built for CUDA {torch_cuda} too, so {fix}, or use SHM protocol."
+    torch_desc = f"built for CUDA {torch_cuda}" if major else "built without CUDA"
+    have = _MOONCAKE_WHEELS.get(needed)
+    uninstall = f"pip uninstall -y {have} && " if have else ""
+    return (
+        f"This Mooncake build needs the CUDA {needed} runtime, but torch is {torch_desc}. "
+        f"Switch to {want}: `{uninstall}pip install --force-reinstall --no-deps {want}`, "
+        "or use SHM protocol."
+    )
+
+
 class MooncakeTransferEngine(TensorTransferEngine):
     """Wraps mooncake.engine.TransferEngine for RDMA or TCP transport."""
 
@@ -218,7 +254,7 @@ class MooncakeTransferEngine(TensorTransferEngine):
             raise RuntimeError(
                 "Mooncake TransferEngine is required for RDMA/TCP protocol. "
                 f"Failed to load mooncake: {detail}. "
-                "Install mooncake-transfer-engine or use SHM protocol."
+                + _mooncake_install_hint(MOONCAKE_IMPORT_ERROR, torch.version.cuda)
             )
 
         if protocol == CommProtocol.RDMA:
