@@ -64,6 +64,11 @@ def _refuse_unskippable_resources(
         shared = spec.nodes & cached_nodes
         if not shared or spec.resource_class.prefix_skip_safe:
             continue
+        # state that cannot skip a prefix can restore one: keyed itself, or
+        # held only in resources that are (a recurrent pool's snapshots)
+        after = spec.depends_on()
+        if spec.resource_key in declared or (after and after <= declared):
+            continue
         raise ValueError(
             f"resource {spec.resource_key!r} cannot serve a request whose "
             f"prefix came from the cache, but it sits on {sorted(shared)}, "

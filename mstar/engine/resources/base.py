@@ -102,6 +102,11 @@ class Resource(ABC):
         """
         return False
 
+    def close_prefix_cache(self) -> None:
+        """Undo `enable_prefix_cache` before any request: another resource on a node this
+        one serves keeps no cache, so a hit here would skip tokens it lacks."""
+        return
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
     ) -> int | None:
@@ -110,6 +115,13 @@ class Resource(ABC):
         None leaves the length to other resources; 0 means nothing can be skipped.
         """
         return None
+
+    def cap_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, length: int,
+    ) -> int:
+        """The longest prefix up to ``length`` this resource can serve, once the
+        resources' answers met at ``length``; any length, unless overridden."""
+        return length
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
@@ -135,6 +147,21 @@ class Resource(ABC):
         resource that overrides ``extend_prefix_chain`` but not this is swept
         every step."""
         return False
+
+    def cached_prefix_pages(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+    ) -> list[int] | None:
+        """What holds the request's first ``matched_len`` tokens here, for rank 0 to
+        send the TP followers; None where this resource holds nothing for it."""
+        return None
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, matched_len: int,
+        pages: list[int] | None = None,
+    ) -> bool:
+        """On a TP follower, take the prefix rank 0 matched (``pages`` are rank 0's).
+        False until this rank holds it too."""
+        return True
 
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
