@@ -15,7 +15,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
-from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources import KVSpec, NodeResourceSpec, PagedKVConfig, ResourceReqConfig
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -460,6 +460,30 @@ class Model(ABC):
         asks for.
         """
         return {}
+
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], **kwargs,
+    ) -> dict:
+        """Return what each paged KV pool reserves for a request, keyed by resource:
+        ``prompt_slots`` per label and the ``decode_labels`` that grow by ``max_tokens``.
+
+        Only the model knows what its walks write (conditioning rows, media expanded
+        on the worker, spans no step commits), so a model with a paged pool overrides
+        this and `kv_counted`.
+        """
+        del tensors, input_modalities, output_modalities, kwargs
+        return {}
+
+    def kv_counted(self) -> frozenset[str]:
+        """The paged KV pools whose need `kv_slots` declares."""
+        return frozenset()
+
+    def paged_kv_keys(self) -> frozenset[str]:
+        return frozenset(
+            spec.resource_key for spec in self.get_node_resources()
+            if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
+        )
 
     def get_request_resource_configs(
         self,

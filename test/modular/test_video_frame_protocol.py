@@ -380,10 +380,11 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     assert "reused" not in worker.request_output_state
     assert worker.request_output_state["other"].frame_index == 8
 
-    worker.model = SimpleNamespace(process_prompt=lambda *args, **kwargs: {})
+    worker.model = SimpleNamespace(process_prompt=lambda *args, **kwargs: {}, kv_slots=lambda *args, **kwargs: {})
     worker.device = "cpu"
     worker.enable_prof = False
     worker._prefix_streams = {}
+    worker._page_sizes = {}
     worker.communicator = SimpleNamespace(send=lambda *args: None)
     worker._process_input(
         PreprocessInput(

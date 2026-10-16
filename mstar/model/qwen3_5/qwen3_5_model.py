@@ -446,6 +446,26 @@ class Qwen3_5DenseModel(Model):
             result["image_grid_thw"] += out["image_grid_thw"]
         return result
 
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], **kwargs,
+    ) -> dict:
+        """What ``kv_cache`` holds before decode: the text spans and each image's merged tokens.
+
+        `split_around_spans` drops an image's ``<|vision_start|>`` and
+        ``<|vision_end|>`` with its pads, and `prefill_vision` writes them back,
+        so an image takes two slots more than its grid.
+        """
+        del input_modalities, output_modalities, kwargs
+        images = sum(
+            int(grid.prod()) // self.vision_config.spatial_merge_size ** 2 + 2
+            for grid in tensors.get("image_grid_thw", [])
+        )
+        main = sum(len(span) for span in tensors["text_inputs"]) + images
+        return {"prompt_slots": {KV_CACHE: {"main": main}}, "decode_labels": {KV_CACHE: ["main"]}}
+
+    def kv_counted(self) -> frozenset[str]:
+        return frozenset({KV_CACHE})
 
     def postprocess(
             self,

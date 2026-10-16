@@ -419,9 +419,9 @@ class PreprocessWorkerThread:
             model.prefix_key_streams()
             if model is not None and model_config else {}
         )
-        # resolved as the worker does at load, so both split a prompt into the same pages
-        self._prefix_page_sizes = (
-            _kv_page_sizes(model, model_config) if self._prefix_streams else {}
+        # resolved as the worker resolves them at load, so the keys and the counts use the pool's page size
+        self._page_sizes = (
+            _kv_page_sizes(model, model_config) if model is not None and model_config else {}
         )
         self.in_queue = in_queue
         self.result_tensor_queue = result_tensor_queue
@@ -535,8 +535,11 @@ class PreprocessWorkerThread:
         # and returns any additional tensors to merge into the final dict.
         model_kwargs = dict(input.model_kwargs or {})
         # only this worker keys a prompt: a client that sent its own could name
-        # another request's pages and be served that request's KV
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode"):
+        # another request's pages and be served that request's KV. A client's
+        # own counts are dropped too, since the pool admits by the model's count.
+        for name in (
+            "prefix_keys", "prefix_tail", "prefix_decode", "prompt_slots", "decode_labels", "page_sizes",
+        ):
             model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
@@ -553,6 +556,10 @@ class PreprocessWorkerThread:
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
+            model_kwargs.update(self.model.kv_slots(
+                tensors, input.input_modalities, input.output_modalities,
+                page_sizes=self._page_sizes, **model_kwargs,
+            ))
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
             prefix_keys, prefix_tail, prefix_decode = self._prefix_keys(tensors)
@@ -622,7 +629,7 @@ class PreprocessWorkerThread:
         tails: dict[str, dict[str, list[int]]] = {}
         decode: dict[str, dict[str, str]] = {}
         for resource_key, by_label in self._prefix_streams.items():
-            page_size = self._prefix_page_sizes[resource_key]
+            page_size = self._page_sizes[resource_key]
             for label, stream in by_label.items():
                 ids = tensors.get(stream.tensor)
                 if stream.keyed_by != "ids" or not ids:

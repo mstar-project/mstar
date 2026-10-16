@@ -79,6 +79,8 @@ from mstar.model.bagel.submodules import (
     VAEDecoderSubmodule,
     VAEEncoderSubmodule,
     ViTEncoderSubmodule,
+    vae_image_slots,
+    vit_image_slots,
 )
 from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
@@ -609,6 +611,10 @@ class BagelModel(Model):
         as ``image_inputs`` by the data worker.
         """
         result: NameToTensorList = {}
+        for side in ("height", "width"):
+            size = kwargs.get(side) if "image" in output_modalities else None
+            if size is not None and size < self.config.latent_downsample:
+                raise ValueError(f"BAGEL needs a {side} of at least {self.config.latent_downsample}; got {size}")
 
         if prompt is not None:
             target_output = output_modalities[0] if output_modalities else "text"
@@ -723,6 +729,50 @@ class BagelModel(Model):
         )
         return resized.squeeze(0)
 
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], **kwargs,
+    ) -> dict:
+        """What each ``kv`` label holds over the request's life, decode aside,
+        and the labels decode grows, for the cache to admit the request by.
+
+        An attachment counts at the size its ViT and VAE walks resize it to: an
+        edit's, resized to fit the output, else the one attached. No walk writes
+        one to ``cfg_img``, and decode writes main and ``cfg_img`` (`active_labels`).
+        """
+        segments = tensors.get("text_inputs") or []
+        cfg = self.config
+        # the first output picks the walks, as in process_prompt, so a text-then-image request only decodes text
+        generating = output_modalities[:1] == ["image"]
+        images = tensors.get("image_inputs") or []
+        preprocess = kwargs.get("image_preprocess", "default")
+        attached = 0
+        for image in images:
+            height, width = image.shape[-2:]
+            attached += vit_image_slots(
+                height, width, preprocess,
+                cfg.vit_config.patch_size, cfg.vit_max_num_patch_per_side,
+            )
+            if generating:
+                attached += vae_image_slots(
+                    height, width, preprocess, cfg.latent_downsample, cfg.max_latent_size,
+                )
+        main = sum(len(span) for span in segments) + attached
+        if not generating:
+            return {"prompt_slots": {"kv": {"main": main}}, "decode_labels": {"kv": ["main"]}}
+        # an edit generates at its input's size, as process_prompt resized it
+        # (see get_initial_forward_pass_args)
+        if images and "image" in input_modalities:
+            height, width = images[0].shape[-2:]
+        else:
+            height, width = kwargs.get("height", 1024), kwargs.get("width", 1024)
+        main += (height // cfg.latent_downsample) * (width // cfg.latent_downsample) + 2
+        think = kwargs.get("think_mode", cfg.think_mode)
+        return {
+            "prompt_slots": {"kv": {"main": main, "cfg_text": main, "cfg_img": main - attached}},
+            "decode_labels": {"kv": ["main", "cfg_img"] if think else []},
+        }
+
     def postprocess(
         self, output: torch.Tensor,
         modality: str, # text | image | video | audio
@@ -766,6 +816,9 @@ class BagelModel(Model):
             "text_inputs", "ids", "prefill_text", "decode",
         )}}
 
+    def kv_counted(self) -> frozenset[str]:
+        return frozenset({"kv"})
+
     def checkpoint_path(self) -> str:
         return snapshot_download(
             repo_id=self.model_path_hf, cache_dir=self.cache_dir,
@@ -798,7 +851,7 @@ class BagelModel(Model):
                     max_segments_per_request=1,
                 ),
             ),
-            KVSpec(resource_key="kv", nodes=nodes, config=kv_config),
+            KVSpec(resource_key="kv", nodes=nodes, config=kv_config, leader="LLM"),
             AttentionSpec(
                 resource_key="attn", nodes=nodes,
                 config=AttentionConfig(kv_cache="kv"),

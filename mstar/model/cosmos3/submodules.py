@@ -162,6 +162,25 @@ def native_flow_sigmas(num_inference_steps: int, num_train_timesteps: int):
     return np.linspace(1.0 - 1.0 / num_train_timesteps, 0.0, num_inference_steps + 1)[:-1]
 
 
+def resolve_sound_frames(md: dict, sample_rate: int, latent_fps: float) -> tuple[int, int]:
+    """Resolve a sound request's target sample count and latent frame count.
+
+    The sound duration defaults to the video duration (``num_frames / fps``,
+    the request's ``sound_duration`` overrides), the target sample count is
+    that duration at the AVAE sample rate, and the latent frame count rounds
+    it up to whole tokenizer hops (the decoded tail past the target is
+    trimmed by the audio decode node)."""
+    num_frames = int(md.get("num_frames", 1))
+    fps = float(md.get("fps", 24.0))
+    duration = md.get("sound_duration")
+    if duration is None:
+        duration = num_frames / fps
+    duration = max(float(duration), 1.0 / max(fps, 1.0))
+    target_samples = max(1, int(round(duration * sample_rate)))
+    hop = int(round(sample_rate / latent_fps))
+    return target_samples, max(1, math.ceil(target_samples / hop))
+
+
 @dataclass(frozen=True)
 class GenStepInfo:
     """What a denoise step's declaration needs and cannot read off the batch.
@@ -381,22 +400,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return static
 
     def _resolve_sound_frames(self, md: dict) -> tuple[int, int]:
-        """Resolve a sound request's target sample count and latent frame count.
-
-        The sound duration defaults to the video duration (``num_frames / fps``,
-        the request's ``sound_duration`` overrides), the target sample count is
-        that duration at the AVAE sample rate, and the latent frame count rounds
-        it up to whole tokenizer hops (the decoded tail past the target is
-        trimmed by the audio decode node)."""
-        num_frames = int(md.get("num_frames", 1))
-        fps = float(md.get("fps", 24.0))
-        duration = md.get("sound_duration")
-        if duration is None:
-            duration = num_frames / fps
-        duration = max(float(duration), 1.0 / max(fps, 1.0))
-        target_samples = max(1, int(round(duration * self.config.sound_sample_rate)))
-        hop = int(round(self.config.sound_sample_rate / self.config.sound_latent_fps))
-        return target_samples, max(1, math.ceil(target_samples / hop))
+        return resolve_sound_frames(md, self.config.sound_sample_rate, self.config.sound_latent_fps)
 
     def _new_scheduler(self, num_inference_steps: int, device, use_karras_sigma=None, flow_shift=None):
         if self.config.distilled_sigmas:

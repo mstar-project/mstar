@@ -5,16 +5,20 @@ without pulling FlashInfer in behind it.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+
+# Tokens a decode label writes past ``max_tokens``. `Worker._try_speculate_next` submits one
+# more step while the step whose `check_stop` ends the loop is still running.
+SPECULATIVE_DECODE_TOKENS = 1
 
 
 class KVLayout(Enum):
@@ -107,6 +111,10 @@ class PagedKVConfig(KVConfig):
         ):
             if value is not None:
                 setattr(self, name, value)
+
+    def request_pages(self) -> int:
+        """Pages one request could have with nothing else admitted: all but the sink."""
+        return self.max_num_pages - 1
 
 
 @dataclass(frozen=True)
@@ -204,6 +212,13 @@ class KVReqConfig(ResourceReqConfig):
     # label -> the output tensor its sampled ids arrive in, if the stream keys generation
     prefix_decode: dict[str, str] | None = None
     prefix_cache: bool = True
+    # What a request reserves, stamped by the conductor.
+    # `max_tokens` is the most tokens the request may generate, None on a row no request owns.
+    # `prompt_slots` maps a label to the tokens it holds over the request's life, apart from decode.
+    # `decode_labels` are the labels decode grows, by up to `max_tokens`.
+    max_tokens: int | None = None
+    prompt_slots: dict[str, int] | None = None
+    decode_labels: list[str] | None = None
 
     def apply_conductor_config(
         self,
@@ -211,6 +226,9 @@ class KVReqConfig(ResourceReqConfig):
         prefix_tail: dict[str, list[int]] | None=None,
         prefix_decode: dict[str, str] | None=None,
         prefix_cache: bool | None=None,
+        max_tokens: int | None=None,
+        prompt_slots: dict[str, int] | None=None,
+        decode_labels: list[str] | None=None,
         **kwargs,
     ):
         if prefix_keys is not None:
@@ -221,6 +239,12 @@ class KVReqConfig(ResourceReqConfig):
             self.prefix_decode = prefix_decode
         if prefix_cache is not None:
             self.prefix_cache = prefix_cache
+        if max_tokens is not None:
+            self.max_tokens = max_tokens
+        if prompt_slots is not None:
+            self.prompt_slots = prompt_slots
+        if decode_labels is not None:
+            self.decode_labels = decode_labels
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
@@ -254,9 +278,55 @@ class KVReqConfig(ResourceReqConfig):
         return mapping.get((node, walk), [])
 
 
+def labels_opened(overrides: KVReqConfig, nodes: Collection[str] | None) -> set[str]:
+    """The labels ``overrides`` can open on ``nodes``, on any walk."""
+    labels = set(overrides.needed_labels or ["main"])
+    for (node, _), named in overrides.needed_labels_per_node_walk.items():
+        if nodes is None or node in nodes:
+            labels.update(named)
+    for node, named in overrides.needed_labels_per_node.items():
+        if nodes is None or node in nodes:
+            labels.update(named)
+    return labels
+
+
+class PageCount(NamedTuple):
+    pages: int
+    # True when the model counted every label, none guessed from its keys
+    exact: bool
+    labels: set[str]
+
+
+def count_pages(overrides: KVReqConfig, config: PagedKVConfig, nodes: Collection[str] | None) -> PageCount:
+    """Count the pages a request may take over its life from a pool shared by ``nodes``,
+    before any it holds.
+
+    A label counts to its prompt, as the model counted it or as its keys
+    describe it, plus its decode. ``max_seq_len`` caps decode but not the
+    prompt, which nothing cuts to it.
+    """
+    page_size = config.page_size
+    decode = min(overrides.max_tokens + SPECULATIVE_DECODE_TOKENS, config.max_seq_len)
+    slots = overrides.prompt_slots or {}
+    labels = labels_opened(overrides, nodes)
+    pages = 0
+    for label in labels:
+        if label in slots:
+            tokens = slots[label] + (decode if label in (overrides.decode_labels or ()) else 0)
+        else:
+            keys = overrides.prefix_keys[label]
+            tail = (overrides.prefix_tail or {}).get(label) or ()
+            tokens = (len(keys) - (1 if tail else 0)) * page_size + len(tail) + decode
+        pages += -(-tokens // page_size)
+    return PageCount(pages=pages, exact=bool(slots) and labels <= slots.keys(), labels=labels)
+
+
 @dataclass
 class KVSpec(NodeResourceSpec):
     config: KVConfig
+    # Under CFG parallel, the node whose cache admits a request for every worker's nodes.
+    # The other nodes' caches hold at most what the leader's does per request.
+    leader: str | None = None
 
     @property
     def resource_class(self) -> "type[Resource]":

@@ -20,6 +20,8 @@ from typing import Any, Tuple
 # ---------------------------------------------------------------------------
 THINKER_KV = "thinker_kv"
 TALKER_KV = "talker_kv"
+# the rows talker_last_prefill writes per request: the assistant prefix its decode starts from
+TALKER_LAST_PREFILL_TOKENS = 6
 
 THINKER_ATTN = "thinker_attn"
 TALKER_ATTN = "talker_attn"

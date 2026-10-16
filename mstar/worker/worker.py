@@ -2359,9 +2359,16 @@ class Worker:
         max_continuing = self.scheduler.room_for_continuing(spec_target)
 
         # Removes, aborts and failures are filtered here; prep_spec_rids
-        # assumes that.
+        # assumes that. So is a rid the target node isn't ready to run, since its admit
+        # would refuse the whole batch. Readiness goes last because it can reload a request
+        # or lease its hit.
+        partition = self.request_state.get_partition_for_node(spec_node_name)
         candidates = [
-            r for r in batch_N.request_to_worker_graph if not self._is_tearing_down(r)
+            r for r in batch_N.request_to_worker_graph
+            if not self._is_tearing_down(r)
+            and (speculating_same_node or self.scheduler.check_ready(
+                spec_node_name, r, self.request_state.get_fwd_info(r, partition),
+            ))
         ]
         # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, StreamingEdge]] = []

@@ -456,6 +456,37 @@ class Qwen3TTSModel(Model):
             ),
         ]
 
+    def kv_slots(
+        self, tensors: NameToTensorList, input_modalities: list[str],
+        output_modalities: list[str], **kwargs,
+    ) -> dict:
+        """What the Talker's prefill writes, from the ``prompt_layout`` that
+        `process_prompt` gives `_build_prefill`.
+
+        It is not the length of ``text_inputs``: the prefill drops the ChatML
+        suffix, adds a codec tag per think, language and speaker slot, and with
+        streamed text holds back every text token but the first, which later
+        frames add to their own rows.
+        """
+        del input_modalities, output_modalities, kwargs
+        instruct_len, text_len, stream_text, ref_text_len, ref_frames = tensors["prompt_layout"][0].tolist()
+        # think tags (one more with a language), TTS BOS over codec PAD, the speaker slot
+        tags = (3 if int(tensors["language_id"][0]) < 0 else 4) + 1
+        if int(tensors["speaker_id"][0]) >= 0 or self.config.supports_reference_audio:
+            tags += 1
+        if ref_frames:
+            # the reference turn closes on ``<|im_end|>\n`` alone, not the full suffix
+            ref_len = ref_text_len - len(CHATML_ASSISTANT_PREFIX_TOKEN_IDS) - 2
+            # codec BOS and the frames, after both transcripts and TTS EOS unless the text streams
+            body = 1 + ref_frames + (0 if stream_text else ref_len + text_len + 1)
+        else:
+            body = 1 if stream_text else text_len + 2
+        main = instruct_len + len(CHATML_ASSISTANT_PREFIX_TOKEN_IDS) + tags + body
+        return {"prompt_slots": {TALKER_KV: {"main": main}}, "decode_labels": {TALKER_KV: ["main"]}}
+
+    def kv_counted(self) -> frozenset[str]:
+        return frozenset({TALKER_KV})
+
     # -----------------------------------------------------------------------
     # Model ABC: walk graph declaration
     # -----------------------------------------------------------------------
