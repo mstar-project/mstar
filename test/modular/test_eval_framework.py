@@ -487,6 +487,9 @@ def test_custom_commands_hosts_and_ipv6_never_reach_results():
     listed = scrub({"extra": {"routing": {"hosts": ["gpu-private.internal:9000", {"name": "b.internal"}]}}})
     assert "internal" not in json.dumps(listed)
     assert "internal" not in scrub_argv(["--extra", 'routing={"hosts": ["gpu-private.internal:9000"]}'])[1]
+    for extra in ('hosts=["gpu-private.internal:9000"]', 'hosts={"gpu-private.internal": 9000, "b.internal": 1}'):
+        assert "internal" not in scrub_argv(["--extra", extra])[1]
+    assert "internal" not in json.dumps(scrub({"extra": {"hosts": {"gpu-private.internal": 9000, "b.internal": 1}}}))
 
 
 def test_tts_suite_end_to_end(tmp_path, fake_cmd):

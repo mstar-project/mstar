@@ -84,7 +84,7 @@ def x_value(r: RunResult) -> float:
 
 
 def _short_gpu(r: RunResult) -> str:
-    gpus = (r.meta.get("machine") or r.meta.get("host") or {}).get("gpus") or []
+    gpus = r.meta.get("machine", {}).get("gpus") or []
     if not gpus:
         return "no GPU"
     name = gpus[0].get("name", "GPU")

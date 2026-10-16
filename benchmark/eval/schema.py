@@ -87,6 +87,8 @@ class RunResult:
         problems = validate(d)
         if problems:
             raise ValueError("not an mstar-eval result: " + "; ".join(problems))
+        if "host" in d["meta"] and "machine" not in d["meta"]:  # early mstar-eval/1 files
+            d["meta"]["machine"] = d["meta"].pop("host")
         return cls(
             suite=d["suite"],
             label=d["label"],
@@ -202,8 +204,11 @@ def scrub(obj: Any, host: bool = False) -> Any:
     treated as a host."""
     if isinstance(obj, dict):
         out = {}
-        for k, v in obj.items():
+        for i, (k, v) in enumerate(obj.items()):
             name = k if isinstance(k, str) else ""
+            if host and isinstance(k, str):  # under a host-like key, mapping keys can be hosts too
+                k = _value("HOST", k)
+                k = k if k not in out else f"{k}{i}"
             out[k] = "<redacted>" if _SECRET.search(name) else scrub(v, host or bool(_HOSTLIKE.search(name)))
         return out
     if isinstance(obj, (list, tuple)):
@@ -247,7 +252,7 @@ def _pair(kv: str) -> str:
     except ValueError:
         nested = None
     if isinstance(nested, (dict, list)):  # --extra 'k={"api_key": ...}': scrub the structure, not the text
-        return f"{k}=<redacted>" if _SECRET.search(k) else f"{k}={json.dumps(scrub(nested))}"
+        return f"{k}=<redacted>" if _SECRET.search(k) else f"{k}={json.dumps(scrub(nested, bool(_HOSTLIKE.search(k))))}"
     return f"{k}{sep}{_value(k, v)}"
 
 
