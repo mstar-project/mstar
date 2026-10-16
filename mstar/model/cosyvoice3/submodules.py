@@ -1,3 +1,19 @@
+# Copyright (c) 2024 Alibaba Inc (authors: Xiang Lyu)
+# Copyright (c) 2024 Alibaba Inc (authors: Xiang Lyu, Zhihao Du)
+# Copyright (c) 2025 Alibaba Inc (authors: Xiang Lyu, Bofan Zhou)
+# Copyright (c) 2025 Alibaba Inc (authors: Xiang Lyu, Yabin Li, Qihua, Shengqiang Li)
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: the reference front end and
+# inference loop split into M* graph-node submodules with continuous batching.
+#
+# Original files (FunAudioLLM/CosyVoice, cosyvoice/cli/frontend.py,
+# cosyvoice/cli/model.py and cosyvoice/llm/llm.py) were released under
+# Apache-2.0, with the full license text available at
+# https://github.com/FunAudioLLM/CosyVoice/blob/main/LICENSE.
+#
+# This modified file is released under the same license.
+
 """Node submodules for CosyVoice3: the compute behind each graph node.
 
 ``SpeakerEncoderSubmodule``  reference clip -> speech tokens for the LM prompt

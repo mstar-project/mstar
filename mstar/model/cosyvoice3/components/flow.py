@@ -1,3 +1,22 @@
+# Copyright (c) 2024 Alibaba Inc (authors: Xiang Lyu, Zhihao Du)
+# Copyright (c) 2025 Alibaba Inc (authors: Xiang Lyu, Bofan Zhou)
+# Copyright (c) 2021 Mobvoi Inc (Binbin Zhang, Di Wu)
+# Copyright (c) 2022 Xingchen Song
+# Copyright (c) 2024 Alibaba Inc (Xiang Lyu)
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: reimplemented on Chatterbox's
+# flow-matching solver, settling whole 25-token chunks so a stream equals a
+# whole-utterance solve.
+#
+# Original files (FunAudioLLM/CosyVoice, cosyvoice/flow/flow.py,
+# cosyvoice/flow/flow_matching.py and
+# cosyvoice/transformer/upsample_encoder.py) were released under Apache-2.0,
+# with the full license text available at
+# https://github.com/FunAudioLLM/CosyVoice/blob/main/LICENSE.
+#
+# This modified file is released under the same license.
+
 """CosyVoice3's token-to-mel flow: speech tokens -> ``mu`` -> mel.
 
 Tokens (prompt then generated) are embedded to 80 channels, passed through a
@@ -14,10 +33,9 @@ block-causally over 25-token chunks, so its frames depend on nothing past the
 end of their chunk; settling whole chunks makes a stream's mel equal to one
 whole-utterance streaming solve.
 
-Learned from ``cosyvoice/flow/flow.py`` (``CausalMaskedDiffWithDiT``),
+Ported from ``cosyvoice/flow/flow.py`` (``CausalMaskedDiffWithDiT``),
 ``cosyvoice/transformer/upsample_encoder.py`` (``PreLookaheadLayer``) and
-``cosyvoice/flow/flow_matching.py`` (``CausalConditionalCFM``); nothing is
-copied.
+``cosyvoice/flow/flow_matching.py`` (``CausalConditionalCFM``).
 """
 
 from __future__ import annotations

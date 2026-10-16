@@ -1,3 +1,18 @@
+# Copyright (c) 2024 Alibaba Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: reimplemented as an M* module
+# with the same numerics, with block-causal chunk masks for streaming.
+#
+# Original files (FunAudioLLM/CosyVoice, cosyvoice/flow/DiT/dit.py and
+# cosyvoice/flow/DiT/modules.py) were released under Apache-2.0, with the full
+# license text available at
+# https://github.com/FunAudioLLM/CosyVoice/blob/main/LICENSE. Those files
+# adapt the DiT of SWivid/F5-TTS, and the rotary helpers follow
+# lucidrains/x-transformers (both MIT).
+#
+# This modified file is released under the same license.
+
 """CosyVoice3's flow-matching velocity estimator: an F5-TTS style DiT.
 
 ``x`` (noisy mel), ``cond`` (prompt mel, zero elsewhere), ``mu`` (token
@@ -15,8 +30,8 @@ Two quirks of the reference are kept on purpose:
 * attention takes a mask, not a length: a block-causal chunk mask when
   streaming (``chunk_attention_mask``), the key padding otherwise.
 
-Learned from ``cosyvoice/flow/DiT/{dit,modules}.py`` and x-transformers'
-``RotaryEmbedding`` / ``apply_rotary_pos_emb``; nothing is copied. Parameter
+Ported from ``cosyvoice/flow/DiT/{dit,modules}.py`` and x-transformers'
+``RotaryEmbedding`` / ``apply_rotary_pos_emb``. Parameter
 paths match ``flow.pt`` under ``decoder.estimator.``.
 """
 

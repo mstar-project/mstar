@@ -1,3 +1,15 @@
+# Copyright (c) 2024 Alibaba Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: the special-token list written
+# down without the reference tokenizer class.
+#
+# Original file (FunAudioLLM/CosyVoice, cosyvoice/tokenizer/tokenizer.py) was
+# released under Apache-2.0, with the full license text available at
+# https://github.com/FunAudioLLM/CosyVoice/blob/main/LICENSE.
+#
+# This modified file is released under the same license.
+
 """CosyVoice3's text tokenizer: the Qwen2 BPE of ``CosyVoice-BlankEN`` plus the
 special tokens CosyVoice3 adds (prompt delimiters, paralinguistic tags, and
 English and pinyin phonemes for pronunciation fixes such as ``[j][ǐ]``).

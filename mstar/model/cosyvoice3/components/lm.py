@@ -1,3 +1,16 @@
+# Copyright (c) 2024 Alibaba Inc (authors: Xiang Lyu, Zhihao Du)
+# Copyright (c) 2025 Alibaba Inc (authors: Xiang Lyu, Yabin Li, Qihua, Shengqiang Li)
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: the Qwen2 speech-token LM
+# rebuilt on M* components over a paged KV cache.
+#
+# Original file (FunAudioLLM/CosyVoice, cosyvoice/llm/llm.py) was released
+# under Apache-2.0, with the full license text available at
+# https://github.com/FunAudioLLM/CosyVoice/blob/main/LICENSE.
+#
+# This modified file is released under the same license.
+
 """CosyVoice3's speech-token LM on M* components.
 
 A Qwen2 0.5B decoder (``CosyVoice-BlankEN``: RMSNorm, GQA with biased q/k/v,
@@ -7,8 +20,8 @@ speech token through its own head over ``speech_token_size + 200`` ids, the
 200 above the codebook being control tokens (any of them ends the utterance).
 ``sos`` and ``task_id`` are rows of the speech embedding.
 
-Learned from ``cosyvoice/llm/llm.py`` (``Qwen2LM``, ``CosyVoice3LM``) and the HF
-Qwen2 implementation; nothing is copied. Parameter paths drop the checkpoint's
+Ported from ``cosyvoice/llm/llm.py`` (``Qwen2LM``, ``CosyVoice3LM``) and the HF
+Qwen2 implementation. Parameter paths drop the checkpoint's
 ``llm.model.model.`` prefix; the backbone's text head is unused and dropped.
 """
 

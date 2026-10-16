@@ -1,3 +1,17 @@
+# Copyright (c) 2020 Mobvoi Inc (Binbin Zhang)
+# Copyright (c) 2024 Alibaba Inc (authors: Xiang Lyu)
+# Copyright (c) 2025 Alibaba Inc (authors: Xiang Lyu, Bofan Zhou)
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: repetition-aware sampling
+# redrawn as hash-seeded Gumbel-max draws that a CUDA graph can capture.
+#
+# Original file (FunAudioLLM/CosyVoice, cosyvoice/utils/common.py) was
+# released under Apache-2.0, with the full license text available at
+# https://github.com/FunAudioLLM/CosyVoice/blob/main/LICENSE.
+#
+# This modified file is released under the same license.
+
 """Repetition-aware sampling (RAS) for the CosyVoice3 speech-token LM.
 
 The reference (``cosyvoice.utils.common.ras_sampling``) draws a token from the

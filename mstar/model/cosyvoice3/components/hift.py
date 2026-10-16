@@ -1,3 +1,19 @@
+# Copyright (c) 2024 Alibaba Inc (authors: Xiang Lyu, Kai Hu)
+# Copyright (c) 2020 Mobvoi Inc. (authors: Binbin Zhang, Di Wu)
+# Copyright (c) 2024 Alibaba Inc (Xiang Lyu)
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file has been modified for M* in 2026: rebuilt from causal pieces on
+# Chatterbox's HiFT, with bounded-window streaming.
+#
+# Original files (FunAudioLLM/CosyVoice, cosyvoice/hifigan/generator.py,
+# cosyvoice/hifigan/f0_predictor.py and cosyvoice/transformer/convolution.py)
+# were released under Apache-2.0, with the full license text available at
+# https://github.com/FunAudioLLM/CosyVoice/blob/main/LICENSE. The generator is
+# modified from jik876/hifi-gan (MIT).
+#
+# This modified file is released under the same license.
+
 """CosyVoice3's causal HiFT vocoder: 80-bin mel at 50 Hz -> 24 kHz waveform.
 
 The same neural-source-filter HiFi-GAN with an iSTFT head as Chatterbox's
@@ -26,10 +42,10 @@ The reference also adds a random phase offset to sample 0 of each harmonic;
 its linear resampling to frame rate never reads sample 0, so it has no effect
 and is left out.
 
-Learned from ``cosyvoice/hifigan/generator.py`` (``CausalHiFTGenerator``,
+Ported from ``cosyvoice/hifigan/generator.py`` (``CausalHiFTGenerator``,
 ``SineGen2``, ``SourceModuleHnNSF``), ``cosyvoice/hifigan/f0_predictor.py``
-(``CausalConvRNNF0Predictor``) and ``cosyvoice/transformer/convolution.py``;
-nothing is copied. Parameter paths match ``hift.pt`` (weight norm folded).
+(``CausalConvRNNF0Predictor``) and ``cosyvoice/transformer/convolution.py``.
+Parameter paths match ``hift.pt`` (weight norm folded).
 """
 
 from __future__ import annotations
