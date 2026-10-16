@@ -5,6 +5,7 @@ import os
 import platform
 import shutil
 import stat
+import sys
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -68,6 +69,90 @@ class FutureAndPointers:
     graph_edges: list[GraphEdge]
     request_id: Rid = ""
     rx_time: float | None = None # seconds
+
+
+#: Earlier Mooncake releases let any host that reaches the TCP data port read
+#: or write arbitrary process memory (CVE-2026-103764).
+MOONCAKE_PATCHED_VERSION = "0.3.12.post1"
+_MOONCAKE_DISTRIBUTIONS = (
+    "mooncake-transfer-engine",
+    "mooncake-transfer-engine-cuda13",
+    "mooncake-transfer-engine-non-cuda",
+)
+_mooncake_version_checked = False
+
+
+def _mooncake_dists_owning(engine_file: str | None, dists: list[str]) -> set[str]:
+    """Which of *dists* installed ``engine_file``, the Mooncake engine this
+    process imported: a RECORD entry that locates to it with its hash.
+
+    One replaced in the same directory keeps a hash that no longer matches,
+    and one installed elsewhere locates to another file. Empty when it can't
+    be told; a distribution whose metadata can't be read is skipped, since
+    this only refines a warning."""
+    import base64
+    from importlib.metadata import distribution
+    if engine_file is None:
+        return set()
+    try:
+        with open(engine_file, "rb") as fh:
+            digest = base64.urlsafe_b64encode(hashlib.sha256(fh.read()).digest()).rstrip(b"=").decode()
+    except OSError:
+        return set()
+    engine_path = os.path.realpath(engine_file)
+    found = set()
+    for dist in dists:
+        try:
+            for f in distribution(dist).files or []:
+                if (f.name == os.path.basename(engine_file) and f.hash is not None
+                        and f.hash.mode == "sha256" and f.hash.value == digest
+                        and os.path.realpath(f.locate()) == engine_path):
+                    found.add(dist)
+        except Exception:  # noqa: BLE001 - e.g. a corrupt RECORD
+            continue
+    return found
+
+
+def _warn_if_mooncake_unpatched() -> None:
+    """Warn once per process if the installed Mooncake predates that fix.
+
+    The extras require a patched release, so this only fires where the
+    environment was built without resolving them (``--no-deps``, a prebuilt
+    image). The distributions install the same ``mooncake`` package, and a
+    replaced one can leave its metadata behind, so with several installed
+    only the one that installed the imported engine counts; if that can't be
+    told, a patched one anywhere keeps it quiet."""
+    global _mooncake_version_checked
+    if _mooncake_version_checked:
+        return
+    _mooncake_version_checked = True
+    try:
+        from packaging.version import Version
+    except ImportError:
+        return
+    from importlib.metadata import PackageNotFoundError, version
+    installed: list[tuple[str, Version]] = []
+    for dist in _MOONCAKE_DISTRIBUTIONS:
+        try:
+            installed.append((dist, Version(version(dist))))
+        except PackageNotFoundError:
+            continue
+        except Exception:  # noqa: BLE001 - a version that can't be read or parsed (corrupt or stale metadata)
+            return
+    if len(installed) > 1:
+        engine = sys.modules.get("mooncake.engine")
+        owners = _mooncake_dists_owning(getattr(engine, "__file__", None), [d for d, _ in installed])
+        if owners:
+            installed = [(d, v) for d, v in installed if d in owners]
+    patched = Version(MOONCAKE_PATCHED_VERSION)
+    if installed and all(v < patched for _, v in installed):
+        logger.warning(
+            "Installed Mooncake (%s) predates %s: any host that can reach the "
+            "transfer engine's TCP data port can read or write this process's "
+            "memory (CVE-2026-103764). Upgrade it, and keep the TCP and RDMA "
+            "transports on a trusted network.",
+            ", ".join(f"{d} {v}" for d, v in installed), MOONCAKE_PATCHED_VERSION,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +305,7 @@ class MooncakeTransferEngine(TensorTransferEngine):
                 f"Failed to load mooncake: {detail}. "
                 "Install mooncake-transfer-engine or use SHM protocol."
             )
+        _warn_if_mooncake_unpatched()
 
         if protocol == CommProtocol.RDMA:
             transfer_device = ""
