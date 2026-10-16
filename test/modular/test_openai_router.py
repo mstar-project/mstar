@@ -142,6 +142,32 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
     assert r.json()["error"]["type"] == "invalid_request_error"
 
 
+def test_chat_refuses_server_paths_uniformly(client_and_stub, tmp_path):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    loop = tmp_path / "loop.png"
+    loop.symlink_to(loop)
+    for ref in (str(loop), str(tmp_path / "missing.png"), "/etc/hostname"):
+        r = client.post("/v1/chat/completions", json={"model": "bagel", "messages": [{
+            "role": "user", "content": [{"type": "image_url", "image_url": {"url": ref}}]}]})
+        assert r.status_code == 400, (ref, r.text)
+        message = r.json()["error"]["message"]
+        assert message.startswith("server file paths are refused") and str(tmp_path) not in message
+    assert stub.last_submit is None
+
+
+@pytest.mark.parametrize("model", ["qwen3_tts_base", "omnivoice"])
+def test_voice_clone_refuses_server_paths_uniformly(client_and_stub, model):
+    client, stub = client_and_stub
+    stub.model_name = model
+    # the suffix-less ones are valid base64; "//..." even decodes to an MPEG frame sync
+    for ref in ("/etc/passwd", "//etc/passwd", "//etc/shadow", "secret", "///x", "/etc/hostname.wav"):
+        r = client.post("/v1/audio/speech", json={"model": model, "input": "hi", "ref_audio": ref, "ref_text": "hi"})
+        assert r.status_code == 400, (ref, r.text)
+        assert r.json()["error"]["message"].startswith("server file paths are refused")
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
 def test_chat_audio_output(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "qwen3_omni"
@@ -535,8 +561,8 @@ def test_speech_refuses_a_format_it_cannot_produce(client_and_stub, body):
 
 
 @pytest.mark.parametrize("ref,message", [
-    ("/etc/passwd", "paths on the server are refused"),
-    ("file:///etc/passwd", "paths on the server are refused"),
+    ("/etc/passwd", "server file paths are refused"),
+    ("file:///etc/passwd", "server file paths are refused"),
     (123, "got int"),
     ({"url": "x"}, "got dict"),
 ])
