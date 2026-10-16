@@ -2,6 +2,7 @@
 import json
 import logging
 import re
+from collections.abc import Container
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -364,3 +365,61 @@ class ByteLevelDetokenizer:
         for token in tokens:
             raw.extend(self.byte_decoder[c] for c in token)
         return bytes(raw)
+
+
+def drop_stop_tokens(
+    output: torch.Tensor, stop_token_ids: Container[int], request_kwargs: dict | None,
+) -> list[int]:
+    """Drop the stop tokens that ended a text reply, unless the request sets ``ignore_eos``.
+
+    A stop token ends the turn, not the reply: a client sends the reply back as
+    an assistant message, whose template closes it. Under ``ignore_eos`` it ends
+    nothing and stays, one chunk per token.
+    """
+    ids = output.reshape(-1).tolist()
+    if (request_kwargs or {}).get("ignore_eos"):
+        return ids
+    return [i for i in ids if i not in stop_token_ids]
+
+
+# generation_config.json key -> mstar knob
+_KNOBS = {
+    "temperature": "temperature",
+    "top_p": "top_p",
+    "top_k": "top_k",
+    "min_p": "min_p",
+    "repetition_penalty": "repetition_penalty",
+    "max_new_tokens": "max_output_tokens",
+}
+
+
+def load_generation_defaults(
+    checkpoint_dir: str | Path | None, prefix: str = "", stage: str = "",
+) -> dict:
+    """The sampling defaults ``checkpoint_dir/generation_config.json`` declares.
+
+    Keys come back under mstar names (``max_new_tokens`` -> ``max_output_tokens``).
+    ``prefix`` selects one stage's keys in a multi-stage file (``"talker_"`` reads
+    ``talker_temperature``) and ``stage`` prefixes the returned names
+    (``"code_predictor_"``). ``do_sample: false`` is greedy: temperature 0.
+    Returns ``{}`` when there is no file, so the caller's own defaults apply.
+    """
+    if checkpoint_dir is None:
+        return {}
+    path = Path(checkpoint_dir) / "generation_config.json"
+    if not path.is_file():
+        return {}
+    try:
+        config = json.loads(path.read_text())
+    except (OSError, ValueError):
+        logger.warning("Unreadable %s; using the model's own defaults", path)
+        return {}
+    out = {}
+    for hf_key, knob in _KNOBS.items():
+        value = config.get(prefix + hf_key)
+        if value is not None:
+            out[stage + knob] = value
+    # HF spells a stage's switch both ways: ``talker_do_sample``, ``subtalker_dosample``
+    if False in (config.get(prefix + "do_sample"), config.get(prefix + "dosample")):
+        out[stage + "temperature"] = 0.0
+    return out

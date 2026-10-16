@@ -1,0 +1,4 @@
+test/modular/test_waypoint_components.py
+test/modular/test_waypoint_dit.py
+test/modular/test_flex_attention_resource.py
+test/modular/test_waypoint_benchmark_videos.py

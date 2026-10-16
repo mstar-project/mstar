@@ -46,6 +46,11 @@ class _FakeEngine:
         del allow_reload
         return FULL_ADMIT_OK
 
+    def get_max_batch_size(self, node_name, graph_walk):
+        """None is no cap: a targeted call now resolves the walk's cap through
+        _room_left, and these tests are about the TP-follow FIFO, not caps."""
+        del node_name, graph_walk
+
 
 class _FakeEngineManager:
     def get_engine(self, node_name):

@@ -97,25 +97,37 @@ async def _stream(api, model_name, request_id, sample_rate):
     yield chunk({"role": "assistant"})
     failed = False
     try:
-        async for c in api.iter_result_chunks(request_id):
-            if c.modality == "text":
-                yield chunk({"content": c.data.decode("utf-8", "replace")})
-            elif c.modality == "audio":
-                # Streaming audio deltas are base64 16-bit PCM at the model rate.
-                yield chunk({"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}})
-            elif c.modality == "image":
-                yield chunk({"content": media_io.png_to_data_url(c.data)})
-            elif c.modality == "error":
-                # The request failed after the stream opened (an engine error
-                # mid generation, a preprocess error); the HTTP status is
-                # committed, so the failure travels in-band the way the
-                # non-streaming path's error body does, not as a normal
-                # ``stop`` a client would take for a complete answer. The error
-                # is the iterator's last chunk, so the loop ends on its own;
-                # returning here instead would trip the iterator's abort on a
-                # request that is already gone.
-                failed = True
-                yield error(c.data.decode("utf-8", "replace"), int(c.metadata.get("status", 500)))
+        # One yield per batch of text chunks: the tokens a request had waiting
+        # when its handler ran go out as one body frame (one write), which is
+        # what keeps the delivery loop ahead at high token rates. A batch of
+        # one is the common case when the loop keeps up.
+        async for batch in api.iter_result_chunk_batches(request_id):
+            text_events: list[str] = []
+            for c in batch:
+                if c.modality == "text":
+                    text_events.append(chunk({"content": c.data.decode("utf-8", "replace")}))
+                    continue
+                if text_events:
+                    yield "".join(text_events)
+                    text_events = []
+                if c.modality == "audio":
+                    # Streaming audio deltas are base64 16-bit PCM at the model rate.
+                    yield chunk({"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}})
+                elif c.modality == "image":
+                    yield chunk({"content": media_io.png_to_data_url(c.data)})
+                elif c.modality == "error":
+                    # The request failed after the stream opened (an engine error
+                    # mid generation, a preprocess error); the HTTP status is
+                    # committed, so the failure travels in-band the way the
+                    # non-streaming path's error body does, not as a normal
+                    # ``stop`` a client would take for a complete answer. The error
+                    # is the iterator's last chunk, so the loop ends on its own;
+                    # returning here instead would trip the iterator's abort on a
+                    # request that is already gone.
+                    failed = True
+                    yield error(c.data.decode("utf-8", "replace"), int(c.metadata.get("status", 500)))
+            if text_events:
+                yield "".join(text_events)
     except HTTPException as exc:
         # The delivery timeout raises out of the iterator (which aborts the
         # request on its way out); report it the same way.
