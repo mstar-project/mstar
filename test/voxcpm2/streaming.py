@@ -30,7 +30,9 @@ def stream_through(vae_node, patches: torch.Tensor, policy, lead: torch.Tensor |
         while buffer.has_chunk_ready():
             chunk = buffer.pop_chunk()
             prepared = vae_node.prepare_inputs(
-                "vae_chunk", info, {STREAM_EDGE: [chunk.data["data"]]},
+                "vae_chunk",
+                info,
+                {STREAM_EDGE: [chunk.data["data"]]},
                 input_metadata=InputMetadata(stream_chunks={STREAM_EDGE: chunk.info}),
             )
             out = vae_node.forward_batched("vae_chunk", engine, **vae_node.preprocess("vae_chunk", engine, [prepared]))

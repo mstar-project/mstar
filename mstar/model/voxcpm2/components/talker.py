@@ -38,13 +38,20 @@ class VoxCPM2Generator(nn.Module):
         lm = config.lm
         hidden, dit_hidden = lm.hidden_size, config.dit.hidden_size
         self.base_lm = MiniCPMLM(
-            lm, attn_key=BASE_ATTN, kv_key=BASE_KV, pos_key=BASE_POS,
-            max_len=config.max_length, comm_group=comm_group,
+            lm,
+            attn_key=BASE_ATTN,
+            kv_key=BASE_KV,
+            pos_key=BASE_POS,
+            max_len=config.max_length,
+            comm_group=comm_group,
         )
         self.residual_lm = MiniCPMLM(
-            config.residual, attn_key=RES_ATTN, kv_key=RES_KV,
+            config.residual,
+            attn_key=RES_ATTN,
+            kv_key=RES_KV,
             pos_key=None if config.residual.no_rope else BASE_POS,
-            max_len=config.max_length, comm_group=comm_group,
+            max_len=config.max_length,
+            comm_group=comm_group,
         )
         self.feat_encoder = LocalEncoder(config.encoder, config.feat_dim, config.patch_size)
         self.feat_decoder = _FeatDecoder(LocalDiT(config.dit, config.feat_dim, config.patch_size))
@@ -91,8 +98,13 @@ class VoxCPM2Generator(nn.Module):
         the previous patch (``cond_patch``) and ``noise`` (``[rows, feat, patch]``)."""
         mu = torch.cat([self.lm_to_dit_proj(lm_hidden), self.res_to_dit_proj(res_hidden)], dim=-1)
         patch = solve_cfm(
-            self.feat_decoder.estimator, noise, mu, cond_patch.transpose(1, 2).contiguous(),
-            cfg_value, t_span, mean_mode=self.config.dit_mean_mode,
+            self.feat_decoder.estimator,
+            noise,
+            mu,
+            cond_patch.transpose(1, 2).contiguous(),
+            cfg_value,
+            t_span,
+            mean_mode=self.config.dit_mean_mode,
         )
         return patch.transpose(1, 2)
 
@@ -109,7 +121,8 @@ class VoxCPM2Generator(nn.Module):
         embed = self.embed_patches(prev_patch)
         lm_hidden = self.fsq_layer(self.base_lm(embed, label=label))
         res_hidden = self.residual_lm(
-            self.fusion_concat_proj(torch.cat([lm_hidden, embed], dim=-1)), label=label,
+            self.fusion_concat_proj(torch.cat([lm_hidden, embed], dim=-1)),
+            label=label,
         )
         patch = self.predict_patch(lm_hidden, res_hidden, prev_patch, noise, cfg_value, t_span)
         return patch, self.stop_logits(lm_hidden)
@@ -144,7 +157,8 @@ class VoxCPM2Generator(nn.Module):
         hidden = self.base_lm(text_mask * text_embed + audio_mask * feat_embed, label=label)
         hidden = self.fsq_layer(hidden) * audio_mask + hidden * text_mask
         res = self.residual_lm(
-            self.fusion_concat_proj(torch.cat([hidden, audio_mask * feat_embed], dim=-1)), label=label,
+            self.fusion_concat_proj(torch.cat([hidden, audio_mask * feat_embed], dim=-1)),
+            label=label,
         )
         lm_hidden = hidden.index_select(0, last_token_indices)
         res_hidden = res.index_select(0, last_token_indices)

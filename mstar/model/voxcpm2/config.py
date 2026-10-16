@@ -31,7 +31,7 @@ REF_AUDIO_END_TOKEN = 104
 
 # Prompt modes, as ``VoxCPM2Model._generate_with_prompt_cache`` names them.
 MODE_ZERO_SHOT = 0
-MODE_REFERENCE = 1        # ref audio isolated between ref_start/ref_end tokens
+MODE_REFERENCE = 1  # ref audio isolated between ref_start/ref_end tokens
 MODE_REF_CONTINUATION = 2  # the reference prefix, then text + its audio to continue
 
 
@@ -55,19 +55,28 @@ class MiniCPM4Config:
     no_rope: bool = False
     use_mup: bool = False
 
-    def resized(self, *, hidden_size: int, intermediate_size: int, num_attention_heads: int,
-                num_hidden_layers: int, head_dim: int | None) -> MiniCPM4Config:
+    def resized(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        num_attention_heads: int,
+        num_hidden_layers: int,
+        head_dim: int | None,
+    ) -> MiniCPM4Config:
         """A stack sharing this one's RoPE, norms and KV head count (the
         reference deep-copies ``lm_config`` and overrides the sizes)."""
-        return MiniCPM4Config(**{
-            **self.__dict__,
-            "hidden_size": hidden_size,
-            "intermediate_size": intermediate_size,
-            "num_attention_heads": num_attention_heads,
-            "num_hidden_layers": num_hidden_layers,
-            "head_dim": head_dim or hidden_size // num_attention_heads,
-            "vocab_size": 0,
-        })
+        return MiniCPM4Config(
+            **{
+                **self.__dict__,
+                "hidden_size": hidden_size,
+                "intermediate_size": intermediate_size,
+                "num_attention_heads": num_attention_heads,
+                "num_hidden_layers": num_hidden_layers,
+                "head_dim": head_dim or hidden_size // num_attention_heads,
+                "vocab_size": 0,
+            }
+        )
 
     @property
     def rope_factors(self) -> tuple[float, ...]:
@@ -183,12 +192,14 @@ class VoxCPM2Config:
             ),
             no_rope=lm_raw.get("no_rope", False),
         )
-        residual = MiniCPM4Config(**{
-            **lm.__dict__,
-            "num_hidden_layers": data.get("residual_lm_num_layers", 8),
-            "no_rope": data.get("residual_lm_no_rope", False),
-            "vocab_size": 0,
-        })
+        residual = MiniCPM4Config(
+            **{
+                **lm.__dict__,
+                "num_hidden_layers": data.get("residual_lm_num_layers", 8),
+                "no_rope": data.get("residual_lm_no_rope", False),
+                "vocab_size": 0,
+            }
+        )
 
         def local(raw: dict[str, Any]) -> MiniCPM4Config:
             return lm.resized(

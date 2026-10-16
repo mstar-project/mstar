@@ -95,7 +95,12 @@ class LocalDiT(nn.Module):
         self.decoder = MiniCPMLocalTransformer(config, max_len=2 + 1 + 2 * patch_size)
 
     def forward(
-        self, x: torch.Tensor, mu: torch.Tensor, t: torch.Tensor, cond: torch.Tensor, dt: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        t: torch.Tensor,
+        cond: torch.Tensor,
+        dt: torch.Tensor,
     ) -> torch.Tensor:
         """``x``/``cond``: ``[rows, feat, patch]``; ``mu``: ``[rows, 2*hidden]``;
         ``t``/``dt``: ``[rows]``. Returns the velocity ``[rows, feat, patch]``."""
@@ -107,7 +112,7 @@ class LocalDiT(nn.Module):
         t = t + dt
         mu = mu.view(x.shape[0], -1, x.shape[-1])
         hidden = self.decoder(torch.cat([mu, t.unsqueeze(1), cond, x], dim=1))
-        hidden = hidden[:, prefix + mu.shape[1] + 1:]
+        hidden = hidden[:, prefix + mu.shape[1] + 1 :]
         return self.out_proj(hidden).transpose(1, 2)
 
 

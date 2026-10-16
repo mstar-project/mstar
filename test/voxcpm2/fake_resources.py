@@ -55,10 +55,14 @@ class DenseKVAttention:
         self._pending = None
         histories = self._kv.setdefault((self._label, kv_cache_layer), [([], []) for _ in self._seq_lens])
         outputs = []
-        for i, (q_i, k_i, v_i) in enumerate(zip(
-            torch.split(q, self._seq_lens), torch.split(k_all, self._seq_lens),
-            torch.split(v_all, self._seq_lens), strict=True,
-        )):
+        for i, (q_i, k_i, v_i) in enumerate(
+            zip(
+                torch.split(q, self._seq_lens),
+                torch.split(k_all, self._seq_lens),
+                torch.split(v_all, self._seq_lens),
+                strict=True,
+            )
+        ):
             histories[i][0].append(k_i)
             histories[i][1].append(v_i)
             keys = torch.cat(histories[i][0])
@@ -67,8 +71,11 @@ class DenseKVAttention:
             q_pos = torch.arange(n_k - n_q, n_k, device=q.device).unsqueeze(1)
             mask = torch.arange(n_k, device=q.device).unsqueeze(0) <= q_pos
             out = F.scaled_dot_product_attention(
-                q_i.transpose(0, 1).unsqueeze(0), keys.transpose(0, 1).unsqueeze(0),
-                vals.transpose(0, 1).unsqueeze(0), attn_mask=mask, enable_gqa=q_i.shape[1] != keys.shape[1],
+                q_i.transpose(0, 1).unsqueeze(0),
+                keys.transpose(0, 1).unsqueeze(0),
+                vals.transpose(0, 1).unsqueeze(0),
+                attn_mask=mask,
+                enable_gqa=q_i.shape[1] != keys.shape[1],
             )
             outputs.append(out.squeeze(0).transpose(0, 1))
         return torch.cat(outputs)

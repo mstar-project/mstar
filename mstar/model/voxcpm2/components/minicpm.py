@@ -56,7 +56,10 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate ``q``/``k`` (``[..., heads, head_dim]``) in fp32; ``cos``/``sin``
     broadcast over the heads axis (``[..., 1, head_dim]``)."""
@@ -157,26 +160,28 @@ class MiniCPMLM(nn.Module):
                 embedding_dim=config.hidden_size,
                 comm_group=comm_group,
             )
-        self.layers = nn.ModuleList([
-            DecoderLayer(
-                self_attn=MiniCPMPagedAttention(
-                    rope=self.rope,
-                    comm_group=comm_group,
-                    hidden_size=config.num_attention_heads * config.head_dim,
-                    num_heads=config.num_attention_heads,
-                    num_kv_heads=config.num_key_value_heads,
-                    head_dim=config.head_dim,
-                    input_hidden_size=config.hidden_size,
-                    attn_key=attn_key,
-                    kv_key=kv_key,
-                    pos_key=pos_key if use_rope else None,
-                ),
-                mlp=_mlp(config, comm_group),
-                input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
-                post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
-            )
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                DecoderLayer(
+                    self_attn=MiniCPMPagedAttention(
+                        rope=self.rope,
+                        comm_group=comm_group,
+                        hidden_size=config.num_attention_heads * config.head_dim,
+                        num_heads=config.num_attention_heads,
+                        num_kv_heads=config.num_key_value_heads,
+                        head_dim=config.head_dim,
+                        input_hidden_size=config.hidden_size,
+                        attn_key=attn_key,
+                        kv_key=kv_key,
+                        pos_key=pos_key if use_rope else None,
+                    ),
+                    mlp=_mlp(config, comm_group),
+                    input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+                    post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def materialize_buffers(self) -> None:
@@ -216,7 +221,9 @@ class MiniCPMLocalAttention(ParallelAttention):
         sin = self._rope.sin[:seq].unsqueeze(1)
         q, k = apply_rope(q, k, cos, sin)
         out = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
             enable_gqa=self.num_heads != self.num_kv_heads,
         )
         out = out.transpose(1, 2).reshape(rows * seq, self.num_heads * self.head_dim)
@@ -231,23 +238,25 @@ class MiniCPMLocalTransformer(nn.Module):
         comm_group = CommGroup.trivial()
         self.config = config
         self.rope = RopeTable(config, max_len)
-        self.layers = nn.ModuleList([
-            DecoderLayer(
-                self_attn=MiniCPMLocalAttention(
-                    rope=self.rope,
-                    comm_group=comm_group,
-                    hidden_size=config.num_attention_heads * config.head_dim,
-                    num_heads=config.num_attention_heads,
-                    num_kv_heads=config.num_key_value_heads,
-                    head_dim=config.head_dim,
-                    input_hidden_size=config.hidden_size,
-                ),
-                mlp=_mlp(config, comm_group),
-                input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
-                post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
-            )
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                DecoderLayer(
+                    self_attn=MiniCPMLocalAttention(
+                        rope=self.rope,
+                        comm_group=comm_group,
+                        hidden_size=config.num_attention_heads * config.head_dim,
+                        num_heads=config.num_attention_heads,
+                        num_kv_heads=config.num_key_value_heads,
+                        head_dim=config.head_dim,
+                        input_hidden_size=config.hidden_size,
+                    ),
+                    mlp=_mlp(config, comm_group),
+                    input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+                    post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def materialize_buffers(self) -> None:

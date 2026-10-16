@@ -74,8 +74,14 @@ class CausalEncoderBlock(nn.Module):
             CausalResidualUnit(input_dim, dilation=3, groups=groups),
             CausalResidualUnit(input_dim, dilation=9, groups=groups),
             Snake1d(input_dim),
-            CausalConv1d(input_dim, output_dim, kernel_size=2 * stride, stride=stride,
-                         padding=math.ceil(stride / 2), output_padding=stride % 2),
+            CausalConv1d(
+                input_dim,
+                output_dim,
+                kernel_size=2 * stride,
+                stride=stride,
+                padding=math.ceil(stride / 2),
+                output_padding=stride % 2,
+            ),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -103,8 +109,14 @@ class CausalDecoderBlock(nn.Module):
         self.input_channels = input_dim
         self.block = nn.Sequential(
             Snake1d(input_dim),
-            CausalTransposeConv1d(input_dim, output_dim, kernel_size=2 * stride, stride=stride,
-                                  padding=math.ceil(stride / 2), output_padding=stride % 2),
+            CausalTransposeConv1d(
+                input_dim,
+                output_dim,
+                kernel_size=2 * stride,
+                stride=stride,
+                padding=math.ceil(stride / 2),
+                output_padding=stride % 2,
+            ),
             CausalResidualUnit(output_dim, dilation=1, groups=groups),
             CausalResidualUnit(output_dim, dilation=3, groups=groups),
             CausalResidualUnit(output_dim, dilation=9, groups=groups),
@@ -139,18 +151,23 @@ class CausalDecoder(nn.Module):
             layers = [CausalConv1d(latent, channels, kernel_size=7, padding=3)]
         for i, stride in enumerate(config.decoder_rates):
             input_dim, output_dim = channels // 2**i, channels // 2 ** (i + 1)
-            layers.append(CausalDecoderBlock(input_dim, output_dim, stride,
-                                             groups=output_dim if config.depthwise else 1))
+            layers.append(
+                CausalDecoderBlock(input_dim, output_dim, stride, groups=output_dim if config.depthwise else 1)
+            )
         layers += [Snake1d(output_dim), CausalConv1d(output_dim, 1, kernel_size=7, padding=3), nn.Tanh()]
         self.model = nn.ModuleList(layers)
         buckets = len(config.sr_bin_boundaries) + 1
         self.register_buffer(
-            "sr_bin_boundaries", torch.tensor(config.sr_bin_boundaries, dtype=torch.int32), persistent=True,
+            "sr_bin_boundaries",
+            torch.tensor(config.sr_bin_boundaries, dtype=torch.int32),
+            persistent=True,
         )
-        self.sr_cond_model = nn.ModuleList([
-            SampleRateCondition(layer.input_channels, buckets) if isinstance(layer, CausalDecoderBlock) else None
-            for layer in layers
-        ])
+        self.sr_cond_model = nn.ModuleList(
+            [
+                SampleRateCondition(layer.input_channels, buckets) if isinstance(layer, CausalDecoderBlock) else None
+                for layer in layers
+            ]
+        )
 
     def forward(self, z: torch.Tensor, sr_index: torch.Tensor) -> torch.Tensor:
         x = z
@@ -237,9 +254,7 @@ def decoder_receptive_field_frames(decoder: CausalDecoder) -> int:
     the modules modelled in ``_earliest_input`` (20 frames for VoxCPM2). The
     sample-rate conditioning is per channel, so it adds nothing.
     """
-    upsample = math.prod(
-        layer.block[1].stride[0] for layer in decoder.model if isinstance(layer, CausalDecoderBlock)
-    )
+    upsample = math.prod(layer.block[1].stride[0] for layer in decoder.model if isinstance(layer, CausalDecoderBlock))
     frame = 10_000
     index = frame * upsample
     for module in reversed(list(decoder.model)):

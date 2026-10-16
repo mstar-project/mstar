@@ -79,7 +79,8 @@ def _resolve_metadata(repo_id: str, cache_dir: str | None) -> str:
     from huggingface_hub import snapshot_download
 
     return snapshot_download(
-        repo_id=repo_id, cache_dir=cache_dir,
+        repo_id=repo_id,
+        cache_dir=cache_dir,
         allow_patterns=["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"],
     )
 
@@ -181,8 +182,9 @@ class VoxCPM2Model(Model):
                 name="Talker",
                 input_names=input_names,
                 outputs=[
-                    GraphEdge(next_node="Talker", name="latent_patch") if loop else
-                    GraphEdge(next_node=EMPTY_DESTINATION, name="latent_patch", persist=True),
+                    GraphEdge(next_node="Talker", name="latent_patch")
+                    if loop
+                    else GraphEdge(next_node=EMPTY_DESTINATION, name="latent_patch", persist=True),
                     StreamingGraphEdge(next_node="VAEDecoder", name=STREAM_EDGE, target_partition="VAEDecoder"),
                 ],
             )
@@ -194,9 +196,12 @@ class VoxCPM2Model(Model):
         )
         return {
             "talker_prefill": talker(list(self.PREFILL_INPUTS), loop=False),
-            "talker_prefill_clone": Sequential([
-                ref_encoder, talker([*self.PREFILL_INPUTS, "ref_patches"], loop=False),
-            ]),
+            "talker_prefill_clone": Sequential(
+                [
+                    ref_encoder,
+                    talker([*self.PREFILL_INPUTS, "ref_patches"], loop=False),
+                ]
+            ),
             "talker_decode": Loop(
                 name="talker_decode_loop",
                 section=talker(["latent_patch"], loop=True),
@@ -219,7 +224,10 @@ class VoxCPM2Model(Model):
                 producer_partitions=[],
             ),
             PartitionDefinition(
-                name="VAEDecoder", graph_walks={"vae_chunk"}, initial_walk=None, producer_partitions=["Talker"],
+                name="VAEDecoder",
+                graph_walks={"vae_chunk"},
+                initial_walk=None,
+                producer_partitions=["Talker"],
             ),
         ]
 
@@ -227,14 +235,18 @@ class VoxCPM2Model(Model):
         schedule, chunk, context = self.stream_schedule, self.stream_chunk_patches, self.stream_left_context
         return PartitionTopology(
             partitions=["Talker", "VAEDecoder"],
-            connections=[Connection(
-                from_partition="Talker",
-                to_partition="VAEDecoder",
-                edge_name=STREAM_EDGE,
-                chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
-                    schedule=schedule, chunk=chunk, left_context=context,
-                ),
-            )],
+            connections=[
+                Connection(
+                    from_partition="Talker",
+                    to_partition="VAEDecoder",
+                    edge_name=STREAM_EDGE,
+                    chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
+                        schedule=schedule,
+                        chunk=chunk,
+                        left_context=context,
+                    ),
+                )
+            ],
         )
 
     # -- API preprocessing ----------------------------------------------------
@@ -253,7 +265,8 @@ class VoxCPM2Model(Model):
 
             audio = soxr.resample(audio, sample_rate, rate, quality="HQ")
         return TensorAndMetadata(
-            data=torch.from_numpy(audio).to(device), metadata={"sample_rate": rate, "num_channels": 1},
+            data=torch.from_numpy(audio).to(device),
+            metadata={"sample_rate": rate, "num_channels": 1},
         )
 
     def _check_reference_seconds(self, seconds: float) -> None:
@@ -307,7 +320,10 @@ class VoxCPM2Model(Model):
             raise ValueError("VoxCPM2 cfg_value must be non-negative")
         min_len = self._number(kwargs, "min_len", self.config.min_len, int)
         max_len = self._number(
-            kwargs, "max_new_tokens", kwargs.get("max_len", self.config.max_len), int,
+            kwargs,
+            "max_new_tokens",
+            kwargs.get("max_len", self.config.max_len),
+            int,
         )
         if min_len < 0 or not 1 <= max_len <= self.config.max_len:
             raise ValueError(f"VoxCPM2 needs min_len >= 0 and 1 <= max_new_tokens <= {self.config.max_len}")
@@ -366,8 +382,10 @@ class VoxCPM2Model(Model):
             clone = "audio" in input_modalities
             walk = "talker_prefill_clone" if clone else "talker_prefill"
             metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities, output_modalities=output_modalities,
-                graph_walk=walk, is_prefill=True,
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                graph_walk=walk,
+                is_prefill=True,
             )
             routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
             if clone:
@@ -387,8 +405,10 @@ class VoxCPM2Model(Model):
             lead = int(model_kwargs.get(STREAM_LEAD_KEY, 0))
             return ForwardPassArgs(
                 full_metadata=CurrentForwardConductorMetadata(
-                    input_modalities=input_modalities, output_modalities=output_modalities,
-                    graph_walk="vae_chunk", is_prefill=False,
+                    input_modalities=input_modalities,
+                    output_modalities=output_modalities,
+                    graph_walk="vae_chunk",
+                    is_prefill=False,
                 ),
                 inputs=[],
                 unpersist_tensors=[],
@@ -412,11 +432,16 @@ class VoxCPM2Model(Model):
                 edge = GraphEdge(next_node="Talker", name="latent_patch")
                 edge.tensor_info = persist_signals.get("latent_patch", [])
                 return ForwardPassArgs(
-                    full_metadata=partition_metadata, inputs=[edge], unpersist_tensors=list(edge.tensor_info),
+                    full_metadata=partition_metadata,
+                    inputs=[edge],
+                    unpersist_tensors=list(edge.tensor_info),
                 )
             if partition_metadata.graph_walk == "talker_decode":
                 return ForwardPassArgs(
-                    full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True,
+                    full_metadata=partition_metadata,
+                    inputs=[],
+                    unpersist_tensors=[],
+                    request_done=True,
                 )
             raise ValueError(f"Talker entered an unexpected graph walk: {partition_metadata.graph_walk!r}")
         if partition_name == "VAEDecoder":
@@ -460,8 +485,12 @@ class VoxCPM2Model(Model):
         return self.local_dir
 
     def get_submodule(
-        self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        self,
+        node_name: str,
+        device: str = "cpu",
+        tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+        sp_group=None,
     ) -> NodeSubmodule | None:
         del sp_group
         if node_name not in ("Talker", "RefEncoder", "VAEDecoder"):
@@ -473,7 +502,8 @@ class VoxCPM2Model(Model):
             if node_name == "Talker":
                 submodule = submodules.TalkerSubmodule(
                     load_generator(self.config, checkpoint, device, autocast_dtype or torch.bfloat16, tp_group),
-                    self.config, self.inference_timesteps,
+                    self.config,
+                    self.inference_timesteps,
                 )
             elif node_name == "RefEncoder":
                 submodule = submodules.RefEncoderSubmodule(load_audio_vae(self.config, checkpoint, device), self.config)

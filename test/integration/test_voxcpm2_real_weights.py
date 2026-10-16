@@ -102,8 +102,9 @@ def test_vae_stream_equals_a_whole_decode(model, design):
     patches = design["patches"][:14].double()
     node = _vae_node(model, torch.float64)
     policy = model.get_partition_topology().connections[0].chunk_policy_factory()
-    short = ScheduledLeftContextChunkPolicy(schedule=model.stream_schedule, chunk=model.stream_chunk_patches,
-                                            left_context=model.stream_left_context - 1)
+    short = ScheduledLeftContextChunkPolicy(
+        schedule=model.stream_schedule, chunk=model.stream_chunk_patches, left_context=model.stream_left_context - 1
+    )
     with torch.no_grad():
         whole = node.vae.decode(patches.reshape(-1, 64).t().unsqueeze(0))[0]
         streamed = torch.cat(stream_through(node, patches, policy))
@@ -123,8 +124,13 @@ def test_teacher_forced_fp32_steps_match_the_reference(model, prompts, design, m
     from test.voxcpm2.fake_resources import bind_dense_resources
 
     # mstar::rms_norm runs fp32 inputs in bf16 on CUDA
-    monkeypatch.setattr(norm, "run_rms_norm", lambda x, weight, eps=1e-6, rms_norm_dtype=None:
-                        x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight)
+    monkeypatch.setattr(
+        norm,
+        "run_rms_norm",
+        lambda x, weight, eps=1e-6, rms_norm_dtype=None: (
+            x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+        ),
+    )
     case = prompts["design"]
     device = torch.device("cuda")
     tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -143,16 +149,22 @@ def test_teacher_forced_fp32_steps_match_the_reference(model, prompts, design, m
             reset()
             plan([tokens.numel()])
             patch, stop = generator.prefill(
-                tokens, torch.ones_like(tokens, dtype=torch.bool), empty, tokens.new_zeros(0),
-                torch.tensor([tokens.numel() - 1], device=device), torch.zeros(1, 4, 64, device=device),
-                torch.randn((1, 64, 4), generator=noise, device=device), cfg, t_span,
+                tokens,
+                torch.ones_like(tokens, dtype=torch.bool),
+                empty,
+                tokens.new_zeros(0),
+                torch.tensor([tokens.numel() - 1], device=device),
+                torch.zeros(1, 4, 64, device=device),
+                torch.randn((1, 64, 4), generator=noise, device=device),
+                cfg,
+                t_span,
             )
             preds.append(patch[0])
             stops.append(int(stop.argmax(-1)))
             for k in range(1, forced.shape[0]):
                 plan([1])
                 step_noise = torch.randn((1, 64, 4), generator=noise, device=device)
-                patch, stop = generator.decode_step(forced[k - 1:k], step_noise, cfg, t_span)
+                patch, stop = generator.decode_step(forced[k - 1 : k], step_noise, cfg, t_span)
                 preds.append(patch[0])
                 stops.append(int(stop.argmax(-1)))
     finally:

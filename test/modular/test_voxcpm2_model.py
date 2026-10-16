@@ -48,41 +48,81 @@ from test.voxcpm2.streaming import stream_through
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "voxcpm2.yaml"
 FACTORS = [1.0 + 0.25 * i for i in range(8)]
-FP64_ROUNDING = 1e-13   # float64 streams differ from a whole decode by up to about 6e-15 on some CPUs, 0 on others
+FP64_ROUNDING = 1e-13  # float64 streams differ from a whole decode by up to about 6e-15 on some CPUs, 0 on others
 TINY = {
     "architecture": "voxcpm2",
     "lm_config": {
-        "bos_token_id": 1, "eos_token_id": 2, "hidden_size": 64, "intermediate_size": 96,
-        "max_position_embeddings": 512, "num_attention_heads": 4, "num_hidden_layers": 2,
-        "num_key_value_heads": 2, "rms_norm_eps": 1e-5, "rope_theta": 10000, "kv_channels": 16,
-        "rope_scaling": {"type": "longrope", "long_factor": FACTORS, "short_factor": FACTORS,
-                         "original_max_position_embeddings": 512},
-        "vocab_size": 128, "use_mup": False, "scale_emb": 12, "dim_model_base": 256, "scale_depth": 1.4,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "hidden_size": 64,
+        "intermediate_size": 96,
+        "max_position_embeddings": 512,
+        "num_attention_heads": 4,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10000,
+        "kv_channels": 16,
+        "rope_scaling": {
+            "type": "longrope",
+            "long_factor": FACTORS,
+            "short_factor": FACTORS,
+            "original_max_position_embeddings": 512,
+        },
+        "vocab_size": 128,
+        "use_mup": False,
+        "scale_emb": 12,
+        "dim_model_base": 256,
+        "scale_depth": 1.4,
     },
-    "patch_size": 4, "feat_dim": 8, "scalar_quantization_latent_dim": 16, "scalar_quantization_scale": 9,
-    "residual_lm_num_layers": 1, "residual_lm_no_rope": True,
+    "patch_size": 4,
+    "feat_dim": 8,
+    "scalar_quantization_latent_dim": 16,
+    "scalar_quantization_scale": 9,
+    "residual_lm_num_layers": 1,
+    "residual_lm_no_rope": True,
     "encoder_config": {"hidden_dim": 32, "ffn_dim": 48, "num_heads": 4, "num_layers": 1, "kv_channels": 16},
     "dit_config": {"hidden_dim": 32, "ffn_dim": 48, "num_heads": 4, "num_layers": 1, "kv_channels": 16},
     # The published geometry (REAL_VAE) upsamples 1920x; a 64x decoder keeps the
     # CPU stream tests fast. Both are checked for their receptive field.
-    "audio_vae_config": {"encoder_dim": 8, "encoder_rates": [2, 5, 8, 8], "latent_dim": 8,
-                         "decoder_dim": 64, "decoder_rates": [2, 2, 2, 2, 2, 2],
-                         "sr_bin_boundaries": [20000, 30000, 40000], "sample_rate": 16000,
-                         "out_sample_rate": 48000},
+    "audio_vae_config": {
+        "encoder_dim": 8,
+        "encoder_rates": [2, 5, 8, 8],
+        "latent_dim": 8,
+        "decoder_dim": 64,
+        "decoder_rates": [2, 2, 2, 2, 2, 2],
+        "sr_bin_boundaries": [20000, 30000, 40000],
+        "sample_rate": 16000,
+        "out_sample_rate": 48000,
+    },
     "max_length": 512,
 }
 
 
-REAL_VAE = {"encoder_dim": 128, "encoder_rates": [2, 5, 8, 8], "latent_dim": 64, "decoder_dim": 2048,
-            "decoder_rates": [8, 6, 5, 2, 2, 2], "sr_bin_boundaries": [20000, 30000, 40000],
-            "sample_rate": 16000, "out_sample_rate": 48000}
+REAL_VAE = {
+    "encoder_dim": 128,
+    "encoder_rates": [2, 5, 8, 8],
+    "latent_dim": 64,
+    "decoder_dim": 2048,
+    "decoder_rates": [8, 6, 5, 2, 2, 2],
+    "sr_bin_boundaries": [20000, 30000, 40000],
+    "sample_rate": 16000,
+    "out_sample_rate": 48000,
+}
 
 
 class _Tokenizer:
     """Whitespace words and CJK runs; '你好' is one vocabulary token, as in the checkpoint."""
 
-    vocab = {"\u2581hello": 10, "\u2581world": 11, "\u2581你好": 12, "你好": 16, "你": 13, "好": 14,
-             "\u2581(warm)hello": 15}
+    vocab = {
+        "\u2581hello": 10,
+        "\u2581world": 11,
+        "\u2581你好": 12,
+        "你好": 16,
+        "你": 13,
+        "好": 14,
+        "\u2581(warm)hello": 15,
+    }
 
     def tokenize(self, text):
         return ["\u2581" + word for word in text.split()]
@@ -232,36 +272,41 @@ def test_process_prompt_builds_each_reference_mode(model):
     assert zero["gen_params"][0].tolist() == [1.5]
 
     design = model.process_prompt("hello", ["text"], ["audio"], instructions="warm")
-    assert design["text_inputs"][0].tolist() == [15, AUDIO_START_TOKEN]   # "(warm)hello"
+    assert design["text_inputs"][0].tolist() == [15, AUDIO_START_TOKEN]  # "(warm)hello"
 
     cjk = model.process_prompt("你好", ["text"], ["audio"])
-    assert cjk["text_inputs"][0].tolist() == [13, 14, AUDIO_START_TOKEN]   # split like the reference
+    assert cjk["text_inputs"][0].tolist() == [13, 14, AUDIO_START_TOKEN]  # split like the reference
 
-    clip = torch.zeros(16000)   # 1 s: 7 patches of 2560 samples
+    clip = torch.zeros(16000)  # 1 s: 7 patches of 2560 samples
     ref = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
     assert ref["prompt_layout"][0][0] == MODE_REFERENCE
-    cont = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]},
-                                ref_text="world ")
+    cont = model.process_prompt(
+        "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="world "
+    )
     tensors, metadata = cont
-    assert tensors["text_inputs"][0].tolist() == [11, 10, AUDIO_START_TOKEN]   # transcript first
+    assert tensors["text_inputs"][0].tolist() == [11, 10, AUDIO_START_TOKEN]  # transcript first
     # transcript and target are tokenized as one string, with no separator added, as the reference does
-    joined, _ = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]},
-                                     ref_text="world")
-    assert joined["text_inputs"][0].tolist() == [3, AUDIO_START_TOKEN]   # "worldhello"
+    joined, _ = model.process_prompt(
+        "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="world"
+    )
+    assert joined["text_inputs"][0].tolist() == [3, AUDIO_START_TOKEN]  # "worldhello"
     # max patches follow the target text only
     assert tensors["prompt_layout"][0].tolist() == [MODE_REF_CONTINUATION, 16, 2]
     assert metadata == {STREAM_LEAD_KEY: 3}
 
 
-@pytest.mark.parametrize("kwargs, inputs, message", [
-    ({"ref_text": "x"}, None, "ref_text needs"),
-    ({"cfg_value": -1}, None, "non-negative"),
-    ({"cfg_value": float("nan")}, None, "finite"),
-    ({"inference_timesteps": 4}, None, "deployment setting"),
-    ({"max_new_tokens": 0}, None, "max_new_tokens"),
-    ({}, [torch.zeros(1000)], "between"),
-    ({}, [torch.zeros(16000), torch.zeros(16000)], "exactly one"),
-])
+@pytest.mark.parametrize(
+    "kwargs, inputs, message",
+    [
+        ({"ref_text": "x"}, None, "ref_text needs"),
+        ({"cfg_value": -1}, None, "non-negative"),
+        ({"cfg_value": float("nan")}, None, "finite"),
+        ({"inference_timesteps": 4}, None, "deployment setting"),
+        ({"max_new_tokens": 0}, None, "max_new_tokens"),
+        ({}, [torch.zeros(1000)], "between"),
+        ({}, [torch.zeros(16000), torch.zeros(16000)], "exactly one"),
+    ],
+)
 def test_process_prompt_rejects_bad_requests(model, kwargs, inputs, message):
     modalities = ["text", "audio"] if inputs else ["text"]
     tensors = {"audio_inputs": inputs} if inputs else None
@@ -270,7 +315,7 @@ def test_process_prompt_rejects_bad_requests(model, kwargs, inputs, message):
 
 
 def test_process_prompt_rejects_prompts_past_the_context(model):
-    long_text = " ".join(["hello"] * 80)   # 80 tokens + 490 patches > 512 positions
+    long_text = " ".join(["hello"] * 80)  # 80 tokens + 490 patches > 512 positions
     with pytest.raises(ValueError, match="context"):
         model.process_prompt(long_text, ["text"], ["audio"])
 
@@ -294,8 +339,9 @@ def test_initial_args_route_reference_audio_and_stream_lead(model):
     routes = sorted((edge.next_node, edge.name) for edge in talker.inputs)
     assert ("RefEncoder", "audio_inputs") in routes and ("RefEncoder", "prompt_layout") in routes
     assert ("Talker", "gen_params") in routes
-    vae = model.get_initial_forward_pass_args("VAEDecoder", ["text", "audio"], ["audio"], {},
-                                              model_kwargs={STREAM_LEAD_KEY: 3})
+    vae = model.get_initial_forward_pass_args(
+        "VAEDecoder", ["text", "audio"], ["audio"], {}, model_kwargs={STREAM_LEAD_KEY: 3}
+    )
     assert vae.stream_lead_items == {STREAM_EDGE: 3}
     plain = model.get_initial_forward_pass_args("Talker", ["text"], ["audio"], signals)
     assert plain.full_metadata.graph_walk == "talker_prefill"
@@ -333,16 +379,18 @@ def _talker(model, timesteps: int = 4):
 def _run(talker, plan, requests: dict, steps: int):
     """Prefill every request together, then ``steps - 1`` batched decode steps."""
     rids = list(requests)
-    infos = {rid: SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed)
-             for rid, (_, seed) in requests.items()}
+    infos = {
+        rid: SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed) for rid, (_, seed) in requests.items()
+    }
     engine = SimpleNamespace(request_ids=rids)
     prepared = [talker.prepare_inputs("talker_prefill", infos[rid], requests[rid][0]) for rid in rids]
     plan([p.input_seq_len for p in prepared])
     out = talker.forward_batched("talker_prefill", engine, **talker.preprocess("talker_prefill", engine, prepared))
     patches = {rid: [out[rid]["latent_patch"][0]] for rid in rids}
     for _ in range(steps - 1):
-        prepared = [talker.prepare_inputs("talker_decode", infos[rid], {"latent_patch": [patches[rid][-1]]})
-                    for rid in rids]
+        prepared = [
+            talker.prepare_inputs("talker_decode", infos[rid], {"latent_patch": [patches[rid][-1]]}) for rid in rids
+        ]
         plan([1] * len(rids))
         out = talker.forward_batched("talker_decode", engine, **talker.preprocess("talker_decode", engine, prepared))
         for rid in rids:
@@ -371,8 +419,9 @@ def test_talker_batches_like_single_requests_and_follows_the_seed(model):
 def test_talker_clone_prefill_streams_the_prompt_tail_as_context(model):
     talker, plan, _ = _talker(model)
     clip = torch.zeros(16000)
-    request, _ = model.process_prompt("hello", ["text", "audio"], ["audio"],
-                                      tensors={"audio_inputs": [clip]}, ref_text="world ")
+    request, _ = model.process_prompt(
+        "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="world "
+    )
     ref = torch.randn(2, 7, 4, 8)
     info = SimpleNamespace(rid_handle="c", request_id="c", random_seed=1)
     prepared = talker.prepare_inputs("talker_prefill_clone", info, {**request, "ref_patches": [ref]})
@@ -381,8 +430,9 @@ def test_talker_clone_prefill_streams_the_prompt_tail_as_context(model):
     plan([prepared.input_seq_len])
     engine = SimpleNamespace(request_ids=["c"])
     with torch.inference_mode():
-        out = talker.forward_batched("talker_prefill_clone", engine,
-                                     **talker.preprocess("talker_prefill_clone", engine, [prepared]))["c"]
+        out = talker.forward_batched(
+            "talker_prefill_clone", engine, **talker.preprocess("talker_prefill_clone", engine, [prepared])
+        )["c"]
     stream = out[STREAM_EDGE]
     assert len(stream) == 4 and all(torch.equal(s, r) for s, r in zip(stream[:3], ref[1][-3:], strict=True))
     assert torch.equal(stream[3], out["latent_patch"][0])
@@ -399,10 +449,10 @@ def test_talker_stops_like_the_reference_loop(model):
         talker.postprocess("r", None, outputs)
         return talker.check_stop("r", None, outputs)
 
-    assert [step(1) for _ in range(3)] == [set(), set(), set()]   # i = 0, 1, 2: not past min_len 2
-    assert step(1) == {TALKER_LOOP}                                # i = 3
+    assert [step(1) for _ in range(3)] == [set(), set(), set()]  # i = 0, 1, 2: not past min_len 2
+    assert step(1) == {TALKER_LOOP}  # i = 3
     talker.request_state("r").add("generated", 0)
-    assert [step(0) for _ in range(6)][-2:] == [set(), {TALKER_LOOP}]   # budget of 6 patches
+    assert [step(0) for _ in range(6)][-2:] == [set(), {TALKER_LOOP}]  # budget of 6 patches
 
 
 def test_talker_vetoes_steps_past_the_patch_budget(model):
@@ -420,7 +470,7 @@ def test_talker_noise_is_drawn_once_per_step(model):
     state = talker.request_state("n")
     state.add_all(generator=torch.Generator().manual_seed(4), noise={}, drawn=0)
     first, second = talker._noise(state, 0), talker._noise(state, 1)
-    assert talker._noise(state, 1) is second   # a re-prepared step reuses its draw
+    assert talker._noise(state, 1) is second  # a re-prepared step reuses its draw
     expected = torch.Generator().manual_seed(4)
     torch.testing.assert_close(first, torch.randn((1, 8, 4), generator=expected)[0])
     torch.testing.assert_close(second, torch.randn((1, 8, 4), generator=expected)[0])
@@ -433,7 +483,10 @@ def test_talker_declares_the_same_span_in_both_caches(model):
     assert [(s.request_id, s.span) for s in step.segments] == [("a", 1), ("b", 1)]
     (graph,) = talker.get_cuda_graph_configs(torch.device("cpu"))
     assert graph.capture_graph_walk == "talker_decode" and set(graph.single_request_inputs.tensor_inputs) == {
-        "prev_patch", "noise", "cfg"}
+        "prev_patch",
+        "noise",
+        "cfg",
+    }
 
 
 # -- VAE stream -------------------------------------------------------------------
@@ -470,7 +523,7 @@ def test_stream_context_below_the_receptive_field_changes_the_audio(model):
         whole = vae_node.vae.decode(patches.reshape(-1, config.feat_dim).t().unsqueeze(0))[0]
     assert streamed.numel() == whole.numel()
     # float64 windows with the full context match to rounding, so a larger difference is the missing context
-    assert (streamed - whole).abs().max() > 100 * FP64_ROUNDING   # about 8e-11 with these weights
+    assert (streamed - whole).abs().max() > 100 * FP64_ROUNDING  # about 8e-11 with these weights
 
 
 def test_streamed_continuation_skips_the_prompt_lead(model):
@@ -485,7 +538,7 @@ def test_streamed_continuation_skips_the_prompt_lead(model):
         streamed = torch.cat(stream_through(vae_node, patches, policy, lead=lead))
         whole = vae_node.vae.decode(torch.cat([lead, patches]).reshape(-1, 8).t().unsqueeze(0))[0]
     _assert_unsaturated(whole)
-    assert (streamed - whole[3 * config.patch_samples:]).abs().max() <= FP64_ROUNDING
+    assert (streamed - whole[3 * config.patch_samples :]).abs().max() <= FP64_ROUNDING
 
 
 def test_vae_batches_windows_of_different_widths(model):
@@ -494,17 +547,22 @@ def test_vae_batches_windows_of_different_widths(model):
     info = SimpleNamespace(rid_handle="x", request_id="x")
     windows = {"a": (torch.randn(1, 4, 8, dtype=torch.float64), 0), "b": (torch.randn(6, 4, 8, dtype=torch.float64), 2)}
     prepared = {
-        rid: vae_node.prepare_inputs("vae_chunk", info, {STREAM_EDGE: [w]}, input_metadata=InputMetadata(
-            stream_chunks={STREAM_EDGE: SimpleNamespace(context_items=ctx)}))
+        rid: vae_node.prepare_inputs(
+            "vae_chunk",
+            info,
+            {STREAM_EDGE: [w]},
+            input_metadata=InputMetadata(stream_chunks={STREAM_EDGE: SimpleNamespace(context_items=ctx)}),
+        )
         for rid, (w, ctx) in windows.items()
     }
     engine = SimpleNamespace(request_ids=list(windows))
     with torch.no_grad():
-        out = vae_node.forward_batched("vae_chunk", engine,
-                                       **vae_node.preprocess("vae_chunk", engine, list(prepared.values())))
+        out = vae_node.forward_batched(
+            "vae_chunk", engine, **vae_node.preprocess("vae_chunk", engine, list(prepared.values()))
+        )
         for rid, (w, ctx) in windows.items():
             vae_node.postprocess(rid, None, out[rid], inputs=prepared[rid])
-            alone = vae_node.vae.decode(w.reshape(-1, 8).t().unsqueeze(0))[0][ctx * config.patch_samples:]
+            alone = vae_node.vae.decode(w.reshape(-1, 8).t().unsqueeze(0))[0][ctx * config.patch_samples :]
             _assert_unsaturated(alone)
             assert (out[rid]["audio_chunk"][0] - alone).abs().max() <= FP64_ROUNDING
 
@@ -514,15 +572,17 @@ def test_vae_batches_windows_of_different_widths(model):
 
 def test_adapter_maps_voice_design_and_cloning(tmp_path):
     adapter = adapters.VoxCPM2Adapter()
-    req = SpeechRequest(model="voxcpm2", input="hello", voice="alloy", speed=1.2, seed=7,
-                        instructions="a calm voice", cfg_value=2.5)
+    req = SpeechRequest(
+        model="voxcpm2", input="hello", voice="alloy", speed=1.2, seed=7, instructions="a calm voice", cfg_value=2.5
+    )
     sa = adapter.speech_to_request(req, tmp_path)
     assert sa.input_modalities == ["text"] and sa.output_modalities == ["audio"]
     assert sa.model_kwargs == {"instruct": "a calm voice", "seed": 7, "cfg_value": 2.5}
 
     data_url = "data:audio/wav;base64," + base64.b64encode(_wav_bytes()).decode()
     clone = adapter.speech_to_request(
-        SpeechRequest(model="voxcpm2", input="hi", ref_audio=data_url, ref_text="words"), tmp_path,
+        SpeechRequest(model="voxcpm2", input="hi", ref_audio=data_url, ref_text="words"),
+        tmp_path,
     )
     assert clone.input_modalities == ["text", "audio"] and "ref_audio" not in clone.model_kwargs
     assert Path(clone.file_paths["audio"][0]).is_file() and clone.model_kwargs["ref_text"] == "words"
@@ -553,11 +613,22 @@ def media_dirs(tmp_path):
     return uploads, secret
 
 
-@pytest.mark.parametrize("ref", [
-    "{secret}/voice.wav", "{uploads}/stored.wav", "{uploads}/link.wav", "{uploads}/../secret/voice.wav",
-    "secret/voice.wav", "file://{secret}/voice.wav", "{secret}/missing.wav", "/etc/passwd", "//etc/passwd",
-    "secret", "ftp://example.com/voice.wav",
-])
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "{secret}/voice.wav",
+        "{uploads}/stored.wav",
+        "{uploads}/link.wav",
+        "{uploads}/../secret/voice.wav",
+        "secret/voice.wav",
+        "file://{secret}/voice.wav",
+        "{secret}/missing.wav",
+        "/etc/passwd",
+        "//etc/passwd",
+        "secret",
+        "ftp://example.com/voice.wav",
+    ],
+)
 def test_adapter_refuses_every_server_path(media_dirs, ref):
     """#411: no plain path, not even a stored upload, and every refusal reads the same."""
     uploads, secret = media_dirs

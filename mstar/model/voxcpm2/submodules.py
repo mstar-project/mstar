@@ -66,7 +66,9 @@ PREFILL_WALKS = ("talker_prefill", "talker_prefill_clone")
 
 
 def build_prompt(
-    text_ids: torch.Tensor, mode: int, ref_patches: torch.Tensor | None,
+    text_ids: torch.Tensor,
+    mode: int,
+    ref_patches: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The prefill layout of ``_generate_with_prompt_cache`` for one request.
 
@@ -85,8 +87,12 @@ def build_prompt(
         raise ValueError("VoxCPM2 voice cloning needs the reference clip's latents")
     ref = ref_patches[0]
     n_ref = ref.shape[0]
-    pieces = [text_ids.new_tensor([REF_AUDIO_START_TOKEN]), text_ids.new_zeros(n_ref),
-              text_ids.new_tensor([REF_AUDIO_END_TOKEN]), text_ids]
+    pieces = [
+        text_ids.new_tensor([REF_AUDIO_START_TOKEN]),
+        text_ids.new_zeros(n_ref),
+        text_ids.new_tensor([REF_AUDIO_END_TOKEN]),
+        text_ids,
+    ]
     audio = [ref]
     audio_pos = [torch.arange(1, 1 + n_ref, device=device)]
     if mode == MODE_REF_CONTINUATION:
@@ -129,8 +135,9 @@ class RefEncoderSubmodule(NodeSubmodule):
         self.config = config
         self._cache: OrderedDict[tuple[str, int], torch.Tensor] = OrderedDict()
 
-    def prepare_inputs(self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
-                       inputs: NameToTensorList, **kwargs: Any) -> NodeInputs:
+    def prepare_inputs(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs: Any
+    ) -> NodeInputs:
         del graph_walk, fwd_info, kwargs
         clip = inputs["audio_inputs"][0].to(device=self.get_device(), dtype=torch.float32).reshape(-1)
         mode = int(inputs["prompt_layout"][0][0].item())
@@ -147,8 +154,15 @@ class RefEncoderSubmodule(NodeSubmodule):
             encodings.append(latents.view(feat, -1, patch).permute(1, 2, 0))
         return torch.stack(encodings)
 
-    def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, clip: torch.Tensor,
-                mode: int = MODE_REFERENCE, key: tuple | None = None, **kwargs: Any) -> NameToTensorList:
+    def forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        clip: torch.Tensor,
+        mode: int = MODE_REFERENCE,
+        key: tuple | None = None,
+        **kwargs: Any,
+    ) -> NameToTensorList:
         del graph_walk, engine_inputs, kwargs
         if key in self._cache:
             self._cache.move_to_end(key)
@@ -211,7 +225,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         while drawn <= step:
             draws[drawn] = torch.randn(
                 (1, self.config.feat_dim, self.config.patch_size),
-                generator=state["generator"], device=self.get_device(), dtype=self._dtype(),
+                generator=state["generator"],
+                device=self.get_device(),
+                dtype=self._dtype(),
             )[0]
             drawn += 1
         state.add("drawn", drawn)
@@ -221,8 +237,9 @@ class TalkerSubmodule(ARNodeSubmodule):
 
     # -- prepare / preprocess ----------------------------------------------
 
-    def prepare_inputs(self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
-                       inputs: NameToTensorList, **kwargs: Any) -> ARNodeInputs | None:
+    def prepare_inputs(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs: Any
+    ) -> ARNodeInputs | None:
         del kwargs
         device = self.get_device()
         state = self.request_state(fwd_info.rid_handle)
@@ -237,21 +254,39 @@ class TalkerSubmodule(ARNodeSubmodule):
             generator.manual_seed(int(fwd_info.random_seed))
             # The last position conditions the first patch: zeros after text,
             # the last prompt patch in continuation mode.
-            cond = (ref[1][-1] if mode == MODE_REF_CONTINUATION else
-                    torch.zeros(self.config.patch_size, self.config.feat_dim, device=device, dtype=self._dtype()))
-            state.add_all(generator=generator, noise={}, drawn=0, step=0, generated=0,
-                          max_patches=max_patches, min_len=min_len, cfg=params[:1].clone())
+            cond = (
+                ref[1][-1]
+                if mode == MODE_REF_CONTINUATION
+                else torch.zeros(self.config.patch_size, self.config.feat_dim, device=device, dtype=self._dtype())
+            )
+            state.add_all(
+                generator=generator,
+                noise={},
+                drawn=0,
+                step=0,
+                generated=0,
+                max_patches=max_patches,
+                min_len=min_len,
+                cfg=params[:1].clone(),
+            )
             if audio is None:
                 audio = torch.zeros(0, self.config.patch_size, self.config.feat_dim, device=device, dtype=self._dtype())
             return ARNodeInputs(
                 input_ids=token_ids,
                 input_seq_len=token_ids.shape[0],
                 tensor_inputs={
-                    "text_mask": text_mask, "audio_patches": audio, "audio_pos": audio_pos,
-                    "cond_patch": cond, "noise": self._noise(state, 0), "cfg": state["cfg"],
+                    "text_mask": text_mask,
+                    "audio_patches": audio,
+                    "audio_pos": audio_pos,
+                    "cond_patch": cond,
+                    "noise": self._noise(state, 0),
+                    "cfg": state["cfg"],
                 },
-                kwargs={"prompt_patches": ref[1][-self.config.prompt_context_patches:]
-                        if mode == MODE_REF_CONTINUATION else None},
+                kwargs={
+                    "prompt_patches": ref[1][-self.config.prompt_context_patches :]
+                    if mode == MODE_REF_CONTINUATION
+                    else None
+                },
             )
         if graph_walk != "talker_decode":
             raise ValueError(f"Unknown VoxCPM2 Talker walk: {graph_walk!r}")
@@ -275,11 +310,11 @@ class TalkerSubmodule(ARNodeSubmodule):
             self._decode_rows = torch.arange(self.MAX_BATCH_SIZE, device=self.get_device())
         return self._decode_rows[:batch_size]
 
-    def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
-                   inputs: list[ARNodeInputs]) -> dict[str, Any]:
+    def preprocess(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]
+    ) -> dict[str, Any]:
         del engine_inputs
-        stack = {name: torch.stack([item.tensor_inputs[name] for item in inputs])
-                 for name in ("noise", "cfg")}
+        stack = {name: torch.stack([item.tensor_inputs[name] for item in inputs]) for name in ("noise", "cfg")}
         stack["cfg"] = stack["cfg"].reshape(-1)
         if graph_walk == "talker_decode":
             stack["prev_patch"] = torch.stack([item.tensor_inputs["prev_patch"] for item in inputs])
@@ -297,9 +332,15 @@ class TalkerSubmodule(ARNodeSubmodule):
         )
         return stack
 
-    def declare_step(self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs],
-                     slot_lease: SlotLease | None = None,
-                     piecewise_leases: Mapping[str, SlotLease] | None = None, **kwargs) -> SubmoduleStep:
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
+    ) -> SubmoduleStep:
         """One causal step over the packed batch, the same span in both LMs."""
         del graph_walk, slot_lease, piecewise_leases, kwargs
         return SubmoduleStep(
@@ -324,8 +365,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         prefill.pop("prompt_patches", None)
         return self.model.prefill(noise=noise, cfg_value=cfg, t_span=self.t_span(), **prefill)
 
-    def _outputs(self, graph_walk: str, patch: torch.Tensor, stop: torch.Tensor,
-                 prompt_patches: torch.Tensor | None) -> NameToTensorList:
+    def _outputs(
+        self, graph_walk: str, patch: torch.Tensor, stop: torch.Tensor, prompt_patches: torch.Tensor | None
+    ) -> NameToTensorList:
         stream = [patch]
         if graph_walk == "talker_prefill_clone" and prompt_patches is not None:
             # A continuation's VAE stream leads with the tail of the prompt
@@ -339,25 +381,32 @@ class TalkerSubmodule(ARNodeSubmodule):
         stop = stop_logits.argmax(dim=-1)
         return self._outputs(graph_walk, patch[0], stop[0:1], prompt[0] if prompt else None)
 
-    def forward_batched(self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
-                        **kwargs: Any) -> dict[str, NameToTensorList]:
+    def forward_batched(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs: Any
+    ) -> dict[str, NameToTensorList]:
         prompt = kwargs.get("prompt_patches") or [None] * len(engine_inputs.request_ids)
         patch, stop_logits = self._run(graph_walk, **kwargs)
         stop = stop_logits.argmax(dim=-1)
         return {
-            rid: self._outputs(graph_walk, patch[i], stop[i:i + 1], prompt[i] if i < len(prompt) else None)
+            rid: self._outputs(graph_walk, patch[i], stop[i : i + 1], prompt[i] if i < len(prompt) else None)
             for i, rid in enumerate(engine_inputs.request_ids)
         }
 
-    def postprocess(self, request_id: str, request_info: CurrentForwardPassInfo,
-                    outputs: dict[str, list[torch.Tensor]], **kwargs: Any) -> None:
+    def postprocess(
+        self,
+        request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        **kwargs: Any,
+    ) -> None:
         del request_info, kwargs
         if "stop_flag" in outputs:
             state = self.request_state(request_id)
             state.add("generated", int(state.get("generated", 0)) + 1)
 
-    def check_stop(self, request_id: str, request_info: CurrentForwardPassInfo,
-                   outputs: dict[str, list[torch.Tensor]]) -> set[str]:
+    def check_stop(
+        self, request_id: str, request_info: CurrentForwardPassInfo, outputs: dict[str, list[torch.Tensor]]
+    ) -> set[str]:
         """The reference's loop exit: the stop head fires past ``min_len``
         steps, or the request's patch budget is spent. The stopping step's
         patch is audio and has already been streamed."""
@@ -386,23 +435,28 @@ class TalkerSubmodule(ARNodeSubmodule):
         del tp_world_size
         dtype = self._dtype()
         cfg = self.config
-        return [BatchedCudaGraphConfig(
-            capture_graph_walk="talker_decode",
-            single_request_inputs=ARNodeInputs(
-                input_seq_len=1,
-                tensor_inputs={
-                    "prev_patch": torch.zeros(cfg.patch_size, cfg.feat_dim, dtype=dtype, device=device),
-                    "noise": torch.zeros(cfg.feat_dim, cfg.patch_size, dtype=dtype, device=device),
-                    "cfg": torch.full((1,), cfg.cfg_value, dtype=torch.float32, device=device),
-                },
-            ),
-            capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            compile=True,
-        )]
+        return [
+            BatchedCudaGraphConfig(
+                capture_graph_walk="talker_decode",
+                single_request_inputs=ARNodeInputs(
+                    input_seq_len=1,
+                    tensor_inputs={
+                        "prev_patch": torch.zeros(cfg.patch_size, cfg.feat_dim, dtype=dtype, device=device),
+                        "noise": torch.zeros(cfg.feat_dim, cfg.patch_size, dtype=dtype, device=device),
+                        "cfg": torch.full((1,), cfg.cfg_value, dtype=torch.float32, device=device),
+                    },
+                ),
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+                compile=True,
+            )
+        ]
 
     def can_use_cuda_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        return (batch.graph_walk == "talker_decode" and self.can_batch(batch, model_inputs)
-                and super().can_use_cuda_graphs(batch, model_inputs))
+        return (
+            batch.graph_walk == "talker_decode"
+            and self.can_batch(batch, model_inputs)
+            and super().can_use_cuda_graphs(batch, model_inputs)
+        )
 
 
 # ===========================================================================
@@ -429,8 +483,14 @@ class VAEDecoderSubmodule(ARNodeSubmodule):
         self.config = config
         self._sr_index: torch.Tensor | None = None
 
-    def prepare_inputs(self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList,
-                       input_metadata: InputMetadata = EMPTY_INPUT_METADATA, **kwargs: Any) -> ARNodeInputs:
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
+        **kwargs: Any,
+    ) -> ARNodeInputs:
         del graph_walk, kwargs
         chunk = input_metadata.stream_chunks.get("latent_patches")
         data = inputs["latent_patches"][0] if inputs.get("latent_patches") else None
@@ -449,8 +509,9 @@ class VAEDecoderSubmodule(ARNodeSubmodule):
             kwargs={"patches": num, "context": context},
         )
 
-    def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
-                   inputs: list[ARNodeInputs]) -> dict[str, torch.Tensor]:
+    def preprocess(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]
+    ) -> dict[str, torch.Tensor]:
         del graph_walk, engine_inputs
         windows = [item.tensor_inputs["latents"] for item in inputs]
         width = max(window.shape[-1] for window in windows)
@@ -463,20 +524,27 @@ class VAEDecoderSubmodule(ARNodeSubmodule):
             self._sr_index = self.vae.output_rate_index(latents.device)
         return self.vae.decode(latents, self._sr_index)
 
-    def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, latents: torch.Tensor,
-                **kwargs: Any) -> NameToTensorList:
+    def forward(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, latents: torch.Tensor, **kwargs: Any
+    ) -> NameToTensorList:
         del graph_walk, engine_inputs, kwargs
         return {"audio_chunk": [self._decode(latents)[0]]}
 
-    def forward_batched(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, latents: torch.Tensor,
-                        **kwargs: Any) -> dict[str, NameToTensorList]:
+    def forward_batched(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, latents: torch.Tensor, **kwargs: Any
+    ) -> dict[str, NameToTensorList]:
         del graph_walk, kwargs
         audio = self._decode(latents)
         return {rid: {"audio_chunk": [audio[i]]} for i, rid in enumerate(engine_inputs.request_ids)}
 
-    def postprocess(self, request_id: str, request_info: CurrentForwardPassInfo,
-                    outputs: dict[str, list[torch.Tensor]], inputs: ARNodeInputs | None = None,
-                    **kwargs: Any) -> None:
+    def postprocess(
+        self,
+        request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        inputs: ARNodeInputs | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Keep the window's new patches only: drop the context's audio and any batch padding."""
         del request_id, request_info, kwargs
         if "audio_chunk" not in outputs:

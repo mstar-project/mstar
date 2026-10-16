@@ -1,6 +1,7 @@
 """Prefill token layout of five requests, recorded from the official ``VoxCPM2Model``
 (voxcpm cce58a5, ``_generate_with_prompt_cache``): token ids and text mask per prompt mode."""
 
+# fmt: off
 OFFICIAL_PROMPTS = {'en': {'text': 'Hello, this is VoxCPM2 served by M star. It speaks thirty languages at forty-eight '
                 'kilohertz.',
         'instruct': '',
