@@ -12,6 +12,7 @@ mean +- std that the results files already hold.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -155,6 +156,11 @@ def agreement(results: list[RunResult], a: str | None = None, b: str | None = No
             raise SystemExit(f"agreement needs two judges' labels; this run has {names}"
                              + (f", skipped: {skipped}" if skipped else ""))
         a, b = names[:2]
+    for name in (a, b):
+        same = {json.dumps(_judge_identity(r, name), sort_keys=True) for r in results}
+        if len(same) > 1:
+            raise SystemExit(f"judge {name!r} is a different model, revision or decoding across these files; "
+                             "pool only results labeled by the same judge")
     rows = [row | {"_repeat": rep.index} for r in results for rep in r.repeats for row in rep.requests]
     xs, ys = valid_label_pairs(rows, a, b)
     out: dict[str, Any] = {"a": a, "b": b, "pairs": len(rows), **stats.label_agreement(xs, ys),
@@ -168,6 +174,12 @@ def agreement(results: list[RunResult], a: str | None = None, b: str | None = No
     per_rep = [r.summary.get(f"agreement.{a}.{b}.{k}") for r in results for k in ("agreement", "kappa")]
     out["per_repeat"] = {"agreement": per_rep[0::2], "kappa": per_rep[1::2]}
     return out
+
+
+def _judge_identity(r: RunResult, name: str) -> dict[str, Any] | None:
+    """What decides a judge's labels in one file (``None``: the file has no such judge)."""
+    j = next((j for j in r.config.get("suite", {}).get("judges") or [] if j["name"] == name), None)
+    return None if j is None else {k: j.get(k) for k in ("kind", "model", "revision", "root", "behavior", "skipped")}
 
 
 def render_agreement(ag: dict[str, Any]) -> str:

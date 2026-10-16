@@ -280,6 +280,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self._json({"status": "healthy"})
+        if self.path.startswith("/auth/") and self.headers.get("Authorization") != "Bearer k-123":
+            return self._json({"error": "unauthorized"}, 401)
         if self.path.endswith("/v1/models"):
             return self._json({"data": [{"id": "fake-judge", "root": "fake/judge"}]})
         self._json({}, 404)
@@ -456,6 +458,21 @@ def test_fdb_suite_end_to_end_with_two_judges_agreement_and_rejudge(tmp_path, fa
     assert not any(k.startswith(("agreement.other.qwen", "agreement.late.qwen")) for k in rep.summary)
     assert rep.config["suite"]["semantic"] is None and not any(".semantic." in k for k in rep.summary)
     assert all("semantic" not in r for rp in rep.repeats for r in rp.requests)
+    # Pooling files where one name means two different judges is refused.
+    monkeypatch.setattr(llm_judge, "resolve", lambda j: (setattr(j, "model", "other-model"), j)[1])
+    main(["rejudge", str(out / "fdb-fake-c2.json"), "--judge", f"other={fake_server}/b/v1",
+          "--out", str(tmp_path / "swapped")])
+    with pytest.raises(SystemExit, match="different model"):
+        main(["agreement", str(out), str(tmp_path / "swapped"), "--judges", "qwen,other"])
+
+
+def test_local_judge_discovery_sends_the_judge_key(fake_server, monkeypatch):
+    monkeypatch.delenv("JUDGE_API_KEY", raising=False)
+    (j,) = llm_judge.parse_judges([f"q={fake_server}/auth/v1"])
+    with pytest.raises(SystemExit, match="unreachable"):
+        llm_judge.resolve(j)
+    monkeypatch.setenv("JUDGE_API_KEY", "k-123")
+    assert llm_judge.resolve(j).model == "fake-judge"
 
 
 def test_fdb_failed_controls_leave_semantic_ungraded(tmp_path, fake_server, monkeypatch):

@@ -86,13 +86,16 @@ class Judge:
                            "enable_thinking": False if self.kind == "local" else None}
         return out
 
-    def chat(self, body: dict[str, Any]) -> dict[str, Any]:
+    def headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         key = os.environ.get(self.api_key_env) if self.api_key_env else None
         if key:
             headers["Authorization"] = f"Bearer {key}"
+        return headers
+
+    def chat(self, body: dict[str, Any]) -> dict[str, Any]:
         try:
-            return (self.post or _post)(f"{self.base_url}/chat/completions", body, headers, self.timeout_s)
+            return (self.post or _post)(f"{self.base_url}/chat/completions", body, self.headers(), self.timeout_s)
         except urllib.error.HTTPError as exc:
             # The status is enough; a body or message could echo the request headers.
             raise JudgeError(f"HTTP {exc.code}") from None
@@ -106,8 +109,8 @@ def _post(url: str, body: dict, headers: dict, timeout_s: float) -> dict:
         return json.loads(r.read())
 
 
-def _get(url: str, timeout_s: float = 30.0) -> dict:
-    with urllib.request.urlopen(url, timeout=timeout_s) as r:
+def _get(url: str, headers: dict, timeout_s: float = 30.0) -> dict:
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout_s) as r:
         return json.loads(r.read())
 
 
@@ -149,7 +152,7 @@ def resolve(judge: Judge) -> Judge:
     if judge.kind != "local" or not judge.available:
         return judge
     try:
-        models = _get(f"{judge.base_url}/models").get("data", [])
+        models = _get(f"{judge.base_url}/models", judge.headers()).get("data", [])
     except (OSError, ValueError) as exc:
         raise SystemExit(f"judge {judge.name!r}: its /models endpoint is unreachable ({type(exc).__name__})") from None
     ids = {m.get("id"): m.get("root") for m in models}
