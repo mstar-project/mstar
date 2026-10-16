@@ -24,6 +24,7 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 
 from __future__ import annotations
 
+import http.client
 import math
 import re
 from dataclasses import dataclass, field, replace
@@ -711,8 +712,8 @@ class VoxCPM2Adapter(OpenAIAdapter):
             # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
             try:
                 return media_io.resolve_media_ref(ref, upload_dir, allow_remote=False)[1]
-            except OSError as exc:  # urllib's URLError and HTTPError (a refused redirect too), timeouts
-                raise ValueError(f"could not fetch ref_audio: {exc}") from exc
+            except (OSError, http.client.HTTPException) as exc:  # urllib errors, timeouts, truncated bodies
+                raise ValueError(f"could not fetch ref_audio: {exc!r}") from exc
         path = None
         try:
             _, path = media_io.save_base64(ref, "wav", "audio", upload_dir)
@@ -720,7 +721,7 @@ class VoxCPM2Adapter(OpenAIAdapter):
 
             soundfile.info(path)
             return path
-        except Exception:  # noqa: BLE001 — not base64 audio the model can load
+        except Exception:  # noqa: BLE001 - not base64 audio the model can load
             if path:
                 Path(path).unlink(missing_ok=True)
         raise ValueError(

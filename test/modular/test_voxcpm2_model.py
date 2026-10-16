@@ -9,10 +9,12 @@ chunk policy stitch to exactly a whole decode, in length and in samples.
 from __future__ import annotations
 
 import base64
+import http.client
 import importlib.util
 import io
 import json
 import math
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -427,8 +429,10 @@ def _talker(model, timesteps: int = 4):
     return talker, plan, reset
 
 
-def _run(talker, plan, requests: dict, steps: int):
-    """Prefill every request together, then ``steps - 1`` batched decode steps."""
+def _run(talker, plan, requests: dict, steps: int, trace: dict | None = None):
+    """Prefill every request together, then ``steps - 1`` batched decode steps,
+    each postprocessed as the worker does. ``trace`` collects each decode
+    step's index and noise per request."""
     rids = list(requests)
     infos = {
         rid: SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed) for rid, (_, seed) in requests.items()
@@ -438,14 +442,19 @@ def _run(talker, plan, requests: dict, steps: int):
     plan([p.input_seq_len for p in prepared])
     out = talker.forward_batched("talker_prefill", engine, **talker.preprocess("talker_prefill", engine, prepared))
     patches = {rid: [out[rid]["latent_patch"][0]] for rid in rids}
+    for rid in rids:
+        talker.postprocess(rid, infos[rid], out[rid])
     for _ in range(steps - 1):
         prepared = [
             talker.prepare_inputs("talker_decode", infos[rid], {"latent_patch": [patches[rid][-1]]}) for rid in rids
         ]
         plan([1] * len(rids))
         out = talker.forward_batched("talker_decode", engine, **talker.preprocess("talker_decode", engine, prepared))
-        for rid in rids:
+        for rid, p in zip(rids, prepared, strict=True):
+            talker.postprocess(rid, infos[rid], out[rid])
             patches[rid].append(out[rid]["latent_patch"][0])
+            if trace is not None:
+                trace.setdefault(rid, []).append((int(p.tensor_inputs["step_index"]), p.tensor_inputs["noise"]))
     return {rid: torch.stack(p) for rid, p in patches.items()}
 
 
@@ -465,6 +474,21 @@ def test_talker_batches_like_single_requests_and_follows_the_seed(model):
     torch.testing.assert_close(together["b"], alone_b["b"], rtol=1e-4, atol=1e-5)
     assert together["a"].shape == (4, 4, 8)
     assert not torch.allclose(reseeded["a"], alone_a["a"])
+
+
+def test_talker_decode_steps_advance_the_patch_index_and_the_noise(model):
+    """Each decode step takes the next patch index and the next draw of the
+    request's seeded generator (prefill takes draw 0)."""
+    talker, plan, _ = _talker(model)
+    request = _prompt(model, "hello world", ["text"], ["audio"])
+    trace: dict = {}
+    with torch.inference_mode():
+        _run(talker, plan, {"a": (request, 5)}, steps=4, trace=trace)
+    expected = torch.Generator().manual_seed(5)
+    draws = [torch.randn((1, 8, 4), generator=expected)[0] for _ in range(4)]
+    assert [index for index, _ in trace["a"]] == [1, 2, 3]
+    for (_, noise), draw in zip(trace["a"], draws[1:], strict=True):
+        torch.testing.assert_close(noise, draw)
 
 
 def test_talker_clone_prefill_streams_the_prompt_tail_as_context(model):
@@ -720,13 +744,20 @@ def test_adapter_refuses_every_server_path(media_dirs, ref):
     assert sorted(uploads.iterdir()) == before
 
 
-def test_adapter_reports_a_failed_fetch_as_a_bad_request(tmp_path, monkeypatch):
-    """urllib refuses a redirect to ``file://`` with an HTTPError; like any
-    failed fetch it is the request's fault, not a server error."""
-    import urllib.error
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.HTTPError("http://example.test/clip.wav", 302, "redirect to file://", None, None),
+        http.client.IncompleteRead(b"RIFF", 996),
+    ],
+)
+def test_adapter_reports_a_failed_fetch_as_a_bad_request(tmp_path, monkeypatch, error):
+    """urllib refuses a redirect to ``file://`` with an HTTPError, and a body cut
+    short raises IncompleteRead; like any failed fetch they are the request's
+    fault, not a server error."""
 
     def refuse(*args, **kwargs):
-        raise urllib.error.HTTPError("http://example.test/clip.wav", 302, "redirect to file://", None, None)
+        raise error
 
     monkeypatch.setattr(adapters.media_io, "resolve_media_ref", refuse)
     request = SpeechRequest(model="voxcpm2", input="hi", ref_audio="http://example.test/clip.wav")
