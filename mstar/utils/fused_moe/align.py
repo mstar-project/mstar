@@ -75,6 +75,19 @@ def _clear_stale_build_lock(name: str) -> None:
             pass
 
 
+def _hip_ldflags() -> list[str]:
+    """ROCm installed as pip wheels keeps ``libamdhip64.so`` in its devel
+    package; torch links against the ``lib`` beside ``hipcc``, which lacks it."""
+    if torch.version.hip is None:
+        return []
+    import importlib.util
+
+    spec = importlib.util.find_spec("_rocm_sdk_devel")
+    if spec is None or spec.origin is None:
+        return []
+    return [f"-L{os.path.join(os.path.dirname(spec.origin), 'lib')}"]
+
+
 @functools.lru_cache(maxsize=1)
 def _cuda_op_available() -> bool:
     """JIT-compile and load the vendored CUDA op; return whether it worked.
@@ -89,7 +102,10 @@ def _cuda_op_available() -> bool:
         from torch.utils.cpp_extension import load
 
         _clear_stale_build_lock("_mstar_moe_C")
-        load(name="_mstar_moe_C", sources=[_CSRC], is_python_module=False, verbose=False)
+        load(
+            name="_mstar_moe_C", sources=[_CSRC], extra_ldflags=_hip_ldflags(),
+            is_python_module=False, verbose=False,
+        )
         # Touch the op so a registration failure surfaces here, not at call time.
         _ = torch.ops._mstar_moe_C.moe_align_block_size
         return True
