@@ -108,6 +108,9 @@ class VoxCPM2Model(Model):
       per VAE window, ramping up so the first audio leaves after one patch.
     * ``stream_left_context_patches``: context per window; defaults to (and
       may not be below) the decoder's receptive field.
+    * ``compile_talker`` (true): ``torch.compile`` the decode step before its
+      CUDA graphs are captured. ``false`` captures the eager step: start-up in
+      seconds instead of about ten minutes, at a lower decode rate.
     """
 
     MODES = {"zero_shot": MODE_ZERO_SHOT, "reference": MODE_REFERENCE, "continuation": MODE_REF_CONTINUATION}
@@ -140,6 +143,9 @@ class VoxCPM2Model(Model):
             raise ValueError("VoxCPM2 stream chunk sizes must be positive")
         if self.config.prompt_context_patches > self.stream_left_context:
             raise ValueError("VoxCPM2 continuation lead exceeds the stream's left context")
+        self.compile_talker = kwargs.get("compile_talker", True)
+        if not isinstance(self.compile_talker, bool):
+            raise ValueError(f"VoxCPM2 compile_talker must be true or false, got {self.compile_talker!r}")
         # The reference tokenizer: the checkpoint's Llama tokenizer, with
         # multi-character CJK tokens split into characters (``mask_multichar_chinese_tokens``).
         self.tokenizer = LlamaTokenizerFast.from_pretrained(self.local_dir)
@@ -515,6 +521,7 @@ class VoxCPM2Model(Model):
                     load_generator(self.config, checkpoint, device, autocast_dtype or torch.bfloat16, tp_group),
                     self.config,
                     self.inference_timesteps,
+                    compile_decode=self.compile_talker,
                 )
             elif node_name == "RefEncoder":
                 submodule = submodules.RefEncoderSubmodule(load_audio_vae(self.config, checkpoint, device), self.config)

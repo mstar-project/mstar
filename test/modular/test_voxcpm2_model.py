@@ -592,6 +592,19 @@ def test_talker_declares_the_same_span_in_both_caches(model):
     }
 
 
+def test_compile_talker_switch_reaches_the_decode_graph(checkpoint, monkeypatch):
+    from mstar.model.voxcpm2 import voxcpm2_model
+
+    (checkpoint / "model.safetensors").touch()
+    monkeypatch.setattr(voxcpm2_model, "load_generator", lambda config, *args: _random_generator(config))
+    for kwargs, compiled in (({}, True), ({"compile_talker": True}, True), ({"compile_talker": False}, False)):
+        model = VoxCPM2Model(model_path_hf=str(checkpoint), **kwargs)
+        (graph,) = model.get_submodule("Talker").get_cuda_graph_configs(torch.device("cpu"))
+        assert model.compile_talker is compiled and graph.compile is compiled
+    with pytest.raises(ValueError, match="compile_talker"):
+        VoxCPM2Model(model_path_hf=str(checkpoint), compile_talker="false")
+
+
 # -- VAE stream -------------------------------------------------------------------
 
 

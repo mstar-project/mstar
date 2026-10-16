@@ -212,11 +212,18 @@ class TalkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
-    def __init__(self, generator: VoxCPM2Generator, config: VoxCPM2Config, inference_timesteps: int):
+    def __init__(
+        self,
+        generator: VoxCPM2Generator,
+        config: VoxCPM2Config,
+        inference_timesteps: int,
+        compile_decode: bool = True,
+    ):
         super().__init__()
         self.model = generator
         self.config = config
         self.inference_timesteps = inference_timesteps
+        self.compile_decode = compile_decode
         self._t_span: torch.Tensor | None = None
         self._decode_rows: torch.Tensor | None = None
 
@@ -459,7 +466,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         return self.MAX_BATCH_SIZE
 
     def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
-        """Capture the whole decode step (both LMs, the 10-step CFM, the stop head)."""
+        """Capture the whole decode step (both LMs, the 10-step CFM, the stop head),
+        ``torch.compile``'d first unless the deployment set ``compile_talker: false``."""
         del tp_world_size
         dtype = self._dtype()
         cfg = self.config
@@ -476,7 +484,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                     },
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-                compile=True,
+                compile=self.compile_decode,
             )
         ]
 

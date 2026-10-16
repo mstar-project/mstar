@@ -12,3 +12,6 @@ node_groups:
   - node_names: [VAEDecoder]
     ranks: [0]
     graph_walks: [vae_chunk]
+# Constructor options (forwarded to VoxCPM2Model.__init__):
+# model_kwargs:
+#   compile_talker: false   # capture the eager decode step: up in seconds instead of ~10 min, 15-30% less throughput
