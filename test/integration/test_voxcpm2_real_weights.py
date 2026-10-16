@@ -74,6 +74,7 @@ def design() -> dict[str, torch.Tensor]:
 def test_prompts_match_the_reference_layout(model, prompts):
     """The real tokenizer (with CJK splitting) and ``build_prompt`` give the
     official prefill tokens and text mask for every prompt mode."""
+    from mstar.model.voxcpm2.config import PROMPT_MODE_KEY
     from mstar.model.voxcpm2.submodules import build_prompt
 
     for name, case in prompts.items():
@@ -83,9 +84,8 @@ def test_prompts_match_the_reference_layout(model, prompts):
             clip = torch.zeros(case["ref_patches"] * model.config.ref_patch_samples)
             tensors, modalities = {"audio_inputs": [clip]}, ["text", "audio"]
             kwargs["ref_text"] = case["ref_text"]
-        out = model.process_prompt(case["text"], modalities, ["audio"], tensors=tensors, **kwargs)
-        out = getattr(out, "new_input_tensors", out)
-        mode = int(out["prompt_layout"][0][0])
+        out, metadata = model.process_prompt(case["text"], modalities, ["audio"], tensors=tensors, **kwargs)
+        mode = metadata[PROMPT_MODE_KEY]
         ref = torch.zeros(2, case["ref_patches"], model.config.patch_size, model.config.feat_dim)
         tokens, text_mask, _, _ = build_prompt(out["text_inputs"][0], mode, ref if case["ref_patches"] else None)
         assert tokens.tolist() == case["tokens"], name

@@ -34,6 +34,18 @@ MODE_ZERO_SHOT = 0
 MODE_REFERENCE = 1  # ref audio isolated between ref_start/ref_end tokens
 MODE_REF_CONTINUATION = 2  # the reference prefix, then text + its audio to continue
 
+# Request facts settled while tokenizing, which the Talker partition's nodes
+# read from ``step_metadata`` rather than off a device tensor. The conductor
+# merges step metadata into the partition's kwargs, hence model-prefixed names.
+# The patch budget also lets the conductor end a one-patch request after
+# prefill, where the loop that would stop it is absent.
+PATCH_BUDGET_KEY = "talker_patch_budget"
+PROMPT_MODE_KEY = "voxcpm2_prompt_mode"
+MIN_LEN_KEY = "voxcpm2_min_len"
+# content hash of the reference clip, the RefEncoder's memo key with the mode
+REF_DIGEST_KEY = "voxcpm2_ref_digest"
+TALKER_STEP_METADATA = (PATCH_BUDGET_KEY, PROMPT_MODE_KEY, MIN_LEN_KEY, REF_DIGEST_KEY)
+
 
 @dataclass
 class MiniCPM4Config:

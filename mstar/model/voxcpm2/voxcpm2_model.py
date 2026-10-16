@@ -25,6 +25,7 @@ Request modes (``process_prompt``), as the reference ``VoxCPM.generate``:
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from pathlib import Path
@@ -56,11 +57,16 @@ from mstar.model.voxcpm2.config import (
     BASE_ATTN,
     BASE_KV,
     BASE_POS,
+    MIN_LEN_KEY,
     MODE_REF_CONTINUATION,
     MODE_REFERENCE,
     MODE_ZERO_SHOT,
+    PATCH_BUDGET_KEY,
+    PROMPT_MODE_KEY,
+    REF_DIGEST_KEY,
     RES_ATTN,
     RES_KV,
+    TALKER_STEP_METADATA,
     VoxCPM2Config,
 )
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
@@ -69,10 +75,13 @@ from mstar.streaming.topology import Connection, PartitionTopology, StreamingGra
 STREAM_EDGE = "latent_patches"
 # model_kwargs key: prompt patches leading a continuation's VAE stream
 STREAM_LEAD_KEY = "vae_stream_lead_patches"
-# the Talker's patch budget, settled while tokenizing; the conductor ends a
-# one-patch request after prefill, where the loop that would stop it is absent
-PATCH_BUDGET_KEY = "talker_patch_budget"
 _CJK = re.compile(r"^[\u4e00-\u9fff]{2,}$")
+
+
+def reference_digest(clip: torch.Tensor) -> str:
+    """Content hash of a reference clip as the RefEncoder receives it (flat float32)."""
+    samples = clip.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+    return hashlib.blake2b(samples.numpy().tobytes(), digest_size=16).hexdigest()
 
 
 def _resolve_metadata(repo_id: str, cache_dir: str | None) -> str:
@@ -116,8 +125,8 @@ class VoxCPM2Model(Model):
     MODES = {"zero_shot": MODE_ZERO_SHOT, "reference": MODE_REFERENCE, "continuation": MODE_REF_CONTINUATION}
     REF_MIN_SECONDS = 0.5
     REF_MAX_SECONDS = 60.0
-    PREFILL_INPUTS = ("text_inputs", "prompt_layout", "gen_params")
-    REF_ENCODER_INPUTS = ("audio_inputs", "prompt_layout")
+    PREFILL_INPUTS = ("text_inputs", "gen_params")
+    REF_ENCODER_INPUTS = ("audio_inputs",)
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any) -> None:
         from transformers import LlamaTokenizerFast
@@ -312,8 +321,9 @@ class VoxCPM2Model(Model):
         tensors: NameToTensorList | None = None,
         **kwargs: Any,
     ) -> NameToTensorList | ProcessPromptOutput:
-        """Tokenize the request into ``text_inputs``, ``prompt_layout``
-        (``[mode, max_patches, min_len]``) and ``gen_params`` (``[cfg_value]``).
+        """Tokenize the request into ``text_inputs`` and ``gen_params``
+        (``[cfg_value]``); the prompt mode, patch budget, ``min_len`` and the
+        reference clip's digest go to the Talker in ``step_metadata``.
 
         Voice design: ``instruct`` (or OpenAI's ``instructions``) becomes the
         ``(description)`` prefix of the text, the reference's format.
@@ -344,6 +354,7 @@ class VoxCPM2Model(Model):
         ref_text = str(kwargs.get("ref_text") or "")
         if not ref_text.strip():
             ref_text = ""
+        digest = None
         if "audio" in input_modalities or clips:
             if len(clips) != 1:
                 raise ValueError(f"VoxCPM2 clones a voice from exactly one reference clip, got {len(clips)}")
@@ -351,6 +362,7 @@ class VoxCPM2Model(Model):
             self._check_reference_seconds(samples / self.config.audio_vae.sample_rate)
             ref_patches = math.ceil(samples / self.config.ref_patch_samples)
             mode = MODE_REF_CONTINUATION if ref_text else MODE_REFERENCE
+            digest = reference_digest(clips[0])
         else:
             if ref_text:
                 raise ValueError("VoxCPM2 ref_text needs a ref_audio clip")
@@ -371,10 +383,9 @@ class VoxCPM2Model(Model):
             )
         outputs = {
             "text_inputs": [torch.tensor(ids, dtype=torch.long)],
-            "prompt_layout": [torch.tensor([mode, max_patches, min_len], dtype=torch.long)],
             "gen_params": [torch.tensor([cfg_value], dtype=torch.float32)],
         }
-        metadata = {PATCH_BUDGET_KEY: max_patches}
+        metadata = {PATCH_BUDGET_KEY: max_patches, PROMPT_MODE_KEY: mode, MIN_LEN_KEY: min_len, REF_DIGEST_KEY: digest}
         if mode == MODE_REF_CONTINUATION:
             metadata[STREAM_LEAD_KEY] = min(self.config.prompt_context_patches, ref_patches)
         return ProcessPromptOutput(outputs, metadata)
@@ -413,6 +424,7 @@ class VoxCPM2Model(Model):
                 inputs=inputs,
                 unpersist_tensors=sum([edge.tensor_info for edge in inputs], start=[]),
                 request_done="audio" not in output_modalities,
+                step_metadata={key: model_kwargs[key] for key in TALKER_STEP_METADATA if key in model_kwargs},
             )
         if partition_name == "VAEDecoder":
             lead = int(model_kwargs.get(STREAM_LEAD_KEY, 0))

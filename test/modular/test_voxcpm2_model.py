@@ -9,6 +9,7 @@ chunk policy stitch to exactly a whole decode, in length and in samples.
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import importlib.util
 import io
@@ -31,16 +32,25 @@ from mstar.model.voxcpm2.components.minicpm import RopeTable, longrope_cos_sin
 from mstar.model.voxcpm2.components.talker import VoxCPM2Generator
 from mstar.model.voxcpm2.config import (
     AUDIO_START_TOKEN,
+    MIN_LEN_KEY,
     MODE_REF_CONTINUATION,
     MODE_REFERENCE,
     MODE_ZERO_SHOT,
+    PATCH_BUDGET_KEY,
+    PROMPT_MODE_KEY,
     REF_AUDIO_END_TOKEN,
     REF_AUDIO_START_TOKEN,
+    REF_DIGEST_KEY,
     VoxCPM2Config,
 )
-from mstar.model.voxcpm2.submodules import TALKER_LOOP, TalkerSubmodule, VAEDecoderSubmodule, build_prompt
+from mstar.model.voxcpm2.submodules import (
+    TALKER_LOOP,
+    RefEncoderSubmodule,
+    TalkerSubmodule,
+    VAEDecoderSubmodule,
+    build_prompt,
+)
 from mstar.model.voxcpm2.voxcpm2_model import (
-    PATCH_BUDGET_KEY,
     STREAM_EDGE,
     STREAM_LEAD_KEY,
     VoxCPM2Model,
@@ -287,11 +297,32 @@ def _prompt(model, *args, **kwargs) -> dict:
     return model.process_prompt(*args, **kwargs).new_input_tensors
 
 
+def _request(model, text: str, clip: torch.Tensor | None = None, **kwargs) -> tuple[dict, dict]:
+    """A request's edge tensors and the Talker partition's ``step_metadata``,
+    as the data worker and the conductor build them."""
+    modalities = ["text", "audio"] if clip is not None else ["text"]
+    tensors = {"audio_inputs": [clip]} if clip is not None else None
+    edges, metadata = model.process_prompt(text, modalities, ["audio"], tensors=tensors, **kwargs)
+    if clip is not None:
+        edges = {**edges, "audio_inputs": [clip]}
+    args = model.get_initial_forward_pass_args("Talker", modalities, ["audio"], {}, model_kwargs=metadata)
+    return edges, args.step_metadata
+
+
+def _info(rid: str, seed: int = 0, step_metadata: dict | None = None) -> SimpleNamespace:
+    return SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed, step_metadata=step_metadata or {})
+
+
+def _layout(metadata: dict) -> list:
+    return [metadata[PROMPT_MODE_KEY], metadata[PATCH_BUDGET_KEY], metadata[MIN_LEN_KEY]]
+
+
 def test_process_prompt_builds_each_reference_mode(model):
-    zero = _prompt(model, "hello  world\n", ["text"], ["audio"], seed=3, cfg_value=1.5)
+    zero, zero_meta = model.process_prompt("hello  world\n", ["text"], ["audio"], seed=3, cfg_value=1.5)
     assert zero["text_inputs"][0].tolist() == [10, 11, AUDIO_START_TOKEN]
-    assert zero["prompt_layout"][0].tolist() == [MODE_ZERO_SHOT, 2 * 6 + 10, 2]
+    assert _layout(zero_meta) == [MODE_ZERO_SHOT, 2 * 6 + 10, 2] and zero_meta[REF_DIGEST_KEY] is None
     assert zero["gen_params"][0].tolist() == [1.5]
+    assert set(zero) == {"text_inputs", "gen_params"}
 
     design = _prompt(model, "hello", ["text"], ["audio"], instructions="warm")
     assert design["text_inputs"][0].tolist() == [15, AUDIO_START_TOKEN]  # "(warm)hello"
@@ -300,8 +331,8 @@ def test_process_prompt_builds_each_reference_mode(model):
     assert cjk["text_inputs"][0].tolist() == [13, 14, AUDIO_START_TOKEN]  # split like the reference
 
     clip = torch.zeros(16000)  # 1 s: 7 patches of 2560 samples
-    ref = _prompt(model, "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
-    assert ref["prompt_layout"][0][0] == MODE_REFERENCE
+    _, ref_meta = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
+    assert ref_meta[PROMPT_MODE_KEY] == MODE_REFERENCE
     cont = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="world "
     )
@@ -313,8 +344,14 @@ def test_process_prompt_builds_each_reference_mode(model):
     )
     assert joined["text_inputs"][0].tolist() == [3, AUDIO_START_TOKEN]  # "worldhello"
     # max patches follow the target text only
-    assert tensors["prompt_layout"][0].tolist() == [MODE_REF_CONTINUATION, 16, 2]
-    assert metadata == {STREAM_LEAD_KEY: 3, PATCH_BUDGET_KEY: 16}
+    digest = hashlib.blake2b(clip.numpy().tobytes(), digest_size=16).hexdigest()
+    assert metadata == {
+        STREAM_LEAD_KEY: 3,
+        PATCH_BUDGET_KEY: 16,
+        PROMPT_MODE_KEY: MODE_REF_CONTINUATION,
+        MIN_LEN_KEY: 2,
+        REF_DIGEST_KEY: digest,
+    }
 
 
 @pytest.mark.parametrize(
@@ -330,9 +367,8 @@ def test_patch_cap_reads_the_standard_and_model_knobs_in_one_order(model, kwargs
     """``max_new_tokens``, then the standard ``max_output_tokens``, then ``max_len``,
     the same in the conductor's cap and in the prompt's patch budget."""
     assert model.get_max_output_tokens(**kwargs) == cap
-    tensors, metadata = model.process_prompt("hello world", ["text"], ["audio"], **kwargs)
-    budget = model.config.max_patches(2, cap)
-    assert tensors["prompt_layout"][0][1] == budget and metadata[PATCH_BUDGET_KEY] == budget
+    _, metadata = model.process_prompt("hello world", ["text"], ["audio"], **kwargs)
+    assert metadata[PATCH_BUDGET_KEY] == model.config.max_patches(2, cap)
 
 
 @pytest.mark.parametrize("budget, done", [(1, True), (2, False)])
@@ -386,12 +422,19 @@ def test_build_prompt_matches_the_reference_layout():
 
 
 def test_initial_args_route_reference_audio_and_stream_lead(model):
-    signals = {name: [f"ptr-{name}"] for name in ("text_inputs", "prompt_layout", "gen_params", "audio_inputs")}
-    talker = model.get_initial_forward_pass_args("Talker", ["text", "audio"], ["audio"], signals)
+    signals = {name: [f"ptr-{name}"] for name in ("text_inputs", "gen_params", "audio_inputs")}
+    _, metadata = model.process_prompt(
+        "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [torch.zeros(16000)]}
+    )
+    talker = model.get_initial_forward_pass_args(
+        "Talker", ["text", "audio"], ["audio"], signals, model_kwargs={**metadata, "unrelated": 1}
+    )
     assert talker.full_metadata.graph_walk == "talker_prefill_clone"
     routes = sorted((edge.next_node, edge.name) for edge in talker.inputs)
-    assert ("RefEncoder", "audio_inputs") in routes and ("RefEncoder", "prompt_layout") in routes
-    assert ("Talker", "gen_params") in routes
+    assert routes == [("RefEncoder", "audio_inputs"), ("Talker", "gen_params"), ("Talker", "text_inputs")]
+    # the prompt facts ride step metadata to the Talker partition's nodes
+    keys = (PATCH_BUDGET_KEY, PROMPT_MODE_KEY, MIN_LEN_KEY, REF_DIGEST_KEY)
+    assert talker.step_metadata == {key: metadata[key] for key in keys}
     vae = model.get_initial_forward_pass_args(
         "VAEDecoder", ["text", "audio"], ["audio"], {}, model_kwargs={STREAM_LEAD_KEY: 3}
     )
@@ -434,11 +477,9 @@ def _run(talker, plan, requests: dict, steps: int, trace: dict | None = None):
     each postprocessed as the worker does. ``trace`` collects each decode
     step's index and noise per request."""
     rids = list(requests)
-    infos = {
-        rid: SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed) for rid, (_, seed) in requests.items()
-    }
+    infos = {rid: _info(rid, seed, meta) for rid, ((_, meta), seed) in requests.items()}
     engine = SimpleNamespace(request_ids=rids)
-    prepared = [talker.prepare_inputs("talker_prefill", infos[rid], requests[rid][0]) for rid in rids]
+    prepared = [talker.prepare_inputs("talker_prefill", infos[rid], requests[rid][0][0]) for rid in rids]
     plan([p.input_seq_len for p in prepared])
     out = talker.forward_batched("talker_prefill", engine, **talker.preprocess("talker_prefill", engine, prepared))
     patches = {rid: [out[rid]["latent_patch"][0]] for rid in rids}
@@ -454,14 +495,14 @@ def _run(talker, plan, requests: dict, steps: int, trace: dict | None = None):
             talker.postprocess(rid, infos[rid], out[rid])
             patches[rid].append(out[rid]["latent_patch"][0])
             if trace is not None:
-                trace.setdefault(rid, []).append((int(p.tensor_inputs["step_index"]), p.tensor_inputs["noise"]))
+                trace.setdefault(rid, []).append((p.kwargs["step"], p.tensor_inputs["noise"]))
     return {rid: torch.stack(p) for rid, p in patches.items()}
 
 
 def test_talker_batches_like_single_requests_and_follows_the_seed(model):
     talker, plan, reset = _talker(model)
-    a = _prompt(model, "hello world", ["text"], ["audio"])
-    b = _prompt(model, "hello hello hello", ["text"], ["audio"], cfg_value=3.0)
+    a = _request(model, "hello world")
+    b = _request(model, "hello hello hello", cfg_value=3.0)
     with torch.inference_mode():
         together = _run(talker, plan, {"a": (a, 5), "b": (b, 9)}, steps=4)
         reset()
@@ -480,7 +521,7 @@ def test_talker_decode_steps_advance_the_patch_index_and_the_noise(model):
     """Each decode step takes the next patch index and the next draw of the
     request's seeded generator (prefill takes draw 0)."""
     talker, plan, _ = _talker(model)
-    request = _prompt(model, "hello world", ["text"], ["audio"])
+    request = _request(model, "hello world")
     trace: dict = {}
     with torch.inference_mode():
         _run(talker, plan, {"a": (request, 5)}, steps=4, trace=trace)
@@ -493,12 +534,9 @@ def test_talker_decode_steps_advance_the_patch_index_and_the_noise(model):
 
 def test_talker_clone_prefill_streams_the_prompt_tail_as_context(model):
     talker, plan, _ = _talker(model)
-    clip = torch.zeros(16000)
-    request, _ = model.process_prompt(
-        "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="world "
-    )
+    request, meta = _request(model, "hello", torch.zeros(16000), ref_text="world ")
     ref = torch.randn(2, 7, 4, 8)
-    info = SimpleNamespace(rid_handle="c", request_id="c", random_seed=1)
+    info = _info("c", 1, meta)
     prepared = talker.prepare_inputs("talker_prefill_clone", info, {**request, "ref_patches": [ref]})
     assert prepared.input_seq_len == 1 + 7 + 1 + 3 + 7
     torch.testing.assert_close(prepared.tensor_inputs["cond_patch"], ref[1][-1])
@@ -516,8 +554,8 @@ def test_talker_clone_prefill_streams_the_prompt_tail_as_context(model):
 def test_talker_stops_like_the_reference_loop(model):
     """``i > min_len and stop`` on the step that produced patch i (kept), or the patch budget."""
     talker, _, _ = _talker(model)
-    request = _prompt(model, "hello", ["text"], ["audio"], max_new_tokens=6)
-    talker.prepare_inputs("talker_prefill", SimpleNamespace(rid_handle="r", request_id="r", random_seed=0), request)
+    request, meta = _request(model, "hello", max_new_tokens=6)
+    talker.prepare_inputs("talker_prefill", _info("r", 0, meta), request)
 
     def step(flag: int, index: int) -> set[str]:
         return talker.check_stop("r", None, {"stop_flag": [torch.tensor([flag, index])]})
@@ -531,8 +569,8 @@ def test_talker_stop_judges_each_step_by_its_own_patch_index(model):
     """A speculative step postprocessed before the previous step's stop check
     moves ``generated`` on; the check still counts the patches of its own step."""
     talker, _, _ = _talker(model)
-    request = _prompt(model, "hello", ["text"], ["audio"], max_new_tokens=6)
-    talker.prepare_inputs("talker_prefill", SimpleNamespace(rid_handle="r", request_id="r", random_seed=0), request)
+    request, meta = _request(model, "hello", max_new_tokens=6)
+    talker.prepare_inputs("talker_prefill", _info("r", 0, meta), request)
     for _ in range(6):
         talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 0])]})
     assert talker.check_stop("r", None, {"stop_flag": [torch.tensor([0, 4])]}) == set()  # patch 5 of 6
@@ -541,13 +579,13 @@ def test_talker_stop_judges_each_step_by_its_own_patch_index(model):
 
 def test_talker_vetoes_steps_past_the_patch_budget(model):
     talker, _, _ = _talker(model)
-    request = _prompt(model, "hello", ["text"], ["audio"], max_new_tokens=2)
-    info = SimpleNamespace(rid_handle="r", request_id="r", random_seed=0)
+    request, meta = _request(model, "hello", max_new_tokens=2)
+    info = _info("r", 0, meta)
     talker.prepare_inputs("talker_prefill", info, request)
     talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 0])]})
     patch = torch.zeros(4, 8)
     first = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
-    assert first is not None and first.tensor_inputs["step_index"].tolist() == [1]
+    assert first is not None and first.kwargs["step"] == 1
     talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 1])]})
     assert talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]}) is None
 
@@ -556,14 +594,14 @@ def test_talker_reprepares_a_refused_step_with_the_same_index_and_noise(model):
     """A step whose admit was refused is prepared again: nothing ran, so it is
     the same patch index and the same noise draw, and the budget is not spent."""
     talker, _, _ = _talker(model)
-    request = _prompt(model, "hello", ["text"], ["audio"], max_new_tokens=2)
-    info = SimpleNamespace(rid_handle="r", request_id="r", random_seed=0)
+    request, meta = _request(model, "hello", max_new_tokens=2)
+    info = _info("r", 0, meta)
     talker.prepare_inputs("talker_prefill", info, request)
     talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 0])]})
     patch = torch.zeros(4, 8)
     refused = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
     retry = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
-    assert retry is not None and retry.tensor_inputs["step_index"].tolist() == [1]
+    assert retry is not None and retry.kwargs["step"] == 1
     assert torch.equal(retry.tensor_inputs["noise"], refused.tensor_inputs["noise"])
 
 
@@ -584,12 +622,128 @@ def test_talker_declares_the_same_span_in_both_caches(model):
     assert set(step.steps) == {"base_kv", "base_attn", "base_pos", "res_kv", "res_attn"}
     assert [(s.request_id, s.span) for s in step.segments] == [("a", 1), ("b", 1)]
     (graph,) = talker.get_cuda_graph_configs(torch.device("cpu"))
-    assert graph.capture_graph_walk == "talker_decode" and set(graph.single_request_inputs.tensor_inputs) == {
-        "prev_patch",
-        "noise",
-        "cfg",
-        "step_index",
+    assert graph.capture_graph_walk == "talker_decode"
+
+
+def _ref_encoder(model) -> RefEncoderSubmodule:
+    return RefEncoderSubmodule(_random_vae(model.config), model.config)
+
+
+def _old_digest(clip: torch.Tensor) -> str:
+    """The memo key's content hash as the RefEncoder used to take it, off the delivered clip."""
+    return hashlib.blake2b(clip.to(torch.float32).reshape(-1).cpu().numpy().tobytes(), digest_size=16).hexdigest()
+
+
+@pytest.mark.parametrize("ref_text", ["", "world "])
+def test_ref_encoder_keys_its_memo_by_clip_content_and_mode_from_step_metadata(model, ref_text):
+    """The digest ``process_prompt`` takes on the host is the hash the
+    RefEncoder took of the delivered clip, so cached encodes hit as before."""
+    clip = torch.randn(20000, generator=torch.Generator().manual_seed(1)) * 0.1
+    mode = MODE_REF_CONTINUATION if ref_text else MODE_REFERENCE
+    edges, meta = _request(model, "hello", clip, ref_text=ref_text)
+    delivered = {"audio_inputs": [clip.clone()]}  # the transport hands over a copy of the bytes
+    prepared = _ref_encoder(model).prepare_inputs("talker_prefill_clone", _info("r", 0, meta), delivered)
+    assert prepared.kwargs == {"mode": mode, "key": (_old_digest(clip), mode)}
+    assert torch.equal(prepared.tensor_inputs["clip"], clip)
+    # the same voice in the other mode is another encoding; another clip is another key
+    other_mode = _request(model, "hello", clip, ref_text="" if ref_text else "world ")[1]
+    assert other_mode[REF_DIGEST_KEY] == meta[REF_DIGEST_KEY] and other_mode[PROMPT_MODE_KEY] != mode
+    assert _request(model, "hello", clip * 0.5, ref_text=ref_text)[1][REF_DIGEST_KEY] != meta[REF_DIGEST_KEY]
+    # an encode is memoised under that key and hit by the next request with the clip
+    encoder = _ref_encoder(model)
+    with torch.inference_mode():
+        first = encoder.forward("talker_prefill_clone", None, **prepared.tensor_inputs, **prepared.kwargs)
+        again = encoder.forward("talker_prefill_clone", None, **prepared.tensor_inputs, **prepared.kwargs)
+    assert list(encoder._cache) == [(_old_digest(clip), mode)]
+    assert again["ref_patches"][0] is first["ref_patches"][0]
+
+
+def test_talker_packs_a_mixed_batch_as_the_prompt_layout_edge_did(model):
+    """Zero-shot, voice design, reference and continuation prefilled together,
+    then a decode step at different patch counts: every packed tensor equals
+    the one built from the old ``[mode, max_patches, min_len]`` edge and
+    device ``torch.tensor`` offsets, in values, dtype and shape."""
+    talker, plan, _ = _talker(model)
+    clip = torch.randn(18000, generator=torch.Generator().manual_seed(2)) * 0.1
+    requests = {
+        "zero": _request(model, "hello world"),
+        "design": _request(model, "hello hello", instructions="warm", cfg_value=3.0, min_len=1),
+        "ref": _request(model, "hello", clip, cfg_value=1.5),
+        "cont": _request(model, "world hello", clip, ref_text="hello ", max_new_tokens=7),
     }
+    expected_layouts = {
+        "zero": [MODE_ZERO_SHOT, 2 * 6 + 10, 2],
+        "design": [MODE_ZERO_SHOT, 2 * 6 + 10, 1],  # "(warm)hello hello": the description joins the first word
+        "ref": [MODE_REFERENCE, 1 * 6 + 10, 2],
+        "cont": [MODE_REF_CONTINUATION, 7, 2],
+    }
+    assert {rid: _layout(meta) for rid, (_, meta) in requests.items()} == expected_layouts
+    n_ref = math.ceil(clip.numel() / model.config.ref_patch_samples)
+    refs = {rid: torch.randn(2 if rid == "cont" else 1, n_ref, 4, 8) for rid in ("ref", "cont")}
+    rids = list(requests)
+    infos = {rid: _info(rid, i, meta) for i, (rid, (_, meta)) in enumerate(requests.items())}
+    prepared = [
+        talker.prepare_inputs(
+            "talker_prefill_clone" if rid in refs else "talker_prefill",
+            infos[rid],
+            {**edges, **({"ref_patches": [refs[rid]]} if rid in refs else {})},
+        )
+        for rid, (edges, _) in requests.items()
+    ]
+    engine = SimpleNamespace(request_ids=rids)
+    packed = talker.preprocess("talker_prefill_clone", engine, prepared)
+
+    layouts = [
+        build_prompt(edges["text_inputs"][0], expected_layouts[rid][0], refs.get(rid))
+        for rid, (edges, _) in requests.items()
+    ]
+    seq_lens = [tokens.shape[0] for tokens, *_ in layouts]
+    offsets = torch.tensor([0, *seq_lens[:-1]]).cumsum(0)
+    expected = {
+        "token_ids": torch.cat([tokens for tokens, *_ in layouts]),
+        "text_mask": torch.cat([mask for _, mask, *_ in layouts]),
+        "audio_index": torch.cat([pos + offsets[i] for i, (*_, pos) in enumerate(layouts)]),
+        "last_token_indices": torch.tensor(seq_lens).cumsum(0) - 1,
+        "step_index": torch.zeros(len(rids), dtype=torch.long),
+        "cfg": torch.tensor([2.0, 3.0, 1.5, 2.0]),
+    }
+    for name, value in expected.items():
+        got = packed[name]
+        assert got.dtype == value.dtype and got.shape == value.shape and torch.equal(got, value), name
+    assert [p is not None for p in packed["prompt_patches"]] == [False, False, False, True]
+
+    plan(seq_lens)
+    with torch.inference_mode():
+        out = talker.forward_batched("talker_prefill_clone", engine, **packed)
+    patches = {rid: out[rid]["latent_patch"][0] for rid in rids}
+    for rid in rids:
+        talker.postprocess(rid, infos[rid], out[rid])
+    talker.postprocess("design", infos["design"], out["design"])  # one row a patch ahead
+    prepared = [talker.prepare_inputs("talker_decode", infos[rid], {"latent_patch": [patches[rid]]}) for rid in rids]
+    packed = talker.preprocess("talker_decode", engine, prepared)
+    assert list(packed) == ["noise", "cfg", "step_index", "prev_patch"]
+    assert packed["step_index"].dtype == torch.long and packed["step_index"].tolist() == [1, 2, 1, 1]
+    assert torch.equal(packed["prev_patch"], torch.stack([patches[rid] for rid in rids]))
+
+
+def test_capture_dummy_inputs_keep_the_static_keys_dtypes_and_shapes(model):
+    """The decode graph's static inputs: what preprocess builds from the capture template at every bucket."""
+    talker, _, _ = _talker(model)
+    (graph,) = talker.get_cuda_graph_configs(torch.device("cpu"))
+    cfg, dtype = model.config, talker._dtype()
+    for bs in graph.capture_batch_sizes:
+        packed = talker.preprocess(
+            "talker_decode", SimpleNamespace(request_ids=list(range(bs))), graph.get_node_inputs(bs, bs)
+        )
+        expected = {
+            "noise": torch.zeros(bs, cfg.feat_dim, cfg.patch_size, dtype=dtype),
+            "cfg": torch.full((bs,), cfg.cfg_value, dtype=torch.float32),
+            "step_index": torch.ones(bs, dtype=torch.long),
+            "prev_patch": torch.zeros(bs, cfg.patch_size, cfg.feat_dim, dtype=dtype),
+        }
+        assert list(packed) == list(expected)
+        for name, value in expected.items():
+            assert packed[name].dtype == value.dtype and torch.equal(packed[name], value), (bs, name)
 
 
 def test_compile_talker_switch_reaches_the_decode_graph(checkpoint, monkeypatch):

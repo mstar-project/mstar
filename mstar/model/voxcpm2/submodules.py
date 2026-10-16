@@ -33,7 +33,7 @@
 
 from __future__ import annotations
 
-import hashlib
+import itertools
 import logging
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -62,15 +62,20 @@ from mstar.model.voxcpm2.config import (
     BASE_ATTN,
     BASE_KV,
     BASE_POS,
+    MIN_LEN_KEY,
     MODE_REF_CONTINUATION,
     MODE_REFERENCE,
     MODE_ZERO_SHOT,
+    PATCH_BUDGET_KEY,
+    PROMPT_MODE_KEY,
     REF_AUDIO_END_TOKEN,
     REF_AUDIO_START_TOKEN,
+    REF_DIGEST_KEY,
     RES_ATTN,
     RES_KV,
     VoxCPM2Config,
 )
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +140,8 @@ class RefEncoderSubmodule(NodeSubmodule):
     reference's AudioVAE. The reference pads the clip to whole patches on the
     right for the isolated reference prefix and on the left for the
     continuation prompt; ``k`` is 1 or 2 accordingly. Encodings are memoised
-    by clip content, since a voice is usually reused.
+    by clip content and mode, since a voice is usually reused; the content
+    hash is ``reference_digest``, taken in ``process_prompt`` on the host copy.
     """
 
     disable_torch_compile = True
@@ -151,11 +157,11 @@ class RefEncoderSubmodule(NodeSubmodule):
     def prepare_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs: Any
     ) -> NodeInputs:
-        del graph_walk, fwd_info, kwargs
+        del graph_walk, kwargs
+        meta = fwd_info.step_metadata
         clip = inputs["audio_inputs"][0].to(device=self.get_device(), dtype=torch.float32).reshape(-1)
-        mode = int(inputs["prompt_layout"][0][0].item())
-        digest = hashlib.blake2b(clip.cpu().numpy().tobytes(), digest_size=16).hexdigest()
-        return NodeInputs(tensor_inputs={"clip": clip}, kwargs={"mode": mode, "key": (digest, mode)})
+        mode = int(meta[PROMPT_MODE_KEY])
+        return NodeInputs(tensor_inputs={"clip": clip}, kwargs={"mode": mode, "key": (meta[REF_DIGEST_KEY], mode)})
 
     def encode(self, clip: torch.Tensor, mode: int) -> torch.Tensor:
         patch, feat = self.config.patch_size, self.config.feat_dim
@@ -225,7 +231,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         self.inference_timesteps = inference_timesteps
         self.compile_decode = compile_decode
         self._t_span: torch.Tensor | None = None
-        self._decode_rows: torch.Tensor | None = None
+        self._index_stager: PinnedStager | None = None
 
     def _dtype(self) -> torch.dtype:
         return self.model.fusion_concat_proj.weight.dtype
@@ -239,7 +245,9 @@ class TalkerSubmodule(ARNodeSubmodule):
 
     def _noise(self, state, step: int) -> torch.Tensor:
         """The ``step``-th CFM noise draw of this request, drawn in order and
-        kept until a later step is asked for."""
+        kept until a later step is asked for. One launch per row (no host
+        sync): each request has its own seeded stream, which one batched draw
+        could not reproduce."""
         draws: dict[int, torch.Tensor] = state["noise"]
         drawn = int(state["drawn"])
         while drawn <= step:
@@ -264,8 +272,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         device = self.get_device()
         state = self.request_state(fwd_info.rid_handle)
         if graph_walk in PREFILL_WALKS:
-            layout = [int(v) for v in inputs["prompt_layout"][0].tolist()]
-            mode, max_patches, min_len = layout[0], layout[1], layout[2]
+            meta = fwd_info.step_metadata
+            mode, max_patches, min_len = (int(meta[k]) for k in (PROMPT_MODE_KEY, PATCH_BUDGET_KEY, MIN_LEN_KEY))
             params = inputs["gen_params"][0].to(device=device, dtype=torch.float32).reshape(-1)
             text_ids = inputs["text_inputs"][0].to(device=device, dtype=torch.long).reshape(-1)
             ref = inputs["ref_patches"][0].to(device=device, dtype=self._dtype()) if "ref_patches" in inputs else None
@@ -300,12 +308,12 @@ class TalkerSubmodule(ARNodeSubmodule):
                     "cond_patch": cond,
                     "noise": self._noise(state, 0),
                     "cfg": state["cfg"],
-                    "step_index": torch.zeros(1, dtype=torch.long, device=device),
                 },
                 kwargs={
+                    "step": 0,
                     "prompt_patches": ref[1][-self.config.prompt_context_patches :]
                     if mode == MODE_REF_CONTINUATION
-                    else None
+                    else None,
                 },
             )
         if graph_walk != "talker_decode":
@@ -323,35 +331,40 @@ class TalkerSubmodule(ARNodeSubmodule):
                 "prev_patch": prev.reshape(self.config.patch_size, self.config.feat_dim),
                 "noise": self._noise(state, step),
                 "cfg": state["cfg"],
-                "step_index": torch.full((1,), step, dtype=torch.long, device=device),
             },
+            kwargs={"step": step},
         )
 
-    def _decode_row_indices(self, batch_size: int) -> torch.Tensor:
-        if self._decode_rows is None:
-            self._decode_rows = torch.arange(self.MAX_BATCH_SIZE, device=self.get_device())
-        return self._decode_rows[:batch_size]
+    def _to_device(self, values: list[int]) -> torch.Tensor:
+        """Host ints as a device long tensor, in one non-blocking copy from pinned memory."""
+        if self._index_stager is None:
+            self._index_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
+        out = torch.empty(len(values), dtype=torch.long, device=self.get_device())
+        self._index_stager.copy_(out, values)
+        return out
 
     def preprocess(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]
     ) -> dict[str, Any]:
         del engine_inputs
         stack = {
-            name: torch.stack([item.tensor_inputs[name] for item in inputs]) for name in ("noise", "cfg", "step_index")
+            "noise": torch.stack([item.tensor_inputs["noise"] for item in inputs]),
+            "cfg": torch.stack([item.tensor_inputs["cfg"] for item in inputs]).reshape(-1),
+            "step_index": self._to_device([item.kwargs["step"] for item in inputs]),
         }
-        stack["cfg"] = stack["cfg"].reshape(-1)
-        stack["step_index"] = stack["step_index"].reshape(-1)
         if graph_walk == "talker_decode":
             stack["prev_patch"] = torch.stack([item.tensor_inputs["prev_patch"] for item in inputs])
             return stack
-        seq_lens = [item.input_seq_len for item in inputs]
-        offsets = torch.tensor([0, *seq_lens[:-1]], device=self.get_device()).cumsum(0)
+        ends = list(itertools.accumulate(item.input_seq_len for item in inputs))
+        starts = [0, *ends[:-1]]
         stack.update(
             token_ids=torch.cat([item.input_ids for item in inputs]),
             text_mask=torch.cat([item.tensor_inputs["text_mask"] for item in inputs]),
             audio_patches=torch.cat([item.tensor_inputs["audio_patches"] for item in inputs]),
-            audio_index=torch.cat([item.tensor_inputs["audio_pos"] + offsets[i] for i, item in enumerate(inputs)]),
-            last_token_indices=torch.tensor(seq_lens, device=self.get_device()).cumsum(0) - 1,
+            audio_index=torch.cat(
+                [item.tensor_inputs["audio_pos"] + start for start, item in zip(starts, inputs, strict=True)]
+            ),
+            last_token_indices=self._to_device([end - 1 for end in ends]),
             cond_patch=torch.stack([item.tensor_inputs["cond_patch"] for item in inputs]),
             prompt_patches=[item.kwargs.get("prompt_patches") for item in inputs],
         )
@@ -480,8 +493,8 @@ class TalkerSubmodule(ARNodeSubmodule):
                         "prev_patch": torch.zeros(cfg.patch_size, cfg.feat_dim, dtype=dtype, device=device),
                         "noise": torch.zeros(cfg.feat_dim, cfg.patch_size, dtype=dtype, device=device),
                         "cfg": torch.full((1,), cfg.cfg_value, dtype=torch.float32, device=device),
-                        "step_index": torch.ones(1, dtype=torch.long, device=device),
                     },
+                    kwargs={"step": 1},
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile=self.compile_decode,
