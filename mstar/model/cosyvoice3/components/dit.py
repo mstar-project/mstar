@@ -209,8 +209,19 @@ class DiT(nn.Module):
         self.transformer_blocks = nn.ModuleList([DiTBlock(config) for _ in range(config.depth)])
         self.norm_out = AdaLayerNormZeroFinal(config.dim)
         self.proj_out = nn.Linear(config.dim, config.mel_dim)
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, config.dim_head, 2).float() / config.dim_head))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("inv_freq", self._inv_freq(torch.device("cpu")), persistent=False)
+
+    def _inv_freq(self, device: torch.device) -> torch.Tensor:
+        dim_head = self.config.dim_head
+        return 1.0 / (10000 ** (torch.arange(0, dim_head, 2, device=device).float() / dim_head))
+
+    def _apply(self, fn, recurse=True):
+        # a half-precision estimator keeps float32 rotary frequencies: rounded ones
+        # shift late positions' phases by up to a radian
+        super()._apply(fn, recurse)
+        if self.inv_freq.dtype in (torch.bfloat16, torch.float16):
+            self.inv_freq = self._inv_freq(self.inv_freq.device)
+        return self
 
     def rotary_freqs(self, seq_len: int) -> torch.Tensor:
         """``[1, T, dim_head]``: each frequency repeated for its pair."""

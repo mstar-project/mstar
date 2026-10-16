@@ -849,8 +849,15 @@ def test_flow_estimator_is_bfloat16_unless_the_deployment_asks_for_float32(tmp_p
     monkeypatch.setattr(model, "_state_dict", lambda name: checkpoint.items())
     monkeypatch.setattr(model, "_reference_encoder", lambda device: None)
     flow = model._create_flow_submodule("cpu").flow
-    assert {p.dtype for p in flow.decoder.estimator.parameters()} == {dtype}
+    estimator = flow.decoder.estimator
+    assert {p.dtype for p in estimator.parameters()} == {dtype}
     assert {p.dtype for p in flow.input_embedding.parameters()} == {torch.float32}
+    # the rotary frequencies are not rounded with the weights
+    exact = 1.0 / (10000 ** (torch.arange(0, 16, 2).float() / 16))
+    assert estimator.inv_freq.dtype == torch.float32 and torch.equal(estimator.inv_freq, exact)
+    assert torch.equal(
+        estimator.rotary_freqs(2000), CosyVoice3Flow(model.config.flow).decoder.estimator.rotary_freqs(2000)
+    )
     with pytest.raises(ValueError, match="Unknown dtype"):
         CosyVoice3Model(model_path_hf=str(tmp_path), flow_estimator_dtype="int8")
 
