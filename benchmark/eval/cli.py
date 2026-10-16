@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import random
 import shlex
+import signal
 import sys
 from pathlib import Path
 
@@ -214,8 +215,15 @@ def cmd_data(args) -> None:
     print(f"wrote {path}")
 
 
+def _exit_on_signal(signum, frame) -> None:  # noqa: ARG001
+    # Unwind through the `with server:` block so a cancelled job never leaves GPU workers behind.
+    raise SystemExit(128 + signum)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _exit_on_signal)
     if args.command == "run":
         cmd_run(args)
     elif args.command == "report":

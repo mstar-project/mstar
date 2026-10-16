@@ -43,9 +43,11 @@ over the items, scoring each pass on its own. A results file holds one point.
   all times. ``--concurrency 1,4,16`` sweeps; each level writes its own file.
 * **Open loop** (``--mode open --rate 1,2,4``): Poisson arrivals at each rate, seeded
   (``--arrival-seed``) so every system sees the same schedule. ``--concurrency N`` caps
-  in-flight requests. Each request records how late it was dispatched
-  (``dispatch_lateness_s``); a large ``dispatch_lateness_s_p99`` means the client, not
-  the server, set the pace, and the point should not be used.
+  in-flight requests; latency is measured from the scheduled arrival, so time spent
+  waiting for a slot counts (``slot_wait_s``). Each request also records how late the
+  client was against the schedule (``arrival_lateness_s``); a large
+  ``arrival_lateness_s_p99`` means the client, not the server, set the pace, and the
+  point should not be used.
 * **Repeats**: every metric is one number per repeat (a p50 over that repeat's
   requests, a corpus WER, ...); the summary is mean +- sample std over repeats.
   Three repeats is the default and what a PR table should show.

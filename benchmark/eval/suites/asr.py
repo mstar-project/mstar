@@ -89,18 +89,22 @@ class ASRSuite(Suite):
                 if resp.status != 200:
                     return error_row(item, f"HTTP {resp.status}: {(await resp.text())[:200]}")
                 if a.stream:
-                    text, deltas = None, []
+                    text = None
                     async for raw in resp.content:
                         line = raw.decode("utf-8", "replace").strip()
                         if not line.startswith("data:") or line == "data: [DONE]":
                             continue
                         ev = json.loads(line[5:])
-                        if ev.get("type") == "transcript.text.delta":
+                        kind = ev.get("type")
+                        if kind == "error" or "error" in ev:
+                            return error_row(item, f"stream error: {str(ev.get('error', ev))[:200]}")
+                        if kind == "transcript.text.delta":
                             first = first or time.perf_counter() - t0
-                            deltas.append(ev.get("delta", ""))
-                        elif ev.get("type") == "transcript.text.done":
+                        elif kind == "transcript.text.done":
                             text = ev.get("text", "")
-                    text = "".join(deltas) if text is None else text
+                    if text is None:
+                        # Deltas alone are not a transcript: the server never said it finished.
+                        return error_row(item, "stream ended without transcript.text.done")
                 else:
                     text = (await resp.json()).get("text", "")
         except Exception as exc:  # noqa: BLE001 - every failure is an error row

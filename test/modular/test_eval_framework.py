@@ -7,7 +7,9 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import struct
+import subprocess
 import sys
 import time
 
@@ -259,6 +261,8 @@ class H(BaseHTTPRequestHandler):
             for i in range(len(req["input"].split()) * 2):
                 if "STALL" in req["input"] and i == 2:
                     time.sleep(0.3)
+                if "SLOW" in req["input"] and i == 1:
+                    time.sleep(30)
                 time.sleep(0.005)
                 self.wfile.write(tone(0.05)); self.wfile.flush()
         elif self.path == "/v1/audio/transcriptions":
@@ -289,6 +293,8 @@ class H(BaseHTTPRequestHandler):
         else:
             self.send_response(404); self.end_headers()
 
+if len(sys.argv) > 2:
+    open(sys.argv[2], "w").write(str(__import__("os").getpid()))
 ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 '''
 
@@ -317,6 +323,93 @@ def test_managed_server_lifecycle(fake_cmd):
     with pytest.raises(ServerError, match="exited with code"):
         with ManagedServer("dead", command=[sys.executable, "-c", "raise SystemExit(3)"]):
             pass
+
+
+def test_sigterm_to_the_runner_stops_the_managed_server(tmp_path, fake_cmd):
+    pidfile = tmp_path / "server.pid"
+    (tmp_path / "s.txt").write_text("SLOW one two\n")
+    runner = subprocess.Popen(
+        [sys.executable, "-m", "benchmark.eval", "run", "tts", "--serve-cmd", f"{fake_cmd} {pidfile}",
+         "--data", str(tmp_path / "s.txt"), "--repeats", "1", "--warmup", "0", "--asr-judge", "none",
+         "--out", str(tmp_path / "out")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 20
+    while not pidfile.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    time.sleep(1.0)  # the slow request is in flight
+    runner.terminate()
+    assert runner.wait(timeout=30) == 128 + 15
+    pid = int(pidfile.read_text())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    pytest.fail("managed server survived SIGTERM to the runner")
+
+
+def test_metadata_never_carries_addresses_secrets_or_home(tmp_path, monkeypatch):
+    from benchmark.eval.schema import collect_metadata, scrub_argv
+
+    home = os.path.expanduser("~")
+    monkeypatch.setattr(sys, "argv", ["eval", "run", "--url", "http://10.1.2.3:8000", "--serve-env",
+                                      "HF_TOKEN=hf_secret", "--extra=api_key=sk-1", "--serve-config", f"{home}/c.yaml"])
+    monkeypatch.setenv("MSTAR_ZMQ_TCP_HOST", "10.9.8.7")
+    meta = collect_metadata(server={"env": {"HF_TOKEN": "hf_secret"}, "url": "http://u:p@127.0.0.1:1/?k=v"})
+    r = RunResult("tts", "x", {"suite": {"extra": {"authorization": "Bearer t"}}}, meta, []).finalize()
+    text = json.dumps(r.to_dict())
+    for leaked in ("10.1.2.3", "10.9.8.7", "hf_secret", "sk-1", "Bearer t", home, "u:p@", "k=v"):
+        assert leaked not in text, leaked
+    assert scrub_argv(["--serve-env", "MSTAR_X=1"]) == ["--serve-env", "MSTAR_X=1"]
+
+
+def test_asr_stream_errors_are_error_rows():
+    from types import SimpleNamespace
+
+    from benchmark.eval.suites.asr import ASRSuite
+
+    events = {
+        "error_after_delta": ['{"type": "transcript.text.delta", "delta": "hello"}',
+                              '{"type": "error", "error": {"message": "boom", "code": 500}}'],
+        "no_done": ['{"type": "transcript.text.delta", "delta": "hello"}'],
+        "ok": ['{"type": "transcript.text.delta", "delta": "hel"}',
+               '{"type": "transcript.text.done", "text": "hello"}'],
+    }
+
+    class Resp:
+        def __init__(self, lines):
+            self.status = 200
+            self.content = self._iter(lines)
+
+        async def _iter(self, lines):
+            for line in [*lines, "[DONE]"]:
+                yield f"data: {line}\n".encode()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+    class Session:
+        def __init__(self, lines):
+            self.lines = lines
+
+        def post(self, *a, **k):
+            return Resp(self.lines)
+
+    args = SimpleNamespace(model_name="m", send_language=False, stream=True, normalizer="basic", extra=[],
+                           timeout=5.0)
+    suite = ASRSuite(args)
+    item = Item("u", text="hello", audio_path=__file__)
+    rows = {k: asyncio.run(suite.request(Session(v), "http://x", 0, item, time.perf_counter()))
+            for k, v in events.items()}
+    assert not rows["error_after_delta"]["ok"] and "boom" in rows["error_after_delta"]["error"]
+    assert not rows["no_done"]["ok"] and "transcript.text.done" in rows["no_done"]["error"]
+    assert rows["ok"]["ok"] and rows["ok"]["hyp"] == "hello" and rows["ok"]["first_text_s"] is not None
 
 
 def test_tts_suite_end_to_end(tmp_path, fake_cmd):
@@ -348,11 +441,12 @@ def test_open_loop_run_records_dispatch_lateness_and_reports(tmp_path, fake_cmd,
               "--out", str(tmp_path)])
     r = RunResult.load(tmp_path / "tts-open-rate40pers.json")
     assert r.config["load"] == {"mode": "open", "concurrency": 0, "rate": 40.0, "seed": 0}
-    assert all(row["dispatch_lateness_s"] < 0.1 for row in r.repeats[0].requests)
-    assert r.summary["dispatch_lateness_s_p99"]["n"] == 1
-    _run_cli(["report", str(tmp_path / "tts-open-rate40pers.json"), "--metrics", "ttfa_ms_p50,dispatch_lateness_s_p99"])
+    rows = r.repeats[0].requests
+    assert all(row["arrival_lateness_s"] < 0.1 and row["slot_wait_s"] < 0.05 for row in rows)
+    assert r.summary["arrival_lateness_s_p99"]["n"] == 1
+    _run_cli(["report", str(tmp_path / "tts-open-rate40pers.json"), "--metrics", "ttfa_ms_p50,arrival_lateness_s_p99"])
     out = capsys.readouterr().out
-    assert "| label | load | n | TTFA p50 (ms) | dispatch late p99 (s) |" in out and "| open | 40 req/s | 4 |" in out
+    assert "| label | load | n | TTFA p50 (ms) | arrival late p99 (s) |" in out and "| open | 40 req/s | 4 |" in out
 
 
 def test_tts_suite_records_http_errors(tmp_path, fake_cmd):

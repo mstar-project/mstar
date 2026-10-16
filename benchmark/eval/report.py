@@ -46,7 +46,8 @@ COLUMNS: dict[str, list[Col]] = {
     ],
     "extra": [
         Col("wer_utt_mean", "WER utt-mean %", 100, 2),
-        Col("dispatch_lateness_s_p99", "dispatch late p99 (s)", digits=3),
+        Col("arrival_lateness_s_p99", "arrival late p99 (s)", digits=3),
+        Col("slot_wait_s_p99", "slot wait p99 (s)", digits=3),
         Col("ttfa_ms_p99", "TTFA p99 (ms)", digits=0),
         Col("first_text_s_p50", "first text p50 (s)", digits=3),
     ],

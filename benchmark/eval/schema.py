@@ -25,6 +25,7 @@ import datetime as _dt
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
@@ -65,6 +66,8 @@ class RunResult:
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
+        # The one place everything passes before it is written: no addresses, secrets or home paths.
+        d["config"], d["meta"] = scrub(d["config"]), scrub(d["meta"])
         return {"schema": d.pop("schema"), **d}
 
     def save(self, path: str | Path) -> Path:
@@ -126,14 +129,68 @@ def validate(d: Any) -> list[str]:
 
 
 def redact_url(url: str | None) -> str | None:
-    """Keep loopback URLs; replace any other host so results never carry an address."""
+    """Loopback hosts are kept, any other host is replaced; credentials and queries are always dropped."""
     if not url:
         return url
-    parts = urlsplit(url)
-    if (parts.hostname or "") in _LOCAL_HOSTS:
-        return url
-    netloc = "remote-host" + (f":{parts.port}" if parts.port else "")
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return "<url>"
+    host = parts.hostname or ""
+    host = host if host in _LOCAL_HOSTS else "remote-host"
+    return urlunsplit((parts.scheme, host + (f":{port}" if port else ""), parts.path, "", ""))
+
+
+_SECRET = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|AUTH|CREDENTIAL|COOKIE|SESSION", re.IGNORECASE)
+_URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]+")
+_IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_URL_FLAGS = {"--url"}
+_PAIR_FLAGS = {"--serve-env", "--extra"}
+
+
+def _scrub(text: str) -> str:
+    """Home paths to ``~``, non-loopback URLs and IPv4 literals redacted."""
+    text = text.replace(os.path.expanduser("~"), "~")
+    text = _URL.sub(lambda m: redact_url(m.group(0)) or "", text)
+    return _IPV4.sub(lambda m: m.group(0) if m.group(0) in _LOCAL_HOSTS else "<ip>", text)
+
+
+def scrub_env(env: dict[str, str]) -> dict[str, str]:
+    """Environment for a results file: values of secret-looking keys are dropped."""
+    return {k: ("<redacted>" if _SECRET.search(k) else _scrub(str(v))) for k, v in sorted(env.items())}
+
+
+def scrub(obj: Any) -> Any:
+    """Recursively scrub a config or metadata tree; values under secret-looking keys are dropped."""
+    if isinstance(obj, dict):
+        return {k: ("<redacted>" if isinstance(k, str) and _SECRET.search(k) else scrub(v)) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [scrub(v) for v in obj]
+    return _scrub(obj) if isinstance(obj, str) else obj
+
+
+def _pair(kv: str) -> str:
+    k, sep, v = kv.partition("=")
+    return f"{k}{sep}{'<redacted>' if _SECRET.search(k) else _scrub(v)}"
+
+
+def scrub_argv(argv: list[str]) -> list[str]:
+    """A command line for a results file: URLs, secret env values, addresses and home paths removed."""
+    out: list[str] = []
+    for i, arg in enumerate(argv):
+        prev = argv[i - 1] if i else ""
+        flag, eq, val = arg.partition("=")
+        if prev in _PAIR_FLAGS:
+            arg = _pair(arg)
+        elif flag in _PAIR_FLAGS and eq:
+            arg = f"{flag}={_pair(val)}"
+        elif prev in _URL_FLAGS:
+            arg = redact_url(arg) or arg
+        elif flag in _URL_FLAGS and eq:
+            arg = f"{flag}={redact_url(val)}"
+        out.append(_scrub(arg))
+    return out
 
 
 def _run(cmd: list[str], cwd: str | Path | None = None) -> str | None:
@@ -210,8 +267,6 @@ def collect_metadata(repo: str | Path | None = None, server: dict[str, Any] | No
             torch_v, cuda_v = torch.__version__, torch.version.cuda
         except ImportError:
             pass
-    home = os.path.expanduser("~")
-    argv = [a.replace(home, "~") for a in sys.argv]
     return {
         "git": git_info(repo),
         "host": {
@@ -227,7 +282,7 @@ def collect_metadata(repo: str | Path | None = None, server: dict[str, Any] | No
             "mstar-ai": _version("mstar-ai"),
             "transformers": _version("transformers"),
         },
-        "env": {k: v for k, v in sorted(os.environ.items()) if k.startswith("MSTAR_")},
+        "env": scrub_env({k: v for k, v in os.environ.items() if k.startswith("MSTAR_")}),
         "server": server or {},
-        "argv": argv,
+        "argv": scrub_argv(sys.argv),
     }

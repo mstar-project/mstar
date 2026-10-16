@@ -36,13 +36,18 @@ async def measure(
     log=print,
 ) -> list[RepeatResult]:
     url = url.rstrip("/")
-    connector = aiohttp.TCPConnector(limit=max(100, spec.concurrency + 10))
+    # Uncapped open loop must not queue behind a client connection pool either.
+    uncapped = spec.mode == "open" and spec.concurrency <= 0
+    connector = aiohttp.TCPConnector(limit=0 if uncapped else max(100, spec.concurrency + 10))
     async with aiohttp.ClientSession(connector=connector, read_bufsize=2**20) as session:
         wall_start = 0.0
         planned = poisson_offsets(len(items), spec.rate, spec.seed) if spec.mode == "open" else None
         timed = False
 
         async def one(index: int, item: Item, t0: float) -> dict[str, Any]:
+            # t0 is the arrival (the latency clock); now is when the request is actually sent,
+            # later than t0 only while an open-loop cap holds it back.
+            sent = time.perf_counter()
             try:
                 row = await suite.request(session, url, index, item, t0)
             except Exception as exc:  # noqa: BLE001 - a suite bug must not hide the other rows
@@ -50,7 +55,8 @@ async def measure(
             row["start_s"] = t0 - wall_start
             if planned is not None and timed:
                 # Open loop is only open while the client keeps the schedule.
-                row["dispatch_lateness_s"] = row["start_s"] - planned[index]
+                row["arrival_lateness_s"] = row["start_s"] - planned[index]
+                row["slot_wait_s"] = sent - t0
             return row
 
         if warmup_requests:
@@ -65,7 +71,8 @@ async def measure(
             rep_dir = audio_dir / f"r{rep}" if (audio_dir is not None and keep) else None
             metrics = suite.score(items, rows, wall, rep_dir)
             if planned is not None:
-                metrics["dispatch_lateness_s_p99"] = stats.percentile([r["dispatch_lateness_s"] for r in rows], 99)
+                metrics["arrival_lateness_s_p99"] = stats.percentile([r["arrival_lateness_s"] for r in rows], 99)
+                metrics["slot_wait_s_p99"] = stats.percentile([r["slot_wait_s"] for r in rows], 99)
             out.append(RepeatResult(rep, wall, metrics, [public_row(r) for r in rows]))
             log(f"[{suite.name}] {spec.describe()} repeat {rep}: " + _brief(metrics))
     return out

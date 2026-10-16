@@ -16,7 +16,8 @@ Builders (``python -m benchmark.eval data <name> --out DIR``) download into
 the Hugging Face cache (``HF_HOME``) and write 16 kHz mono WAVs plus
 ``manifest.jsonl``. Dataset terms: LibriSpeech and FLEURS are CC BY 4.0;
 Seed-TTS-eval's test set comes from Common Voice (CC0) and DiDiSpeech, for
-research use, and its prompt archive is on Google Drive (fetched with gdown).
+research use (read from its Hugging Face mirror, or the official Google Drive
+archive with gdown).
 """
 
 from __future__ import annotations
@@ -121,27 +122,56 @@ def build_librispeech(out: Path, split: str = "test.clean", limit: int = 200) ->
     return save_manifest(items, out / "manifest.jsonl")
 
 
+# FLEURS config prefixes that are not ISO-639-1 (the judge and the server expect "zh", not "cmn").
+_FLEURS_LANG = {"cmn": "zh"}
+
+
 def build_fleurs(out: Path, lang: str = "en_us", split: str = "test", limit: int = 100) -> Path:
-    """FLEURS (``google/fleurs``) for one language config, e.g. ``en_us``, ``cmn_hans_cn``."""
-    items = []
-    (out / "audio").mkdir(parents=True, exist_ok=True)
+    """FLEURS (``google/fleurs``) for one language config, e.g. ``en_us``, ``cmn_hans_cn``.
+
+    The dataset is a TSV plus an audio tarball per language (no parquet), read
+    directly. FLEURS records each sentence once per speaker; the first take is kept.
+    ``text`` is the raw transcription (cased and punctuated), so it also works as TTS input.
+    """
+    import csv
+    import sys
+
+    from huggingface_hub import hf_hub_download
+
+    csv.field_size_limit(sys.maxsize)
+    tsv = hf_hub_download("google/fleurs", f"data/{lang}/{split}.tsv", repo_type="dataset")
+    tgz = hf_hub_download("google/fleurs", f"data/{lang}/audio/{split}.tar.gz", repo_type="dataset")
+    rows: list[list[str]] = []
     seen: set[str] = set()
-    for row in _hf_rows("google/fleurs", lang, split, limit * 3):
-        uid = str(row["id"])
-        if uid in seen:  # FLEURS repeats a sentence once per speaker; keep the first take
-            continue
-        seen.add(uid)
-        dst = out / "audio" / f"{lang}_{uid}.wav"
-        if not dst.exists():
-            _write_16k(row["audio"]["bytes"], dst)
-        items.append(Item(id=f"{lang}_{uid}", text=row["transcription"], audio_path=str(dst),
-                          lang=lang.split("_", maxsplit=1)[0], extra={"raw_text": row.get("raw_transcription")}))
-        if len(items) >= limit:
-            break
+    with open(tsv, newline="", encoding="utf-8") as f:
+        for row in csv.reader(f, delimiter="\t", quoting=csv.QUOTE_NONE):
+            if row[0] in seen:
+                continue
+            seen.add(row[0])
+            rows.append(row)
+            if len(rows) >= limit:
+                break
+    want = {r[1]: r for r in rows}
+    found: dict[str, Path] = {}
+    (out / "audio").mkdir(parents=True, exist_ok=True)
+    with tarfile.open(tgz, "r:gz") as tf:
+        for member in tf:
+            name = os.path.basename(member.name)
+            if member.isfile() and name in want and name not in found:
+                dst = out / "audio" / f"{lang}_{Path(name).stem}.wav"
+                if not dst.exists():
+                    _write_16k(tf.extractfile(member).read(), dst)
+                found[name] = dst
+                if len(found) == len(want):
+                    break
+    short = lang.split("_", maxsplit=1)[0]
+    items = [Item(id=f"{lang}_{r[0]}", text=r[2], audio_path=str(found[r[1]]), lang=_FLEURS_LANG.get(short, short),
+                  extra={"normalized_text": r[3]}) for r in rows if r[1] in found]
     return save_manifest(items, out / "manifest.jsonl")
 
 
 SEEDTTS_GDRIVE_ID = "1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP"  # from github.com/BytedanceSpeech/seed-tts-eval
+SEEDTTS_HF_MIRROR = "zhaochenyang20/seed-tts-eval"
 
 
 def parse_seedtts_meta(meta: Path, locale: str) -> list[Item]:
@@ -157,17 +187,32 @@ def parse_seedtts_meta(meta: Path, locale: str) -> list[Item]:
 
 
 def build_seedtts(out: Path, locale: str = "en", limit: int | None = None, archive: str | None = None) -> Path:
-    """Seed-TTS-eval zero-shot set (target text + reference prompt wav and transcript)."""
-    root = out / "seedtts_testset"
-    meta = root / locale / "meta.lst"
-    if not meta.exists():
-        tar_path = Path(archive) if archive else out / "seedtts_testset.tar"
-        if not tar_path.exists():
-            import gdown
+    """Seed-TTS-eval zero-shot set (target text + reference prompt wav and transcript).
 
-            out.mkdir(parents=True, exist_ok=True)
-            gdown.download(f"https://drive.google.com/uc?id={SEEDTTS_GDRIVE_ID}", str(tar_path), quiet=False)
-        with tarfile.open(tar_path) as tar:
-            tar.extractall(out, filter="data")
+    Reads the Hugging Face mirror (``zhaochenyang20/seed-tts-eval``, same layout as the
+    official archive) into the HF cache; falls back to the official Google Drive tarball
+    (or ``archive``) when the mirror is unreachable.
+    """
+    meta = None
+    if archive is None:
+        try:
+            from huggingface_hub import snapshot_download
+
+            snap = Path(snapshot_download(SEEDTTS_HF_MIRROR, repo_type="dataset", allow_patterns=[f"{locale}/*"]))
+            meta = snap / locale / "meta.lst"
+        except Exception:  # noqa: BLE001 - fall back to the official archive
+            meta = None
+    if meta is None or not meta.exists():
+        root = out / "seedtts_testset"
+        meta = root / locale / "meta.lst"
+        if not meta.exists():
+            tar_path = Path(archive) if archive else out / "seedtts_testset.tar"
+            if not tar_path.exists():
+                import gdown
+
+                out.mkdir(parents=True, exist_ok=True)
+                gdown.download(f"https://drive.google.com/uc?id={SEEDTTS_GDRIVE_ID}", str(tar_path), quiet=False)
+            with tarfile.open(tar_path) as tar:
+                tar.extractall(out, filter="data")
     items = parse_seedtts_meta(meta, locale)
     return save_manifest(items[:limit] if limit else items, out / f"manifest_{locale}.jsonl")
