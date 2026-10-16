@@ -1408,9 +1408,12 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             logger.debug("Registering %s for send", uuid)
             tensor = self.tensor_store.get_tensor(uuid)
             t0 = time.perf_counter()
+            # Mooncake rejects a 0-byte region, and a reader of an empty
+            # tensor copies nothing (see start_read_tensors), so there is
+            # nothing to pin.
             ret_value = self.transfer_engine.register_memory(
                 tensor.data_ptr(), tensor.nbytes
-            )
+            ) if tensor.nbytes else 0
             if PHASE_PERIOD:
                 phase_record(
                     "tensors.register_memory", time.perf_counter() - t0,
@@ -1440,11 +1443,12 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         if registered is None:
             registered = self.tensor_store.is_registered(uuid)
         if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP) and registered:
-            ret_value = self.transfer_engine.unregister_memory(
-                self.tensor_store.get_tensor(uuid).data_ptr()
-            )
-            if ret_value != 0:
-                raise RuntimeError("Mooncake memory unregistration failed.")
+            tensor = self.tensor_store.get_tensor(uuid)
+            # an empty tensor is marked ready without being registered
+            if tensor.nbytes:
+                ret_value = self.transfer_engine.unregister_memory(tensor.data_ptr())
+                if ret_value != 0:
+                    raise RuntimeError("Mooncake memory unregistration failed.")
         self.tensor_store.remove_tensor(uuid)
 
     def start_read_tensors(
@@ -1486,6 +1490,11 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 # +1 for graph-node usage (released by _cleanup_consumed_inputs)
                 self.tensor_store.increment_ref(info.uuid, 2
                 )
+                # Nothing to read, and Mooncake rejects a 0-byte region: the
+                # empty buffer is the whole tensor. With no reads, the edge
+                # gets no future and is ready once earlier reads are.
+                if info.nbytes == 0:
+                    continue
 
                 if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
                     self.transfer_engine.register_memory(buffer.data_ptr(), info.nbytes)
