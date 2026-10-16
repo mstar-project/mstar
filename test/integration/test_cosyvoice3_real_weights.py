@@ -43,8 +43,13 @@ def _clip(seconds: float) -> torch.Tensor:
 def test_text_tokenizer_carries_the_trained_delimiter(model):
     ids = model.tokenizer(f"{SYSTEM_PROMPT}{END_OF_PROMPT}hello")
     assert (ids == END_OF_PROMPT_ID).sum() == 1
-    out = model.process_prompt("Hello there.", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip(2.0)]},
-                               ref_text="A reference transcript.")
+    out = model.process_prompt(
+        "Hello there.",
+        ["text", "audio"],
+        ["audio"],
+        tensors={"audio_inputs": [_clip(2.0)]},
+        ref_text="A reference transcript.",
+    )
     assert (out["text_inputs"][0] == END_OF_PROMPT_ID).sum() == 1
 
 

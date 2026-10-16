@@ -161,7 +161,9 @@ class _FeedForward(nn.Module):
         super().__init__()
         inner = dim * mult
         self.ff = nn.Sequential(
-            nn.Sequential(nn.Linear(dim, inner), nn.GELU(approximate="tanh")), nn.Dropout(0.0), nn.Linear(inner, dim),
+            nn.Sequential(nn.Linear(dim, inner), nn.GELU(approximate="tanh")),
+            nn.Dropout(0.0),
+            nn.Linear(inner, dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -202,8 +204,13 @@ class DiT(nn.Module):
         return torch.stack((freqs, freqs), dim=-1).flatten(-2)[None]
 
     def forward(
-        self, x: torch.Tensor, mask: torch.Tensor, mu: torch.Tensor, t: torch.Tensor,
-        spks: torch.Tensor, cond: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mu: torch.Tensor,
+        t: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
     ) -> torch.Tensor:
         """``x, mu, cond``: ``[B, 80, T]``; ``mask``: ``[B, 1, T, T]`` attention
         mask (``chunk_attention_mask``; bool, or 0/1 in any float dtype);

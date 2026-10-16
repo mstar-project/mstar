@@ -142,8 +142,8 @@ class CausalF0Predictor(nn.Module):
 class VocoderWindow:
     """Where a call's frames sit in the utterance (all counts global)."""
 
-    start: int = 0           # first mel frame of the window
-    f0_history: int = 0      # frames before ``start`` fed to the F0 predictor only
+    start: int = 0  # first mel frame of the window
+    f0_history: int = 0  # frames before ``start`` fed to the F0 predictor only
     phase_carry: torch.Tensor | None = None  # [B, H+1] cycle sum of the frames before ``start``
 
 
@@ -158,18 +158,25 @@ class CausalHiFTGenerator(nn.Module):
         self.m_source.l_linear = nn.Linear(cfg.nb_harmonics + 1, 1)
         self.f0_predictor = CausalF0Predictor(cfg.in_channels, cfg.f0_cond_channels)
         self.conv_pre = CausalConv1d(cfg.in_channels, cfg.base_channels, cfg.conv_pre_look_right + 1, side="right")
-        self.ups = nn.ModuleList([
-            CausalUpsample(cfg.base_channels // (2 ** i), cfg.base_channels // (2 ** (i + 1)), k, u)
-            for i, (u, k) in enumerate(zip(cfg.upsample_rates, cfg.upsample_kernel_sizes, strict=True))
-        ])
+        self.ups = nn.ModuleList(
+            [
+                CausalUpsample(cfg.base_channels // (2**i), cfg.base_channels // (2 ** (i + 1)), k, u)
+                for i, (u, k) in enumerate(zip(cfg.upsample_rates, cfg.upsample_kernel_sizes, strict=True))
+            ]
+        )
         rates = [1] + list(cfg.upsample_rates[::-1][:-1])
         cum = [math.prod(rates[: i + 1]) for i in range(len(rates))][::-1]
         n_bins = cfg.istft_n_fft + 2
         self.source_downs = nn.ModuleList()
         self.source_resblocks = nn.ModuleList()
-        for i, (u, k, d) in enumerate(zip(
-            cum, cfg.source_resblock_kernel_sizes, cfg.source_resblock_dilation_sizes, strict=True,
-        )):
+        for i, (u, k, d) in enumerate(
+            zip(
+                cum,
+                cfg.source_resblock_kernel_sizes,
+                cfg.source_resblock_dilation_sizes,
+                strict=True,
+            )
+        ):
             ch = cfg.base_channels // (2 ** (i + 1))
             self.source_downs.append(CausalConv1d(n_bins, ch, 1) if u == 1 else CausalDownsample(n_bins, ch, u * 2, u))
             self.source_resblocks.append(CausalResBlock(ch, k, tuple(d)))
@@ -182,13 +189,18 @@ class CausalHiFTGenerator(nn.Module):
         window = torch.hann_window(cfg.istft_n_fft, periodic=True, dtype=torch.float64).float()
         self.register_buffer("stft_window", window, persistent=False)
         self.register_buffer(
-            "harmonics", torch.arange(1, cfg.nb_harmonics + 2, dtype=torch.float32), persistent=False,
+            "harmonics",
+            torch.arange(1, cfg.nb_harmonics + 2, dtype=torch.float32),
+            persistent=False,
         )
         # The excitation noise, by output sample; kept on the host (it is large)
         # and copied per call.
         generator = torch.Generator().manual_seed(cfg.noise_seed)
         self.source_noise = torch.rand(
-            1, int(cfg.noise_seconds * cfg.sampling_rate), cfg.nb_harmonics + 1, generator=generator,
+            1,
+            int(cfg.noise_seconds * cfg.sampling_rate),
+            cfg.nb_harmonics + 1,
+            generator=generator,
         )
 
     @property
@@ -198,7 +210,9 @@ class CausalHiFTGenerator(nn.Module):
     # -- excitation ------------------------------------------------------------
 
     def harmonic_source(
-        self, f0: torch.Tensor, window: VocoderWindow,
+        self,
+        f0: torch.Tensor,
+        window: VocoderWindow,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``f0`` ``[B, F]`` of the window's frames -> (excitation ``[B, 1, 480F]``,
         cycle sums ``[B, F, H+1]`` through each frame)."""
@@ -229,7 +243,12 @@ class CausalHiFTGenerator(nn.Module):
     def _stft(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.config
         spec = torch.stft(
-            x, cfg.istft_n_fft, cfg.istft_hop_len, cfg.istft_n_fft, window=self.stft_window, return_complex=True,
+            x,
+            cfg.istft_n_fft,
+            cfg.istft_hop_len,
+            cfg.istft_n_fft,
+            window=self.stft_window,
+            return_complex=True,
         )
         spec = torch.view_as_real(spec)
         return spec[..., 0], spec[..., 1]
@@ -270,7 +289,10 @@ class CausalHiFTGenerator(nn.Module):
 
     @torch.no_grad()
     def vocode(
-        self, mel: torch.Tensor, finalize: bool = True, window: VocoderWindow | None = None,
+        self,
+        mel: torch.Tensor,
+        finalize: bool = True,
+        window: VocoderWindow | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``mel`` ``[B, 80, history + F]`` (the window's frames after
         ``window.f0_history`` frames of F0-only history) -> (waveform from the
@@ -313,7 +335,11 @@ class StreamState:
 
 
 def stream_vocode(
-    hift: CausalHiFTGenerator, state: StreamState, new_mel: torch.Tensor, final: bool, context_frames: int,
+    hift: CausalHiFTGenerator,
+    state: StreamState,
+    new_mel: torch.Tensor,
+    final: bool,
+    context_frames: int,
 ) -> torch.Tensor:
     """Append ``new_mel`` ``[80, F]`` and return the samples that are final now
     (all of them when ``final``). ``context_frames <= 0`` re-vocodes the whole
@@ -339,7 +365,8 @@ def stream_vocode(
     if lo < 0:
         raise RuntimeError("streaming vocoder dropped mel it still needs")
     window = VocoderWindow(
-        start=start, f0_history=history,
+        start=start,
+        f0_history=history,
         phase_carry=None if state.carry is None else state.carry[None],
     )
     wav, cycles = hift.vocode(state.mel[None, :, lo:], finalize=final, window=window)

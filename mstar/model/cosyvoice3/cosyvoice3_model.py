@@ -157,7 +157,10 @@ class CosyVoice3Model(Model):
             cfg.flow_estimator_dtype = str(flow_estimator_dtype)
         if max_new_tokens_limit is not None:
             cfg.max_new_tokens_limit = _integer(
-                "max_new_tokens_limit", max_new_tokens_limit, low=1, high=cfg.max_speech_tokens,
+                "max_new_tokens_limit",
+                max_new_tokens_limit,
+                low=1,
+                high=cfg.max_speech_tokens,
             )
         if cfg.stream_hop_tokens and cfg.stream_hop_tokens % cfg.flow.chunk_tokens:
             raise ValueError(
@@ -218,13 +221,16 @@ class CosyVoice3Model(Model):
             KVSpec(resource_key=LM_KV, nodes={LM_NODE}, config=kv),
             AttentionSpec(resource_key=LM_ATTN, nodes={LM_NODE}, config=AttentionConfig(kv_cache=LM_KV)),
             PositionSpec(
-                resource_key=LM_POS, nodes={LM_NODE},
+                resource_key=LM_POS,
+                nodes={LM_NODE},
                 config=PositionConfig(kv_cache=LM_KV, rope_theta=lm.rope_theta),
             ),
         ]
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
+        self,
+        partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args, model_kwargs
         return {LM_KV: KVReqConfig(needed_labels=[LM_LABEL])}
@@ -243,8 +249,10 @@ class CosyVoice3Model(Model):
             "ras_tau": _number("ras_tau", mk.get("ras_tau", s.ras_tau), low=0.0, high=1.0),
             "ignore_eos": _flag("ignore_eos", mk.get("ignore_eos", False)),
             "n_cfm_timesteps": _integer(
-                "n_cfm_timesteps", mk.get("n_cfm_timesteps", self.config.flow.cfm.n_timesteps),
-                low=1, high=MAX_CFM_TIMESTEPS,
+                "n_cfm_timesteps",
+                mk.get("n_cfm_timesteps", self.config.flow.cfm.n_timesteps),
+                low=1,
+                high=MAX_CFM_TIMESTEPS,
             ),
         }
         if knobs["ras_window"] > self.config.sampling.ras_window and knobs["ras_window"] != 0:
@@ -276,52 +284,70 @@ class CosyVoice3Model(Model):
             StreamingGraphEdge(next_node=FLOW_NODE, name=SPEECH_TOKENS, target_partition=TOKEN2WAV_PARTITION),
         ]
         if first:
-            edges.insert(0, GraphEdge(
-                next_node=EMPTY_DESTINATION, name=SPEECH_TOKENS, conductor_new_token=True, persist=True,
-            ))
+            edges.insert(
+                0,
+                GraphEdge(
+                    next_node=EMPTY_DESTINATION,
+                    name=SPEECH_TOKENS,
+                    conductor_new_token=True,
+                    persist=True,
+                ),
+            )
         else:
             edges.insert(0, GraphEdge(next_node=LM_NODE, name=PREV_TOKEN))
         return edges
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = GraphNode(name=LM_NODE, input_names=[TEXT_INPUTS, TOKEN_LIMITS], outputs=self._lm_outputs(first=True))
-        prefill_voice = Sequential([
-            GraphNode(
-                name=SPEAKER_ENCODER_NODE, input_names=[REF_AUDIO, VOICE_KEY],
-                outputs=[GraphEdge(next_node=LM_NODE, name=PROMPT_TOKENS)],
-            ),
-            GraphNode(
-                name=LM_NODE, input_names=[TEXT_INPUTS, TOKEN_LIMITS, PROMPT_TOKENS],
-                outputs=self._lm_outputs(first=True),
-            ),
-        ])
+        prefill_voice = Sequential(
+            [
+                GraphNode(
+                    name=SPEAKER_ENCODER_NODE,
+                    input_names=[REF_AUDIO, VOICE_KEY],
+                    outputs=[GraphEdge(next_node=LM_NODE, name=PROMPT_TOKENS)],
+                ),
+                GraphNode(
+                    name=LM_NODE,
+                    input_names=[TEXT_INPUTS, TOKEN_LIMITS, PROMPT_TOKENS],
+                    outputs=self._lm_outputs(first=True),
+                ),
+            ]
+        )
         decode = Loop(
             name="decode_loop",
             section=GraphNode(name=LM_NODE, input_names=[PREV_TOKEN], outputs=self._lm_outputs(first=False)),
             max_iters=self._speech_limit,
             outputs=[],
         )
-        token2wav = Sequential([
-            GraphNode(
-                name=FLOW_NODE, input_names=[SPEECH_TOKENS, REF_AUDIO, VOICE_KEY],
-                outputs=[GraphEdge(next_node=HIFT_NODE, name=MEL), GraphEdge(next_node=HIFT_NODE, name=MEL_FINAL)],
-            ),
-            GraphNode(
-                name=HIFT_NODE, input_names=[MEL, MEL_FINAL],
-                outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=AUDIO_CHUNK, output_modality="audio")],
-            ),
-        ])
+        token2wav = Sequential(
+            [
+                GraphNode(
+                    name=FLOW_NODE,
+                    input_names=[SPEECH_TOKENS, REF_AUDIO, VOICE_KEY],
+                    outputs=[GraphEdge(next_node=HIFT_NODE, name=MEL), GraphEdge(next_node=HIFT_NODE, name=MEL_FINAL)],
+                ),
+                GraphNode(
+                    name=HIFT_NODE,
+                    input_names=[MEL, MEL_FINAL],
+                    outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=AUDIO_CHUNK, output_modality="audio")],
+                ),
+            ]
+        )
         return {"prefill": prefill, "prefill_voice": prefill_voice, "decode": decode, "token2wav": token2wav}
 
     def get_partitions(self) -> list[PartitionDefinition]:
         return [
             PartitionDefinition(
-                name=LM_PARTITION, graph_walks={"prefill", "prefill_voice", "decode"},
-                initial_walk="prefill", producer_partitions=[],
+                name=LM_PARTITION,
+                graph_walks={"prefill", "prefill_voice", "decode"},
+                initial_walk="prefill",
+                producer_partitions=[],
             ),
             PartitionDefinition(
-                name=TOKEN2WAV_PARTITION, graph_walks={"token2wav"},
-                initial_walk=None, producer_partitions=[LM_PARTITION],
+                name=TOKEN2WAV_PARTITION,
+                graph_walks={"token2wav"},
+                initial_walk=None,
+                producer_partitions=[LM_PARTITION],
             ),
         ]
 
@@ -331,16 +357,22 @@ class CosyVoice3Model(Model):
         node keeps no copy of its own and decides itself what can settle."""
         cfg = self.config
         return ScheduledLeftContextChunkPolicy(
-            schedule=(), chunk=cfg.stream_poll_tokens, left_context=self._speech_limit + 1,
+            schedule=(),
+            chunk=cfg.stream_poll_tokens,
+            left_context=self._speech_limit + 1,
         )
 
     def get_partition_topology(self) -> PartitionTopology:
         return PartitionTopology(
             partitions=[LM_PARTITION, TOKEN2WAV_PARTITION],
-            connections=[Connection(
-                from_partition=LM_PARTITION, to_partition=TOKEN2WAV_PARTITION,
-                edge_name=SPEECH_TOKENS, chunk_policy_factory=self._chunk_policy,
-            )],
+            connections=[
+                Connection(
+                    from_partition=LM_PARTITION,
+                    to_partition=TOKEN2WAV_PARTITION,
+                    edge_name=SPEECH_TOKENS,
+                    chunk_policy_factory=self._chunk_policy,
+                )
+            ],
         )
 
     # -----------------------------------------------------------------------
@@ -422,8 +454,12 @@ class CosyVoice3Model(Model):
         return "" if END_OF_PROMPT in text else f"{SYSTEM_PROMPT}{END_OF_PROMPT}"
 
     def process_prompt(
-        self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
-        tensors: NameToTensorList | None = None, **kwargs: Any,
+        self,
+        prompt: str | None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        tensors: NameToTensorList | None = None,
+        **kwargs: Any,
     ) -> NameToTensorList:
         if not prompt or not prompt.strip():
             raise ValueError("CosyVoice3 requires a non-empty text prompt")
@@ -483,8 +519,12 @@ class CosyVoice3Model(Model):
         return step
 
     def get_initial_forward_pass_args(
-        self, partition_name: str, input_modalities: list[str], output_modalities: list[str],
-        input_signals: dict[str, list[TensorPointerInfo]], model_kwargs: dict | None = None,
+        self,
+        partition_name: str,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+        model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         knobs = self.resolve_generation_kwargs(model_kwargs)
         wants_audio = "audio" in output_modalities
@@ -492,14 +532,18 @@ class CosyVoice3Model(Model):
             mode, _ = self.resolve_mode(model_kwargs, uploaded="audio" in input_modalities)
             zero_shot = mode == "zero_shot"
             metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities, output_modalities=output_modalities,
-                graph_walk="prefill_voice" if zero_shot else "prefill", is_prefill=True,
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                graph_walk="prefill_voice" if zero_shot else "prefill",
+                is_prefill=True,
                 kwargs={k: knobs[k] for k in _LM_KNOBS},
             )
             names = [TEXT_INPUTS, TOKEN_LIMITS] + ([REF_AUDIO, VOICE_KEY] if zero_shot else [])
             targets = {
-                TEXT_INPUTS: LM_NODE, TOKEN_LIMITS: LM_NODE,
-                REF_AUDIO: SPEAKER_ENCODER_NODE, VOICE_KEY: SPEAKER_ENCODER_NODE,
+                TEXT_INPUTS: LM_NODE,
+                TOKEN_LIMITS: LM_NODE,
+                REF_AUDIO: SPEAKER_ENCODER_NODE,
+                VOICE_KEY: SPEAKER_ENCODER_NODE,
             }
             inputs = []
             for name in names:
@@ -507,7 +551,8 @@ class CosyVoice3Model(Model):
                 edge.tensor_info = input_signals.get(name, [])
                 inputs.append(edge)
             return ForwardPassArgs(
-                full_metadata=metadata, inputs=inputs,
+                full_metadata=metadata,
+                inputs=inputs,
                 # the clip stays persisted for the flow node
                 unpersist_tensors=list(input_signals.get(TEXT_INPUTS, [])) + list(input_signals.get(TOKEN_LIMITS, [])),
                 request_done=not wants_audio,
@@ -515,12 +560,17 @@ class CosyVoice3Model(Model):
             )
         if partition_name == TOKEN2WAV_PARTITION:
             metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities, output_modalities=output_modalities,
-                graph_walk="token2wav", is_prefill=False, kwargs={k: knobs[k] for k in _FLOW_KNOBS},
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                graph_walk="token2wav",
+                is_prefill=False,
+                kwargs={k: knobs[k] for k in _FLOW_KNOBS},
             )
             return ForwardPassArgs(
-                full_metadata=metadata, inputs=self._voice_inputs(input_signals),
-                unpersist_tensors=[], request_done=not wants_audio,
+                full_metadata=metadata,
+                inputs=self._voice_inputs(input_signals),
+                unpersist_tensors=[],
+                request_done=not wants_audio,
                 step_metadata=self._step_metadata(metadata, _FLOW_KNOBS),
             )
         raise ValueError(f"Unknown CosyVoice3 partition {partition_name!r}")
@@ -537,7 +587,9 @@ class CosyVoice3Model(Model):
         return inputs
 
     def get_partition_forward_pass_args(
-        self, partition_name: str, partition_metadata: CurrentForwardConductorMetadata,
+        self,
+        partition_name: str,
+        partition_metadata: CurrentForwardConductorMetadata,
         persist_signals: dict[str, list[TensorPointerInfo]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
@@ -549,13 +601,17 @@ class CosyVoice3Model(Model):
                 edge = GraphEdge(next_node=LM_NODE, name=PREV_TOKEN)
                 edge.tensor_info = persist_signals.get(SPEECH_TOKENS, [])
                 return ForwardPassArgs(
-                    full_metadata=partition_metadata, inputs=[edge],
+                    full_metadata=partition_metadata,
+                    inputs=[edge],
                     unpersist_tensors=list(edge.tensor_info),
                     step_metadata=self._step_metadata(partition_metadata, _LM_KNOBS),
                 )
             if partition_metadata.graph_walk == "decode":
                 return ForwardPassArgs(
-                    full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True,
+                    full_metadata=partition_metadata,
+                    inputs=[],
+                    unpersist_tensors=[],
+                    request_done=True,
                 )
             raise ValueError(f"LM in unexpected walk {partition_metadata.graph_walk!r}")
         if partition_name == TOKEN2WAV_PARTITION:
@@ -600,8 +656,12 @@ class CosyVoice3Model(Model):
         return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
 
     def get_submodule(
-        self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        self,
+        node_name: str,
+        device: str = "cpu",
+        tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+        sp_group=None,
     ) -> NodeSubmodule | None:
         del sp_group
         if node_name in self._submodule_cache:
@@ -688,9 +748,12 @@ class CosyVoice3Model(Model):
 
 def _parse_dtype(name: str) -> torch.dtype:
     dtypes = {
-        "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
-        "float16": torch.float16, "fp16": torch.float16,
-        "float32": torch.float32, "fp32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
     }
     try:
         return dtypes[name.lower()]

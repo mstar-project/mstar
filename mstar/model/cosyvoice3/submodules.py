@@ -58,15 +58,15 @@ from mstar.model.submodule_base import (
 logger = logging.getLogger(__name__)
 
 # Edge names (kept in sync with cosyvoice3_model.py)
-TEXT_INPUTS = "text_inputs"        # prompt text + text ids
-TOKEN_LIMITS = "token_limits"      # [min, max] speech tokens for this text
-REF_AUDIO = "ref_audio"            # 24 kHz mono reference clip
-VOICE_KEY = "voice_key"            # content hash of the clip
-PROMPT_TOKENS = "prompt_tokens"    # speech tokens of the clip (LM prompt)
-SPEECH_TOKENS = "speech_tokens"    # LM output, streamed to the flow
+TEXT_INPUTS = "text_inputs"  # prompt text + text ids
+TOKEN_LIMITS = "token_limits"  # [min, max] speech tokens for this text
+REF_AUDIO = "ref_audio"  # 24 kHz mono reference clip
+VOICE_KEY = "voice_key"  # content hash of the clip
+PROMPT_TOKENS = "prompt_tokens"  # speech tokens of the clip (LM prompt)
+SPEECH_TOKENS = "speech_tokens"  # LM output, streamed to the flow
 PREV_TOKEN = "prev_token"
-MEL = "mel"                        # newly settled mel frames
-MEL_FINAL = "mel_final"            # [1] bool: the stream has ended
+MEL = "mel"  # newly settled mel frames
+MEL_FINAL = "mel_final"  # [1] bool: the stream has ended
 AUDIO_CHUNK = "audio_chunk"
 DECODE_LOOP = "decode_loop"
 
@@ -209,11 +209,14 @@ class LMSubmodule(ARNodeSubmodule):
             limits = inputs[TOKEN_LIMITS][0].reshape(-1).tolist()
             prompt = (
                 inputs[PROMPT_TOKENS][0].to(device, torch.long).reshape(-1)
-                if inputs.get(PROMPT_TOKENS) else torch.zeros(0, dtype=torch.long, device=device)
+                if inputs.get(PROMPT_TOKENS)
+                else torch.zeros(0, dtype=torch.long, device=device)
             )
             embeds = self.model.build_prefill_embeds(text_ids, prompt)
             state.add_all(
-                generated=0, min_len=int(limits[0]), max_len=int(limits[1]),
+                generated=0,
+                min_len=int(limits[0]),
+                max_len=int(limits[1]),
                 seed=int(fwd_info.random_seed) & (2**63 - 1),
                 history=torch.full((max(self.window, 1),), -1, dtype=torch.long, device=device),
             )
@@ -226,7 +229,8 @@ class LMSubmodule(ARNodeSubmodule):
         else:
             raise ValueError(f"Unknown LM walk {graph_walk!r}")
         return ARNodeInputs(
-            input_embeds=embeds, input_seq_len=embeds.shape[0],
+            input_embeds=embeds,
+            input_seq_len=embeds.shape[0],
             tensor_inputs=self._row_tensors(fwd_info, state, history),
         )
 
@@ -238,8 +242,13 @@ class LMSubmodule(ARNodeSubmodule):
         return packed
 
     def declare_step(
-        self, graph_walk, request_ids, inputs: list[ARNodeInputs],
-        slot_lease: SlotLease | None = None, piecewise_leases=None, **kwargs,
+        self,
+        graph_walk,
+        request_ids,
+        inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases=None,
+        **kwargs,
     ) -> SubmoduleStep:
         del graph_walk, slot_lease, piecewise_leases, kwargs
         return SubmoduleStep(
@@ -250,8 +259,21 @@ class LMSubmodule(ARNodeSubmodule):
             steps={LM_KV: KVStep(), LM_ATTN: AttentionStep(causal=True), LM_POS: PositionStep()},
         )
 
-    def _forward(self, graph_walk, engine_inputs, input_embeds, history, seed, step, temperature, top_p,
-                 top_k, threshold, block_sos, block_stop) -> torch.Tensor:
+    def _forward(
+        self,
+        graph_walk,
+        engine_inputs,
+        input_embeds,
+        history,
+        seed,
+        step,
+        temperature,
+        top_p,
+        top_k,
+        threshold,
+        block_sos,
+        block_stop,
+    ) -> torch.Tensor:
         hidden = self.model.hidden(input_embeds, label=LM_LABEL)
         if graph_walk in PREFILL_WALKS:
             hidden = engine_inputs.resources[LM_ATTN].select_last_hidden(hidden, label=LM_LABEL)
@@ -259,9 +281,15 @@ class LMSubmodule(ARNodeSubmodule):
         ids = torch.arange(logits.shape[-1], device=logits.device)[None, :]
         blocked = (block_sos & (ids == self.lm.sos_token)) | (block_stop & (ids >= self.lm.speech_token_size))
         return ras_sample(
-            logits, seed=seed.reshape(-1), step=step.reshape(-1), history=history,
-            temperature=temperature.reshape(-1), top_p=top_p.reshape(-1), top_k=top_k.reshape(-1),
-            repeat_threshold=threshold.reshape(-1), blocked=blocked,
+            logits,
+            seed=seed.reshape(-1),
+            step=step.reshape(-1),
+            history=history,
+            temperature=temperature.reshape(-1),
+            top_p=top_p.reshape(-1),
+            top_k=top_k.reshape(-1),
+            repeat_threshold=threshold.reshape(-1),
+            blocked=blocked,
         )
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
@@ -317,15 +345,18 @@ class LMSubmodule(ARNodeSubmodule):
             "block_sos": torch.zeros(1, dtype=torch.bool, device=device),
             "block_stop": torch.zeros(1, dtype=torch.bool, device=device),
         }
-        return [BatchedCudaGraphConfig(
-            capture_graph_walk="decode",
-            single_request_inputs=ARNodeInputs(
-                input_embeds=torch.zeros(1, self.lm.hidden_size, dtype=dtype, device=device),
-                input_seq_len=1, tensor_inputs=tensor_inputs,
-            ),
-            capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            compile=False,
-        )]
+        return [
+            BatchedCudaGraphConfig(
+                capture_graph_walk="decode",
+                single_request_inputs=ARNodeInputs(
+                    input_embeds=torch.zeros(1, self.lm.hidden_size, dtype=dtype, device=device),
+                    input_seq_len=1,
+                    tensor_inputs=tensor_inputs,
+                ),
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+                compile=False,
+            )
+        ]
 
     def can_use_cuda_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return self.can_batch(batch, model_inputs) and super().can_use_cuda_graphs(batch, model_inputs)
@@ -412,7 +443,7 @@ class FlowSubmodule(NodeSubmodule):
         the hop ends on a 25-token attention chunk."""
         cfg = self.config
         cap = max(cfg.stream_max_hop_tokens, cfg.stream_hop_tokens)
-        hop = int(min(cfg.stream_hop_tokens * cfg.stream_hop_growth ** k, cap))
+        hop = int(min(cfg.stream_hop_tokens * cfg.stream_hop_growth**k, cap))
         if k == 0:
             hop += -(-prompt_tokens // self.chunk_tokens) * self.chunk_tokens - prompt_tokens
         return hop
@@ -456,7 +487,9 @@ class FlowSubmodule(NodeSubmodule):
         return NodeInputs(
             tensor_inputs={SPEECH_TOKENS: tokens},
             kwargs={
-                "rid": rid, "voice": voice, "final": final,
+                "rid": rid,
+                "voice": voice,
+                "final": final,
                 "n_timesteps": int(meta.get("n_cfm_timesteps", self.config.flow.cfm.n_timesteps)),
             },
         )

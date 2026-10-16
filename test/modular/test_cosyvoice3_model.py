@@ -100,12 +100,24 @@ def _clip(seconds: float = 1.0, amplitude: float = 0.3) -> torch.Tensor:
 
 
 def _tiny_config(**overrides) -> CosyVoice3Config:
-    lm = LMConfig(hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
-                  intermediate_size=96, text_vocab_size=64, speech_token_size=40, num_control_tokens=10)
-    flow = FlowConfig(vocab_size=40, pre_lookahead_channels=32, spk_embed_dim=16,
-                      dit=DiTConfig(dim=32, depth=2, heads=2, dim_head=16, conv_pos_kernel=5, conv_pos_groups=4,
-                                    time_freq_dim=16),
-                      noise_frames=2000)
+    lm = LMConfig(
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        intermediate_size=96,
+        text_vocab_size=64,
+        speech_token_size=40,
+        num_control_tokens=10,
+    )
+    flow = FlowConfig(
+        vocab_size=40,
+        pre_lookahead_channels=32,
+        spk_embed_dim=16,
+        dit=DiTConfig(dim=32, depth=2, heads=2, dim_head=16, conv_pos_kernel=5, conv_pos_groups=4, time_freq_dim=16),
+        noise_frames=2000,
+    )
     hift = CausalHiFTConfig(base_channels=16, f0_cond_channels=16, noise_seconds=12.0)
     cfg = CosyVoice3Config(lm=lm, flow=flow, hift=hift, silent_tokens=(1, 2), max_speech_tokens=512)
     for key, value in overrides.items():
@@ -155,7 +167,11 @@ def _voice(cfg: CosyVoice3Config, prompt_tokens: int, seed: int = 0) -> Referenc
 def test_config_matches_the_checkpoint_geometry():
     cfg = CosyVoice3Config()
     assert (cfg.lm.sos_token, cfg.lm.eos_token, cfg.lm.task_id_token, cfg.lm.speech_vocab_size) == (
-        6561, 6562, 6563, 6761)
+        6561,
+        6562,
+        6563,
+        6761,
+    )
     assert cfg.flow.chunk_tokens == 25 and cfg.tokenizer.n_layer == 12 and cfg.mel.fmax is None
     assert cfg.hift.stream_holdback_frames == 8 and cfg.hift.upsample_factor == 480
     s = cfg.sampling
@@ -197,44 +213,51 @@ def test_graph_walks_and_partitions(model):
 
 def test_process_prompt_modes_and_token_limits(model):
     clip = _clip()
-    zero = model.process_prompt("one two three", ["text", "audio"], ["audio"],
-                                tensors={"audio_inputs": [clip]}, ref_text="ref words")
+    zero = model.process_prompt(
+        "one two three", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="ref words"
+    )
     tok = _Tokenizer()
     expected = torch.cat([tok(f"{SYSTEM_PROMPT}{END_OF_PROMPT}ref words"), tok("one two three")])
     assert torch.equal(zero[TEXT_INPUTS][0], expected)
-    assert zero[TOKEN_LIMITS][0].tolist() == [6, 60]   # 2x and 20x the text's 3 tokens
+    assert zero[TOKEN_LIMITS][0].tolist() == [6, 60]  # 2x and 20x the text's 3 tokens
     assert zero["voice_key"][0].numel() == 1 and zero["ref_audio"][0].shape == clip.shape
 
     cross = model.process_prompt("one two", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
     assert torch.equal(cross[TEXT_INPUTS][0], torch.cat([tok(f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), tok("one two")]))
     assert model.resolve_mode({}, uploaded=True) == ("cross_lingual", None)
 
-    instruct = model.process_prompt("one", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]},
-                                    instruct="speak slowly")
+    instruct = model.process_prompt(
+        "one", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, instruct="speak slowly"
+    )
     assert torch.equal(instruct[TEXT_INPUTS][0][:-1], tok(f"{SYSTEM_PROMPT} speak slowly{END_OF_PROMPT}"))
 
-    capped = model.process_prompt("one two three", ["text", "audio"], ["audio"],
-                                  tensors={"audio_inputs": [clip]}, max_new_tokens=10)
+    capped = model.process_prompt(
+        "one two three", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, max_new_tokens=10
+    )
     assert capped[TOKEN_LIMITS][0].tolist() == [6, 10]
-    forced = model.process_prompt("one", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]},
-                                  max_new_tokens=100, ignore_eos=True)
+    forced = model.process_prompt(
+        "one", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, max_new_tokens=100, ignore_eos=True
+    )
     assert forced[TOKEN_LIMITS][0].tolist() == [2, 100]
 
 
-@pytest.mark.parametrize("kwargs, inputs, message", [
-    ({}, None, "needs a reference voice"),
-    ({}, [_clip(), _clip()], "one reference clip"),
-    ({}, [torch.zeros(SR)], "silent"),
-    ({}, [_clip(0.3)], "at least 0.5 s"),
-    ({}, [_clip(31.0)], "at most 30"),
-    ({}, [torch.full((SR,), float("nan"))], "NaN"),
-    ({"top_k": 0}, [_clip()], "top_k"),
-    ({"temperature": -1}, [_clip()], "temperature"),
-    ({"ras_window": 11}, [_clip()], "ras_window"),
-    ({"max_new_tokens": 0}, [_clip()], "max_new_tokens"),
-    ({"ref_text": 3}, [_clip()], "ref_text must be a string"),
-    ({"ref_audio": "/etc/passwd"}, [_clip()], "upload the clip"),
-])
+@pytest.mark.parametrize(
+    "kwargs, inputs, message",
+    [
+        ({}, None, "needs a reference voice"),
+        ({}, [_clip(), _clip()], "one reference clip"),
+        ({}, [torch.zeros(SR)], "silent"),
+        ({}, [_clip(0.3)], "at least 0.5 s"),
+        ({}, [_clip(31.0)], "at most 30"),
+        ({}, [torch.full((SR,), float("nan"))], "NaN"),
+        ({"top_k": 0}, [_clip()], "top_k"),
+        ({"temperature": -1}, [_clip()], "temperature"),
+        ({"ras_window": 11}, [_clip()], "ras_window"),
+        ({"max_new_tokens": 0}, [_clip()], "max_new_tokens"),
+        ({"ref_text": 3}, [_clip()], "ref_text must be a string"),
+        ({"ref_audio": "/etc/passwd"}, [_clip()], "upload the clip"),
+    ],
+)
 def test_process_prompt_rejects_bad_requests(model, kwargs, inputs, message):
     modalities = ["text", "audio"] if inputs else ["text"]
     tensors = {"audio_inputs": inputs} if inputs else None
@@ -269,8 +292,9 @@ def test_preset_voices_resolve_inside_voices_dir_only(tmp_path, monkeypatch):
 
 def test_initial_and_partition_args_route_the_walks(model):
     signals = {name: [f"ptr-{name}"] for name in (TEXT_INPUTS, TOKEN_LIMITS, "ref_audio", "voice_key")}
-    zero = model.get_initial_forward_pass_args(LM_PARTITION, ["text", "audio"], ["audio"], signals,
-                                               model_kwargs={"ref_text": "words"})
+    zero = model.get_initial_forward_pass_args(
+        LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs={"ref_text": "words"}
+    )
     assert zero.full_metadata.graph_walk == "prefill_voice"
     routes = sorted((edge.next_node, edge.name) for edge in zero.inputs)
     assert ("speaker_encoder", "ref_audio") in routes and ("llm", TEXT_INPUTS) in routes
@@ -280,8 +304,7 @@ def test_initial_and_partition_args_route_the_walks(model):
     assert cross.full_metadata.graph_walk == "prefill"
     assert {edge.next_node for edge in cross.inputs} == {"llm"}
 
-    decode = model.get_partition_forward_pass_args(LM_PARTITION, zero.full_metadata,
-                                                   {SPEECH_TOKENS: ["ptr-token"]})
+    decode = model.get_partition_forward_pass_args(LM_PARTITION, zero.full_metadata, {SPEECH_TOKENS: ["ptr-token"]})
     assert zero.full_metadata.graph_walk == "decode" and decode.inputs[0].name == PREV_TOKEN
     assert decode.unpersist_tensors == ["ptr-token"]
     done = model.get_partition_forward_pass_args(LM_PARTITION, zero.full_metadata, {})
@@ -316,7 +339,8 @@ def _speech(**extra) -> SpeechRequest:
 
 def test_adapter_maps_voice_instructions_and_sampling(tmp_path):
     sa = adapters.CosyVoice3Adapter().speech_to_request(
-        _speech(voice="anna", instructions="slowly", temperature=0.7, seed=5, top_k=10), tmp_path)
+        _speech(voice="anna", instructions="slowly", temperature=0.7, seed=5, top_k=10), tmp_path
+    )
     assert sa.input_modalities == ["text"] and sa.file_paths is None
     assert sa.model_kwargs == {"voice": "anna", "instruct": "slowly", "temperature": 0.7, "seed": 5, "top_k": 10}
 
@@ -325,15 +349,17 @@ def test_adapter_accepts_a_data_url_and_base64_audio(tmp_path):
     adapter = adapters.CosyVoice3Adapter()
     raw = _wav_bytes()
     url = adapter.speech_to_request(
-        _speech(ref_audio="data:audio/wav;base64," + base64.b64encode(raw).decode(), ref_text="w"), tmp_path)
+        _speech(ref_audio="data:audio/wav;base64," + base64.b64encode(raw).decode(), ref_text="w"), tmp_path
+    )
     assert url.input_modalities == ["text", "audio"] and "ref_audio" not in url.model_kwargs
     assert Path(url.file_paths["audio"][0]).read_bytes() == raw and url.model_kwargs["ref_text"] == "w"
     bare = adapter.speech_to_request(_speech(ref_audio=base64.b64encode(raw).decode()), tmp_path)
     assert Path(bare.file_paths["audio"][0]).read_bytes() == raw
 
 
-@pytest.mark.parametrize("ref", ["/etc/passwd", "//etc/passwd", "///x", "secret", "relative/clip.wav",
-                                 "file:///etc/passwd", "../clip.wav"])
+@pytest.mark.parametrize(
+    "ref", ["/etc/passwd", "//etc/passwd", "///x", "secret", "relative/clip.wav", "file:///etc/passwd", "../clip.wav"]
+)
 def test_adapter_refuses_server_paths_and_leaves_nothing_behind(tmp_path, ref):
     upload = tmp_path / "uploads"
     with pytest.raises(ValueError, match="server file paths are refused"):
@@ -369,10 +395,14 @@ def test_adapter_fetches_a_url_only_when_the_server_allows(tmp_path, monkeypatch
 def _ras(logits, seeds, history=None, temperature=1.0, top_p=0.8, top_k=25, threshold=1.0, blocked=None):
     b, v = logits.shape
     return ras_sample(
-        logits, seed=seeds, step=torch.zeros(b, dtype=torch.long),
+        logits,
+        seed=seeds,
+        step=torch.zeros(b, dtype=torch.long),
         history=history if history is not None else torch.full((b, 10), -1),
-        temperature=torch.full((b,), temperature), top_p=torch.full((b,), top_p),
-        top_k=torch.full((b,), top_k, dtype=torch.long), repeat_threshold=torch.full((b,), threshold),
+        temperature=torch.full((b,), temperature),
+        top_p=torch.full((b,), top_p),
+        top_k=torch.full((b,), top_k, dtype=torch.long),
+        repeat_threshold=torch.full((b,), threshold),
         blocked=blocked if blocked is not None else torch.zeros(b, v, dtype=torch.bool),
     )
 
@@ -392,7 +422,7 @@ def test_ras_nucleus_follows_the_reference_distribution():
     logits = torch.log(torch.tensor([0.4, 0.25, 0.2, 0.1, 0.05]))[None].expand(n, -1).contiguous()
     tokens = _ras(logits, torch.arange(n), threshold=0.0)
     freq = torch.bincount(tokens, minlength=5).double() / n
-    expected = torch.tensor([0.4, 0.25, 0.2, 0.0, 0.0]) / 0.85   # 0.4 + 0.25 < 0.8 -> id 2 is still in
+    expected = torch.tensor([0.4, 0.25, 0.2, 0.0, 0.0]) / 0.85  # 0.4 + 0.25 < 0.8 -> id 2 is still in
     assert (freq - expected).abs().max() < 0.015
     assert torch.equal(_ras(logits[:4], torch.arange(4), top_k=1), torch.zeros(4, dtype=torch.long))
     assert torch.equal(_ras(logits[:4], torch.arange(4), temperature=0.0), torch.zeros(4, dtype=torch.long))
@@ -403,7 +433,7 @@ def test_ras_redraws_a_repeated_token_from_the_rest_of_the_distribution():
     probs = torch.tensor([0.9, 0.06, 0.04])
     logits = torch.log(probs)[None].expand(n, -1).contiguous()
     history = torch.full((n, 10), -1)
-    history[:, -1] = 0   # one repeat reaches window * tau = 1
+    history[:, -1] = 0  # one repeat reaches window * tau = 1
     tokens = _ras(logits, torch.arange(n), history=history)
     first = _ras(logits, torch.arange(n), threshold=0.0)
     redrawn = first == 0
@@ -423,8 +453,9 @@ def test_ras_respects_blocked_ids_and_is_batch_invariant():
     seeds = torch.tensor([1, 2, 3, 4, 5, 6])
     together = _ras(logits, seeds, blocked=blocked, top_k=50, top_p=1.0)
     assert not blocked.gather(1, together[:, None]).any()
-    alone = torch.cat([_ras(logits[i:i + 1], seeds[i:i + 1], blocked=blocked[i:i + 1], top_k=50, top_p=1.0)
-                       for i in range(6)])
+    alone = torch.cat(
+        [_ras(logits[i : i + 1], seeds[i : i + 1], blocked=blocked[i : i + 1], top_k=50, top_p=1.0) for i in range(6)]
+    )
     assert torch.equal(together, alone)
 
 
@@ -444,8 +475,16 @@ def _lm(cfg: CosyVoice3Config, seed: int = 0):
 
 
 def _info(rid: int, seed: int, **knobs):
-    meta = {"temperature": 1.0, "top_p": 0.8, "top_k": 25, "ras_window": 10, "ras_tau": 0.1,
-            "ignore_eos": False, "is_prefill": True, **knobs}
+    meta = {
+        "temperature": 1.0,
+        "top_p": 0.8,
+        "top_k": 25,
+        "ras_window": 10,
+        "ras_tau": 0.1,
+        "ignore_eos": False,
+        "is_prefill": True,
+        **knobs,
+    }
     return SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed, step_metadata=meta)
 
 
@@ -477,8 +516,7 @@ def _lm_run(sub, res, requests: dict, steps: int, **knobs) -> dict[int, list[int
 
 def _lm_request(text_len: int = 5, prompt: int = 4, limits=(0, 30)):
     g = torch.Generator().manual_seed(text_len)
-    req = {TEXT_INPUTS: [torch.randint(0, 64, (text_len,), generator=g)],
-           TOKEN_LIMITS: [torch.tensor(list(limits))]}
+    req = {TEXT_INPUTS: [torch.randint(0, 64, (text_len,), generator=g)], TOKEN_LIMITS: [torch.tensor(list(limits))]}
     if prompt:
         req[PROMPT_TOKENS] = [torch.randint(0, 40, (prompt,), generator=g)]
     return req
@@ -518,6 +556,7 @@ def _fixed_logits(sub, favourite: int, second: int):
         out = torch.full((hidden.shape[0], vocab), -20.0)
         out[:, favourite], out[:, second] = 10.0, 5.0
         return out
+
     sub.model.logits = logits
 
 
@@ -573,8 +612,8 @@ def test_lm_ras_history_is_committed_once_per_step():
     sub.prepare_inputs("prefill", info, _lm_request())
     state = sub.request_state(3)
     again = sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([9])]})
-    sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([9])]})   # re-driven step
-    assert state["history"].tolist() == [-1] * 10   # not committed until postprocess
+    sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([9])]})  # re-driven step
+    assert state["history"].tolist() == [-1] * 10  # not committed until postprocess
     sub.postprocess(3, info, {SPEECH_TOKENS: [torch.tensor([4])]}, inputs=again)
     assert state["history"].tolist() == [-1] * 9 + [9] and state["generated"] == 1
 
@@ -618,10 +657,10 @@ def test_flow_hop_plan_follows_the_reference_ramp():
     assert [sub.hop_size(k, 10) for k in range(4)] == [40, 50, 100, 100]
     state = sub.request_state(0)
     tokens = torch.zeros(300, dtype=torch.long)
-    assert sub.plan(state, voice, tokens[:42], final=False) is None   # 40 + 3 look-ahead not there yet
+    assert sub.plan(state, voice, tokens[:42], final=False) is None  # 40 + 3 look-ahead not there yet
     assert sub.plan(state, voice, tokens[:43], final=False).settle == 40
     state.add("settled", 40)
-    assert sub.plan(state, voice, tokens[:200], final=False).settle == 190   # 90 and 190 in one solve
+    assert sub.plan(state, voice, tokens[:200], final=False).settle == 190  # 90 and 190 in one solve
     state.add("settled", 190)
     final = sub.plan(state, voice, tokens[:200], final=True)
     assert final.final and final.settle == 200
@@ -715,7 +754,7 @@ def test_hift_stream_stitches_to_the_whole_decode(chunk, context):
     assert streamed.numel() == whole.shape[-1] == total * 480
     torch.testing.assert_close(streamed, whole[0], rtol=0, atol=1e-9)
     if context:
-        assert state.mel.shape[-1] <= context + 8 + chunk + 8   # bounded history
+        assert state.mel.shape[-1] <= context + 8 + chunk + 8  # bounded history
 
 
 def test_hift_node_final_flush_without_new_frames_releases_the_tail():
@@ -743,12 +782,14 @@ def _stream_token2wav(cfg, flow_node, hift_node, policy, tokens: list[int]) -> l
     def drain():
         while buffer.has_chunk_ready():
             chunk = buffer.pop_chunk()
-            p = flow_node.prepare_inputs("token2wav", info, {SPEECH_TOKENS: [chunk.data["data"]]},
-                                         is_final_stream_chunk=chunk.is_final)
+            p = flow_node.prepare_inputs(
+                "token2wav", info, {SPEECH_TOKENS: [chunk.data["data"]]}, is_final_stream_chunk=chunk.is_final
+            )
             mel = flow_node.forward("token2wav", None, **flow_node.preprocess("token2wav", None, [p]))
             h = hift_node.prepare_inputs("token2wav", info, mel)
-            chunks.append(hift_node.forward("token2wav", None, **hift_node.preprocess("token2wav", None, [h]))[
-                AUDIO_CHUNK][0])
+            chunks.append(
+                hift_node.forward("token2wav", None, **hift_node.preprocess("token2wav", None, [h]))[AUDIO_CHUNK][0]
+            )
 
     for i, token in enumerate(tokens):
         buffer.pre_read_register(f"t{i}")
@@ -769,7 +810,7 @@ def test_streamed_audio_equals_the_whole_streaming_decode(model, num_tokens, pro
     flow_node.request_state(0).add("voice", voice)
     g = torch.Generator().manual_seed(num_tokens)
     tokens = torch.randint(3, 40, (num_tokens,), generator=g).tolist()
-    tokens[num_tokens // 2: num_tokens // 2 + 8] = [1] * min(8, num_tokens - num_tokens // 2)   # a silent run
+    tokens[num_tokens // 2 : num_tokens // 2 + 8] = [1] * min(8, num_tokens - num_tokens // 2)  # a silent run
     tokens.append(cfg.lm.eos_token)
     policy = model.get_partition_topology().connections[0].chunk_policy_factory()
     with torch.no_grad():
@@ -802,4 +843,3 @@ def test_offline_deployment_decodes_once_with_full_attention(model):
     assert [c.numel() for c in chunks if c.numel()] == [60 * 960]
     whole = (whole[0].clamp(-1, 1) * 32767).to(torch.int16)
     assert (torch.cat(chunks).int() - whole.int()).abs().max() <= 1
-

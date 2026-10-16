@@ -40,8 +40,8 @@ class ReferenceVoice:
     """What the flow (and the LM's prompt) needs from a reference clip."""
 
     prompt_tokens: torch.Tensor  # [P] long, speech tokens of the clip
-    prompt_feat: torch.Tensor    # [2P, 80] float, 24 kHz mel of the clip
-    embedding: torch.Tensor      # [192] float, CAMPPlus x-vector
+    prompt_feat: torch.Tensor  # [2P, 80] float, 24 kHz mel of the clip
+    embedding: torch.Tensor  # [192] float, CAMPPlus x-vector
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -86,7 +86,9 @@ class CosyVoice3Flow(nn.Module):
         self.input_embedding = nn.Embedding(config.vocab_size, config.input_size)
         self.spk_embed_affine_layer = nn.Linear(config.spk_embed_dim, config.output_size)
         self.pre_lookahead_layer = PreLookaheadLayer(
-            config.input_size, config.pre_lookahead_channels, config.pre_lookahead_len,
+            config.input_size,
+            config.pre_lookahead_channels,
+            config.pre_lookahead_len,
         )
         self.decoder = CausalConditionalCFM(config.cfm, DiT(config.dit))
         generator = torch.Generator().manual_seed(config.noise_seed)
@@ -154,10 +156,7 @@ class CosyVoice3Flow(nn.Module):
         mask = chunk_attention_mask(valid, total, cfg.dit.static_chunk_size, streaming)
         noise = self.noise[:, :, :total].to(device, dtype).expand(batch, -1, -1).contiguous()
         mel = self.decoder.solve(mu, mask, spks, cond, noise, n_timesteps or cfg.cfm.n_timesteps)
-        return [
-            mel[i, :, row.voice.num_prompt_tokens * ratio : int(valid[i])]
-            for i, row in enumerate(rows)
-        ]
+        return [mel[i, :, row.voice.num_prompt_tokens * ratio : int(valid[i])] for i, row in enumerate(rows)]
 
     # ------------------------------------------------------------------
     # Weights

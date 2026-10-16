@@ -41,10 +41,10 @@ FLOW_NODE = "flow"
 HIFT_NODE = "hift"
 
 # Sample rates and token geometry fixed by the checkpoint
-TOKENIZER_SR = 16_000   # speech tokenizer and CAMPPlus input rate
-SAMPLE_RATE = 24_000    # prompt mel and output waveform rate
-TOKEN_RATE = 25         # speech tokens per second
-SPEECH_VOCAB = 6561     # 3**8 FSQ codes; ids >= this are control tokens
+TOKENIZER_SR = 16_000  # speech tokenizer and CAMPPlus input rate
+SAMPLE_RATE = 24_000  # prompt mel and output waveform rate
+TOKEN_RATE = 25  # speech tokens per second
+SPEECH_VOCAB = 6561  # 3**8 FSQ codes; ids >= this are control tokens
 SAMPLES_PER_FRAME = 480  # one 50 Hz mel frame of 24 kHz audio
 
 # Instruction prefix the LM was trained with. Every prompt must contain
@@ -193,9 +193,9 @@ class CosyVoice3Config:
     max_silent_tokens: int = 5
 
     # Serving limits
-    max_text_tokens: int = 512          # prompt text + text
+    max_text_tokens: int = 512  # prompt text + text
     max_reference_seconds: float = 30.0  # the tokenizer's single-pass limit
-    max_speech_tokens: int = 2048       # ~82 s of audio per request
+    max_speech_tokens: int = 2048  # ~82 s of audio per request
     voice_cache_size: int = 64
     max_new_tokens_limit: int | None = None
 

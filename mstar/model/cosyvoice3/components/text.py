@@ -16,12 +16,26 @@ import torch
 from mstar.model.cosyvoice3.config import END_OF_PROMPT, END_OF_PROMPT_ID
 
 _TAGS = (
-    "<|im_start|>", "<|im_end|>", "<|endofprompt|>",
-    "[breath]", "<strong>", "</strong>", "[noise]",
-    "[laughter]", "[cough]", "[clucking]", "[accent]",
-    "[quick_breath]", "<laughter>", "</laughter>",
-    "[hissing]", "[sigh]", "[vocalized-noise]",
-    "[lipsmack]", "[mn]", "<|endofsystem|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|endofprompt|>",
+    "[breath]",
+    "<strong>",
+    "</strong>",
+    "[noise]",
+    "[laughter]",
+    "[cough]",
+    "[clucking]",
+    "[accent]",
+    "[quick_breath]",
+    "<laughter>",
+    "</laughter>",
+    "[hissing]",
+    "[sigh]",
+    "[vocalized-noise]",
+    "[lipsmack]",
+    "[mn]",
+    "<|endofsystem|>",
 )
 
 _EN_PHONEMES = (
@@ -49,11 +63,13 @@ class CosyVoice3TextTokenizer:
         from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(str(path))
-        self.tokenizer.add_special_tokens({
-            "eos_token": "<|endoftext|>",
-            "pad_token": "<|endoftext|>",
-            "additional_special_tokens": list(SPECIAL_TOKENS),
-        })
+        self.tokenizer.add_special_tokens(
+            {
+                "eos_token": "<|endoftext|>",
+                "pad_token": "<|endoftext|>",
+                "additional_special_tokens": list(SPECIAL_TOKENS),
+            }
+        )
         got = self.tokenizer.convert_tokens_to_ids(END_OF_PROMPT)
         if got != END_OF_PROMPT_ID:
             raise RuntimeError(f"{END_OF_PROMPT} tokenizes to {got}; the LM was trained with {END_OF_PROMPT_ID}")

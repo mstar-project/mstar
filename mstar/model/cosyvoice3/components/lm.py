@@ -34,32 +34,34 @@ class CosyVoice3LM(nn.Module):
         comm_group = comm_group or CommGroup.trivial()
         self.config = config
         self.embed_tokens = nn.Embedding(config.text_vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([
-            DecoderLayer(
-                self_attn=ParallelAttention(
-                    comm_group=comm_group,
-                    hidden_size=config.num_attention_heads * config.head_dim,
-                    num_heads=config.num_attention_heads,
-                    num_kv_heads=config.num_key_value_heads,
-                    head_dim=config.head_dim,
-                    qkv_bias=True,
-                    rope_theta=config.rope_theta,
-                    input_hidden_size=config.hidden_size,
-                    attn_key=LM_ATTN,
-                    kv_key=LM_KV,
-                    pos_key=LM_POS,
-                ),
-                mlp=ParallelGatedMLP(
-                    comm_group=comm_group,
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.intermediate_size,
-                    activation="silu",
-                ),
-                input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
-                post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
-            )
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                DecoderLayer(
+                    self_attn=ParallelAttention(
+                        comm_group=comm_group,
+                        hidden_size=config.num_attention_heads * config.head_dim,
+                        num_heads=config.num_attention_heads,
+                        num_kv_heads=config.num_key_value_heads,
+                        head_dim=config.head_dim,
+                        qkv_bias=True,
+                        rope_theta=config.rope_theta,
+                        input_hidden_size=config.hidden_size,
+                        attn_key=LM_ATTN,
+                        kv_key=LM_KV,
+                        pos_key=LM_POS,
+                    ),
+                    mlp=ParallelGatedMLP(
+                        comm_group=comm_group,
+                        hidden_size=config.hidden_size,
+                        intermediate_size=config.intermediate_size,
+                        activation="silu",
+                    ),
+                    input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+                    post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.speech_embedding = nn.Embedding(config.speech_vocab_size, config.hidden_size)
         self.llm_decoder = nn.Linear(config.hidden_size, config.speech_vocab_size, bias=False)
@@ -107,12 +109,15 @@ class CosyVoice3LM(nn.Module):
         if name.startswith("llm.model.lm_head."):
             return None
         if name.startswith("llm.model.model."):
-            return name[len("llm.model.model."):]
+            return name[len("llm.model.model.") :]
         return name
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Stream ``llm.pt`` (or ``llm.rl.pt``) into this module, exactly."""
         return load_component(
-            self, weights, component="CosyVoice3 LM", name_remapper=self._remap,
+            self,
+            weights,
+            component="CosyVoice3 LM",
+            name_remapper=self._remap,
             stacked_params=LLAMA_STACKED_PARAMS,
         )
