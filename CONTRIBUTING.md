@@ -72,9 +72,9 @@ The first three invoke compiled FlexAttention, which requires AVX2 with the
 pinned PyTorch 2.9.1 CPU implementation. The video test hits an illegal
 instruction in PyAV 19.0.1 encoding in the tested Apple VM; this also reproduces
 without mstar. The entire modules are excluded,
-including their portable structural cases. Currently the Mac subset selects
-49 of the 53 core modules. It prints the exclusions and saves the exact
-selection in `cpu-smoke-tests.txt` with the reports. New core modules are
+including their portable structural cases. The runner prints the exclusions
+and selected module count, and saves the exact selection in
+`cpu-smoke-tests.txt` with the reports. New core modules are
 included automatically unless explicitly excluded; invalid or stale exclusions
 fail the check. Existing GPU/optional-feature skips are reported by pytest.
 No test assertions are changed for the Mac runner.
