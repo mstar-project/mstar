@@ -85,7 +85,9 @@ def _stream_batched(
             )
             items = [
                 submodule.prepare_inputs(
-                    "snac_chunk", fwd_infos[rid], {"new_token": [chunks[rid].data["data"]]},
+                    "snac_chunk", fwd_infos[rid],
+                    # as the worker routes it: an empty chunk carries no tensor
+                    {"new_token": [] if chunks[rid].data["data"] is None else [chunks[rid].data["data"]]},
                     input_metadata=meta[rid], is_final_stream_chunk=chunks[rid].is_final,
                 )
                 for rid in rids
@@ -316,6 +318,18 @@ def test_no_context_geometry_captures_only_decodable_windows():
         codes = submodule.preprocess("snac_chunk", None, [cfg.single_request_inputs])
         audio = submodule._decode(codes["codes_0"], codes["codes_1"], codes["codes_2"])
         assert audio.shape[-1] == cfg.additional_key_info * HOP
+
+
+def test_no_context_stream_cut_at_a_chunk_boundary_ends_cleanly():
+    """No context and no EOS (the token limit hit on a chunk boundary): the
+    buffer drains to empty, so the final flush carries no tokens at all."""
+    config = OrpheusModelConfig(snac_chunk_schedule=(4,), snac_left_context_frames=0,
+                                snac_right_context_frames=0)
+    submodule = SNACDecoderSubmodule(_NeighbourDecoder(), config)
+    tokens = _tokens(config, 8)
+    chunks = _stream(submodule, tokens)
+    assert chunks[-1].numel() == 0
+    assert sum(chunk.numel() for chunk in chunks) == 8 * HOP
 
 
 @pytest.mark.parametrize("overrides", [

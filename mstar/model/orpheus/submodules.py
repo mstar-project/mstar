@@ -295,7 +295,10 @@ class SNACDecoderSubmodule(NodeSubmodule):
         """
         tpf = self.config.tokens_per_frame
         right = self.config.snac_right_context_frames
-        tokens = inputs["new_token"][0].flatten()
+        # an empty final chunk (a no-context stream cut at a chunk boundary
+        # without EOS) arrives as no tensor at all
+        received = inputs.get("new_token") or [self.idx_14.new_empty(0)]
+        tokens = received[0].flatten()
         chunk = self._stream_chunk(input_metadata)
         frames = tokens.numel() // tpf
         final = is_final_stream_chunk or chunk is None or chunk.is_final
