@@ -24,6 +24,7 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 
 from __future__ import annotations
 
+import http.client
 import math
 import re
 from dataclasses import dataclass, field, replace
@@ -674,8 +675,8 @@ def _uploaded_ref_audio(ref, upload_dir: Path) -> str:
     if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
         try:
             return media_io.resolve_media_ref(ref, upload_dir, allow_remote=False)[1]
-        except OSError as exc:  # urllib's URLError and HTTPError (a refused redirect too), timeouts
-            raise ValueError(f"could not fetch ref_audio: {exc}") from exc
+        except (OSError, http.client.HTTPException) as exc:  # urllib errors, timeouts, truncated bodies
+            raise ValueError(f"could not fetch ref_audio: {exc!r}") from exc
     try:
         _, path = media_io.save_base64(ref, "wav", "audio", upload_dir)
     except ValueError:

@@ -96,8 +96,10 @@ class CosyVoice3LM(nn.Module):
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """float32 logits over the speech vocabulary (the head is kept in float32;
-        sampling a bfloat16 head shifts the nucleus)."""
-        return F.linear(hidden.float(), self.llm_decoder.weight.float())
+        sampling a bfloat16 head shifts the nucleus). The engine runs the LM
+        under bfloat16 autocast, which would recast this matmul."""
+        with torch.autocast(device_type=hidden.device.type, enabled=False):
+            return F.linear(hidden.float(), self.llm_decoder.weight.float())
 
     def keep_head_in_float32(self) -> None:
         self.llm_decoder.float()

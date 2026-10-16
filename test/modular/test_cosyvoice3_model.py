@@ -12,9 +12,11 @@ of one whole streaming-mode decode.
 from __future__ import annotations
 
 import base64
+import http.client
 import importlib.util
 import io
 import math
+import urllib.error
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
@@ -371,13 +373,20 @@ def test_adapter_refuses_server_paths_and_leaves_nothing_behind(tmp_path, ref):
     assert not upload.exists() or not any(upload.iterdir())
 
 
-def test_adapter_reports_a_failed_fetch_as_a_bad_request(tmp_path, monkeypatch):
-    """urllib refuses a redirect to ``file://`` with an HTTPError; like any
-    failed fetch it is the request's fault, not a server error."""
-    import urllib.error
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.HTTPError("http://example.test/clip.wav", 302, "redirect to file://", None, None),
+        http.client.IncompleteRead(b"RIFF", 996),
+    ],
+)
+def test_adapter_reports_a_failed_fetch_as_a_bad_request(tmp_path, monkeypatch, error):
+    """urllib refuses a redirect to ``file://`` with an HTTPError, and a body cut
+    short raises IncompleteRead; like any failed fetch they are the request's
+    fault, not a server error."""
 
     def refuse(*args, **kwargs):
-        raise urllib.error.HTTPError("http://example.test/clip.wav", 302, "redirect to file://", None, None)
+        raise error
 
     monkeypatch.setattr(adapters.media_io, "resolve_media_ref", refuse)
     with pytest.raises(ValueError, match="could not fetch ref_audio"):
@@ -537,6 +546,19 @@ def _lm_request(text_len: int = 5, prompt: int = 4, limits=(0, 30)):
     if prompt:
         req[PROMPT_TOKENS] = [torch.randint(0, 40, (prompt,), generator=g)]
     return req
+
+
+def test_lm_head_stays_float32_under_the_engines_autocast():
+    cfg = _tiny_config()
+    lm = CosyVoice3LM(cfg.lm).to(torch.bfloat16)
+    lm.keep_head_in_float32()
+    with torch.no_grad():
+        lm.llm_decoder.weight.normal_(0, 0.1)
+        hidden = torch.randn(3, cfg.lm.hidden_size, dtype=torch.bfloat16)
+        plain = lm.logits(hidden)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            cast = lm.logits(hidden)
+    assert cast.dtype == torch.float32 and torch.equal(cast, plain)
 
 
 def test_lm_prefill_layout_matches_the_reference():
