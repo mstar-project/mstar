@@ -86,9 +86,20 @@ from mstar.streaming.topology import Connection, PartitionTopology, StreamingGra
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _encoder_attn_impl() -> str:
+    """HF attention for the audio and vision towers: FA2's varlen path when
+    ``flash_attn`` is installed, else SDPA. ROCm builds ship no ``flash_attn``;
+    SDPA loops over segments, slower on multi-frame video but correct."""
+    import importlib.util
+
+    if importlib.util.find_spec("flash_attn") is not None:
+        return "flash_attention_2"
+    logger.warning("flash_attn is not installed; the Qwen3-Omni encoders fall back to SDPA")
+    return "sdpa"
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -1573,7 +1584,7 @@ class Qwen3OmniModel(Model):
         # which is significantly slower than FA2's varlen path.
         patch_hf_fa2_int_maxlen()
         audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(
-            audio_config, attn_implementation="flash_attention_2"
+            audio_config, attn_implementation=_encoder_attn_impl()
         )
 
         load_weights_from_hf_shards(
@@ -1618,7 +1629,7 @@ class Qwen3OmniModel(Model):
         # per layer handles all frames at once via cu_seqlens.
         patch_hf_fa2_int_maxlen()
         vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(
-            vision_config, attn_implementation="flash_attention_2"
+            vision_config, attn_implementation=_encoder_attn_impl()
         )
 
         load_weights_from_hf_shards(
