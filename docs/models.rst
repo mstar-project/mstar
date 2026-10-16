@@ -47,6 +47,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``nvidia/Cosmos3-Super-Text2Image-4Step`` / ``…-Image2Video-4Step``
      - 4-step distilled Super task checkpoints (guidance baked in, fixed-sigma
        stochastic sampler); TP=2 deployments.
+   * - ``cosyvoice3``
+     - ``FunAudioLLM/Fun-CosyVoice3-0.5B-2512``
+     - Zero-shot voice-cloning TTS: Qwen2-0.5B speech-token LM with RAS sampling,
+       DiT flow-matching decoder and causal HiFT vocoder, streamed in chunks.
+       Clones from a preset or an uploaded clip. 24 kHz.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
@@ -212,6 +217,20 @@ Kokoro notes
   pointed at M*, ``response_format="pcm"``); ``GET /v1/audio/voices`` lists the
   voices for a picker: the bundled voices whose G2P extra is installed on the server
   (a request for one of the others gets a 400 with the ``pip install`` hint).
+
+CosyVoice3 notes
+----------------
+
+- Install with ``pip install -e '.[cosyvoice3]'`` and serve with
+  ``mstar serve cosyvoice3 --gpus 0``. Every request clones a voice: a
+  ``ref_audio`` clip (with its transcript in ``ref_text`` for zero-shot
+  cloning) or a preset from ``voices_dir`` (see ``configs/cosyvoice3.yaml``).
+  ``instructions`` carries a style instruction. Output is 24 kHz.
+- The flow's DiT estimator runs in bfloat16 by default; the Euler state, the
+  rest of the flow and the HiFT vocoder stay float32 (HiFT's F0 predictor
+  float64).
+  ``model_kwargs: {flow_estimator_dtype: float32}`` in the deployment YAML runs
+  the estimator at the reference's precision instead, at lower throughput.
 
 Qwen3-TTS notes
 ---------------
