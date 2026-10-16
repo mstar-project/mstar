@@ -1,8 +1,31 @@
+import socket
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import torch
 import torch.distributed as dist
+from torch.distributed.constants import default_pg_timeout
+
+
+def rendezvous_store(init_method: str, rank: int, world_size: int) -> dist.TCPStore:
+    """The ``tcp://host:port`` store every rank meets at, listening on ``host`` only.
+
+    ``init_process_group(init_method="tcp://...")`` has rank 0 serve its
+    TCPStore on every interface whatever the host, so rank 0 binds the
+    listener itself and hands it over.
+    """
+    url = urlparse(init_method)
+    if url.scheme != "tcp" or not url.hostname or not url.port:
+        raise ValueError(f"init_method must be tcp://host:port; got {init_method!r}")
+    if rank != 0:
+        return dist.TCPStore(url.hostname, url.port, world_size, is_master=False, timeout=default_pg_timeout)
+    listener = socket.create_server((url.hostname, url.port), backlog=max(world_size, 128))
+    # the store owns the descriptor from here
+    return dist.TCPStore(
+        url.hostname, url.port, world_size, is_master=True, timeout=default_pg_timeout,
+        wait_for_workers=False, master_listen_fd=listener.detach(),
+    )
 
 
 class CommGroup:
@@ -330,7 +353,7 @@ class WorkerParallelGroups:
 
         dist.init_process_group(
             backend=backend,
-            init_method=init_method,
+            store=rendezvous_store(init_method, self.global_rank, self.num_workers),
             world_size=self.num_workers,
             rank=self.global_rank,
             device_id=device,
