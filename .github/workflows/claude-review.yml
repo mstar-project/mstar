@@ -43,10 +43,6 @@ on:
     types: [opened, reopened, ready_for_review, labeled]
   issue_comment:
     types: [created]
-  # TEMPORARY self-test for #501: runs this branch's copy of the workflow on its
-  # own pushes (same-repo branches get secrets). Reverted before merge.
-  pull_request:
-    types: [synchronize]
 
 permissions: {}
 
@@ -64,10 +60,6 @@ jobs:
        ((github.event.action == 'labeled' && github.event.label.name == 'ai-review-thorough') ||
         (github.event.action != 'labeled' &&
          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association))))
-      ||
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name == github.repository &&
-       github.event.pull_request.head.ref == 'fix/claude-review-token')
       ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
