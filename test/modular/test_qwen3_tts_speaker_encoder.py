@@ -13,6 +13,7 @@ import warnings
 
 import pytest
 import torch
+import transformers
 
 from mstar.model.qwen3_tts.components.speaker_encoder import (
     Qwen3TTSMelFrontEnd,
@@ -21,9 +22,17 @@ from mstar.model.qwen3_tts.components.speaker_encoder import (
 )
 from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
 
-pytestmark = pytest.mark.skipif(
-    importlib.util.find_spec("qwen_tts") is None, reason="qwen-tts reference not installed"
-)
+# The reference package imports only under the transformers it pins; a
+# ``--no-deps`` install next to transformers 5 serves fine but cannot be the oracle.
+pytestmark = [
+    pytest.mark.skipif(
+        importlib.util.find_spec("qwen_tts") is None, reason="qwen-tts reference not installed"
+    ),
+    pytest.mark.skipif(
+        int(transformers.__version__.split(".")[0]) >= 5,
+        reason="the qwen-tts reference needs the transformers 4.57.3 it pins",
+    ),
+]
 
 
 def _reference_modules():

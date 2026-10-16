@@ -29,6 +29,10 @@ and the greedy divergence point are reported but not gated: bf16 with
 different attention kernels flips near-ties, and one flipped code changes
 every later frame of an autoregressive run.
 
+The reference imports the whole ``qwen_tts`` package, which needs the
+transformers it pins (4.57.3), so run this where ``qwen-tts==0.1.1`` was
+installed with its dependencies, not the ``--no-deps`` serving install.
+
 Run inside the GPU allocation (weights must already be in the HF cache)::
 
     python test/qwen3-tts/parity_qwen3_tts.py --repo Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \\
