@@ -86,7 +86,7 @@ Keep the body to one short paragraph that names the triggering inputs or state; 
 
 **Findings:** <N> inline (<count by priority>), or `none`. <Any finding that couldn't be anchored, in the inline format above, with its `path:line`.>
 
-<Problems with the PR description, as plain sentences: inaccuracies first, then what's missing. No heading, no bold and no bullets.>
+<Problems with the PR description, as plain sentences: inaccuracies first, then what's missing.>
 
 #### Questions
 - <question, and what the answer would change>
