@@ -5,10 +5,13 @@ their addresses, so they are sized to the bucket on first plan and never
 reallocated: a `torch.zeros` firing on a later, larger layout means a replay
 reads freed memory.
 """
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
 # as an explicit constexpr rather than autotuning it.
@@ -562,6 +565,10 @@ class GDNDecodeWrapper(GDNWrapper):
         )
 
         self._plan_state: GDNDecodePlan | None = None
+        # ROCm: AITER's FlyDSL kernel, until its first call fails; see
+        # `_run_flydsl`. It skips no slot, so it needs the sink.
+        self._flydsl = torch.version.hip is not None and null_slot_id >= 0
+        self._dt_bias_cast: dict[int, torch.Tensor] = {}
 
     # The cutlass decode kernel really does normalise in-kernel, which saves
     # the caller a norm + divide + two casts per q and k, per layer, per step.
@@ -596,6 +603,13 @@ class GDNDecodeWrapper(GDNWrapper):
         )
 
     def run(self, q, k, v, g, beta, state, a_log, dt_bias):
+        if self._flydsl:
+            try:
+                return self._run_flydsl(q, k, v, g, beta, state, a_log, dt_bias)
+            except (ImportError, OSError) as e:
+                # first call, in warmup: no FlyDSL, or a read-only JIT cache
+                logger.warning("FlyDSL GDN decode unavailable, using Triton: %s", e)
+                self._flydsl = False
         if torch.version.hip is not None:
             return self._run_aiter(q, k, v, g, beta, state, a_log, dt_bias)
         from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
@@ -625,6 +639,38 @@ class GDNDecodeWrapper(GDNWrapper):
             use_qk_l2norm=self._qk_l2norm,
         )
         return out.squeeze(1)
+
+    def _run_flydsl(self, q, k, v, a, b, state, a_log, dt_bias):
+        """ROCm with a sink: AITER's FlyDSL decode, tuned for gfx942. It reads
+        q/k/v as the conv output's column views, so nothing is concatenated,
+        and updates the K-last pool in place by slot. Per layer on MI300X:
+        75 us at 64 rows where the Triton path takes 93 (job 465605)."""
+        from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
+
+        head_k_dim = q.shape[-1]
+        if self._sm_scale is not None and abs(self._sm_scale * head_k_dim ** 0.5 - 1) > 1e-6:
+            # the kernel's scale is fixed at 1/sqrt(head_k_dim)
+            self._flydsl = False
+            return self._run_aiter(q, k, v, a, b, state, a_log, dt_bias)
+        # It takes dt_bias in the activations' dtype. Qwen3.5's checkpoint
+        # stores it bf16 and `GatedDeltaNet` widens it to fp32, so there the
+        # cast back is exact.
+        key = dt_bias.data_ptr()
+        dt_bias_cast = self._dt_bias_cast.get(key)
+        if dt_bias_cast is None:
+            dt_bias_cast = self._dt_bias_cast[key] = dt_bias.to(q.dtype)
+        n = q.shape[0]
+        out = torch.empty(
+            (n, 1, v.shape[1], v.shape[2]), dtype=q.dtype, device=q.device,
+        )
+        # one token per row: the sequence axis is unsqueezed
+        flydsl_gdr_decode(
+            q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
+            a.unsqueeze(1), b.unsqueeze(1), dt_bias_cast, a_log,
+            self._plan_state.slots.to(torch.int32), state, out,
+            use_qk_l2norm=self._qk_l2norm, need_shuffle_state=False,
+        )
+        return out.view(n, v.shape[1], v.shape[2])
 
     def _run_aiter(self, q, k, v, a, b, state, a_log, dt_bias):
         """ROCm: AITER's fused decode reads q/k/v packed, forms the decay and
