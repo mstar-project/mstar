@@ -106,9 +106,9 @@ def build_prompt(
     ref = ref_patches[0]
     n_ref = ref.shape[0]
     pieces = [
-        text_ids.new_tensor([REF_AUDIO_START_TOKEN]),
+        text_ids.new_full((1,), REF_AUDIO_START_TOKEN),
         text_ids.new_zeros(n_ref),
-        text_ids.new_tensor([REF_AUDIO_END_TOKEN]),
+        text_ids.new_full((1,), REF_AUDIO_END_TOKEN),
         text_ids,
     ]
     audio = [ref]

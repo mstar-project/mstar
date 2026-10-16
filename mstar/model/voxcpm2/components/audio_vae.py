@@ -206,7 +206,7 @@ class AudioVAE(nn.Module):
 
     def output_rate_index(self, device) -> torch.Tensor:
         """Bucket of the default output rate, as ``AudioVAEV2.decode`` picks it."""
-        rate = torch.tensor([self.config.out_sample_rate], dtype=torch.int32, device=device)
+        rate = torch.full((1,), self.config.out_sample_rate, dtype=torch.int32, device=device)
         return torch.bucketize(rate, self.decoder.sr_bin_boundaries.to(device))
 
     def encode(self, audio: torch.Tensor) -> torch.Tensor:
