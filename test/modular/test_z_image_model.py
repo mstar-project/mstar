@@ -87,6 +87,8 @@ def test_process_prompt_and_validation():
         model.process_prompt("x", ["text"], ["image"], height=1000)
     with pytest.raises(ValueError, match="num_inference_steps"):
         model.process_prompt("x", ["text"], ["image"], num_inference_steps=0)
+    with pytest.raises(ValueError, match="output_format"):
+        model.process_prompt("x", ["text"], ["image"], output_format="gif")
 
 
 def test_schedule_and_caption_bucket_from_token_count():
