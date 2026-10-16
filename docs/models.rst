@@ -52,6 +52,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
        decoder, 54 bundled voices and voice blends, sentence-chunked streaming,
        batched across requests.
+   * - ``voxcpm2``
+     - ``openbmb/VoxCPM2``
+     - Tokenizer-free TTS: MiniCPM-4 base and residual LMs emit continuous latent
+       patches through a local flow-matching DiT, decoded by AudioVAE V2 in
+       streamed chunks. Zero-shot, voice design, and cloning from a clip. 48 kHz.
    * - ``nemotron_duplex`` *(Beta)*
      - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
@@ -309,6 +314,22 @@ the saved WAVs with ``benchmark/tts_speech_wer.py``::
    python -m benchmark.tts_speech_bench --engine mstar --url http://127.0.0.1:8000 \
        --model qwen3_tts_1p7b --sentences sentences_200.txt --voice vivian \
        --language English --concurrency 8 --repeats 3 --out results/mstar_c8.json
+
+VoxCPM2 notes
+-------------
+
+- Install with ``pip install -e '.[voxcpm2]'`` and serve with
+  ``mstar serve voxcpm2 --gpus 0``. ``/v1/audio/speech`` takes the text alone
+  (zero-shot), a voice description in ``instructions`` (voice design), a
+  ``ref_audio`` clip (cloning) or ``ref_audio`` with its transcript in
+  ``ref_text`` (continuation). Output is 48 kHz.
+- The Talker's decode step (both LMs, the local DiT solve, the stop head) is
+  ``torch.compile``'d and captured as CUDA graphs at start-up, so the first
+  start-up takes about ten minutes. ``model_kwargs: {compile_talker: false}``
+  in the deployment YAML captures the eager step instead: on a B200 the server
+  is up in about 15 seconds, with about a third less throughput at
+  concurrency 1 and a sixth less at concurrency 8.
+
 Nemotron VoiceChat (``nemotron_duplex``) notes
 ----------------------------------------------
 
