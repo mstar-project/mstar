@@ -7,8 +7,10 @@ twelve times, so an unpinned one added later would quietly allow it again.
 """
 import importlib.metadata
 import logging
+import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -74,7 +76,11 @@ def installed(monkeypatch):
             if dist in dists:
                 return dists[dist]
             raise importlib.metadata.PackageNotFoundError(dist)
+        def no_record(dist):
+            raise importlib.metadata.PackageNotFoundError(dist)
         monkeypatch.setattr(importlib.metadata, "version", fake_version)
+        # the real distributions' RECORDs would decide between the fake ones
+        monkeypatch.setattr(importlib.metadata, "distribution", no_record)
         monkeypatch.setattr(tensors, "_mooncake_version_checked", False)
     return install
 
@@ -96,6 +102,93 @@ def test_a_patched_or_unreadable_version_is_quiet(installed, caplog, version):
     with caplog.at_level(logging.WARNING, logger=tensors.logger.name):
         tensors._warn_if_mooncake_unpatched()
     assert caplog.records == []
+
+
+@pytest.mark.parametrize("broken", [None, UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")])
+def test_a_version_that_cannot_be_read_is_quiet(installed, caplog, monkeypatch, broken):
+    """Stale or corrupt metadata beside a working engine must not stop it
+    from starting: no Version field, or a METADATA that isn't UTF-8."""
+    installed("0.3.11.post1")
+
+    def version(dist):
+        if isinstance(broken, Exception):
+            raise broken
+        return broken
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    with caplog.at_level(logging.WARNING, logger=tensors.logger.name):
+        tensors._warn_if_mooncake_unpatched()
+    assert caplog.records == []
+
+
+OLD, NEW = b"engine 0.3.11.post1", b"engine 0.3.13.post1"
+
+
+def _engine_record(root, dist, content: bytes, on_disk: bytes):
+    """A distribution under ``root`` whose RECORD hashes ``content`` for the
+    engine, while the engine on disk holds ``on_disk``."""
+    import base64
+    import hashlib
+    engine = root / "mooncake" / "engine.so"
+    engine.parent.mkdir(parents=True, exist_ok=True)
+    engine.write_bytes(on_disk)
+    digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode()
+    info = root / f"{dist.replace('-', '_')}-0.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(f"Name: {dist}\nVersion: 0\n")
+    (info / "RECORD").write_text(f"mooncake/engine.so,sha256={digest},{len(content)}\n")
+    return importlib.metadata.PathDistribution(info)
+
+
+def _warn_with_engine(monkeypatch, caplog, dists, imported):
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda name: dists[name])
+    monkeypatch.setitem(sys.modules, "mooncake.engine", SimpleNamespace(__file__=str(imported)))
+    with caplog.at_level(logging.WARNING, logger=tensors.logger.name):
+        tensors._warn_if_mooncake_unpatched()
+    return [r.getMessage() for r in caplog.records]
+
+
+def test_the_imported_engine_decides_between_installed_distributions(installed, caplog, monkeypatch, tmp_path):
+    """A patched default wheel, then an unpatched non-CUDA one over it: both
+    report a version, but the engine on disk is the old one."""
+    installed("0.3.13.post1", **{"non-cuda": "0.3.11.post1"})
+    dists = {
+        "mooncake-transfer-engine": _engine_record(tmp_path, "mooncake-transfer-engine", NEW, OLD),
+        "mooncake-transfer-engine-non-cuda": _engine_record(tmp_path, "mooncake-transfer-engine-non-cuda", OLD, OLD),
+    }
+    warnings = _warn_with_engine(monkeypatch, caplog, dists, tmp_path / "mooncake" / "engine.so")
+    assert len(warnings) == 1
+    assert "mooncake-transfer-engine-non-cuda 0.3.11.post1" in warnings[0]
+
+
+def test_a_patched_engine_that_is_not_imported_does_not_count(installed, caplog, monkeypatch, tmp_path):
+    """Each in its own site directory, both engines match their RECORDs; the
+    old one comes first on the path, so it is the one running."""
+    installed("0.3.13.post1", **{"non-cuda": "0.3.11.post1"})
+    dists = {
+        "mooncake-transfer-engine": _engine_record(tmp_path / "late", "mooncake-transfer-engine", NEW, NEW),
+        "mooncake-transfer-engine-non-cuda": _engine_record(
+            tmp_path / "early", "mooncake-transfer-engine-non-cuda", OLD, OLD),
+    }
+    warnings = _warn_with_engine(monkeypatch, caplog, dists, tmp_path / "early" / "mooncake" / "engine.so")
+    assert len(warnings) == 1
+    assert "mooncake-transfer-engine-non-cuda 0.3.11.post1" in warnings[0]
+
+
+class _UnreadableRecord:
+    @property
+    def files(self):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+
+def test_unreadable_records_fall_back_to_any_patched_one(installed, caplog, monkeypatch, tmp_path):
+    """A corrupt RECORD must not stop the engine from starting; with no hash
+    to compare, a patched distribution anywhere keeps it quiet as before."""
+    installed("0.3.13.post1", **{"non-cuda": "0.3.11.post1"})
+    engine = tmp_path / "engine.so"
+    engine.write_bytes(OLD)
+    dists = {name: _UnreadableRecord() for name in ("mooncake-transfer-engine", "mooncake-transfer-engine-non-cuda")}
+    assert _warn_with_engine(monkeypatch, caplog, dists, engine) == []
 
 
 def test_a_patched_distribution_beside_stale_metadata_is_quiet(installed, caplog):
