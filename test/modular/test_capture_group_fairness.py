@@ -9,6 +9,10 @@ new request's prefill on the same worker waited until one group finished.
 The fairness yield did fire, but its batch came from the excluded node's own
 backlog, so it went straight back to T3; and on the serial path every off-group
 row parked again behind the step that drained the last one.
+
+Skipping that backlog on every yield is not right either: the other nodes then
+get a turn per group instead of per round of groups, twice the s3gen steps per
+decoded token with half the chunks each, which costs audio throughput.
 """
 
 from __future__ import annotations
@@ -51,17 +55,27 @@ def _scene(groups):
 # -- the two lines -------------------------------------------------------------
 
 
-def test_an_excluded_backlog_leaves_room_for_another_ready_node():
+def test_an_excluded_backlog_runs_once_then_leaves_room_for_another_ready_node():
     manager, sched = _scene(MIXED)
     sched.runtime = manager.runtime
     manager.queues["wg0"]._ready.pop(1)
+    manager.queues["wg0"]._ready.pop(0)
+
     sched.backlog[(NODE, WALK)] = _batch([1])
-
-    batch = sched.get_next_batch(manager, exclude_target=(NODE, WALK))
-
-    assert batch is not None and batch.node_name == OTHER, (
-        "the yield-away pass was served the excluded node's own backlog"
+    first = sched.get_next_batch(manager, exclude_target=(NODE, WALK))
+    assert first.node_name == NODE and list(first.request_to_worker_graph) == [1], (
+        "the other group's turn in this round was skipped"
     )
+
+    sched.backlog[(NODE, WALK)] = _batch([0])
+    second = sched.get_next_batch(manager, exclude_target=(NODE, WALK))
+    assert second is not None and second.node_name == OTHER, (
+        "the yield-away pass was served the excluded node's own backlog again"
+    )
+
+    # OTHER had its step, so the next round starts with the backlog again
+    third = sched.get_next_batch(manager, exclude_target=(NODE, WALK))
+    assert third.node_name == NODE and list(third.request_to_worker_graph) == [0]
 
 
 def test_an_excluded_backlog_still_runs_once_nothing_else_is_ready():
@@ -69,11 +83,13 @@ def test_an_excluded_backlog_still_runs_once_nothing_else_is_ready():
     sched.runtime = manager.runtime
     manager.queues["wg0"]._ready.clear()
     sched.backlog[(NODE, WALK)] = _batch([1])
+    assert sched.get_next_batch(manager, exclude_target=(NODE, WALK)).node_name == NODE
 
+    sched.backlog[(NODE, WALK)] = _batch([0])
     assert sched.get_next_batch(manager, exclude_target=(NODE, WALK)) is None
     # the main loop's unexcluded fallback pass
     batch = sched.get_next_batch(manager)
-    assert batch.node_name == NODE and list(batch.request_to_worker_graph) == [1]
+    assert batch.node_name == NODE and list(batch.request_to_worker_graph) == [0]
 
 
 def test_a_fresh_off_group_row_goes_back_on_a_backlog_step():
@@ -89,6 +105,45 @@ def test_a_fresh_off_group_row_goes_back_on_a_backlog_step():
         "the other group's fresh row parked, handing the key a backlog again"
     )
     assert result.backlog is None
+
+
+def test_a_fresh_off_group_row_parks_when_no_backlogged_row_ran():
+    # Row 2 is backlogged but blocked (OOM backoff, pending remove, not
+    # ready), so only fresh rows run. Returned, row 1 would lose the group to
+    # row 0 on every step for as long as row 2 stays blocked.
+    groups = {0: False, 1: True, 2: False}
+    result = FIFOBatchBuilder().build_batch(BatchBuildRequest(
+        node_name=NODE, graph_walk=WALK,
+        backlog=_batch([2]), fresh=_batch([0, 1]), blocked_rids={2},
+        max_batch_size=32, capture_group=groups.get,
+    ))
+
+    assert list(result.scheduled.request_to_worker_graph) == [0]
+    assert not result.returned, "the other group's row went back behind row 0 again"
+    assert sorted(result.backlog.request_to_worker_graph) == [1, 2]
+
+
+def test_serial_path_alternates_groups_beside_a_blocked_backlogged_row():
+    manager = _Manager([0, 1])
+    manager.per_request_info[2] = object()
+    sched = _scheduler(_Engine(max_bs=32, groups=MIXED, not_ready={2}))
+    sched.runtime = manager.runtime
+    sched.backlog[(NODE, WALK)] = _batch([2])
+    ready = manager.queues["wg0"]._ready
+    order = []
+    for _ in range(8):
+        batch = sched.get_next_batch(manager)
+        order.append(sorted(batch.request_to_worker_graph))
+        for rid in batch.request_to_worker_graph:
+            manager.in_flight.discard((rid, NODE))
+            manager.ingest(rid)
+        # the runtime scans its queues in request order, not by arrival
+        rows = sorted(ready.items())
+        ready.clear()
+        ready.update(rows)
+    assert [1] in order[:2] and order.count([0]) == order.count([1]), (
+        f"a blocked backlogged row starved one group: {order}"
+    )
 
 
 # -- serial path: the scheduler alone ------------------------------------------
@@ -214,14 +269,17 @@ class _Loop:
         )
 
 
-def _first_service_async(groups, steps=200, peek=True, max_consecutive=1024):
-    """The worker step at which OTHER first runs, or None."""
+def _async_order(groups, steps=200, peek=True, max_consecutive=1024, other_stays_ready=False):
+    """What each worker step ran: OTHER, or the sorted NODE rids. With
+    ``other_stays_ready`` OTHER goes ready again after every step it runs, as
+    s3gen does while decode keeps producing chunks; otherwise the run stops
+    at OTHER's first step."""
     manager, sched = _scene(groups)
     sched.runtime = _AsyncRuntime(manager)
     loop = _Loop(sched, manager)
     fair = _SpecFairness(peek=peek, max_consecutive=max_consecutive)
-    pending, consecutive = None, 0
-    for step in range(steps):
+    pending, consecutive, order = None, 0, []
+    for _ in range(steps):
         speculation, yield_away = loop._build_speculation(pending, consecutive, fair)
         if pending is not None:
             # N completes: its rids are re-readied unless N+1 already holds them
@@ -243,20 +301,46 @@ def _first_service_async(groups, steps=200, peek=True, max_consecutive=1024):
             if batch is None:
                 batch = sched.get_next_batch(manager)
         if batch is None:
-            return None
+            break
         if batch.node_name == OTHER:
-            return step
+            order.append(OTHER)
+            if not other_stays_ready:
+                break
+            manager.queues["wg0"]._ready[2] = {OTHER}
+            pending = None
+            continue
+        order.append(tuple(sorted(batch.request_to_worker_graph)))
         sched._set_in_flight(NODE, batch.request_to_worker_graph, True)
         pending = SimpleNamespace(
             batch=batch, node_name=NODE, graph_walk=WALK, tp_seq=-1,
             node_batch=SimpleNamespace(admit_error=None),
         )
-    return None
+    return order
+
+
+def _first_service_async(groups, **kwargs):
+    """The worker step at which OTHER first runs, or None."""
+    order = _async_order(groups, **kwargs)
+    return len(order) - 1 if order and order[-1] == OTHER else None
+
+
+def _rids_per_turn(order):
+    """For each stretch of NODE steps between two OTHER steps: how many steps
+    each rid took part in."""
+    turns, current = [], {}
+    for step in order:
+        if step == OTHER:
+            turns.append(current)
+            current = {}
+        else:
+            for rid in step:
+                current[rid] = current.get(rid, 0) + 1
+    return turns[1:]  # the stretch before the first OTHER step is a warm-up
 
 
 def test_async_path_serves_the_other_node_beside_two_groups():
     first = _first_service_async(MIXED)
-    assert first is not None and first <= 4, (
+    assert first is not None and first <= 5, (
         f"OTHER first ran at step {first}: every fairness yield went back to "
         "the decode node's own backlog"
     )
@@ -266,8 +350,21 @@ def test_async_path_with_one_group_is_unchanged():
     assert _first_service_async(SAME) == 2
 
 
+def test_two_groups_share_the_other_node_like_one_group_does():
+    # Between two s3gen steps each guidance group decodes as many tokens as a
+    # single group does: s3gen then gets the same share per decoded token, so
+    # its batches are as large. A turn per group would halve them.
+    same = _rids_per_turn(_async_order(SAME, steps=60, other_stays_ready=True))
+    mixed = _rids_per_turn(_async_order(MIXED, steps=60, other_stays_ready=True))
+    assert same and set(map(str, same)) == {str({0: 2, 1: 2})}
+    assert len(mixed) >= 5, f"OTHER ran only {len(mixed) + 1} times: {mixed}"
+    assert all(turn == {0: 2, 1: 2} for turn in mixed), (
+        f"tokens per rid between OTHER steps: two groups {mixed}, one group {same[0]}"
+    )
+
+
 def test_the_consecutive_cap_alone_no_longer_needs_the_peek():
     # MSTAR_MAX_CONSECUTIVE_SPEC_STEPS=1 yields every step; the yield has to
     # reach the other node rather than the decode node's backlog
-    first = _first_service_async(MIXED, max_consecutive=1)
-    assert first is not None and first <= 4, f"OTHER first ran at step {first}"
+    first = _first_service_async(MIXED, peek=False, max_consecutive=1)
+    assert first is not None and first <= 5, f"OTHER first ran at step {first}"
