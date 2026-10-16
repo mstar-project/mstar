@@ -30,7 +30,8 @@ Procedural knowledge — how to run a benchmark, how to debug a hang — belongs
 
 1. Add `ANTHROPIC_API_KEY` as an **organization** secret on `mstar-project` (Settings → Secrets and variables → Actions), scoped to this repository. Bill it to a project account rather than a personal one so usage is attributable.
 2. Create a `skip-ai-review` label (applying it to a PR skips the automatic review) and an `ai-review-thorough` label (applying it runs one thorough review).
-3. Nothing else. The workflow is advisory, so it needs no branch-protection change.
+3. Install the Claude GitHub App on the repository (https://github.com/apps/claude, or `/install-github-app` in Claude Code). The action exchanges the job's OIDC token for the app's token and posts as the app.
+4. Nothing else. The workflow is advisory, so it needs no branch-protection change.
 
 Until the secret exists the job logs a warning and exits green, so the workflow can land first.
 
@@ -67,4 +68,4 @@ Current levers, roughly in order of effect: only contributors' PRs are reviewed 
 
 ## Threat model
 
-`pull_request_target` and `issue_comment` run with secrets on PRs from forks, so the PR's contents and comments are untrusted input. A comment only selects the mode, by exact match in the job's `if`; its text never reaches a shell or the prompt. The workflow never executes PR code, checks the PR out only into `pr-head/`, reads its rules from the base tree, disables mutation and network tools, and holds write permission on pull requests alone. The residual risk is prompt injection producing a misleading comment — annoying, not dangerous. Preserve all four properties listed in the workflow header when editing it.
+`pull_request_target` and `issue_comment` run with secrets on PRs from forks, so the PR's contents and comments are untrusted input. A comment only selects the mode, by exact match in the job's `if`; its text never reaches a shell or the prompt. The workflow never executes PR code, checks the PR out only into `pr-head/`, reads its rules from the base tree, disables mutation and network tools, and allows only two write tools (inline comments and `gh pr comment`). It posts as the Claude GitHub App, whose installation token can carry broader repository permissions than the job's own `pull-requests: write`; the tool allowlist is what keeps a prompt injection to a bad comment, so keep it narrow. The residual risk is prompt injection producing a misleading comment — annoying, not dangerous. Preserve all four properties listed in the workflow header when editing it.
