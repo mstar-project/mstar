@@ -330,6 +330,28 @@ def test_grouped_path_at_tp1_expert_width(tokens, monkeypatch, fp32_matmul):
     _assert_near_oracle(got, _oracle(p, x, topk_w, topk_ids, None), grouped=True)
 
 
+@gpu
+def test_new_token_counts_reuse_the_compiled_grouped_kernels(layer, monkeypatch, fp32_matmul):
+    """A prefill window or a prefix hit's tail can be any length: past the pair bound a new
+    count must not compile the grouped kernels again (each did, ~1.4 s mid-request), as long
+    as its pairs fill the same power of two."""
+    tuning = _use(monkeypatch, "_H100")
+    kernels = (decode._plan_kernel, decode._grouped_gate_up_kernel, decode._grouped_down_kernel)
+
+    def compiled():
+        return sum(len(k.device_caches[torch.cuda.current_device()][0]) for k in kernels)
+
+    for i, tokens in enumerate((521, 600, 777, 900)):  # 8 pairs each: 4168..7200 of 8192
+        assert tokens > tuning.pair_max_tokens
+        x = torch.randn(tokens, 6144, device="cuda").bfloat16()
+        topk_w, topk_ids = _routing(tokens)
+        got = decode.experts(x, *_experts(layer), topk_w, topk_ids, block_size=BLOCK)
+        _assert_near_oracle(got, _oracle(layer, x, topk_w, topk_ids, None), grouped=True)
+        if i == 0:
+            first = compiled()
+    assert compiled() == first
+
+
 def test_the_router_refuses_more_tokens_than_its_tile_holds():
     """All T tokens share one router tile; at 129+ on the H200 table the first launch
     raised OutOfResources. The models send at most 64 tokens here."""

@@ -34,7 +34,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, PrefixStream
 from mstar.model.glm5_next.config import (
     ATTN,
     KDA,
@@ -49,6 +49,10 @@ from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import sampling_kwargs
 
 logger = logging.getLogger(__name__)
+
+# the one-shot all-reduce's workspace: messages up to this size take it, a full decode
+# batch of verify blocks among them (FlashInfer picks one- or two-shot by size)
+AR_ONESHOT_MAX_BYTES = 2 << 20
 
 
 def process_weights_after_loading(root: torch.nn.Module, device: torch.device) -> None:
@@ -117,6 +121,8 @@ class Glm5NextModel(Model):
             self.config = Glm5NextModelConfig()
         if "moe_quant_kernel" in kwargs:
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
+        if "allreduce_oneshot" in kwargs:
+            self.config.allreduce_oneshot = bool(kwargs["allreduce_oneshot"])
         if "mtp_num_draft_tokens" in kwargs:
             self.config.mtp_num_draft_tokens = int(kwargs["mtp_num_draft_tokens"])
         if "prefill_graphs" in kwargs:
@@ -199,6 +205,17 @@ class Glm5NextModel(Model):
     # Model ABC: KV cache config
     # -------------------------------------------------------------------
 
+    def checkpoint_path(self) -> str | None:
+        return self._resolve_checkpoint()
+
+    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+        """Under dsa_long_context the prompt's ids key the MLA cache and the KDA state's
+        snapshots beside it: a hit needs both. Replies are not keyed, as GLM-5.2's."""
+        if not self.config.dsa_long_context:
+            return {}
+        stream = PrefixStream("text_inputs", "ids", "prefill")
+        return {KV_CACHE: {"main": stream}, KDA_STATE: {"main": stream}}
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """The LLM node's five resources."""
         num_kv_layers = self.config.num_kv_planes
@@ -258,6 +275,9 @@ class Glm5NextModel(Model):
                     num_layers=len(self.config.kda_layer_indices),
                     blocks=kda_blocks,
                     max_slots=self.kda_max_requests + 1,  # + the sink
+                    # prefix reuse past a long prompt: its KDA state at page boundaries
+                    prefix_slots=16 if self.config.dsa_long_context else 0,
+                    prefix_page_size=128,
                 ),
             ),
             LinearAttnSpec(
@@ -286,9 +306,7 @@ class Glm5NextModel(Model):
         if "top_k" in model_kwargs:
             params["top_k"] = int(model_kwargs["top_k"])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
-            # MTP drafting is greedy-only: greedy is the DECLARED default
-            # on MTP configs so a bare request serves coherently; an EXPLICIT
-            # temperature > 0 still reaches the refusal.
+            # greedy is the declared default on MTP configs; a request asks for a temperature
             params["temperature"] = 0.0
         return {SAMPLER: SamplingReqConfig(**params)}
 
@@ -435,14 +453,15 @@ class Glm5NextModel(Model):
             raise ValueError(f"GLM-5.3 is served without min_p (min_p={kwargs['min_p']}); send none")
 
         if self.config.mtp_num_draft_tokens > 0:
-            # MTP verifies by argmax. Refused here it is the client's 400; the worker's
-            # refusal was a 500, after the request had reached every rank
-            temperature = float(kwargs.get("temperature", 0.0))
+            # MTP's verify samples speculatively but tracks no seen tokens. Refused here it is
+            # the client's 400; the worker's refusal was a 500, after the request had reached
+            # every rank
             penalty = float(kwargs.get("repetition_penalty", self.config.repetition_penalty))
-            if temperature > 0.0 or penalty != 1.0:
+            min_p = float(kwargs.get("min_p") or 0.0)
+            if penalty != 1.0 or min_p > 0.0:
                 raise ValueError(
-                    f"MTP drafting is greedy only (temperature={temperature}, "
-                    f"repetition_penalty={penalty}); serve with mtp_num_draft_tokens: 0"
+                    f"MTP takes no repetition_penalty or min_p (repetition_penalty={penalty}, "
+                    f"min_p={min_p}); serve with mtp_num_draft_tokens: 0"
                 )
 
         if self._tokenizer_mode == "byte":
@@ -487,8 +506,11 @@ class Glm5NextModel(Model):
     def max_decode_steps(self) -> int:
         """Decode iterations a one-token prompt can run before its context
         reaches the context limit or its cache rows reach kv_rows (an MTP step
-        stores k + 1); check_stop stops every request before either."""
+        with holes stores k + 1; under mtp_trims the rows follow the context);
+        check_stop stops every request before either."""
         cfg = self.config
+        if cfg.mtp_trims:
+            return cfg.context_limit - 1
         return min(cfg.context_limit - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
 
     def stop_token_ids(self) -> frozenset[int]:
@@ -590,6 +612,13 @@ class Glm5NextModel(Model):
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
+        if self.config.allreduce_oneshot and tp_group is not None and tp_group.world_size > 1:
+            # collective over the TP group; every rank builds the LLM here
+            dtype = language_model.model.norm.weight.dtype
+            hidden = self.config.hidden_size
+            tp_group.init_allreduce_fusion(
+                hidden, dtype, max_tokens=AR_ONESHOT_MAX_BYTES // (hidden * dtype.itemsize),
+                all_reduce=True)
         # The declared conv-tail dtype must match the loaded projections.
         self.kda_conv_dtype = language_model.kda_conv_dtype()
 

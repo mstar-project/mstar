@@ -46,6 +46,13 @@ def test_mtp_loop_cap_is_held_to_the_cache_rows():
     assert _decode(m).max_iters == min(cfg.index_topk - 1, (cfg.kv_rows - 1) // 4)
 
 
+def test_under_trims_the_mtp_loop_cap_is_the_context():
+    m = _model(mtp_num_draft_tokens=3, dsa_long_context=True, max_seq_len=65536)
+    assert m.config.mtp_trims
+    # a step's rejected rows go back, and every step emits a token
+    assert _decode(m).max_iters == m.config.context_limit - 1
+
+
 def test_chat_template_returns_the_bare_ids():
     class ChatTokenizer:
         chat_template = "{{ messages }}"

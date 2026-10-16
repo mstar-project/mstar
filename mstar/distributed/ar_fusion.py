@@ -72,3 +72,22 @@ def allreduce_add_rmsnorm(
 @allreduce_add_rmsnorm.register_fake
 def _(x, residual, weight, eps, weight_bias, ws_id):
     return torch.empty_like(x), torch.empty_like(residual)
+
+
+@torch.library.custom_op("mstar::allreduce", mutates_args=())
+def allreduce(x: torch.Tensor, ws_id: int) -> torch.Tensor:
+    """``allreduce(x)`` alone, by the workspace's one-shot kernel."""
+    import flashinfer.comm as fc
+
+    out = torch.empty_like(x)
+    fc.allreduce_fusion(
+        input=x, workspace=_WORKSPACES[ws_id], pattern=fc.AllReduceFusionPattern.kAllReduce,
+        launch_with_pdl=True, output=out, fp32_acc=True, trigger_completion_at_end=True,
+    )
+    return out
+
+
+@allreduce.register_fake
+def _(x, ws_id):
+    return torch.empty_like(x)
+

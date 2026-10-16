@@ -23,7 +23,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.attn.sparse_mla import check_flashinfer
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, PrefixStream
 from mstar.model.glm52.components.indexer import full_indexer_layers
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
@@ -217,6 +217,20 @@ class Glm52Model(Model):
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
+
+    def checkpoint_path(self) -> str | None:
+        return self._resolve_checkpoint()
+
+    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+        """The prompt's ids key the latent cache, and under dsa_long_context the index
+        keys beside it: a hit needs both. Replies are not keyed: the chat template
+        renders a reply again, and under TP each rank's host reads a reply's ids at its
+        own step, where the ranks' indexes have to change in step."""
+        stream = PrefixStream("text_inputs", "ids", "prefill")
+        streams = {KV_RESOURCE: {"main": stream}}
+        if self.config.dsa_long_context:
+            streams[INDEX_KV_RESOURCE] = {"main": stream}
+        return streams
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         # Absorbed MLA caches one latent row per token per layer
@@ -422,12 +436,11 @@ class Glm52Model(Model):
         if sampling.min_p > 0:
             # the node's sampler is built without min-p: a 400 here, not the worker's 500
             raise ValueError(f"GLM-5.2 is served without min_p (min_p={sampling.min_p}); send none")
-        if self.config.mtp_num_draft_tokens > 0 and (
-                sampling.temperature != 0 or sampling.repetition_penalty != 1):
+        if self.config.mtp_num_draft_tokens > 0 and sampling.repetition_penalty != 1:
             # what prepare_inputs refuses, as a 500 once every rank had the request
             raise ValueError(
-                f"MTP drafting is greedy only (temperature={sampling.temperature}, "
-                f"repetition_penalty={sampling.repetition_penalty}); serve with mtp_num_draft_tokens: 0"
+                f"MTP takes no repetition_penalty (repetition_penalty={sampling.repetition_penalty}); "
+                "serve with mtp_num_draft_tokens: 0"
             )
 
         if self._tokenizer_mode == "byte":
@@ -481,10 +494,7 @@ class Glm52Model(Model):
             if model_kwargs.get(k) is not None:
                 params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
-            # MTP is greedy-only, so greedy is the declared default on MTP
-            # configs: a bare request serves instead of inheriting the config
-            # temperature and being refused by prepare_inputs. An explicit
-            # temperature > 0 still refuses.
+            # greedy is the declared default on MTP configs; a request asks for a temperature
             params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
 

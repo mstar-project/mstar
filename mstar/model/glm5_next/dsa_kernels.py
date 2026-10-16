@@ -20,8 +20,13 @@ import torch
 import triton
 import triton.language as tl
 
+# Per-row metadata (pages, page_start, row_req, pos) arrives as slices at any offset, and
+# lengths are any count: specialized on alignment or divisibility, each new combination would
+# compile mid-request. Their loads are per row or gathers, which neither hint speeds up.
+_METADATA = ["pages", "page_start", "row_req", "pos"]
 
-@triton.jit
+
+@triton.jit(do_not_specialize_on_alignment=_METADATA)
 def _pool_keys_kernel(plane, pages, page_start, row_req, pos, ape,
                       W: tl.constexpr, D: tl.constexpr, KP: tl.constexpr, PAGE: tl.constexpr):
     """Program per step row; a row at the last position of a pool writes that pool's key."""
@@ -43,7 +48,7 @@ def _pool_keys_kernel(plane, pages, page_start, row_req, pos, ape,
     tl.store(plane + (page * PAGE + p % PAGE) * W + 2 * D + d, key.to(tl.bfloat16))
 
 
-@triton.jit(do_not_specialize=["splits"])
+@triton.jit(do_not_specialize=["max_pools", "splits"], do_not_specialize_on_alignment=_METADATA)
 def _decode_scores_kernel(q, w, plane, pages, page_start, row_req, pos, out, max_pools, splits,
                           NH: tl.constexpr, D: tl.constexpr, W: tl.constexpr,
                           KP: tl.constexpr, PAGE: tl.constexpr, BP: tl.constexpr):
@@ -69,7 +74,8 @@ def _decode_scores_kernel(q, w, plane, pages, page_start, row_req, pos, out, max
         tl.store(out + r.to(tl.int64) * max_pools + jj, sc, mask=live)
 
 
-@triton.jit(do_not_specialize=["splits"])
+@triton.jit(do_not_specialize=["start", "R", "max_pools", "splits"],
+            do_not_specialize_on_alignment=["pages", "pos"])
 def _prefill_scores_kernel(q, w, plane, pages, start, pos, out, R, max_pools, splits,
                            NH: tl.constexpr, D: tl.constexpr, W: tl.constexpr,
                            KP: tl.constexpr, PAGE: tl.constexpr, BR: tl.constexpr,
@@ -101,12 +107,12 @@ def _prefill_scores_kernel(q, w, plane, pages, start, pos, out, R, max_pools, sp
                  mask=live_r[:, None] & (j[None, :] < n[:, None]))
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=_METADATA)
 def _expand_slots_kernel(first, pos, row_req, pages, page_start, out, K, W,
                          KP: tl.constexpr, PAGE: tl.constexpr, BLOCK: tl.constexpr):
     """Program per row: the members of its selected pools (``first`` holds each pool's first
-    slot, -1 past the selection), then its tail ``[KP * pools, pos]``, packed from entry 0;
-    -1 after."""
+    slot over KP, -1 past the selection), then its tail ``[KP * pools, pos]``, packed from
+    entry 0; -1 after."""
     r = tl.program_id(0)
     p = tl.load(pos + r)
     pools = (p + 1) // KP
@@ -119,7 +125,7 @@ def _expand_slots_kernel(first, pos, row_req, pages, page_start, out, K, W,
         t = pools * KP + (e - n)                                    # tail position
         in_tail = (e >= n) & (t <= p)
         page = tl.load(pages + start + t // PAGE, mask=in_tail, other=0)
-        val = tl.where(in_pool, f + e % KP, tl.where(in_tail, page * PAGE + t % PAGE, -1))
+        val = tl.where(in_pool, f * KP + e % KP, tl.where(in_tail, page * PAGE + t % PAGE, -1))
         tl.store(out + r.to(tl.int64) * W + e, val, mask=e < W)
 
 

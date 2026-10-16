@@ -63,6 +63,8 @@ logger = logging.getLogger(__name__)
 
 # Captured prefill shapes when the config names none (prefill_graphs on). Buckets start
 # above the MoE decode path's 64 tokens: the fused runner routes padding rows safely.
+# the verify step that samples speculatively (a request with temperature > 0)
+SAMPLED = "sampled"
 # 128-token steps to 1024, then 64 up to one request's max, so a long prompt replays at most
 # 63 padding tokens; then 256 to 4096, so a step of several prompts pads at most 255.
 PREFILL_TOKEN_BUCKETS = (*range(128, 1024, 128), *range(1024, 2049, 64), *range(2304, 4097, 256))
@@ -71,6 +73,9 @@ PREFILL_CAPTURE_BATCH_SIZES = (1, 2, 4)
 # The rope slot of a rejected draft row: against a query rope part of ones, a -6.4e5 score term.
 HOLE_KPE = -1.0e4
 _VERDICT_TIMEOUT_S = 120.0
+# KDA snapshots one prompt may reserve: its last whole page and its newest window ends,
+# leaving the pool's other slots to other prompts
+_SNAPSHOTS_PER_PROMPT = 4
 
 
 def _fused_kda(config: Glm5NextModelConfig) -> bool:
@@ -118,6 +123,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self._mtp_len: torch.Tensor | None = None
         self._pad_slot: int | None = None
         self._pad_kpe: torch.Tensor | None = None
+        # prefix reuse: the KV page size an eager prefill's KDA snapshots fall on (None: off)
+        self._snapshot_page: int | None = None
         # accepted-draft counts since the last log line: a histogram over 0..k
         self._mtp_hist = [0] * (self.mtp_k + 1)
         self._mtp_logged = time.monotonic()
@@ -127,6 +134,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # CUDA graphs one sparse-attention plan per (capture slot, rows)
         self._dsa = DsaState()
         self._sparse_plans: dict[tuple[str, int, int], sparse_mla.SparseGraphPlan] = {}
+        # the first MLA attention, whose heads and scale every sparse plan takes
+        self._mla_attn: Glm5NextMLAAttention | None = None
         # per (walk, capture slot): the workspace and index buffer its plans share
         self._sparse_buffers: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         if config.dsa_long_context:
@@ -166,6 +175,16 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         kda = resources.get(KDA)
         if kda is not None and (kda.kernels is None or not _fused_kda(self.config)):
             kda.set_kernels(TorchKDAKernels())
+        # prefix reuse: an eager long prefill saves its KDA state at page boundaries
+        pool = resources.get(KDA_STATE)
+        self._snapshot_page = None
+        if pool is not None and pool.keeps_snapshots and KV_CACHE in resources:
+            page = resources[KV_CACHE].kv_cache.page_size
+            if pool.config.prefix_page_size != page:
+                raise ValueError(
+                    f"kda_state.prefix_page_size={pool.config.prefix_page_size} must equal the "
+                    f"KV page_size={page}: a snapshot is keyed by the page it ends")
+            self._snapshot_page = page
 
     # -- CUDA-graph configs ----------------------------------------------
 
@@ -279,6 +298,18 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 compile=False,
             ),
         ]
+        if self.mtp_k > 0:
+            # a verify step with a sampled request in it: speculative sampling
+            configs.append(BatchedCudaGraphConfig(
+                capture_graph_walk="decode",
+                additional_key_info=SAMPLED,
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                    input_seq_len=self.mtp_block, resource_step_info=SAMPLED,
+                ),
+                capture_batch_sizes=batch_sizes,
+                compile=False,
+            ))
         if self.config.prefill_graphs and not _fused_kda(self.config):
             # The reference KDA prefill loops over spans on the host, so a
             # captured replay would run the capture's dummy spans.
@@ -331,8 +362,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         text_inputs = inputs["text_inputs"][0]
         seq_len = text_inputs.shape[0]
+        sampled = False
         if self.mtp_k > 0:
-            self._check_mtp_sampling(fwd_info)
+            sampled = self._check_mtp_sampling(fwd_info)
             if graph_walk == "decode":
                 # one id in, the last emitted token: the step verifies it and k drafts
                 seq_len = self.mtp_block
@@ -344,7 +376,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         limit = self.config.context_limit
         # the handle, which the batch, check_stop and cleanup_request key by
         state = self.request_state(fwd_info.rid_handle)
-        committed = state.get("context", 0)
+        # cache rows: the context, less what _trim took back (its own counter: the GPU thread
+        # adds to the context while the plan thread trims)
+        committed = state.get("context", 0) - state.get("mtp_trimmed", 0)
         real = committed
         if self.mtp_k > 0 and graph_walk == "decode":
             # holes are cache rows, not context: the model sees the prompt and the
@@ -359,26 +393,35 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 "index_topk, where dense MLA is exactly GLM-5.3-Flash's DSA."
             )
         if graph_walk == "prefill":
+            # a hit's split sets it again after this; one from a refused admit must not stay
+            state.add("cached_prefix", 0)
             state.add("prompt_len", committed + seq_len)
             if self.mtp_k > 0:
                 state.add_all(mtp_generated=1, mtp_pending=None)
-        return ARNodeInputs(input_ids=text_inputs, input_seq_len=seq_len)
+                if self.config.mtp_trims:
+                    # mutated in place from here on: the plan thread trims while the GPU thread
+                    # records the next verdict (_trim, _read_verdicts)
+                    state.add_all(mtp_untrimmed=[], mtp_accepted={}, mtp_trimmed=0)
+        # a sampled request's verify step runs the sampled capture (`cg_key_info`)
+        return ARNodeInputs(input_ids=text_inputs, input_seq_len=seq_len,
+                            resource_step_info=SAMPLED if sampled and graph_walk == "decode"
+                            else None)
 
-    def _check_mtp_sampling(self, fwd_info: CurrentForwardPassInfo) -> None:
-        """MTP verifies by argmax: refuse what it would silently ignore."""
+    def _check_mtp_sampling(self, fwd_info: CurrentForwardPassInfo) -> bool:
+        """Whether this request samples (temperature > 0), which a verify step does by
+        speculative sampling; refuse what MTP would silently ignore."""
         cfg = fwd_info.resource_configs.get(SAMPLER) if fwd_info.resource_configs else None
         if cfg is None:
-            return
+            return False
         # not `or`: an explicit repetition_penalty of 0 must not read as unset
-        temperature = 0.0 if cfg.temperature is None else cfg.temperature
         penalty = 1.0 if cfg.repetition_penalty is None else cfg.repetition_penalty
-        if temperature > 0.0 or penalty != 1.0:
+        if penalty != 1.0 or (getattr(cfg, "min_p", None) or 0.0) > 0.0:
             raise RuntimeError(
-                f"request {fwd_info.request_id}: MTP drafting is greedy only "
-                f"(temperature={cfg.temperature}, "
-                f"repetition_penalty={cfg.repetition_penalty}); serve it with "
-                "mtp_num_draft_tokens: 0"
+                f"request {fwd_info.request_id}: MTP takes no repetition_penalty or min_p "
+                f"(repetition_penalty={cfg.repetition_penalty}, "
+                f"min_p={getattr(cfg, 'min_p', None)}); serve it with mtp_num_draft_tokens: 0"
             )
+        return (cfg.temperature or 0.0) > 0.0
 
     def declare_step(
         self,
@@ -403,21 +446,81 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             KDA_STATE: RecurrentStep(),
             KDA: LinearAttnStep(),
         }
+        sampled = any(inp.resource_step_info == SAMPLED for inp in inputs)
         if self.mtp_k > 0 and graph_walk == "decode":
-            # the verify and the drafts are argmaxes in the forward; the KDA layers first
-            # replay what the last step accepted
-            del steps[SAMPLER]
+            # the drafts are argmaxes in the forward, and so is a greedy step's verify; a
+            # sampled one samples speculatively with the sampler's per-request settings. The
+            # KDA layers first replay what the last step accepted
+            if sampled:
+                steps[SAMPLER] = SamplerStep(apply_penalty=False)
+            else:
+                del steps[SAMPLER]
             steps[KDA] = LinearAttnStep(speculative=True)
+            if self.config.mtp_trims:
+                self._trim(request_ids)
         if self.config.dsa_long_context:
             # every MLA layer attends sparse (dsa.py): no dense plan over the whole context
             del steps[ATTN]
+        kept, spares = self._snapshot_points(graph_walk, request_ids, inputs, slot_lease)
+        if kept or spares:
+            steps[KDA_STATE] = RecurrentStep(snapshots=kept, spare_snapshots=spares)
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
             steps=steps,
+            cg_key_info=SAMPLED if sampled else self._cg_key(graph_walk, request_ids),
         )
+
+    def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
+        if graph_walk == "prefill" and start > 0:
+            # a cached prefix: postprocess counts it as context, and the step runs eager
+            self.request_state(fwd_info.rid_handle).add("cached_prefix", start)
+        return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+
+    def cg_key_info(self, graph_walk: str, per_request_info: dict,
+                    per_request_input_metadata=None, **kwargs) -> str | None:
+        if self.mtp_k > 0 and graph_walk == "decode" and any(
+                (getattr(info.resource_configs.get(SAMPLER), "temperature", 0) or 0) > 0
+                for info in per_request_info.values() if info.resource_configs):
+            return SAMPLED
+        return self._cg_key(graph_walk, per_request_info)
+
+    def _cg_key(self, graph_walk: str, rids) -> str | None:
+        """Every capture's key (None), or for a prefill with a request past a cached prefix
+        one no capture has: a bucket's sparse plan holds whole prompts no longer than it."""
+        if graph_walk == "prefill" and any(
+                self.request_states[rid].get("cached_prefix", 0)
+                for rid in rids if rid in self.request_states):
+            return "eager"
+        return None
+
+    def _snapshot_points(
+        self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None,
+    ) -> tuple[tuple[tuple[str, str, int], ...], tuple[tuple[str, str, int], ...]]:
+        """Where an eager long prefill saves each request's KDA state for a later prompt that
+        shares it, kept and spare: its last whole page, which a next turn extending the prompt
+        needs, then as spares its windows' ends from the newest, where pages end. A spare takes
+        only a free slot, so it never evicts another session's last page. A captured prefill
+        saves nothing: its graph cannot stop at a request's page."""
+        if (self._snapshot_page is None or graph_walk != "prefill" or slot_lease is not None
+                or not self.config.dsa_long_context):
+            return (), ()
+        page, size = self._snapshot_page, self.config.prefill_window_tokens
+        kept, spares = [], []
+        for rid, inp in zip(request_ids, inputs, strict=True):
+            state, n = self.request_states.get(rid), inp.input_seq_len
+            start = state.get("cached_prefix", 0) if state is not None else 0
+            last = (start + n) // page * page
+            ends = sorted({start + k * size for k in range(1, -(-n // size))} - {last},
+                          reverse=True)
+            mine = [(rid, LABEL, last)] if start < last else []
+            room = _SNAPSHOTS_PER_PROMPT - len(mine)
+            kept += mine
+            spares += [(rid, LABEL, p) for p in ends if p % page == 0][:room]
+        return tuple(kept), tuple(spares)
 
     def preprocess(
         self,
@@ -507,8 +610,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                         torch.zeros(rows * width + 1, dtype=torch.int32, device=device))
                 sparse_plan = self._sparse_plans[key] = sparse_mla.SparseGraphPlan(
                     rows, width, buffers[0], buffers[1])
-            attn = next(m for m in self.language_model.modules()
-                        if isinstance(m, Glm5NextMLAAttention))
+            attn = self._mla_attn
+            if attn is None:
+                attn = self._mla_attn = next(m for m in self.language_model.modules()
+                                             if isinstance(m, Glm5NextMLAAttention))
             sparse_plan.plan(lens, attn.num_heads, cfg.kv_lora_rank, cfg.mla_cache_kpe,
                              attn.softmax_scale)
         return {
@@ -545,7 +650,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         keep, start = [1.0] * num_tokens, 0
         for rid, inp in zip(engine_inputs.request_ids, inputs, strict=True):
             state = self.request_states.get(rid)
-            fresh = state is None or state.get("context", 0) == 0
+            fresh = state is None or not (state.get("context", 0) or state.get("cached_prefix", 0))
             if fresh and inp.input_seq_len > 0 and start < num_tokens:
                 keep[start] = 0.0
             start += inp.input_seq_len
@@ -577,8 +682,35 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             real = set(ctx.request_ids if ctx is not None else engine_inputs.per_request_info)
             for row, rid in enumerate(engine_inputs.request_ids):
                 if rid in real:
-                    self.request_state(rid).add("mtp_pending", (seq, key, row))
+                    state = self.request_state(rid)
+                    state.add("mtp_pending", (seq, key, row))
+                    untrimmed = state.get("mtp_untrimmed")
+                    if untrimmed is not None:
+                        # its rejected rows go back once a later step is declared (_trim)
+                        untrimmed.append(seq)
         return to_device_async([seq], torch.long, self.lm_head.weight.device)
+
+    def _trim(self, request_ids: list[str]) -> None:
+        """mtp_trims: take back the rejected rows of every verify step older than the newest,
+        before this step is admitted. Every rank declares this step after the newest one was
+        preprocessed, and that one only after the GPU thread had read the verdicts before it,
+        so each rank trims the same steps at the same point, without waiting; the newest
+        step's verdict may not exist yet. The device already writes each block at the true
+        rows (_trim_on_device), so this moves the host's count only: its cache length and
+        context."""
+        kv = self.node_resources[KV_CACHE]
+        for rid in request_ids:
+            state = self.request_state(rid)
+            untrimmed = state.get("mtp_untrimmed")
+            if untrimmed is None or len(untrimmed) < 2:
+                continue
+            older = untrimmed[:-1]
+            accepted = state.get("mtp_accepted")
+            drop = sum(self.mtp_k - accepted.pop(seq) for seq in older)
+            del untrimmed[:len(older)]
+            if drop:
+                kv.correct_len(rid, LABEL, -drop)
+                state.add("mtp_trimmed", state.get("mtp_trimmed", 0) + drop)
 
     def _last_rows(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """Each row's last token, which a captured prefill reads at a fixed
@@ -651,11 +783,15 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         last = [r0 + n - 1 for r0, n, _ in ctx.spans]
         # one window: the step's own plans (one-token prompts plan as decode, unsplittable)
         split = total > size and len(ctx.spans) != total
+        # rows after which the KDA state is saved for prefix reuse (`_snapshot_points`)
+        cuts = self._snapshot_cuts(engine_inputs, ctx)
+        split = split or bool(cuts)
+        bounds = sorted({*range(size, total, size), *cuts, total}) if split else [total]
+        pool = engine_inputs.resources.get(KDA_STATE)
         hidden: list[torch.Tensor | None] = [None] * len(last)
         nxt = torch.roll(input_ids, -1) if self.mtp_k > 0 else None
         try:
-            for start in range(0, total, size if split else total):
-                end = min(start + size, total) if split else total
+            for start, end in zip([0, *bounds[:-1]], bounds, strict=True):
                 ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
                 with contextlib.ExitStack() as scope:
                     if split:
@@ -676,6 +812,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                         out = full.index_select(0, rows)
                 for k, (i, _) in enumerate(ends):
                     hidden[i] = out[k]
+                if end in cuts:
+                    pool.write_snapshot(*cuts[end])
             last_hidden = torch.stack(hidden)
             new_tokens = sampler.sample(engine_inputs.request_ids, logits=self.lm_head(last_hidden))
             if nxt is not None:
@@ -690,6 +828,20 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         finally:
             self._dsa.ctx = ctx
         return new_tokens
+
+    @staticmethod
+    def _snapshot_cuts(engine_inputs: ModelInputsFromEngine, ctx) -> dict[int, tuple]:
+        """The step's KDA snapshots by the row they follow, each from its request's first row."""
+        step = getattr(engine_inputs, "step", None)
+        rec = step.steps.get(KDA_STATE) if step is not None else None
+        snaps = (*getattr(rec, "snapshots", ()), *getattr(rec, "spare_snapshots", ()))
+        if not snaps:
+            return {}
+        # each request's first row and that row's position
+        first = {engine_inputs.request_ids[req]: (r0, ctx.host_pos[r0])
+                 for r0, n, req in ctx.spans if n}
+        return {first[rid][0] + tokens - first[rid][1]: (rid, label, tokens)
+                for rid, label, tokens in snaps}
 
     # -- MTP device side ---------------------------------------------------
 
@@ -734,8 +886,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     def _trim_on_device(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
         """mtp_trims: move this verify step's block to each request's true rows. The host
-        plans every block after the last one's whole block, as with holes, and never takes
-        rows back, so its cache, and every rank's, moves the same whatever was accepted;
+        plans every block after the last one's whole block, as with holes, before that one's
+        verdict exists (it takes the rows back two steps on, _trim);
         ``_mtp_len`` (each slot's tokens in cache, advanced by every verify on device) gives
         the true rows, and the rows' positions and the cache slots their latents and index
         keys go to follow them. A captured step keeps its plan, made for the longest rows, and
@@ -804,11 +956,17 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             drafts.append(self._draft_tokens(h, drafts[-1]))
         drafts = self._broadcast(torch.stack(drafts, 1))
 
-        # Verify: greedy, the longest prefix of drafts the target agrees with.
+        # Verify: the longest prefix of drafts the target agrees with, or a sampled step's
+        # speculative sampling.
         ids = torch.cat([input_ids.view(n, 1), drafts], 1).view(-1)
         hidden = lm.model(ids)
-        target = self._argmax(hidden).view(n, block)
-        accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
+        step = getattr(engine_inputs, "step", None)
+        if step is not None and step.cg_key_info == SAMPLED:
+            target, accepted = engine_inputs.resources[SAMPLER].speculative_sample(
+                engine_inputs.request_ids, self.lm_head(hidden).view(n, block, -1), drafts)
+        else:
+            target = self._argmax(hidden).view(n, block)
+            accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
         verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
         target, accepted = verdict[:, :block], verdict[:, block]
         kda.set_prefix_len(SpecBlocks.of(pool, 0), accepted)
@@ -941,6 +1099,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         out = [(table[p[2]][:k1], table[p[2]][k1]) for p in pending]
         for st, verdict in zip(states, out, strict=True):
             st.add("mtp_verdict", (seq, *verdict))
+            accepted = st.get("mtp_accepted")
+            if accepted is not None:
+                accepted[seq] = verdict[1]
         return out
 
     def unpack_packed_outputs(
@@ -987,7 +1148,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # The step ran, so its tokens are the request's context now.
         if inputs is not None:
             state = self.request_state(request_id)
-            state.add("context", state.get("context", 0) + inputs.input_seq_len)
+            # a cached prefix's tokens are context too, though this step did not run them
+            state.add("context", state.get("context", 0) + inputs.input_seq_len
+                      + state.get("cached_prefix", 0))
+            state.add("cached_prefix", 0)
         # Seed the next decode step from the emitted token: the walk's
         # text_inputs loop-back edge (get_graph_walk_graphs) carries it. An MTP
         # verify step already set it: the token after the accepted drafts.
@@ -1060,10 +1224,14 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         steps = request_info.dynamic_loop_iter_counts.get("decode_loop", 0)
         if request_info.graph_walk == "decode":
             steps += 1
-        # every verify step's block stays in the host's cache, holes or rows the device rewrote
-        prompt, room = state.get("prompt_len", 0), 2 * self.mtp_block
+        # Holes keep every verify step's block in the cache. Under mtp_trims it holds the
+        # context and the newest blocks: two, and a third while a step prepared inline has not
+        # been trimmed yet (prepare_inputs runs before declare_step there)
+        prompt = state.get("prompt_len", 0)
+        room = (3 if self.config.mtp_trims else 2) * self.mtp_block
         full = (prompt + generated + room > self.config.context_limit
-                or prompt + steps * self.mtp_block + room > self.config.kv_rows)
+                or (not self.config.mtp_trims
+                    and prompt + steps * self.mtp_block + room > self.config.kv_rows))
         if is_eos or generated >= request_info.max_tokens or full:
             return {"decode_loop"}
         return set()

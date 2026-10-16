@@ -559,6 +559,26 @@ def test_serve_yaml_caps_prefill_steps(name):
     assert serve["model_kwargs"]["prefill_max_step_tokens"] == "auto"
 
 
+@pytest.mark.parametrize("name", ["glm5_next_tp8_longctx.yaml", "glm5_next_tp8_longctx_mtp.yaml"])
+def test_longctx_yaml_keeps_two_snapshots_for_each_of_8_sessions(name):
+    """The yaml's prefix_slots reaches the KDA pool: a multi-turn session holds the snapshot its
+    turn restored and the one it saved."""
+    import yaml
+
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    serve = yaml.safe_load((Path(__file__).parents[2] / "configs" / name).read_text())
+    model = object.__new__(Glm5NextModel)
+    model.config = Glm5NextModelConfig()
+    model.config.dsa_long_context = True
+    model.kda_max_requests = 64
+    model.kda_conv_dtype = torch.bfloat16
+    specs = model.get_node_resources()
+    apply_yaml_overrides(specs, serve)
+    pool = next(s.config for s in specs if s.resource_key == KDA_STATE)
+    assert pool.prefix_slots == serve["resources"]["kda_state"]["prefix_slots"] >= 2 * 8
+
+
 def test_glm5next_model_constructs_from_config():
     """The five node resources, full-size and reduced."""
     model = object.__new__(Glm5NextModel)

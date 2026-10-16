@@ -146,6 +146,10 @@ class CommGroup:
         # see ``init_allreduce_fusion``
         self._ar_fusion_ws: int | None = None
         self._ar_fusion_max_tokens = 0
+        # (hidden, dtype) the workspace was built for, and of the messages ``all_reduce``
+        # sends through it when a model opts in
+        self._ar_fusion_shape: tuple[int, torch.dtype] | None = None
+        self._ar_oneshot: tuple[int, torch.dtype] | None = None
         self._symm_ar: _SymmAllReduce | None = None
 
     def _maybe_init_symm_allreduce(
@@ -244,9 +248,8 @@ class CommGroup:
         the symmetric-memory path this is the symm buffer, so ``all_reduce``
         skips its copy in and returns the sum in a new tensor: use its return
         value, and all-reduce nothing else on this group in between."""
-        if not torch.compiler.is_compiling() and self._symm_fits(
-            math.prod(shape) * dtype.itemsize, dtype
-        ):
+        if (not torch.compiler.is_compiling() and not self._oneshot_fits(shape, dtype)
+                and self._symm_fits(math.prod(shape) * dtype.itemsize, dtype)):
             return self._symm_ar.buffer(shape, dtype)
         return torch.empty(shape, dtype=dtype, device=device)
 
@@ -259,6 +262,15 @@ class CommGroup:
         # NCCL.
         nbytes = input_.numel() * input_.element_size()
         if (
+            self._ar_oneshot is not None
+            and self._oneshot_fits(tuple(input_.shape), input_.dtype)
+            and input_.is_cuda
+            and input_.is_contiguous()
+        ):
+            from mstar.distributed.ar_fusion import allreduce
+
+            return allreduce(input_, self._ar_fusion_ws)
+        if (
             self._symm_fits(nbytes, input_.dtype)
             and input_.is_cuda
             and input_.is_contiguous()
@@ -269,19 +281,46 @@ class CommGroup:
 
     def init_allreduce_fusion(
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
+        all_reduce: bool = False,
     ) -> bool:
         """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
-        hidden]`` inputs; larger inputs keep the NCCL path. Collective: every
-        member calls it at the same point. Returns whether it is available."""
-        if self.world_size == 1 or self._ar_fusion_ws is not None:
-            return self._ar_fusion_ws is not None
-        from mstar.distributed.ar_fusion import create_workspace
+        hidden]`` inputs; larger inputs keep the NCCL path. With ``all_reduce``,
+        ``all_reduce`` sends such inputs through its one-shot kernel too.
+        Collective: every member calls it at the same point. Returns whether it
+        is available."""
+        if self.world_size == 1:
+            return False
+        if self._ar_fusion_ws is None:
+            from mstar.distributed.ar_fusion import create_workspace
 
-        self._ar_fusion_ws = create_workspace(
-            self.rank, self.world_size, self.cpu_group, max_tokens, hidden, dtype,
-        )
-        self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
+            ws = create_workspace(
+                self.rank, self.world_size, self.cpu_group, max_tokens, hidden, dtype,
+            )
+            # every rank or none: one rank on NCCL while its peers spin in the one-shot
+            # kernel for its flag deadlocks the first all-reduce
+            if not _all_ranks_agree(ws is not None, self.cpu_group):
+                if ws is not None:
+                    logger.warning("all-reduce fusion: another rank could not build its "
+                                   "workspace; keeping NCCL")
+                ws = None
+            self._ar_fusion_ws = ws
+            self._ar_fusion_max_tokens = max_tokens if ws is not None else 0
+            self._ar_fusion_shape = (hidden, dtype) if ws is not None else None
+        if all_reduce and self._ar_fusion_ws is not None:
+            if self._ar_fusion_shape == (hidden, dtype):
+                self._ar_oneshot = (hidden, dtype)
+            else:
+                logger.warning("all-reduce fusion workspace is %s; not sending %s through it",
+                               self._ar_fusion_shape, (hidden, dtype))
         return self._ar_fusion_ws is not None
+
+    def _oneshot_fits(self, shape: tuple[int, ...], dtype: torch.dtype) -> bool:
+        return (
+            self._ar_oneshot is not None
+            and len(shape) == 2
+            and (shape[1], dtype) == self._ar_oneshot
+            and 0 < shape[0] <= self._ar_fusion_max_tokens
+        )
 
     def allreduce_add_rmsnorm(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,

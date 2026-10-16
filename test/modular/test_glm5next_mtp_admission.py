@@ -1,5 +1,6 @@
-"""MTP is greedy only: a sampling request is refused as a 400 by process_prompt,
-not as a 500 by the worker after it reached every rank."""
+"""MTP takes no repetition penalty or min_p: such a request is refused as a 400 by
+process_prompt, not as a 500 by the worker after it reached every rank. A temperature is
+served, by speculative sampling."""
 from types import SimpleNamespace
 
 import pytest
@@ -14,17 +15,19 @@ def _mtp_model() -> Glm5NextModel:
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"temperature": 0.7}, {"repetition_penalty": 1.1}, {"repetition_penalty": 0.9},
+    {"repetition_penalty": 1.1}, {"repetition_penalty": 0.9}, {"min_p": 0.1},
 ])
-def test_process_prompt_refuses_sampling_under_mtp(kwargs):
-    with pytest.raises(ValueError, match="greedy only"):
+def test_process_prompt_refuses_a_penalty_under_mtp(kwargs):
+    # min_p is refused for every request, before MTP's own check
+    with pytest.raises(ValueError, match="repetition_penalty|min_p"):
         _mtp_model().process_prompt("hi", ["text"], ["text"], **kwargs)
 
 
-def test_process_prompt_takes_greedy_under_mtp():
+def test_process_prompt_takes_greedy_and_sampled_requests_under_mtp():
     m = _mtp_model()
     assert m.process_prompt("hi", ["text"], ["text"])["text_inputs"][0].tolist() == [104, 105]
     m.process_prompt("hi", ["text"], ["text"], temperature=0.0, repetition_penalty=1.0)
+    m.process_prompt("hi", ["text"], ["text"], temperature=0.7, top_p=0.9)
 
 
 def test_the_worker_refuses_an_explicit_zero_penalty():
@@ -32,7 +35,7 @@ def test_the_worker_refuses_an_explicit_zero_penalty():
     sub = object.__new__(Glm5NextLLMSubmodule)
     info = SimpleNamespace(request_id="r", resource_configs={
         SAMPLER: SimpleNamespace(temperature=0.0, repetition_penalty=0.0)})
-    with pytest.raises(RuntimeError, match="greedy only"):
+    with pytest.raises(RuntimeError, match="repetition_penalty"):
         sub._check_mtp_sampling(info)
 
 
@@ -59,6 +62,20 @@ def test_shipped_configs_admit_one_request_per_kda_slot(name):
 
     cfg = yaml.safe_load((Path(__file__).resolve().parents[2] / "configs" / name).read_text())
     assert cfg["max_concurrent_requests"] == cfg["resources"]["kda_state"]["max_slots"] - 1
+
+
+def test_the_oneshot_all_reduce_is_opt_in_and_the_tp8_yamls_take_it():
+    from pathlib import Path
+
+    import yaml
+
+    assert not Glm5NextModel("x", tokenizer_mode="byte").config.allreduce_oneshot
+    m = Glm5NextModel("x", tokenizer_mode="byte", allreduce_oneshot=True)
+    assert m.config.allreduce_oneshot
+    for name in ("glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml", "glm5_next_tp8_longctx.yaml",
+                 "glm5_next_tp8_longctx_mtp.yaml"):
+        path = Path(__file__).resolve().parents[2] / "configs" / name
+        assert yaml.safe_load(path.read_text())["model_kwargs"]["allreduce_oneshot"] is True, name
 
 
 def test_bucket_overrides_reach_the_config():

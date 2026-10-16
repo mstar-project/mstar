@@ -55,19 +55,22 @@ def _mtp_cfg(k: int) -> Glm52ModelConfig:
 @pytest.mark.parametrize("k", [1, 3])
 def test_mtp_decode_captures_one_graph_over_the_block(k):
     """Under MTP the whole verify step is one decode capture of k+1 rows per request (one
-    id in), next to the same prefill captures as k=0, and no piecewise regions."""
+    id in), greedy and again for a step that samples, next to the same prefill captures as
+    k=0, and no piecewise regions."""
     cfg = _mtp_cfg(k)
     sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
     configs = sub.get_cuda_graph_configs(CPU)
-    (decode,) = [c for c in configs if isinstance(c, BatchedCudaGraphConfig)]
-    assert decode.capture_graph_walk == "decode"
-    assert decode.single_request_inputs.input_seq_len == k + 1
-    assert decode.single_request_inputs.input_ids.numel() == 1
-    assert decode.get_total_tokens(4) == [4 * (k + 1)]
-    assert decode.capture_batch_sizes == Glm52LLMSubmodule.MTP_CAPTURE_BATCH_SIZES
+    decodes = [c for c in configs if isinstance(c, BatchedCudaGraphConfig)]
+    assert [c.additional_key_info for c in decodes] == [None, "sampled"]
+    for decode in decodes:
+        assert decode.capture_graph_walk == "decode"
+        assert decode.single_request_inputs.input_seq_len == k + 1
+        assert decode.single_request_inputs.input_ids.numel() == 1
+        assert decode.get_total_tokens(4) == [4 * (k + 1)]
+        assert decode.capture_batch_sizes == Glm52LLMSubmodule.MTP_CAPTURE_BATCH_SIZES
     cfg.mtp_num_draft_tokens = 0
     plain = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg).get_cuda_graph_configs(CPU)
-    assert len(plain) == len(configs)
+    assert len(plain) == len(configs) - 1
     assert sub.get_piecewise_cuda_graph_configs(CPU, torch.bfloat16, tp_world_size=1) == {}
 
 

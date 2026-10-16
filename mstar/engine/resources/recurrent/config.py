@@ -396,3 +396,5 @@ class RecurrentStep(ResourceStep):
     # (rid, label, tokens): the forward saves the state its request reaches at ``tokens``
     # (``RecurrentStatePool.write_snapshot``) into a snapshot slot admit reserves
     snapshots: tuple[tuple[str, str, int], ...] = ()
+    # as ``snapshots``, but saved only into a free slot, and evicted before any of those
+    spare_snapshots: tuple[tuple[str, str, int], ...] = ()

@@ -211,8 +211,8 @@ def _scores_torch(q, w, view, ctx, req, pos, pools):
 
 def top_pools(scores: torch.Tensor, ctx: Glm5NextDsaContext, c0: int = 0,
               c1: int | None = None) -> torch.Tensor:
-    """``[rows, topk / kpool]`` int32: the slot of the first token of each row's top pools
-    (ties to the earlier pool), -1 past ``min(pools, topk / kpool)``."""
+    """``[rows, topk / kpool]`` int32: each row's top pools (ties to the earlier pool) as the
+    slot of their first token over kpool, -1 past ``min(pools, topk / kpool)``."""
     rows = slice(c0, c1)
     pos, req = ctx.pos[rows], ctx.row_req[rows]
     n = ((pos + 1) // ctx.kpool).to(torch.int32)
@@ -226,7 +226,7 @@ def top_pools(scores: torch.Tensor, ctx: Glm5NextDsaContext, c0: int = 0,
             tie_break=flashinfer.TopKTieBreak.SMALL, dsa_graph_safe=True,
             page_table_row_starts=ctx.page_start[req.long()].to(torch.int32),
             page_size=ctx.page_size // ctx.kpool)
-        return torch.where(pool_slots >= 0, pool_slots * ctx.kpool, -1)
+        return pool_slots  # the transform's own unit, a pool: expand_slots scales it
     # stable sort: equal scores keep pool order, so ties go to the earlier pool
     order = torch.sort(scores, dim=-1, descending=True, stable=True).indices[:, :k]
     if order.shape[1] < k:
@@ -234,7 +234,7 @@ def top_pools(scores: torch.Tensor, ctx: Glm5NextDsaContext, c0: int = 0,
     live = torch.arange(k, device=scores.device)[None, :] < n[:, None]
     first = _token_slots(ctx, req[:, None].long(), torch.where(live, order * ctx.kpool, 0),
                          ctx.page_size)
-    return torch.where(live, first, -1).to(torch.int32)
+    return torch.where(live, first // ctx.kpool, -1).to(torch.int32)
 
 
 def expand_slots(pool_first: torch.Tensor, ctx: Glm5NextDsaContext, c0: int = 0,
@@ -250,7 +250,7 @@ def expand_slots(pool_first: torch.Tensor, ctx: Glm5NextDsaContext, c0: int = 0,
     pos, req = ctx.pos[rows].long(), ctx.row_req[rows].long()
     kp, k = ctx.kpool, ctx.topk // ctx.kpool
     m = torch.arange(kp, device=pos.device)
-    tokens = torch.where(pool_first[..., None] >= 0, pool_first[..., None] + m, -1)
+    tokens = torch.where(pool_first[..., None] >= 0, pool_first[..., None] * kp + m, -1)
     out = torch.full((pos.shape[0], ctx.width + 1), -1, dtype=torch.int32, device=pos.device)
     out[:, :k * kp] = tokens.flatten(1)
     pools = (pos + 1) // kp

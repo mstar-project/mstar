@@ -1,8 +1,8 @@
 model: "glm52"
-# glm52_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-78 draft module (greedy
-# requests only). A verify step takes its rejected rows back from both KV resources (latents
-# and index keys) before the next step plans, and every verify row and the draft module's
-# own indexer select their top-2048 tokens like the trunk's. MTP's prefill over DSA runs eager.
+# glm52_tp8_longctx.yaml with MTP: 3 drafts a step from the layer-78 draft module. A verify
+# step takes its rejected rows back from both KV resources (latents and index keys) before
+# the next step plans, and every verify row and the draft module's own indexer select their
+# top-2048 tokens like the trunk's. MTP's prefill over DSA runs eager.
 #
 # KV per token per rank: 79 MLA layers x (512 + 64) x 2 B + 22 index layers x 128 x 2 B
 # ~= 96 KB, so the pools below hold about one full window, as glm52_tp8_longctx.yaml's.
@@ -36,18 +36,25 @@ resources:
   kv:
     max_num_pages: 2304
     page_size: 128
+    # the prefix cache at TP > 1: rank 0 decides each hit and the other ranks adopt it
+    prefix_cache_tp: true
   kv_index:
     max_num_pages: 2304
     page_size: 128
+    prefix_cache_tp: true
 # MTP's prefill over DSA runs eager, a short prompt's too (the buckets above only size
 # prefill_max_step_tokens), in row chunks past prefill_chunk_tokens, and its kernels compile on
 # first use. Four lengths (1k, 6k, 12.5k and 20k tokens) take those compiles before the server
 # binds, not the first request.
+# Each text is its own, so no warmup hits another's cached prefix and each compiles the long
+# prefill whole; the last two extend the 20k one, so a cached prefix's prefill compiles too.
 warmup_requests:
-  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 100, model_kwargs: {max_output_tokens: 4}}
+  - {text: "Every morning the baker opens the small shop. ", repeat: 100, model_kwargs: {max_output_tokens: 4}}
   - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 600, model_kwargs: {max_output_tokens: 4}}
-  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}
-  - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
+  - {text: "A slow green turtle walks past the old mill. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}
+  - {text: "Seven bright stars shine over the quiet harbor. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
+  - {text: "Seven bright stars shine over the quiet harbor. ", repeat: 2010, model_kwargs: {max_output_tokens: 4}}
+  - {text: "Seven bright stars shine over the quiet harbor. ", repeat: 2300, model_kwargs: {max_output_tokens: 4}}
 node_groups:
   - node_names: [LLM]
     ranks: [0, 1, 2, 3, 4, 5, 6, 7]

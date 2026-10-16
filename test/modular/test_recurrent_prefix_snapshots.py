@@ -74,10 +74,11 @@ def _ingest(run: StepRunner, rid: str, tokens: list[int]) -> None:
     run.ingest_request(rid, {POOL: KVReqConfig(prefix_keys={"main": chain(pages)})})
 
 
-def _step(rid: str, span: int, snapshots=(), keys=(POOL,)) -> SubmoduleStep:
+def _step(rid: str, span: int, snapshots=(), keys=(POOL,), spares=()) -> SubmoduleStep:
     seg = Segment(rid, "main", span)
     st = SubmoduleStep(segments=[seg], steps={
-        key: RecurrentStep(segments=(seg,), snapshots=tuple(snapshots)) if key == POOL
+        key: RecurrentStep(segments=(seg,), snapshots=tuple(snapshots),
+                           spare_snapshots=tuple(spares)) if key == POOL
         else RecurrentStep(segments=(seg,)) for key in keys})
     st.set_ctx(StepContext(request_ids=(rid,), graph_walk=WALK, slot=0, capture=False))
     return st
@@ -87,12 +88,15 @@ def _state(pool: RecurrentStatePool, rid: str) -> torch.Tensor:
     return pool.block("state", 0)[pool._slots[rid]["main"].index]
 
 
-def _prefill(run, pool, rid, tokens, saves) -> tuple[int, torch.Tensor]:
+def _prefill(run, pool, rid, tokens, saves, spares=()) -> tuple[int, torch.Tensor]:
     """One prefill step past whatever hit: the forward leaves the state at ``tokens`` -> value
-    for each boundary in ``saves`` and saves it there. Returns the hit and the restored state."""
+    for each boundary in ``saves`` and saves it there, as a spare at those in ``spares``.
+    Returns the hit and the restored state."""
     matched = run.resolve_cached_prefix(rid, NODE, WALK)
     run.apply_cached_prefix(rid, NODE, WALK, None, matched)
-    st = _step(rid, len(tokens) - matched, [(rid, "main", t) for t in saves if t > matched])
+    points = {spare: [(rid, "main", t) for t in saves if t > matched and (t in spares) == spare]
+              for spare in (False, True)}
+    st = _step(rid, len(tokens) - matched, points[False], spares=points[True])
     assert run.admit(st).ok
     run.plan(st)
     restored = _state(pool, rid).clone()
@@ -165,6 +169,27 @@ def test_the_oldest_snapshot_nothing_holds_goes_first():
     assert held == {16, 8} and pool._snap_by_key  # a@16 kept, c@8 took a@8's slot
     _ingest(run, "d", a[:8] + [77] * 9)
     assert pool.resolve_cached_prefix("d", NODE, WALK) == 0  # a@8 is gone
+
+
+def test_a_spare_takes_only_a_free_slot_and_is_evicted_first():
+    pool = _pool(prefix_slots=2)
+    run = _runner(pool)
+    a, c = list(range(20)), list(range(100, 120))
+    _ingest(run, "a", a)
+    _prefill(run, pool, "a", a, {8: 1.0, 16: 2.0}, spares={8})
+    _ingest(run, "e", a[:8] + [77] * 9)
+    assert pool.resolve_cached_prefix("e", NODE, WALK) == 8  # a free slot took the spare
+    run.remove_request("e")
+    # c's kept snapshot takes a's spare at 8, though a's kept one at 16 is older; c's spare
+    # finds no free slot
+    _ingest(run, "c", c)
+    _prefill(run, pool, "c", c, {8: 3.0, 16: 4.0}, spares={8})
+    assert sorted(meta[1] for meta in pool._snap_meta.values()) == [16, 16]
+    for rid, prompt in (("b", a), ("d", c)):
+        _ingest(run, rid, prompt[:16] + [99] * 5)
+        assert pool.resolve_cached_prefix(rid, NODE, WALK) == 16
+    _ingest(run, "f", a[:8] + [77] * 9)
+    assert pool.resolve_cached_prefix("f", NODE, WALK) == 0
 
 
 def test_a_refused_admit_gives_the_hit_back():
