@@ -302,7 +302,8 @@ all = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "transformers",
+    # Qwen3-TTS's speech tokenizer (qwen-tts, installed --no-deps) needs check_model_inputs
+    "transformers>=4.57.3",
     "safetensors",
     "triton",
     "qwen-omni-utils",

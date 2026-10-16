@@ -69,3 +69,24 @@ def test_a_missing_qwen_tts_names_the_install_command(no_qwen_tts):
 
 def test_the_docs_show_the_same_command():
     assert qwen3_tts_model.QWEN_TTS_INSTALL in (ROOT / "docs" / "installation.rst").read_text()
+
+
+@pytest.mark.parametrize("name", ["Dockerfile", "Dockerfile.dynamo-base"])
+def test_the_docker_images_install_qwen_tts(name):
+    """Both images install ``.[all]``, which does not carry qwen-tts."""
+    dockerfile = (ROOT / "mstar" / "integrations" / "dynamo" / "docker" / name).read_text()
+    assert '--no-deps "qwen-tts==0.1.1"' in dockerfile
+
+
+def test_all_keeps_the_transformers_floor_qwen3_tts_needs():
+    """qwen-tts is installed --no-deps, so nothing else holds transformers at
+    the 4.57.3 its speech tokenizer needs; an older one fails to load it."""
+    extras = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]
+
+    def floor(extra):
+        (req,) = [Requirement(r) for r in extras[extra] if canonicalize_name(Requirement(r).name) == "transformers"]
+        return req.specifier
+
+    for extra in ("all", "qwen3_tts"):
+        assert not floor(extra).contains("4.57.2"), extra
+        assert floor(extra).contains("4.57.3") and floor(extra).contains("5.19.0"), extra

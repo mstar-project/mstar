@@ -62,6 +62,10 @@ RUN uv pip install --python /opt/mstar/venv/bin/python -e ".[all,dynamo]" \
         torchaudio==${TORCHAUDIO_VERSION} \
         torchcodec==${TORCHCODEC_VERSION}
 
+# Qwen3-TTS's speech tokenizer is not in [all]: --no-deps keeps its
+# transformers==4.57.3 pin out of the environment (docs/installation.rst).
+RUN uv pip install --python /opt/mstar/venv/bin/python --no-deps "qwen-tts==0.1.1"
+
 # The venv must lead PATH: FlashInfer's JIT invokes ninja (installed in the
 # venv) via PATH lookup at request time.
 ENV PATH=/opt/mstar/venv/bin:$PATH \
