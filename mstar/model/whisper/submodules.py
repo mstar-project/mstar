@@ -83,7 +83,10 @@ class WhisperEncoderSubmodule(NodeSubmodule):
     ``None``.
     """
 
-    ENCODER_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # Every size up to 8: an encoder step pads to the next captured size, and at
+    # serving concurrency its batches are small (2-3 typical), so a 3 that ran as
+    # a 4 spent a quarter of the step's GPU time on a padding row.
+    ENCODER_CAPTURE_BATCH_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32]
     # Graph capture alone removes the per-layer launch gaps. Inductor's
     # fusions are a second-order gain on these GEMM-bound shapes and cost one
     # compile per bucket, so they are off until measured to win.
