@@ -18,12 +18,8 @@ name: Claude Review
 #   3. Rules are read from the base checkout at the root. The prompt tells the
 #      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
 #      cannot rewrite the rules it is judged by.
-#   4. The job's own token can write pull requests only; the Claude GitHub App
-#      token the action mints (via id-token: write) has whatever the app's
-#      installation grants. Mutation tools are disabled and the only write tools
-#      allowed are the inline-comment tool and `gh pr comment`, so the worst
-#      case for a prompt injection is a bad comment. Keep the allowlist that
-#      narrow, and keep the app's repository permissions to what it needs.
+#   4. Write permission is pull-requests only, and mutation tools are disabled,
+#      so the worst case for a prompt injection is a bad comment.
 
 # Who can trigger it: GitHub author_association OWNER, MEMBER, COLLABORATOR or
 # CONTRIBUTOR, i.e. the team plus anyone who has had a PR merged here. First-time
@@ -79,9 +75,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      # The action exchanges an OIDC token for a Claude GitHub App installation
-      # token and posts as the Claude app. Needs the app installed on the repo.
-      id-token: write
     steps:
       # Secrets can't be tested in a job-level `if`, so short-circuit here
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
@@ -164,6 +157,10 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The job's own token (pull-requests: write, above). Without it the
+          # action tries to mint a Claude GitHub App token over OIDC, which needs
+          # `id-token: write` and the app installed, and fails before reviewing.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
             Read .github/review/review-prompt.md from the repository root and follow it
             exactly. It defines your trust boundary, your method, your reporting bar and
