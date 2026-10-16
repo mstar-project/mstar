@@ -50,7 +50,7 @@ M\* serves one model per process, so the pipeline is three M\* servers. Turn det
 - `extra_body={"enable_thinking": False}` on the LLM. Qwen3.5's chat template opens a `<think>` block by default; the plugin strips it, but nothing is spoken until it closes.
 - `response_format="pcm"` on the TTS. The plugin reads bare PCM as 24 kHz mono, which is what Kokoro and Qwen3-TTS produce. For a model with another output rate use `wav`, which the plugin decodes and resamples.
 - The TTS plugin asks for streaming with OpenAI's `stream_format`, so the first audio of each sentence leaves M\* as soon as it is synthesized.
-- Barge-in. Self-hosted, LiveKit interrupts on VAD and needs 0.5 s of user speech first. In the runs below the agent went quiet 0.7 to 1.2 s (p50) after the user started talking over it, and LiveKit did not act on 2 of the 16 turns that talked over it. `TurnHandlingOptions(interruption={"min_duration": ...})` tunes this. M\* is not on that path: the agent stops its own playout.
+- Barge-in. Self-hosted, LiveKit interrupts on VAD and needs 0.5 s of user speech first. In the runs below the agent went quiet 0.7 to 0.8 s (p50) after the user started talking over it, and on 4 of the 16 turns that talked over it the agent was still speaking when the user finished. `TurnHandlingOptions(interruption={"min_duration": ...})` tunes this. M\* is not on that path: the agent stops its own playout.
 
 ## Scripted participant
 
@@ -81,11 +81,11 @@ Measured on one B200 with the three M\* servers, the LiveKit server, the agent a
 |---|---|---|---|---|
 | Kokoro | 6 turns, twice | 2 / 2 | 1.35 / 1.39 s | 0.50 / 0.51 s |
 | Kokoro | `mix`, 8 at once | 7 / 8 | 1.35 / 1.41 s | 0.49 / 0.55 s |
-| Kokoro | `mix`, 16 at once | 15 / 16 | 1.36 / 1.48 s | 0.47 / 0.53 s |
+| Kokoro | `mix`, 16 at once | 14 / 16 | 1.37 / 1.48 s | 0.47 / 0.53 s |
 | Qwen3-TTS | 5 turns | 1 / 1 | 1.48 / 1.76 s | 0.62 / 0.87 s |
-| Qwen3-TTS | `mix`, 8 at once | 8 / 8 | 1.49 / 2.74 s | 0.60 / 0.91 s |
+| Qwen3-TTS | `mix`, 8 at once | 7 / 8 | 1.49 / 1.79 s | 0.60 / 0.91 s |
 
-The two incomplete conversations are barge-ins LiveKit did not act on: the agent stayed `speaking` through the user's whole utterance and finished its reply. Across the stress runs every M\* request was torn down and none failed, and GPU memory stayed flat.
+A barge-in counts only if the agent leaves `speaking` and its audio stops before the user finishes. The four incomplete conversations are barge-ins with the shortest utterance (1.4 to 1.5 s), where the agent was still `speaking` when the user finished: in two LiveKit stopped it 0.3 s later, and the other two ended with it still speaking. Across the stress runs every M\* request was torn down and none failed, and GPU memory stayed flat.
 
 "After endpointing" starts when the agent decides the user is done. About 0.68 s of each turn passes before that decision: the VAD's silence window, then Whisper's transcript, which LiveKit waits for. The VAD and `endpointing` settings in `agent.py` tune it. M\*'s own calls in a Kokoro turn are short: Whisper takes 0.10 s on 2.6 s of speech, Qwen3.5's first token takes 24 ms, and each sentence's first audio takes 36 ms (37 ms with Qwen3-TTS). These are p50 values from LiveKit's metrics. The rest is the LLM writing its first sentence, plus LiveKit's audio path.
 
