@@ -181,7 +181,7 @@ def redact_url(url: str | None) -> str | None:
 
 
 _SECRET = re.compile(
-    r"TOKEN|SECRET|PASSW|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|AUTH|CREDENTIAL|COOKIE|SESSION", re.IGNORECASE
+    r"TOKEN(?!S)|SECRET|PASSW|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|AUTH|CREDENTIAL|COOKIE|SESSION", re.IGNORECASE
 )
 # Keys whose values name a machine; their values are kept only when loopback.
 _HOSTLIKE = re.compile(r"HOST|ADDR|ENDPOINT|URL|URI|DOMAIN|PEER|(^|_)IP($|_)", re.IGNORECASE)

@@ -203,8 +203,9 @@ class Judging:
     def identity(self) -> dict[str, Any]:
         sem = None
         if self.semantic is not None:
-            sem = {"judge": self.semantic.name, "decoding": SEMANTIC_DECODING, "batch_pairs": SEMANTIC_BATCH,
-                   "enable_thinking": self.semantic.kind == "local", "controls": self._controls}
+            sem = {"judge": self.semantic.name, "identity": self.semantic.identity(), "decoding": SEMANTIC_DECODING,
+                   "batch_pairs": SEMANTIC_BATCH, "enable_thinking": self.semantic.kind == "local",
+                   "controls": self._controls}
         return {"judges": [j.identity() for j in self.judges], "semantic": sem}
 
     def label(self, rows: list[dict[str, Any]]) -> None:
@@ -247,6 +248,11 @@ class Judging:
                                                         if axes[ax].get("conversion")}}
 
 
+def _derived(metric: str) -> bool:
+    """A metric ``fdb_metrics`` computes (per group, or agreement)."""
+    return metric.split(".", 1)[0] in (*GROUPS, "agreement") and "." in metric
+
+
 def rejudge(result, judging: Judging):
     """Label a stored ``fdb`` results file with more judges (or again), from the transcripts
     its rows hold: no server, no GPU. Judges of the same name are replaced."""
@@ -254,19 +260,27 @@ def rejudge(result, judging: Judging):
         raise SystemExit(f"rejudge reads fdb results, not {result.suite!r}")
     suite_cfg = result.config.setdefault("suite", {})
     new = {j["name"]: j for j in judging.identity()["judges"]}
-    suite_cfg["judges"] = [j for j in suite_cfg.get("judges") or [] if j["name"] not in new] + list(new.values())
-    if judging.semantic is not None:
-        for rep in result.repeats:
-            for r in rep.requests:
-                r.pop("semantic", None)
+    old = suite_cfg.get("judges") or []
+    # A replaced judge keeps its place, so agreement keys keep their order across rejudges.
+    suite_cfg["judges"] = [new.get(j["name"], j) for j in old] + [j for n, j in new.items()
+                                                                  if n not in {o["name"] for o in old}]
+    sem_cfg = suite_cfg.get("semantic")
+    if sem_cfg and judging.semantic is None and sem_cfg.get("judge") in new:
+        print(f"[fdb] semantic grades by the replaced judge {sem_cfg['judge']!r} are dropped; pass "
+              f"--semantic-judge {sem_cfg['judge']} to regrade them", file=sys.stderr)
+        suite_cfg["semantic"] = sem_cfg = None
+    regrade = judging.semantic is not None or sem_cfg is None
     names = [j["name"] for j in suite_cfg["judges"] if not j.get("skipped")]
     for rep in result.repeats:
         for r in rep.requests:
             for name in new:
                 (r.get("labels") or {}).pop(name, None)
+            if regrade:
+                r.pop("semantic", None)
         judging.label(rep.requests)
-        semantic = judging.semantic is not None or bool(suite_cfg.get("semantic"))
-        rep.metrics.update(fdb_metrics(rep.requests, names, semantic))
+        # Every derived metric is recomputed from the rows; none of the old ones survive.
+        kept = {k: v for k, v in rep.metrics.items() if not _derived(k)}
+        rep.metrics = kept | fdb_metrics(rep.requests, names, judging.semantic is not None or bool(sem_cfg))
     if judging.semantic is not None:
         suite_cfg["semantic"] = judging.identity()["semantic"]
     result.config.setdefault("rejudged", []).append(

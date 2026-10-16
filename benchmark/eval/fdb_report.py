@@ -22,6 +22,9 @@ from benchmark.eval.schema import RunResult
 from benchmark.eval.suites.duplex_fdb import GROUPS, SEMANTIC_AXES, valid_label_pairs
 
 SHORT = {"C_RESPOND": "RESPOND", "C_RESUME": "RESUME", "C_UNCERTAIN_HANDLING": "UNCERTAIN", "C_UNKNOWN": "UNKNOWN"}
+# The label that should be high in each category (sglang-omni's reading guide).
+DESIRED = {"user_interruption": "RESPOND", "user_backchannel": "RESUME", "talking_to_other": "RESUME",
+           "background_speech": "RESUME"}
 
 
 def judges_of(r: RunResult) -> list[str]:
@@ -57,7 +60,9 @@ def render(results: list[RunResult]) -> str:
     out: list[str] = []
     for r in results:
         judges = judges_of(r)
-        sem = (r.config.get("suite", {}).get("semantic") or {}).get("judge")
+        sem_cfg = r.config.get("suite", {}).get("semantic") or {}
+        sem = sem_cfg.get("judge")
+        sem_model = (sem_cfg.get("identity") or {}).get("model")
         out.append(f"**fdb {r.label}** ({provenance([r])}). Latencies are pooled whole-file overlap intervals; "
                    "label shares are over valid judge labels.\n")
         timing = [("pairs", "Pairs", "count"), ("timed_overlap_sessions", "Timed overlap sessions", "count"),
@@ -74,7 +79,8 @@ def render(results: list[RunResult]) -> str:
         if sem:
             cols = [(f"semantic.{ax}_{m}", f"{ax} {m}", "percent")
                     for ax in SEMANTIC_AXES for m in ("quality", "coverage")]
-            out += [f"Semantic A/F/U judge `{sem}`: quality = A/(A+F), coverage = (A+F)/N; joint fails if any axis "
+            who = f"`{sem}` ({sem_model})" if sem_model else f"`{sem}`"
+            out += [f"Semantic A/F/U judge {who}: quality = A/(A+F), coverage = (A+F)/N; joint fails if any axis "
                     "fails and accepts only if all three accept.", ""] + _table(r, cols) + [""]
         for i, a in enumerate(judges):
             for b in judges[i + 1:]:
@@ -126,7 +132,7 @@ def render_chart(results: list[RunResult], path: str | Path, judge: str | None =
                 if v >= 6:
                     ax.text(i, b + v / 2, f"{v:.0f}%", ha="center", va="center", fontsize=7, color="white")
             bottoms = [b + v for b, v in zip(bottoms, vals, strict=True)]
-        ax.set_xticks(range(len(cats)), [c.replace("_", "\n") for c in cats], fontsize=8)
+        ax.set_xticks(range(len(cats)), [c.replace("_", "\n") + f"\n(want {DESIRED[c]})" for c in cats], fontsize=8)
         ax.set_ylim(0, 100)
         ax.set_ylabel("% of judged pairs")
         ax.set_title(f"{r.label}: behavior labels (judge {j})")
@@ -168,8 +174,8 @@ def render_agreement(ag: dict[str, Any]) -> str:
     a, b, n = ag["a"], ag["b"], ag["n"]
     if not n:
         return f"No pair has valid labels from both `{a}` and `{b}`."
-    lines = [f"**Judge agreement: `{a}` vs `{b}`** over {n} pairs both labeled validly ({ag['pairs']} pairs x "
-             "repeats in total).", "",
+    lines = [f"**Judge agreement: `{a}` vs `{b}`** over {n} pairs both labeled validly ({ag['pairs']} pair "
+             "sessions over all repeats).", "",
              f"- Label agreement: {100 * ag['agreement']:.1f}%",
              f"- Cohen's kappa: {ag['kappa']:.2f}"]
     for k, (ra, rk) in enumerate(zip(ag["per_repeat"]["agreement"], ag["per_repeat"]["kappa"], strict=True)):

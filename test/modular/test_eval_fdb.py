@@ -415,6 +415,19 @@ def test_fdb_suite_end_to_end_with_two_judges_agreement_and_rejudge(tmp_path, fa
     assert back.summary["agreement.qwen.other.agreement"]["mean"] == pytest.approx(1 / 3)
     assert back.config["rejudged"] == [{"judges": ["late"], "semantic": None}]
     assert back.summary["user_interruption.stop_latency_s"] == s["user_interruption.stop_latency_s"]
+    assert back.config["suite"]["semantic"]["identity"]["model"] == "fake-judge"
+    assert back.config["suite"]["semantic"]["decoding"]["max_tokens"] == 32768  # a count, not a secret
+
+    # Replacing a judge by name: it keeps its place, every derived metric is recomputed, and the
+    # semantic grades it gave are dropped unless regraded.
+    main(["rejudge", str(tmp_path / "rejudged"), "--judge", f"qwen={fake_server}/b/v1",
+          "--out", str(tmp_path / "replaced")])
+    rep = RunResult.load(tmp_path / "replaced" / "fdb-fake-c2.json")
+    assert [j["name"] for j in rep.config["suite"]["judges"]] == ["qwen", "other", "gpt4o", "late"]
+    assert rep.summary["agreement.qwen.other.agreement"]["mean"] == 1.0
+    assert not any(k.startswith(("agreement.other.qwen", "agreement.late.qwen")) for k in rep.summary)
+    assert rep.config["suite"]["semantic"] is None and not any(".semantic." in k for k in rep.summary)
+    assert all("semantic" not in r for rp in rep.repeats for r in rp.requests)
 
 
 def test_fdb_failed_controls_leave_semantic_ungraded(tmp_path, fake_server, monkeypatch):
