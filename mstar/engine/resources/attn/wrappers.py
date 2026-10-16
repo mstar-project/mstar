@@ -202,6 +202,15 @@ class FlashInferPrefillWrapper:
         return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
 
 
+def decode_tensor_cores(num_qo_heads: int, num_kv_heads: int) -> bool:
+    """Whether a one-token-per-row decode uses FlashInfer's tensor-core kernel.
+
+    It pads each KV head's query rows to a tile, so it pays off only with
+    enough query heads per KV head; the CUDA-core decode kernel (and its
+    lighter plan) serves MHA and narrow GQA."""
+    return num_qo_heads // num_kv_heads >= 4
+
+
 class FlashInferDecodeWrapper:
     """Batched decode attention with paged KV cache.
 

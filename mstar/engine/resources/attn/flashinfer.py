@@ -13,6 +13,7 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
     check_flashinfer_head_dim,
+    decode_tensor_cores,
 )
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
@@ -55,6 +56,9 @@ class FlashInferManager(AttentionManager):
             device=device,
             backend=backend
         )
+        self._decode_tensor_cores = decode_tensor_cores(
+            kv_config.num_qo_heads, kv_config.num_kv_heads,
+        )
 
         self._workspaces = WorkspacePool(device)
 
@@ -96,6 +100,7 @@ class FlashInferManager(AttentionManager):
                 workspace_buffer=buffer,
                 batch_size=num_rows,
                 use_cuda_graph=True,
+                use_tensor_cores=self._decode_tensor_cores,
                 **kv_kwargs,
             )
         else:
@@ -121,11 +126,16 @@ class FlashInferManager(AttentionManager):
         key = EagerSlotKey(label=label, slot=slot, is_decode=is_decode)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            cls = FlashInferDecodeWrapper if is_decode else FlashInferPrefillWrapper
-            wrapper = self._eager_plan_states[key] = cls(
-                workspace_buffer=self._workspaces.get(label, slot),
-                **self._wrapper_kv_kwargs,
-            )
+            workspace = self._workspaces.get(label, slot)
+            if is_decode:
+                wrapper = FlashInferDecodeWrapper(
+                    workspace_buffer=workspace,
+                    use_tensor_cores=self._decode_tensor_cores,
+                    **self._wrapper_kv_kwargs,
+                )
+            else:
+                wrapper = FlashInferPrefillWrapper(workspace_buffer=workspace, **self._wrapper_kv_kwargs)
+            self._eager_plan_states[key] = wrapper
         return wrapper
 
     @property

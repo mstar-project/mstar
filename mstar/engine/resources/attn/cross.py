@@ -18,6 +18,7 @@ from mstar.engine.resources.attn.config import (
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
+    decode_tensor_cores,
 )
 from mstar.engine.resources.base import (
     AttentionResource,
@@ -393,9 +394,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             num_qo_heads=kv["num_qo_heads"], num_kv_heads=kv["num_kv_heads"],
             head_dim=kv["head_dim"], page_size=kv["page_size"],
             max_num_pages=kv["max_num_pages"], device=kv["device"], backend=kv["backend"],
-            # few query heads per KV head (Whisper is MHA): the CUDA-core
-            # kernel; the tensor-core one pads the query rows to a tile
-            use_tensor_cores=kv["num_qo_heads"] // kv["num_kv_heads"] >= 4,
+            use_tensor_cores=decode_tensor_cores(kv["num_qo_heads"], kv["num_kv_heads"]),
             **kwargs,
         )
 
