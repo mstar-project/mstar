@@ -307,7 +307,7 @@ def test_ep_expert_load_off_by_default():
 
 def test_ep_routing_check_passes_when_ranks_agree():
     block = ExpertParallelSparseMoeBlock(
-        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(1, 4), debug_check_routing=True,
+        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(0, 4), debug_check_routing=True,
     )
     _load(block, _checkpoint())
     with torch.no_grad():
@@ -331,9 +331,9 @@ def test_ep_routing_check_catches_disagreement():
 
 
 def _rank_blocks(cls, world_size, ckpt, router_w, device, dtype, **kwargs):
-    blocks = []
+    blocks, bus = [], {}
     for rank in range(world_size):
-        block = cls(HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(rank, world_size), **kwargs)
+        block = cls(HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(rank, world_size, bus), **kwargs)
         with torch.no_grad():
             block.gate.weight.copy_(router_w)
         block = block.to(device, dtype)
