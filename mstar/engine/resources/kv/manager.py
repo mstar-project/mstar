@@ -473,6 +473,7 @@ class KVManager(AttentionResource):
         # (slot, label) -> the plan output whose state that slot's static
         # buffers hold, so a reused plan skips re-staging them
         self._staged_outputs: dict[tuple, KVPlanOutput] = {}
+        self._empty_locations: torch.Tensor | None = None
         self._current_plan_states: dict[str, KVPlanState] = {}
         self.reset_default_cursors()
 
@@ -1407,6 +1408,12 @@ class KVManager(AttentionResource):
             total_tokens=total_tokens
         )
 
+    def _empty_plan_state(self) -> KVPlanState:
+        empty = self._empty_locations
+        if empty is None:
+            empty = self._empty_locations = torch.empty(0, dtype=torch.long, device=self._device)
+        return KVPlanState(token_to_page=empty, token_to_cache=empty, total_tokens=0)
+
     def _decode_plan_state(self, views: list[SequenceView]) -> KVPlanState:
         """Write addressing for a step appending one token per request.
 
@@ -1479,13 +1486,19 @@ class KVManager(AttentionResource):
                 else:
                     self._current_plan_states[label] = plan_state
                 continue
+            total_tokens = None if indptrs.is_decode else indptrs.get_total_len()
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(indptrs.views)
+            elif total_tokens == 0:
+                # every segment span 0 (a decoder reading the encoder context
+                # it wrote at prefill): nothing is written, so there is no
+                # addressing to upload and unpack
+                plan_state = self._empty_plan_state()
             else:
                 indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
                 plan_state = self._compute_plan_state(
                     indptrs.cuda_indptrs,
-                    total_tokens=indptrs.get_total_len()
+                    total_tokens=total_tokens,
                 )
             if lease is not None:
                 static_state = self._static_plan_state(lease.slot, label)
