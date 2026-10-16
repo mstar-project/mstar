@@ -20,7 +20,7 @@ from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
-from mstar.model.glm52.config import ATTN_RESOURCE, KV_RESOURCE, Glm52ModelConfig
+from mstar.model.glm52.config import ATTN_RESOURCE, INDEX_KV_RESOURCE, KV_RESOURCE, Glm52ModelConfig
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine
 
@@ -36,8 +36,10 @@ TOPK = 8
 PROMPT_LEN = 6
 MAX_TOKENS = 14  # 1 prefill + 13 decode tokens: final context 6 + 13 = 19, far past topk
 # 8-token pages, 16 of them (one is the sink page): 120 cached tokens for a
-# 20-token context, and the torch fallback's page table spans every page.
-KV_YAML = {"resources": {KV_RESOURCE: {"max_num_pages": 16, "page_size": 8}}}
+# 20-token context, and the torch fallback's page table spans every page. The
+# index-key store gets the same geometry.
+KV_YAML = {"resources": {key: {"max_num_pages": 16, "page_size": 8}
+                         for key in (KV_RESOURCE, INDEX_KV_RESOURCE)}}
 
 
 def _fill_layer(layer, cfg):
@@ -142,7 +144,10 @@ class _Serve:
         self.submodule = submodule
         self.rid = rid
         specs = model.get_node_resources()
-        apply_yaml_overrides(specs, KV_YAML)
+        # the flag-off arm declares no index-key cache
+        declared = {spec.resource_key for spec in specs}
+        apply_yaml_overrides(specs, {"resources": {
+            key: block for key, block in KV_YAML["resources"].items() if key in declared}})
         by_key = resolve_spec_dependencies(specs)
         groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
         transfer = TransferEngineInfo(
@@ -214,8 +219,8 @@ class _Serve:
 
 def _generate_greedy(model, submodule, prompt_ids, max_tokens):
     """The real serve loop (prefill -> decode -> check_stop) on the sparse
-    path; returns (generated tokens, stopped-via-check_stop). Leaves the
-    submodule's per-request state (the k-store) for the caller to inspect."""
+    path; returns (generated tokens, stopped-via-check_stop, the tokens the
+    latent cache and the index-key store hold before retirement)."""
     serve = _Serve(model, submodule)
     info = serve.info(max_tokens)
     generated: list[int] = []
@@ -238,9 +243,11 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
             if stop:
                 stopped = True
                 break
+        stored = tuple(serve.resources[key].stored_len(serve.rid)
+                       for key in (KV_RESOURCE, INDEX_KV_RESOURCE))
     finally:
-        serve.close(cleanup_request=False)
-    return generated, stopped
+        serve.close()
+    return generated, stopped, stored
 
 
 def _teacher_forced_logits(model, submodule, prompt_ids, forced_tokens):
@@ -277,10 +284,6 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
 
     submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
     assert isinstance(submodule, Glm52LLMSubmodule)
-    # Long-context serving is eager-only (host-side DSA upkeep would not
-    # replay inside a captured graph): neither whole-forward nor piecewise.
-    assert submodule.get_cuda_graph_configs(DEVICE) == []
-    assert submodule.get_piecewise_cuda_graph_configs(DEVICE, DTYPE) == {}
     # The absorbed declaration: one latent row per token, the MLA resource
     # planned over it (its torch fallback at reduced dims).
     specs = {spec.resource_key: spec for spec in model.get_node_resources()}
@@ -288,21 +291,21 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     assert specs[KV_RESOURCE].config.head_dim == cfg.kv_lora_rank + cfg.qk_rope_head_dim
     assert specs[KV_RESOURCE].config.kv_lora_rank == cfg.kv_lora_rank
     assert specs[ATTN_RESOURCE].config.backend is AttnBackend.FLASHINFER_MLA
+    # the index keys: one index_head_dim latent per token per FULL layer
+    assert specs[INDEX_KV_RESOURCE].config.layout == KVLayout.MLA
+    assert specs[INDEX_KV_RESOURCE].config.kv_lora_rank == cfg.index_head_dim
 
     prompt_ids = torch.arange(10, 10 + PROMPT_LEN, device=DEVICE)
 
     # ---- (1) the sparse path serves and stops cleanly ------------------
-    generated, stopped = _generate_greedy(model, submodule, prompt_ids, MAX_TOKENS)
+    generated, stopped, stored = _generate_greedy(model, submodule, prompt_ids, MAX_TOKENS)
     assert stopped, "decode loop did not terminate via check_stop"
     assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
-    # k-store lifecycle on the real path: one row per token per FULL layer
-    # (prefill 6 + one per decode forward), gone after retirement.
-    assert submodule._dsa_k_store.tokens("r0", 0) == PROMPT_LEN + MAX_TOKENS - 1  # 6 prompt rows + 13 decode forwards
-    assert submodule._dsa_k_store.tokens("r0", 1) == 0  # SHARED layer: none
-    submodule.cleanup_request("r0")
-    assert submodule._dsa_k_store.tracked_requests() == set()
+    # the index-key store holds a row per token, as the latent cache does
+    # (prefill 6 + one per decode forward)
+    assert stored == (PROMPT_LEN + MAX_TOKENS - 1,) * 2  # 6 prompt rows + 13 decode forwards
 
     # ---- teacher-forced replays of the generated sequence --------------
     forced = generated[:-1]  # the last token is never fed back

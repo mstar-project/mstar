@@ -95,10 +95,10 @@ def test_process_prompt_refuses_a_prompt_without_room():
         m.process_prompt("x" * (n + 1), ["text"], ["text"])
 
 
-def test_a_long_context_prompt_is_held_to_index_topk():
-    # the DSA prefill attends densely: a longer prompt failed its prefill batch
+def test_a_long_context_prompt_takes_the_window():
+    # the paged DSA path selects past index_topk in prefill as well
     cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=8192)
-    assert cfg.max_prompt_tokens == cfg.index_topk == 2048
+    assert cfg.max_prompt_tokens == 8192 - 2
     assert Glm52ModelConfig().max_prompt_tokens == 2046
     # an MTP step writes its whole verify block: two of them for k = 3
     assert Glm52ModelConfig(mtp_num_draft_tokens=3).max_prompt_tokens == 2048 - 8
@@ -132,8 +132,13 @@ def test_the_compile_hatch_covers_uncaptured_steps(monkeypatch):
     from mstar.model.glm52.submodules import Glm52LLMSubmodule
 
     sub = object.__new__(Glm52LLMSubmodule)
+    sub.config = Glm52ModelConfig()
     monkeypatch.delenv("MSTAR_GLM52_GRAPH_COMPILE", raising=False)
     assert not sub.disable_torch_compile
+    # DSA's uncaptured steps run eager; compiled, the frame keys on each prompt's length
+    sub.config.dsa_long_context = True
+    assert sub.disable_torch_compile
+    sub.config.dsa_long_context = False
     monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
     assert sub.disable_torch_compile and not sub._compile_flags()["compile"]
 
