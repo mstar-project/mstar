@@ -1,0 +1,173 @@
+"""Eval datasets as JSONL manifests, plus builders that fetch public sets into one.
+
+A manifest line is one item::
+
+    {"id": "1089-134686-0000", "text": "he hoped there would be stew ...",
+     "audio_path": "audio/1089-134686-0000.wav", "lang": "en",
+     "ref_audio": null, "ref_text": null, "extra": {}}
+
+``text`` is the TTS input or the ASR reference; ``audio_path`` the ASR or
+duplex input; ``ref_audio``/``ref_text`` a voice-clone prompt (Seed-TTS).
+Relative paths resolve against the manifest's directory, so a built dataset
+directory can be copied between hosts as is. A ``.txt`` file is also a
+manifest: one TTS sentence per line.
+
+Builders (``python -m benchmark.eval data <name> --out DIR``) download into
+the Hugging Face cache (``HF_HOME``) and write 16 kHz mono WAVs plus
+``manifest.jsonl``. Dataset terms: LibriSpeech and FLEURS are CC BY 4.0;
+Seed-TTS-eval's test set comes from Common Voice (CC0) and DiDiSpeech, for
+research use, and its prompt archive is on Google Drive (fetched with gdown).
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import tarfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+ASR_RATE = 16000
+
+
+@dataclass
+class Item:
+    id: str
+    text: str | None = None
+    audio_path: str | None = None
+    lang: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+def load_manifest(path: str | Path, limit: int | None = None) -> list[Item]:
+    path = Path(path)
+    items: list[Item] = []
+    if path.suffix == ".txt":
+        lines = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()]
+        items = [Item(id=f"{i:04d}", text=ln) for i, ln in enumerate((ln for ln in lines if ln), start=1)]
+    else:
+        root = path.parent
+        known = set(Item.__dataclass_fields__)
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            unknown = set(row) - known
+            if unknown or "id" not in row:
+                raise ValueError(f"{path}:{n}: needs 'id', unknown keys {sorted(unknown)}")
+            for key in ("audio_path", "ref_audio"):
+                if row.get(key) and not os.path.isabs(row[key]):
+                    row[key] = str(root / row[key])
+            items.append(Item(**row))
+    ids = [it.id for it in items]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"{path}: duplicate item ids")
+    return items[:limit] if limit else items
+
+
+def save_manifest(items: list[Item], path: str | Path) -> Path:
+    """Write items, storing paths under the manifest's directory relative to it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    root = path.parent.resolve()
+    with path.open("w", encoding="utf-8") as f:
+        for it in items:
+            row = asdict(it)
+            for key in ("audio_path", "ref_audio"):
+                p = row.get(key)
+                if p and Path(p).resolve().is_relative_to(root):
+                    row[key] = str(Path(p).resolve().relative_to(root))
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return path
+
+
+def _write_16k(audio_bytes: bytes, dst: Path) -> None:
+    import soundfile as sf
+
+    from benchmark.eval.audio import resample, write_wav
+
+    x, rate = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+    write_wav(dst, resample(x.mean(axis=1), int(rate), ASR_RATE), ASR_RATE)
+
+
+def _hf_rows(repo: str, config: str | None, split: str, limit: int):
+    from datasets import Audio, load_dataset
+
+    ds = load_dataset(repo, config, split=split, streaming=True)
+    ds = ds.cast_column("audio", Audio(decode=False))
+    for i, row in enumerate(ds):
+        if i >= limit:
+            break
+        yield row
+
+
+def build_librispeech(out: Path, split: str = "test.clean", limit: int = 200) -> Path:
+    """LibriSpeech (``openslr/librispeech_asr``), first ``limit`` utterances of a split."""
+    config, _, sub = split.partition(".")
+    sub = sub or "clean"
+    if config in ("clean", "other"):  # "clean.test" style
+        config, sub = sub, config
+    items = []
+    (out / "audio").mkdir(parents=True, exist_ok=True)
+    for row in _hf_rows("openslr/librispeech_asr", sub, config, limit):
+        dst = out / "audio" / f"{row['id']}.wav"
+        if not dst.exists():
+            _write_16k(row["audio"]["bytes"], dst)
+        items.append(Item(id=row["id"], text=row["text"], audio_path=str(dst), lang="en"))
+    return save_manifest(items, out / "manifest.jsonl")
+
+
+def build_fleurs(out: Path, lang: str = "en_us", split: str = "test", limit: int = 100) -> Path:
+    """FLEURS (``google/fleurs``) for one language config, e.g. ``en_us``, ``cmn_hans_cn``."""
+    items = []
+    (out / "audio").mkdir(parents=True, exist_ok=True)
+    seen: set[str] = set()
+    for row in _hf_rows("google/fleurs", lang, split, limit * 3):
+        uid = str(row["id"])
+        if uid in seen:  # FLEURS repeats a sentence once per speaker; keep the first take
+            continue
+        seen.add(uid)
+        dst = out / "audio" / f"{lang}_{uid}.wav"
+        if not dst.exists():
+            _write_16k(row["audio"]["bytes"], dst)
+        items.append(Item(id=f"{lang}_{uid}", text=row["transcription"], audio_path=str(dst),
+                          lang=lang.split("_", maxsplit=1)[0], extra={"raw_text": row.get("raw_transcription")}))
+        if len(items) >= limit:
+            break
+    return save_manifest(items, out / "manifest.jsonl")
+
+
+SEEDTTS_GDRIVE_ID = "1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP"  # from github.com/BytedanceSpeech/seed-tts-eval
+
+
+def parse_seedtts_meta(meta: Path, locale: str) -> list[Item]:
+    """``utt_id|prompt_text|prompt_wav|target_text`` rows of a Seed-TTS ``meta.lst``."""
+    items = []
+    for line in meta.read_text(encoding="utf-8").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 4 or not parts[3].strip():
+            continue
+        uid, ref_text, ref_wav, text = (p.strip() for p in parts[:4])
+        items.append(Item(id=uid, text=text, lang=locale, ref_audio=str(meta.parent / ref_wav), ref_text=ref_text))
+    return items
+
+
+def build_seedtts(out: Path, locale: str = "en", limit: int | None = None, archive: str | None = None) -> Path:
+    """Seed-TTS-eval zero-shot set (target text + reference prompt wav and transcript)."""
+    root = out / "seedtts_testset"
+    meta = root / locale / "meta.lst"
+    if not meta.exists():
+        tar_path = Path(archive) if archive else out / "seedtts_testset.tar"
+        if not tar_path.exists():
+            import gdown
+
+            out.mkdir(parents=True, exist_ok=True)
+            gdown.download(f"https://drive.google.com/uc?id={SEEDTTS_GDRIVE_ID}", str(tar_path), quiet=False)
+        with tarfile.open(tar_path) as tar:
+            tar.extractall(out, filter="data")
+    items = parse_seedtts_meta(meta, locale)
+    return save_manifest(items[:limit] if limit else items, out / f"manifest_{locale}.jsonl")
