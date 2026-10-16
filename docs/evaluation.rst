@@ -246,6 +246,12 @@ and agreement metrics::
 
     python -m benchmark.eval rejudge results/fdb --judge gpt4o=openai --out results/fdb-gpt4o
 
+``--semantic-only --semantic-judge NAME`` regrades only the semantic A/F/U axes and keeps
+every judge's labels; ``--retry-failed`` relabels only the pairs whose label from an
+unchanged judge failed. Rate limits, server errors and dropped connections are retried
+with the same request and seed, with exponential backoff (``Retry-After`` honored), so they
+never move the official loop to its next seed; a pair whose retries run out is ``failed``.
+
 Results and reports
 -------------------
 
