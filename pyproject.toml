@@ -193,6 +193,18 @@ chatterbox_multilingual = [
     "spacy-pkuseg",
 ]
 
+# VoxCPM2: soundfile reads reference clips and soxr resamples them to 16 kHz
+# the way the reference's librosa.load does.
+voxcpm2 = [
+    "flashinfer-python>=0.6.14",
+    "huggingface-hub",
+    "mooncake-transfer-engine",
+    "safetensors",
+    "soundfile",
+    "soxr",
+    "transformers",
+]
+
 orpheus = [
     "einops",
     "flashinfer-python>=0.6.14",
