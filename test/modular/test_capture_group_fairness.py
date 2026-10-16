@@ -364,7 +364,8 @@ def test_two_groups_share_the_other_node_like_one_group_does():
 
 
 def test_the_consecutive_cap_alone_no_longer_needs_the_peek():
-    # MSTAR_MAX_CONSECUTIVE_SPEC_STEPS=1 yields every step; the yield has to
-    # reach the other node rather than the decode node's backlog
+    # MSTAR_SPEC_PEEK_FOR_FAIRNESS=0 with MSTAR_MAX_CONSECUTIVE_SPEC_STEPS=1
+    # yields every step; the yield has to reach the other node rather than the
+    # decode node's backlog
     first = _first_service_async(MIXED, peek=False, max_consecutive=1)
     assert first is not None and first <= 5, f"OTHER first ran at step {first}"
