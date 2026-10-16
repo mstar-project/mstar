@@ -2619,6 +2619,14 @@ class KVManager(AttentionResource):
                 f"pages still being written into, but not owned alone: {crowded}"
             )
 
+    def after_capture(self):
+        """Zero the pages. Capture ran its dummy rows on real pages and freed
+        them, so a request handed one later finds their K/V past its own
+        length. A kernel that loads a whole page and masks arithmetically
+        turns a non-finite value there into a NaN output: AITER's paged decode
+        on MI300X did, once pages were reused."""
+        self.kv_cache.tensor.zero_()
+
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank
 
