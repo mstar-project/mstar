@@ -19,6 +19,7 @@ from mstar.engine.resources.base import (
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import (
+    KVLayout,
     KVReqConfig,
     KVSpec,
     KVStep,
@@ -2890,6 +2891,24 @@ class KVManager(AttentionResource):
         self._default_layer_idx = 0
 
     @torch.compiler.disable
+    def write_target(self, layer_idx: int = None, label: str = None):
+        """Where this step's K/V go, for a layer that writes them itself in a
+        fused kernel instead of calling ``write_kv``: ``(layer cache, page of
+        each token, slot in page of each token, tokens to write)``. NHD only."""
+        if layer_idx is None:
+            layer_idx = self._default_layer_idx
+        if label is None:
+            label = self._default_label
+        if self.kv_cache.layout != KVLayout.NHD:
+            raise NotImplementedError(f"write_target is not implemented for layout {self.kv_cache.layout}")
+        state = self._current_plan_states[label]
+        if state.ready is not None:
+            torch.cuda.current_stream().wait_event(state.ready)
+        return (
+            self.kv_cache.tensor[layer_idx], state.token_to_page, state.token_to_cache,
+            int(state.total_tokens),
+        )
+
     def layer_view(self, layer_idx: int=None) -> torch.Tensor:
         """layer pages as needed by attention kernel
 

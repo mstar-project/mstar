@@ -275,6 +275,104 @@ def _qk_norm_rope_inplace_fake(q, k, q_weight, k_weight, pos_ids, q_eps, k_eps, 
     return None
 
 
+@triton.jit
+def _qk_norm_rope_kv_kernel(
+    Q_ptr, K_ptr, V_ptr, WQ_ptr, WK_ptr, Pos_ptr, Cache_ptr, Page_ptr, Slot_ptr,
+    q_eps, k_eps, rope_theta, n_write,
+    sq_m, sq_h, sk_m, sk_h, sv_m, sv_h,
+    sc_page, sc_kv, sc_slot, sc_head,
+    H_Q: tl.constexpr,
+    H_KV: tl.constexpr,
+    D: tl.constexpr,
+    HALF_D: tl.constexpr,
+):
+    """``_qk_pair_norm_rope_kernel`` plus the step's KV write: a k head is
+    stored rotated into its (page, slot) of the NHD cache layer, a v head
+    (programs past the q and k heads) copied there; tokens past ``n_write``
+    (the plan's padding) write nothing."""
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_half = tl.arange(0, HALF_D)
+    if pid_h >= H_Q + H_KV:
+        if pid_m < n_write:
+            h = pid_h - H_Q - H_KV
+            src = V_ptr + pid_m * sv_m + h * sv_h
+            page = tl.load(Page_ptr + pid_m).to(tl.int64)
+            slot = tl.load(Slot_ptr + pid_m).to(tl.int64)
+            dst = Cache_ptr + page * sc_page + sc_kv + slot * sc_slot + h * sc_head
+            tl.store(dst + offs_half, tl.load(src + offs_half).to(Cache_ptr.dtype.element_ty))
+            tl.store(dst + offs_half + HALF_D, tl.load(src + offs_half + HALF_D).to(Cache_ptr.dtype.element_ty))
+        return
+    if pid_h < H_Q:
+        base = Q_ptr + pid_m * sq_m + pid_h * sq_h
+        w_ptr = WQ_ptr
+        eps = q_eps
+    else:
+        base = K_ptr + pid_m * sk_m + (pid_h - H_Q) * sk_h
+        w_ptr = WK_ptr
+        eps = k_eps
+
+    x_first = tl.load(base + offs_half).to(tl.float32)
+    x_second = tl.load(base + offs_half + HALF_D).to(tl.float32)
+    sumsq = tl.sum(x_first * x_first, axis=0) + tl.sum(x_second * x_second, axis=0)
+    inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
+    x_first = x_first * inv_rms * tl.load(w_ptr + offs_half).to(tl.float32)
+    x_second = x_second * inv_rms * tl.load(w_ptr + offs_half + HALF_D).to(tl.float32)
+
+    pos = tl.load(Pos_ptr + pid_m).to(tl.float32)
+    inv_freq = tl.exp(-tl.log(rope_theta) * (offs_half.to(tl.float32) * 2.0 / D))
+    angle = pos * inv_freq
+    cos = tl.cos(angle)
+    sin = tl.sin(angle)
+    out_first = x_first * cos - x_second * sin
+    out_second = x_second * cos + x_first * sin
+
+    if pid_h < H_Q:
+        tl.store(base + offs_half, out_first.to(Q_ptr.dtype.element_ty))
+        tl.store(base + offs_half + HALF_D, out_second.to(Q_ptr.dtype.element_ty))
+    elif pid_m < n_write:
+        h = pid_h - H_Q
+        page = tl.load(Page_ptr + pid_m).to(tl.int64)
+        slot = tl.load(Slot_ptr + pid_m).to(tl.int64)
+        dst = Cache_ptr + page * sc_page + slot * sc_slot + h * sc_head
+        tl.store(dst + offs_half, out_first.to(Cache_ptr.dtype.element_ty))
+        tl.store(dst + offs_half + HALF_D, out_second.to(Cache_ptr.dtype.element_ty))
+
+
+@torch.library.custom_op("mstar::qk_norm_rope_kv_write", mutates_args={"q", "cache_layer"})
+def qk_norm_rope_kv_write(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    q_weight: torch.Tensor, k_weight: torch.Tensor, pos_ids: torch.Tensor,
+    cache_layer: torch.Tensor, page_idx: torch.Tensor, slot_idx: torch.Tensor, n_write: int,
+    q_eps: float, k_eps: float, rope_theta: float,
+) -> None:
+    """``qk_norm_rope_inplace`` on q, and the step's KV write in the same
+    launch: k normed and rotated, and v, stored at each token's (page, slot)
+    of one NHD cache layer ``[pages, 2, page_size, H_kv, D]`` (``k`` itself
+    is left as it was). The first ``n_write`` tokens are written."""
+    num_tokens, num_q_heads, head_dim = q.shape
+    num_kv_heads = k.shape[1]
+    assert k.shape == v.shape and k.shape[0] == num_tokens and k.shape[2] == head_dim
+    assert q.stride(2) == 1 and k.stride(2) == 1 and v.stride(2) == 1
+    assert cache_layer.shape[-2:] == (num_kv_heads, head_dim) and cache_layer.stride(-1) == 1
+    if num_tokens == 0:
+        return
+    _qk_norm_rope_kv_kernel[(num_tokens, num_q_heads + 2 * num_kv_heads)](
+        q, k, v, q_weight, k_weight, pos_ids, cache_layer, page_idx, slot_idx,
+        q_eps, k_eps, rope_theta, n_write,
+        q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1),
+        cache_layer.stride(0), cache_layer.stride(1), cache_layer.stride(2), cache_layer.stride(3),
+        H_Q=num_q_heads, H_KV=num_kv_heads, D=head_dim, HALF_D=head_dim // 2,
+        num_warps=4, num_stages=1,
+    )
+
+
+@qk_norm_rope_kv_write.register_fake
+def _qk_norm_rope_kv_write_fake(q, k, v, q_weight, k_weight, pos_ids, cache_layer, page_idx, slot_idx,
+                                n_write, q_eps, k_eps, rope_theta) -> None:
+    return None
+
+
 # ============================================================================
 # RoPE from position ids (no QK-norm, in-place).
 #

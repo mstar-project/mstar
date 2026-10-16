@@ -122,3 +122,32 @@ def test_cuda_graph_replay_follows_inputs():
     torch.cuda.synchronize()
     torch.testing.assert_close(q.double(), ref_q, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(k.double(), ref_k, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_tokens,n_write", [(1, 1), (7, 7), (8, 5)])
+def test_kv_write_variant_matches_and_writes_the_planned_slots(num_tokens, n_write):
+    """``qk_norm_rope_kv_write``: q as ``qk_norm_rope_inplace`` leaves it; the
+    normed, rotated k and the raw v at each written token's (page, slot) of the
+    NHD layer; tokens past ``n_write`` (plan padding) and every other slot
+    untouched; the k input as it was."""
+    from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
+
+    qkv, wq, wk, pos = _inputs(num_tokens, torch.bfloat16)
+    q, k, v = _split(qkv)
+    ref = qkv.clone()
+    rq, rk, _ = _split(ref)
+    qk_norm_rope_inplace(rq, rk, wq, wk, pos, EPS, EPS, THETA)
+    pages, page_size = 6, 4
+    cache = torch.randn(pages, 2, page_size, HKV, D, device="cuda", dtype=torch.bfloat16)
+    before = cache.clone()
+    flat = torch.randperm(pages * page_size, device="cuda")[:num_tokens]
+    page_idx, slot_idx = flat // page_size, flat % page_size
+    k_before = k.clone()
+    qk_norm_rope_kv_write(q, k, v, wq, wk, pos, cache, page_idx, slot_idx, n_write, EPS, EPS, THETA)
+    torch.cuda.synchronize()
+    assert torch.equal(q, rq)
+    assert torch.equal(k, k_before)
+    expect = before.clone()
+    expect[page_idx[:n_write], 0, slot_idx[:n_write]] = rk[:n_write]
+    expect[page_idx[:n_write], 1, slot_idx[:n_write]] = v[:n_write]
+    assert torch.equal(cache, expect)

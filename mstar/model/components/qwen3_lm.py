@@ -30,12 +30,11 @@ from mstar.model.components.norm import RMSNorm
 
 
 class Qwen3Attention(ParallelAttention):
-    """``ParallelAttention`` with Qwen3's per-head q/k RMSNorm and its 1D RoPE
-    in one Triton kernel for q and k (``qk_norm_rope_inplace``), in place on
-    the projected q and k. At decode width a step is a few small kernels per
-    layer, and the separate norm and FlashInfer RoPE kernels are a sizeable
-    share of it. Falls back to the unfused path off CUDA or without planned
-    positions."""
+    """``ParallelAttention`` with Qwen3's per-head q/k RMSNorm, its 1D RoPE and
+    the step's KV write in one Triton kernel (``qk_norm_rope_kv_write``). At
+    decode width a step is a few small kernels per layer, and the separate
+    norm, RoPE and KV-write kernels were a sizeable share of it. Falls back to
+    the unfused path off CUDA or without planned positions."""
 
     _fuse_qk = False
 
@@ -54,17 +53,30 @@ class Qwen3Attention(ParallelAttention):
         pos_ids = self.pos.pos_ids(self.attend.label) if self._fuse_qk else None
         if pos_ids is None or not hidden_states.is_cuda:
             return super().forward(hidden_states)
-        from mstar.utils.attention import qk_norm_rope_inplace
-
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
-        qk_norm_rope_inplace(
-            q, k, self.q_norm.weight, self.k_norm.weight, pos_ids,
-            float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon), float(self.rope_theta),
-        )
-        attn_output = self.attend(q, k, v)
+        attn_output = self._norm_rope_attend(q, k, v, pos_ids)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
+
+    @torch.compiler.disable
+    def _norm_rope_attend(self, q, k, v, pos_ids) -> torch.Tensor:
+        """q/k norm and RoPE, the step's KV write and attention. For a backend
+        that reads K/V from the paged cache, the write rides in the norm/RoPE
+        kernel (``qk_norm_rope_kv_write``) rather than a launch of its own."""
+        from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
+
+        eps = (float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon), float(self.rope_theta))
+        attend = self.attend
+        if not attend.attn.requires_kv_write:
+            qk_norm_rope_inplace(q, k, self.q_norm.weight, self.k_norm.weight, pos_ids, *eps)
+            return attend(q, k, v)
+        layer, page_idx, slot_idx, n = attend.kv.write_target()
+        qk_norm_rope_kv_write(
+            q, k, v, self.q_norm.weight, self.k_norm.weight, pos_ids,
+            layer, page_idx, slot_idx, min(n, q.shape[0]), *eps,
+        )
+        return attend.attn.run(q, kv_cache_layer=attend.kv.layer_view())
 
 
 @dataclass
