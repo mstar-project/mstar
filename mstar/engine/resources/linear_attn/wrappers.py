@@ -14,6 +14,13 @@ import torch
 # as an explicit constexpr rather than autotuning it.
 _CONV_BLOCK_M = 8
 
+# ROCm: the largest captured prefill bucket that walks its tokens with the
+# recurrent kernel. Its cost grows with the longest row, ~1.3 us a token a
+# layer on MI300X (one 2048-token row: 2.7 ms against the chunked kernel's
+# 0.55), which a bucket bounds only by its token count; larger buckets stay
+# eager on the chunked kernel.
+_ROCM_RECURRENT_MAX_TOKENS = 512
+
 
 class GDNWrapper(ABC):
     def __init__(
@@ -136,6 +143,12 @@ class GDNPrefillWrapper(GDNWrapper):
         # What this arch's chunked kernel reads as its packed state; the
         # manager picks it off the device capability.
         self._prefill_dtype = prefill_dtype
+        # AITER's chunked kernels build their schedule on the host, which
+        # capture forbids; see `_run_recurrent`.
+        self._recurrent = (
+            torch.version.hip is not None and cuda_graph and has_sink_state
+            and num_tokens <= _ROCM_RECURRENT_MAX_TOKENS
+        )
 
         self._rows_capacity = -1
         self._mask_capacity = -1
@@ -281,9 +294,12 @@ class GDNPrefillWrapper(GDNWrapper):
         )
         # ROCm: AITER's VK kernel takes a chunk schedule built from the host
         # spans, once here for every layer of the step. It refuses to run
-        # under capture, so ROCm prefill runs eagerly.
+        # under capture, so it serves the eager walks only.
         self._aiter_schedule = None
-        if torch.version.hip is not None and self._has_sink_state:
+        if (
+            torch.version.hip is not None and self._has_sink_state
+            and not self._recurrent
+        ):
             from aiter.ops.triton.gated_delta_net import (
                 build_gated_delta_rule_prefill_metadata,
             )
@@ -330,6 +346,8 @@ class GDNPrefillWrapper(GDNWrapper):
         )
 
     def run(self, q, k, v, a, b, state, a_log, dt_bias):
+        if self._recurrent:
+            return self._run_recurrent(q, k, v, a, b, state, a_log, dt_bias)
         # The chunked kernel takes the decay and the learning rate already
         # formed, where the decode kernel takes `a`/`b` raw and forms them from
         # the same two weights. Keep the formula here so the paths agree.
@@ -466,6 +484,51 @@ class GDNPrefillWrapper(GDNWrapper):
         )
         out = out.squeeze(0)[:n]
         return _with_room(out, real_len - n) if real_len > n else out
+
+    def _run_recurrent(self, q, k, v, a, b, state, a_log, dt_bias):
+        """ROCm, captured bucket: AITER's recurrent kernel, the one decode
+        runs, walks each row's tokens in turn. One program per row and head,
+        so no host schedule; correct for any span, slow only on long ones."""
+        from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
+            fused_rearrange_sigmoid_gated_delta_rule,
+        )
+
+        plan = self._plan_state
+        rows = plan.num_rows
+        addr = plan.slots[:rows].to(torch.int64)
+        # the kernel reads every row's slot, so a fresh row's must read as zeros
+        state.index_copy_(0, addr, torch.where(
+            plan.has_state.view(-1, 1, 1, 1),
+            torch.index_select(state, 0, addr),
+            torch.zeros((), dtype=state.dtype, device=state.device),
+        ))
+
+        # room for the token `plan` hands each padding row, as in `run`
+        real_len = q.shape[0]
+        q, k, v, a, b = (_with_room(t, rows) for t in (q, k, v, a, b))
+        n = q.shape[0]
+        qkv = torch.cat(
+            (q.reshape(n, -1), k.reshape(n, -1), v.reshape(n, -1)), dim=-1,
+        )
+
+        # In place, the kernel stores the state after token t to column t of a
+        # [rows, tokens] index and skips -1. Column 0 is also where it reads the
+        # initial state, so a row's slot goes there and at its last token.
+        cu = plan.cu_seqlens
+        slots = addr.to(torch.int32).view(-1, 1)
+        index = torch.full((rows, n), -1, dtype=torch.int32, device=q.device)
+        index[:, :1] = slots
+        index.scatter_(1, (cu[1:] - cu[:-1] - 1).view(-1, 1), slots)
+        out, _ = fused_rearrange_sigmoid_gated_delta_rule(
+            A_log=a_log, a=a, b=b, dt_bias=dt_bias, qkv=qkv,
+            key_dim=q.shape[1] * q.shape[2], value_dim=v.shape[1] * v.shape[2],
+            head_k_dim=q.shape[2], head_v_dim=v.shape[2],
+            scale=self._sm_scale, initial_state=state, inplace_final_state=True,
+            cu_seqlens=cu, ssm_state_indices=index,
+            # the caller has normalised q and k (see `qk_l2norm_in_kernel`)
+            use_qk_l2norm_in_kernel=False,
+        )
+        return out.reshape(n, v.shape[1], v.shape[2])[:real_len]
 
 
 @dataclass(frozen=True)
