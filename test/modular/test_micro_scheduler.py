@@ -174,6 +174,10 @@ class _Manager:
         del node_name
         return "default"
 
+    def ingested_stream_chunks(self, rid, node_name):
+        del node_name
+        return getattr(self, "stream_chunks", {}).get(rid, {})
+
     def get_graph_walk(self, rid, partition):
         del rid, partition
         return self._walk
@@ -196,13 +200,20 @@ class _Engine:
         self.groups = dict(groups or {})
         # rids check_ready was asked about, in order
         self.checked = []
+        # rid -> the input metadata capture_group was last handed
+        self.metadata = {}
 
     def get_max_batch_size(self, node_name, graph_walk):
         del node_name, graph_walk
         return self._max_bs
 
-    def capture_group(self, node_name, graph_walk, rid, fwd_info):
+    def splits_by_capture_key(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return True
+
+    def capture_group(self, node_name, graph_walk, rid, fwd_info, input_metadata=None):
         del node_name, graph_walk, fwd_info
+        self.metadata[rid] = input_metadata
         return self.groups.get(rid)
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
@@ -851,6 +862,87 @@ def test_a_submodule_that_does_not_opt_in_is_never_split():
 
 def test_a_walk_without_a_capture_is_never_split():
     assert _capture_group(captured=()) is None
+
+
+class _StreamKeyedSubmodule:
+    """A codec whose capture is its window size, read off the stream chunk."""
+
+    def split_batches_by_capture_key(self, graph_walk):
+        del graph_walk
+        return True
+
+    def cg_key_info(self, graph_walk, per_request_info, per_request_input_metadata=None):
+        del graph_walk
+        ((rid, _),) = per_request_info.items()
+        meta = (per_request_input_metadata or {}).get(rid)
+        return None if meta is None else meta.stream_chunks["codes"].num_items
+
+
+def _stream_engine():
+    from mstar.engine.engine import Engine
+
+    runner = SimpleNamespace(captures_walk=lambda walk: walk == WALK)
+    engine = _Engine(max_bs=16)  # readiness and the cap; the grouping is the real Engine's
+    engine._submodules = {
+        NODE: SimpleNamespace(submodule=_StreamKeyedSubmodule(), cuda_graph_runner=runner),
+    }
+    engine.splits_by_capture_key = lambda node, walk: Engine.splits_by_capture_key(engine, node, walk)
+    engine.capture_group = lambda *a, **kw: Engine.capture_group(engine, *a, **kw)
+    return engine
+
+
+def _chunk(num_items):
+    from mstar.streaming.stream_buffer import StreamChunkInfo
+
+    return StreamChunkInfo(start_offset=0, context_items=0, num_items=num_items, is_final=False)
+
+
+def test_capture_group_hands_the_stream_chunk_to_cg_key_info():
+    from mstar.model.submodule_base import InputMetadata
+
+    engine = _stream_engine()
+    meta = InputMetadata(stream_chunks={"codes": _chunk(9)})
+    assert engine.capture_group(NODE, WALK, 0, object(), input_metadata=meta) == 9
+    assert engine.capture_group(NODE, WALK, 0, object()) is None
+
+
+def test_the_scheduler_groups_streamed_rows_by_the_chunk_they_ingested():
+    """The regression: codec windows of different sizes shared a step and ran eager."""
+    sched = _scheduler(_stream_engine())
+    manager = _Manager(["a", "b", "c", "d"])
+    manager.stream_chunks = {rid: {"codes": _chunk(n)} for rid, n in zip("abcd", (9, 4, 9, 4), strict=True)}
+
+    batch = _next_batch(sched, manager)
+
+    assert list(batch.request_to_worker_graph) == ["a", "c"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b", "d"]
+
+
+def test_a_walk_that_does_not_split_never_reads_stream_chunks():
+    """`capture_group` is asked per row on every build: rows of a walk that
+    does not split must not pay for the stream lookup."""
+    engine = SimpleNamespace(splits_by_capture_key=lambda node, walk: False)
+    sched = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda name: engine), parallel_leader_nodes={NODE},
+    )
+    manager = SimpleNamespace(ingested_stream_chunks=lambda rid, node: pytest.fail("read stream chunks"))
+    assert sched._capture_group(manager, NODE, WALK, 0) is None
+
+
+def test_request_state_reports_the_chunk_each_input_stream_ingested():
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
+    from mstar.worker.node_manager_utils import PerRequestInfo, RequestStateManager
+
+    sbuf = StreamBuffer(request_id=0, edge_name="codes", from_partition="P", policy=FixedChunkPolicy(2))
+    state = RequestStateManager(per_request_info={0: PerRequestInfo(
+        stream_buffers={"codes": sbuf}, stream_buffers_by_consumer={NODE: {"codes": sbuf}},
+    )})
+    assert state.ingested_stream_chunks(0, NODE) == {}
+    sbuf.ingested_chunk = _chunk(2)
+    assert state.ingested_stream_chunks(0, NODE) == {"codes": _chunk(2)}
+    assert state.ingested_stream_chunks(0, "other") == {}
+    assert state.ingested_stream_chunks(7, NODE) == {}
 
 
 # ── bounded readiness checks on the backlog ──────────────────────────────

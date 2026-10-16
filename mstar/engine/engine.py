@@ -1773,9 +1773,19 @@ class Engine:
             outputs.setdefault(rid, {}).update(rid_out)
 
 
+    def splits_by_capture_key(self, node_name: str, graph_walk: str) -> bool:
+        """Whether ``capture_group`` can tell this walk's requests apart: the
+        submodule opts in and the walk has a capture."""
+        submodule_mgmt = self._submodules[node_name]
+        if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
+            return False
+        cg_runner = submodule_mgmt.cuda_graph_runner
+        return cg_runner is not None and cg_runner.captures_walk(graph_walk)
+
     def capture_group(
         self, node_name: str, graph_walk: str, request_id: int,
         request_info: CurrentForwardPassInfo,
+        input_metadata: InputMetadata | None = None,
     ) -> Any | None:
         """The capture bucket this one request would replay, by
         ``cg_key_info``; None when the walk has no capture or the submodule
@@ -1783,7 +1793,8 @@ class Engine:
 
         A batch spanning two groups matches no capture and runs eager, so the
         scheduler batches each group on its own when the submodule opts in
-        (``split_batches_by_capture_key``).
+        (``split_batches_by_capture_key``). ``input_metadata`` is the step's
+        input facts the lease will see, e.g. the stream chunk it consumes.
         """
         submodule_mgmt = self._submodules[node_name]
         if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
@@ -1791,8 +1802,11 @@ class Engine:
         cg_runner = submodule_mgmt.cuda_graph_runner
         if cg_runner is None or not cg_runner.captures_walk(graph_walk):
             return None
+        if input_metadata is None:
+            return submodule_mgmt.submodule.cg_key_info(graph_walk, {request_id: request_info})
         return submodule_mgmt.submodule.cg_key_info(
             graph_walk, {request_id: request_info},
+            per_request_input_metadata={request_id: input_metadata},
         )
 
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
