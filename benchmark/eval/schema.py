@@ -110,8 +110,8 @@ def _scrub_row(row: dict[str, Any]) -> dict[str, Any]:
     in ``scrubbed`` so nothing downstream mistakes them for what the model said."""
     out, changed = {}, []
     for k, v in row.items():
-        if isinstance(v, str) and k != "id":
-            clean = _scrub(v)
+        if k != "id":
+            clean = _scrub_strings(v)
             if clean != v:
                 changed.append(k)
             v = clean
@@ -119,6 +119,17 @@ def _scrub_row(row: dict[str, Any]) -> dict[str, Any]:
     if changed:
         out["scrubbed"] = sorted(set(changed) | set(row.get("scrubbed") or []))
     return out
+
+
+def _scrub_strings(v: Any) -> Any:
+    """Every string inside a row value (nested transcripts too) scrubbed; keys kept."""
+    if isinstance(v, str):
+        return _scrub(v)
+    if isinstance(v, dict):
+        return {k: _scrub_strings(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return type(v)(_scrub_strings(x) for x in v)
+    return v
 
 
 def _json_default(obj: Any) -> Any:

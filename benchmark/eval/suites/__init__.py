@@ -3,8 +3,9 @@
 from benchmark.eval.suites.asr import ASRSuite
 from benchmark.eval.suites.base import Suite
 from benchmark.eval.suites.duplex import DuplexSuite
+from benchmark.eval.suites.duplex_fdb import FDBSuite
 from benchmark.eval.suites.tts import TTSSuite
 
-SUITES: dict[str, type[Suite]] = {s.name: s for s in (TTSSuite, ASRSuite, DuplexSuite)}
+SUITES: dict[str, type[Suite]] = {s.name: s for s in (TTSSuite, ASRSuite, DuplexSuite, FDBSuite)}
 
 __all__ = ["SUITES", "Suite"]
