@@ -1,6 +1,6 @@
 name: Claude Review
 
-# Advisory LLM review of every PR. Not a merge gate. Rules live in AGENTS.md;
+# Advisory LLM review of contributors' PRs. Not a merge gate. Rules live in AGENTS.md;
 # the reviewer's operating instructions are in .github/review/review-prompt.md.
 #
 # Why pull_request_target: a plain `pull_request` trigger withholds secrets from
@@ -21,16 +21,30 @@ name: Claude Review
 #   4. Write permission is pull-requests only, and mutation tools are disabled,
 #      so the worst case for a prompt injection is a bad comment.
 
+# Who can trigger it: GitHub author_association OWNER, MEMBER, COLLABORATOR or
+# CONTRIBUTOR, i.e. the team plus anyone who has had a PR merged here. First-time
+# contributors and strangers get no automatic review (cost, spam); a maintainer
+# can still comment /review on their PR.
+#
+# When it runs:
+#   - light, once, when a contributor opens, reopens or readies a non-draft PR;
+#   - light, when a contributor comments `/review` on a PR (re-review after pushes);
+#   - thorough, when a contributor comments `/review thorough`, or someone with
+#     triage access applies the `ai-review-thorough` label.
+# Pushes don't trigger a review on their own; comment /review for that.
+#
+# issue_comment also runs with secrets and the default branch's workflow file,
+# so the same four rules hold. The comment body is only matched by the `if`
+# below, never passed to a shell.
+
 on:
   pull_request_target:
     # `labeled` is for on-demand thorough reviews; other labels are filtered out below.
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    types: [opened, reopened, ready_for_review, labeled]
+  issue_comment:
+    types: [created]
 
 permissions: {}
-
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
 
 jobs:
   review:
@@ -39,12 +53,23 @@ jobs:
     # preflight below, which is the same protection and visible in the log
     # rather than a silently skipped job. It also means a fork that *does* set
     # the key gets reviews, which is how you test changes to this workflow.
-    # A light review runs on every push. Applying the `ai-review-thorough` label
-    # (triage access or above) runs one thorough review; later pushes go back to light.
     if: >-
-      !github.event.pull_request.draft &&
-      !contains(github.event.pull_request.labels.*.name, 'skip-ai-review') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'ai-review-thorough')
+      (github.event_name == 'pull_request_target' &&
+       !github.event.pull_request.draft &&
+       !contains(github.event.pull_request.labels.*.name, 'skip-ai-review') &&
+       ((github.event.action == 'labeled' && github.event.label.name == 'ai-review-thorough') ||
+        (github.event.action != 'labeled' &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association))))
+      ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       (github.event.comment.body == '/review' || github.event.comment.body == '/review thorough') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.comment.author_association))
+    # Job-level, so an unrelated PR comment (which still starts a workflow run
+    # that this `if` skips) can never cancel a review in progress.
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -66,12 +91,39 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # The PR's number, refs and title, the same way for both triggers (an
+      # issue_comment event doesn't carry the PR's head or base). The title is
+      # untrusted; it only ever reaches the prompt.
+      - name: Resolve the PR
+        if: steps.pre.outputs.run == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          THOROUGH: ${{ (github.event.action == 'labeled' || github.event.comment.body == '/review thorough') && 'true' || 'false' }}
+        run: |
+          gh api "repos/$REPO/pulls/$PR" > pr.json
+          {
+            echo "number=$PR"
+            echo "base_sha=$(jq -r .base.sha pr.json)"
+            echo "head_sha=$(jq -r .head.sha pr.json)"
+            echo "head_repo=$(jq -r '.head.repo.full_name // empty' pr.json)"
+            if [ "$THOROUGH" = "true" ]; then echo "mode=thorough"; else echo "mode=light"; fi
+            delim="TITLE_$(openssl rand -hex 8)"
+            echo "title<<$delim"; jq -r .title pr.json; echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+          if [ -z "$(jq -r '.head.repo.full_name // empty' pr.json)" ]; then
+            echo "::error::The PR's head repository no longer exists; can't check it out."
+            exit 1
+          fi
+
       # Trusted: the base branch. AGENTS.md and the review prompt come from here.
       - name: Check out the base branch
         if: steps.pre.outputs.run == 'true'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ steps.pr.outputs.base_sha }}
           persist-credentials: false
 
       # Untrusted: the PR's tree, for reading changed files in full context.
@@ -80,8 +132,8 @@ jobs:
         if: steps.pre.outputs.run == 'true'
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
+          repository: ${{ steps.pr.outputs.head_repo }}
+          ref: ${{ steps.pr.outputs.head_sha }}
           path: pr-head
           persist-credentials: false
 
@@ -91,7 +143,7 @@ jobs:
         id: diff
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
+          PR: ${{ steps.pr.outputs.number }}
           REPO: ${{ github.repository }}
         run: |
           gh pr diff "$PR" --repo "$REPO" > pr.diff
@@ -110,15 +162,15 @@ jobs:
             exactly. It defines your trust boundary, your method, your reporting bar and
             your output format.
 
-            Mode: ${{ github.event.action == 'labeled' && 'thorough' || 'light' }}
-            PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}
+            Mode: ${{ steps.pr.outputs.mode }}
+            PR #${{ steps.pr.outputs.number }}: ${{ steps.pr.outputs.title }}
             pr.diff is ${{ steps.diff.outputs.lines }} lines.
           # Read-only. Blocking the mutation and network tools caps a prompt
           # injection at a bad comment. The only write tools allowed are the
           # inline-comment tool (which the action loads only when it is listed
           # here) and `gh pr comment` for the summary.
           claude_args: |
-            --model claude-sonnet-5-5
+            --model claude-opus-5-5
             --max-turns 40
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*)"
             --disallowedTools Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch
