@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 15, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 16, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -748,22 +748,28 @@ postprocess()                 # model output tensor -&gt; bytes for the client
 └── components/          # the actual nn.Modules (attention, decoder, etc.)
 </pre></div>
 </div>
-<p>Plus two things outside that package:</p>
+<p>Plus a handful of things outside that package:</p>
 <ul class="simple">
-<li><p>an entry in <code class="docutils literal notranslate"><span class="pre">mstar/model/registry.py</span></code> so the model is discoverable, and</p></li>
-<li><p>a config YAML in <code class="docutils literal notranslate"><span class="pre">configs/</span></code> mapping nodes to ranks.</p></li>
+<li><p>an entry in <code class="docutils literal notranslate"><span class="pre">mstar/model/registry.py</span></code> so the model is discoverable,</p></li>
+<li><p>a config YAML in <code class="docutils literal notranslate"><span class="pre">configs/</span></code> mapping nodes to ranks,</p></li>
+<li><p>an entry in <code class="docutils literal notranslate"><span class="pre">DEFAULT_CONFIGS</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/cli/main.py</span></code>) so <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> knows the name,</p></li>
+<li><p>a row in <code class="docutils literal notranslate"><span class="pre">docs/models.rst</span></code>, and</p></li>
+<li><p>an OpenAI adapter, only if the model needs OpenAI-compatible routes.</p></li>
 </ul>
+<p>Step 1 covers all of them.</p>
 </section>
 <section id="step-1-register-the-model">
 <h2>Step 1 — Register the model<a class="headerlink" href="#step-1-register-the-model" title="Link to this heading">#</a></h2>
-<p>Open <code class="docutils literal notranslate"><span class="pre">mstar/model/registry.py</span></code> and add your class to <code class="docutils literal notranslate"><span class="pre">MODEL_REGISTRY</span></code> (and, if it
+<p>Open <code class="docutils literal notranslate"><span class="pre">mstar/model/registry.py</span></code> and add your model to <code class="docutils literal notranslate"><span class="pre">MODEL_REGISTRY</span></code> (and, if it
 loads weights from Hugging Face, to <code class="docutils literal notranslate"><span class="pre">HF_MODELS</span></code>). The dict key is the string you put
 under <code class="docutils literal notranslate"><span class="pre">model:</span></code> in a config YAML.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.your_model.your_model_model</span><span class="w"> </span><span class="kn">import</span> <span class="n">YourModel</span>
-
-<span class="n">MODEL_REGISTRY</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">type</span><span class="p">[</span><span class="n">Model</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span>
+<p>The value is a <code class="docutils literal notranslate"><span class="pre">(module_path,</span> <span class="pre">class_name)</span></code> tuple, not an imported class: the module is
+imported lazily through <code class="docutils literal notranslate"><span class="pre">import_module</span></code> when the model is actually used, which keeps
+<code class="docutils literal notranslate"><span class="pre">mstar.model.registry</span></code> cheap to import. A direct class import here would pull every
+model’s dependencies into every process.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">MODEL_REGISTRY</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span>
     <span class="c1"># ...</span>
-    <span class="s2">"your_model"</span><span class="p">:</span> <span class="n">YourModel</span><span class="p">,</span>
+    <span class="s2">"your_model"</span><span class="p">:</span> <span class="p">(</span><span class="s2">"mstar.model.your_model.your_model_model"</span><span class="p">,</span> <span class="s2">"YourModel"</span><span class="p">),</span>
 <span class="p">}</span>
 
 <span class="n">HF_MODELS</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
@@ -772,8 +778,22 @@ under <code class="docutils literal notranslate"><span class="pre">model:</span>
 <span class="p">}</span>
 </pre></div>
 </div>
-<p>This is the only wiring step. There is no plugin scan. The registry import is the single
-source of truth.</p>
+<p>There is no plugin scan, so the registry is the only place the class is discovered — but it
+is <strong>not</strong> the only wiring step. A model also needs:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">DEFAULT_CONFIGS</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/cli/main.py</span></code>, mapping the name to its default config file.
+Without it, <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">&lt;your_model&gt;</span></code> exits with <code class="docutils literal notranslate"><span class="pre">error:</span> <span class="pre">unknown</span> <span class="pre">model</span></code> before
+anything loads.</p></li>
+<li><p>a row in <code class="docutils literal notranslate"><span class="pre">docs/models.rst</span></code>, which is the model list users read.</p></li>
+<li><p>an <code class="docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code> subclass in <code class="docutils literal notranslate"><span class="pre">ADAPTER_REGISTRY</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar/api_server/openai/adapters.py</span></code>), <em>only</em> if the model maps onto OpenAI semantics
+such as <code class="docutils literal notranslate"><span class="pre">chat.completions</span></code>, <code class="docutils literal notranslate"><span class="pre">audio.speech</span></code> or <code class="docutils literal notranslate"><span class="pre">images.generate</span></code>. A model reached
+only through <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code> needs none.</p></li>
+<li><p>the client-example tuples further down <code class="docutils literal notranslate"><span class="pre">mstar/cli/main.py</span></code>, so <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> prints a
+usage snippet. Cosmetic, but user-visible.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">test/modular/test_model_registration.py</span></code> enforces the registry, CLI and docs entries, so
+CI fails rather than shipping a model nobody can reach.</p>
 </section>
 <section id="step-2-implement-the-model-class">
 <h2>Step 2 — Implement the <code class="docutils literal notranslate"><span class="pre">Model</span></code> class<a class="headerlink" href="#step-2-implement-the-model-class" title="Link to this heading">#</a></h2>
@@ -2352,8 +2372,14 @@ uses them to decide when to run.</p>
       [ ] get_submodule
       [ ] (optional) get_request_resource_configs
       [ ] (optional) prefix_key_streams + checkpoint_path   — cross-request prefix reuse
-[ ] mstar/model/registry.py                    — add to MODEL_REGISTRY (+ HF_MODELS)
+[ ] mstar/model/registry.py                    — (module_path, class_name) in MODEL_REGISTRY
+      [ ] HF_MODELS too, if weights come from Hugging Face
 [ ] configs/&lt;your_model&gt;.yaml                  — node_groups → ranks (+ resources: overrides)
+[ ] mstar/cli/main.py DEFAULT_CONFIGS          — else `mstar serve &lt;name&gt;` says "unknown model"
+      [ ] the client-example tuples lower down (cosmetic, user-visible)
+[ ] docs/models.rst                            — one row in the registry-key table
+[ ] (optional) mstar/api_server/openai/adapters.py — only for OpenAI-compatible routes
+[ ] (optional) pyproject.toml extra            — if it needs deps the base install lacks
 [ ] (optional) async partitions if pipelined
 </pre></div>
 </div>
@@ -2520,7 +2546,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 15, 2026.
+  Last updated on Oct 16, 2026.
   <br/>
 </p>
   </div>

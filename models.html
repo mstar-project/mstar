@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 15, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 16, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -681,11 +681,11 @@ representative Hugging Face identifier.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">ByteDance-Seed/BAGEL-7B-MoT</span></code></p></td>
 <td><p>Unified multimodal model (text + image understanding and generation).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">chatterbox</span></code> / <code class="docutils literal notranslate"><span class="pre">chatterbox_turbo</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">chatterbox</span></code> / <code class="docutils literal notranslate"><span class="pre">chatterbox_multilingual</span></code> / <code class="docutils literal notranslate"><span class="pre">chatterbox_turbo</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">ResembleAI/chatterbox</span></code>, <code class="docutils literal notranslate"><span class="pre">ResembleAI/chatterbox-turbo</span></code></p></td>
 <td><p>Zero-shot voice-cloning TTS: T3 speech-token LM (Llama-520M, or GPT-2-medium
 for Turbo) with CFG and exaggeration control, S3Gen flow-matching decoder,
-HiFT vocoder, PerTh watermark. 24 kHz.</p></td>
+HiFT vocoder, PerTh watermark. 24 kHz. Multilingual covers 23 languages.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cosmos3</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Nano</span></code></p></td>
@@ -788,17 +788,22 @@ backbone + audio codec. Clones a voice from a reference clip.</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code></p></td>
 <td><p>Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">waypoint</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Overworld/Waypoint-1.5-1B</span></code></p></td>
+<td><p>Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
+frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-4B</span></code></p></td>
 <td><p>FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
 image editing; Qwen3-4B hidden-state text encoder + FLUX.2 VAE. Apache-2.0.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-9B</span></code></p></td>
 <td><p>FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
 the FLUX Non-Commercial License; check it before deploying.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Tongyi-MAI/Z-Image-Turbo</span></code></p></td>
 <td><p>Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
 encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.</p></td>
@@ -1664,7 +1669,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 15, 2026.
+  Last updated on Oct 16, 2026.
   <br/>
 </p>
   </div>
