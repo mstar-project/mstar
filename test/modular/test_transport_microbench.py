@@ -48,6 +48,33 @@ def test_arguments_are_checked():
     assert microbench.parse_args(["--dtype", "float32", "--sizes", "4,64"]).sizes == [4, 64]
 
 
+class _ReachedMakeCommError(Exception):
+    pass
+
+
+@pytest.mark.parametrize(("role", "devices", "made_current"), [
+    ("Sender", ["--device", "cuda:1", "--receiver-device", "cuda:2"], ["cuda:1"]),
+    ("Receiver", ["--device", "cuda:1", "--receiver-device", "cuda:2"], ["cuda:2"]),
+    ("Sender", ["--device", "cuda"], []),
+    ("Receiver", ["--device", "cpu"], []),
+])
+def test_each_role_makes_its_device_current_before_building(monkeypatch, role, devices, made_current):
+    """The transports record their CUDA events on the current device's
+    stream, so ``cuda:N`` other than 0 has to be current before any is made.
+    ``cuda`` alone already means the current one."""
+    args = microbench.parse_args(devices)
+    current = []
+    monkeypatch.setattr(microbench.torch.cuda, "set_device", lambda d: current.append(str(d)))
+
+    def make_comm(my_id, args):
+        raise _ReachedMakeCommError(list(current))
+
+    monkeypatch.setattr(microbench, "make_comm", make_comm)
+    with pytest.raises(_ReachedMakeCommError) as built:
+        getattr(microbench, role)(args)
+    assert built.value.args[0] == made_current
+
+
 def test_fit_recovers_fixed_cost_and_bandwidth():
     sizes = [64 * 4 ** i for i in range(9)]
     lat = [20e-6 + s / 2e9 for s in sizes]

@@ -233,6 +233,15 @@ def _sync(device: str) -> None:
         torch.cuda.synchronize(device)
 
 
+def _use_device(device: str) -> None:
+    """Make ``device`` current, as a worker does when it is built: the
+    transports record their CUDA events on the current device's stream.
+    ``cuda`` alone means the current device, so it is left as is."""
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is not None:
+        torch.cuda.set_device(dev)
+
+
 class HostCopier:
     """Device <-> host copies on a side stream, waited on alone, the way a
     worker keeps them from queueing behind its next step."""
@@ -338,6 +347,7 @@ class SizeResult:
 class Sender:
     def __init__(self, args):
         self.args = args
+        _use_device(args.device)
         self.comm = make_comm(SENDER, args)
         self.dtype = getattr(torch, args.dtype)
         self.copier = HostCopier(args.device)
@@ -690,6 +700,7 @@ class Sender:
 class Receiver:
     def __init__(self, args):
         self.args = args
+        _use_device(args.receiver_device)
         self.comm = make_comm(RECEIVER, args)
         self.copier = HostCopier(args.receiver_device)
         self.mgr = None
