@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from benchmark.eval.schema import describe_command, redact_url, scrub_argv, scrub_env
+from benchmark.eval.schema import describe_args, describe_command, redact_url, scrub_argv, scrub_env
 
 
 def free_port() -> int:
@@ -178,7 +178,7 @@ class ManagedServer:
             "managed": True,
             "model": self.model,
             "config": scrub_argv([self.config])[0] if self.config else None,
-            "extra_args": scrub_argv(self.extra_args),
+            "extra_args": describe_args(self.extra_args),
             "command": describe_command(self._command),
             "env": scrub_env(self.env),
             "startup_s": self.startup_s,

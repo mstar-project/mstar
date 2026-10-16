@@ -160,8 +160,9 @@ _SECRET = re.compile(
 # Keys whose values name a machine; their values are kept only when loopback.
 _HOSTLIKE = re.compile(r"HOST|ADDR|ENDPOINT|URL|URI|DOMAIN|PEER|(^|_)IP($|_)", re.IGNORECASE)
 _URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]+")
-_IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-_IPV6 = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
+# Bounded by anything that cannot continue an address, so "label_10.0.0.1" still matches.
+_IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+_IPV6 = re.compile(r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])")
 _HOME = re.compile(r"/(?:home|Users)/[^/\s'\"]+")
 _URL_FLAGS = {"--url"}
 _PAIR_FLAGS = {"--serve-env", "--extra"}
@@ -248,18 +249,30 @@ def finite(obj: Any) -> Any:
     return obj
 
 
-def describe_command(cmd: list[str] | str | None) -> str | None:
-    """A custom server command for a results file: its program and a fingerprint, never its
-    text (shell wrappers, inline exports and engine flags can hold secrets and hostnames)."""
+def _fingerprint(tokens: list[str]) -> str:
     import hashlib
+    import shlex
+
+    return hashlib.sha256(shlex.join(tokens).encode()).hexdigest()[:12]
+
+
+def describe_command(cmd: list[str] | str | None) -> str | None:
+    """A custom server command for a results file: a fingerprint only, never its text
+    (shell wrappers, inline exports, env options and engine flags can hold secrets and
+    hostnames). Two runs with the same fingerprint launched the same command."""
     import shlex
 
     if not cmd:
         return None
-    tokens = shlex.split(cmd) if isinstance(cmd, str) else list(cmd)
-    program = next((t for t in tokens if t != "env" and not _ASSIGN.match(t)), "")
-    digest = hashlib.sha256(shlex.join(tokens).encode()).hexdigest()[:12]
-    return f"<command {os.path.basename(program)} sha256:{digest}>"
+    return f"<command sha256:{_fingerprint(shlex.split(cmd) if isinstance(cmd, str) else list(cmd))}>"
+
+
+def describe_args(args: list[str] | None) -> dict[str, Any] | None:
+    """Arguments forwarded to ``mstar serve``: the flag names and a fingerprint of the whole
+    list, never the values (``--ho=<host>`` is an accepted abbreviation of ``--host``)."""
+    if not args:
+        return None
+    return {"flags": sorted({a.split("=", 1)[0] for a in args if a.startswith("-")}), "sha256": _fingerprint(args)}
 
 
 def _pair(kv: str) -> str:

@@ -141,8 +141,8 @@ max, n per metric).
 
 Results files are meant to be shared, so they never carry addresses, secrets or home
 paths: values under secret-looking keys are dropped, host-like keys keep only loopback
-values, a ``--serve-cmd`` is recorded as its program and a fingerprint, and raw command
-lines are not recorded. A failed request keeps only an error category (``HTTP 503``, an
+values, a ``--serve-cmd`` is recorded as a fingerprint and ``--serve-arg`` values as flag
+names plus a fingerprint, and raw command lines are not recorded. A failed request keeps only an error category (``HTTP 503``, an
 exception type); the server's message and the exception text go to
 ``<out>/errors-<suite>-<label>-<load>.log`` next to the server log.
 

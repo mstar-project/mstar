@@ -180,6 +180,8 @@ def test_redact_url_keeps_only_loopback():
     full = "2001:1234:5678:9012:3456:7890:1234:5678"
     assert full not in redact_url(f"http://127.0.0.1:8000/routes/{full}")
     assert scrub({"note": f"{full} at 07:02:51, ::1"}) == {"note": "<ip> at 07:02:51, ::1"}
+    assert scrub({"label": "kokoro_10.42.0.7 kokoro_2001:db8::42"}) == {"label": "kokoro_<ip> kokoro_<ip>"}
+    assert scrub({"v": "torch 2.12.1, port 8000"}) == {"v": "torch 2.12.1, port 8000"}
 
 
 def test_render_table_mean_std_and_provenance(tmp_path):
@@ -485,7 +487,14 @@ def test_custom_commands_hosts_and_ipv6_never_reach_results():
         assert out == describe_command(cmd) and out.startswith("<command ")
         for leaked in ("abc", "k1", "gpu.internal", "t2"):
             assert leaked not in out
-    assert describe_command("env A=1 vllm serve x").startswith("<command vllm sha256:")
+    assert describe_command("env A=1 vllm serve x").startswith("<command sha256:")
+    assert "hf_x" not in describe_command(["env", "--split-string=HF_TOKEN=hf_x python -V"])
+    from benchmark.eval.schema import describe_args
+    from benchmark.eval.server import ManagedServer
+
+    info = ManagedServer("kokoro", extra_args=["--ho=gpu-private.internal", "--log-level", "DEBUG"]).info()
+    assert info["extra_args"]["flags"] == ["--ho", "--log-level"] and "internal" not in json.dumps(info)
+    assert describe_args(None) is None
     env = scrub({"MSTAR_ZMQ_TCP_HOST": "gpu.internal", "MSTAR_SERVER_HOST": "2001:db8::42",
                  "MSTAR_ADDR": "127.0.0.1", "PYTHONPATH": "/home/someone/a:/Users/x/b", "note": "at 07:02:51"})
     assert env == {"MSTAR_ZMQ_TCP_HOST": "<host>", "MSTAR_SERVER_HOST": "<host>", "MSTAR_ADDR": "127.0.0.1",
