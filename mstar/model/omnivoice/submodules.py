@@ -19,6 +19,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources.diffusion_sampler.resource import DiffusionSamplerResource
 from mstar.model.omnivoice.components.backbone import (
     CanvasItem,
     OmniVoiceBackbone,
@@ -33,7 +34,6 @@ from mstar.model.omnivoice.components.codec import (
 from mstar.model.omnivoice.components.unmask import (
     apply_reveal,
     build_reveal_schedule,
-    predict_tokens_with_scoring,
 )
 from mstar.model.omnivoice.config import OmniVoiceConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
@@ -41,6 +41,7 @@ from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSu
 logger = logging.getLogger(__name__)
 
 UNMASK_LOOP_NAME = "unmask_loop"
+DIFFUSION_SAMPLER = "diffusion_sampler"
 
 
 class _SingleRequestMixin:
@@ -262,6 +263,12 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
                 guidance_scale=float(
                     engine_inputs.per_request_info[rid].step_metadata["guidance_scale"]
                 ),
+                # Which diffusion step this request is on. Requests in one
+                # batch are generally at different iterations, and the
+                # sampler seeds its draw per request from it.
+                iteration=int(
+                    row.tensor_inputs["step_index"].reshape(-1)[0].item()
+                ),
             )
             for rid, row in zip(engine_inputs.request_ids, inputs, strict=True)
         ]
@@ -282,9 +289,11 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         would let the first case allocate a logits tensor several hundred MB
         wide.
 
-        The cap is deliberately conservative and has room now that the
-        float32 upcast is per request rather than over the whole batch, but
-        raising it is a measurement, not a guess, so it stays where it was.
+        Scoring runs batched over the gathered positions, so the float32
+        copy is of the whole step's target region rather than of one request.
+        That is the trade this cap now guards: batched scoring is worth more
+        than the smaller peak, and raising the cap is a measurement rather
+        than a guess, so it stays where it was.
         """
         packed = sum(inp.input_seq_len for inp in model_inputs)
         if packed > self.config.max_packed_tokens:
@@ -306,37 +315,69 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         canvas: PackedCanvas | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        """One packed forward over the whole batch.
+        """One packed forward, then one batched scoring call, for the whole step.
 
-        Nothing request-shaped happens here: the canvas arrives built from
-        ``preprocess`` and the CFG branches leave as a per-request pair of
-        logit blocks, so the body is a single backbone call.
-
-        The float32 upcast happens per slice rather than on the whole packed
-        tensor. Scoring needs float32, but casting first materialises a
-        float32 copy of every request's logits at once, and that peak is what
-        ``max_packed_tokens`` has to be set low enough to survive. Casting
-        after the slice keeps the peak at one batch in the backbone's dtype
-        plus one request in float32.
+        Scoring runs here rather than per request in ``postprocess`` because
+        this is where the batch still exists. The conditional target blocks of
+        every request are already contiguous in the gathered logits, so the
+        sampler resource sees one ``[C, positions, V]`` tensor and applies each
+        request's guidance scale and temperature as a vector. What leaves is a
+        token and its log-probability per cell; which of them get committed is
+        the reveal's business, and that stays per request.
         """
         assert items is not None and canvas is not None, (
             "OmniVoice backbone requires preprocess output"
         )
+        sampler: DiffusionSamplerResource = engine_inputs.resources[DIFFUSION_SAMPLER]
         logits = self.backbone(canvas)
+
+        # Layout: every conditional block, then the unconditional blocks of
+        # the requests that asked for CFG. float32 for the scoring maths, cast
+        # once over the gathered positions rather than over the packed row.
+        total = canvas.flat_target_total
+        c_packed = logits[0, :, :total, :].to(torch.float32)
+        u_packed = self._unconditional_half(logits, canvas, items, c_packed)
+
+        tokens, logprobs = sampler.sample(
+            [item.request_id for item in items],
+            c_packed, u_packed,
+            seq_lens=[item.target_len for item in items],
+            iterations=[item.iteration for item in items],
+        )
+
         outputs: dict[str, NameToTensorList] = {}
         for item in items:
-            c_logits, u_logits = canvas.slice_logits(logits, item)
-            row: NameToTensorList = {"c_logits": [c_logits[0].to(torch.float32)]}
-            # An item with CFG off has no unconditional document. Echo the
-            # conditional block so the edge keeps one shape for every request;
-            # scoring ignores it at guidance_scale 0.
-            row["u_logits"] = (
-                [u_logits[0].to(torch.float32)]
-                if u_logits is not None
-                else row["c_logits"]
-            )
-            outputs[item.request_id] = row
+            sl = slice(item.flat_start, item.flat_start + item.target_len)
+            outputs[item.request_id] = {
+                "pred_tokens": [tokens[:, sl]],
+                "scores": [logprobs[:, sl]],
+            }
         return outputs
+
+    @staticmethod
+    def _unconditional_half(logits, canvas, items, c_packed):
+        """The unconditional logits lined up with ``c_packed``, or None.
+
+        Three cases. Nobody wants guidance, so there is nothing to line up.
+        Everybody does, and the second half of the gathered logits already is
+        the answer, no copy. Or the step mixes the two, and the items without
+        an unconditional document borrow their own conditional block, which
+        scoring multiplies by a zero guidance scale anyway.
+        """
+        if canvas.flat_uncond_total == 0:
+            return None
+        tail = logits[0, :, canvas.flat_target_total:, :]
+        if canvas.flat_uncond_total == canvas.flat_target_total:
+            return tail.to(torch.float32)
+        parts = []
+        for item in items:
+            c_slice = slice(item.flat_start, item.flat_start + item.target_len)
+            if item.flat_u_start < 0:
+                parts.append(c_packed[:, c_slice, :])
+            else:
+                u = slice(item.flat_u_start, item.flat_u_start + item.target_len)
+                parts.append(tail[:, u, :].to(torch.float32))
+        return torch.cat(parts, dim=1)
 
     def postprocess(
         self,
@@ -346,10 +387,14 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         inputs: NodeInputs | None = None,
         **kwargs,
     ):
-        """Turn this request's logits into its next canvas.
+        """Commit this step's reveal to the request's canvas.
 
-        Scoring, the reveal schedule and the in-place write are per-request and
-        data-dependent, which is what keeps them out of ``forward_batched``.
+        The scoring already happened, batched, in ``forward_batched``; what is
+        left is the part that is genuinely per request: how many cells this
+        iteration reveals, the confidence ranking that picks them, and the
+        write. Those depend on a schedule and a layer penalty that belong to
+        this decoder, not to a sampler.
+
         The iteration index is read off the ``step_index`` edge rather than
         ``dynamic_loop_iter_counts``, which the worker sets wrong on the
         speculative path; everything else comes from step metadata.
@@ -368,32 +413,23 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
             num_step=int(meta["num_step"]),
             t_shift=float(meta["t_shift"]),
         )
-        # Reseeded per step from the request's seed plus the iteration, so a
-        # replay matches step for step; one generator for the whole request
-        # would only match if every step ran in the same order, which async
-        # scheduling does not promise.
-        generator = self._step_generator(request_info, k, tokens.device)
-        pred_tokens, scores = predict_tokens_with_scoring(
-            c_logits=outputs["c_logits"][0].unsqueeze(0),
-            u_logits=outputs["u_logits"][0].unsqueeze(0),
-            audio_mask_id=self.config.audio_mask_id,
-            guidance_scale=float(meta["guidance_scale"]),
-            class_temperature=float(meta["class_temperature"]),
-            generator=generator,
-        )
         tokens = apply_reveal(
             tokens=tokens,
-            pred_tokens=pred_tokens,
-            scores=scores,
+            pred_tokens=outputs["pred_tokens"][0].unsqueeze(0),
+            scores=outputs["scores"][0].unsqueeze(0),
             reveal_count=schedule[k] if k < len(schedule) else 0,
             audio_mask_id=self.config.audio_mask_id,
             layer_penalty_factor=float(meta["layer_penalty_factor"]),
             position_temperature=float(meta["position_temperature"]),
-            generator=generator,
+            # The reveal order has its own draw, reseeded per step so a replay
+            # matches step for step. One generator for a whole request would
+            # only match if every step ran in the same order, which async
+            # scheduling does not promise.
+            generator=self._step_generator(request_info, k, tokens.device),
         )
 
-        outputs.pop("c_logits", None)
-        outputs.pop("u_logits", None)
+        outputs.pop("pred_tokens", None)
+        outputs.pop("scores", None)
         outputs["audio_tokens"] = [tokens[0]]
         outputs["step_index"] = [inputs.tensor_inputs["step_index"] + 1]
 
