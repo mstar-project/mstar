@@ -48,6 +48,7 @@ from test.voxcpm2.streaming import stream_through
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "voxcpm2.yaml"
 FACTORS = [1.0 + 0.25 * i for i in range(8)]
+FP64_ROUNDING = 1e-13   # float64 streams differ from a whole decode by up to about 6e-15 on some CPUs, 0 on others
 TINY = {
     "architecture": "voxcpm2",
     "lm_config": {
@@ -451,7 +452,8 @@ def test_streamed_audio_equals_a_whole_decode(model, num_patches):
     streamed = torch.cat(chunks)
     _assert_unsaturated(whole)
     assert streamed.numel() == whole.numel() == num_patches * config.patch_samples
-    assert torch.equal(streamed, whole)   # float64: the windows reproduce it exactly
+    # float64: the windows reproduce it up to rounding (bit equality depends on the CPU's kernels)
+    assert (streamed - whole).abs().max() <= FP64_ROUNDING
     # the first audio leaves after one patch
     assert chunks[0].numel() == config.patch_samples
 
@@ -467,8 +469,8 @@ def test_stream_context_below_the_receptive_field_changes_the_audio(model):
         streamed = torch.cat(stream_through(vae_node, patches, short))
         whole = vae_node.vae.decode(patches.reshape(-1, config.feat_dim).t().unsqueeze(0))[0]
     assert streamed.numel() == whole.numel()
-    # float64 windows with the full context are bit-exact, so any difference is the missing context
-    assert not torch.equal(streamed, whole)
+    # float64 windows with the full context match to rounding, so a larger difference is the missing context
+    assert (streamed - whole).abs().max() > 100 * FP64_ROUNDING   # about 8e-11 with these weights
 
 
 def test_streamed_continuation_skips_the_prompt_lead(model):
@@ -483,7 +485,7 @@ def test_streamed_continuation_skips_the_prompt_lead(model):
         streamed = torch.cat(stream_through(vae_node, patches, policy, lead=lead))
         whole = vae_node.vae.decode(torch.cat([lead, patches]).reshape(-1, 8).t().unsqueeze(0))[0]
     _assert_unsaturated(whole)
-    assert torch.equal(streamed, whole[3 * config.patch_samples:])
+    assert (streamed - whole[3 * config.patch_samples:]).abs().max() <= FP64_ROUNDING
 
 
 def test_vae_batches_windows_of_different_widths(model):
@@ -504,7 +506,7 @@ def test_vae_batches_windows_of_different_widths(model):
             vae_node.postprocess(rid, None, out[rid], inputs=prepared[rid])
             alone = vae_node.vae.decode(w.reshape(-1, 8).t().unsqueeze(0))[0][ctx * config.patch_samples:]
             _assert_unsaturated(alone)
-            assert torch.equal(out[rid]["audio_chunk"][0], alone)
+            assert (out[rid]["audio_chunk"][0] - alone).abs().max() <= FP64_ROUNDING
 
 
 # -- adapter -------------------------------------------------------------------
