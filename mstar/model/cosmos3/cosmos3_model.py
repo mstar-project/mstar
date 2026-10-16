@@ -999,7 +999,7 @@ class Cosmos3Model(Model):
                 frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
         if not frames:
             raise ValueError(f"no video frames decoded from {filepath}")
-        video = torch.stack(frames).to(device).float() / 255.0
+        video = torch.stack(frames).to(device).float().div_(255.0)
         metadata = {
             "num_frames": len(frames), "average_fps": fps,
             "duration_seconds": (len(frames) / fps) if fps else None,

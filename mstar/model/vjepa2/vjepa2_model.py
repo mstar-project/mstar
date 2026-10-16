@@ -54,6 +54,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata, video_metadata_dict
+from mstar.model.media_limits import VideoBudget
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
@@ -615,6 +616,10 @@ class VJepa2Model(Model):
             step,
         )
 
+        height = getattr(metadata_obj, "height", None)
+        width = getattr(metadata_obj, "width", None)
+        if height and width:
+            VideoBudget().add(height, width, len(indices))
         get_at = getattr(decoder, "get_frames_at", None)
         if get_at is not None:
             logger.info("load_video: calling get_frames_at(%d indices)", len(indices))
@@ -627,6 +632,7 @@ class VJepa2Model(Model):
             frames = torch.stack([decoder[i] for i in indices])
         logger.info("load_video: decoded frames shape=%s", tuple(frames.shape))
 
+        VideoBudget().add(frames.shape[-2], frames.shape[-1], frames.shape[0])
         video = frames.float() / 255.0
 
         try:

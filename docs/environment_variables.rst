@@ -200,15 +200,15 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        every route. Empty by default, so a direct deployment is unaffected.
    * - ``MSTAR_MAX_IMAGE_PIXELS``
      - ``89478485``
-     - Pixels one request image may decode to (every frame of an animated
-       GIF counts), checked from the header before decoding; larger images
-       get a 400. Applies behind either frontend. Pillow refuses images over
+     - Pixels one request image may decode to, checked from the header
+       before decoding; larger images get a 400. A GIF is read as its first
+       frame. Applies behind either frontend. Pillow refuses images over
        twice its own limit (about 179M pixels) whatever this is set to.
    * - ``MSTAR_MAX_VIDEO_PIXELS``
-     - ``1073741824``
+     - ``268435456``
      - Pixels one request video may decode to, summed over the frames the
-       model's loader keeps (about 39 s of 720p30); the decode stops with a
-       400 once it passes the limit. Applies behind either frontend.
+       model's loader decodes (about 10 s of 720p30 for loaders that keep
+       every frame); larger videos get a 400. Applies behind either frontend.
 
 Serving (Rust frontend)
 -----------------------
