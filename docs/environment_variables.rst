@@ -172,6 +172,12 @@ model, so they are named for it.
      - ``1,2,4``
      - Comma-separated batch sizes to capture. Read only when
        ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
+   * - ``MSTAR_BAGEL_CFG_PRUNE``
+     - ``1``
+     - BAGEL: image generation runs only the CFG branches a denoising step
+       uses. The image branch runs only when ``cfg_img_scale > 1``, and outside
+       ``cfg_interval`` the step runs the main branch alone. ``0`` runs all
+       three branches on every step, the former behaviour, for an A/B.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
      - OmniVoice: load weights from this local directory instead of the

@@ -74,6 +74,7 @@ from mstar.model.bagel.components.tokenization import BagelTokenizer, add_specia
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN, BagelVisionModel
 from mstar.model.bagel.config import load_bagel_config
 from mstar.model.bagel.submodules import (
+    IMAGE_GEN_LOOP,
     CombineCFGSubmodule,
     LLMSubmodule,
     VAEDecoderSubmodule,
@@ -1016,6 +1017,9 @@ class BagelModel(Model):
         # there are N-1 intervals, so N-1 Euler steps are needed.
         image_gen = Sequential([
             Loop(
+                # named: LLMSubmodule reads this loop's iteration count to
+                # pick the step's CFG branches on the host (cfg_branches)
+                name=IMAGE_GEN_LOOP,
                 section=GraphNode(
                     name="LLM",
                     input_names=["latents", "time_index"],
