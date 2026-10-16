@@ -56,6 +56,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.components import MoeParallelConfig
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -1261,8 +1262,11 @@ class Qwen3OmniModel(Model):
         # ``codec_tokens``, ``talker_input_embeds``, ``new_token``) is
         # already replicated by the upstream all-reduce or sampler
         # broadcast before it leaves its producing node.
+        # The Thinker's routed experts can also run EP; the Talker's
+        # shared-expert block has no EP variant.
         return ShardingConfig(
             groups=[], tp_enabled_nodes={"Thinker", "Talker"}, shard_dim={},
+            ep_enabled_nodes={"Thinker"},
         )
 
     # -----------------------------------------------------------------------
@@ -1272,11 +1276,13 @@ class Qwen3OmniModel(Model):
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(
             node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+            moe_parallel=moe_parallel,
         )
         logger.info("Successfully loaded Qwen3-Omni submodule for %s", node_name)
         self._submodule_cache[node_name] = submodule
@@ -1304,10 +1310,12 @@ class Qwen3OmniModel(Model):
     def _create_submodule(
         self, node_name: str, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule | None:
         if node_name == "Thinker":
             return self._create_thinker_submodule(
                 device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+                moe_parallel=moe_parallel,
             )
         elif node_name == "Talker":
             return self._create_talker_submodule(
@@ -1395,13 +1403,16 @@ class Qwen3OmniModel(Model):
     def _create_thinker_submodule(
         self, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule:
         from mstar.model.loader import load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
 
         with torch.device("meta"):
-            thinker_model = Qwen3OmniThinkerModel(self.config, comm_group=tp_group)
+            thinker_model = Qwen3OmniThinkerModel(
+                self.config, comm_group=tp_group, moe_parallel=moe_parallel,
+            )
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
         if autocast_dtype is not None:

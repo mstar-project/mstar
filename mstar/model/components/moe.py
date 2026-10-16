@@ -195,6 +195,24 @@ def dispatch_experts_fused(
     return final_hidden_states
 
 
+def _mask_padding(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    token_valid: torch.Tensor,
+    sentinel: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route padding rows to ``sentinel`` so no GEMM runs them.
+
+    ``token_valid`` is ``(tokens,)`` bool; a CUDA-graph replay pads the batch
+    with rows past the real tokens. Dispatch with ``skip_invalid=True``.
+    """
+    keep = token_valid[:, None]
+    return (
+        torch.where(keep, selected_experts, sentinel),
+        torch.where(keep, routing_weights, 0),
+    )
+
+
 def _dispatch(
     hidden_states: torch.Tensor,
     gate_up_proj: torch.Tensor,
@@ -481,22 +499,28 @@ class ParallelSparseMoeBlock(nn.Module):
         router_states: torch.Tensor | None = None,
         *,
         return_router_states: bool = False,
+        token_valid: torch.Tensor | None = None,
     ):
         input_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
         routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
+        skip = token_valid is not None
+        if skip:
+            selected_experts, routing_weights = _mask_padding(
+                selected_experts, routing_weights, token_valid, self.num_experts,
+            )
 
         if self.comm_group.world_size == 1:
             out = _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
-                self.num_experts, selected_experts, routing_weights,
+                self.num_experts, selected_experts, routing_weights, skip_invalid=skip,
             )
         else:
             routing_weights, selected_experts = _sync_routing(
                 self.comm_group, routing_weights, selected_experts,
             )
-            out = self._dispatch_tp(flat, routing_weights, selected_experts)
+            out = self._dispatch_tp(flat, routing_weights, selected_experts, skip_invalid=skip)
         out = out.view(input_shape)
         return (out, router_states_next) if return_router_states else out
 
@@ -504,6 +528,7 @@ class ParallelSparseMoeBlock(nn.Module):
         self, flat: torch.Tensor,
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
+        skip_invalid: bool = False,
     ) -> torch.Tensor:
         from mstar.utils.fused_moe import fused_experts, moe_sum_reduce_triton
 
@@ -511,6 +536,7 @@ class ParallelSparseMoeBlock(nn.Module):
         cache3 = fused_experts(
             flat, self.experts.gate_up_proj, self.experts.down_proj,
             routing_weights, selected_experts, reduce_results=False,
+            skip_invalid=skip_invalid,
         )
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
@@ -695,6 +721,14 @@ class ExpertParallelSparseMoeBlock(nn.Module):
 
     The signature matches :class:`ParallelSparseMoeBlock`. When
     ``world_size == 1`` the forward is identical to :class:`SparseMoeBlock`.
+
+    Two debug knobs, both off by default and both CUDA-graph safe:
+
+    * ``debug_check_routing``: all-gather ``selected_experts`` and
+      device-assert every rank picked the same experts. Temporary; costs one
+      extra collective per layer.
+    * ``track_expert_load``: accumulate per-expert slot counts in the
+      ``expert_load`` buffer; read and reset it with :meth:`pop_expert_load`.
     """
 
     def __init__(
@@ -706,6 +740,8 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         norm_topk_prob: bool = True,
         router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
+        debug_check_routing: bool = False,
+        track_expert_load: bool = False,
     ) -> None:
         super().__init__()
         if comm_group is None:
@@ -718,6 +754,13 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         self.moe_intermediate_size = moe_intermediate_size
         self.num_local_experts = divide(num_experts, comm_group.world_size)
         self.expert_start = comm_group.rank * self.num_local_experts
+        self.debug_check_routing = debug_check_routing
+        self.track_expert_load = track_expert_load
+        if track_expert_load:
+            # Routing is replicated, so every rank counts every expert.
+            self.register_buffer(
+                "expert_load", torch.zeros(num_experts, dtype=torch.int64), persistent=False,
+            )
 
         self.gate = router if router is not None else TopKRouter(
             hidden_size=hidden_size,
@@ -749,7 +792,28 @@ class ExpertParallelSparseMoeBlock(nn.Module):
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
         self._attach_weight_loaders()
+        if self.track_expert_load:
+            # to_empty leaves the buffer uninitialised.
+            self.expert_load.zero_()
         return result
+
+    def pop_expert_load(self) -> torch.Tensor:
+        """Return per-expert slot counts since the last pop, and reset them.
+
+        Shape ``(num_experts,)``; rank ``r`` owns ``[r*E_local, (r+1)*E_local)``.
+        Syncs the device, so call it from eager code, never inside a forward.
+        """
+        counts = self.expert_load.to("cpu", copy=True)
+        self.expert_load.zero_()
+        return counts
+
+    def _check_routing_agrees(self, selected_experts: torch.Tensor) -> None:
+        gathered = self.comm_group.all_gather(selected_experts.contiguous(), dim=0)
+        gathered = gathered.view(self.comm_group.world_size, *selected_experts.shape)
+        torch._assert_async(
+            (gathered == selected_experts).all(),
+            "EP routing disagrees across ranks: top-k expert ids differ",
+        )
 
     def forward(
         self,
@@ -757,22 +821,39 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         router_states: torch.Tensor | None = None,
         *,
         return_router_states: bool = False,
+        token_valid: torch.Tensor | None = None,
     ):
+        """``token_valid``: ``(tokens,)`` bool; rows marked False are padding and skip every GEMM."""
         input_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
         routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
 
+        if self.track_expert_load:
+            ids = selected_experts.flatten()
+            if token_valid is None:
+                ones = torch.ones_like(ids, dtype=torch.int64)
+            else:
+                ones = token_valid[:, None].expand_as(selected_experts).flatten().to(torch.int64)
+            self.expert_load.index_add_(0, ids, ones)
+        if self.debug_check_routing and self.comm_group.world_size > 1:
+            self._check_routing_agrees(selected_experts)
+
         if self.comm_group.world_size == 1:
+            skip = token_valid is not None
+            if skip:
+                selected_experts, routing_weights = _mask_padding(
+                    selected_experts, routing_weights, token_valid, self.num_experts,
+                )
             out = _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
-                self.num_experts, selected_experts, routing_weights,
+                self.num_experts, selected_experts, routing_weights, skip_invalid=skip,
             )
         else:
             routing_weights, selected_experts = _sync_routing(
                 self.comm_group, routing_weights, selected_experts,
             )
-            out = self._dispatch_ep(flat, routing_weights, selected_experts)
+            out = self._dispatch_ep(flat, routing_weights, selected_experts, token_valid)
         out = out.view(input_shape)
         return (out, router_states_next) if return_router_states else out
 
@@ -780,10 +861,13 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         self, flat: torch.Tensor,
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
+        token_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Every shape is static, so this stays torch.compile and CUDA-graph safe.
         local = selected_experts - self.expert_start
         owned = (local >= 0) & (local < self.num_local_experts)
+        if token_valid is not None:
+            owned = owned & token_valid[:, None]
         local = torch.where(owned, local, self.num_local_experts)
         # Skipped slots never reach a GEMM; zeroing their weight is belt-and-braces.
         routing_weights = torch.where(owned, routing_weights, 0)

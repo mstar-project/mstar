@@ -23,6 +23,11 @@ from mstar.model.components.moe import (
     TopKRouter,
     dispatch_experts_fused,
 )
+from mstar.model.components.moe_parallel import (
+    MoeParallelConfig,
+    MoeParallelMixin,
+    instantiate_moe_block,
+)
 from mstar.model.components.norm import AdaRMSNorm, RMSNorm, RMSNormGated
 
 __all__ = [
@@ -35,6 +40,9 @@ __all__ = [
     "MLP",
     "GatedMLP",
     "ExpertParallelSparseMoeBlock",
+    "MoeParallelConfig",
+    "MoeParallelMixin",
+    "instantiate_moe_block",
     "ParallelSparseMoeBlock",
     "ParallelSparseMoeBlockWithSharedExpert",
     "SparseMoeBlock",
