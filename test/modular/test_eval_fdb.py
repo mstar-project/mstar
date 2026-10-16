@@ -212,6 +212,42 @@ def test_transport_retries_rate_limits_with_backoff_and_counts_usage():
         no_retry.chat({"seed": 1})
     assert no_retry.usage["retries"] == 0
 
+    # Retries that run out end the pair as failed on its first seed, never a label from seed 2.
+    seeds, waits = [], []
+
+    def limited(url, body, headers, timeout):
+        seeds.append(body["seed"])
+        raise http_error(429, "120")
+
+    busy = llm_judge.Judge("j", "local", "http://127.0.0.1:1/v1", "m", post=limited, sleep=waits.append)
+    res = llm_judge.behavior_label(busy, _behavior(), t, sleep=lambda s: None)
+    assert (res["status"], res["label"], set(seeds)) == ("failed", None, {1})
+    assert waits == [120.0] * llm_judge.TRANSPORT_RETRIES  # Retry-After is a minimum, honored in full
+    seeds.clear()
+
+    def far(url, body, headers, timeout):
+        seeds.append(body["seed"])
+        raise http_error(429, "3600")
+
+    gone = llm_judge.Judge("j", "local", "http://127.0.0.1:1/v1", "m", post=far, sleep=waits.append)
+    assert llm_judge.behavior_label(gone, _behavior(), t, sleep=lambda s: None)["status"] == "failed"
+    assert seeds == [1]
+
+
+def test_malformed_replies_never_raise_their_content():
+    secret = "Bearer SYNTHETIC-VALUE"
+
+    def post(url, body, headers, timeout):
+        return {"model": "m", "usage": {"prompt_tokens": secret, "completion_tokens": True},
+                "choices": [{"message": None, "finish_reason": "stop"}]}
+
+    judge = llm_judge.Judge("j", "local", "http://127.0.0.1:1/v1", "m", post=post)
+    assert llm_judge.submit(judge, {"seed": 1}) is None
+    assert judge.usage["prompt"] == 0 and judge.usage["completion"] == 0
+    t = {k: {"text": k, "chunks": []} for k in ("input", "clean_input", "output", "clean_output")}
+    res = llm_judge.behavior_label(judge, _behavior(), t, sleep=lambda s: None)
+    assert res["status"] == "failed" and secret not in json.dumps(res)
+
 
 def test_api_judge_is_skipped_without_a_key_and_keys_never_reach_results(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -497,6 +533,17 @@ def test_fdb_suite_end_to_end_with_two_judges_agreement_and_rejudge(tmp_path, fa
     assert not any(k.startswith(("agreement.other.qwen", "agreement.late.qwen")) for k in rep.summary)
     assert rep.config["suite"]["semantic"] is None and not any(".semantic." in k for k in rep.summary)
     assert all("semantic" not in r for rp in rep.repeats for r in rp.requests)
+    # Semantic regrading alone keeps every behavior label and the judge list.
+    main(["rejudge", str(tmp_path / "rejudged"), "--judge", f"sem={fake_server}/a/v1", "--semantic-judge", "sem",
+          "--semantic-only", "--out", str(tmp_path / "semantic")])
+    sem = RunResult.load(tmp_path / "semantic" / "fdb-fake-c2.json")
+    assert [j["name"] for j in sem.config["suite"]["judges"]] == ["qwen", "other", "gpt4o", "late"]
+    assert sem.config["suite"]["semantic"]["judge"] == "sem" and sem.config["rejudged"][-1]["semantic_only"]
+    assert sem.config["rejudged"][-1]["usage"]["sem"]["requests"] == 1 + 2  # the controls, then a batch per repeat
+    assert sem.summary["all.semantic.joint_quality"]["mean"] == 1.0
+    assert sem.summary["agreement.qwen.other.agreement"] == back.summary["agreement.qwen.other.agreement"]
+    assert all("sem" not in r["labels"] for rp in sem.repeats for r in rp.requests)
+
     # Pooling files where one name means two different judges is refused.
     monkeypatch.setattr(llm_judge, "resolve", lambda j: (setattr(j, "model", "other-model"), j)[1])
     main(["rejudge", str(out / "fdb-fake-c2.json"), "--judge", f"other={fake_server}/b/v1",

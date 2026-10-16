@@ -183,7 +183,7 @@ def assessable(row: dict[str, Any]) -> bool:
 class Judging:
     """The LLM judges of a run, loaded once and reused across repeats."""
 
-    def __init__(self, judges: list, semantic_name: str | None, concurrency: int = 8):
+    def __init__(self, judges: list, semantic_name: str | None, concurrency: int = 8, behavior: bool = True):
         from benchmark.eval import llm_judge
 
         self.judges = [llm_judge.resolve(j) for j in judges]
@@ -198,6 +198,7 @@ class Judging:
             semantic_name = next((j.name for j in self.available if j.kind == "local"), "none")
         self.semantic = next((j for j in self.available if j.name == semantic_name), None)
         self.concurrency = concurrency
+        self.behavior = behavior  # False: the judges only regrade semantic quality
         self._behavior = self._assets = self._controls = None
 
     def identity(self) -> dict[str, Any]:
@@ -221,7 +222,7 @@ class Judging:
         if self._behavior is None:
             self._behavior = fdb_reference.load_behavior()
         transcripts = [r.get("asr") if assessable(r) else None for r in rows]
-        for j in self.available:
+        for j in self.available if self.behavior else []:
             for r, res in zip(rows, llm_judge.label_pairs(j, self._behavior, transcripts, self.concurrency),
                               strict=True):
                 r.setdefault("labels", {})[j.name] = res
@@ -263,7 +264,7 @@ def rejudge(result, judging: Judging):
     if result.suite != "fdb":
         raise SystemExit(f"rejudge reads fdb results, not {result.suite!r}")
     suite_cfg = result.config.setdefault("suite", {})
-    new = {j["name"]: j for j in judging.identity()["judges"]}
+    new = {j["name"]: j for j in judging.identity()["judges"]} if judging.behavior else {}
     old = suite_cfg.get("judges") or []
     # A replaced judge keeps its place, so agreement keys keep their order across rejudges.
     suite_cfg["judges"] = [new.get(j["name"], j) for j in old] + [j for n, j in new.items()
@@ -290,6 +291,7 @@ def rejudge(result, judging: Judging):
         suite_cfg["semantic"] = judging.identity()["semantic"]
     result.config.setdefault("rejudged", []).append(
         {"judges": sorted(new), "semantic": judging.semantic.name if judging.semantic else None,
+         "semantic_only": not judging.behavior,
          "usage": {n: {k: v - before[n][k] for k, v in u.items()} for n, u in judging.usage().items()}})
     result.summary = {}
     return result.finalize()

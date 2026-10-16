@@ -129,6 +129,8 @@ def _judge_args(p) -> None:
                    help="judge to add: NAME=openai (needs OPENAI_API_KEY) or NAME=URL of a local endpoint")
     p.add_argument("--judge-revision", action="append", default=[], metavar="NAME=REV")
     p.add_argument("--semantic-judge", default="none", help="also regrade semantic A/F/U with this judge")
+    p.add_argument("--semantic-only", action="store_true",
+                   help="only regrade semantic A/F/U with --semantic-judge; keep every judge's behavior labels")
     p.add_argument("--judge-concurrency", type=int, default=8)
 
 
@@ -305,7 +307,9 @@ def cmd_rejudge(args) -> None:
         judges = parse_judges(args.judge, args.judge_revision)
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
-    judging = Judging(judges, args.semantic_judge, args.judge_concurrency)
+    if args.semantic_only and args.semantic_judge in (None, "none"):
+        raise SystemExit("--semantic-only needs --semantic-judge")
+    judging = Judging(judges, args.semantic_judge, args.judge_concurrency, behavior=not args.semantic_only)
     if not judging.available:
         raise SystemExit("no judge is available (see the skip reasons above)")
     out = Path(args.out)

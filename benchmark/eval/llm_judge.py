@@ -58,11 +58,21 @@ RETRY_HTTP = {408, 409, 429, 500, 502, 503, 504}
 TRANSPORT_RETRIES = 6
 BACKOFF_S = 2.0
 BACKOFF_MAX_S = 60.0
+RETRY_AFTER_MAX_S = 300.0
 ACCEPTABLE_OUTCOMES = ["Apply the supplied rubric."]
 
 
 class JudgeError(RuntimeError):
     pass
+
+
+class TransportError(JudgeError):
+    """The endpoint stayed unavailable through every transport retry. Not a reply, so the
+    official loop must not move on to its next seed."""
+
+
+def _count(v: Any) -> int:
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
 
 
 @dataclass
@@ -114,20 +124,26 @@ class Judge:
                 error, retry = f"HTTP {exc.code}", exc.code in RETRY_HTTP
                 after = (exc.headers or {}).get("Retry-After")
                 if retry and after and after.replace(".", "", 1).isdigit():
-                    wait = min(BACKOFF_MAX_S, float(after))
+                    if float(after) > RETRY_AFTER_MAX_S:
+                        raise TransportError(error) from None
+                    wait = float(after)  # a minimum, so never shortened
             except (urllib.error.URLError, OSError) as exc:
                 error, retry = type(exc).__name__, True
             except ValueError as exc:  # an unparseable body is the reply's problem, not the transport's
                 raise JudgeError(type(exc).__name__) from None
             else:
-                u = resp.get("usage") or {}
+                if not isinstance(resp, dict):
+                    raise JudgeError("reply is not an object")
+                u = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
                 with self._lock:
                     self.usage["requests"] += 1
-                    self.usage["prompt"] += int(u.get("prompt_tokens") or 0)
-                    self.usage["completion"] += int(u.get("completion_tokens") or 0)
+                    self.usage["prompt"] += _count(u.get("prompt_tokens"))
+                    self.usage["completion"] += _count(u.get("completion_tokens"))
                 return resp
-            if not retry or attempt == TRANSPORT_RETRIES:
+            if not retry:
                 raise JudgeError(error)
+            if attempt == TRANSPORT_RETRIES:
+                raise TransportError(error)
             with self._lock:
                 self.usage["retries"] += 1
             self.sleep(wait)
@@ -219,6 +235,8 @@ def behavior_label(judge: Judge, behavior, transcripts: dict[str, Any], sleep=ti
             resp = judge.chat(body | {"seed": seed})
             choice = resp["choices"][0]
             parsed = behavior.parse_eval(choice["message"]["content"])
+        except TransportError as exc:
+            return {"status": "failed", "label": None, "seed": seed, "attempts": i + 1, "errors": [*errors, str(exc)]}
         except Exception as exc:  # noqa: BLE001 - the official loop retries on any exception
             errors.append(str(exc) if isinstance(exc, JudgeError) else type(exc).__name__)
             if i + 1 < len(BEHAVIOR_SEEDS):
@@ -295,11 +313,15 @@ def submit(judge: Judge, body: dict[str, Any]) -> dict[str, Any] | None:
             continue
         if resp.get("model") != judge.model:
             return None
-        choice = resp["choices"][0]
-        if choice.get("finish_reason") != "stop":
+        try:
+            choice = resp["choices"][0]
+            finish, text = choice.get("finish_reason"), choice["message"]["content"]
+        except (KeyError, IndexError, TypeError, AttributeError):
+            continue
+        if finish != "stop":
             continue
         try:
-            content = json.loads(choice["message"]["content"])
+            content = json.loads(text)
         except (TypeError, ValueError):
             continue
         if isinstance(content, dict) and isinstance(content.get("assessments"), list):
