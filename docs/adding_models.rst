@@ -354,18 +354,29 @@ The spec types are:
        ``PagedKVConfig`` adds ``max_seq_len`` and five fields that
        a deployment can tune: ``max_num_pages``, ``page_size``, ``cpu_offload_pages``
        (the number of pinned host pages used for offload; 0 disables offload),
-       ``prefix_cache`` and ``prefix_cache_salt``.
+       ``prefix_cache`` and ``prefix_cache_salt``. ``layout=KVLayout.MLA`` stores one
+       Multi-head Latent Attention latent per token in place of K and V. It needs
+       ``kv_lora_rank`` and ``qk_rope_head_dim``, and sets ``num_kv_heads`` to 1 and
+       ``head_dim`` to their sum. Every rank holds the whole latent; only
+       ``num_qo_heads`` shards, and MLA attention needs it set to the model's query heads.
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
        Ring storage is currently paired with FlexAttention.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
-       ``AttnBackend.FLASHINFER`` (the default), ``AttnBackend.DENSE`` or
-       ``AttnBackend.FLEX``. FlashInfer and dense attention require a
-       ``PagedKVConfig``; FlexAttention requires a ``RingKVConfig``.
+       ``AttnBackend.FLASHINFER`` (the default), ``AttnBackend.DENSE``,
+       ``AttnBackend.FLEX`` or ``AttnBackend.FLASHINFER_MLA``. FlashInfer, dense and MLA
+       attention require a ``PagedKVConfig``; FlexAttention requires a ``RingKVConfig``.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
-       ``"fa3"`` when the FlashInfer backend is selected.
+       ``"fa3"`` when the FlashInfer backend is selected. ``FLASHINFER_MLA`` is
+       Multi-head Latent Attention over a ``KVLayout.MLA`` cache. It needs ``sm_scale``,
+       the softmax scale of the model's original qk head dim, which the other backends
+       refuse. Its ``run`` takes the absorbed query (``[tokens, heads, kv_lora_rank]``)
+       with the rope part as ``q_pe``, and returns the output in the latent space, so
+       the layer applies ``W_UV``. FlashInfer's kernel covers a 512-wide latent with a
+       64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
+       fallback, which cannot be captured in a CUDA graph.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended. Only
        the FlashInfer backend is implemented. See `Cross-attention (encoder-decoder
@@ -760,7 +771,10 @@ resource key:
 - The ``segments`` argument of ``SubmoduleStep`` is a default value. Any ``ResourceStep``
   that does not set its own ``segments`` uses this list.
 - ``KVStep(commit=, combined_labels=, pre_forks=, post_forks=)``. See below.
-- ``AttentionStep(causal=)`` describes the attention plan. A ``RaggedAttentionSpec``
+- ``AttentionStep(causal=, context_only=)`` describes the attention plan.
+  ``context_only=True`` has the queries attend to the stored context alone, not to the
+  tokens this step appends, and the step's own ``segments`` then give the query counts.
+  Only the MLA backend reads it; the others refuse it. A ``RaggedAttentionSpec``
   steps through this same type. There, the segments are the whole layout rather than an
   extension of a cache. See `Cacheless attention (encoder towers)`_.
 - ``PositionStep(pos_ids=, advance=)``. With ``pos_ids=None``, positions are derived from
