@@ -27,7 +27,14 @@ from mstar.engine.resources import PagedKVConfig, PositionConfig, StepContext, S
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.manager import RopeManager
-from mstar.model.bagel.submodules import MIXED_TEXT, LLMSubmodule, active_labels
+from mstar.model.bagel.submodules import (
+    MIXED_TEXT,
+    PARTIAL_CFG,
+    LLMSubmodule,
+    active_labels,
+    cfg_key,
+    guided_token_index,
+)
 from mstar.model.submodule_base import ARNodeInputs
 
 pytestmark = pytest.mark.skipif(
@@ -253,8 +260,8 @@ def test_a_mixed_step_keeps_an_unguided_row_out_of_the_guidance_branch():
         "only the guided row belongs in the guidance branch"
     )
     # the step still declares the branch, so the guided row is not silently
-    # demoted to an unguided forward
-    assert step.cg_key_info is True
+    # demoted to an unguided forward; no capture holds a partly guided step
+    assert step.cg_key_info == PARTIAL_CFG
 
 
 def test_a_mixed_step_forks_only_its_prompt_rows():
@@ -275,6 +282,35 @@ def test_a_mixed_step_forks_only_its_prompt_rows():
     kv = step.steps["kv"]
     assert kv.pre_forks == (("main", "cfg_text"),)
     assert kv.fork_rids == {"guided"}
+
+
+@pytest.mark.parametrize("flags,key", [
+    ((True, True), True), ((False, False), False), ((True, False), PARTIAL_CFG),
+])
+def test_the_capture_key_tells_a_partly_guided_step_apart(flags, key):
+    assert cfg_key(flags) == key
+
+
+def test_a_partly_guided_step_runs_guidance_on_the_guided_tokens_only():
+    rows = [
+        ARNodeInputs(input_seq_len=1, graph_walk="decode", resource_step_info=False),
+        ARNodeInputs(input_seq_len=3, graph_walk="prefill_text", resource_step_info=True),
+        ARNodeInputs(input_seq_len=1, graph_walk="decode", resource_step_info=True),
+    ]
+    assert guided_token_index(rows, torch.device("cpu")).tolist() == [1, 2, 3, 4]
+
+
+def test_an_image_prefill_forks_only_its_guided_rows():
+    submodule = _llm_stub()
+    rows = [
+        ARNodeInputs(input_seq_len=4, graph_walk="prefill_vit", resource_step_info=True),
+        ARNodeInputs(input_seq_len=4, graph_walk="prefill_vit", resource_step_info=False),
+    ]
+
+    step = LLMSubmodule.declare_step(submodule, "prefill_vit", ["edit", "caption"], rows)
+
+    assert step.steps["kv"].post_forks == (("main", "cfg_text"),)
+    assert step.steps["kv"].fork_rids == {"edit"}
 
 
 def test_a_mixed_step_of_unguided_rows_declares_no_branch():
