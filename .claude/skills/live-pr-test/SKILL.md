@@ -55,6 +55,7 @@ python3 $S/gpu.py terminate <instance>
 - Take the cheapest offer that has the GPU count, in a region with the team's persistent storage (`offers` filters for that). An offer with more GPUs than needed is fine when it's cheaper.
 - **No availability:** if `offers` returns nothing, do not provision anything. Report "no availability" with the `--all-regions` output: what GPU counts and types are available where, at what price, and whether a smaller plan (e.g. the 2-GPU substitutes in the test matrix) would fit what is available. Stop there.
 - **Budget:** `budget.max_usd_per_hour` and `budget.max_hours` from the config. `launch` refuses an offer above the hourly cap, and arms a watchdog that terminates the instance at the deadline even if this session dies. The watchdog runs on the machine that launched it, so a laptop that sleeps or shuts down stops it: when this session ends early, `gpu.py list --all` and terminate by hand. To go over either cap, ask first; `gpu.py extend <instance> --hours H` moves the deadline.
+- **Check the GPUs before building anything.** `gpu.py push <instance> $S/gpu_health.py '~/'`, then `gpu.py ssh <instance> 'python3 ~/gpu_health.py'` (the image's python has torch). It loads every GPU for a minute and exits 1 on a thermal throttle or a GPU running far hotter or slower than the rest. A TP instance runs at its slowest rank's pace, so one badly cooled GPU invalidates every number on the box, competitors' included. On failure, terminate and launch another offer.
 - **Always terminate**, on success and on failure, after the copy-back. Before ending the session, run `gpu.py list` and confirm nothing launched for this PR is still up.
 
 Then set up the box:
@@ -65,11 +66,13 @@ python3 $S/gpu.py push <instance> .claude/skills/benchmarking/scripts/server.sh 
 python3 $S/gpu.py ssh <instance> 'bash ~/bootstrap.sh <n> --hf-home <hf_home from wait> > ~/bootstrap.log 2>&1; tail -20 ~/bootstrap.log'
 ```
 
-`bootstrap.sh` builds two arms, `~/live-pr/pr` and `~/live-pr/main`, each with its own venv and its own `mstar_rust` build, and writes `~/live-pr/env.sh` (HF home, local caches, `MSTAR_SHM_ARENA=1`, and an `arm pr|main` helper). It takes a few minutes. Pass `--base <branch>` for a stacked PR, and `--no-main` when nothing in the plan compares against the base. Read `results/env.txt`: a non-empty dependency diff between the arms has to be explained before any A/B number means anything.
+`bootstrap.sh` builds two arms, `~/live-pr/pr` and `~/live-pr/main`, each with its own venv and its own `mstar_rust` build, and writes `~/live-pr/env.sh` (HF home, local caches, `MSTAR_SHM_ARENA=1`, and the `arm pr|main`, `stage_model` and `save_caches` helpers). It takes a few minutes, and restores the Inductor, Triton and FlashInfer compile caches from a tarball on persistent storage when one exists for the box's compute capability. Pass `--base <branch>` for a stacked PR, and `--no-main` when nothing in the plan compares against the base. Read `results/env.txt`: a non-empty dependency diff between the arms has to be explained before any A/B number means anything.
 
 In cluster mode, run the same script on the cluster with `--workdir` and `--hf-home` from the config.
 
 ## 3. Run
+
+Never serve weights straight from FUSE-mounted persistent storage (RunPod's `/workspace` is geesefs): a server mmaps the checkpoint, and random page-ins through FUSE ran at ~4 MB/s per worker, so a 27B TP4 load had not finished after 20 minutes. `bootstrap.sh` detects a FUSE mount and points `HF_HOME` at local disk; run `stage_model <hf repo>` for every model in the plan before its first server start. It downloads from the Hub (52 GB in ~1 min, where a sequential copy off geesefs took ~9) and falls back to the persistent cache for a repo the Hub won't serve. On NFS (the cluster, Lambda) it is a no-op.
 
 Start every server through the benchmarking skill's `server.sh` (copied to `~/server.sh`, so both arms use the same one even when a PR predates or edits it), from the arm's checkout, with the arm's venv active:
 
@@ -93,12 +96,13 @@ MSTAR_TP_ASYNC_SCHED=1 ~/server.sh start pr 8100 --timeout 2400 \
 
 ```bash
 OUT=$(python3 -c 'import json,os;print(os.path.expanduser(json.load(open(".claude/skills/live-pr-test/config.local.json"))["results_dir"]))')/pr-<n>-$(date +%Y%m%d-%H%M)
+python3 $S/gpu.py ssh <instance> 'source ~/live-pr/env.sh && save_caches'   # compile caches for the next box
 mkdir -p "$OUT" && python3 $S/gpu.py pull <instance> '~/live-pr/results/.' "$OUT"/
 python3 $S/gpu.py terminate <instance>
 python3 $S/gpu.py list
 ```
 
-Copy back before terminating; the box's local disk goes with it. Server logs over a few MB: copy the tail and grep hits (errors, tracebacks, recompiles), not the whole file.
+Copy back before terminating; the box's local disk goes with it. `save_caches` overwrites the tarball with this box's caches, which are a superset of what it restored; skip it when the run was cut short before any server finished compiling. A restored Inductor cache also reuses autotune choices, so cross-restart repeats no longer sample kernel-selection variance (benchmarking skill, trap 1): that narrows the spread between arms, and both arms share it. Server logs over a few MB: copy the tail and grep hits (errors, tracebacks, recompiles), not the whole file.
 
 ## 5. Report
 
