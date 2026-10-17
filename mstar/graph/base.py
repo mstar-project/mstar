@@ -76,6 +76,9 @@ class GraphEdge:
     # set on a synthetic streaming-input edge carrying the final chunk, so the
     # consuming pass (not the earlier ingest) reports the partition done
     _final_stream_chunk: bool = field(default=False)
+    # False on a chunked prefill's non-final chunk, streamed early to a
+    # consumer that opted into ``ChunkPolicy.allow_partial_input``
+    finished_graph_walk: bool = field(default=True)
 
     # Set for sharded configurations
     _total_fanin: int = 1
@@ -92,6 +95,7 @@ class GraphEdge:
             output_modality=self.output_modality,
             _persist_for_loop=self._persist_for_loop,
             _final_stream_chunk=self._final_stream_chunk,
+            finished_graph_walk=self.finished_graph_walk,
         )
 
 
@@ -203,6 +207,25 @@ class ReadySignals:
         self.ready_names.clear()
         self.is_ready = False
         self.is_ready_for_streaming = False
+
+    def clear_streaming(self):
+        """``clear`` for the streaming inputs only: the rest stay for the
+        node's next step, which the next streamed chunk triggers."""
+        names = self.streaming_inputs & self.ready_names
+        if self._tensor_manager is not None:
+            self._tensor_manager.dereference_batch_uniform([
+                info.uuid
+                for name in names
+                if not self.ready_inputs[name]._persist_for_loop
+                for info in self.ready_inputs[name].tensor_info
+            ])
+        for name in names:
+            del self.ready_inputs[name]
+        self.ready_names -= names
+        self.is_ready = self.input_names.issubset(self.ready_names)
+        self.is_ready_for_streaming = self.is_ready or self.input_names.issubset(
+            self.ready_names | self.streaming_inputs
+        )
 
     def remove(self, edge_name: str) -> "GraphEdge | None":
         """Reverse ``update(edge)`` without dereferencing tensor_info.
