@@ -31,6 +31,7 @@ from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.model.base import Model, ProcessPromptOutput
+from mstar.model.media_limits import check_media_limits
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils import profiler
 from mstar.utils.ipc_format import (
@@ -130,6 +131,7 @@ class PreprocessWorker:
         model_config: dict | None = None,
         enable_nvtx: bool=False,
     ):
+        check_media_limits()
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()

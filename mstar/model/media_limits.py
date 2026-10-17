@@ -11,15 +11,19 @@ import torch
 
 # PIL's DecompressionBombWarning threshold (about 9459 x 9459 RGB)
 DEFAULT_MAX_IMAGE_PIXELS = 89_478_485
-# about 10 s of 720p30, or 4 s of 1080p30, decoded at once
-DEFAULT_MAX_VIDEO_PIXELS = 1 << 28
+# about 39 s of 720p30, or 2.6 min of 640x360 at 30 fps, decoded at once: a
+# full decode of every short (up to 2 min) Video-MME clip fits
+DEFAULT_MAX_VIDEO_PIXELS = 1 << 30
 
 
 def _positive_int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
         return default
-    value = int(raw)
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
     if value <= 0:
         raise ValueError(f"{name} must be a positive integer; got {raw!r}")
     return value
@@ -34,6 +38,13 @@ def max_video_pixels() -> int:
     """``MSTAR_MAX_VIDEO_PIXELS``: pixels one request video may decode to,
     summed over the frames a loader decodes."""
     return _positive_int_env("MSTAR_MAX_VIDEO_PIXELS", DEFAULT_MAX_VIDEO_PIXELS)
+
+
+def check_media_limits() -> None:
+    """Read both limits once at startup: a bad value then stops the server,
+    instead of turning every media request into a 400 that blames the client."""
+    max_image_pixels()
+    max_video_pixels()
 
 
 def check_image_size(filepath: str) -> str:

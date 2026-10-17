@@ -168,8 +168,17 @@ def test_waypoint_and_flux2_loaders_check_the_header(tmp_path, no_decode):
 @pytest.mark.parametrize("value", ["0", "-1", "lots"])
 def test_bad_env_value_is_an_error(monkeypatch, value):
     monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", value)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS must be a positive integer"):
         VideoBudget()
+
+
+@pytest.mark.parametrize("name", ["MSTAR_MAX_IMAGE_PIXELS", "MSTAR_MAX_VIDEO_PIXELS"])
+def test_bad_env_value_stops_the_data_worker_at_startup(monkeypatch, name):
+    from mstar.api_server.data_worker import PreprocessWorker
+
+    monkeypatch.setenv(name, "lots")
+    with pytest.raises(ValueError, match=name):
+        PreprocessWorker(model=None)
 
 
 @dataclass

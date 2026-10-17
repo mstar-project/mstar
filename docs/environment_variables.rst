@@ -198,17 +198,6 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        request reaches the pod (Run:AI serves a workload at
        ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
        every route. Empty by default, so a direct deployment is unaffected.
-   * - ``MSTAR_MAX_IMAGE_PIXELS``
-     - ``89478485``
-     - Pixels one request image may decode to, checked from the header
-       before decoding; larger images get a 400. A GIF is read as its first
-       frame. Applies behind either frontend. Pillow refuses images over
-       twice its own limit (about 179M pixels) whatever this is set to.
-   * - ``MSTAR_MAX_VIDEO_PIXELS``
-     - ``268435456``
-     - Pixels one request video may decode to, summed over the frames the
-       model's loader decodes (about 10 s of 720p30 for loaders that keep
-       every frame); larger videos get a 400. Applies behind either frontend.
 
 Serving (Rust frontend)
 -----------------------
@@ -277,6 +266,36 @@ uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
   the audio is dropped and a warning is logged. Do not set ``generate_sound`` on
   the Rust frontend (it spends compute on a track the client won't receive), or
   run the Python frontend for sound video.
+
+Request media
+-------------
+
+Read by the model's media loaders in the data worker's preprocess thread,
+behind either frontend. Both are also checked once when the data worker starts
+(:func:`mstar.model.media_limits.check_media_limits`), so an invalid value
+stops the server instead of failing every media request.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_MAX_IMAGE_PIXELS``
+     - ``89478485``
+     - Pixels one request image may decode to (see
+       :func:`mstar.model.media_limits.max_image_pixels`), checked from the
+       header before decoding; larger images get a 400. A GIF is read as its
+       first frame. Pillow refuses images over twice its own limit (about
+       179M pixels) whatever this is set to.
+   * - ``MSTAR_MAX_VIDEO_PIXELS``
+     - ``1073741824``
+     - Pixels one request video may decode to (see
+       :func:`mstar.model.media_limits.max_video_pixels`), summed over the
+       frames the model's loader decodes (about 39 s of 720p30, or 2.6 min
+       of 640x360, for loaders that keep every frame); larger videos get a
+       400.
 
 Worker scheduling
 -----------------
