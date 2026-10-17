@@ -30,7 +30,8 @@ import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.communication.wire import decode, encode, encode_field, encode_fields
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.graph.base import GraphEdge, TensorPointerInfo
+from mstar.distributed.base import ShardingConfig, ShardingGroup
+from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import ColumnarEdgeSpecs
 from mstar.utils.ipc_format import (
@@ -596,7 +597,7 @@ def test_a_speculative_completion_does_not_report_the_partition_done(tmp_path):
 P2 = "worker_2"
 
 
-def _fanout_mesh(tmp_path, shard_dim=None):
+def _fanout_mesh(tmp_path, shard_dim=None, dims=(4, 3), nbytes=24, stride=None):
     """A tp1 source feeding a tp2 destination group on two peers.
 
     The case the same-group edges never exercise: source and destination in
@@ -625,8 +626,11 @@ def _fanout_mesh(tmp_path, shard_dim=None):
     )
     rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
                          [ME, PEER, P2], [1, 2])
-    # 4 rows of 6 bytes.
-    book.put_tensor(1, _info(1, dims=[4, 3], nbytes=24))
+    # By default 4 rows of 6 bytes.
+    book.put_tensor(1, _info(
+        1, dims=list(dims), nbytes=nbytes,
+        stride=[1] * len(dims) if stride is None else stride,
+    ))
     book.increment_ref(1, 1)
 
     rt.ingest_inputs_batch(_one_signal(rid, "prompt", "src"))
@@ -659,6 +663,53 @@ def test_each_destination_rank_gets_its_own_slice(tmp_path):
     # 4 rows split two ways: 2 rows each, the second starting 12 bytes in.
     assert (lo.dims[0], lo.nbytes, lo.offset) == (2, 12, 0)
     assert (hi.dims[0], hi.nbytes, hi.offset) == (2, 12, 12)
+
+
+def _python_fanout(shard_dim, dims, nbytes):
+    """The same tp1 -> tp2 edge through Python's ShardingConfig fanout, as
+    (dims, nbytes, offset) per destination worker."""
+    src = ShardingGroup(nodes={"src"}, tp_size=1)
+    sink = ShardingGroup(nodes={"sink"}, tp_size=2)
+    cfg = ShardingConfig(
+        groups=[src, sink], tp_enabled_nodes={"sink"},
+        shard_dim={} if shard_dim is None else {"out": shard_dim},
+    )
+    cfg.setup({
+        NodeAndGraphWalk("src", WALK): [ME],
+        NodeAndGraphWalk("sink", WALK): [PEER, P2],
+    })
+    src._tp_rank = 0
+    info = _info(1, dims=list(dims), nbytes=nbytes, stride=[1] * len(dims))
+    edge = GraphEdge(next_node="sink", name="out", tensor_info=[info])
+    out = cfg.fanout_graph_edges(
+        edge, source_node="src", source_graph_walk=WALK, dest_graph_walk=WALK,
+    )
+    return {
+        w: [(list(i.dims), i.nbytes, i.offset) for i in e.tensor_info]
+        for w, e in out.items()
+    }
+
+
+@pytest.mark.parametrize("shard_dim,dims,nbytes", [
+    (None, (), 2),          # a replicated 0-dim tensor
+    (None, (0,), 0),        # a replicated empty tensor
+    (0, (4, 0), 0),         # sharded rows of zero bytes
+    (0, (4, 3), 24),        # the ordinary case, as a control
+    (0, (2, 2, 3), 24),     # several trailing dims
+])
+def test_python_and_rust_fan_out_awkward_shapes_alike(tmp_path, shard_dim, dims, nbytes):
+    """Python's fanout read dims[0] of every tensor, sharded or not, and took
+    the row size as nbytes // prod(dims): a 0-dim replicated tensor raised
+    IndexError and a [4, 0] sharded one ZeroDivisionError, where the Rust
+    fanout routes both. Each destination must see the same slice either way."""
+    python = _python_fanout(shard_dim, dims, nbytes)
+    _book, got = _fanout_mesh(tmp_path, shard_dim=shard_dim, dims=dims, nbytes=nbytes)
+    rust = {
+        w: [(list(i.dims), i.nbytes, i.offset)
+            for i in msgs[0].body.inputs[0].tensor_info]
+        for w, msgs in got.items() if msgs
+    }
+    assert python == rust
 
 
 def test_the_hold_settles_to_the_number_of_readers(tmp_path):
