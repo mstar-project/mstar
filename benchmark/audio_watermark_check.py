@@ -67,8 +67,14 @@ def exactness(args) -> dict:
     msg = torch.tensor([cfg.message_bits()], device=args.device)
 
     def library(audio):
-        with torch.no_grad(), no_compile():
-            return audio + wmk.generator.get_watermark(audio.view(1, 1, -1), message=msg).view(-1)
+        # full fp32, as the watermarker runs: cuDNN's default TF32 convolutions round a few 1e-5 apart
+        matmul, cudnn = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+        try:
+            with torch.no_grad(), no_compile():
+                return audio + wmk.generator.get_watermark(audio.view(1, 1, -1), message=msg).view(-1)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = matmul, cudnn
 
     ref = library(x)
     n = x.shape[0]
