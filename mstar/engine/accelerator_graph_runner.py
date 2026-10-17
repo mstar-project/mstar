@@ -1351,6 +1351,13 @@ class AcceleratorGraphRunner:
             graph_walk, bs, num_tokens, cg_key_info
         ) is not None
 
+    def packs_walk(self, graph_walk: str) -> bool:
+        """Whether a packed capture replays ``graph_walk``."""
+        return any(
+            key.graph_walk == graph_walk and _is_packed(bucket.config)
+            for key, bucket in self._buckets.items()
+        )
+
     def is_packed(self, lease: SlotLease) -> bool:
         """Whether ``lease`` replays a packed capture."""
         return _is_packed(self._buckets[lease.bucket].config)

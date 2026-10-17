@@ -753,6 +753,28 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk
         return False
 
+    def speculative_input_seq_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+    ) -> int | None:
+        """The span of a row continuing from the step in flight, predicted
+        before that step's outputs reach it, for walks that fix it (one token
+        a decode step). None, the default, is no prediction: a speculative
+        packed step holding the row is planned inline. Only a hint: a wrong
+        one costs its pre-plan, since the prepared rows are checked against it."""
+        del graph_walk, fwd_info
+        return None
+
+    def declare_inputs_from_spans(
+        self, graph_walk: str, spans: Sequence[int], walks: Sequence[str],
+    ) -> list[NodeInputs] | None:
+        """Rows of these spans and walks to declare a packed step over before
+        ``prepare_inputs`` runs, so the step can be pre-planned; None when this
+        walk's ``declare_step`` reads more of a row than its span and walk (the
+        step is then planned inline). Built on the plan thread beside the step
+        in flight, so host-only: no device tensors."""
+        del graph_walk, spans, walks
+        return None
+
     def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
         """Loop-back input signals of this walk whose per-row value the node
         keeps on the device itself (a sampler's slot master), so the worker

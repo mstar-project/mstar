@@ -679,6 +679,19 @@ class LLMSubmodule(ARNodeSubmodule):
         # feed `prefill_tokens` from the inputs
         return graph_walk == "decode"
 
+    def speculative_input_seq_len(self, graph_walk, fwd_info):
+        return 1 if graph_walk == "decode" else None
+
+    def declare_inputs_from_spans(self, graph_walk, spans, walks):
+        # a text row declares its span and walk; its ids only feed the
+        # sampler's prompt mask, which a pre-plan leaves alone
+        if graph_walk not in ("prefill_text", LLM_MIXED):
+            return None
+        return [
+            ARNodeInputs(input_seq_len=span, graph_walk=walk)
+            for span, walk in zip(spans, walks, strict=True)
+        ]
+
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # the decode loop's client edge carries the sampled token the stop
         # check already has on the host; prefill's new_token edge is persisted

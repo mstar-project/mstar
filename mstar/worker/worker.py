@@ -1914,6 +1914,16 @@ class Worker:
             self._reset_skip_plan_flags(spec_batch)
             return False
 
+    def _measure_ahead_spans(self, spec: Speculation) -> None:
+        """Measure the speculative step's row spans, on the main thread, when
+        that is what lets it lease and pre-plan a packed capture."""
+        node_batch = spec.node_batch
+        engine = self.engine_manager.get_engine(node_batch.node_name)
+        if not engine.wants_ahead_spans(node_batch.node_name, node_batch.step_context.graph_walk):
+            return
+        with self._span("worker.measure_ahead_spans"):
+            engine.measure_ahead_spans(node_batch, spec.continuing_rids)
+
     def _reset_skip_plan_flags(self, spec_node_batch: ExecutingBatch) -> None:
         """Drop the pre-plan staged for ``spec_node_batch``.
 
@@ -2034,9 +2044,9 @@ class Worker:
                     # The stage was for this batch, which now never runs.
                     engine.reset_pre_plan_for_batch(node_batch)
                 raise
-            # call is_stale after prepare_inputs because prepare_inputs may drop rids
-            if plan_future is not None and engine.preplan_is_stale(node_batch):
-                engine.reset_pre_plan_for_batch(node_batch)
+            # after prepare_inputs, which may drop rows or cut a cached prefix
+            if plan_future is not None:
+                engine.settle_preplan(node_batch)
             execution_stream = (
                 torch.accelerator.current_stream(self.device)
                 if self.device_capability.is_accelerator
@@ -4313,6 +4323,7 @@ class Worker:
             # while the main thread sits in await_gpu with the GIL
             # released and N's kernels are still running.
             if plan_executor is not None and self._plans_ahead(spec):
+                self._measure_ahead_spans(spec)
                 spec.plan_future = plan_executor.submit(
                     self._preplan_spec, pending, spec,
                 )
