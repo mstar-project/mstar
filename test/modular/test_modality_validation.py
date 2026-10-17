@@ -198,6 +198,10 @@ ACCEPTED = [
     ("flux2_klein", ["text"], ["image"]),
     ("flux2_klein", ["image", "text"], ["image"]),
     ("z_image_turbo", ["text"], ["image"]),
+    # benchmark/nemotron_duplex/sessions.py; with --instructions, a system prompt
+    ("nemotron_duplex", ["audio"], ["text", "audio"]),
+    ("nemotron_duplex", ["audio", "text"], ["text", "audio"]),
+    ("nemotron_duplex", ["audio"], ["audio"]),
 ]
 
 # Combinations a model has no encoder/decoder for; "audio is required" isn't
@@ -235,6 +239,8 @@ REJECTED = [
     ("flux2_klein", ["text"], ["text"]),
     # the shared image adapter opens /edits, but Z-Image-Turbo has no edit path
     ("z_image_turbo", ["image", "text"], ["image"]),
+    ("nemotron_duplex", ["image", "audio"], ["audio"]),
+    ("nemotron_duplex", ["audio"], ["video"]),
 ]
 
 
@@ -270,6 +276,13 @@ def test_declarations_stay_inside_the_known_universe(name):
     cls = _model_cls(name)
     assert cls.SUPPORTED_INPUT_MODALITIES <= SUPPORTED_MODALITIES
     assert cls.SUPPORTED_OUTPUT_MODALITIES <= SUPPORTED_MODALITIES
+
+
+def test_nemotron_duplex_defaults_to_speaking():
+    # process_prompt refuses an output without audio, so the base rule's
+    # text default would turn a request that names no output into a 400
+    cls = _model_cls("nemotron_duplex")
+    assert "audio" in cls.__new__(cls).default_output_modalities()
 
 
 def test_vjepa2_fails_a_request_with_no_video():
