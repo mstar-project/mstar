@@ -1287,6 +1287,8 @@ Step 6 — Write a config YAML
 A config maps nodes to GPU ranks. The value under ``model:`` is your registry key. Each
 ``node_groups`` entry assigns one or more ``node_names`` to ``ranks``. An entry can also
 name specific ``graph_walks``, which is how prefill-decode disaggregation is expressed.
+Every node of a walk must be placed by exactly one entry that applies to that walk; the
+conductor refuses a config that places it twice or not at all.
 
 .. code-block:: yaml
 
@@ -1773,13 +1775,23 @@ Override these methods:
   objects between them, including a ``chunk_policy_factory`` such as
   ``SlidingWindowChunkPolicy(window=..., stride=...)``.
 - ``get_partitions()`` declares each ``PartitionDefinition``: its walks, its initial walk,
-  and the partitions that produce data into it.
+  and the partitions that produce data into it. Every walk belongs to exactly one
+  partition.
 - Route cross-partition tensors with ``StreamingGraphEdge(next_node=..., name=...,
   target_partition=...)`` instead of a plain ``GraphEdge``.
 
 The consuming partition's ``get_partition_forward_pass_args`` reads
 ``incoming_connections``, which provides token counts and a ``producer_done`` flag, and
 uses them to decide when to run.
+
+Keep a walk that consumes a stream to one node or one ``Loop`` on one node group, and move
+later work into a downstream partition fed by its own ``StreamingGraphEdge``. A consumer
+whose every input is streamed runs again as soon as the next chunk arrives, and the
+runtime and conductor count passes per worker graph, so the conductor refuses at startup
+such a consumer sharing its worker graph with another top-level node or ``Loop``, and a
+stream-consuming walk split over worker graphs, unless every consumer also waits on a
+non-streamed input and all the walk's worker graphs run on the same workers. That input
+must arrive once per pass (from the conductor, say); startup cannot check this.
 
 Checklist
 ---------
