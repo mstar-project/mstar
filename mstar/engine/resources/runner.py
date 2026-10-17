@@ -406,8 +406,9 @@ class StepRunner:
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             except Exception:
-                # a raise fails the step, so the marks taken above go too
-                self._abort(step, admitted)
+                # a raise fails the step, so its marks go too, including those
+                # the pre-admit took for the covered resources
+                self._abort(step, [*covered, *admitted])
                 raise
             finally:
                 if PHASE_PERIOD:
