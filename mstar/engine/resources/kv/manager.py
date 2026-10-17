@@ -1876,8 +1876,9 @@ class KVManager(AttentionResource):
         self._cached_plan_output = None
 
     def abort_step(self, step: KVStep, ctx: StepContext):
-        # only the in-flight mark: the rid is failed and removed, which frees
-        # the rest. `.get` for the zero-span segments admit made no stream for
+        # only the in-flight mark, which would block offload; the pages are
+        # rollback_admit's or, for a failed rid, its removal's. `.get` for the
+        # zero-span segments admit made no stream for
         with self._lock:
             for segment in step.segments:
                 stream = self._streams.get(
