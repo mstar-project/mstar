@@ -55,8 +55,8 @@ console scripts, ``mstar`` and ``mstar-serve``.
 
 .. important::
 
-   **Always pass** ``--torch-backend=auto``. ``mstar`` floors PyTorch at 2.9
-   (``torch>=2.9.1`` / ``torchvision>=0.24.1`` / ``torchaudio>=2.9.1``). The flag tells 
+   **Always pass** ``--torch-backend=auto``. ``mstar`` floors PyTorch at 2.10
+   (``torch>=2.10.0`` / ``torchvision>=0.25.0`` / ``torchaudio>=2.10.0``). The flag tells 
    ``uv`` to detect your driver's CUDA version and fetch the **matching** torch build
    — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
    compiled extensions (``flash-attn``) and the JIT-built MoE kernel for Qwen3-Omni
@@ -178,7 +178,9 @@ The GPU model families depend on:
   extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
 - **mooncake-transfer-engine** — RDMA tensor transport for multi-GPU, disaggregated
   deployments. Single-node deployments can use shared-memory (``SHM``) or ``TCP`` transport
-  instead (see :doc:`serving`).
+  instead (see :doc:`serving`). The extras install Mooncake's CUDA 12 wheel; next to a CUDA
+  13 torch (``+cu130``), replace it with ``mooncake-transfer-engine-cuda13`` of the same
+  version, as the Docker images do (#480).
 
 Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
 installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
@@ -218,7 +220,7 @@ build from source (see `No matching wheel — build from source`_ below).
 The wheels live on flash-attn's `GitHub releases
 <https://github.com/Dao-AILab/flash-attention/releases>`_, named by CUDA major, torch
 **minor** version, Python tag, and C++ ABI. ``mstar`` no longer pins torch (floor
-``>=2.9.1``), so the wheel's ``torchX.Y`` tag must match **whatever torch you actually
+``>=2.10.0``), so the wheel's ``torchX.Y`` tag must match **whatever torch you actually
 installed**, and its ``cu1x`` must match that torch's CUDA build — not your system toolkit.
 Check both first:
 
@@ -226,25 +228,20 @@ Check both first:
 
    python -c "import torch; print(torch.__version__, torch.version.cuda)"
    # e.g. 2.12.1+cu130 13.0  ->  torch2.12 / cu13
-   #      2.9.1+cu128  12.8  ->  torch2.9  / cu12
+   #      2.10.0+cu130 13.0  ->  torch2.10 / cu13
 
 Pick the release that has a wheel for your torch minor (each flash-attn release lists which
 ``torchX.Y`` tags it ships), then install it by **direct URL** (don't use ``--find-links`` —
 uv sorts the ``+cu13…`` local version above ``+cu12…`` and will grab cu13 even on a CUDA 12
-box). The examples below are for **torch 2.9**; substitute the ``torch2.9`` segment with your
-own tag. Note the prebuilt wheels **top out at** ``torch2.10`` (``cu13``, in release
-``v2.8.3``) — there is **no** ``torch2.11+`` wheel, so on newer torch (e.g. 2.12) you must
-build from source instead:
+box). The example below is for **torch 2.10**, the floor. The prebuilt wheels **top out at**
+``torch2.10``, and only for ``cu13`` (release ``v2.8.3``): on a cu12 torch, or on torch 2.11+,
+you must build from source instead:
 
 .. code-block:: bash
 
-   # torch built for CUDA 12.x (cu12)
+   # torch 2.10 built for CUDA 13.x (cu13)
    uv pip install \
-     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
-
-   # torch built for CUDA 13.x (cu13)
-   uv pip install \
-     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
 Because it's a binary wheel nothing compiles, so your *system* CUDA version is irrelevant —
 only the torch build matters. Verify with:
@@ -347,13 +344,13 @@ requirement as already satisfied):
 .. code-block:: bash
 
    # pick the index for your CUDA toolkit: cu128 (CUDA 12.8), cu130 (CUDA 13.x), …
-   uv pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+   uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
        --index-url https://download.pytorch.org/whl/cu128
    uv pip install -e ".[all]"
 
 Check your driver's CUDA version with ``nvidia-smi`` and pick the closest build at
-https://pytorch.org/get-started/locally/. Keep all three packages on the same ``2.9`` /
-``0.24`` line — ``torchvision`` and ``torchaudio`` are versioned in lockstep with ``torch``.
+https://pytorch.org/get-started/locally/. Keep all three packages on the same ``2.10`` /
+``0.25`` line — ``torchvision`` and ``torchaudio`` are versioned in lockstep with ``torch``.
 
 Verify the install
 ------------------

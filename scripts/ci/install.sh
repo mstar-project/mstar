@@ -22,8 +22,8 @@ case "$job" in
             --index-url https://download.pytorch.org/whl/cpu
         if [[ $job == cpu-smoke ]]; then
             # flex_attention imports torch._inductor, which needs Triton even
-            # on CPU; 3.5.1 is the version torch 2.9.1 pins.
-            python -m pip install triton==3.5.1
+            # on CPU; 3.6.0 is the version torch 2.10.0 pins.
+            python -m pip install triton==3.6.0
             python -m pip install -e '.[dev,waypoint]'
             # BAGEL's CPU graph/KV tests need these without the CUDA extras.
             python -m pip install einops regex transformers
