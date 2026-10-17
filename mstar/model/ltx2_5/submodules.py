@@ -24,6 +24,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import (
     AttentionStep,
     RaggedCrossAttentionStep,
@@ -38,6 +39,7 @@ from mstar.model.components.diffusion.attention import joint_attention, sdpa_att
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
+from mstar.model.components.distributed.sequence_parallel import sp_seq_split
 from mstar.model.ltx2_5.components.transformer import LTX2Attends, build_rope
 from mstar.model.ltx2_5.config import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES, LTX25Config
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
@@ -227,6 +229,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         capture_buckets=(),
         capture_batch_sizes=(1, 2, 4),
         replay_walks=None,
+        sp_group: CommGroup | None = None,
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=None,
@@ -237,6 +240,9 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         self.use_ragged_attention = use_ragged_attention
         # walks that run the two-stage recipe's stage 2 (the refine loop)
         self.refine_walks = frozenset(refine_walks)
+        # the transformer's sequence-parallel group: each rank's cross-attentions attend
+        # from its share of the video tokens
+        self.sp_group = sp_group or CommGroup.trivial()
         self._attends: LTX2Attends | None = None
         if compile_transformer and transformer is not None:
             # Fuses the AdaLN modulation, norms, RoPE and gating chains (44% of an eager
@@ -358,19 +364,28 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
     ) -> SubmoduleStep | None:
         if not self.use_ragged_attention:
             return None
-        video, audio, text = [], [], []
+        sp = self.sp_group
+        video, video_shard, audio, text = [], [], [], []
         for rid, inp in zip(request_ids, inputs, strict=True):
             shape: LTXShape = inp.resource_step_info
             video.append(Segment(request_id=rid, label=VIDEO_SPAN, span=shape.video_tokens))
+            # the cross-attentions attend from this rank's share of the video tokens
+            shard = sp_seq_split(shape.video_tokens, sp.world_size)[sp.rank]
+            video_shard.append(Segment(request_id=rid, label=VIDEO_SPAN, span=shard))
             audio.append(Segment(request_id=rid, label=AUDIO_SPAN, span=shape.audio_frames))
             text.append(Segment(request_id=rid, label=TEXT_SPAN, span=shape.text_len))
+        # sharded, the audio queries attend each rank's video shard outside the resource
+        # (LTX2Block merges the shards' partial attentions)
+        audio_pairs = AUDIO_XATTN_PAIRS if sp.world_size == 1 else AUDIO_XATTN_PAIRS[:2]
         return SubmoduleStep(
             steps={
                 VIDEO_ATTN: AttentionStep(segments=tuple(video), causal=False),
                 AUDIO_ATTN: AttentionStep(segments=tuple(audio), causal=False),
-                VIDEO_XATTN: RaggedCrossAttentionStep(segments=tuple(video + text), pairs=VIDEO_XATTN_PAIRS),
+                VIDEO_XATTN: RaggedCrossAttentionStep(
+                    segments=tuple(video_shard + text), pairs=VIDEO_XATTN_PAIRS,
+                ),
                 AUDIO_XATTN: RaggedCrossAttentionStep(
-                    segments=tuple(video + audio + text), pairs=AUDIO_XATTN_PAIRS,
+                    segments=tuple(video_shard + audio + text), pairs=audio_pairs,
                 ),
             },
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),

@@ -1218,6 +1218,7 @@ modalities, so ``["video"]`` skips the audio decode (the model still denoises bo
 
    mstar serve ltx2_5                             # configs/ltx2_5.yaml: DiT on GPU 0, the rest on GPU 1
    mstar serve ltx2_5 --config configs/ltx2_5_tp2.yaml   # DiT tensor-parallel over 2 GPUs
+   mstar serve ltx2_5 --config configs/ltx2_5_sp2.yaml   # DiT sequence-parallel over 2 GPUs (fastest)
 
 Request knobs (``model_kwargs``): ``height`` / ``width`` (multiples of 32; 64 for the
 two-stage recipe), ``num_frames`` (8k+1), ``fps``, ``seed``, and ``recipe``:
@@ -1232,16 +1233,22 @@ Outputs are an H.264 ``video`` and a 48 kHz stereo ``audio`` chunk (16-bit PCM).
 (``"audio": false`` in the body for video alone); the mux needs the ``ffmpeg`` binary
 on the server's ``PATH`` and falls back to video only without it.
 
-Performance (2x H100, warm, against diffusers 0.41 with the same recipe and seeds):
+``ltx2_5_sp2`` shards the video tokens (Ulysses): each rank holds the whole DiT and
+half the tokens, and only the video self-attention exchanges them (one all-to-all
+each way); the cross-attentions run on each rank's own tokens, and the audio queries
+over the video merge the ranks' partial attentions. ``ltx2_5_tp2`` shards the
+weights instead and all-reduces after every block's attentions and feed-forwards.
 
-======================================  ==============  ==============
-                                        diffusers       ``ltx2_5_tp2``
-======================================  ==============  ==============
-544x960x121, one request                7.87 s          4.97 s
-544x960x121, 4 concurrent               7.6 videos/min  17.9 videos/min
-two-stage 1088x1920x121, one request    21.6 s          14.6 s
-two-stage, 2 concurrent                 2.8 videos/min  5.4 videos/min
-======================================  ==============  ==============
+Performance (2x H100, warm; diffusers with the same recipe and seeds):
+
+======================================  ================  ================  ================
+                                        diffusers         ``ltx2_5_tp2``    ``ltx2_5_sp2``
+======================================  ================  ================  ================
+544x960x121, one request                7.87 s            4.09 s            3.57 s
+544x960x121, 4 concurrent               7.6 videos/min    18.7 videos/min   20.8 videos/min
+two-stage 1088x1920x121, one request    21.6 s            12.5 s            11.3 s
+two-stage, 2 concurrent                 2.8 videos/min    5.4 videos/min    6.1 videos/min
+======================================  ================  ================  ================
 
 The DiT is compiled and its denoise step captured per shape (``capture_shapes``,
 ``capture_refine_shapes``); other shapes run the compiled eager path, and the first

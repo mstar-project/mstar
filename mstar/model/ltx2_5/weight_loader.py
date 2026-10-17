@@ -67,10 +67,10 @@ def remap_ff_and_out(name: str) -> str:
 
 def build_transformer(
     config: LTX25Config, snapshot: Path, device, comm_group: CommGroup | None = None,
-    dtype: torch.dtype = torch.bfloat16,
+    dtype: torch.dtype = torch.bfloat16, sp_group: CommGroup | None = None,
 ) -> LTX2DiT:
     with torch.device("meta"):
-        module = LTX2DiT(config.transformer, comm_group)
+        module = LTX2DiT(config.transformer, comm_group, sp_group)
     materialize(module, dtype, device)
     return load_native(
         module, iter_diffusers_component(snapshot / "transformer", device), remap_ff_and_out, "LTX-2.5 transformer",

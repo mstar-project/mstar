@@ -26,11 +26,13 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.distributed.sequence_parallel import gather_sequence, scatter_sequence, sp_seq_split
 from mstar.model.ltx2_5.components.layers import (
     Attend,
     GatedAttention,
     GeluFeedForward,
     RotaryTable,
+    SeqParallel,
     rms_norm_no_weight,
     split_rope_table,
 )
@@ -170,7 +172,10 @@ class LTX2Block(nn.Module):
         temb: TemporalEmbeddings,
         rope: LTX2Rope,
         attends: LTX2Attends,
+        sp: SeqParallel | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``sp``: ``x`` holds this rank's share of the video tokens; audio and text are
+        replicated. Only the video self-attention exchanges tokens (see ``SeqParallel``)."""
         eps = self.eps
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, shift_tq, scale_tq, gate_tq = (
             modulation(self.scale_shift_table, temb.video)
@@ -180,7 +185,7 @@ class LTX2Block(nn.Module):
 
         # 1. self-attention
         h = rms_norm_no_weight(x, eps) * (1 + scale_msa) + shift_msa
-        x = x + self.attn1(h, attends.video_self, q_rope=rope.video) * gate_msa
+        x = x + self.attn1(h, attends.video_self, q_rope=rope.video, exchange=sp) * gate_msa
         h = rms_norm_no_weight(a, eps) * (1 + a_scale_msa) + a_shift_msa
         a = a + self.audio_attn1(h, attends.audio_self, q_rope=rope.audio) * a_gate_msa
 
@@ -211,7 +216,8 @@ class LTX2Block(nn.Module):
         q_in = norm_a * (1 + a_v2a_scale) + a_v2a_shift
         kv_in = norm_x * (1 + v_v2a_scale) + v_v2a_shift
         a = a + v2a_gate * self.video_to_audio_attn(
-            q_in, attends.video_to_audio, context=kv_in, q_rope=rope.cross_audio, k_rope=rope.cross_video,
+            q_in, attends.video_to_audio if sp is None else sp.attend_shards, context=kv_in,
+            q_rope=rope.cross_audio, k_rope=rope.cross_video,
         )
 
         # 4. feed-forward
@@ -221,9 +227,14 @@ class LTX2Block(nn.Module):
 
 
 class LTX2DiT(nn.Module):
-    def __init__(self, cfg: LTX2TransformerConfig, comm_group: CommGroup | None = None):
+    def __init__(
+        self, cfg: LTX2TransformerConfig, comm_group: CommGroup | None = None, sp_group: CommGroup | None = None,
+    ):
         super().__init__()
         comm_group = comm_group or CommGroup.trivial()
+        # Sequence parallelism shards the video tokens (nearly all the compute) and
+        # replicates the weights, the ~100 audio tokens and the text.
+        self.sp_group = sp_group or CommGroup.trivial()
         self.cfg = cfg
         dim, adim = cfg.inner_dim, cfg.audio_inner_dim
         self.proj_in = nn.Linear(cfg.in_channels, dim)
@@ -285,17 +296,30 @@ class LTX2DiT(nn.Module):
         """One velocity prediction. ``latents`` / ``audio_latents`` in the model dtype;
         ``timestep`` is ``sigma * 1000``, ``[B]`` fp32. Returns ``(video, audio)``
         velocities in the model dtype."""
+        sp = None
+        if self.sp_group.world_size > 1:
+            sp = SeqParallel(self.sp_group, sp_seq_split(latents.shape[1], self.sp_group.world_size))
+            latents = scatter_sequence(sp.group, latents, sp.sizes, dim=1)
+            rope = rope._replace(video=_shard_rows(sp, rope.video), cross_video=_shard_rows(sp, rope.cross_video))
         x = self.proj_in(latents)
         a = self.audio_proj_in(audio_latents)
         temb, video_embedded, audio_embedded = self.temporal_embeddings(timestep)
         for block in self.transformer_blocks:
-            x, a = block(x, a, text, audio_text, temb, rope, attends)
+            x, a = block(x, a, text, audio_text, temb, rope, attends, sp)
 
         shift, scale = (self.scale_shift_table[None, None] + video_embedded[:, :, None]).unbind(dim=2)
         x = nn.functional.layer_norm(x, (x.shape[-1],), eps=1e-6) * (1 + scale) + shift
         a_shift, a_scale = (self.audio_scale_shift_table[None, None] + audio_embedded[:, :, None]).unbind(dim=2)
         a = nn.functional.layer_norm(a, (a.shape[-1],), eps=1e-6) * (1 + a_scale) + a_shift
-        return self.proj_out(x), self.audio_proj_out(a)
+        video = self.proj_out(x)
+        if sp is not None:
+            video = gather_sequence(sp.group, video, sp.sizes, dim=1)
+        return video, self.audio_proj_out(a)
+
+
+def _shard_rows(sp: SeqParallel, table: RotaryTable) -> RotaryTable:
+    start, count = sum(sp.sizes[: sp.group.rank]), sp.sizes[sp.group.rank]
+    return RotaryTable(table.cos.narrow(1, start, count), table.sin.narrow(1, start, count))
 
 
 def video_positions(

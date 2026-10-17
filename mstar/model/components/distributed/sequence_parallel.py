@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import Callable
 
 import torch
+import torch.distributed as dist
 
 from mstar.distributed.communication import CommGroup
 
@@ -132,3 +133,58 @@ def sp_head_gather(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:
     if sp_group.world_size == 1:
         return x
     return sp_group.all_gather(x, dim=1)
+
+
+@torch.compiler.disable
+def sequence_to_heads(
+    sp_group: CommGroup, x: torch.Tensor, seq_sizes: list[int], seq_dim: int, head_dim: int,
+) -> torch.Tensor:
+    """Ulysses' first exchange for any layout: this rank's tokens over all heads to
+    every token over this rank's head-group (``[.., S/P, .., H, ..] -> [.., S, .., H/P, ..]``).
+
+    One ``all_to_all_single``, which replays from a CUDA graph."""
+    world_size = sp_group.world_size
+    if world_size == 1:
+        return x
+    # [.., H, ..] -> [P, .., H/P, ..]: piece r (head-group r) goes to rank r
+    send = x.unflatten(head_dim, (world_size, -1)).movedim(head_dim, 0).contiguous()
+    if len(set(seq_sizes)) == 1:
+        recv = torch.empty_like(send)
+        dist.all_to_all_single(recv, send, group=sp_group.device_group)
+        # piece r is rank r's tokens: concatenate them along the sequence, in rank order
+        return recv.movedim(0, seq_dim).flatten(seq_dim, seq_dim + 1)
+    # uneven: rank r's piece holds its own token count
+    piece = list(send.shape[1:])
+    shapes = [piece[:seq_dim] + [n] + piece[seq_dim + 1:] for n in seq_sizes]
+    numels = [int(torch.Size(shape).numel()) for shape in shapes]
+    recv = torch.empty(sum(numels), dtype=x.dtype, device=x.device)
+    dist.all_to_all_single(recv, send.flatten(), numels, [send[0].numel()] * world_size,
+                           group=sp_group.device_group)
+    pieces = [chunk.view(shape) for chunk, shape in zip(recv.split(numels), shapes, strict=True)]
+    return torch.cat(pieces, dim=seq_dim)
+
+
+@torch.compiler.disable
+def heads_to_sequence(
+    sp_group: CommGroup, x: torch.Tensor, seq_sizes: list[int], seq_dim: int, head_dim: int,
+) -> torch.Tensor:
+    """The inverse of :func:`sequence_to_heads`: ``[.., S, .., H/P, ..] -> [.., S/P, .., H, ..]``."""
+    world_size = sp_group.world_size
+    if world_size == 1:
+        return x
+    if len(set(seq_sizes)) == 1:
+        # [.., S, ..] -> [P, .., S/P, ..]: piece r (rank r's tokens) goes to rank r
+        send = x.unflatten(seq_dim, (world_size, -1)).movedim(seq_dim, 0).contiguous()
+        recv = torch.empty_like(send)
+    else:
+        # uneven: piece r holds rank r's token count
+        chunks = x.split(seq_sizes, dim=seq_dim)
+        send = torch.cat([chunk.contiguous().flatten() for chunk in chunks])
+        mine = chunks[sp_group.rank].shape
+        recv = torch.empty((world_size, *mine), dtype=x.dtype, device=x.device)
+        dist.all_to_all_single(recv.flatten(), send, [mine.numel()] * world_size, [c.numel() for c in chunks],
+                               group=sp_group.device_group)
+        return recv.movedim(0, head_dim).flatten(head_dim, head_dim + 1)
+    dist.all_to_all_single(recv, send, group=sp_group.device_group)
+    # piece r is head-group r of this rank's tokens
+    return recv.movedim(0, head_dim).flatten(head_dim, head_dim + 1)
