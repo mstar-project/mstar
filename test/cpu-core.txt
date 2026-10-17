@@ -73,6 +73,7 @@ test/modular/test_worker_device_loopback.py
 test/modular/test_gc_freeze.py
 test/modular/test_qwen3_5_bucket_knobs.py
 test/modular/test_fast_tokenize.py
+test/modular/test_ar_fusion_fallback.py
 test/modular/test_wire_codec.py
 test/modular/test_wire_security.py
 test/modular/test_model_kwargs_tensor_transport.py
