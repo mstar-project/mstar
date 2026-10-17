@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -427,6 +428,13 @@ class RouteInput(NamedTuple):
     # rid i's signal s. The runtime looks the metadata up in the store.
     tensors: list[int]
     num_tensors: list[int]
+    # One output signal whose per-rid value is a host scalar the worker
+    # already has (the sampled token): its EMIT_TO_CLIENT edge then rides
+    # inline in one frame per step instead of as a tensor per request. The
+    # values are in wg_ids.keys() order; empty means none. A runtime without
+    # `supports_inline_emit` ignores both.
+    inline_signal: str | None = None
+    inline_values: tuple[int, ...] | list[int] = ()
 
 
 class RouteOutput(NamedTuple):
@@ -491,6 +499,11 @@ class GraphRuntime(ABC):
     only what cannot live behind it -- forward-pass info (a wire object it
     forwards opaquely) and stream buffers (which hold tensors).
     """
+
+    # Whether `RouteInput.inline_signal` is honoured: an emit edge sent as one
+    # RESULT_TOKENS frame per step. A runtime that does not keeps the
+    # per-request tensor path, which stays correct.
+    supports_inline_emit: bool = False
 
     # --------- Bookkeeping ----------
     @abstractmethod
@@ -585,6 +598,18 @@ class GraphRuntime(ABC):
         partition: str,
     ) -> ParallelList[int, dict[str,int]]:
         pass
+
+    def update_dynamic_loop_iters(
+        self, per_request_info: Mapping[int, "CurrentForwardPassInfo"], partition: str,
+    ) -> None:
+        """Refresh ``dynamic_loop_iter_counts`` on each request's forward-pass
+        info from the runtime's loop counters. The default goes through
+        ``get_dynamic_loop_iters``; a runtime with a cheaper bulk form
+        overrides this."""
+        for rid, new_iters in self.get_dynamic_loop_iters(
+            list(per_request_info), partition=partition,
+        ):
+            per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
 
     @abstractmethod
     def is_async_schedulable(self, node_name: str, graph_walk: str) -> bool:

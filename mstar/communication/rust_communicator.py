@@ -26,7 +26,6 @@ except ModuleNotFoundError:
 from mstar.communication.codec import (  # noqa: F401  (re-exported)
     Codec,
     MsgpackCodec,
-    PickleCodec,
     WireCodec,
     decode_each,
     default_codec,

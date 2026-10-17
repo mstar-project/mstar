@@ -141,6 +141,9 @@ qwen3_omni = [
     "Pillow",
     "regex",
     "qwen-omni-utils",
+    # qwen-omni-utils imports audioread for a video's audio track but does not
+    # declare it, and librosa no longer pulls it in
+    "audioread",
     "numba>=0.61",
     "torchvision",
     "torchaudio",
@@ -302,6 +305,7 @@ all = [
     "safetensors",
     "triton",
     "qwen-omni-utils",
+    "audioread",  # see the qwen3_omni extra
     "qwen-tts==0.1.1",
     "numba>=0.61",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel

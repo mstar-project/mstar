@@ -26,6 +26,20 @@ class ResultTensors:
 
 
 @dataclass
+class ResultTokens:
+    """One step's client-facing scalars (sampled tokens), every request in one
+    frame. Replaces one ResultTensors per request for an output whose value
+    the worker already holds on the host: no transport tensor, no ack."""
+    request_ids: list[str]
+    values: list[int]
+    # per request, the loop context of the step that produced the value
+    loop_indices: list[NestedLoopIndices | None]
+    signal: str
+    modality: str
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
 class RequestComplete:
     """Signals that a request has finished processing."""
     request_id: str
@@ -52,12 +66,16 @@ class RequestFailed:
     status: int = 500
 
 
+# what an ``APIServerMessage`` carries; None for ``setup_done``
+APIServerMessageBody = ResultTensors | ResultTokens | RequestComplete | RequestFailed | None
+
+
 @dataclass
 class APIServerMessage:
     """Envelope for messages received by the API server."""
-    # "result_tensors" | "request_complete" | "request_failed" | "setup_done"
+    # "result_tensors" | "result_tokens" | "request_complete" | "request_failed" | "setup_done"
     message_type: str
-    body: ResultTensors | RequestComplete | RequestFailed | None = None  # None for setup_done
+    body: APIServerMessageBody = None
 
 
 @dataclass
