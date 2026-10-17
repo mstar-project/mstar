@@ -1,7 +1,4 @@
-import logging
-import math
 from dataclasses import dataclass, field
-from datetime import timedelta
 from typing import Any
 
 import torch
@@ -9,99 +6,8 @@ import torch.distributed as dist
 from torch.distributed.constants import default_pg_nccl_timeout, default_pg_timeout
 from torch.distributed.distributed_c10d import _set_pg_timeout
 
-logger = logging.getLogger(__name__)
-
-# Small-message all-reduce backend: "nccl" (default) or "symm_oneshot" /
-# "symm_multimem", which route messages up to ``tp_allreduce_max_kb`` through
-# torch symmetric memory (NVLink one-shot / NVLS multicast). Reduction order
-# differs from NCCL's, so bf16 can differ at the last bit — opt-in, from the
-# deployment config's ``tp_allreduce``.
-TP_SYMM_AR_MODES = ("symm_oneshot", "symm_multimem")
-# The symm_mem ops check the message byte size is aligned (at least
-# max(4, element_size)) and vectorize at 16; anything else raises inside
-# the op, so only 16-byte-multiple messages are routed there.
-TP_SYMM_AR_ALIGN_BYTES = 16
-# The symm_mem kernels dispatch only these.
-TP_SYMM_AR_DTYPES = (torch.bfloat16, torch.float32)
-# symm_multimem reduces messages up to this size in one kernel that writes the
-# caller's tensor (in 16-byte stores, so that tensor must start 16-byte
-# aligned). Every rank then reads the whole message through the switch, so
-# larger ones take the split kernel and a copy out.
-MULTIMEM_ONESHOT_MAX_BYTES = 32 * 1024
-
-
-class _SymmAllReduce:
-    """One persistent symmetric-memory buffer per group; all-reduce small
-    messages through it (copy in, reduce, result back in the input — in-place
-    semantics, except for an input that is the buffer itself)."""
-
-    def __init__(self, device_group, device: torch.device, max_bytes: int, mode: str):
-        import torch.distributed._symmetric_memory as symm
-
-        self.mode = mode
-        self.max_bytes = max_bytes
-        self.group_name = device_group.group_name
-        symm.enable_symm_mem_for_group(self.group_name)
-        # Raw byte buffer; viewed per dtype at call time.
-        self._buf = symm.empty(max_bytes, dtype=torch.uint8, device=device)
-        handle = symm.rendezvous(self._buf, self.group_name)
-        # Without NVLS the multimem kernel raises at its first call; fail
-        # here instead, where the caller falls back to NCCL.
-        if mode == "symm_multimem" and not handle.multicast_ptr:
-            raise RuntimeError("no NVLink multicast for this group")
-
-    def buffer(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-        return self._buf[: math.prod(shape) * dtype.itemsize].view(dtype).view(shape)
-
-    def all_reduce_(self, input_: torch.Tensor) -> torch.Tensor:
-        n = input_.numel()
-        flat = input_.view(-1)
-        view = self._buf[: n * input_.element_size()].view(input_.dtype)
-        # data_ptr() breaks a torch.compile graph at every call, so a compiled
-        # forward reads neither: it never gets the buffer (all_reduce_buffer)
-        # and takes the split kernel.
-        eager = not torch.compiler.is_compiling()
-        if eager and flat.data_ptr() == view.data_ptr():
-            # The producer wrote into the buffer, and the next call reuses it,
-            # so the sum goes to a new tensor.
-            input_ = torch.empty_like(input_)
-            flat = input_.view(-1)
-        else:
-            view.copy_(flat)
-        if (
-            self.mode == "symm_multimem"
-            and view.nbytes <= MULTIMEM_ONESHOT_MAX_BYTES
-            and eager
-            and flat.data_ptr() % 16 == 0
-        ):
-            torch.ops.symm_mem.multimem_one_shot_all_reduce_out(view, "sum", self.group_name, flat)
-        elif self.mode == "symm_multimem":
-            torch.ops.symm_mem.multimem_all_reduce_(view, "sum", self.group_name)
-            flat.copy_(view)
-        else:
-            out = torch.ops.symm_mem.one_shot_all_reduce(view, "sum", self.group_name)
-            flat.copy_(out)
-        return input_
-
-
-def resolve_dist_timeout(dist_timeout_s: float | None = None) -> dict[str, timedelta]:
-    """Build the ``timeout`` kwarg for ``init_process_group`` / ``new_group``
-    from the config's ``dist_timeout_s``; unset, PyTorch's default applies
-    (``{}``). Large checkpoint loads (hundreds of GB at TP8) exceed that
-    default, so deployments opt in.
-    """
-    if dist_timeout_s is None:
-        return {}
-    if dist_timeout_s <= 0:
-        raise ValueError(f"dist_timeout_s must be positive, got {dist_timeout_s}")
-    return {"timeout": timedelta(seconds=float(dist_timeout_s))}
-
-
-def _all_ranks_agree(flag: bool, cpu_group) -> bool:
-    """AND ``flag`` across the ranks of ``cpu_group``."""
-    t = torch.tensor([int(flag)])
-    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=cpu_group)
-    return bool(t.item())
+from mstar.distributed.all_reduce import AllReduce
+from mstar.distributed.utils import resolve_dist_timeout
 
 
 class CommGroup:
@@ -132,49 +38,15 @@ class CommGroup:
         # see ``init_allreduce_fusion``
         self._ar_fusion_ws: int | None = None
         self._ar_fusion_max_tokens = 0
-        self._symm_ar: _SymmAllReduce | None = None
+        # NCCL until ``init_all_reduce`` sets up the deployment's backend
+        self._all_reduce = AllReduce(self.device_group)
 
-    def _maybe_init_symm_allreduce(
-        self, config_mode: str | None = None, config_max_kb: int | None = None,
-    ) -> None:
-        """Build the symmetric-memory all-reduce path if the deployment
-        config's ``tp_allreduce`` (``config_mode``) asks for it;
-        ``tp_allreduce_max_kb`` (``config_max_kb``) sizes it. Collective
-        across the group (rendezvous) — every member calls this from
-        ``init_dist`` at the same point. Falls back to NCCL."""
-        mode = (config_mode or "nccl").strip().lower()
-        if mode not in TP_SYMM_AR_MODES:
-            if mode != "nccl":
-                logger.warning("unknown all-reduce mode %r; using NCCL", mode)
-            return
-        if self.world_size == 1 or self.device_group is None or not torch.cuda.is_available():
-            return
-        max_kb = 512 if config_max_kb is None else int(config_max_kb)
-        if max_kb <= 0:
-            return
-        try:
-            self._symm_ar = _SymmAllReduce(
-                self.device_group, torch.device("cuda", torch.cuda.current_device()),
-                max_kb * 1024, mode,
-            )
-        except Exception as exc:  # noqa: BLE001 — fall back to NCCL, loudly
-            logger.warning(
-                "all-reduce %s requested but symmetric memory could not be set up (%r); using NCCL",
-                mode, exc,
-            )
-            self._symm_ar = None
-        # every rank or none: one rank on NCCL while its peers wait in the symmetric
-        # kernel for its signal deadlocks the first all-reduce
-        if not _all_ranks_agree(self._symm_ar is not None, self.cpu_group):
-            if self._symm_ar is not None:
-                logger.warning("all-reduce %s: another rank could not set it up; using NCCL", mode)
-            self._symm_ar = None
-            return
-        if self.rank == 0:
-            logger.info(
-                "all-reduce %s for messages up to %d KiB, ranks %s",
-                mode, max_kb, self.group_members,
-            )
+    def init_all_reduce(self, mode: str | None = None, max_kb: int | None = None) -> None:
+        """Set up the all-reduce backend the deployment config's ``tp_allreduce``
+        (``mode``) and ``tp_allreduce_max_kb`` (``max_kb``) ask for (see
+        ``AllReduce.new``). Collective across the group — every member calls
+        this from ``init_dist`` at the same point."""
+        self._all_reduce = AllReduce.new(self, mode, max_kb)
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -212,15 +84,6 @@ class CommGroup:
             return
         dist.barrier(group=self.device_group)
 
-    def _symm_fits(self, nbytes: int, dtype: torch.dtype) -> bool:
-        symm = self._symm_ar
-        return (
-            symm is not None
-            and dtype in TP_SYMM_AR_DTYPES
-            and 0 < nbytes <= symm.max_bytes
-            and nbytes % TP_SYMM_AR_ALIGN_BYTES == 0
-        )
-
     def all_reduce_buffer(
         self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:
@@ -228,28 +91,12 @@ class CommGroup:
         the symmetric-memory path this is the symm buffer, so ``all_reduce``
         skips its copy in and returns the sum in a new tensor: use its return
         value, and all-reduce nothing else on this group in between."""
-        if not torch.compiler.is_compiling() and self._symm_fits(
-            math.prod(shape) * dtype.itemsize, dtype
-        ):
-            return self._symm_ar.buffer(shape, dtype)
-        return torch.empty(shape, dtype=dtype, device=device)
+        return self._all_reduce.buffer(shape, dtype, device)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
             return input_
-        # Small contiguous CUDA messages go through symmetric memory when
-        # enabled; everything else (prefill-sized, strided, host, other
-        # dtypes, or a byte size the op would reject as misaligned) stays on
-        # NCCL.
-        nbytes = input_.numel() * input_.element_size()
-        if (
-            self._symm_fits(nbytes, input_.dtype)
-            and input_.is_cuda
-            and input_.is_contiguous()
-        ):
-            return self._symm_ar.all_reduce_(input_)
-        dist.all_reduce(input_, group=self.device_group)
-        return input_
+        return self._all_reduce.all_reduce(input_)
 
     def init_allreduce_fusion(
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
@@ -556,7 +403,7 @@ class WorkerParallelGroups:
             # Collective rendezvous within the group. Members visit shared
             # groups in the same relative order: GlobalParallelConfig fills
             # every worker's dicts in one global iteration order.
-            comm_group._maybe_init_symm_allreduce(self.tp_allreduce, self.tp_allreduce_max_kb)
+            comm_group.init_all_reduce(self.tp_allreduce, self.tp_allreduce_max_kb)
 
     def get_tp_config_for_node(self, node: str) -> CommGroup:
         if node not in self.node_to_tp_group:

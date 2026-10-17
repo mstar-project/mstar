@@ -20,11 +20,8 @@ from torch.distributed.constants import default_pg_timeout
 sys.path.insert(0, ".")
 
 import mstar.distributed.communication as comm_mod
-from mstar.distributed.communication import (
-    CommGroup,
-    WorkerParallelGroups,
-    resolve_dist_timeout,
-)
+from mstar.distributed.communication import CommGroup, WorkerParallelGroups
+from mstar.distributed.utils import resolve_dist_timeout
 
 
 def test_neither_set_is_torch_default():
