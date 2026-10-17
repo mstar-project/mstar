@@ -318,8 +318,8 @@ class Conductor:
         self._draining_deadlines: deque[tuple[float, str]] = deque()
         self._early_reads_done_deadlines: deque[tuple[float, str]] = deque()
         self._early_abort_deadlines: deque[tuple[float, str]] = deque()
-        # (deadline, rid, entity, message) for teardown sends that raised; the
-        # request's state is already freed, so this is the only copy left.
+        # (deadline, rid, entity, message) for teardown sends that raised: the
+        # only copy left of each, since nothing rebuilds a teardown message.
         self._unsent_teardown: list[tuple[float, str, str, object]] = []
 
         self.model = model
@@ -949,8 +949,8 @@ class Conductor:
         logger.info("Rejecting request %s (%d): %s", request_id, status, error)
         self._early_reads_done.pop(request_id, None)
         self._send_remove_to_preprocess_worker(request_id)
-        self.communicator.send(
-            "api_server",
+        self._send_for_teardown(
+            request_id, "api_server",
             APIServerMessage(
                 message_type="request_failed",
                 body=RequestFailed(request_id=request_id, error_message=error, status=status),
@@ -1165,8 +1165,8 @@ class Conductor:
             self._finalize_draining(request_id)
 
     def _send_remove_to_preprocess_worker(self, request_id: str):
-        self.communicator.send(
-            self.PREPROCESS_WORKER,
+        self._send_for_teardown(
+            request_id, self.PREPROCESS_WORKER,
             WorkerMessage(
                 message_type=WorkerMessageType.REMOVE_REQUEST,
                 body=RemoveRequest(request_id),
@@ -1210,6 +1210,14 @@ class Conductor:
         dr = self.draining.pop(request_id, None)
         if dr is None:
             return
+        if self._unsent_teardown:
+            # A DRAIN_REQUEST still waiting for a resend would now land after
+            # the REMOVE_REQUEST below.
+            self._unsent_teardown = [
+                entry for entry in self._unsent_teardown
+                if entry[1] != request_id
+                or entry[3].message_type != WorkerMessageType.DRAIN_REQUEST
+            ]
         # The drain record is gone, so nothing would ever finish this teardown
         # later: a send that raises must not skip the other sends or the free,
         # and is retried on its own.
@@ -1347,9 +1355,14 @@ class Conductor:
         """
         workers = self._request_workers(request_data)
         participants = workers | {self.PREPROCESS_WORKER}
+        # The drain record below is what finishes this teardown (or its TTL
+        # does), so a send that raises must not skip it. The sends go first: a
+        # barrier whose READS_DONE all came early finalizes on registration,
+        # and a DRAIN_REQUEST must not reach a participant after its
+        # REMOVE_REQUEST.
         for entity in participants:
-            self.communicator.send(
-                entity,
+            self._send_for_teardown(
+                request_id, entity,
                 WorkerMessage(
                     message_type=WorkerMessageType.DRAIN_REQUEST,
                     body=DrainRequest(request_id),
