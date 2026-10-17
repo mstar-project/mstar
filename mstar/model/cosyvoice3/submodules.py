@@ -193,6 +193,7 @@ class LMRequestKnobs:
     temperature: float
     top_p: float
     top_k: int
+    window: int  # ras_window, at most the deployment's (the history width)
     threshold: float  # ras_window * ras_tau; 0 disables the redraw
     ignore_eos: bool
     min_len: int
@@ -201,7 +202,7 @@ class LMRequestKnobs:
 
 # The decode capture's template row
 CAPTURE_KNOBS = LMRequestKnobs(
-    seed=0, temperature=1.0, top_p=0.8, top_k=25, threshold=1.0, ignore_eos=False, min_len=0, max_len=1
+    seed=0, temperature=1.0, top_p=0.8, top_k=25, window=1, threshold=1.0, ignore_eos=False, min_len=0, max_len=1
 )
 
 
@@ -225,7 +226,7 @@ class LMSubmodule(ARNodeSubmodule):
         self.config = config
         self.lm = config.lm
         self.window = int(config.sampling.ras_window)
-        self._int_stager = PinnedStager(torch.long, numel=3 * self.MAX_BATCH_SIZE)
+        self._int_stager = PinnedStager(torch.long, numel=4 * self.MAX_BATCH_SIZE)
         self._float_stager = PinnedStager(torch.float32, numel=3 * self.MAX_BATCH_SIZE)
         self._bool_stager = PinnedStager(torch.bool, numel=2 * self.MAX_BATCH_SIZE)
         self._eos_flags: dict[bool, torch.Tensor] = {}
@@ -244,6 +245,7 @@ class LMSubmodule(ARNodeSubmodule):
             temperature=float(self._knob(meta, "temperature")),
             top_p=float(self._knob(meta, "top_p")),
             top_k=int(self._knob(meta, "top_k")),
+            window=window,
             threshold=float(window) * float(self._knob(meta, "ras_tau")) if window > 0 else 0.0,
             ignore_eos=bool(meta.get("ignore_eos", False)),
             min_len=int(meta[MIN_SPEECH_TOKENS]),
@@ -319,7 +321,9 @@ class LMSubmodule(ARNodeSubmodule):
         n = len(inputs)
         knobs: list[LMRequestKnobs] = [inp.kwargs[KNOBS] for inp in inputs]
         steps = [inp.kwargs[STEP] for inp in inputs]
-        ints = np.array([[k.seed for k in knobs], steps, [k.top_k for k in knobs]], dtype=np.int64)
+        ints = np.array(
+            [[k.seed for k in knobs], steps, [k.top_k for k in knobs], [k.window for k in knobs]], dtype=np.int64
+        )
         floats = np.array(
             [[k.temperature for k in knobs], [k.top_p for k in knobs], [k.threshold for k in knobs]], dtype=np.float32
         )
@@ -331,7 +335,7 @@ class LMSubmodule(ARNodeSubmodule):
         )
         columns = {}
         for names, host, stager in (
-            (("seed", "step", "top_k"), ints, self._int_stager),
+            (("seed", "step", "top_k", "window"), ints, self._int_stager),
             (("temperature", "top_p", "threshold"), floats, self._float_stager),
             (("block_sos", "block_stop"), flags, self._bool_stager),
         ):
@@ -381,6 +385,7 @@ class LMSubmodule(ARNodeSubmodule):
         temperature,
         top_p,
         top_k,
+        window,
         threshold,
         block_sos,
         block_stop,
@@ -406,6 +411,7 @@ class LMSubmodule(ARNodeSubmodule):
             temperature=temperature.reshape(-1),
             top_p=top_p.reshape(-1),
             top_k=top_k.reshape(-1),
+            window=window.reshape(-1),
             repeat_threshold=threshold.reshape(-1),
             blocked=blocked,
         )

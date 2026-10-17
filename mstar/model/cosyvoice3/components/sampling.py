@@ -82,6 +82,7 @@ def ras_sample(
     temperature: torch.Tensor,
     top_p: torch.Tensor,
     top_k: torch.Tensor,
+    window: torch.Tensor,
     repeat_threshold: torch.Tensor,
     blocked: torch.Tensor,
 ) -> torch.Tensor:
@@ -90,9 +91,11 @@ def ras_sample(
     ``logits`` ``[B, V]`` float32. Per row: ``seed``/``step`` (int64) key the
     noise; ``history`` ``[B, W]`` holds the last W generated tokens (-1 where
     fewer exist); ``temperature`` (0 = greedy), ``top_p``, ``top_k`` (<=
-    ``MAX_TOP_K``) and ``repeat_threshold`` (``window * tau``; <= 0 disables
-    the redraw) are ``[B]``; ``blocked`` ``[B, V]`` bool marks ids that may not
-    be drawn this step (the reference's minimum-length rule).
+    ``MAX_TOP_K``), ``window`` (the row's RAS window, <= W: repeats count in
+    its last ``window`` history slots only) and ``repeat_threshold``
+    (``window * tau``; <= 0 disables the redraw) are ``[B]``; ``blocked``
+    ``[B, V]`` bool marks ids that may not be drawn this step (the
+    reference's minimum-length rule).
     """
     vocab = logits.shape[-1]
     greedy = temperature <= 0
@@ -112,7 +115,9 @@ def ras_sample(
     token = top_ids.gather(1, pick[:, None]).squeeze(1)
     token = torch.where(greedy, top_ids[:, 0], token)
 
-    repeats = (history == token[:, None]).sum(dim=-1).to(repeat_threshold.dtype)
+    width = history.shape[-1]
+    recent = torch.arange(width, device=history.device)[None, :] >= width - window[:, None]
+    repeats = ((history == token[:, None]) & recent).sum(dim=-1).to(repeat_threshold.dtype)
     redraw = (repeat_threshold > 0) & (repeats >= repeat_threshold)
     ids = torch.arange(vocab, device=logits.device)[None, :]
     masked = log_probs.masked_fill(ids == token[:, None], float("-inf"))

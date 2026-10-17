@@ -27,6 +27,7 @@ import yaml
 
 from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
+from mstar.model.base import TensorAndMetadata
 from mstar.model.chatterbox.chatterbox_model import voice_key_for
 from mstar.model.cosyvoice3.components.dit import _SinusEmbedding, chunk_attention_mask
 from mstar.model.cosyvoice3.components.flow import CosyVoice3Flow, FlowRow, ReferenceVoice
@@ -46,7 +47,7 @@ from mstar.model.cosyvoice3.config import (
     FlowConfig,
     LMConfig,
 )
-from mstar.model.cosyvoice3.cosyvoice3_model import LM_PARTITION, TOKEN2WAV_PARTITION, CosyVoice3Model
+from mstar.model.cosyvoice3.cosyvoice3_model import LM_PARTITION, PROMPT_MODE, TOKEN2WAV_PARTITION, CosyVoice3Model
 from mstar.model.cosyvoice3.submodules import (
     AUDIO_CHUNK,
     DECODE_LOOP,
@@ -230,10 +231,16 @@ def test_process_prompt_modes_and_token_limits(model):
     assert torch.equal(zero.new_input_tensors[TEXT_INPUTS][0], expected)
     assert zero.new_input_tensors["ref_audio"][0].shape == clip.shape
     # 2x and 20x the text's 3 tokens; the voice key is the clip's content hash
-    assert zero.metadata == {MIN_SPEECH_TOKENS: 6, MAX_SPEECH_TOKENS: 60, VOICE_KEY: int(voice_key_for(clip)[0])}
+    assert zero.metadata == {
+        MIN_SPEECH_TOKENS: 6,
+        MAX_SPEECH_TOKENS: 60,
+        VOICE_KEY: int(voice_key_for(clip)[0]),
+        PROMPT_MODE: "zero_shot",
+    }
 
     cross = model.process_prompt("one two", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
     cross_ids = cross.new_input_tensors[TEXT_INPUTS][0]
+    assert cross.metadata[PROMPT_MODE] == "cross_lingual"
     assert torch.equal(cross_ids, torch.cat([tok(f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), tok("one two")]))
     assert model.resolve_mode({}, uploaded=True) == ("cross_lingual", None)
 
@@ -241,6 +248,7 @@ def test_process_prompt_modes_and_token_limits(model):
         "one", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, instruct="speak slowly"
     )
     instruct_ids = instruct.new_input_tensors[TEXT_INPUTS][0]
+    assert instruct.metadata[PROMPT_MODE] == "instruct"
     assert torch.equal(instruct_ids[:-1], tok(f"{SYSTEM_PROMPT} speak slowly{END_OF_PROMPT}"))
 
     capped = model.process_prompt(
@@ -304,11 +312,52 @@ def test_preset_voices_resolve_inside_voices_dir_only(tmp_path, monkeypatch):
         model.process_prompt("one", ["text"], ["audio"], voice="a" * 300)
 
 
+@pytest.mark.parametrize(
+    "modalities, upload, kwargs, walk",
+    [
+        # a preset with a transcript and "audio" listed but no file: zero-shot prompt
+        (["text", "audio"], False, {"voice": "anna"}, "prefill_voice"),
+        # a file but "audio" not listed: the preset's transcript is skipped, cross-lingual prompt
+        (["text"], True, {"voice": "anna"}, "prefill"),
+        (["text"], False, {"voice": "anna"}, "prefill_voice"),
+        (["text", "audio"], True, {"voice": "anna"}, "prefill"),
+        (["text"], True, {"ref_text": "words"}, "prefill_voice"),
+        (["text", "audio"], True, {"voice": "anna", "instruct": "slowly"}, "prefill"),
+    ],
+)
+def test_conductor_walk_follows_the_prompt_process_prompt_built(
+    tmp_path, monkeypatch, modalities, upload, kwargs, walk
+):
+    """The LM walk is the one for the prompt ``process_prompt`` built, whatever
+    the caller lists in ``input_modalities``: ``prefill_voice`` feeds the clip's
+    speech tokens after a transcript prompt, ``prefill`` feeds none."""
+    monkeypatch.setattr(CosyVoice3Model, "_build_text_tokenizer", lambda self: _Tokenizer())
+    monkeypatch.setattr(CosyVoice3Model, "load_audio", lambda self, path, device: TensorAndMetadata(data=_clip()))
+    voices = tmp_path / "voices"
+    voices.mkdir()
+    (voices / "anna.wav").write_bytes(b"")
+    (voices / "anna.txt").write_text("hello there\n")
+    model = CosyVoice3Model(model_path_hf=str(tmp_path), voices_dir=str(voices))
+    tensors = {"audio_inputs": [_clip()]} if upload else None
+    out = model.process_prompt("one two", modalities, ["audio"], tensors=tensors, **kwargs)
+    tok = _Tokenizer()
+    ids = out.new_input_tensors[TEXT_INPUTS][0]
+    transcript = kwargs.get("ref_text") or "hello there"
+    zero_shot_prompt = tok(f"{SYSTEM_PROMPT}{END_OF_PROMPT}{transcript}")
+    assert torch.equal(ids[: zero_shot_prompt.numel()], zero_shot_prompt) == (walk == "prefill_voice")
+    # the data worker folds the metadata into model_kwargs, over the caller's keys
+    model_kwargs = {**kwargs, **out.metadata}
+    signals = {name: [f"ptr-{name}"] for name in (TEXT_INPUTS, "ref_audio")}
+    args = model.get_initial_forward_pass_args(LM_PARTITION, modalities, ["audio"], signals, model_kwargs=model_kwargs)
+    assert args.full_metadata.graph_walk == walk
+    assert ("speaker_encoder" in {edge.next_node for edge in args.inputs}) == (walk == "prefill_voice")
+
+
 def test_initial_and_partition_args_route_the_walks(model):
     signals = {name: [f"ptr-{name}"] for name in (TEXT_INPUTS, "ref_audio")}
     facts = {MIN_SPEECH_TOKENS: 3, MAX_SPEECH_TOKENS: 40, VOICE_KEY: 77}
     zero = model.get_initial_forward_pass_args(
-        LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs={"ref_text": "words", **facts}
+        LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs={PROMPT_MODE: "zero_shot", **facts}
     )
     assert zero.full_metadata.graph_walk == "prefill_voice"
     routes = sorted((edge.next_node, edge.name) for edge in zero.inputs)
@@ -316,11 +365,15 @@ def test_initial_and_partition_args_route_the_walks(model):
     # the clip stays persisted for the flow node
     assert zero.unpersist_tensors == [f"ptr-{TEXT_INPUTS}"]
     assert facts.items() <= zero.step_metadata.items()
-    cross = model.get_initial_forward_pass_args(LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs=facts)
+    cross = model.get_initial_forward_pass_args(
+        LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs={PROMPT_MODE: "cross_lingual", **facts}
+    )
     assert cross.full_metadata.graph_walk == "prefill"
     assert {edge.next_node for edge in cross.inputs} == {"llm"}
     with pytest.raises(ValueError, match="process_prompt"):
         model.get_initial_forward_pass_args(LM_PARTITION, ["text", "audio"], ["audio"], signals)
+    with pytest.raises(ValueError, match="process_prompt"):
+        model.get_initial_forward_pass_args(LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs=facts)
 
     decode = model.get_partition_forward_pass_args(LM_PARTITION, zero.full_metadata, {SPEECH_TOKENS: ["ptr-token"]})
     assert zero.full_metadata.graph_walk == "decode" and decode.inputs[0].name == PREV_TOKEN
@@ -442,6 +495,7 @@ def _ras(logits, seeds, history=None, temperature=1.0, top_p=0.8, top_k=25, thre
         temperature=torch.full((b,), temperature),
         top_p=torch.full((b,), top_p),
         top_k=torch.full((b,), top_k, dtype=torch.long),
+        window=torch.full((b,), 10, dtype=torch.long),
         repeat_threshold=torch.full((b,), threshold),
         blocked=blocked if blocked is not None else torch.zeros(b, v, dtype=torch.bool),
     )
@@ -735,6 +789,27 @@ def test_lm_ras_breaks_a_repeating_favourite():
     assert all(b != 5 for a, b in pairwise(tokens) if a == 5)
 
 
+def test_lm_ras_counts_repeats_in_the_requests_own_window():
+    """A request's ``ras_window`` below the deployment's counts repeats over
+    its own last ``ras_window`` tokens, as the reference rule does, not over
+    the deployment-wide history the captured decode carries."""
+    cfg = _tiny_config()
+    assert cfg.sampling.ras_window == 10
+    sub, res = _lm(cfg)
+    _fixed_logits(sub, favourite=5, second=6)
+
+    def favourites(**knobs):
+        with torch.no_grad():
+            tokens = _lm_run(sub, res, {0: (_lm_request(limits=(0, 18)), 3)}, steps=40, ignore_eos=True, **knobs)[0]
+        return [i for i, t in enumerate(tokens) if t == 5]
+
+    # threshold window * tau = 0.5: one earlier favourite inside the window redraws it
+    assert favourites() == [0, 11]
+    assert favourites(ras_window=5) == [0, 6, 12]
+    assert favourites(ras_window=1) == list(range(0, 18, 2))
+    assert favourites(ras_window=0) == list(range(18))
+
+
 def test_lm_ras_history_is_committed_once_per_step():
     cfg = _tiny_config()
     sub, _ = _lm(cfg)
@@ -763,6 +838,7 @@ def _row_tensors_per_value(sub, info, seed, step, min_len, history, force_eos):
         "temperature": torch.tensor([float(sub._knob(meta, "temperature"))]),
         "top_p": torch.tensor([float(sub._knob(meta, "top_p"))]),
         "top_k": torch.tensor([int(sub._knob(meta, "top_k"))], dtype=torch.long),
+        "window": torch.tensor([window], dtype=torch.long),
         "threshold": torch.tensor([threshold]),
         "block_sos": torch.tensor([step < min_len or ignore_eos]),
         "block_stop": torch.tensor([ignore_eos]),
@@ -852,6 +928,7 @@ def test_lm_staged_columns_equal_the_per_value_tensors():
             "temperature": torch.ones(1),
             "top_p": torch.full((1,), 0.8),
             "top_k": torch.full((1,), 25, dtype=torch.long),
+            "window": torch.ones(1, dtype=torch.long),
             "threshold": torch.ones(1),
             "block_sos": torch.zeros(1, dtype=torch.bool),
             "block_stop": torch.zeros(1, dtype=torch.bool),

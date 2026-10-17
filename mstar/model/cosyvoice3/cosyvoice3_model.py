@@ -111,6 +111,9 @@ _FLOW_KNOBS = ("n_cfm_timesteps",)
 # them from step_metadata instead of from device tensors
 _LM_FACTS = (MIN_SPEECH_TOKENS, MAX_SPEECH_TOKENS, VOICE_KEY)
 _FLOW_FACTS = (VOICE_KEY,)
+# the cloning mode process_prompt built the prompt for; the conductor picks the
+# LM walk from it rather than deciding again from the caller's input_modalities
+PROMPT_MODE = "prompt_mode"
 
 # A clip quieter or shorter than these clones noise
 MIN_REFERENCE_SECONDS = 0.5
@@ -516,6 +519,7 @@ class CosyVoice3Model(Model):
                 MIN_SPEECH_TOKENS: min_len,
                 MAX_SPEECH_TOKENS: max(max_len, 1),
                 VOICE_KEY: int(voice_key_for(wav)[0]),
+                PROMPT_MODE: mode,
             },
         )
 
@@ -548,8 +552,7 @@ class CosyVoice3Model(Model):
         knobs = self.resolve_generation_kwargs(model_kwargs)
         wants_audio = "audio" in output_modalities
         if partition_name == LM_PARTITION:
-            mode, _ = self.resolve_mode(model_kwargs, uploaded="audio" in input_modalities)
-            zero_shot = mode == "zero_shot"
+            zero_shot = self._prompt_facts(model_kwargs, (PROMPT_MODE,))[PROMPT_MODE] == "zero_shot"
             metadata = CurrentForwardConductorMetadata(
                 input_modalities=input_modalities,
                 output_modalities=output_modalities,
