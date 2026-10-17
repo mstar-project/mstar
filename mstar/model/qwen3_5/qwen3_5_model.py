@@ -26,7 +26,7 @@ from mstar.engine.resources.linear_attn.config import (
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec, ResourceReqConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -54,7 +54,6 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTN,
     LLM_MIXED,
-    MIXED_MAX_PREFILL_ROWS,
     ROPE,
     SAMPLER,
     VISION_ATTN,
@@ -65,6 +64,10 @@ from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
+
+# a mixed step's prompt rows (as many as `max_rows_in_combined` lets in) take
+# the prefill kernels, its decode rows the decode ones
+_MIXED_SPLIT = CombinedSplit(LLM_MIXED, prefill_walks=("prefill_text",))
 
 
 def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
@@ -206,8 +209,7 @@ class Qwen3_5DenseModel(Model):
                 resource_key=ATTN, nodes={"LLM"},
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
-                    split_walks=(LLM_MIXED,),
-                    split_max_prefill_rows=MIXED_MAX_PREFILL_ROWS,
+                    splits=(_MIXED_SPLIT,),
                 ),
             ),
             PositionSpec(
@@ -232,8 +234,7 @@ class Qwen3_5DenseModel(Model):
                 config=LinearAttnConfig(
                     recurrent_state=GDN_STATE,
                     variant=LinearAttnVariant.GDN,
-                    split_walks=(LLM_MIXED,),
-                    split_max_prefill_rows=MIXED_MAX_PREFILL_ROWS,
+                    splits=(_MIXED_SPLIT,),
                 ),
             ),
             SamplerSpec(

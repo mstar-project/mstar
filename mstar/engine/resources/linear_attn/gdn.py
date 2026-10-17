@@ -10,6 +10,7 @@ block as a plain tensor argument to ``run``.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 
 import torch
 
@@ -24,6 +25,7 @@ from mstar.engine.resources.linear_attn.wrappers import (
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
 from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentAddressing
+from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
@@ -51,8 +53,11 @@ class GDNManager(LinearAttnManager):
         state_dtype: torch.dtype,
         has_sink: bool,
         device: torch.device,
+        max_rows_in_combined: Mapping[str, int | None] | None = None,
     ):
         self.config = config
+        self._splits = {split.combined_walk: split for split in config.splits}
+        self._max_rows_in_combined = max_rows_in_combined or {}
         self.geometry = geometry
         self.num_layers = num_layers
         self.state_dtype = state_dtype
@@ -167,7 +172,7 @@ class GDNManager(LinearAttnManager):
 
     def _get_wrapper(
         self, label: str, is_decode: bool, lease: SlotLease | None = None,
-        split: bool = False,
+        split: CombinedSplit | None = None,
     ) -> GDNWrapper:
         """The wrapper this (label, walk) plans into, built once and reused.
 
@@ -176,7 +181,7 @@ class GDNManager(LinearAttnManager):
         """
         if lease is None:
             # both walks can run eagerly under one label
-            key, store = (label, "split" if split else is_decode), self._eager_wrappers
+            key, store = (label, "split" if split is not None else is_decode), self._eager_wrappers
             bs, tok = None, None
         else:
             key = CGSlotKey(lease.bucket, lease.slot, label)
@@ -186,7 +191,7 @@ class GDNManager(LinearAttnManager):
 
         if key not in store:
             null_slot_id = SINK_SLOT if self._has_sink else NO_SLOT
-            if split:
+            if split is not None:
                 store[key] = GDNMixedWrapper(
                     device=self._device,
                     pad_slot_id=PAD_SLOT_ID,
@@ -198,7 +203,10 @@ class GDNManager(LinearAttnManager):
                     cuda_graph=lease is not None,
                     has_sink_state=self._has_sink,
                     null_slot_id=null_slot_id,
-                    max_prefill_rows=self.config.split_max_prefill_rows,
+                    max_prefill_rows=(
+                        split.max_prefill_rows(self._max_rows_in_combined, lease.bucket.bs)
+                        if lease is not None else None
+                    ),
                 )
             elif is_decode:
                 store[key] = GDNDecodeWrapper(
@@ -242,8 +250,9 @@ class GDNManager(LinearAttnManager):
         # A split walk's step (decode rows beside prompt rows) takes both.
         is_decode = not ctx.force_prefill and bool(spans) and all(s == 1 for s in spans)
         walk = ctx.slot_lease.bucket.graph_walk if ctx.slot_lease is not None else ctx.graph_walk
-        if walk in self.config.split_walks and addressing.host_slot_indices is not None:
-            wrapper = self._get_wrapper(label, False, ctx.slot_lease, split=True)
+        split = self._splits.get(walk)
+        if split is not None and addressing.host_slot_indices is not None:
+            wrapper = self._get_wrapper(label, False, ctx.slot_lease, split=split)
             wrapper.plan(
                 spans, addressing.host_slot_indices[:num_rows],
                 addressing.host_has_state[:num_rows],

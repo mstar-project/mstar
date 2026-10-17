@@ -567,13 +567,16 @@ class GDNMixedWrapper(GDNWrapper):
         has_sink_state: bool = True,
         cuda_graph: bool = False,
         null_slot_id: int = 0,
-        max_prefill_rows: int = 4,
+        # the chunked half's rows under capture; eagerly, the step's own
+        max_prefill_rows: int | None = None,
     ):
         super().__init__(
             device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,
             qk_l2norm=qk_l2norm, num_tokens=num_tokens, bs=bs,
             cuda_graph=cuda_graph, null_slot_id=null_slot_id,
         )
+        if cuda_graph and max_prefill_rows is None:
+            raise ValueError("GDNMixedWrapper: a captured split needs max_prefill_rows")
         self._max_prefill_rows = max_prefill_rows
         self._prefill = GDNPrefillWrapper(
             device=device, pad_slot_id=pad_slot_id, sm_scale=sm_scale,

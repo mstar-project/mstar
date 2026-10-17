@@ -36,7 +36,8 @@ def test_a_mixed_step_tracks_only_its_prefill_rows_prompt_tokens():
 class _Recorder(GDNManager):
     def __init__(self):
         self.kinds = []
-        self.config = SimpleNamespace(split_walks=())
+        self.config = SimpleNamespace(splits=())
+        self._splits = {}
 
     def _get_wrapper(self, label, is_decode, lease=None, split=False):
         self.kinds.append("decode" if is_decode else "prefill")

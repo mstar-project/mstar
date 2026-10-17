@@ -1,5 +1,7 @@
 """Paged attention through FlashInfer's prefill/decode wrappers."""
 
+from collections.abc import Mapping
+
 import torch
 
 from mstar.engine.resources.attn.base import (
@@ -18,6 +20,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 
 
@@ -29,12 +32,12 @@ class FlashInferManager(AttentionManager):
         dtype: torch.dtype,
         kv_config: PagedKVConfig,
         backend: str="auto",
-        split_walks: tuple[str, ...] = (),
-        split_max_prefill_rows: int = 4,
+        splits: tuple[CombinedSplit, ...] = (),
+        max_rows_in_combined: Mapping[str, int | None] | None = None,
     ):
         self._kv_cache_name = kv_cache
-        self._split_walks = frozenset(split_walks)
-        self._split_max_prefill_rows = split_max_prefill_rows
+        self._splits = {split.combined_walk: split for split in splits}
+        self._max_rows_in_combined = max_rows_in_combined or {}
         self._device = device
         self._dtype = dtype
 
@@ -98,14 +101,17 @@ class FlashInferManager(AttentionManager):
             **self._wrapper_kv_kwargs,
             "max_num_pages": num_rows * self._kv_config.max_num_pages,
         }
-        if bucket.graph_walk in self._split_walks:
+        split = self._splits.get(bucket.graph_walk)
+        if split is not None:
             # its own workspaces: both wrappers are planned for the one step
             wrapper = FlashInferMixedWrapper(
                 decode_workspace=self._workspaces.get(f"{label}.split_decode", lease.slot),
                 prefill_workspace=self._workspaces.get(f"{label}.split_prefill", lease.slot),
                 batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
-                max_prefill_rows=self._split_max_prefill_rows,
+                max_prefill_rows=split.max_prefill_rows(
+                    self._max_rows_in_combined, num_rows,
+                ),
                 **kv_kwargs,
             )
         elif bucket.bs == bucket.num_tokens and not force_prefill:

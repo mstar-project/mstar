@@ -502,6 +502,9 @@ class Engine:
                     dependencies={
                         key: specs_by_key[key] for key in spec.depends_on()
                     },
+                    max_rows_in_combined=self._max_rows_in_combined(
+                        spec.resource_key, relevant_nodes, submodules, model,
+                    ),
                 ),
             )
 
@@ -1842,6 +1845,30 @@ class Engine:
         return submodule_mgmt.submodule.cg_key_info(
             graph_walk, {request_id: request_info},
         )
+
+    @staticmethod
+    def _max_rows_in_combined(
+        resource_key: str,
+        nodes: set[str],
+        submodules: dict[str, NodeSubmodule],
+        model: "Model | None",
+    ) -> dict[str, int | None]:
+        """Each walk of ``nodes`` to its ``max_rows_in_combined``, one value a
+        walk across the nodes a resource serves."""
+        if model is None:
+            return {}
+        caps: dict[str, int | None] = {}
+        for walk, graph in model.get_graph_walk_graphs().items():
+            for node in sorted(nodes & set(graph.get_nodes())):
+                cap = submodules[node].max_rows_in_combined(walk)
+                if walk in caps and caps[walk] != cap:
+                    raise ValueError(
+                        f"resource {resource_key!r}: the nodes it serves cap "
+                        f"walk {walk!r} differently in a combined step "
+                        f"({caps[walk]} and {cap})"
+                    )
+                caps[walk] = cap
+        return caps
 
     def get_max_rows_in_combined(self, node_name: str, graph_walk: str) -> int | None:
         """Rows of ``graph_walk`` a step mixing it with another walk may hold."""

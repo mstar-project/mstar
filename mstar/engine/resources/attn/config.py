@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -27,12 +27,10 @@ class AttentionConfig:
     kv_cache: str # name of the KV cache
     backend: AttnBackend = AttnBackend.FLASHINFER
     flashinfer_backend: str = "auto"
-    # FlashInfer only: walks whose captured steps mix one-token rows with
-    # prompt rows, and plan them on two wrappers (`FlashInferMixedWrapper`):
-    # the decode one for the one-token rows, the prefill one for at most
-    # ``split_max_prefill_rows`` prompt rows
-    split_walks: tuple[str, ...] = ()
-    split_max_prefill_rows: int = 4
+    # FlashInfer only: combined walks whose captured steps plan their
+    # one-token rows on the decode wrapper and their prompt rows on a prefill
+    # wrapper sized to them (`FlashInferMixedWrapper`)
+    splits: tuple[CombinedSplit, ...] = ()
 
 
 @dataclass
