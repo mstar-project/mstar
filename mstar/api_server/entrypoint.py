@@ -694,6 +694,7 @@ class APIServer:
         Also watches the conductor process. Once it exits, every pending
         request is failed and the HTTP server is told to stop."""
         next_liveness_check = 0.0
+        wait = self._pass_wait()
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -883,7 +884,21 @@ class APIServer:
                 if self.running:
                     logger.exception("Error in message processing loop")
                     time.sleep(0.01)
-            time.sleep(0.001)
+            wait()
+
+    def _pass_wait(self):
+        """How the message thread waits between passes: at most 1 ms, as a
+        sleep used to, but ended early by a message on the socket or by the
+        data worker queueing result chunks, so a finished request is not held
+        for the rest of the millisecond. getattr: tests build the server
+        around fakes without either."""
+        register = getattr(self.communicator, "register_event_for_poll", None)
+        poll = getattr(self.communicator, "poll_for_messages", None)
+        results_wakeup = getattr(self.preprocess_worker, "results_wakeup", None)
+        if not callable(register) or not callable(poll) or results_wakeup is None:
+            return lambda: time.sleep(0.001)
+        register(results_wakeup)
+        return lambda: poll(timeout_ms=1)
 
     # ----------------------------------------------------------
     # Streaming helper
