@@ -194,7 +194,7 @@ def test_a_completion_sends_the_conductor_a_worker_graphs_done(tmp_path):
         message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
         body=WorkerGraphsDone(
             request_id="r1", worker_graph_ids=[WG_ID], is_first_tp_rank=True,
-            partition_name="default",
+            partition_name="default", graph_walk=WALK,
         ),
     ))]
     assert got["api_server"] == [] and got[PEER] == []

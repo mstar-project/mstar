@@ -764,6 +764,16 @@ impl RequestState {
         self.loops.iter().map(|l| l.curr_iter).collect()
     }
 
+    /// Python's `WorkerGraphIO.is_idle`: no input held, nothing in flight, no
+    /// loop mid-run -- what `reset` leaves behind.
+    pub fn is_idle(&self) -> bool {
+        self.root_completed == 0
+            && self.nodes.iter().all(|n| {
+                n.cur.mask == 0 && n.next.mask == 0 && n.spec.mask == 0 && !n.in_flight
+            })
+            && self.loops.iter().all(|l| l.curr_iter == 0 && l.ext_inputs.is_empty())
+    }
+
     // -- speculation ---------------------------------------------------------
 
     /// Python's `WorkerGraphIO.ingest_for_speculation`.
