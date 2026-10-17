@@ -11,10 +11,16 @@ Normalizers:
   whitespace collapsed. Dependency free; the CPU tests use it.
 * ``seedtts``: the Seed-TTS-eval recipe (punctuation removed except the
   apostrophe, lower case).
+* ``whisper``: Whisper's own convention, chosen per utterance from its
+  language: ``whisper_en`` for English (and for an utterance with no
+  language), ``whisper_basic`` for every other language.
 * ``whisper_en``: Whisper's ``EnglishTextNormalizer`` (numbers, spellings,
-  contractions) from ``transformers``, the convention for English WER. Falls
-  back to ``whisper_basic`` when its spelling table cannot be loaded, and says
-  so in the returned name.
+  contractions) from ``transformers``. English only: it decomposes accented
+  and combining characters and drops the marks, so Korean would be scored
+  over jamo and Hindi vowel signs would split words; an utterance in another
+  language is refused. Both ``whisper`` and ``whisper_en`` fall back to
+  ``whisper_basic`` when the spelling table cannot be loaded, and say so in
+  the returned name.
 * ``whisper_basic``: Whisper's ``BasicTextNormalizer`` (language agnostic).
 
 Both Whisper normalizers delete text inside brackets and parentheses, which
@@ -33,6 +39,49 @@ from dataclasses import dataclass
 
 # Languages scored by characters rather than words (no whitespace word boundaries).
 CHAR_LANGS = frozenset({"zh", "ja", "ko", "th", "yue", "cmn", "my", "lo", "km"})
+ENGLISH = frozenset({"en", "eng", "english"})
+
+
+def _base_lang(lang: str) -> str:
+    return lang.split("-", maxsplit=1)[0].split("_", maxsplit=1)[0].lower()
+
+
+def is_english(lang: str | None) -> bool:
+    """English, or no language given (scored as English, the default judge language)."""
+    return lang is None or _base_lang(lang) in ENGLISH
+
+
+@dataclass(frozen=True)
+class ByLanguage:
+    """A normalizer chosen per utterance: ``english`` for English ones,
+    ``other`` for the rest, or a refusal when ``other`` is None."""
+
+    name: str
+    english: Callable[[str], str]
+    other: Callable[[str], str] | None
+
+    def for_lang(self, lang: str | None) -> Callable[[str], str]:
+        if is_english(lang):
+            return self.english
+        if self.other is None:
+            raise ValueError(
+                f"normalizer {self.name!r} is for English only, but an item's language is {lang!r}; "
+                "use 'whisper' (English normalizer for English, the basic one for the rest) or 'whisper_basic'"
+            )
+        return self.other
+
+    def __call__(self, text: str) -> str:
+        return self.english(text)
+
+
+Normalizer = Callable[[str], str] | ByLanguage
+
+
+def check_languages(normalize: Normalizer, langs: Sequence[str | None]) -> None:
+    """Raise before a run if ``normalize`` refuses any of ``langs``."""
+    if isinstance(normalize, ByLanguage):
+        for lang in set(langs):
+            normalize.for_lang(lang)
 
 
 @dataclass(frozen=True)
@@ -126,28 +175,33 @@ def _whisper_en() -> Callable[[str], str]:
         return _keep_bracketed(EnglishTextNormalizer(json.load(f)))
 
 
-def get_normalizer(name: str) -> tuple[str, Callable[[str], str]]:
-    """``(name_actually_used, fn)`` for a normalizer name."""
+NORMALIZERS = ("whisper", "whisper_en", "whisper_basic", "seedtts", "basic")
+
+
+def get_normalizer(name: str) -> tuple[str, Normalizer]:
+    """``(name_actually_used, normalizer)`` for a normalizer name."""
     if name == "basic":
         return "basic", _basic
     if name == "seedtts":
         return "seedtts", _seedtts
     if name == "whisper_basic":
         return "whisper_basic", _whisper_basic()
-    if name == "whisper_en":
+    if name in ("whisper", "whisper_en"):
         try:
-            return "whisper_en", _whisper_en()
+            english = _whisper_en()
         except Exception:  # noqa: BLE001 - offline or no transformers: say which one ran
             try:
                 return "whisper_basic(fallback)", _whisper_basic()
             except Exception:  # noqa: BLE001
                 return "basic(fallback)", _basic
-    raise ValueError(f"unknown normalizer {name!r} (basic, seedtts, whisper_en, whisper_basic)")
+        other = _whisper_basic() if name == "whisper" else None
+        return name, ByLanguage(name, english, other)
+    raise ValueError(f"unknown normalizer {name!r} ({', '.join(NORMALIZERS)})")
 
 
 def tokenize(text: str, lang: str | None) -> list[str]:
     """Words, or characters (spaces dropped) for languages in ``CHAR_LANGS``."""
-    if lang and lang.split("-")[0].split("_")[0].lower() in CHAR_LANGS:
+    if lang and _base_lang(lang) in CHAR_LANGS:
         return [ch for ch in text if not ch.isspace()]
     return text.split()
 
@@ -155,21 +209,23 @@ def tokenize(text: str, lang: str | None) -> list[str]:
 def error_rate(
     references: Sequence[str],
     hypotheses: Sequence[str],
-    normalize: Callable[[str], str] = _basic,
+    normalize: Normalizer = _basic,
     langs: Sequence[str | None] | None = None,
     unit: str = "auto",
 ) -> tuple[float | None, list[EditCounts]]:
     """Corpus error rate and per-utterance counts.
 
     ``unit`` is ``word``, ``char`` or ``auto`` (characters for ``CHAR_LANGS``,
-    words otherwise, decided per utterance by ``langs``).
+    words otherwise, decided per utterance by ``langs``). A ``ByLanguage``
+    normalizer is also picked per utterance by ``langs``.
     """
     if len(references) != len(hypotheses):
         raise ValueError(f"{len(references)} references but {len(hypotheses)} hypotheses")
     langs = list(langs) if langs is not None else [None] * len(references)
     per: list[EditCounts] = []
     for ref, hyp, lang in zip(references, hypotheses, langs, strict=True):
-        r, h = normalize(ref or ""), normalize(hyp or "")
+        norm = normalize.for_lang(lang) if isinstance(normalize, ByLanguage) else normalize
+        r, h = norm(ref or ""), norm(hyp or "")
         if unit == "char":
             rt, ht = [c for c in r if not c.isspace()], [c for c in h if not c.isspace()]
         elif unit == "word":

@@ -97,6 +97,45 @@ def test_cer_for_character_languages_and_normalizers():
         text_metrics.get_normalizer("nope")
 
 
+def test_whisper_normalizer_is_chosen_per_item_language():
+    """English items get Whisper's English normalizer, the rest its basic one:
+    the English one decomposes Hangul into jamo, so Korean CER would count jamo."""
+    english_normalizer = pytest.importorskip("transformers.models.whisper.english_normalizer")
+    en = english_normalizer.EnglishTextNormalizer({})
+    whisper = text_metrics.ByLanguage("whisper", en, english_normalizer.BasicTextNormalizer())
+    refs, hyps = ["안녕하세요", "Mr. Smith is 20"], ["안녕하세오", "mister smith is twenty"]
+    rate, per = text_metrics.error_rate(refs, hyps, whisper, ["ko", "en_us"])
+    assert [p.rate for p in per] == [pytest.approx(1 / 5), 0.0]  # syllables; English numbers and titles
+    _, jamo = text_metrics.error_rate(refs[:1], hyps[:1], en, ["ko"])
+    assert jamo[0].reference_len > 5  # the English normalizer alone scores Korean over jamo
+    assert text_metrics.is_english(None) and text_metrics.is_english("eng_Latn")
+    assert not text_metrics.is_english("zh") and not text_metrics.is_english("ko_kr")
+
+
+def test_english_only_normalizer_refuses_other_languages_before_the_run(monkeypatch):
+    monkeypatch.setattr(text_metrics, "_whisper_en", lambda: text_metrics._basic)
+    name, whisper = text_metrics.get_normalizer("whisper")
+    assert name == "whisper" and whisper.other is not None
+    name, english_only = text_metrics.get_normalizer("whisper_en")
+    assert name == "whisper_en" and english_only.other is None
+    text_metrics.check_languages(english_only, ["en", None, "en_us"])
+    with pytest.raises(ValueError, match="English only"):
+        text_metrics.error_rate(["x"], ["x"], english_only, ["ko"])
+    from types import SimpleNamespace
+
+    from benchmark.eval.suites.asr import ASRSuite
+
+    args = SimpleNamespace(model_name="m", send_language=False, stream=False, normalizer="whisper_en", extra=[],
+                           timeout=1.0)
+    suite = ASRSuite(args)
+    suite.check_items([Item("a", text="hi", audio_path="a.wav", lang="en")])
+    with pytest.raises(ValueError, match="English only"):
+        suite.check_items([Item("a", text="hi", audio_path="a.wav", lang="en"),
+                           Item("b", text="안녕", audio_path="b.wav", lang="ko")])
+    monkeypatch.setattr(text_metrics, "_whisper_en", lambda: 1 / 0)
+    assert text_metrics.get_normalizer("whisper")[0] in ("whisper_basic(fallback)", "basic(fallback)")
+
+
 def _wav_header(rate: int, size: int = 0xFFFFFFFF, extra_chunk: bytes = b"") -> bytes:
     fmt = struct.pack("<4sIHHIIHH", b"fmt ", 16, 1, 1, rate, rate * 2, 2, 16)
     return b"RIFF" + struct.pack("<I", size) + b"WAVE" + fmt + extra_chunk + b"data" + struct.pack("<I", size)

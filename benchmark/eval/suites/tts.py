@@ -24,7 +24,7 @@ from benchmark.eval import judges, stats
 from benchmark.eval.audio import parse_wav_header, pcm16_to_float, playback_stalls, read_wav, write_wav
 from benchmark.eval.datasets import Item
 from benchmark.eval.suites.base import Suite, data_url, error_row, exception_row, parse_extra
-from benchmark.eval.text_metrics import error_rate, get_normalizer
+from benchmark.eval.text_metrics import NORMALIZERS, check_languages, error_rate, get_normalizer
 
 ENGINES = ("mstar", "vllm-omni", "sglang-omni")
 
@@ -49,7 +49,8 @@ class TTSSuite(Suite):
         g.add_argument("--extra", action="append", default=[], metavar="KEY=JSON", help="extra request field")
         g.add_argument("--asr-judge", default="openai/whisper-large-v3",
                        help="HF id of the Whisper judge for round-trip WER, or 'none'")
-        g.add_argument("--normalizer", default="whisper_en", help="text normalizer for WER (see text_metrics)")
+        g.add_argument("--normalizer", default="whisper", choices=NORMALIZERS,
+                       help="text normalizer for WER, per item language for 'whisper' (see text_metrics)")
         g.add_argument("--judge-language", default="en", help="language for the ASR judge when items have none")
         g.add_argument("--sim-judge", default="microsoft/wavlm-base-plus-sv",
                        help="speaker-similarity judge (used when items carry ref_audio), or 'none'")
@@ -64,6 +65,10 @@ class TTSSuite(Suite):
         super().__init__(args)
         self.extra = parse_extra(args.extra)
         self.normalizer_name, self.normalize = get_normalizer(args.normalizer)
+
+    def check_items(self, items: list[Item]) -> None:
+        super().check_items(items)
+        check_languages(self.normalize, [it.lang or self.args.judge_language for it in items])
 
     def config(self) -> dict[str, Any]:
         a = self.args

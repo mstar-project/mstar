@@ -120,10 +120,13 @@ Quality judges
 Model-based scores depend on the judge, so every results file names it, and tables
 should only compare runs scored by the same judge and normalizer.
 
-* WER normalizers (``--normalizer``): ``whisper_en`` (Whisper's English normalizer, the
-  ASR convention, default), ``seedtts`` (the Seed-TTS-eval recipe: punctuation removed
-  except the apostrophe), ``whisper_basic``, ``basic``. Both the corpus rate (``wer``)
-  and the per-utterance mean (``wer_utt_mean``, what Seed-TTS-eval publishes) are kept.
+* WER normalizers (``--normalizer``): ``whisper`` (default; Whisper's convention, per
+  item: its English normalizer for English items and items with no language, its basic
+  normalizer for every other language), ``whisper_en`` (English only; a run whose items
+  are in another language is refused before it starts), ``seedtts`` (the Seed-TTS-eval
+  recipe: punctuation removed except the apostrophe), ``whisper_basic``, ``basic``. Both
+  the corpus rate (``wer``) and the per-utterance mean (``wer_utt_mean``, what
+  Seed-TTS-eval publishes) are kept.
 * Speaker similarity uses ``microsoft/wavlm-base-plus-sv`` x-vectors; Seed-TTS-eval's
   published SIM uses a WavLM-large ECAPA checkpoint, so absolute values differ.
 * UTMOS is UTMOS22 strong from ``tarepan/SpeechMOS`` on torch.hub.

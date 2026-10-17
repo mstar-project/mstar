@@ -20,7 +20,7 @@ import aiohttp
 from benchmark.eval import stats
 from benchmark.eval.datasets import Item
 from benchmark.eval.suites.base import Suite, error_row, exception_row, parse_extra
-from benchmark.eval.text_metrics import error_rate, get_normalizer
+from benchmark.eval.text_metrics import NORMALIZERS, check_languages, error_rate, get_normalizer
 
 
 def audio_seconds(path: str) -> float | None:
@@ -46,7 +46,8 @@ class ASRSuite(Suite):
         g = p.add_argument_group("asr")
         g.add_argument("--send-language", action="store_true", help="send each item's lang as 'language'")
         g.add_argument("--stream", action="store_true", help="stream deltas and record time to first text")
-        g.add_argument("--normalizer", default="whisper_en", help="text normalizer for WER (see text_metrics)")
+        g.add_argument("--normalizer", default="whisper", choices=NORMALIZERS,
+                       help="text normalizer for WER, per item language for 'whisper' (see text_metrics)")
         g.add_argument("--extra", action="append", default=[], metavar="KEY=VALUE", help="extra form field")
         g.add_argument("--timeout", type=float, default=600.0, help="per-request timeout, seconds")
 
@@ -55,6 +56,10 @@ class ASRSuite(Suite):
         self.extra = parse_extra(args.extra)
         self.normalizer_name, self.normalize = get_normalizer(args.normalizer)
         self._durations: dict[str, float | None] = {}
+
+    def check_items(self, items: list[Item]) -> None:
+        super().check_items(items)
+        check_languages(self.normalize, [it.lang for it in items])
 
     def config(self) -> dict[str, Any]:
         a = self.args
