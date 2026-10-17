@@ -1976,6 +1976,15 @@ class Worker:
         on its way to the host, so evicting anything else is wasted work — the
         retry is gated on ``check_ready`` reloading it.
         """
+        # A rid prepare_inputs dropped (vetoed, as a loop's extra step past
+        # the rid's own count is, or failed) has no step to retry: on success
+        # the routing drops it too. Re-queued, it would run again with its
+        # loop-back inputs already spent.
+        prepared = set(node_batch.request_ids)
+        for rid in list(batch.request_to_worker_graph):
+            if rid not in prepared:
+                del batch.request_to_worker_graph[rid]
+
         reason = node_batch.admit_error
         if isinstance(reason, AllocationFailed):
             self._handle_allocation_failure(batch, node_batch, referenced_rids)
