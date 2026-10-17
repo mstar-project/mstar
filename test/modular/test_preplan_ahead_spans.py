@@ -14,6 +14,7 @@ import torch
 
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import StepContext
+from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 from mstar.model.qwen3_5.config import LLM_MIXED
 from mstar.model.qwen3_5.submodules import LLMSubmodule
 from mstar.model.submodule_base import ARNodeInputs, InputSeqLenInfo
@@ -132,7 +133,7 @@ def test_qwen_declares_a_mixed_step_from_spans_as_from_its_rows():
         ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([3]), graph_walk="decode"),
         ARNodeInputs(input_seq_len=4, input_ids=torch.arange(4), graph_walk="prefill_text"),
     ]
-    ahead = llm.declare_inputs_from_spans(LLM_MIXED, (1, 4), ("decode", "prefill_text"))
+    ahead = llm.declare_inputs_from_spans(LLM_MIXED, (1, 4), ("decode", "prefill_text"), (None, None))
 
     from_rows = llm.declare_step(LLM_MIXED, [0, 1], real)
     from_spans = llm.declare_step(LLM_MIXED, [0, 1], ahead)
@@ -140,3 +141,17 @@ def test_qwen_declares_a_mixed_step_from_spans_as_from_its_rows():
     assert from_spans.segments == from_rows.segments
     assert llm.speculative_input_seq_len("decode", None) == 1
     assert llm.speculative_input_seq_len("prefill_text", None) is None
+
+
+def test_orpheus_declares_a_mixed_step_from_spans_as_from_its_rows():
+    llm = object.__new__(OrpheusLLMSubmodule)
+    real = [
+        ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([3]), graph_walk="decode"),
+        ARNodeInputs(input_seq_len=5, input_ids=torch.arange(5), graph_walk="prefill"),
+    ]
+    ahead = llm.declare_inputs_from_spans("mixed", (1, 5), ("decode", "prefill"), (None, None))
+
+    assert llm.declare_step("mixed", [0, 1], ahead).segments == (
+        llm.declare_step("mixed", [0, 1], real).segments
+    )
+    assert llm.speculative_input_seq_len("decode", None) == 1
