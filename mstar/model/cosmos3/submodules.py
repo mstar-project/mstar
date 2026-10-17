@@ -112,6 +112,14 @@ VIDEO_GEN_AR_LOOP = "video_gen_ar_loop"
 VIDEO_SOUND_GEN_LOOP = "video_sound_gen_loop"
 ACTION_GEN_LOOP = "action_gen_loop"
 ACTION_VIDEO_GEN_LOOP = "action_video_gen_loop"
+# Each denoise walk's loop; any other walk runs the image loop.
+DENOISE_LOOP_FOR_WALK = {
+    ACTION_GEN_WALK: ACTION_GEN_LOOP,
+    ACTION_VIDEO_GEN_WALK: ACTION_VIDEO_GEN_LOOP,
+    VIDEO_GEN_WALK: VIDEO_GEN_LOOP,
+    VIDEO_GEN_AR_WALK: VIDEO_GEN_AR_LOOP,
+    VIDEO_SOUND_GEN_WALK: VIDEO_SOUND_GEN_LOOP,
+}
 
 # Both action walks run the joint video+action denoise loop body; they differ
 # only in what they emit (the predicted action vs the predicted video).
@@ -150,6 +158,40 @@ REASONER_PREFILL_WALKS = (REASONER_PREFILL_WALK, REASONER_PREFILL_VISION_WALK)
 REASONER_DECODE_LOOP = "reasoner_decode_loop"
 # The reasoner keeps every request's text under one cache label.
 REASONER_LABEL = "main"
+
+
+def _loop_step(fwd_info, graph_walk: str, time_index: torch.Tensor) -> int:
+    """The denoise iteration a step runs, from the engine's loop counter.
+
+    ``time_index`` holds the same value (global over a windowed request's
+    windows and commits, like the counter), but it is the previous step's
+    device output: reading it on the host waits for that step to finish, which
+    stalls the speculative preparation of this one. Callers that drive the
+    submodule without a loop counter (tests, harnesses) fall back to the edge.
+    """
+    loop = DENOISE_LOOP_FOR_WALK.get(graph_walk, IMAGE_GEN_LOOP)
+    counts = getattr(fwd_info, "dynamic_loop_iter_counts", None) or {}
+    if loop in counts:
+        return int(counts[loop])
+    return int(time_index.reshape(-1)[0].item())
+
+
+# Attribute a request's scheduler carries its timesteps under as a host list,
+# filled once at build time. ``set_timesteps`` puts them on the device, and a
+# per-step read there (the guidance-interval test) would be a host sync.
+_HOST_TIMESTEPS = "mstar_host_timesteps"
+
+
+def _with_host_timesteps(scheduler):
+    setattr(scheduler, _HOST_TIMESTEPS, scheduler.timesteps.tolist())
+    return scheduler
+
+
+def _host_timesteps(scheduler) -> list:
+    """The scheduler's timesteps as Python numbers (the values ``.item()``
+    returns), from the host copy when it was built here."""
+    host = getattr(scheduler, _HOST_TIMESTEPS, None)
+    return host if host is not None else scheduler.timesteps.tolist()
 
 
 def native_flow_sigmas(num_inference_steps: int, num_train_timesteps: int):
@@ -430,7 +472,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             scheduler.set_timesteps(num_inference_steps, device=device, sigmas=sigmas)
         else:
             scheduler.set_timesteps(num_inference_steps, device=device)
-        return scheduler
+        return _with_host_timesteps(scheduler)
 
     def _new_distilled_scheduler(self, device):
         """The 4-step distilled sampler: a FlowMatchEuler scheduler with the
@@ -450,7 +492,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 stochastic_sampling=bool(sc.stochastic_sampling),
             )
         scheduler.set_timesteps(sigmas=[float(x) for x in self.config.distilled_sigmas], device=device)
-        return scheduler
+        return _with_host_timesteps(scheduler)
 
     @staticmethod
     def _scheduler_step(st, velocity, t, latents):
@@ -495,7 +537,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if graph_walk in SOUND_WALKS:
             return self._prepare_video_sound_gen(fwd_info, inputs, device)
         if graph_walk in ACTION_WALKS:
-            return self._prepare_action_gen(fwd_info, inputs, device)
+            return self._prepare_action_gen(graph_walk, fwd_info, inputs, device)
         raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
 
     def _prepare_prefill(self, fwd_info, inputs, device) -> ARNodeInputs:
@@ -1087,12 +1129,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # from the noise drawn above (the reference RNG order).
                 latents = st["vmask"] * st["cond_video_latents"] + (1.0 - st["vmask"]) * latents
             time_index = torch.zeros(1, dtype=torch.long, device=device)
+            step_index = 0
         else:
             latents = inputs["latents"][0]
             time_index = inputs["time_index"][0]
+            step_index = _loop_step(fwd_info, graph_walk, time_index)
 
         scheduler = st["scheduler"]
-        step_index = int(time_index.reshape(-1)[0].item())
         if windowed:
             # The loop counter is global over every window's iterations; the
             # schedule index is the within-window step, and in kv mode the
@@ -1168,13 +1211,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 (1, self.config.sound_dim, st["num_sound"]), generator=gen, device=device, dtype=dtype
             )
             time_index = torch.zeros(1, dtype=torch.long, device=device)
+            step_index = 0
         else:
             latents = inputs["latents"][0]
             sound_latents = inputs["sound_latents"][0]
             time_index = inputs["time_index"][0]
+            step_index = _loop_step(fwd_info, VIDEO_SOUND_GEN_WALK, time_index)
 
         scheduler = st["scheduler"]
-        step_index = int(time_index.reshape(-1)[0].item())
         if step_index >= len(scheduler.timesteps):
             return None
         return ARNodeInputs(
@@ -1187,7 +1231,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             ),
         )
 
-    def _prepare_action_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
+    def _prepare_action_gen(self, graph_walk, fwd_info, inputs, device) -> ARNodeInputs:
         st = self.request_states[fwd_info.rid_handle]
         if "latents" not in inputs or len(inputs["latents"]) == 0:
             self._ingest_cond_latents(st, inputs, device)
@@ -1211,13 +1255,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             v_noise = randn_tensor(st["latent_shape"], generator=gen, device=device, dtype=dtype)
             latents = st["vmask"] * st["cond_video_latents"] + (1.0 - st["vmask"]) * v_noise
             time_index = torch.zeros(1, dtype=torch.long, device=device)
+            step_index = 0
         else:
             latents = inputs["latents"][0]
             action_latents = inputs["action_latents"][0]
             time_index = inputs["time_index"][0]
+            step_index = _loop_step(fwd_info, graph_walk, time_index)
 
         scheduler = st["scheduler"]
-        step_index = int(time_index.reshape(-1)[0].item())
         if step_index >= len(scheduler.timesteps):
             return None
         return ARNodeInputs(
@@ -1567,10 +1612,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         gi = st.get("guidance_interval")
         if gi is None:
             return True
-        sched = st["scheduler"]
-        if step_index >= len(sched.timesteps):
+        timesteps = _host_timesteps(st["scheduler"])
+        if step_index >= len(timesteps):
             return False
-        t = float(sched.timesteps[step_index].item())
+        t = float(timesteps[step_index])
         return gi[0] <= t <= gi[1]
 
     def _forward_image_gen(self, attn, st, latents, time_index, **kwargs) -> dict:
@@ -2385,13 +2430,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         st = self.request_states.get(request_id)
         if st is None:
             return set()
-        loop = {
-            ACTION_GEN_WALK: ACTION_GEN_LOOP,
-            ACTION_VIDEO_GEN_WALK: ACTION_VIDEO_GEN_LOOP,
-            VIDEO_GEN_WALK: VIDEO_GEN_LOOP,
-            VIDEO_GEN_AR_WALK: VIDEO_GEN_AR_LOOP,
-            VIDEO_SOUND_GEN_WALK: VIDEO_SOUND_GEN_LOOP,
-        }.get(request_info.graph_walk, IMAGE_GEN_LOOP)
+        loop = DENOISE_LOOP_FOR_WALK.get(request_info.graph_walk, IMAGE_GEN_LOOP)
         iter_idx = request_info.dynamic_loop_iter_counts.get(loop, 0)
         # Windowed requests run every window's iterations in one loop; others
         # stop at their scheduler's step count.

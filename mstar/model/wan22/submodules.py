@@ -154,6 +154,20 @@ def _set_buffer(module: nn.Module, dotted_name: str, value: torch.Tensor):
     setattr(owner, attr, value)
 
 
+def _loop_step(fwd_info: CurrentForwardPassInfo, time_index: torch.Tensor) -> int:
+    """The denoise iteration this step runs, from the engine's loop counter.
+
+    ``time_index`` holds the same value, but it is the previous step's device
+    output: reading it on the host waits for that step to finish, which stalls
+    the speculative preparation of this one. Callers that drive the submodule
+    without a loop counter (tests, harnesses) fall back to the edge.
+    """
+    counts = getattr(fwd_info, "dynamic_loop_iter_counts", None) or {}
+    if DENOISE_LOOP_NAME in counts:
+        return int(counts[DENOISE_LOOP_NAME])
+    return int(time_index.reshape(-1)[0].item())
+
+
 def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, int]:
     """(T_lat, H_lat, W_lat) for the request's pixel-space dims (diffusers
     ``prepare_latents``: T=(F-1)//4+1, spatial /16)."""
@@ -404,7 +418,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
             tensor_inputs["unipc_last_sample"] = torch.zeros(shape, dtype=torch.float32, device=device)
         else:
             time_index = inputs["time_index"][0]
-            k = int(time_index.reshape(-1)[0].item())
+            k = _loop_step(fwd_info, time_index)
             num_steps = int(fwd_info.step_metadata["num_inference_steps"])
             if k >= num_steps:
                 # Async scheduling dispatched an iteration past this request's
