@@ -3,6 +3,7 @@ into the Rust shared-memory arena, the location rides the TensorPointerInfo,
 a separate consumer manager reads them zero-copy, and reclaim frees the
 arena slots. Skipped unless the ``mstar_rust`` extension is installed."""
 import os
+import sys
 
 import pytest
 import torch
@@ -704,3 +705,224 @@ def test_arena_stages_the_stored_host_copy(tmp_path):
         "r1", [GraphEdge(next_node="B", name="tok", tensor_info=infos["tok"])],
     )
     assert torch.equal(cons.tensor_store.get_tensor(infos["tok"][0].uuid), host)
+
+
+def test_an_overflowing_reserve_is_full_and_changes_nothing():
+    """A size that overflows alignment is "full", not a 0-byte block that
+    later reservations overlap."""
+    from mstar_rust import SegmentedShmArena, ShmArena
+
+    a = ShmArena.create(f"mstar_test_overflow_{os.getpid()}", 4096)
+    try:
+        with pytest.raises(RuntimeError, match="arena full"):
+            a.reserve((1 << 64) - 1)
+        assert a.bytes_free == 4096
+        assert (a.reserve(256), a.reserve(256)) == (0, 256)
+    finally:
+        a.close()
+    s = SegmentedShmArena.create(f"mstar_test_overflow_seg_{os.getpid()}", 4096, 2)
+    with pytest.raises(RuntimeError, match="arena full"):
+        s.reserve((1 << 64) - 1)
+    assert s.num_segments == 1 and s.stats() == (4096, 4096, 4096)
+
+
+def _bigger_than_dev_shm() -> int:
+    """A size no segment in /dev/shm can have: preallocating it fails with
+    ENOSPC up front, without filling the real /dev/shm."""
+    if not sys.platform.startswith("linux") or not os.path.isdir("/dev/shm"):
+        pytest.skip("Linux /dev/shm only")
+    st = os.statvfs("/dev/shm")
+    if not st.f_blocks:
+        pytest.skip("/dev/shm has no size limit")
+    return st.f_frsize * st.f_blocks + (1 << 20)
+
+
+def test_a_segment_dev_shm_cannot_hold_is_full_and_leaves_no_file():
+    from mstar_rust import SegmentedShmArena
+
+    base = f"mstar_test_nospace_{os.getpid()}"
+    s = SegmentedShmArena.create(base, 4096, 2)
+    with pytest.raises(RuntimeError, match="arena full: no space"):
+        s.reserve(_bigger_than_dev_shm())
+    assert s.num_segments == 1
+    assert not os.path.exists(f"/dev/shm/{s.segment_name(1)}")
+    assert s.reserve(100) == (0, 0)
+
+
+class _NoRoomToGrow:
+    """The producer's arena, except that every reserve asks for a segment
+    /dev/shm cannot hold: what growth meets once /dev/shm is full."""
+
+    def __init__(self, arena, too_big):
+        self._arena, self._too_big = arena, too_big
+
+    def reserve(self, nbytes):
+        return self._arena.reserve(self._too_big)
+
+    def __getattr__(self, name):
+        return getattr(self._arena, name)
+
+
+@pytest.mark.parametrize("spill", ["1", "0"])
+def test_no_room_to_grow_spills_or_fails_clearly(tmp_path, monkeypatch, spill):
+    monkeypatch.setenv("MSTAR_SHM_ARENA_SPILL", spill)
+    monkeypatch.setenv("MSTAR_SHM_ARENA_FULL_TIMEOUT_S", "0.05")
+    prod = _manager("w0", tmp_path)
+    cons = _manager("w1", tmp_path)
+    prod._arena = _NoRoomToGrow(prod._arena, _bigger_than_dev_shm())
+    t = torch.arange(64, dtype=torch.int64)
+    infos = prod.store_and_return_tensor_info("r1", {"x": [t]})
+    if spill == "0":
+        with pytest.raises(RuntimeError, match="arena full.*no space"):
+            prod.register_for_send("r1", infos["x"])
+        return
+    prod.register_for_send("r1", infos["x"])
+    (info,) = infos["x"]
+    assert info.shm_segment is None and info.uuid in prod._shm_files
+    cons.start_read_tensors(
+        "r1", [GraphEdge(next_node="B", name="x", tensor_info=infos["x"])])
+    assert torch.equal(cons.tensor_store.get_tensor(info.uuid), t)
+
+
+# Two producers and a consumer whose per-entity ceilings (3 x 4 MiB) each fit
+# a 16 MiB /dev/shm, but whose staged tensors together do not. Spills go to
+# argv[1], off the small tmpfs, so they can be read back; the last step spills
+# into the full tmpfs itself, the default spill directory.
+_SMALL_DEV_SHM_SCRIPT = """
+import errno, os, sys
+os.environ.update(MSTAR_SHM_ARENA_SEGMENT_MB="4", MSTAR_SHM_ARENA_MAX_SEGMENTS="3")
+import torch
+from mstar.communication.arena import ArenaShmCommunicationManager
+from mstar.graph.base import GraphEdge
+
+class Comm:
+    def send(self, *a):
+        raise AssertionError
+    def get_all_new_messages(self):
+        return []
+
+def manager(entity):
+    return ArenaShmCommunicationManager(
+        my_entity_id=entity, hostname="localhost", device="cpu",
+        communicator=Comm(), shm_dir=sys.argv[1])
+
+prods, cons = [manager("p0"), manager("p1")], manager("c0")
+sent, spilled = {}, 0
+for p in prods:
+    for i in range(3):
+        t = torch.full((3_500_000,), i + 1, dtype=torch.uint8)
+        (info,) = p.store_and_return_tensor_info("r", {"x": [t]})["x"]
+        p.register_for_send("r", [info])
+        spilled += info.shm_segment is None
+        sent[info.uuid] = (t, info)
+edge = GraphEdge(next_node="B", name="x", tensor_info=[i for _, i in sent.values()])
+cons.start_read_tensors("r", [edge])
+assert all(torch.equal(cons.tensor_store.get_tensor(u), t) for u, (t, _) in sent.items())
+try:
+    manager("late")
+except RuntimeError as e:
+    assert "no space" in str(e), e
+    assert not [n for n in os.listdir("/dev/shm") if "_late_" in n]
+else:
+    raise AssertionError("an arena was created in a full /dev/shm")
+prods[1].shm_dir = "/dev/shm"
+(info,) = prods[1].store_and_return_tensor_info("r", {"x": [torch.ones(3_500_000)]})["x"]
+try:
+    prods[1].register_for_send("r", [info])
+except OSError as e:
+    assert e.errno == errno.ENOSPC, e
+else:
+    raise AssertionError("a spill into a full /dev/shm succeeded")
+print(f"spilled={spilled}")
+"""
+
+
+def _private_small_dev_shm_cmd(inner: str) -> list[str]:
+    """Run ``inner`` in a private mount namespace whose /dev/shm is a 16 MiB
+    tmpfs, so the host's /dev/shm is never touched. Needs passwordless sudo."""
+    return ["sudo", "-n", "unshare", "-m", "sh", "-c",
+            "mount -t tmpfs -o size=16m,mode=1777 tmpfs /dev/shm && " + inner]
+
+
+def _run_in_small_dev_shm(tmp_path, source: str, *args: str):
+    """Run ``source`` as this user, in a private 16 MiB /dev/shm; skip where
+    that mount is not possible."""
+    import shlex
+    import shutil
+    import subprocess
+
+    if not sys.platform.startswith("linux") or not all(
+            shutil.which(b) for b in ("sudo", "unshare", "setpriv")):
+        pytest.skip("needs Linux with sudo, unshare and setpriv")
+    probe = subprocess.run(_private_small_dev_shm_cmd("true"), check=False,
+                           capture_output=True, timeout=30)
+    if probe.returncode:
+        pytest.skip("cannot mount a private tmpfs: "
+                    f"{probe.stderr.decode(errors='replace').strip()}")
+    script = tmp_path / "small_dev_shm.py"
+    script.write_text(source)
+    env = [f"{k}={v}" for k, v in os.environ.items()
+           if not k.startswith("MSTAR_SHM_ARENA")]
+    inner = shlex.join([
+        "setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}",
+        "--clear-groups", "env", "-i", *env,
+        sys.executable, str(script), *args])
+    proc = subprocess.run(_private_small_dev_shm_cmd("exec " + inner),
+                          check=False, capture_output=True, text=True,
+                          timeout=300)
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}")
+    return proc
+
+
+def test_a_full_dev_shm_spills_instead_of_crashing(tmp_path):
+    """Real tmpfs exhaustion: before segments were preallocated, the second
+    producer's copy into a sparse segment died with SIGBUS."""
+    spill_dir = tmp_path / "spill"
+    spill_dir.mkdir()
+    proc = _run_in_small_dev_shm(tmp_path, _SMALL_DEV_SHM_SCRIPT, str(spill_dir))
+    spilled = int(proc.stdout.strip().rsplit("=", 1)[1])
+    assert spilled > 0, proc.stdout
+
+
+# /dev/shm keeps 3 MiB free, less than one 4 MiB segment. Preallocating there
+# would fill the tmpfs and then fail; the arena must see the shortfall up
+# front, not repeat the growth on every send, and grow once room is back.
+_LESS_THAN_A_SEGMENT_FREE_SCRIPT = """
+import os, time
+from mstar_rust import SegmentedShmArena
+
+MiB = 1 << 20
+filler = f"/dev/shm/filler_{os.getpid()}"
+with open(filler, "wb") as f:
+    f.write(b"\\1" * (9 * MiB))
+a = SegmentedShmArena.create(f"mstar_test_lowroom_{os.getpid()}", 4 * MiB, 4)
+assert a.reserve(4 * MiB) == (0, 0)
+st = os.statvfs("/dev/shm")
+free = st.f_bavail * st.f_frsize
+assert 0 < free < 4 * MiB, free
+failed_at = time.monotonic()
+for i in range(3):
+    try:
+        a.reserve(256)
+    except RuntimeError as e:
+        msg = str(e)
+    else:
+        raise AssertionError("grew a segment /dev/shm cannot hold")
+    assert msg.startswith("arena full: no space"), msg
+    if i == 0:
+        assert f"only {free} B free" in msg, msg
+    else:  # a stall past the 1 s window legitimately allows the retry
+        assert "not retried" in msg or time.monotonic() - failed_at >= 1, msg
+    st = os.statvfs("/dev/shm")
+    assert st.f_bavail * st.f_frsize == free
+os.remove(filler)
+time.sleep(1.1)
+assert a.reserve(256) == (1, 0) and a.num_segments == 2
+print("ok")
+"""
+
+
+def test_less_than_a_segment_free_fails_growth_up_front(tmp_path):
+    proc = _run_in_small_dev_shm(tmp_path, _LESS_THAN_A_SEGMENT_FREE_SCRIPT)
+    assert proc.stdout.strip() == "ok", proc.stdout
