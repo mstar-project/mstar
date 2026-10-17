@@ -2,7 +2,7 @@
   "mode": "cloud",
   "results_dir": "~/live-pr-results",
   "ssh_public_key": "~/.ssh/id_ed25519.pub",
-  "budget": {"max_usd_per_hour": 20, "max_hours": 6},
+  "budget": {"max_usd_per_hour": 20, "max_hours": 6, "max_concurrent_instances": 1, "max_total_usd": 150},
   "runpod": {
     "image": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
     "disk_gb": 300,

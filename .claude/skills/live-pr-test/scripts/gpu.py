@@ -27,6 +27,8 @@ the skill (see config.example.json). Stdlib only, so it runs from any python3.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -285,6 +287,24 @@ def save_ledger(d: dict) -> None:
     tmp.replace(LEDGER)
 
 
+@contextlib.contextmanager
+def ledger_txn():
+    """Read-modify-write of the ledger under an exclusive lock. Several sessions
+    (parallel PR tests, their watchdogs) share one ledger; without the lock one
+    save drops another's entry, and that instance loses its budget accounting."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "instances.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        d = ledger()
+        yield d
+        save_ledger(d)
+
+
+def committed_usd(e: dict) -> float:
+    """What an instance costs if it runs to its deadline."""
+    return e["usd_per_hour"] * (e["deadline"] - e["launched_at"]) / 3600
+
+
 def entry(key: str) -> dict:
     d = ledger()
     if key not in d:
@@ -320,6 +340,8 @@ def cmd_launch(args, cfg):
         die(f"{hours} h is over the {cfg['budget']['max_hours']} h cap; ask before passing --allow-over-budget")
     pubkey = Path(cfg["ssh_public_key"]).expanduser().read_text().strip()
     name = f"live-pr-{args.pr}-{time.strftime('%m%d-%H%M')}"
+    max_instances = cfg["budget"].get("max_concurrent_instances", 1)
+    max_total = cfg["budget"].get("max_total_usd")
 
     if o["provider"] == "runpod":
         rp = cfg["runpod"]
@@ -347,24 +369,32 @@ def cmd_launch(args, cfg):
         print(json.dumps(body, indent=1).replace(pubkey, "<public key>"))
         return
 
-    try:
-        if o["provider"] == "runpod":
-            iid = runpod("POST", "/pods", body)["id"]
-        else:
-            iid = lambda_("POST", "/instance-operations/launch", body)["instance_ids"][0]
-    except ApiError as e:
-        if e.status in (400, 409) or "capacity" in e.code():
-            die(f"no availability: {o['id']} was taken before launch ({e}); rerun offers")
-        raise
-    key = f"{o['provider']}:{iid}"
-    now = time.time()
-    d = ledger()
-    d[key] = {"provider": o["provider"], "instance_id": iid, "name": name, "offer": o["id"], "pr": args.pr,
+    # The caps are checked and the launch recorded under one lock, so parallel
+    # sessions can't each pass the check and launch together.
+    with ledger_txn() as d:
+        if len(d) >= max_instances and not args.allow_over_budget:
+            die(f"{len(d)} instance(s) already up ({', '.join(d)}); budget.max_concurrent_instances is "
+                f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
+        committed = sum(committed_usd(e) for e in d.values()) + o["usd_per_hour"] * hours
+        if max_total is not None and committed > max_total and not args.allow_over_budget:
+            die(f"running to their deadlines, the live instances plus this one would cost ~${committed:.0f}, "
+                f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
+        try:
+            if o["provider"] == "runpod":
+                iid = runpod("POST", "/pods", body)["id"]
+            else:
+                iid = lambda_("POST", "/instance-operations/launch", body)["instance_ids"][0]
+        except ApiError as e:
+            if e.status in (400, 409) or "capacity" in e.code():
+                die(f"no availability: {o['id']} was taken before launch ({e}); rerun offers")
+            raise
+        key = f"{o['provider']}:{iid}"
+        now = time.time()
+        d[key] = {"provider": o["provider"], "instance_id": iid, "name": name, "offer": o["id"], "pr": args.pr,
               "usd_per_hour": o["usd_per_hour"], "gpu": o["gpu"], "count": o["count"], "region": o["region"],
               "launched_at": now, "deadline": now + hours * 3600,
               "user": "root" if o["provider"] == "runpod" else "ubuntu",
               "hf_home": hf_home(cfg, o["provider"], o["region"])}
-    save_ledger(d)
     log = STATE / f"{key.replace(':', '_')}.watchdog.log"
     with open(log, "a") as fh:
         subprocess.Popen([sys.executable, __file__, "watchdog", key], stdout=fh, stderr=fh,
@@ -412,9 +442,9 @@ def cmd_wait(args, cfg):
             probe = ssh_base(e) + ["-o", "BatchMode=yes", f"{e['user']}@{host}", "nvidia-smi -L"]
             r = subprocess.run(probe, capture_output=True, text=True, check=False)
             if r.returncode == 0:
-                d = ledger()
-                d[args.instance] = e
-                save_ledger(d)
+                with ledger_txn() as d:
+                    if args.instance in d:
+                        d[args.instance].update(host=host, port=port)
                 print(r.stdout.strip())
                 print(f"ready after {int(time.time() - t0)}s: {' '.join(ssh_base(e))} {e['user']}@{host}")
                 print(f"hf_home: {e['hf_home']}")
@@ -454,9 +484,8 @@ def terminate(key: str, e: dict) -> None:
     except ApiError as err:
         if err.status != 404 and "does-not-exist" not in err.code():
             raise
-    d = ledger()
-    d.pop(key, None)
-    save_ledger(d)
+    with ledger_txn() as d:
+        d.pop(key, None)
     hours = (time.time() - e["launched_at"]) / 3600
     print(f"terminated {key} after {hours:.2f} h, ~${hours * e['usd_per_hour']:.2f}")
 
@@ -467,10 +496,9 @@ def cmd_terminate(args, cfg):
 
 def cmd_extend(args, cfg):
     entry(args.instance)
-    d = ledger()
-    e = d[args.instance]
-    e["deadline"] = time.time() + args.hours * 3600
-    save_ledger(d)
+    with ledger_txn() as d:
+        e = d[args.instance]
+        e["deadline"] = time.time() + args.hours * 3600
     print(f"{args.instance} deadline now {time.strftime('%H:%M', time.localtime(e['deadline']))}")
 
 

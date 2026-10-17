@@ -21,6 +21,15 @@ Read alongside this:
 
 Settings live in `config.local.json` next to this file (gitignored; copy [config.example.json](config.example.json)). API keys come from `RUNPOD_API_KEY` and `LAMBDA_API_KEY` in the environment. Never print them, write them to the box, or put them in a command line that gets logged.
 
+## Several PRs at once
+
+When asked to test more than one PR, the session that was asked (the parent) keeps every decision that needs the requester, and one subagent per PR does the running.
+
+- **The parent** does step 1 for every PR: trust checks, plans, boxes and estimated cost. It shows all the plans together, and gets one answer on the batch budget. It sets `budget.max_concurrent_instances` and `budget.max_total_usd` for the batch; `launch` enforces both under a lock on the shared ledger, so parallel launches can't overshoot them.
+- **Each subagent** (Agent tool; a Workflow only if the requester opted into one) gets one approved plan, and runs steps 2–5 for it: provision, run, collect, tear down, write `report.md`. It doesn't ask the requester anything, pass `--allow-over-budget`, or extend past the plan. When the plan can't fit, or a decision would change it, the subagent cuts suites as in step 3, or stops and returns the question to the parent.
+- **The parent** reads each report, relays the verdicts, posts PR comments when asked, and runs `gpu.py list` at the end, after every subagent has finished.
+- **Cluster mode:** the PRs share GPUs, so only functional checks run in parallel, on disjoint GPUs and with distinct ports, `SERVER_STATE_DIR` and `--socket-path-prefix`. Perf phases run one PR at a time.
+
 ## 1. Read the PR and plan
 
 ```bash
@@ -35,6 +44,7 @@ gh pr diff <n>
 - Map touched files to suites with the test matrix. Add the edge cases the diff branches on.
 - Size the box: GPU count from the largest config in the plan, 80 GB-class Hopper or newer.
 - If nothing needs a GPU (docs, CPU-only tests, benchmark scripts without a claimed number), say so and stop.
+- Reference (transformers) parity is for new model code or changes to a model's forward. A PR that serves a new checkpoint on an existing architecture's code inherits that architecture's parity; list it under "Not tested" with that reason.
 
 Show the plan before provisioning: claims → checks, suites, concurrency, the box, the estimated hours and cost. Then proceed without waiting unless the run would exceed the budget (below) or the trust check failed.
 
@@ -54,7 +64,7 @@ python3 $S/gpu.py terminate <instance>
 
 - Take the cheapest offer that has the GPU count, in a region with the team's persistent storage (`offers` filters for that). An offer with more GPUs than needed is fine when it's cheaper.
 - **No availability:** if `offers` returns nothing, do not provision anything. Report "no availability" with the `--all-regions` output: what GPU counts and types are available where, at what price, and whether a smaller plan (e.g. the 2-GPU substitutes in the test matrix) would fit what is available. Stop there.
-- **Budget:** `budget.max_usd_per_hour` and `budget.max_hours` from the config. `launch` refuses an offer above the hourly cap, and arms a watchdog that terminates the instance at the deadline even if this session dies. The watchdog runs on the machine that launched it, so a laptop that sleeps or shuts down stops it: when this session ends early, `gpu.py list --all` and terminate by hand. To go over either cap, ask first; `gpu.py extend <instance> --hours H` moves the deadline.
+- **Budget:** `budget.max_usd_per_hour` and `budget.max_hours` from the config. `launch` refuses an offer above the hourly cap, and arms a watchdog that terminates the instance at the deadline even if this session dies. The watchdog runs on the machine that launched it, so a laptop that sleeps or shuts down stops it: when this session ends early, `gpu.py list --all` and terminate by hand. To go over either cap, ask first; `gpu.py extend <instance> --hours H` moves the deadline. `budget.max_concurrent_instances` (default 1) and `budget.max_total_usd` (what the live instances cost if they all run to their deadlines) bound parallel runs. If `terminate` fails for lack of the API key (e.g. after a terminal restart), `gpu.py extend <instance> --hours 0`: the watchdog was started with the key and terminates the instance within a minute.
 - **Check the GPUs before building anything.** `gpu.py push <instance> $S/gpu_health.py '~/'`, then `gpu.py ssh <instance> 'python3 ~/gpu_health.py'` (the image's python has torch). It loads every GPU for a minute and exits 1 on a thermal throttle or a GPU running far hotter or slower than the rest. A TP instance runs at its slowest rank's pace, so one badly cooled GPU invalidates every number on the box, competitors' included. On failure, terminate and launch another offer.
 - **Always terminate**, on success and on failure, after the copy-back. Before ending the session, run `gpu.py list` and confirm nothing launched for this PR is still up.
 
@@ -86,7 +96,7 @@ MSTAR_TP_ASYNC_SCHED=1 ~/server.sh start pr 8100 --timeout 2400 \
 - Run anything longer than a couple of minutes detached on the box (`nohup ... > log 2>&1 &`, or tmux if present), then poll its log. An ssh drop must not kill a sweep.
 - Order: functional checks of the claims first, cheapest suites before expensive ones, so an early failure is found before an hour of benchmarks.
 - Each A/B model: main and PR back to back, restart the server between repeats, then the next model. When nothing is being timed, the two arms may run in parallel on disjoint GPUs.
-- `MSTAR_TP_ASYNC_SCHED=1` on any TP/SP config; `MSTAR_SHM_ARENA=1` always (from `env.sh`). Check each server log for `control mesh transport: rust` and `graph runtime: rust`.
+- `MSTAR_TP_ASYNC_SCHED=1` on any TP/SP config; `MSTAR_SHM_ARENA=1` always (from `env.sh`). Check each server log for `control mesh transport: rust` and `graph runtime: rust`, and on TP configs for `all-reduce fusion workspace:`. On cloud containers without NVSwitch multicast, FlashInfer's MNNVL backend fails, and before #563 mstar fell back to NCCL all-reduce, 1.4–1.6x slower on a 27B TP4 model. The same hosts need `NCCL_NVLS_ENABLE=0` for competitors whose NCCL tries NVLS. Note either in the report when it applies.
 - One `--output-dir` per cell under `$LIVE_RESULTS/bench/<suite>/<arm>/c<conc>.r<rep>/`, stdout tee'd to `bench.log` inside it. Check `failed` in every `results.json` before using a number.
 - Save media as the test matrix describes. Keep it small: a few representative outputs per suite and arm.
 - If a server fails to start or every request errors on **both** arms, it is an environment problem, not a regression. Fix it or record it under "Not tested", and keep going with the rest of the plan.
