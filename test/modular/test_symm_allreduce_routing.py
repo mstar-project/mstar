@@ -1,5 +1,4 @@
-"""``tp_allreduce`` / ``MSTAR_TP_ALLREDUCE``: which all-reduces go through
-symmetric memory."""
+"""``tp_allreduce``: which all-reduces go through symmetric memory."""
 
 from __future__ import annotations
 
@@ -16,8 +15,6 @@ sys.path.insert(0, ".")
 
 import mstar.distributed.communication as comm
 from mstar.distributed.communication import (
-    TP_ALLREDUCE_ENV,
-    TP_SYMM_AR_MAX_KB_ENV,
     CommGroup,
     GlobalParallelConfig,
     WorkerParallelGroups,
@@ -72,8 +69,6 @@ class _CudaTensor:
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
-    monkeypatch.delenv(TP_ALLREDUCE_ENV, raising=False)
-    monkeypatch.delenv(TP_SYMM_AR_MAX_KB_ENV, raising=False)
     monkeypatch.setattr(comm, "_SymmAllReduce", _FakeSymm)
     # one process: every rank is this one
     monkeypatch.setattr(comm, "_all_ranks_agree", lambda flag, cpu_group: flag)
@@ -111,49 +106,31 @@ def test_default_mode_never_builds_symm(fake_cuda):
 
 
 @pytest.mark.parametrize("mode", ["symm_oneshot", "symm_multimem", " Symm_OneShot "])
-def test_symm_modes_build_it_with_default_cutoff(monkeypatch, fake_cuda, mode):
-    monkeypatch.setenv(TP_ALLREDUCE_ENV, mode)
+def test_symm_modes_build_it_with_default_cutoff(fake_cuda, mode):
     g = _group()
-    g._maybe_init_symm_allreduce()
+    g._maybe_init_symm_allreduce(mode)
     assert g._symm_ar is _FakeSymm.instances[0]
     assert g._symm_ar.max_bytes == 512 * 1024
     assert g._symm_ar.mode == mode.strip().lower()
     assert g._symm_ar.device_group is g.device_group
 
 
-def test_max_kb_env_sets_cutoff(monkeypatch, fake_cuda):
-    monkeypatch.setenv(TP_ALLREDUCE_ENV, "symm_oneshot")
-    monkeypatch.setenv(TP_SYMM_AR_MAX_KB_ENV, "64")
-    g = _group()
-    g._maybe_init_symm_allreduce()
-    assert g._symm_ar.max_bytes == 64 * 1024
-
-
-def test_unknown_mode_is_nccl(monkeypatch, fake_cuda):
-    monkeypatch.setenv(TP_ALLREDUCE_ENV, "symm_twoshot")
-    g = _group()
-    g._maybe_init_symm_allreduce()
-    assert g._symm_ar is None
-
-
 def test_single_rank_and_no_cuda_skip(monkeypatch):
-    monkeypatch.setenv(TP_ALLREDUCE_ENV, "symm_oneshot")
     g = _group(world_size=1)
-    g._maybe_init_symm_allreduce()
+    g._maybe_init_symm_allreduce("symm_oneshot")
     assert g._symm_ar is None
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     g = _group()
-    g._maybe_init_symm_allreduce()
+    g._maybe_init_symm_allreduce("symm_oneshot")
     assert g._symm_ar is None
 
 
 def test_setup_failure_falls_back_to_nccl_with_warning(monkeypatch, fake_cuda, caplog):
-    monkeypatch.setenv(TP_ALLREDUCE_ENV, "symm_multimem")
     monkeypatch.setattr(comm, "_SymmAllReduce", _RaisingSymm)
     g = _group()
     with caplog.at_level(logging.WARNING, logger=comm.__name__):
-        g._maybe_init_symm_allreduce()
+        g._maybe_init_symm_allreduce("symm_multimem")
     assert g._symm_ar is None
     assert any("using NCCL" in r.getMessage() for r in caplog.records)
 
@@ -172,7 +149,6 @@ def test_a_peer_that_failed_takes_every_rank_to_nccl(monkeypatch, fake_cuda, cap
 def test_init_dist_sets_up_every_comm_group(monkeypatch, fake_cuda):
     """The hook point: ``init_dist`` builds the symm path for each group it
     wires a process group into."""
-    monkeypatch.setenv(TP_ALLREDUCE_ENV, "symm_oneshot")
     pgs: list = []
 
     def new_group(**kw):
@@ -187,7 +163,7 @@ def test_init_dist_sets_up_every_comm_group(monkeypatch, fake_cuda):
 
     groups = WorkerParallelGroups(
         num_workers=4, global_rank=0, any_parallelism=True,
-        world_parallel_groups=[(0, 1), (0, 1, 2, 3)],
+        world_parallel_groups=[(0, 1), (0, 1, 2, 3)], tp_allreduce="symm_oneshot",
     )
     tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
     sp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1, 2, 3])
@@ -204,29 +180,20 @@ def test_init_dist_sets_up_every_comm_group(monkeypatch, fake_cuda):
 # --- the deployment config's tp_allreduce -----------------------------------
 
 
-@pytest.mark.parametrize("config, env, want", [
-    ("symm_multimem", None, "symm_multimem"),
-    ("symm_oneshot", None, "symm_oneshot"),
-    ("nccl", None, None),
-    ("symm_multimem", "nccl", None),  # the env var overrides the config
-    ("symm_multimem", "symm_oneshot", "symm_oneshot"),
-    (None, "symm_multimem", "symm_multimem"),
+@pytest.mark.parametrize("config, want", [
+    ("symm_multimem", "symm_multimem"),
+    ("symm_oneshot", "symm_oneshot"),
+    ("nccl", None),
+    (None, None),
 ])
-def test_config_mode_and_env_override(monkeypatch, fake_cuda, config, env, want):
-    if env is not None:
-        monkeypatch.setenv(TP_ALLREDUCE_ENV, env)
+def test_config_mode(fake_cuda, config, want):
     g = _group()
     g._maybe_init_symm_allreduce(config)
     assert getattr(g._symm_ar, "mode", None) == want
 
 
-@pytest.mark.parametrize("config_kb, env, want_kb", [
-    (None, None, 512), (32768, None, 32768), (32768, "64", 64), (None, "64", 64),
-    (0, None, None),
-])
-def test_config_max_kb_and_env_override(monkeypatch, fake_cuda, config_kb, env, want_kb):
-    if env is not None:
-        monkeypatch.setenv(comm.TP_SYMM_AR_MAX_KB_ENV, env)
+@pytest.mark.parametrize("config_kb, want_kb", [(None, 512), (64, 64), (32768, 32768), (0, None)])
+def test_config_max_kb(fake_cuda, config_kb, want_kb):
     g = _group()
     g._maybe_init_symm_allreduce("symm_multimem", config_kb)
     # 0 turns it off (it used to read as unset: 512)
@@ -287,14 +254,13 @@ def fake_symm_mem(monkeypatch):
     ("symm_oneshot", 0, True),
 ])
 def test_multimem_needs_multicast(
-    monkeypatch, fake_cuda, fake_symm_mem, caplog, mode, multicast_ptr, builds
+    fake_cuda, fake_symm_mem, caplog, mode, multicast_ptr, builds
 ):
     fake_symm_mem.multicast_ptr = multicast_ptr
-    monkeypatch.setenv(TP_ALLREDUCE_ENV, mode)
     g = _group()
     g.device_group = SimpleNamespace(group_name="tp")
     with caplog.at_level(logging.WARNING, logger=comm.__name__):
-        g._maybe_init_symm_allreduce()
+        g._maybe_init_symm_allreduce(mode)
     assert (g._symm_ar is not None) == builds
     assert any("multicast" in r.getMessage() for r in caplog.records) == (not builds)
 

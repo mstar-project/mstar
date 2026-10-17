@@ -1,9 +1,9 @@
-"""``resolve_dist_timeout`` / ``MSTAR_DIST_TIMEOUT_S``: the process-group timeout knob.
+"""``resolve_dist_timeout``: the process-group timeout knob.
 
 Torch's default (10 min) is shorter than a large checkpoint load at TP8, so a
-deployment opts in via ``dist_timeout_s`` in its config; the env var overrides
-it per process. Unset means ``{}`` — torch's default, untouched. Serving
-collectives go back to torch's default once warmup is done.
+deployment opts in via ``dist_timeout_s`` in its config. Unset means ``{}`` —
+torch's default, untouched. Serving collectives go back to torch's default
+once warmup is done.
 """
 
 from __future__ import annotations
@@ -21,16 +21,10 @@ sys.path.insert(0, ".")
 
 import mstar.distributed.communication as comm_mod
 from mstar.distributed.communication import (
-    DIST_TIMEOUT_ENV,
     CommGroup,
     WorkerParallelGroups,
     resolve_dist_timeout,
 )
-
-
-@pytest.fixture(autouse=True)
-def _clear_env(monkeypatch):
-    monkeypatch.delenv(DIST_TIMEOUT_ENV, raising=False)
 
 
 def test_neither_set_is_torch_default():
@@ -42,33 +36,10 @@ def test_config_alone():
     assert resolve_dist_timeout(7200) == {"timeout": timedelta(seconds=7200)}
 
 
-def test_env_overrides_config(monkeypatch):
-    monkeypatch.setenv(DIST_TIMEOUT_ENV, "90")
-    assert resolve_dist_timeout(7200) == {"timeout": timedelta(seconds=90)}
-    assert resolve_dist_timeout() == {"timeout": timedelta(seconds=90)}
-
-
-def test_blank_env_falls_back_to_config(monkeypatch):
-    monkeypatch.setenv(DIST_TIMEOUT_ENV, "  ")
-    assert resolve_dist_timeout(30) == {"timeout": timedelta(seconds=30)}
-
-
 @pytest.mark.parametrize("bad", [0, -1, -0.5])
 def test_non_positive_config_raises(bad):
     with pytest.raises(ValueError, match="positive"):
         resolve_dist_timeout(bad)
-
-
-def test_non_positive_env_raises(monkeypatch):
-    monkeypatch.setenv(DIST_TIMEOUT_ENV, "0")
-    with pytest.raises(ValueError, match="positive"):
-        resolve_dist_timeout(7200)
-
-
-def test_non_numeric_env_raises(monkeypatch):
-    monkeypatch.setenv(DIST_TIMEOUT_ENV, "soon")
-    with pytest.raises(ValueError, match=DIST_TIMEOUT_ENV):
-        resolve_dist_timeout()
 
 
 def _capture_process_group_calls(monkeypatch):

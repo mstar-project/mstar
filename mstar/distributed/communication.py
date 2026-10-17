@@ -1,6 +1,5 @@
 import logging
 import math
-import os
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -12,15 +11,11 @@ from torch.distributed.distributed_c10d import _set_pg_timeout
 
 logger = logging.getLogger(__name__)
 
-DIST_TIMEOUT_ENV = "MSTAR_DIST_TIMEOUT_S"
-
 # Small-message all-reduce backend: "nccl" (default) or "symm_oneshot" /
-# "symm_multimem", which route messages up to MSTAR_TP_SYMM_AR_MAX_KB through
+# "symm_multimem", which route messages up to ``tp_allreduce_max_kb`` through
 # torch symmetric memory (NVLink one-shot / NVLS multicast). Reduction order
 # differs from NCCL's, so bf16 can differ at the last bit — opt-in, from the
-# deployment config's ``tp_allreduce`` or this env var, which overrides it.
-TP_ALLREDUCE_ENV = "MSTAR_TP_ALLREDUCE"
-TP_SYMM_AR_MAX_KB_ENV = "MSTAR_TP_SYMM_AR_MAX_KB"
+# deployment config's ``tp_allreduce``.
 TP_SYMM_AR_MODES = ("symm_oneshot", "symm_multimem")
 # The symm_mem ops check the message byte size is aligned (at least
 # max(4, element_size)) and vectorize at 16; anything else raises inside
@@ -90,24 +85,15 @@ class _SymmAllReduce:
 
 
 def resolve_dist_timeout(dist_timeout_s: float | None = None) -> dict[str, timedelta]:
-    """Build the ``timeout`` kwarg for ``init_process_group`` / ``new_group``.
-
-    ``MSTAR_DIST_TIMEOUT_S`` overrides the config's ``dist_timeout_s``; with
-    neither set, PyTorch's default applies (``{}``). Large checkpoint loads
-    (hundreds of GB at TP8) exceed that default, so deployments opt in.
+    """Build the ``timeout`` kwarg for ``init_process_group`` / ``new_group``
+    from the config's ``dist_timeout_s``; unset, PyTorch's default applies
+    (``{}``). Large checkpoint loads (hundreds of GB at TP8) exceed that
+    default, so deployments opt in.
     """
-    raw = os.environ.get(DIST_TIMEOUT_ENV, "").strip()
-    if raw:
-        try:
-            dist_timeout_s = float(raw)
-        except ValueError as exc:
-            raise ValueError(
-                f"{DIST_TIMEOUT_ENV} must be a number of seconds, got {raw!r}"
-            ) from exc
     if dist_timeout_s is None:
         return {}
     if dist_timeout_s <= 0:
-        raise ValueError(f"Distributed timeout must be positive, got {dist_timeout_s}")
+        raise ValueError(f"dist_timeout_s must be positive, got {dist_timeout_s}")
     return {"timeout": timedelta(seconds=float(dist_timeout_s))}
 
 
@@ -152,20 +138,18 @@ class CommGroup:
         self, config_mode: str | None = None, config_max_kb: int | None = None,
     ) -> None:
         """Build the symmetric-memory all-reduce path if the deployment
-        config's ``tp_allreduce`` (``config_mode``) or MSTAR_TP_ALLREDUCE,
-        which overrides it, asks for it; ``tp_allreduce_max_kb`` (or
-        MSTAR_TP_SYMM_AR_MAX_KB) sizes it. Collective across the group
-        (rendezvous) — every member calls this from ``init_dist`` at the same
-        point. Falls back to NCCL."""
-        mode = (os.environ.get(TP_ALLREDUCE_ENV) or config_mode or "nccl").strip().lower()
+        config's ``tp_allreduce`` (``config_mode``) asks for it;
+        ``tp_allreduce_max_kb`` (``config_max_kb``) sizes it. Collective
+        across the group (rendezvous) — every member calls this from
+        ``init_dist`` at the same point. Falls back to NCCL."""
+        mode = (config_mode or "nccl").strip().lower()
         if mode not in TP_SYMM_AR_MODES:
             if mode != "nccl":
                 logger.warning("unknown all-reduce mode %r; using NCCL", mode)
             return
         if self.world_size == 1 or self.device_group is None or not torch.cuda.is_available():
             return
-        env_kb = os.environ.get(TP_SYMM_AR_MAX_KB_ENV)
-        max_kb = int(env_kb if env_kb else 512 if config_max_kb is None else config_max_kb)
+        max_kb = 512 if config_max_kb is None else int(config_max_kb)
         if max_kb <= 0:
             return
         try:
@@ -474,10 +458,10 @@ class WorkerParallelGroups:
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
     # Process-group timeout in seconds for load and warmup, from the config's
-    # ``dist_timeout_s``; ``MSTAR_DIST_TIMEOUT_S`` overrides. None = torch default.
+    # ``dist_timeout_s``. None = torch default.
     dist_timeout_s: float | None = None
     # Small-message all-reduce path from the deployment config's
-    # ``tp_allreduce``; MSTAR_TP_ALLREDUCE overrides. None = NCCL.
+    # ``tp_allreduce``. None = NCCL.
     tp_allreduce: str | None = None
     # Largest message it takes, from ``tp_allreduce_max_kb``; None = 512.
     tp_allreduce_max_kb: int | None = None

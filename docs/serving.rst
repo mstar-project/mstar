@@ -198,14 +198,22 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``dist_timeout_s``
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel
        subgroups during weight load and warmup; serving keeps PyTorch's default.
-       Unset keeps PyTorch's default throughout; ``MSTAR_DIST_TIMEOUT_S`` overrides.
+       Unset keeps PyTorch's default throughout. Raise it only where weight load,
+       JIT or CUDA-graph capture can exceed that default.
    * - ``tp_allreduce``
-     - *(optional)* Small-message all-reduce path: ``nccl`` (default),
-       ``symm_oneshot`` or ``symm_multimem`` (see ``MSTAR_TP_ALLREDUCE``, which
-       overrides it).
+     - *(optional)* Small-message all-reduce path of every TP and SP group:
+       ``nccl`` (default), ``symm_oneshot`` or ``symm_multimem``. The last two send
+       contiguous bf16 and fp32 CUDA messages up to ``tp_allreduce_max_kb`` through
+       torch symmetric memory: one-shot reads every peer's buffer over NVLink and
+       reduces locally, multimem uses NVLS multicast (NVSwitch and driver support).
+       Larger messages stay on NCCL. Both are CUDA-graph capturable. Reduction order
+       differs from NCCL's, so bf16 results can differ at the last bit. Falls back
+       to NCCL, with a warning, where symmetric memory cannot be set up on every
+       rank of the group.
    * - ``tp_allreduce_max_kb``
      - *(optional)* Largest message, in KiB, the symmetric-memory path takes;
-       larger ones go to NCCL. Default 512; ``MSTAR_TP_SYMM_AR_MAX_KB`` overrides.
+       larger ones go to NCCL. It is also the size of the buffer each group
+       rendezvouses. Default 512.
    * - ``tp_async_sched``
      - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
        (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
