@@ -1,4 +1,4 @@
-"""Attention as one dense FlashAttention-3 varlen pass."""
+"""Attention as one dense varlen pass: FlashAttention-3, or AITER on ROCm."""
 
 import functools
 import logging
@@ -19,9 +19,9 @@ try:
     from fa3_fwd_interface import flash_attn_varlen_func
 except Exception as _fa3_exc:  # noqa: BLE001
     flash_attn_varlen_func = None
-    _FA3_IMPORT_ERROR: str | None = f"{type(_fa3_exc).__name__}: {_fa3_exc}"
+    _VARLEN_IMPORT_ERROR: str | None = f"{type(_fa3_exc).__name__}: {_fa3_exc}"
 else:
-    _FA3_IMPORT_ERROR = None
+    _VARLEN_IMPORT_ERROR = None
 
 # ROCm has no FA3; AITER's varlen FMHA takes the same call, so dense runs on it
 # there instead of degrading to the paged backend
@@ -29,22 +29,22 @@ if flash_attn_varlen_func is None and torch.version.hip is not None:
     try:
         from aiter import flash_attn_varlen_func
     except Exception as _aiter_exc:  # noqa: BLE001
-        _FA3_IMPORT_ERROR = f"{_FA3_IMPORT_ERROR}; aiter: {type(_aiter_exc).__name__}: {_aiter_exc}"
+        _VARLEN_IMPORT_ERROR = f"{_VARLEN_IMPORT_ERROR}; aiter: {type(_aiter_exc).__name__}: {_aiter_exc}"
     else:
-        _FA3_IMPORT_ERROR = None
+        _VARLEN_IMPORT_ERROR = None
 
 
 @functools.cache
 def _fa3_unavailable_reason() -> str | None:
-    """verify flash attention 3 fwd kernel imports"""
-    return _FA3_IMPORT_ERROR
+    """why no varlen kernel imported: fa3-fwd, and AITER on ROCm"""
+    return _VARLEN_IMPORT_ERROR
 
 
 @functools.cache
 def _warn_dense_fallback(reason: str) -> None:
     logger.warning(
-        "Attention backend 'dense' requested but the fa3-fwd kernel is "
-        "unavailable (%s); using the paged 'flashinfer' backend instead.",
+        "Attention backend 'dense' requested but no varlen kernel is "
+        "available (%s); using the paged 'flashinfer' backend instead.",
         reason,
     )
 
@@ -82,7 +82,7 @@ class _GatheredPrefix:
 
 
 class DenseAttentionManager(AttentionManager):
-    """Attention as one dense FlashAttention-3 varlen pass over a contiguous
+    """Attention as one dense varlen pass (FA3, AITER on ROCm) over a contiguous
     [frozen prefix | fresh tokens] sequence.
 
     For a workload that recomputes every one of its K/V every step and only
