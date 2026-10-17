@@ -141,6 +141,9 @@ class PreprocessWorker:
         self.stop_event = threading.Event()
         # Wakes the thread's idle wait: every producer below signals it.
         self.wakeup = EventWakeup()
+        # The other direction: signalled when chunks land on output_queue, so
+        # the API server's message thread can poll on it instead of sleeping.
+        self.results_wakeup = EventWakeup()
 
         self.per_request_reading_tensors = {}
         self.output_loop_idxs: dict[str, NameToLoopIndices] = {}
@@ -178,6 +181,7 @@ class PreprocessWorker:
                 discard_tensor_queue=self.discard_tensor_queue,
                 stop_event=self.stop_event,
                 wakeup=self.wakeup,
+                results_wakeup=self.results_wakeup,
                 communicator=self.communicator,
                 tensor_manager=self.tensor_manager,
                 model=model,
@@ -412,6 +416,7 @@ class PreprocessWorkerThread:
         model_config: dict | None = None,
         enable_nvtx: bool=False,
         wakeup: EventWakeup | None = None,
+        results_wakeup: EventWakeup | None = None,
     ):
         # keying a stream needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no stream
@@ -462,6 +467,7 @@ class PreprocessWorkerThread:
         # with a bare communicator).
         self.wakeup = wakeup
         self.idle_wait_ms = 20
+        self.results_wakeup = results_wakeup
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -1072,6 +1078,10 @@ class PreprocessWorkerThread:
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
 
+            # getattr: teardown tests build a thread without its constructor
+            results_wakeup = getattr(self, "results_wakeup", None)
+            if results_wakeup is not None and not self.out_queue.empty():
+                results_wakeup.signal()
             if not did_work:
                 idle_wait()
 
