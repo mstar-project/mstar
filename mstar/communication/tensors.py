@@ -302,6 +302,21 @@ EdgeNameToTxInfo = dict[str, TxInfo]
 SourceAndEdgeToRxInfo = dict[tuple[str, str], RxInfo]
 
 
+def _is_dense(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` fills exactly its ``nbytes`` from ``data_ptr()``,
+    with no gaps or overlaps: contiguous up to a permutation of its dims."""
+    if tensor.numel() == 0:
+        return True
+    expected = 1
+    for stride, size in sorted(zip(tensor.stride(), tensor.shape, strict=True)):
+        if size == 1:
+            continue
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
 class TensorCommunicationManager(ABC):
     """Base class for inter-worker tensor transport.
 
@@ -356,6 +371,8 @@ class TensorCommunicationManager(ABC):
         # req_id -> {name -> shards}
         self.buffered_shards: dict[Rid, dict[str, BufferedShards]] = {}
         self.uuid_to_shard_dim: dict[int, int | None] = {}
+        self._flat_copy_stream: torch.cuda.Stream | None = None
+        self._flat_copy_pending = False
 
     @property
     def needs_cpu_tensor(self) -> bool:
@@ -364,7 +381,41 @@ class TensorCommunicationManager(ABC):
         False for transports that read device memory (TCP / RDMA)."""
         return False
 
+    #: Whether a consumer reads a stored tensor as ``nbytes`` contiguous bytes
+    #: from its ``address`` (Mooncake RDMA / TCP), so the store must hold a
+    #: layout that one flat read reproduces. False for transports that
+    #: serialize a contiguous copy at send time (SHM). An attribute, not a
+    #: property: every store call reads it.
+    needs_flat_layout: bool = False
+
     # ---- shared: store ----
+    def _flat_layout(self, tensor: torch.Tensor, sharded: bool) -> torch.Tensor:
+        """``tensor`` if one flat read of its ``nbytes`` from ``data_ptr()``
+        reproduces it, else a contiguous copy. Only for a non-contiguous
+        tensor on a ``needs_flat_layout`` transport.
+
+        A dense permutation (a transpose) is kept as is: the consumer
+        rebuilds it from the strides. A sharded tensor must be contiguous,
+        since its slices are byte ranges of rows. A CUDA copy runs on a side
+        stream so it does not queue behind the next step; the store waits for
+        it before returning the descriptors.
+        """
+        if not sharded and _is_dense(tensor):
+            return tensor
+        if not tensor.is_cuda:
+            return tensor.contiguous()
+        stream = self._flat_copy_stream
+        if stream is None:
+            stream = self._flat_copy_stream = torch.cuda.Stream(device=tensor.device)
+        with torch.cuda.stream(stream):
+            copy = tensor.contiguous()
+        self._flat_copy_pending = True
+        return copy
+
+    def _wait_flat_copies(self) -> None:
+        self._flat_copy_pending = False
+        self._flat_copy_stream.synchronize()
+
     @staticmethod
     def _host_copies_by_tensor(
         tensors: NameToTensorList, cpu_tensors: NameToTensorList | None,
@@ -462,6 +513,7 @@ class TensorCommunicationManager(ABC):
             self._host_copies_by_tensor(tensors, cpu_tensors)
             if out_cpu is not None else {}
         )
+        flat = self.needs_flat_layout
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name, tensor_list in tensors.items():
             tensor_info[name] = []
@@ -474,6 +526,8 @@ class TensorCommunicationManager(ABC):
                 # it here unconditionally so TensorPointerInfo dims/strides
                 # match what receivers will read.
                 canonical = self._ensure_leading_shard_dim(shard_dim, tensor)
+                if flat and not canonical.is_contiguous():
+                    canonical = self._flat_layout(canonical, shard_dim is not None)
                 # Built before the put: the store keeps the descriptor so an
                 # edge can be rebuilt from its uuid alone. This is the same
                 # object the edge carries, so later in-place edits (the
@@ -545,6 +599,8 @@ class TensorCommunicationManager(ABC):
         self.tensor_store.put_tensor_batch_multi(
             request_ids, uuids, canonicals, infos, cpu_tensors=cpus,
         )
+        if self._flat_copy_pending:
+            self._wait_flat_copies()
         return tensor_info
 
     def store_row_outputs_batch(
@@ -587,6 +643,7 @@ class TensorCommunicationManager(ABC):
             tp_rank=tp_rank,
         )
         want_cpu = host_rows is not None and self.needs_cpu_tensor
+        flat = self.needs_flat_layout
         # signal -> the row tensor it views, learned from the first request
         # that has it and checked on every other
         alias: dict[str, str] = {}
@@ -637,6 +694,11 @@ class TensorCommunicationManager(ABC):
                             return None
                         alias[signal] = name
                         if name not in template:
+                            # rows of one tensor share a layout; one that a
+                            # flat read cannot reproduce is copied per tensor
+                            # by the general path
+                            if flat and not row_views[name][0].is_contiguous():
+                                return None
                             template[name] = self._row_template(
                                 views, columns, host_rows if want_cpu else None, name,
                             )
@@ -748,6 +810,7 @@ class TensorCommunicationManager(ABC):
         canonicals: list[torch.Tensor] = []
         want_cpu = cpu_tensors is not None and self.needs_cpu_tensor
         cpus: list[torch.Tensor | None] | None = [] if want_cpu else None
+        flat = self.needs_flat_layout
 
         columnar = self.tensor_store.has_put_tensor_batch_columns
         infos: list[TensorPointerInfo] = []
@@ -806,6 +869,10 @@ class TensorCommunicationManager(ABC):
                         canonical = self._ensure_leading_shard_dim(
                             shard_dim, tensor,
                         )
+                        if flat and not canonical.is_contiguous():
+                            canonical = self._flat_layout(
+                                canonical, shard_dim is not None,
+                            )
                         flat_uuids.append(tensor_uuid)
                         flat_rids.append(request_id)
                         signal_idxs.append(i)
@@ -844,6 +911,8 @@ class TensorCommunicationManager(ABC):
                 self.uuid_to_shard_dim.pop(uuid, None)
                 self.uuid_to_edge_name.pop(uuid, None)
             raise
+        if self._flat_copy_pending:
+            self._wait_flat_copies()
         return StoredOutputs(flat_uuids, flat_rids, signal_idxs, num_tensors)
 
     def _tensor_info(
@@ -1374,6 +1443,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             enable_prof=enable_prof
         )
         self.protocol = protocol
+        # the consumer has the engine copy ``nbytes`` from ``address + offset``
+        # into a buffer it views with the descriptor's strides
+        self.needs_flat_layout = protocol in (CommProtocol.RDMA, CommProtocol.TCP)
         self._async_reader = AsyncMooncakeReader(
             engine._engine, device=device,
             enable_prof=enable_prof
