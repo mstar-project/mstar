@@ -75,12 +75,12 @@ class FeatureExtractor(nn.Module):
         self.layers = nn.Sequential(*layers)
         self.layer_descs = list(layer_descs)
 
-    def output_lengths(self, seq_lens: torch.Tensor) -> torch.Tensor:
-        """Frames each row yields: ``floor((len - kernel) / stride) + 1`` per conv."""
-        lens = seq_lens
+    def output_length(self, num_samples: int) -> int:
+        """Frames a row yields: ``floor((len - kernel) / stride) + 1`` per conv."""
+        n = num_samples
         for _, kernel_size, stride in self.layer_descs:
-            lens = torch.div(lens - kernel_size, stride, rounding_mode="floor") + 1
-        return lens
+            n = (n - kernel_size) // stride + 1
+        return n
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
         # (N, S) -> (N, 1, S) -> (N, C, T) -> (N, T, C)
@@ -195,26 +195,31 @@ class Wav2Vec2CTC(nn.Module):
         self.encoder = Encoder(cfg)
         self.final_proj = nn.Linear(cfg.model_dim, cfg.vocab_size)
 
-    def frame_lengths(self, seq_lens: torch.Tensor) -> torch.Tensor:
-        return self.encoder_frontend.feature_extractor.output_lengths(seq_lens)
+    def frame_lengths(self, seq_lens: list[int]) -> list[int]:
+        return [self.encoder_frontend.feature_extractor.output_length(n) for n in seq_lens]
 
     def forward(
         self,
         waveforms: torch.Tensor,
-        seq_lens: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(N, S)`` waveforms (and their lengths, for a padded batch) ->
-        ``(N, T, vocab)`` logits and each row's valid frame count."""
+        seq_lens: list[int] | None = None,
+    ) -> tuple[torch.Tensor, list[int]]:
+        """``(N, S)`` waveforms (and each row's sample count, for a padded batch) ->
+        ``(N, T, vocab)`` logits and each row's valid frame count.
+
+        The lengths are host ints, so a padded batch is masked without reading
+        anything back from the device."""
         front = self.encoder_frontend
         x = front.feature_extractor(waveforms)
         n, t = x.shape[:2]
-        if seq_lens is None:
-            frame_lens = torch.full((n,), t, dtype=torch.long, device=x.device)
-        else:
-            frame_lens = self.frame_lengths(seq_lens.to(x.device))
-        padded = bool((frame_lens < t).any())
-        frame_mask = torch.arange(t, device=x.device)[None, :] < frame_lens[:, None] if padded else None
+        frame_lens = [t] * n if seq_lens is None else self.frame_lengths(seq_lens)
+        frame_mask = None
+        if any(f < t for f in frame_lens):
+            lens = torch.tensor(frame_lens)
+            if x.is_cuda:
+                lens = lens.pin_memory()
+            lens = lens.to(x.device, non_blocking=True)
+            frame_mask = torch.arange(t, device=x.device)[None, :] < lens[:, None]
         x = front.model_dim_proj(front.post_extract_layer_norm(x))
         x = front.pos_encoder(x, frame_mask)
-        x = self.encoder(x, attention_mask(frame_mask) if padded else None)
+        x = self.encoder(x, None if frame_mask is None else attention_mask(frame_mask))
         return self.final_proj(x), frame_lens

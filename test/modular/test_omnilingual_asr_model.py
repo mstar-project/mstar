@@ -386,18 +386,18 @@ def test_frame_lengths_follow_the_conv_arithmetic():
     model = _random_model(_tiny_config())
     for n in (50, 51, 69, 70, 1000, 1234):
         logits, frames = model(torch.randn(1, n))
-        assert logits.shape[1] == int(frames[0])
+        assert frames == [logits.shape[1]]
     with torch.device("meta"):
         real = Wav2Vec2CTC(ctc_config("300m", "v2"))
     # 1 s -> 49 frames, 40 s -> 1999; 400 samples is the shortest clip with a frame
-    assert real.frame_lengths(torch.tensor([16000, 640000, 400, 399])).tolist() == [49, 1999, 1, 0]
+    assert real.frame_lengths([16000, 640000, 400, 399]) == [49, 1999, 1, 0]
 
 
 def test_padded_batch_matches_single_runs_and_needs_the_mask():
     model = _random_model(_tiny_config())
     torch.manual_seed(1)
     waves = [torch.randn(n) for n in (1200, 700, 333, 1200)]
-    lens = torch.tensor([w.shape[0] for w in waves])
+    lens = [w.shape[0] for w in waves]
     batch = torch.zeros(4, 1200)
     for i, w in enumerate(waves):
         batch[i, : w.shape[0]] = w
@@ -405,13 +405,12 @@ def test_padded_batch_matches_single_runs_and_needs_the_mask():
         logits, frames = model(batch, lens)
         unmasked, _ = model(batch, None)
         for i, w in enumerate(waves):
-            single, n = model(w[None])
-            n = int(n[0])
-            assert int(frames[i]) == n
+            single, (n,) = model(w[None])
+            assert frames[i] == n
             assert torch.allclose(logits[i, :n], single[0], atol=1e-5)
             assert torch.equal(logits[i, :n].argmax(-1), single[0].argmax(-1))
     # without the lengths, the short rows see their padding
-    assert not torch.allclose(unmasked[2, : int(frames[2])], logits[2, : int(frames[2])], atol=1e-3)
+    assert not torch.allclose(unmasked[2, : frames[2]], logits[2, : frames[2]], atol=1e-3)
 
 
 def test_attention_mask_keeps_padded_rows_finite():
@@ -511,6 +510,10 @@ def test_postprocess_drops_blank_and_specials(tiny_model):
     pieces = _vocab(10288)
     expected = pieces[5][0] + " " + pieces[6][0] + UNK_SURFACE
     assert tiny_model.postprocess(ids, "text") == expected.encode("utf-8")
+    # the node emits one id per frame; repeats collapse here, a blank splits a real double
+    frames = torch.tensor([5, 5, 0, 0, 5, 4, 4, 6, 6, 6])
+    double = pieces[5][0] * 2 + " " + pieces[6][0]
+    assert tiny_model.postprocess(frames, "text") == double.encode("utf-8")
     with pytest.raises(ValueError, match="modality"):
         tiny_model.postprocess(ids, "audio")
 
@@ -543,7 +546,8 @@ def test_node_batches_and_matches_single_requests(tiny_model):
     for i, w in enumerate(waves):
         single = _run_node(sub, [w])["r0"]
         assert torch.equal(batched[f"r{i}"], single)
-        assert single.numel() >= 1  # blanks stay in: never an empty emit
+        # one id per valid frame, blanks included: never an empty emit
+        assert single.numel() == sub.model.frame_lengths([w.shape[0]])[0] >= 1
     # any set batches; the step splits it, shortest first, to fit 80 padded seconds
     nodes = [types.SimpleNamespace(input_seq_len=n) for n in (16000, 16000)]
     assert sub.can_batch(None, nodes) and not sub.can_batch(None, nodes[:1])
@@ -560,6 +564,33 @@ def test_node_batches_and_matches_single_requests(tiny_model):
     for i, w in enumerate(short_waves):
         assert torch.equal(split[f"r{i}"], _run_node(sub, [w])["r0"])
     assert sub.max_batch_size(TRANSCRIBE_WALK) == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_node_step_never_waits_on_the_gpu(tiny_model):
+    """A padded step cut into sub-batches launches without a host sync."""
+    sub = tiny_model.get_submodule(ENCODER_NODE, "cuda")
+    small = type(sub)(sub.model, max_batch_size=4, max_batch_seconds=0.5)
+    torch.manual_seed(5)
+    waves = [audio.preprocess(torch.randn(n)).cuda() for n in (6000, 1000, 5000, 2000)]
+    rids = [f"r{i}" for i in range(len(waves))]
+    inputs = [
+        small.prepare_inputs(TRANSCRIBE_WALK, types.SimpleNamespace(request_id=r), {WAVEFORM: [w]})
+        for r, w in zip(rids, waves, strict=True)
+    ]
+    pre = small.preprocess(TRANSCRIBE_WALK, _engine_inputs(rids), inputs)
+    with torch.no_grad():
+        warm = small.forward_batched(TRANSCRIBE_WALK, _engine_inputs(rids), **pre)  # warms the pinned pool
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            out = small.forward_batched(TRANSCRIBE_WALK, _engine_inputs(rids), **pre)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    for r, w in zip(rids, waves, strict=True):
+        ids = out[r][TOKEN_IDS][0]
+        assert ids.is_cuda and ids.numel() == small.model.frame_lengths([w.shape[0]])[0]
+        assert torch.equal(ids, warm[r][TOKEN_IDS][0])
 
 
 def test_load_audio_returns_16k_mono(tiny_model, tmp_path, monkeypatch):

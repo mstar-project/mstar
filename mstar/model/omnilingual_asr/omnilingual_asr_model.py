@@ -9,10 +9,11 @@ Graph (one node, one walk, no state)::
              v   waveform [S] float32
     ┌─ transcribe ────────────────────────────────────────────────────┐
     │  encoder (GPU): wav2vec 2.0 encoder -> CTC head -> argmax over   │
-    │                 valid frames -> collapse repeats                 │
+    │                 valid frames (one id per frame)                  │
     │       └──> token_ids ──> EMIT_TO_CLIENT                          │
     └─────────────────────────────────────────────────────────────────┘
-    postprocess (API server): ids -> text, blank and specials dropped
+    postprocess (API server): collapse repeats -> text, blank and
+        specials dropped
 
 The model takes no language code and no prompt: the CTC head covers every
 language at once (the reference ignores ``lang`` for CTC models too). Sizes
@@ -48,7 +49,7 @@ from mstar.model.omnilingual_asr.config import (
     ctc_config,
     parse_dtype,
 )
-from mstar.model.omnilingual_asr.tokenizer import CharTokenizer
+from mstar.model.omnilingual_asr.tokenizer import CharTokenizer, ctc_collapse
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -198,11 +199,12 @@ class OmnilingualASRModel(Model):
     # -- output ------------------------------------------------------------
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """Collapsed CTC ids -> UTF-8 text; the blank and specials render as nothing."""
+        """Per-frame CTC ids -> UTF-8 text: repeats collapse, and the blank and
+        specials render as nothing."""
         del request_kwargs
         if modality != "text":
             raise ValueError(f"Unsupported Omnilingual ASR output modality: {modality!r}")
-        return self.tokenizer.decode(output.reshape(-1).tolist()).encode("utf-8")
+        return self.tokenizer.decode(ctc_collapse(output.reshape(-1)).tolist()).encode("utf-8")
 
     # -- worker-side construction ------------------------------------------
 

@@ -1,11 +1,13 @@
-"""The Omnilingual ASR CTC node: waveform -> collapsed CTC token ids.
+"""The Omnilingual ASR CTC node: waveform -> per-frame CTC token ids.
 
-One stateless forward per request: the wav2vec 2.0 encoder, the CTC head, a
-per-frame argmax over each request's valid frames and the collapse of
-repeated frames, all on the device. The blank and the other control ids stay
-in the emitted ids; ``OmnilingualASRModel.postprocess`` drops them when it
-turns ids into text, as the reference's decoder does. So a request always
-emits at least one id (one per distinct run of frames), even for silence.
+One stateless forward per request: the wav2vec 2.0 encoder, the CTC head and
+a per-frame argmax over each request's valid frames, on the device. The node
+emits one id per valid frame; ``OmnilingualASRModel.postprocess`` collapses
+repeated frames and drops the blank and the other control ids when it turns
+ids into text, as the reference's decoder does. Collapsing there, on the CPU
+copy, keeps the step free of the device-to-host read a variable-length
+result would need. Row and frame counts come from the host-side lengths, so
+the step never waits on the GPU.
 
 Concurrent requests are batched (up to ``max_batch_size``). Inside a step
 the rows are sorted by length and cut into sub-batches whose padded audio
@@ -27,7 +29,6 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import ExecutingBatch
 from mstar.model.omnilingual_asr.components.wav2vec2 import Wav2Vec2CTC
 from mstar.model.omnilingual_asr.config import SAMPLE_RATE, TOKEN_IDS, WAVEFORM
-from mstar.model.omnilingual_asr.tokenizer import ctc_collapse
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 
@@ -104,21 +105,21 @@ class OmniASRCTCSubmodule(NodeSubmodule):
         return groups
 
     def _transcribe(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
-        """Collapsed argmax ids per row, over the row's valid frames."""
+        """Argmax ids per row, over the row's valid frames."""
         lengths = [w.shape[0] for w in waveforms]
         out: list[torch.Tensor | None] = [None] * len(waveforms)
         for group in self.sub_batches(lengths):
-            longest = max(lengths[row] for row in group)
+            group_lens = [lengths[row] for row in group]
+            longest = max(group_lens)
             batch = waveforms[group[0]].new_zeros(len(group), longest)
             for i, row in enumerate(group):
                 batch[i, : lengths[row]] = waveforms[row]
-            padded = any(lengths[row] < longest for row in group)
-            seq_lens = torch.tensor([lengths[row] for row in group], device=batch.device) if padded else None
+            padded = any(n < longest for n in group_lens)
             with _full_fp32_matmuls(self.dtype == torch.float32 and batch.is_cuda):
-                logits, frame_lens = self.model(batch, seq_lens)
+                logits, frame_lens = self.model(batch, group_lens if padded else None)
             ids = logits.argmax(dim=-1)
-            for i, (row, n) in enumerate(zip(group, frame_lens.tolist(), strict=True)):
-                out[row] = ctc_collapse(ids[i, :n])
+            for i, (row, n) in enumerate(zip(group, frame_lens, strict=True)):
+                out[row] = ids[i, :n]
         return out
 
     def forward(

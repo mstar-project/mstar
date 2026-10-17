@@ -99,13 +99,13 @@ def main():
     tok = port.tokenizer.CharTokenizer.from_file(args.tokenizer)
 
     def run(waves, mask=True):
-        lens = torch.tensor([w.shape[0] for w in waves])
-        batch = torch.zeros(len(waves), int(lens.max()))
+        lens = [w.shape[0] for w in waves]
+        batch = torch.zeros(len(waves), max(lens))
         for i, w in enumerate(waves):
             batch[i, : w.shape[0]] = w
         with torch.inference_mode():
-            logits, frames = model(batch.to(device, dtype), lens.to(device) if mask else None)
-        return logits.float().cpu(), frames.cpu()
+            logits, frames = model(batch.to(device, dtype), lens if mask else None)
+        return logits.float().cpu(), frames
 
     def transcribe(logits, n, tokenizer=tok):
         return tokenizer.decode(port.tokenizer.ctc_greedy_ids(logits, n).tolist())
@@ -176,7 +176,7 @@ def main():
         for i in range(0, len(sub), 4):
             group = sub[i : i + 4]
             logits, _ = run([waves[p] for p in group], mask=False)
-            frames = model.frame_lengths(torch.tensor([waves[p].shape[0] for p in group]))
+            frames = model.frame_lengths([waves[p].shape[0] for p in group])
             m += sum(transcribe(logits[j], int(frames[j])) == records[p]["text"] for j, p in enumerate(group))
         controls["padding_without_mask"] = f"{m}/{len(sub)} transcripts match"
         if args.v1_tokenizer:
