@@ -578,7 +578,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
         return state
 
     def get_device(self):
-        return next(self.parameters()).device
+        # Called per request per step (prepare_inputs); ``parameters()`` walks
+        # the module tree each time. ``_apply`` (to / cuda / to_empty) drops it.
+        device = self.__dict__.get("_cached_device")
+        if device is None:
+            device = self.__dict__["_cached_device"] = next(self.parameters()).device
+        return device
+
+    def _apply(self, fn, recurse=True):
+        self.__dict__.pop("_cached_device", None)
+        return super()._apply(fn, recurse)
 
     @abstractmethod
     def prepare_inputs(

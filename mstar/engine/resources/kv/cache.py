@@ -4,6 +4,8 @@ import queue
 import threading
 
 import torch
+import triton
+import triton.language as tl
 
 from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
 
@@ -53,15 +55,51 @@ class PageAllocator:
         return self.free_pages.qsize()
 
 
+@triton.jit
+def _kv_scatter_nhd_kernel(
+    layer_ptr, k_ptr, v_ptr, page_idx_ptr, cache_idx_ptr,
+    sk_t, sk_h, sk_d, sv_t, sv_h, sv_d,
+    s_page, s_kv, s_slot,
+    D: tl.constexpr, HD: tl.constexpr, BLOCK: tl.constexpr,
+):
+    t = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < HD
+    h, d = offs // D, offs % D
+    page = tl.load(page_idx_ptr + t).to(tl.int64)
+    slot = tl.load(cache_idx_ptr + t).to(tl.int64)
+    # an NHD slot (page, k|v, slot) is num_kv_heads * head_dim contiguous elements
+    dst = layer_ptr + page * s_page + slot * s_slot + offs
+    k = tl.load(k_ptr + t * sk_t + h * sk_h + d * sk_d, mask=mask)
+    v = tl.load(v_ptr + t * sv_t + h * sv_h + d * sv_d, mask=mask)
+    tl.store(dst, k.to(layer_ptr.dtype.element_ty), mask=mask)
+    tl.store(dst + s_kv, v.to(layer_ptr.dtype.element_ty), mask=mask)
+
+
 @torch.compiler.disable
-def _kv_scatter_nhd_eager(
+def _kv_scatter_nhd(
     cache: torch.Tensor, layer_idx: int,
     k: torch.Tensor, v: torch.Tensor,
     page_idx: torch.Tensor, cache_idx: torch.Tensor,
 ) -> None:
     layer = cache[layer_idx]
-    layer[page_idx, 0, cache_idx] = k.to(cache.dtype)
-    layer[page_idx, 1, cache_idx] = v.to(cache.dtype)
+    num_tokens = k.shape[0]
+    _, _, _, num_kv_heads, head_dim = layer.shape
+    if (not layer.is_cuda or num_tokens == 0 or k.dim() != 3 or v.dim() != 3
+            or layer.stride(4) != 1 or layer.stride(3) != head_dim):
+        layer[page_idx, 0, cache_idx] = k.to(cache.dtype)
+        layer[page_idx, 1, cache_idx] = v.to(cache.dtype)
+        return
+    # One kernel for K and V instead of two advanced-index scatters: at decode
+    # width the scatters' index math dominates the copy, once per layer.
+    hd = num_kv_heads * head_dim
+    block = min(triton.next_power_of_2(hd), 2048)
+    _kv_scatter_nhd_kernel[(num_tokens, triton.cdiv(hd, block))](
+        layer, k, v, page_idx, cache_idx,
+        k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1), v.stride(2),
+        layer.stride(0), layer.stride(1), layer.stride(2),
+        D=head_dim, HD=hd, BLOCK=block,
+    )
 
 
 class KVCache:
@@ -184,7 +222,7 @@ class KVCache:
             raise NotImplementedError(
                 f"write_tokens is not implemented for layout {self.layout}."
             )
-        _kv_scatter_nhd_eager(
+        _kv_scatter_nhd(
             self.tensor, layer_idx, k, v, page_idx, cache_idx,
         )
         if return_tensor:

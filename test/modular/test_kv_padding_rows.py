@@ -107,3 +107,38 @@ def test_a_full_arena_still_admits_a_padded_step():
     assert mgr._arena.num_free == 0
     mgr.plan(step, ctx)
     mgr.commit(step, ctx)
+
+
+@requires_cuda
+def test_an_eager_write_under_a_lease_keeps_its_own_addressing_and_skips_padding():
+    """KVStep.eager_write: a leased step whose tokens are written outside the
+    graph (a decoder prefill's encoder context, 20 tokens a request here, under a
+    bucket of 2 prompt tokens) keeps an ordinary plan state sized by its spans,
+    not the slot's static buffers; a write that carries only the real rows lands
+    in their pages and leaves the padding row's (sink) tokens alone."""
+    from mstar.engine.resources import SlotLease
+    from mstar.engine.resources.step import BucketKey
+
+    mgr = _make_manager(max_num_pages=16)
+    real, pad = ["a", "b"], "__cg_LLM_0_0__"
+    for rid in [*real, pad]:
+        mgr.ingest_request(rid)
+    padded = [*real, pad]
+    step = KVStep(segments=tuple(Segment(rid, "ctx", 20) for rid in padded), eager_write=True)
+    ctx = StepContext(
+        request_ids=tuple(real), graph_walk="prefill", slot=0, capture=False,
+        slot_lease=SlotLease(slot=0, bucket=BucketKey(graph_walk="prefill", bs=3, num_tokens=3)),
+    )
+    ctx.set_padded_rids(tuple(padded))
+    sink_before = mgr.kv_cache.tensor[:, SINK_PAGE].clone()
+    assert mgr.admit(step, ctx).ok
+    mgr.plan(step, ctx)
+    state = mgr._current_plan_states["ctx"]
+    assert state.total_tokens == 60 and state.ready is None
+    k = torch.arange(40 * 4, dtype=torch.float32, device="cuda").view(40, 1, 4)
+    mgr.write_kv(k, -k, layer_idx=0, label="ctx")
+    torch.cuda.synchronize()
+    written = mgr.kv_cache.read_tokens(0, state.token_to_page[:40], state.token_to_cache[:40])
+    assert torch.equal(written[:, 0], k) and torch.equal(written[:, 1], -k)
+    assert torch.equal(mgr.kv_cache.tensor[:, SINK_PAGE], sink_before)
+    mgr.commit(step, ctx)

@@ -202,6 +202,15 @@ class FlashInferPrefillWrapper:
         return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
 
 
+def decode_tensor_cores(num_qo_heads: int, num_kv_heads: int) -> bool:
+    """Whether a one-token-per-row decode uses FlashInfer's tensor-core kernel.
+
+    It pads each KV head's query rows to a tile, so it pays off only with
+    enough query heads per KV head; the CUDA-core decode kernel (and its
+    lighter plan) serves MHA and narrow GQA."""
+    return num_qo_heads // num_kv_heads >= 4
+
+
 class FlashInferDecodeWrapper:
     """Batched decode attention with paged KV cache.
 
@@ -233,6 +242,7 @@ class FlashInferDecodeWrapper:
         use_cuda_graph: bool = False,
         enable_nvtx: bool = False,
         backend: str = "auto",
+        use_tensor_cores: bool = True,
     ):
         check_flashinfer_head_dim(head_dim, device)
         self.device = device
@@ -267,7 +277,7 @@ class FlashInferDecodeWrapper:
                 workspace_buffer,
                 "NHD",
                 use_cuda_graph=True,
-                use_tensor_cores=True,
+                use_tensor_cores=use_tensor_cores,
                 paged_kv_indptr_buffer=self._paged_kv_indptr_buf,
                 paged_kv_indices_buffer=self._paged_kv_indices_buf,
                 paged_kv_last_page_len_buffer=self._paged_kv_last_page_len_buf,
@@ -276,7 +286,7 @@ class FlashInferDecodeWrapper:
         else:
             self.attn_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD",
-                use_tensor_cores=True,
+                use_tensor_cores=use_tensor_cores,
                 backend=backend,
             )
 
