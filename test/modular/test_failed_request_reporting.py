@@ -14,12 +14,14 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
 
 
 def _pending(rids, failed):
     return SimpleNamespace(
-        batch=SimpleNamespace(
+        batch=ScheduledBatch(
+            node_name="n", graph_walk="w",
             request_to_worker_graph=dict.fromkeys(rids, "wg0"),
         ),
         node_batch=SimpleNamespace(

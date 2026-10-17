@@ -31,6 +31,7 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     PopRidsOutput,
     ReadyNodeSpec,
+    RequestWalks,
 )
 from mstar.utils.containers import ParallelList
 from mstar.worker.batch_builder import (
@@ -78,21 +79,26 @@ class _Runtime:
     def __init__(self, manager: _Manager):
         self._manager = manager
 
+    # what the worker constructs the real runtime with
+    combined_walk_of: dict = {}
+
+    def _names(self, target, node_name, walk):
+        return target[0] == node_name and target[1] in (
+            walk, self.combined_walk_of.get((node_name, walk)),
+        )
+
     def _scan(self, exclude_rids, target, exclude_target):
-        target_node, target_walk = target if target is not None else (None, None)
-        walk = self._manager._walk
         for queue in self._manager.queues.values():
             for rid, node_names in queue.get_ready_node_names().items():
                 if rid in exclude_rids \
                         or rid not in self._manager.per_request_info:
                     continue
+                walk = self._manager.walk_of(rid)
                 for node_name in node_names:
-                    if target_node is not None and node_name != target_node:
-                        continue
-                    if target_walk is not None and walk != target_walk:
+                    if target is not None and not self._names(target, node_name, walk):
                         continue
                     if exclude_target is not None \
-                            and (node_name, walk) == exclude_target:
+                            and self._names(exclude_target, node_name, walk):
                         continue
                     yield node_name, walk, rid
 
@@ -117,21 +123,36 @@ class _Runtime:
         return "wg0"
 
     def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):
-        del graph_walk
+        return self.pop_walk_rids(
+            node_name, RequestWalks(request_ids, [graph_walk], [0] * len(request_ids)),
+            check_ready,
+        )
+
+    def pop_walk_rids(self, node_name, rows, check_ready=False):
+        self._manager.pops.append((tuple(rows.walks), list(rows.rids)))
+        assert all(
+            self._manager.walk_of(r) == rows.walks[w]
+            for r, w in zip(rows.rids, rows.walk_idx, strict=True)
+        ), "each rid pops under its own walk's worker graph"
         queue = self._manager.queues["wg0"]
         if check_ready:
             ready = queue.get_ready_node_names()
-            for rid in request_ids:
+            for rid in rows.rids:
                 if node_name not in ready.get(rid, ()):
                     return None
-        rids, wg_ids = [], []
-        for rid in request_ids:
+        rids, wg_ids, walk_idx = [], [], []
+        for rid, w in zip(rows.rids, rows.walk_idx, strict=True):
             if queue.pop_ready_nodes(rid, [node_name]):
                 rids.append(rid)
                 wg_ids.append("wg0")
+                walk_idx.append(w)
+        signals = tuple((f"out_{walk}",) for walk in rows.walks)
         return PopRidsOutput(
             wg_ids=ParallelList(rids, wg_ids),
             input_edges=_edge_block(rids),
+            output_signals=signals[0],
+            rid_walk_idx=walk_idx,
+            walk_output_signals=signals,
         )
 
     def get_nodes(self, node_name, rids, wg_ids):
@@ -144,8 +165,8 @@ class _Runtime:
         for rid in rids:
             queue._ready.setdefault(rid, set()).add(node_name)
 
-    def set_in_flight(self, node_name, wg_id, rids, in_flight):
-        del wg_id
+    def set_in_flight(self, node_name, rids, wg_ids, in_flight):
+        del wg_ids
         for rid in rids:
             if in_flight:
                 self._manager.in_flight.add((rid, node_name))
@@ -156,10 +177,13 @@ class _Runtime:
 class _Manager:
     """Stands in for RequestStateManager: one worker graph, one node."""
 
-    def __init__(self, rids, node=NODE, walk=WALK):
+    def __init__(self, rids, node=NODE, walk=WALK, walks=None):
         self.queues = {"wg0": _Queue(rids, node)}
         self.per_request_info = dict.fromkeys(rids, object())
         self._walk = walk
+        # rid -> real walk, overriding ``walk``
+        self.walks = dict(walks or {})
+        self.pops: list = []
         self.runtime = _Runtime(self)
         # (rid, node) pairs marked in flight
         self.in_flight: set = set()
@@ -175,8 +199,11 @@ class _Manager:
         return "default"
 
     def get_graph_walk(self, rid, partition):
-        del rid, partition
-        return self._walk
+        del partition
+        return self.walk_of(rid)
+
+    def walk_of(self, rid):
+        return self.walks.get(rid, self._walk)
 
     def get_fwd_info(self, rid, partition):
         del rid, partition
@@ -186,9 +213,11 @@ class _Manager:
 class _Engine:
     def __init__(
         self, max_bs=None, not_ready=frozenset(), unservable=frozenset(),
-        groups=None,
+        groups=None, row_caps=None,
     ):
         self._max_bs = max_bs
+        # real walk -> rows of it a mixed step may hold
+        self._row_caps = dict(row_caps or {})
         self.not_ready = set(not_ready)
         # rids a resource rejects outright, as opposed to "not yet"
         self.unservable = set(unservable)
@@ -197,8 +226,14 @@ class _Engine:
         # rids check_ready was asked about, in order
         self.checked = []
 
+    def get_max_rows_in_combined(self, node_name, graph_walk):
+        del node_name
+        return self._row_caps.get(graph_walk)
+
     def get_max_batch_size(self, node_name, graph_walk):
-        del node_name, graph_walk
+        del node_name
+        if isinstance(self._max_bs, dict):
+            return self._max_bs.get(graph_walk)
         return self._max_bs
 
     def capture_group(self, node_name, graph_walk, rid, fwd_info):
@@ -235,11 +270,13 @@ def _next_batch(sched: MicroScheduler, manager: _Manager, **kwargs):
     manager per call, so the binding happens here instead.
     """
     sched.runtime = manager.runtime
+    manager.runtime.combined_walk_of = sched.combined_walk_of
     return sched.get_next_batch(manager, **kwargs)
 
 
 def _has_ready(sched: MicroScheduler, manager: _Manager, exclude_target=None):
     sched.runtime = manager.runtime
+    manager.runtime.combined_walk_of = sched.combined_walk_of
     return sched.has_ready_excluding(manager, exclude_target)
 
 
@@ -501,6 +538,21 @@ def test_a_caller_filled_by_its_backlog_does_not_scan():
 
     assert set(batch.request_to_worker_graph) == {f"b{i}" for i in range(8)}
     assert not {"f0", "f1"} & set(engine.checked), "the ready queue was scanned"
+
+
+def test_a_backlog_that_fills_the_step_runs_without_a_scan():
+    """The worker's own scheduling pass too: fresh rows could not join, so
+    checking and popping them only to park them again is wasted."""
+    engine = _Engine(max_bs=4)
+    sched = _scheduler(engine)
+    sched.backlog[(NODE, WALK)] = _batch([f"b{i}" for i in range(4)])
+    manager = _Manager(["f0", "f1"])
+
+    batch = _next_batch(sched, manager)
+
+    assert set(batch.request_to_worker_graph) == {f"b{i}" for i in range(4)}
+    assert not {"f0", "f1"} & set(engine.checked), "the ready queue was scanned"
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"f0", "f1"}
 
 
 def test_a_held_backlog_row_does_not_count_toward_skipping_the_scan():
@@ -938,7 +990,7 @@ def test_the_scheduler_runs_the_configured_builder():
     assert list(batch.request_to_worker_graph) == ["r0", "r2"]
     (request,) = builder.requests
     assert (request.node_name, request.graph_walk) == (NODE, WALK)
-    assert request.max_batch_size == 8
+    assert request.walk_caps == {WALK: 8}
     assert request.capture_group_of == "r2"
 
 
@@ -961,7 +1013,7 @@ def test_fifo_puts_the_backlog_ahead_of_fresh_rows():
         node_name=NODE, graph_walk=WALK,
         backlog=_batch(["b0", "b1"]),
         fresh=_batch(["f0", "f1"]),
-        max_batch_size=3,
+        walk_caps={WALK: 3},
     ))
 
     assert list(result.scheduled.request_to_worker_graph) == ["b0", "b1", "f0"]
@@ -1093,3 +1145,334 @@ def test_a_builder_that_loses_a_row_is_refused():
         _next_batch(sched, _Manager(["r0", "r1", "r2"]))
 
 
+# ── combined walks ──────────────────────────────────────────────────────
+
+MIXED = "mixed"
+
+
+def _combined_scheduler(engine: _Engine, mixes=None) -> MicroScheduler:
+    return MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda name: engine),
+        parallel_leader_nodes={NODE},
+        combined_walk_of={(NODE, "prefill"): MIXED, (NODE, WALK): MIXED},
+        speculation_mixes_walks=mixes,
+    )
+
+
+def test_a_combined_walk_batches_its_walks_together():
+    sched = _combined_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["p0", "d0", "d1"], walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == MIXED
+    assert batch.request_walks == {"p0": "prefill", "d0": WALK, "d1": WALK}
+    assert [sorted(walks) for walks, _ in manager.pops] == [["decode", "prefill"]]  # one call
+
+
+def test_a_combined_batch_of_one_walk_keeps_its_real_label():
+    """A pure-decode step still replays the decode captures."""
+    sched = _combined_scheduler(_Engine(max_bs=8))
+
+    batch = _next_batch(sched, _Manager(["d0", "d1"]))
+
+    assert batch.graph_walk == WALK
+    assert batch.request_walks == {}
+
+
+def test_the_backlog_and_round_robin_key_on_the_combined_walk():
+    sched = _combined_scheduler(_Engine(max_bs=2))
+    manager = _Manager(["p0", "d0", "d1"], walks={"p0": "prefill"})
+    sched.runtime = manager.runtime  # as _next_batch does, for _backlog below
+    # a parked chunk is filed under the combined key, not either real walk,
+    # and carries each row's real walk as the assembly would
+    parked = _batch(["b0"], walk=MIXED)
+    parked.request_walks = {"b0": WALK}
+    sched._backlog((NODE, MIXED), parked)
+    assert set(sched.backlog) == {(NODE, MIXED)}
+
+    first = _next_batch(sched, manager)
+    assert (NODE, MIXED) in sched.node_and_walk_to_last_batch_num
+    # Rows the per-walk cap left out park under the combined key as well --
+    # unlike a row the plain cap pushes out, they cannot run this step
+    # whichever walk holds them, so going back would re-pop them every pass.
+    assert set(sched.backlog) == {(NODE, MIXED)}
+    second = _next_batch(sched, manager)
+
+    assert len(first) + len(second) == 4
+    assert second.walk_of("d1") == WALK
+
+
+def test_a_real_walk_target_takes_its_combined_walks_rows():
+    """The speculation merge names the walk it continues; fresh rows of the
+    other constituent walk ride along."""
+    sched = _combined_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager, target=(NODE, WALK))
+
+    assert set(batch.request_to_worker_graph) == {"p0", "d0"}
+
+
+def test_excluding_a_real_walk_excludes_only_that_walk():
+    """A chain on one walk yields to another walk of its combined walk: the
+    peek counts that walk's rows, and the yield-away takes them."""
+    sched = _combined_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
+
+    assert _has_ready(sched, manager, exclude_target=(NODE, WALK))
+    batch = _next_batch(sched, manager, exclude_target=(NODE, WALK))
+    assert list(batch.request_to_worker_graph) == ["p0"] and batch.graph_walk == "prefill"
+
+
+def test_a_split_keeps_each_halfs_walks():
+    batch = _batch(["p0", "d0", "d1"], walk=MIXED)
+    batch.request_walks = {"p0": "prefill", "d0": WALK, "d1": WALK}
+
+    first, rest = batch.split_off_first(2)
+
+    assert first.request_walks == {"p0": "prefill", "d0": WALK}
+    assert rest.request_walks == {"d1": WALK}
+
+
+def test_a_follower_pops_each_walk_of_a_combined_head():
+    sched = _combined_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
+    sched.runtime = manager.runtime
+    manager.runtime.combined_walk_of = sched.combined_walk_of
+
+    popped = sched.pop_ready_rids(
+        manager, NODE, MIXED, ["p0", "d0"], walks=["prefill", WALK], walk_idx=[0, 1],
+    )
+
+    assert set(popped.wg_ids) == {"p0", "d0"}
+    assert popped.request_walks == {"p0": "prefill", "d0": WALK}
+    assert popped.walk_output_signals == {"prefill": ["out_prefill"], WALK: [f"out_{WALK}"]}
+    assert len(manager.pops) == 1
+
+
+def test_a_follower_pop_is_all_or_none_across_walks():
+    sched = _combined_scheduler(_Engine(max_bs=8))
+    manager = _Manager(["p0"], walks={"p0": "prefill", "d0": WALK})
+    manager.per_request_info["d0"] = object()  # known, but its node is not ready
+    sched.runtime = manager.runtime
+    manager.runtime.combined_walk_of = sched.combined_walk_of
+
+    assert sched.pop_ready_rids(
+        manager, NODE, MIXED, ["p0", "d0"], walks=["prefill", WALK], walk_idx=[0, 1],
+    ) is None
+    assert "p0" in manager.queues["wg0"].get_ready_node_names()
+
+
+def test_a_walk_that_would_shrink_the_step_waits_its_turn():
+    """With no cap of its own, a mixed step takes the smallest of its walks'.
+    Six decode rows fit a decode step of 8; taking the prompt would cap the
+    step at its walk's 2. It is left out, and runs first next step."""
+    sched = _combined_scheduler(_Engine(max_bs={WALK: 8, "prefill": 2}))
+    rids = [f"d{i}" for i in range(3)] + ["p0"] + [f"d{i}" for i in range(3, 6)]
+    manager = _Manager(rids, walks={"p0": "prefill"})
+
+    first = _next_batch(sched, manager)
+    assert first.graph_walk == WALK and len(first) == 6
+    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p0"]
+
+    manager.queues["wg0"]._ready.update({f"d{i}": {NODE} for i in range(6)})
+    second = _next_batch(sched, manager)
+    assert second.graph_walk == MIXED and len(second) == 2
+    assert next(iter(second.request_to_worker_graph)) == "p0"
+
+
+def test_a_combined_walks_own_cap_overrides_its_walks():
+    """The combined walk's own cap (its own captures) bounds a mixed step, not
+    a smaller cap of one of the walks in it: the prompt joins the six."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 2}))
+    rids = [f"d{i}" for i in range(3)] + ["p0"] + [f"d{i}" for i in range(3, 6)]
+    manager = _Manager(rids, walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == MIXED and len(batch) == 7
+    assert (NODE, MIXED) not in sched.backlog
+
+
+def test_a_walk_joins_when_it_costs_nothing():
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 4}))
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == MIXED and len(batch) == 3
+
+
+def test_a_one_walk_step_takes_its_walks_cap_not_the_combined_walks():
+    """Decode-only steps replay the decode graphs, so a smaller mixed cap (the
+    packed captures') must not hold them back."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 4, WALK: 8, "prefill": 4}))
+    manager = _Manager([f"d{i}" for i in range(6)])
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == WALK and len(batch) == 6
+
+
+def test_a_mixed_step_takes_the_combined_walks_cap():
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 4, WALK: 8, "prefill": 8}))
+    manager = _Manager(["p0"] + [f"d{i}" for i in range(6)], walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == MIXED and len(batch) == 4
+
+
+def test_a_mixed_step_takes_at_most_its_row_cap_of_prompts():
+    """Three prompts ready beside decode rows, two allowed in a mixed step:
+    the third is left out and parked, first in line next time."""
+    sched = _combined_scheduler(_Engine(
+        max_bs={MIXED: 8, WALK: 8, "prefill": 8}, row_caps={"prefill": 2},
+    ))
+    manager = _Manager(
+        ["d0", "p0", "p1", "p2", "d1"], walks={"p0": "prefill", "p1": "prefill", "p2": "prefill"},
+    )
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.graph_walk == MIXED
+    assert sorted(batch.request_to_worker_graph) == ["d0", "d1", "p0", "p1"]
+    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p2"]
+
+
+def test_a_one_walk_step_is_not_bound_by_its_row_cap():
+    """The cap is on a step mixing walks: prompts alone fill their own step."""
+    sched = _combined_scheduler(_Engine(
+        max_bs={MIXED: 8, WALK: 8, "prefill": 8}, row_caps={"prefill": 2},
+    ))
+    manager = _Manager(["p0", "p1", "p2"], walks={"p0": "prefill", "p1": "prefill", "p2": "prefill"})
+
+    batch = _next_batch(sched, manager)
+
+    assert len(batch) == 3 and batch.graph_walk == "prefill"
+
+
+def test_a_merge_takes_only_its_own_walk():
+    """A speculation merge on the decode walk takes ready decode rows and
+    leaves a prompt on its queue, where the peek reports it for a yield."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}))
+    manager = _Manager(["p0", "d6"], walks={"p0": "prefill"})
+
+    merged = _next_batch(sched, manager, target=(NODE, WALK), pre_existing_batch_size=6)
+
+    assert list(merged.request_to_worker_graph) == ["d6"]
+    assert (NODE, MIXED) not in sched.backlog
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"p0"}
+    assert _has_ready(sched, manager, exclude_target=(NODE, WALK))
+
+
+def test_a_yield_away_leaves_the_chains_own_parked_rows():
+    """Decode rows parked under the combined walk beside a waiting prompt: a
+    yield-away from decode runs the prompt alone, not a mixed step, and the
+    decode rows stay parked for the chain's next merge."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}))
+    parked = _batch(["d0", "d1"], walk=MIXED)
+    parked.request_walks = {"d0": WALK, "d1": WALK}
+    sched.backlog[(NODE, MIXED)] = parked
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+
+    batch = _next_batch(sched, manager, exclude_target=(NODE, WALK))
+
+    assert list(batch.request_to_worker_graph) == ["p0"] and batch.graph_walk == "prefill"
+    assert sorted(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["d0", "d1"]
+
+
+def test_a_full_merge_leaves_every_row_queued():
+    """Continuing rows at the decode cap: the merge pops nothing, another
+    walk's rows included, and the chain's room is its whole cap."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}))
+    manager = _Manager(["p0", "d9"], walks={"p0": "prefill"})
+
+    merged = _next_batch(sched, manager, target=(NODE, WALK), pre_existing_batch_size=8)
+
+    assert merged is None
+    assert not sched.backlog
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"p0", "d9"}
+    assert sched.room_for_continuing((NODE, WALK)) == 8
+
+
+def test_a_relabelled_step_routes_with_its_own_walks_outputs():
+    """The merged batch keeps its first walk's output names; a step that turns
+    out to be one walk must route with that walk's, or a decode row loses its
+    loop-back edge."""
+    sched = _combined_scheduler(_Engine(max_bs=8, not_ready={"p0"}))
+    backlogged = _batch(["p0"], walk=MIXED)
+    backlogged.request_walks = {"p0": "prefill"}
+    backlogged.output_signals = ["out_prefill"]
+    backlogged.walk_output_signals = {"prefill": ["out_prefill"]}
+    sched.backlog[(NODE, MIXED)] = backlogged
+
+    batch = _next_batch(sched, _Manager(["d0", "d1"]))
+
+    assert batch.graph_walk == WALK
+    assert list(batch.output_signals) == [f"out_{WALK}"]
+
+
+# --- speculation_mixes_walks: a chain that merges its combined walk's other walks
+
+
+@pytest.mark.parametrize("mixes", [{NODE: True}, {NODE: {WALK: True}}])
+def test_a_mixing_merge_takes_another_walks_rows(mixes):
+    """With the setting on for the decode walk, its merge takes a ready
+    prompt too, and the peek no longer counts the prompt as a reason to yield."""
+    sched = _combined_scheduler(_Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}), mixes)
+    manager = _Manager(["p0", "d6"], walks={"p0": "prefill"})
+
+    assert not _has_ready(sched, manager, exclude_target=(NODE, WALK))
+    merged = _next_batch(sched, manager, target=(NODE, WALK), pre_existing_batch_size=6)
+
+    assert sorted(merged.request_to_worker_graph) == ["d6", "p0"]
+    assert merged.request_walks == {"p0": "prefill", "d6": WALK}
+
+
+def test_mixing_is_per_walk():
+    """On for the prompt walk only: the decode chain still keeps to its own walk."""
+    sched = _combined_scheduler(
+        _Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}), {NODE: {"prefill": True}},
+    )
+    manager = _Manager(["p0", "d6"], walks={"p0": "prefill"})
+
+    merged = _next_batch(sched, manager, target=(NODE, WALK), pre_existing_batch_size=6)
+
+    assert list(merged.request_to_worker_graph) == ["d6"]
+    assert sched.speculation_mixes(NODE, "prefill") and not sched.speculation_mixes(NODE, WALK)
+
+
+def test_a_full_mixing_merge_parks_another_walks_rows():
+    """A mixing chain at its cap never yields for its combined walk's other
+    rows, so the merge parks them, and its next room leaves them a place."""
+    sched = _combined_scheduler(
+        _Engine(max_bs={MIXED: 8, WALK: 8, "prefill": 8}), {NODE: {WALK: True}},
+    )
+    manager = _Manager(["p0", "d9"], walks={"p0": "prefill"})
+
+    merged = _next_batch(sched, manager, target=(NODE, WALK), pre_existing_batch_size=8)
+
+    assert merged is None
+    assert list(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["p0"]
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"d9"}
+    assert sched.room_for_continuing((NODE, WALK)) == 7
+
+
+def test_a_mixing_yield_away_skips_the_whole_combined_walk():
+    sched = _combined_scheduler(_Engine(max_bs=8), {NODE: True})
+    manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
+
+    assert not _has_ready(sched, manager, exclude_target=(NODE, WALK))
+
+
+@pytest.mark.parametrize("mixes, error", [
+    ({"other": True}, "has no combined walk"),
+    ({NODE: {"nope": True}}, "in none of its combined walks"),
+    ({NODE: {WALK: "yes"}}, "is not a bool"),
+    ({NODE: 1}, "is not a bool"),
+])
+def test_a_bad_mixing_setting_is_refused(mixes, error):
+    with pytest.raises(ValueError, match=error):
+        _combined_scheduler(_Engine(max_bs=8), mixes)

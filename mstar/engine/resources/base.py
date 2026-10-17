@@ -66,6 +66,11 @@ class EngineResourceInfo:
     dependencies: "Mapping[str, NodeResourceSpec]" = field(
         default_factory=dict
     )
+    # walk -> rows of it a step of its combined walk may hold (None uncapped),
+    # for every walk of this resource's local nodes
+    max_rows_in_combined: "Mapping[str, int | None]" = field(
+        default_factory=dict
+    )
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)
