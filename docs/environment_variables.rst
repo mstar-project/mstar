@@ -64,15 +64,6 @@ Communication
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
-   * - ``MSTAR_GRAPH_COMPILE_MODE``
-     - unset
-     - Overrides the ``torch.compile`` mode of every captured forward
-       (whole forwards and piecewise regions). Unset or empty, each capture
-       config's ``compile_mode`` applies, else ``max-autotune-no-cudagraphs``.
-       ``default`` keeps Inductor's fusion but takes cuBLAS for every GEMM
-       and skips autotuning. An unknown mode fails at import, and so
-       does one with Inductor's own CUDA graphs (``reduce-overhead``,
-       ``max-autotune``).
    * - ``MSTAR_DIST_TIMEOUT_S``
      - config's ``dist_timeout_s``
      - Timeout in seconds for the NCCL world group and its parallel

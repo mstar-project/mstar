@@ -1017,6 +1017,11 @@ Both types share the base ``CudaGraphConfig`` fields:
   engine's eager batch size for the walk. The default is ``True``, so the engine never
   batches beyond a captured size.
 - ``compile`` runs ``torch.compile`` before capture. The default is ``True``.
+- ``compile_mode`` is that ``torch.compile``'s mode. The default, ``None``, is
+  ``max-autotune-no-cudagraphs``. ``default`` keeps Inductor's fusion but takes cuBLAS for
+  every GEMM and skips autotuning. Building the config refuses an unknown mode, and one
+  that turns on Inductor's own CUDA graphs (``reduce-overhead``, ``max-autotune``), which
+  fail inside the runner's capture.
 - ``required`` makes every bucket in the config mandatory. If capture fails locally or
   on another participating rank, warmup raises after rank-wide agreement instead of
   dropping the bucket and falling back to eager execution. The default is ``False``.
@@ -1131,6 +1136,7 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
+- ``compile_mode`` is that ``torch.compile``'s mode, as on ``CudaGraphConfig``.
 - ``required`` makes every declared shape mandatory. If any participating rank cannot
   capture one, warmup raises instead of leaving that shape on the eager path. The default
   is ``False``.

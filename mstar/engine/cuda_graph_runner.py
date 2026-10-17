@@ -26,65 +26,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
-# torch.compile mode for a captured forward. A config names its mode
-# (``compile_mode``); "default" keeps cuBLAS GEMMs with Inductor fusion and
-# skips GEMM autotuning. The env var overrides every config.
-_COMPILE_MODE_ENV = "MSTAR_GRAPH_COMPILE_MODE"
+# torch.compile mode for a captured forward whose config's ``compile_mode`` is None
 _DEFAULT_COMPILE_MODE = "max-autotune-no-cudagraphs"
 
 
-def _validate_compile_mode(mode: str, source: str) -> str:
-    """Raise now rather than inside every capture, where the per-capture
-    fallback would serve the model eager."""
-    if mode == "default":
-        return mode
-    if not mode:
-        # list_mode_options("") is the whole table, and torch.compile skips a falsy mode
-        raise ValueError(f"{source} is empty; name a mode or unset it")
-    try:
-        from torch._inductor import list_mode_options
-
-        options = list_mode_options(mode)
-    except Exception as exc:
-        raise ValueError(
-            f"{source}={mode!r} is not a mode this torch.compile accepts: {exc}"
-        ) from exc
-    if options.get("triton.cudagraphs"):
-        # Inductor's own graphs inside the runner's capture fail it, and the
-        # bucket would serve eager
-        raise ValueError(
-            f"{source}={mode!r} turns on Inductor's CUDA graphs inside the runner's "
-            "capture; use a -no-cudagraphs mode"
-        )
-    return mode
-
-
-def _read_compile_mode_override(environ: Mapping[str, str] | None = None) -> str | None:
-    """The env override, validated at import. Takes the mapping so a test
-    can drive it without reloading this module."""
-    env = os.environ if environ is None else environ
-    # an empty export (MODE=${MODE:-}) means unset, not a mode
-    mode = env.get(_COMPILE_MODE_ENV, "").strip()
-    if not mode:
-        return None
-    return _validate_compile_mode(mode, _COMPILE_MODE_ENV)
-
-
-_COMPILE_MODE_OVERRIDE = _read_compile_mode_override()
-
-
-def resolve_compile_mode(config_mode: str | None) -> str:
-    """The env override, else the config's mode, else the default."""
-    if _COMPILE_MODE_OVERRIDE is not None:
-        return _COMPILE_MODE_OVERRIDE
-    if config_mode is not None:
-        return _validate_compile_mode(config_mode, "compile_mode")
-    return _DEFAULT_COMPILE_MODE
-
-
 def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
+    """``torch.compile``'s arguments for a capture config whose ``compile_mode``
+    is ``config_mode``, which the config checked when it was built."""
     kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": False}
-    mode = resolve_compile_mode(config_mode)
+    mode = _DEFAULT_COMPILE_MODE if config_mode is None else config_mode
+    # "default" is torch.compile's own: Inductor fusion, cuBLAS GEMMs, no autotuning
     if mode != "default":
         kwargs["mode"] = mode
     return kwargs

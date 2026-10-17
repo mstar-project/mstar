@@ -9,6 +9,31 @@ from mstar.engine.resources import SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
 
+def check_compile_mode(mode: str | None) -> str | None:
+    """A capture config's ``compile_mode``, refused at build rather than at capture,
+    where the per-capture fallback would serve the bucket eager."""
+    if mode is None or mode == "default":
+        return mode
+    if not mode:
+        # torch.compile takes a falsy mode for "default"
+        raise ValueError("compile_mode is empty; name a mode or leave it None")
+    try:
+        from torch._inductor import list_mode_options
+
+        options = list_mode_options(mode)
+    except Exception as exc:
+        raise ValueError(
+            f"compile_mode={mode!r} is not a mode this torch.compile accepts: {exc}"
+        ) from exc
+    if options.get("triton.cudagraphs"):
+        # Inductor's own graphs inside the runner's capture fail it
+        raise ValueError(
+            f"compile_mode={mode!r} turns on Inductor's CUDA graphs inside the runner's "
+            "capture; use a -no-cudagraphs mode"
+        )
+    return mode
+
+
 class CudaGraphConfigType(Enum):
     BASIC_BATCHED = "basic_batched"
     FLASH_INFER_PACKED = "flash_infer_packed"
@@ -25,8 +50,7 @@ class CudaGraphConfig(ABC):
         additional_key_info: Any | None = None,
         compile: bool = True, # whether to run torch.compile before cuda graph capture
         # torch.compile mode for the captured forward; None takes the runner's
-        # default (MSTAR_GRAPH_COMPILE_MODE, else max-autotune-no-cudagraphs).
-        # See cuda_graph_runner.resolve_compile_mode.
+        # default, max-autotune-no-cudagraphs
         compile_mode: str | None = None,
 
         # Per-config override for the set of batch sizes to capture
@@ -48,7 +72,7 @@ class CudaGraphConfig(ABC):
         self.replay_graph_walks = replay_graph_walks or [capture_graph_walk]
         self.additional_key_info = additional_key_info
         self.compile = compile
-        self.compile_mode = compile_mode
+        self.compile_mode = check_compile_mode(compile_mode)
         self.capture_batch_sizes = capture_batch_sizes
         self.capture_forward_method = capture_forward_method
         self.caps_eager_batch_size = caps_eager_batch_size
@@ -256,9 +280,12 @@ class PiecewiseCudaGraphConfig(ABC):
     # Whether to torch.compile capture_fn before capture. Default off; the
     # block loop already benefits from graph capture alone.
     compile: bool = False
-    # torch.compile mode for the region; None takes the runner's default
-    # (MSTAR_GRAPH_COMPILE_MODE, else max-autotune-no-cudagraphs)
+    # torch.compile mode for the region; None takes the runner's default,
+    # max-autotune-no-cudagraphs
     compile_mode: str | None = None
+
+    def __post_init__(self):
+        check_compile_mode(self.compile_mode)
 
     @abstractmethod
     def get_config_type(self) -> PiecewiseConfigType:
