@@ -169,7 +169,16 @@ def _api_server_stub(preprocess_worker):
     server.request_lock = threading.Lock()
     server.timeout_seconds = 5.0
     server.enable_nvtx = False
+    server._live = {}
+    server._client_ids = {}
     return server
+
+
+def _register(server, rid, req):
+    """What ``submit_request`` registers, with the request's key equal to its id."""
+    server.pending_requests[rid] = req
+    server._live[rid] = rid
+    server._client_ids[rid] = rid
 
 
 def test_ttl_expiry_with_undelivered_chunks_fails_request():
@@ -227,7 +236,7 @@ def test_stream_carries_error_as_final_chunk():
     req.error = "result delivery timed out; response is incomplete"
     req.error_status = 500
     req.event.set()
-    server.pending_requests["r3"] = req
+    _register(server, "r3", req)
 
     async def _collect():
         return [chunk async for chunk in server.iter_result_chunks("r3")]
@@ -243,7 +252,7 @@ def test_a_chunk_from_another_thread_wakes_the_stream_at_once():
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
     req = _pending_request()
-    server.pending_requests["r4"] = req
+    _register(server, "r4", req)
 
     async def _collect():
         loop = asyncio.get_running_loop()
@@ -315,7 +324,7 @@ def test_chunks_waiting_together_come_as_one_batch():
     req = _pending_request()
     for i in range(3):
         req.chunks.append(ResultChunk(request_id="r5", modality="text", data=f"t{i}".encode()))
-    server.pending_requests["r5"] = req
+    _register(server, "r5", req)
 
     async def _collect():
         batches = server.iter_result_chunk_batches("r5")
@@ -344,7 +353,7 @@ def test_error_tail_is_its_own_last_batch():
     req.error = "result delivery timed out; response is incomplete"
     req.error_status = 500
     req.event.set()
-    server.pending_requests["r6"] = req
+    _register(server, "r6", req)
 
     async def _collect():
         return [[c.modality for c in b] async for b in server.iter_result_chunk_batches("r6")]

@@ -132,12 +132,15 @@ class RustFrontendBridge:
             logger.warning("submit %s failed: %r", rid, e)
             self._err(rid, repr(e))
             return
-        asyncio.get_running_loop().create_task(self._relay(rid))
+        # Bound to this submission now, not when the task first runs: a later
+        # submit in the same receive batch may reuse the rid.
+        chunks = self.server.iter_result_chunks(rid)
+        asyncio.get_running_loop().create_task(self._relay(rid, chunks))
 
-    async def _relay(self, rid: str) -> None:
+    async def _relay(self, rid: str, chunks) -> None:
         """Forward this request's ResultChunks; terminal err on failure."""
         try:
-            async for chunk in self.server.iter_result_chunks(rid):
+            async for chunk in chunks:
                 self._send({
                     "t": "chunk", "rid": rid, "modality": chunk.modality,
                     "data": bytes(chunk.data), "metadata": chunk.metadata,

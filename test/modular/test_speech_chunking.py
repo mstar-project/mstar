@@ -439,10 +439,12 @@ def test_release_request_aborts_only_requests_still_running():
     done.set()
     server = types.SimpleNamespace(
         request_lock=threading.Lock(),
-        pending_requests={"done": types.SimpleNamespace(event=done),
-                          "running": types.SimpleNamespace(event=running)},
-        abort_request=aborted.append,
+        _live={"done": "done#1", "running": "running#2"},
+        pending_requests={"done#1": types.SimpleNamespace(event=done),
+                          "running#2": types.SimpleNamespace(event=running)},
+        _retire=lambda key: None,
+        _abort_key=aborted.append,
     )
     APIServer.release_request(server, "done")
     APIServer.release_request(server, "running")
-    assert aborted == ["running"] and "done" not in server.pending_requests
+    assert aborted == ["running#2"] and "done#1" not in server.pending_requests

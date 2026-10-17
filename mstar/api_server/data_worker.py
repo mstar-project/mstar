@@ -595,7 +595,8 @@ class PreprocessWorkerThread:
                 initial_input_modalities=input.input_modalities,
                 initial_output_modalities=input.output_modalities,
                 input_metadata=input_metadata,
-                model_kwargs=conductor_kwargs
+                model_kwargs=conductor_kwargs,
+                client_request_id=input.client_request_id,
             ),
         )
         self.communicator.send("conductor", msg)

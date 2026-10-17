@@ -219,6 +219,9 @@ class NewRequestConductor(MessageBody):
     initial_output_modalities: list[str]
     input_metadata: dict[str, list[dict]]
     model_kwargs: dict
+    # The client's request_id. ``request_id`` is the API server's key for this
+    # one submission, never reused; the seed still derives from the client's.
+    client_request_id: str | None = None
 
 
 @dataclass
