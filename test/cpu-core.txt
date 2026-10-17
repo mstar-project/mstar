@@ -88,3 +88,4 @@ test/modular/test_worker_in_flight.py
 test/modular/test_qwen3_5_mixed.py
 test/modular/test_qwen3omni_vision_mixed.py
 test/modular/test_flashinfer_force_prefill.py
+test/modular/test_preplan_ahead_spans.py
