@@ -1914,15 +1914,20 @@ class Worker:
             self._reset_skip_plan_flags(spec_batch)
             return False
 
-    def _measure_ahead_spans(self, spec: Speculation) -> None:
+    def _measure_ahead_spans(self, spec: Speculation, pending: PendingBatch | None) -> None:
         """Measure the speculative step's row spans, on the main thread, when
-        that is what lets it lease and pre-plan a packed capture."""
+        that is what lets it lease and pre-plan a packed capture. A continuing
+        row's estimate starts from its span in the step in flight."""
         node_batch = spec.node_batch
         engine = self.engine_manager.get_engine(node_batch.node_name)
         if not engine.wants_ahead_spans(node_batch.node_name, node_batch.step_context.graph_walk):
             return
+        prev = pending.node_batch if pending is not None and spec.is_same_node else None
         with self._span("worker.measure_ahead_spans"):
-            engine.measure_ahead_spans(node_batch, spec.continuing_rids)
+            engine.measure_ahead_spans(node_batch, {
+                rid: prev.seq_len_of(rid) if prev is not None else -1
+                for rid in spec.continuing_rids
+            })
 
     def _reset_skip_plan_flags(self, spec_node_batch: ExecutingBatch) -> None:
         """Drop the pre-plan staged for ``spec_node_batch``.
@@ -4323,7 +4328,7 @@ class Worker:
             # while the main thread sits in await_gpu with the GIL
             # released and N's kernels are still running.
             if plan_executor is not None and self._plans_ahead(spec):
-                self._measure_ahead_spans(spec)
+                self._measure_ahead_spans(spec, pending)
                 spec.plan_future = plan_executor.submit(
                     self._preplan_spec, pending, spec,
                 )

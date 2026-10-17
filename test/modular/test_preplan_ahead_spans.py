@@ -2,7 +2,7 @@
 
 Before ``prepare_inputs`` a packed step has no token count, so its rows are
 measured: a row in hand from its inputs, a row continuing from the step in
-flight from the submodule's prediction. The step leases and declares from
+flight from the submodule's estimate, which starts from its span there. The step leases and declares from
 those spans; once the rows are prepared, a stage they do not match (a cached
 prefix cut a prompt, a row left) is dropped with its lease, so the step plans
 inline rather than replaying a plan for other spans.
@@ -12,19 +12,31 @@ from types import SimpleNamespace
 
 import torch
 
-from mstar.engine.engine import Engine
+from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.step import StepContext
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 from mstar.model.qwen3_5.config import LLM_MIXED
 from mstar.model.qwen3_5.submodules import LLMSubmodule
-from mstar.model.submodule_base import ARNodeInputs, InputSeqLenInfo
+from mstar.model.submodule_base import ARNodeInputs, InputSeqLenInfo, NodeSubmodule
 
 
-class _Submodule:
-    """Decode rows predict one token; a prompt measures its ids."""
+class _Submodule(NodeSubmodule):
+    """Decode rows estimate one token, others the base rule; a prompt
+    measures its ids."""
 
-    def speculative_input_seq_len(self, graph_walk, fwd_info):
-        return 1 if graph_walk == "decode" else None
+    def __init__(self):
+        pass
+
+    def prepare_inputs(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
+        if graph_walk == "decode":
+            return 1
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
     def get_input_sequence_len(self, graph_walk, fwd_info, inputs):
         if "text_inputs" not in inputs:
@@ -67,23 +79,44 @@ def _batch(rids, walks, inputs=None):
     )
 
 
-def test_a_continuing_row_takes_the_prediction_and_a_new_prompt_its_ids():
+def test_a_continuing_row_takes_the_estimate_and_a_new_prompt_its_ids():
     engine, _ = _engine()
     batch = _batch([1, 2], ["decode", "prefill_text"], {2: {"text_inputs": [torch.zeros(9)]}})
 
-    engine.measure_ahead_spans(batch, continuing={1})
+    # row 1 ran its prompt's last 40 tokens in the step in flight
+    engine.measure_ahead_spans(batch, prev_seq_lens={1: 40})
 
     assert batch.ahead_spans == (1, 9)
 
 
-def test_a_continuing_row_without_a_prediction_leaves_the_step_unmeasured():
+def test_a_continuing_row_repeats_its_last_span_on_this_node():
     engine, _ = _engine()
-    batch = _batch([1, 2], ["prefill_text", "decode"], {1: {"text_inputs": [torch.zeros(9)]}})
+    batch = _batch([1, 2], ["prefill_text", "decode"])
 
-    # row 1 continues as a prompt: its length is not the walk's to predict
-    engine.measure_ahead_spans(batch, continuing={1, 2})
+    engine.measure_ahead_spans(batch, prev_seq_lens={1: 128, 2: 1})
+
+    assert batch.ahead_spans == (128, 1)
+
+
+def test_a_row_from_another_node_has_no_estimate():
+    engine, _ = _engine()
+    batch = _batch([1, 2], ["prefill_text", "decode"])
+
+    engine.measure_ahead_spans(batch, prev_seq_lens={1: -1, 2: 1})
 
     assert batch.ahead_spans is None
+
+
+def test_a_prepared_batch_reports_each_rows_tokens():
+    batch = ExecutingBatch(
+        node_name="LLM", per_request_info={},
+        step_context=StepContext(request_ids=[1, 2], graph_walk=LLM_MIXED, slot=0, capture=False),
+    )
+    assert batch.seq_len_of(1) == -1
+    batch.register_prepare_batch([ARNodeInputs(input_seq_len=1), ARNodeInputs(input_seq_len=7)])
+    batch.prepared_rids = (1, 2)
+
+    assert (batch.seq_len_of(1), batch.seq_len_of(2), batch.seq_len_of(3)) == (1, 7, -1)
 
 
 def test_a_prepared_span_that_differs_drops_the_stage_and_its_lease():
@@ -139,8 +172,8 @@ def test_qwen_declares_a_mixed_step_from_spans_as_from_its_rows():
     from_spans = llm.declare_step(LLM_MIXED, [0, 1], ahead)
 
     assert from_spans.segments == from_rows.segments
-    assert llm.speculative_input_seq_len("decode", None) == 1
-    assert llm.speculative_input_seq_len("prefill_text", None) is None
+    assert llm.speculative_input_seq_len("decode", None, 40) == 1
+    assert llm.speculative_input_seq_len("prefill_text", None, 64) == 64
 
 
 def test_orpheus_declares_a_mixed_step_from_spans_as_from_its_rows():
@@ -154,4 +187,4 @@ def test_orpheus_declares_a_mixed_step_from_spans_as_from_its_rows():
     assert llm.declare_step("mixed", [0, 1], ahead).segments == (
         llm.declare_step("mixed", [0, 1], real).segments
     )
-    assert llm.speculative_input_seq_len("decode", None) == 1
+    assert llm.speculative_input_seq_len("decode", None, 12) == 1

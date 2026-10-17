@@ -8,7 +8,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
 
 import torch
 
@@ -310,6 +310,10 @@ class ExecutingBatch:
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
+    # the rows ``inputs`` holds, in order, as prepared; ``seq_len_of`` maps
+    # them to their tokens on first use
+    prepared_rids: tuple[int, ...] = ()
+    _seq_lens: dict[int, int] | None = field(default=None, repr=False)
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[int] = field(default_factory=set)
@@ -397,6 +401,18 @@ class ExecutingBatch:
 
     def register_prepare_batch(self, inputs: list[NodeInputs]):
         self.inputs = inputs
+        self._seq_lens = None
+
+    def seq_len_of(self, rid: int) -> int:
+        """The tokens ``rid`` runs this step; -1 before it is prepared."""
+        if self._seq_lens is None:
+            if self.inputs is None:
+                return -1
+            self._seq_lens = {
+                r: inp.input_seq_len
+                for r, inp in zip(self.prepared_rids, self.inputs, strict=True)
+            }
+        return self._seq_lens.get(rid, -1)
 
     def release_waiters(self):
         """Let anything waiting on this step proceed.
@@ -980,6 +996,7 @@ class Engine:
                 # batch, on the gpu thread before the launch)
                 node_inputs = [uniform] * len(batch.request_ids)
                 batch.register_prepare_batch(node_inputs)
+                batch.prepared_rids = tuple(batch.request_ids)
                 batch.running_batched = submodule.can_batch(
                     batch=batch, model_inputs=node_inputs
                 )
@@ -1021,6 +1038,7 @@ class Engine:
 
         batch.register_prepare_batch(node_inputs)
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
+        batch.prepared_rids = tuple(batch.request_ids)
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
         )
@@ -2327,23 +2345,24 @@ class Engine:
         )
 
     def measure_ahead_spans(
-        self, batch: ExecutingBatch, continuing: Collection[int],
+        self, batch: ExecutingBatch, prev_seq_lens: Mapping[int, int],
     ) -> None:
         """Each row's span before ``prepare_inputs``; unset if any row has none.
 
         A row with its inputs in hand is measured from them. A row continuing
-        from the step in flight has none yet, so its span is the submodule's
-        prediction (``speculative_input_seq_len``), which it gives only where
-        the walk fixes it. A wrong one costs the pre-plan, not correctness:
-        ``settle_preplan`` drops a stage the prepared spans do not match.
+        from the step in flight (a key of ``prev_seq_lens``: its span there,
+        -1 from another node) has none yet, so its span is the submodule's
+        estimate (``speculative_input_seq_len``). A wrong one costs the
+        pre-plan, not correctness: ``settle_preplan`` drops a stage the
+        prepared spans do not match.
         """
         ctx = batch.step_context
         submodule = self._submodules[batch.node_name].submodule
         spans = []
         for rid in batch.request_ids:
             walk, info = ctx.walk_of(rid), batch.per_request_info[rid]
-            if rid in continuing:
-                span = submodule.speculative_input_seq_len(walk, info)
+            if rid in prev_seq_lens:
+                span = submodule.speculative_input_seq_len(walk, info, prev_seq_lens[rid])
             else:
                 measured = submodule.get_input_sequence_len(
                     walk, info, batch.per_request_input_tensors.get(rid, {}),

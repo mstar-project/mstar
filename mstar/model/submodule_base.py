@@ -755,14 +755,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
     def speculative_input_seq_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        prev_seq_len: int,
     ) -> int | None:
-        """The span of a row continuing from the step in flight, predicted
-        before that step's outputs reach it, for walks that fix it (one token
-        a decode step). None, the default, is no prediction: a speculative
-        packed step holding the row is planned inline. Only a hint: a wrong
-        one costs its pre-plan, since the prepared rows are checked against it."""
+        """The span of a row continuing from the step in flight, estimated
+        before that step's outputs reach it. ``prev_seq_len`` is its span in
+        that step, or -1 if it ran on another node. The default repeats the
+        last span on this node and has no estimate otherwise; a walk that
+        fixes its span (one token a decode step) should say so. Only an
+        estimate: a wrong one costs a pre-plan, and the prepared rows are
+        checked against it."""
         del graph_walk, fwd_info
-        return None
+        return prev_seq_len if prev_seq_len >= 0 else None
 
     def declare_inputs_from_spans(
         self, graph_walk: str, spans: Sequence[int], walks: Sequence[str],

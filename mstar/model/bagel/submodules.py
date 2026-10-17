@@ -947,8 +947,10 @@ class LLMSubmodule(ARNodeSubmodule):
 
         return node_inputs
 
-    def speculative_input_seq_len(self, graph_walk, fwd_info):
-        return 1 if graph_walk == "decode" else None
+    def speculative_input_seq_len(self, graph_walk, fwd_info, prev_seq_len):
+        if graph_walk == "decode":
+            return 1
+        return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
     def declare_inputs_from_spans(self, graph_walk, spans, walks, infos):
         # a text row declares its span, walk and guidance (as prepare_inputs
