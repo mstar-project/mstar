@@ -27,7 +27,7 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 
 | Claim | Result |
 | --- | --- |
-| <claim, paraphrased short> | ✅ / ❌ / ⚠️ <the number or a few words of evidence> |
+| <claim, paraphrased short> | ✅ / ❌ / ⚠️ / ➖ <the number or a few words of evidence> |
 
 ### Performance
 
@@ -47,12 +47,22 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 - **Media:** <links when there is media; omit otherwise>
 ```
 
+## Result marks
+
+- ✅ held, ❌ failed on the setup it was measured on, ⚠️ held only partly (some cells, some restarts).
+- ➖ not exercised here, with the reason: the base bug didn't fire on this box (so neither arm can show the fix), or the claim's number came from another GPU, harness or metric and this run can't stand in for it ("not comparable: B200 claim, host-bound H200"). Never ⚠️ for these; ⚠️ says the PR fell short.
+- A case the description hands to another open PR is "owned by #N" with a link, not a ⚠️ here. Test it on that PR, or on both merged, if it matters to the verdict.
+
 ## Rules
 
 - No cost, price, provider, region, driver/library versions or wall time. The hardware line is enough. (Competitor engine versions are fine in the performance table.)
 - A section with nothing in it is left out, not filled with "none".
 - No methodology paragraphs: the protocol follows the benchmarking skill unless a deviation changes how a number reads, and then it's one clause in the caveats line.
 - Every number carries its harness, config and concurrency (AGENTS.md invariant 10), via the table it sits in. A mechanism you inferred but did not check is labeled a hypothesis.
+- Put the exact client command for every number in the report (a collapsed block is fine), so the author can rerun it. Set the client's model-dependent defaults explicitly (`tts_speech_bench --sample-rate` is 24 kHz by default; a 48 kHz model then reads 2x audio-s/s and half the RTF), and say whether a concurrency is closed-loop or one burst (`tts_speech_bench` sends each repeat as a single burst of c).
+- Next to a claimed number, name the claim's GPU, harness and metric when they differ from yours. A mismatch is ➖ not comparable, not a failure.
+- "Within noise" names its rule in one clause, e.g. "inside the spread across restarts of either arm".
+- An output diff between arms needs a same-code control (two processes of one arm). If the same prompts differ in every PR process, suspect a changed input; if a different prompt differs in each process, it is a near-tie fork, so say which pattern you saw.
 - Report what was run, including what failed or was skipped. A suite that could not run is a "Not tested" line, never silently dropped.
 - Length-sensitive metrics (req/s, audio-sec/s, RTF tails) only compare when output volume matches; check `Output bytes` first (benchmarking skill, trap 3).
 - No debugging narrative. State what happened and the evidence.

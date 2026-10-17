@@ -40,9 +40,10 @@ gh pr diff <n>
 
 - **Trust check first.** The box runs the PR's code with the team's persistent storage mounted (HF cache, possibly an HF token). If `author_association` is not `OWNER`, `MEMBER` or `COLLABORATOR`, stop and ask before provisioning; mention anything in the diff that reaches the network, the filesystem outside the repo, or environment variables.
 - A PR based on another feature branch (stacked) is compared against its base branch, not `main`. Say so in the plan.
-- Extract the claims: every behavior or number the description asserts. Each becomes a check.
+- Extract the claims: every behavior or number the description asserts. Each becomes a check. For each claimed number, note the GPU, harness and metric it came from, so the report can say when yours isn't comparable.
+- A case the description hands to another open PR is that PR's: test it there (or on both merged) if it matters, otherwise mark it "owned by #N" in the report.
 - Map touched files to suites with the test matrix. Add the edge cases the diff branches on.
-- Size the box: GPU count from the largest config in the plan, 80 GB-class Hopper or newer.
+- Size the box: GPU count from the largest config in the plan, 80 GB-class Hopper or newer. Prefer the GPU type the claimed numbers came from when it fits the budget.
 - If nothing needs a GPU (docs, CPU-only tests, benchmark scripts without a claimed number), say so and stop.
 - Reference (transformers) parity is for new model code or changes to a model's forward. A PR that serves a new checkpoint on an existing architecture's code inherits that architecture's parity; list it under "Not tested" with that reason.
 
@@ -100,6 +101,8 @@ MSTAR_TP_ASYNC_SCHED=1 ~/server.sh start pr 8100 --timeout 2400 \
 - Each A/B model: main and PR back to back, restart the server between repeats, then the next model. When nothing is being timed, the two arms may run in parallel on disjoint GPUs.
 - `MSTAR_TP_ASYNC_SCHED=1` on any TP/SP config; `MSTAR_SHM_ARENA=1` always (from `env.sh`). Check each server log for `control mesh transport: rust` and `graph runtime: rust`, and on TP configs for `all-reduce fusion workspace:`. On cloud containers without NVSwitch multicast, FlashInfer's MNNVL backend fails, and before #563 mstar fell back to NCCL all-reduce, 1.4–1.6x slower on a 27B TP4 model. The same hosts need `NCCL_NVLS_ENABLE=0` for competitors whose NCCL tries NVLS. Note either in the report when it applies.
 - One `--output-dir` per cell under `$LIVE_RESULTS/bench/<suite>/<arm>/c<conc>.r<rep>/`, stdout tee'd to `bench.log` inside it. Check `failed` in every `results.json` before using a number.
+- Log host load with every perf cell: the 1-minute load average and `nvidia-smi pmon` (with each pid's owner, since other users' processes can land on your GPUs). `gpu_health.py` catches a throttled GPU, not a busy host. A cell run with more than half the cores busy, or with the GPU mostly idle because the host is the bottleneck, is rerun or carries a caveat, and a delta between cells at very different load is not evidence.
+- On a shared machine: run Python from a directory you own (a stray module in a shared `/tmp` gets imported), give each extra server in a job a port from its own range rather than base+1 (the next job's base port is base+1), and give a start that is expected to hang (a bug repro on the base arm) a short `--timeout`.
 - Save media as the test matrix describes. Keep it small: a few representative outputs per suite and arm.
 - If a server fails to start or every request errors on **both** arms, it is an environment problem, not a regression. Fix it or record it under "Not tested", and keep going with the rest of the plan. When the box itself makes the PR's code slower (a kernel backend that fails here and silently falls back, a missing NVLink/NCCL feature), find the setting that works, then rerun the claim checks and the base and competitor arms with it, so the headline numbers reflect the code and not the box. Log every setup problem and its fix in `$LIVE_RESULTS/harness-notes.md` as you go; none of it belongs in the report (see [references/report.md](references/report.md)).
 - Watch the clock against the deadline. If the plan won't fit, cut the lowest-priority suites (test matrix order) and record them as not tested.
