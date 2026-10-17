@@ -81,3 +81,10 @@ test/modular/test_kv_decode_plan_cache.py
 test/modular/test_kv_pinned_index_ring.py
 test/modular/test_kv_plan_host_lens.py
 test/modular/test_sampler_trash_row.py
+test/modular/test_combined_split.py
+test/modular/test_combined_walk_tp_groups.py
+test/modular/test_packed_token_layout.py
+test/modular/test_worker_in_flight.py
+test/modular/test_qwen3_5_mixed.py
+test/modular/test_qwen3omni_vision_mixed.py
+test/modular/test_flashinfer_force_prefill.py
