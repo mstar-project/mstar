@@ -11,6 +11,7 @@ from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
+from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ else:
 
 # ROCm has no FA3; AITER's varlen FMHA takes the same call, so dense runs on it
 # there instead of degrading to the paged backend
-if flash_attn_varlen_func is None and torch.version.hip is not None:
+if flash_attn_varlen_func is None and current_platform.is_rocm():
     try:
         from aiter import flash_attn_varlen_func
     except Exception as _aiter_exc:  # noqa: BLE001
