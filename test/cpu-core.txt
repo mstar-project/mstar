@@ -25,6 +25,7 @@ test/modular/test_binary_framing.py
 test/modular/test_video_frame_protocol.py
 test/modular/test_client_sdk.py
 test/modular/test_request_failure_propagation.py
+test/modular/test_ingest_unpersist.py
 test/modular/test_api_result_delivery.py
 test/modular/test_api_completion_guard.py
 test/modular/test_speculation_external_inputs.py
@@ -53,6 +54,7 @@ test/modular/test_mamba2_resource.py
 test/modular/test_streams.py
 test/modular/test_batched_model_output.py
 test/modular/test_qwen3_5_check_stop_batched.py
+test/modular/test_model_registration.py
 test/modular/test_lazy_publish.py
 test/modular/test_collect_outputs_fast_path.py
 test/modular/test_inline_tokens.py
@@ -71,6 +73,7 @@ test/modular/test_worker_device_loopback.py
 test/modular/test_gc_freeze.py
 test/modular/test_qwen3_5_bucket_knobs.py
 test/modular/test_fast_tokenize.py
+test/modular/test_qwen3_5_config.py
 test/modular/test_wire_codec.py
 test/modular/test_wire_security.py
 test/modular/test_model_kwargs_tensor_transport.py
@@ -81,3 +84,5 @@ test/modular/test_kv_decode_plan_cache.py
 test/modular/test_kv_pinned_index_ring.py
 test/modular/test_kv_plan_host_lens.py
 test/modular/test_sampler_trash_row.py
+test/modular/test_launch_script_socket_prefix.py
+test/modular/test_startup_graph_validation.py

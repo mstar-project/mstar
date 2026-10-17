@@ -138,6 +138,9 @@ HF_MODELS.update({
     f"qwen3_5_{size}b": {"model_path_hf": f"Qwen/Qwen3.5-{size}B"} \
         for size in qwen_3_5_dense_sizes
 })
+# Qwen3.8-27B is the Qwen3.5 architecture (same config.json geometry)
+MODEL_REGISTRY["qwen3_8_27b"] = ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel")
+HF_MODELS["qwen3_8_27b"] = {"model_path_hf": "Qwen/Qwen3.8-27B"}
 
 
 def model_init_kwargs(name: str) -> dict:
