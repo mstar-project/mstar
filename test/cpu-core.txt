@@ -95,7 +95,7 @@ test/modular/test_fused_moe_prefill.py
 test/modular/test_conductor_moe_prebuild.py
 test/modular/test_mla_kv_layout.py
 test/modular/test_quant_fp8.py
-test/modular/test_step_token_budget.py
+test/modular/test_scheduler_room.py
 test/modular/test_symm_allreduce_routing.py
 test/modular/test_kv_offload.py
 test/modular/test_openai_router.py
