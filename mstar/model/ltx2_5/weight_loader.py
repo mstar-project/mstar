@@ -26,15 +26,14 @@ from pathlib import Path
 import torch
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.diffusion.gemma4 import weight_loading as gemma4_weights
 from mstar.model.components.diffusion.weight_loading import (
     iter_diffusers_component,
-    iter_transformers_component,
     load_native,
     materialize,
 )
 from mstar.model.loader.base import StackedParamRule
 from mstar.model.ltx2_5.components.connectors import LTX2TextConnectors
-from mstar.model.ltx2_5.components.gemma4 import Gemma4TextEncoder
 from mstar.model.ltx2_5.components.transformer import LTX2DiT
 from mstar.model.ltx2_5.config import LTX25Config
 
@@ -89,18 +88,7 @@ def build_connectors(config: LTX25Config, snapshot: Path, device, dtype: torch.d
     )
 
 
-_GEMMA_PREFIX = "model.language_model."
-
-
 def build_text_encoder(config: LTX25Config, snapshot: Path, device, dtype: torch.dtype = torch.bfloat16):
-    with torch.device("meta"):
-        module = Gemma4TextEncoder(config.text)
-    materialize(module, dtype, device)
-
-    def skip(name: str) -> bool:
-        return not name.startswith(_GEMMA_PREFIX)
-
-    weights = iter_transformers_component(snapshot / "text_encoder", device, skip=skip)
-    return load_native(
-        module, weights, lambda name: name[len(_GEMMA_PREFIX):], "LTX-2.5 Gemma-4 text encoder",
+    return gemma4_weights.build_text_encoder(
+        config.text, snapshot / "text_encoder", device, dtype, name="LTX-2.5 Gemma-4",
     )

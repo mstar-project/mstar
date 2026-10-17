@@ -7,8 +7,8 @@
 
 Numerics follow the checkpoint dtypes (bf16 weights, fp32 latents between steps and
 fp32 step math), not the engine's autocast: ``LTX25Model.get_autocast_dtype`` is
-None. Each forward mirrors ``LTX2Pipeline``'s op order; see
-``integration_testing/ltx25/parity_notes.md`` for what was verified against it.
+None. Each forward mirrors ``LTX2Pipeline``'s op order; ``test/ltx2_5/parity_harness.py``
+checks each stage against recordings of it.
 """
 
 from __future__ import annotations
@@ -205,7 +205,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
     and four cross-attentions between them, on four resources (self / cross x the
     two head geometries). With no resource bound
     (``attention_backend="sdpa"``), every attention runs SDPA, which is what the
-    reference pipeline runs.
+    reference pipeline runs; so does any attention whose resource is not bound.
     """
 
     SOLVER_STATE = (AUDIO_LATENTS,)
@@ -305,24 +305,20 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         """The six attentions' callables, built once per resource binding: a compiled
         region guards on their identity (see ``DenoiseLoopSubmodule.ragged_for``)."""
         if self._attends is None:
-            keys = (VIDEO_ATTN, AUDIO_ATTN, VIDEO_XATTN, AUDIO_XATTN)
-            bound = [self.node_resources.get(key) for key in keys] if self.use_ragged_attention else []
-            if len(bound) < len(keys) or any(r is None for r in bound):
-                self._attends = LTX2Attends(*([sdpa_attention] * 6))
-            else:
-                video, audio, video_x, audio_x = bound
-
-                def on(resource, label):
-                    # every row has the bucket's spans, so [B, L, H, D] packs per request
-                    return functools.partial(joint_attention, ragged=RaggedAttentionCallable(resource, label))
-                self._attends = LTX2Attends(
-                    video_self=on(video, VIDEO_SPAN),
-                    audio_self=on(audio, AUDIO_SPAN),
-                    video_text=on(video_x, cross_label(VIDEO_SPAN, TEXT_SPAN)),
-                    audio_text=on(audio_x, cross_label(AUDIO_SPAN, TEXT_SPAN)),
-                    audio_to_video=on(audio_x, cross_label(VIDEO_SPAN, AUDIO_SPAN)),
-                    video_to_audio=on(audio_x, cross_label(AUDIO_SPAN, VIDEO_SPAN)),
-                )
+            def on(key, label):
+                resource = self.node_resources.get(key) if self.use_ragged_attention else None
+                if resource is None:
+                    return sdpa_attention
+                # every row has the bucket's spans, so [B, L, H, D] packs per request
+                return functools.partial(joint_attention, ragged=RaggedAttentionCallable(resource, label))
+            self._attends = LTX2Attends(
+                video_self=on(VIDEO_ATTN, VIDEO_SPAN),
+                audio_self=on(AUDIO_ATTN, AUDIO_SPAN),
+                video_text=on(VIDEO_XATTN, cross_label(VIDEO_SPAN, TEXT_SPAN)),
+                audio_text=on(AUDIO_XATTN, cross_label(AUDIO_SPAN, TEXT_SPAN)),
+                audio_to_video=on(AUDIO_XATTN, cross_label(VIDEO_SPAN, AUDIO_SPAN)),
+                video_to_audio=on(AUDIO_XATTN, cross_label(AUDIO_SPAN, VIDEO_SPAN)),
+            )
         return self._attends
 
     def declare_step(

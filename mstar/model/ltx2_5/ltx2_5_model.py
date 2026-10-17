@@ -289,6 +289,11 @@ class LTX25Model(Model):
             raise ValueError(f"LTX-2.5 fps must be a number; got {raw_fps!r}") from None
         if fps <= 0:
             raise ValueError(f"LTX-2.5 fps must be positive; got {raw_fps!r}")
+        if geo.audio_frames(num_frames, fps) < 1:
+            raise ValueError(
+                f"LTX-2.5 num_frames={num_frames} at fps={fps:g} is {num_frames / fps:.3f} s of video, which rounds "
+                f"to no audio latent frames (one is {1 / geo.audio_latents_per_second:.3f} s); lower fps or add frames"
+            )
         stride = geo.spatial_compression
         tokens = geo.latent_frames(num_frames) * (height // stride) * (width // stride)
         if tokens > self.max_video_tokens:

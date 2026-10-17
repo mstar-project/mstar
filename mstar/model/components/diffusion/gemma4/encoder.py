@@ -1,4 +1,4 @@
-"""The Gemma-4 text tower LTX-2.5 encodes prompts with, native and forward-only.
+"""A Gemma-4 text tower as a DiT prompt encoder (LTX-2.5's), native and forward-only.
 
 A port of ``transformers``' ``Gemma4UnifiedTextModel`` (transformers >= 5.5; the
 serving environment pins an older release without it) restricted to what the
@@ -27,11 +27,68 @@ Gemma-4 specifics, from ``modeling_gemma4_unified.py``:
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.ltx2_5.config import GemmaTextConfig
+
+def _gemma4_layer_types(num_layers: int = 48, every: int = 6) -> tuple[str, ...]:
+    """Gemma-4's pattern: every ``every``-th layer global, the rest sliding."""
+    return tuple("full_attention" if (i + 1) % every == 0 else "sliding_attention" for i in range(num_layers))
+
+
+@dataclass(frozen=True)
+class GemmaTextConfig:
+    """``text_encoder/config.json``'s ``text_config`` (Gemma-4 unified), text tower only;
+    the defaults are LTX-2.5's Gemma-4 12B."""
+
+    hidden_size: int = 3840
+    num_hidden_layers: int = 48
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 8
+    head_dim: int = 256
+    global_head_dim: int = 512
+    num_global_key_value_heads: int = 1
+    intermediate_size: int = 15360
+    vocab_size: int = 262144
+    rms_norm_eps: float = 1e-6
+    layer_types: tuple[str, ...] = field(default_factory=_gemma4_layer_types)
+    sliding_window: int = 1024
+    attention_k_eq_v: bool = True
+    rope_parameters: dict = field(default_factory=lambda: {
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        "full_attention": {"rope_type": "proportional", "rope_theta": 1000000.0, "partial_rotary_factor": 0.25},
+    })
+    pad_token_id: int = 0
+
+    @property
+    def sliding_rope_theta(self) -> float:
+        return self.rope_parameters["sliding_attention"]["rope_theta"]
+
+    @property
+    def global_rope_theta(self) -> float:
+        return self.rope_parameters["full_attention"]["rope_theta"]
+
+    @property
+    def global_partial_rotary_factor(self) -> float:
+        return self.rope_parameters["full_attention"].get("partial_rotary_factor", 1.0)
+
+    @classmethod
+    def from_dict(cls, cfg: dict) -> "GemmaTextConfig":
+        tc = cfg.get("text_config", cfg)
+        rope = tc["rope_parameters"]
+        if rope["sliding_attention"]["rope_type"] != "default" or rope["full_attention"]["rope_type"] != "proportional":
+            raise NotImplementedError(f"Gemma-4 port implements default/proportional RoPE; got {rope}")
+        for flag, ok in (("num_kv_shared_layers", 0), ("hidden_size_per_layer_input", 0),
+                         ("enable_moe_block", False), ("use_double_wide_mlp", False), ("attention_bias", False)):
+            if tc.get(flag, ok) != ok:
+                raise NotImplementedError(f"Gemma-4 port does not implement {flag}={tc[flag]!r}")
+        if tc["hidden_activation"] != "gelu_pytorch_tanh":
+            raise NotImplementedError(f"Gemma-4 port implements gelu_pytorch_tanh; got {tc['hidden_activation']}")
+        names = cls.__dataclass_fields__
+        return cls(**{k: tuple(v) if isinstance(v, list) else v for k, v in tc.items() if k in names})
 
 
 class GemmaRMSNorm(nn.Module):
