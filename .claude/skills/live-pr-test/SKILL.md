@@ -99,7 +99,7 @@ MSTAR_TP_ASYNC_SCHED=1 ~/server.sh start pr 8100 --timeout 2400 \
 - `MSTAR_TP_ASYNC_SCHED=1` on any TP/SP config; `MSTAR_SHM_ARENA=1` always (from `env.sh`). Check each server log for `control mesh transport: rust` and `graph runtime: rust`, and on TP configs for `all-reduce fusion workspace:`. On cloud containers without NVSwitch multicast, FlashInfer's MNNVL backend fails, and before #563 mstar fell back to NCCL all-reduce, 1.4–1.6x slower on a 27B TP4 model. The same hosts need `NCCL_NVLS_ENABLE=0` for competitors whose NCCL tries NVLS. Note either in the report when it applies.
 - One `--output-dir` per cell under `$LIVE_RESULTS/bench/<suite>/<arm>/c<conc>.r<rep>/`, stdout tee'd to `bench.log` inside it. Check `failed` in every `results.json` before using a number.
 - Save media as the test matrix describes. Keep it small: a few representative outputs per suite and arm.
-- If a server fails to start or every request errors on **both** arms, it is an environment problem, not a regression. Fix it or record it under "Not tested", and keep going with the rest of the plan.
+- If a server fails to start or every request errors on **both** arms, it is an environment problem, not a regression. Fix it or record it under "Not tested", and keep going with the rest of the plan. When the box itself makes the PR's code slower (a kernel backend that fails here and silently falls back, a missing NVLink/NCCL feature), find the setting that works, then rerun the claim checks and the base and competitor arms with it, so the headline numbers reflect the code and not the box. Log every setup problem and its fix in `$LIVE_RESULTS/harness-notes.md` as you go; none of it belongs in the report (see [references/report.md](references/report.md)).
 - Watch the clock against the deadline. If the plan won't fit, cut the lowest-priority suites (test matrix order) and record them as not tested.
 
 ## 4. Collect and tear down
@@ -116,4 +116,4 @@ Copy back before terminating; the box's local disk goes with it. `save_caches` o
 
 ## 5. Report
 
-Write `report.md` per [references/report.md](references/report.md) into the results directory, then give the requester the verdict, the claims table and regressions table inline, and the path to the directory with the media. Only post to the PR when asked, with the AI-generated header from the report reference.
+Write `report.md` per [references/report.md](references/report.md) into the results directory, then give the requester the verdict, the claims table and regressions table inline, and the path to the directory with the media. The report covers the PR only: setup problems and their fixes go in `harness-notes.md`, and the requester gets one line pointing at it when it is non-empty. Only post to the PR when asked, with the AI-generated header from the report reference.
