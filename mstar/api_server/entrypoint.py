@@ -28,6 +28,7 @@ from mstar.api_server import media_io
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.communication.tensors import ensure_deployment_token
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.profile.display import pretty_print_profile
@@ -303,6 +304,10 @@ class APIServer:
         self.model = model
         self.model_name = model_name
 
+        # This process is the root of the deployment (the conductor and, via
+        # it, the workers are spawned from here and inherit the environment),
+        # so the token is minted before the first tensor manager below.
+        ensure_deployment_token()
         self.preprocess_worker = PreprocessWorker(
             model=model,
             model_config=model_config,

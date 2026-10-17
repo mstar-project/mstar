@@ -266,7 +266,8 @@ def test_instance_unique_names_no_collision(tmp_path):
 
 def test_orphan_sweep(tmp_path):
     """A SIGKILLed server's segments (owner pid gone) are reclaimed by the
-    next construction's sweep; live owners' files are left alone."""
+    next construction's sweep. A segment from a build that never locked it
+    is still spared while its owner pid is visible."""
     dead = "/dev/shm/mstar_arena_zombie_999999999_deadbeef.seg0"
     keep = f"/dev/shm/mstar_arena_alive_{os.getpid()}_cafebabe.seg0"
     with open(dead, "wb") as f:
@@ -283,6 +284,100 @@ def test_orphan_sweep(tmp_path):
                 os.unlink(f)
             except FileNotFoundError:
                 pass
+
+
+def _hide_own_pid(monkeypatch):
+    """What a sweeper in another PID namespace sees: no ``/proc/<our pid>``
+    (``/proc`` is per namespace; ``--ipc=host`` shares only the tmpfs)."""
+    real_exists = os.path.exists
+    hidden = f"/proc/{os.getpid()}"
+    monkeypatch.setattr(
+        os.path, "exists", lambda p: False if p == hidden else real_exists(p))
+    return real_exists
+
+
+def test_start_in_another_pid_namespace_keeps_live_segments(
+    monkeypatch, tmp_path,
+):
+    """A deployment starting in another container that shares /dev/shm used
+    to sweep every live segment of its neighbour: their owner pid is not in
+    its /proc. A consumer that opens one by name afterwards (a grown
+    segment, a restarted consumer) then fails its read."""
+    a = _manager("w_ns_a", tmp_path)
+    x = torch.arange(64, dtype=torch.uint8)
+    infos = a.store_and_return_tensor_info("r", {"x": [x]})
+    a.register_for_send("r", list(infos["x"]))
+    seg_path = a._own_segment_paths[0]
+    assert os.path.exists(seg_path)
+
+    real_exists = _hide_own_pid(monkeypatch)
+    _manager("w_ns_b", tmp_path)
+    monkeypatch.setattr(os.path, "exists", real_exists)
+
+    assert os.path.exists(seg_path), (
+        "a sweep from another PID namespace unlinked a live arena segment")
+    cons = _manager("w_ns_c", tmp_path)
+    edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
+    cons.start_read_tensors("r", [edge])
+    assert torch.equal(cons.tensor_store.get_tensor(infos["x"][0].uuid), x)
+
+
+def test_orphan_sweep_decides_by_the_owners_lock(monkeypatch, tmp_path):
+    """With the owner's pid invisible, the lock alone decides: a segment
+    whose lock is held survives, one whose lock is free is swept."""
+    import fcntl
+
+    shm = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+    pid = os.getpid()
+    held = f"{shm}/mstar_arena_held_{pid}_cafebabe.seg0"
+    dead = f"{shm}/mstar_arena_dead_{pid}_deadbeef.seg0"
+    for path in (held, dead):
+        with open(path, "wb") as f:
+            f.write(b"x" * 64)
+    fd = os.open(held, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _hide_own_pid(monkeypatch)
+        _manager("sweeper_ns", tmp_path)
+        assert os.path.exists(held), "segment with a live lock holder swept"
+        assert not os.path.exists(dead), "segment with a free lock not swept"
+    finally:
+        os.close(fd)
+        for path in (held, dead):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def test_segment_paths_come_from_rust(monkeypatch, tmp_path):
+    """Rust picks the segment directory (``/tmp`` where there is no
+    /dev/shm, as on macOS; here forced with MSTAR_SHM_ARENA_DIR). Python
+    used to assume /dev/shm, so it evicted every live peer mapping, never
+    swept orphans, and its exit finalizer unlinked nothing."""
+    seg_dir = tmp_path / "segments"
+    seg_dir.mkdir()
+    monkeypatch.setenv("MSTAR_SHM_ARENA_DIR", str(seg_dir))
+    stale = seg_dir / "mstar_arena_gone_999999999_deadbeef.seg0"
+    stale.write_bytes(b"x" * 64)
+
+    prod = _manager("w_dir_p", tmp_path)
+    assert not stale.exists(), "orphan in the segment dir not swept"
+    x = torch.arange(64, dtype=torch.uint8)
+    infos = prod.store_and_return_tensor_info("r", {"x": [x]})
+    prod.register_for_send("r", list(infos["x"]))
+    seg = infos["x"][0].shm_segment
+    assert prod._own_segment_paths[0] == str(seg_dir / seg)
+    assert (seg_dir / seg).exists()
+
+    cons = _manager("w_dir_c", tmp_path)
+    edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
+    cons.start_read_tensors("r", [edge])
+    assert torch.equal(cons.tensor_store.get_tensor(infos["x"][0].uuid), x)
+    cons.pending.clear()
+    cons._peer_evict_last = 0.0
+    cons.start_read_tensors("r", [])   # runs the eviction sweep
+    assert seg in cons._peer_segments, "live peer segment evicted"
 
 
 def test_dead_peer_segments_evicted(tmp_path):

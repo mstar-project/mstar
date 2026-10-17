@@ -175,6 +175,12 @@ impl PyShmArena {
         self.arena.bytes_free()
     }
 
+    /// The file backing the arena (empty once a producer has closed it).
+    #[getter]
+    fn path(&self) -> String {
+        self.arena.path().to_string()
+    }
+
     /// `(base_ptr, len)` for the pinning hook — `cudaHostRegister` the
     /// mapping once (e.g. `torch.cuda.cudart().cudaHostRegister(ptr, len, 0)`).
     fn ptr_len(&self) -> (usize, usize) {
@@ -227,6 +233,12 @@ impl PyShmSegment {
     /// `(base_ptr, len)` for the pinning hook (see `ShmArena::ptr_len`).
     fn ptr_len(&self) -> (usize, usize) {
         (self.seg.as_mut_ptr() as usize, self.seg.size())
+    }
+
+    /// The file backing the segment.
+    #[getter]
+    fn path(&self) -> String {
+        self.seg.path().to_string()
     }
 
     unsafe fn __getbuffer__(
@@ -304,6 +316,14 @@ impl PySegmentedShmArena {
         self.arena.segment_name(i)
     }
 
+    /// The file backing segment `i`: Python cleanup and liveness checks use
+    /// this rather than rebuilding the path, so both agree on the directory.
+    fn segment_path(&self, i: usize) -> PyResult<String> {
+        self.arena
+            .segment_path(i)
+            .ok_or_else(|| PyValueError::new_err(format!("no segment {i}")))
+    }
+
     /// Shared buffer-protocol view of segment `i`.
     fn segment(&self, i: usize) -> PyResult<PyShmSegment> {
         self.arena
@@ -313,9 +333,17 @@ impl PySegmentedShmArena {
     }
 }
 
+/// The directory arena segments are created in (`shm::shm_dir`): the one
+/// to list when sweeping orphans or checking whether a peer's segment exists.
+#[pyfunction]
+fn shm_dir() -> String {
+    shm::shm_dir().to_string_lossy().into_owned()
+}
+
 #[pymodule]
 fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add_function(wrap_pyfunction!(shm_dir, m)?)?;
     m.add_class::<PyZmqCommunicator>()?;
     m.add_class::<PyShmArena>()?;
     m.add_class::<PyShmSegment>()?;

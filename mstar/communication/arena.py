@@ -36,6 +36,7 @@ transport. See :doc:`environment_variables` for all knobs.
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import queue
@@ -206,9 +207,12 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             communicator=communicator, shm_dir=shm_dir,
             enable_prof=enable_prof,
         )
-        from mstar_rust import SegmentedShmArena, ShmArena
+        from mstar_rust import SegmentedShmArena, ShmArena, shm_dir
 
         self._ShmArena = ShmArena
+        # Where Rust puts segments (it falls back to /tmp without /dev/shm);
+        # every path built here comes from Rust so the two cannot disagree.
+        self._segment_dir = shm_dir()
         segment_mb = int(os.getenv("MSTAR_SHM_ARENA_SEGMENT_MB", "256"))
         max_segments = int(os.getenv("MSTAR_SHM_ARENA_MAX_SEGMENTS", "32"))
         self._full_timeout_s = float(
@@ -270,7 +274,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # surfacing as ENOSPC on a growth mid-run.
         per_entity_max = (segment_mb << 20) * max_segments
         try:
-            st = os.statvfs("/dev/shm")
+            st = os.statvfs(self._segment_dir)
             shm_total = st.f_frsize * st.f_blocks
             shm_avail = st.f_frsize * st.f_bavail
         except OSError:
@@ -282,14 +286,16 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     f"SHM arena ceiling for ONE entity "
                     f"({per_entity_max >> 20} MiB = "
                     f"MSTAR_SHM_ARENA_MAX_SEGMENTS x _SEGMENT_MB) exceeds "
-                    f"/dev/shm ({shm_total >> 20} MiB) — and every entity "
-                    f"multiplies this. Lower the knobs or grow tmpfs.")
+                    f"{self._segment_dir} ({shm_total >> 20} MiB) — and "
+                    f"every entity multiplies this. Lower the knobs or grow "
+                    f"tmpfs.")
             if per_entity_max > shm_avail:
                 logger.warning(
                     "ARENA: this entity's ceiling (%d MiB) exceeds current "
-                    "/dev/shm free space (%d MiB); ceilings are per-entity "
+                    "%s free space (%d MiB); ceilings are per-entity "
                     "and multiply across workers — growth may hit ENOSPC "
-                    "under load", per_entity_max >> 20, shm_avail >> 20)
+                    "under load", per_entity_max >> 20, self._segment_dir,
+                    shm_avail >> 20)
         try:
             phys = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         except (ValueError, OSError):
@@ -307,8 +313,8 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # and across users (permission-denied at startup). pid + random
         # token makes each instance's names unique; wire-compatibility is
         # free because consumers open whatever segment name the descriptor
-        # carries. The pid embedded in the name also enables the orphan
-        # sweep below.
+        # carries. Liveness for the orphan sweep below comes from the lock
+        # Rust holds on each segment, not from the pid.
         import secrets
 
         self._sweep_orphans()
@@ -367,12 +373,20 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
 
     def _sweep_orphans(self) -> None:
         """A SIGKILLed server never runs Drop, orphaning up to its full
-        arena in /dev/shm until reboot. Names embed the owning pid, so a
-        startup sweep can reclaim any segment whose owner is gone. Files we
-        cannot judge (foreign naming) or cannot remove (another user's)
-        are left with a debug note."""
+        arena until reboot, so a startup sweep reclaims segments whose owner
+        is gone.
+
+        The owner is alive exactly while it holds the exclusive ``flock``
+        Rust takes on each segment it creates, so a segment is unlinked only
+        while this sweep holds that lock itself. A pid cannot decide this:
+        ``/proc`` is per PID namespace, and a deployment in another container
+        sharing the tmpfs (``--ipc=host``, hostIPC) has pids this one cannot
+        see. The pid in the name only VETOES an unlink: segments from builds
+        that never locked are still spared while their owner is visible
+        here. Files we cannot judge (foreign naming) or cannot remove
+        (another user's) are left with a debug note."""
         try:
-            names = os.listdir("/dev/shm")
+            names = os.listdir(self._segment_dir)
         except OSError:
             return
         for name in names:
@@ -382,13 +396,28 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             if len(parts) != 3 or not parts[1].isdigit():
                 continue   # pre-uniquification or foreign naming: skip
             if os.path.exists(f"/proc/{parts[1]}"):
-                continue   # owner alive
+                continue
+            path = os.path.join(self._segment_dir, name)
             try:
-                os.unlink(f"/dev/shm/{name}")
-                logger.info("ARENA: swept orphaned segment %s "
-                            "(owner pid %s is gone)", name, parts[1])
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             except OSError as e:
                 logger.debug("ARENA: cannot sweep %s: %s", name, e)
+                continue
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue   # its owner holds the lock: alive
+                held, named = os.fstat(fd), os.lstat(path)
+                if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+                    continue   # replaced since we opened it
+                os.unlink(path)
+                logger.info("ARENA: swept orphaned segment %s "
+                            "(no live owner holds its lock)", name)
+            except OSError as e:
+                logger.debug("ARENA: cannot sweep %s: %s", name, e)
+            finally:
+                os.close(fd)
 
     def _maybe_pin(self, ptr: int, nbytes: int) -> int:
         """Pin within budget; returns the bytes actually pinned (0 if
@@ -425,7 +454,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             i = len(self._seg_views)
             seg = self._arena.segment(i)
             name = self._arena.segment_name(i)
-            self._own_segment_paths.append(f"/dev/shm/{name}")
+            self._own_segment_paths.append(self._arena.segment_path(i))
             self._seg_names.append(name)
             self._seg_views.append(memoryview(seg))
             self._maybe_pin(*seg.ptr_len())
@@ -535,8 +564,8 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 or now - self._peer_evict_last < 10.0):
             return
         self._peer_evict_last = now
-        for name in list(self._peer_segments):
-            if os.path.exists(f"/dev/shm/{name}"):
+        for name, (peer, _view, _pinned) in list(self._peer_segments.items()):
+            if os.path.exists(peer.path):
                 continue
             with self._pin_lock:
                 arena, view, pinned = self._peer_segments[name]

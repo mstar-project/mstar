@@ -71,6 +71,24 @@ Communication
        extension; raises if missing). ``AUTO``: the arena when the
        extension imports, files otherwise. Must match across the
        deployment — arena locations ride in the tensor descriptors.
+   * - ``MSTAR_DEPLOYMENT_TOKEN``
+     - random per launch
+     - Per-launch token mixed into the SHM tensor-file namespace (read by
+       :func:`mstar.communication.tensors._deployment_namespace`), so two
+       deployments that share ``/dev/shm`` from different containers
+       (``--ipc=host``, hostIPC) never share file names even with the same
+       socket prefix and ports. The API server sets it at startup when unset
+       (:func:`mstar.communication.tensors.ensure_deployment_token`) and the
+       conductor and workers inherit it. Leave it unset; set it only when a
+       launcher starts a deployment's processes separately, to the same value
+       in all of them and a different value per deployment.
+   * - ``MSTAR_SHM_ARENA_DIR``
+     - ``/dev/shm`` (or ``/tmp`` if unavailable)
+     - Directory the SHM arena's segments are created in (read by
+       ``shm_dir`` in ``rust/src/shm.rs``, exposed as
+       ``mstar_rust.shm_dir``). Must be the same for every process of a
+       deployment, since descriptors carry only the segment name, and should
+       be a tmpfs.
    * - ``MSTAR_KV_SHM_DIR``
      - ``/dev/shm`` (or ``/tmp`` if unavailable)
      - Base directory for host-staged KV snapshots when remote KV transfer
