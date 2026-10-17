@@ -1680,11 +1680,18 @@ The ``SamplerSpec`` sets ``enable_repetion_penalty=False``, because ASR transcri
 decodes greedily.
 
 The page counts show how to size a cache for a specific model instead of using the
-default. A sequence is at most ``max_target_positions`` (448) tokens, which is 4 pages per
-request. 128 pages therefore support about 32 concurrent requests and use about 2.7 GB.
-The 2048-page default would use about 43 GB. The fixed 30-second context window is
-``max_source_positions`` (1500) tokens, which is 12 pages per request, so 192 pages
-support about 16 concurrent requests.
+default. Both caches use 128-token pages and hold ``WhisperModel.MAX_CONCURRENT_REQUESTS``
+(64) requests at full length, plus the sink page that every ``KVManager`` keeps out of
+circulation. A sequence is at most ``max_target_positions`` (448) tokens, which is 4 pages
+per request, so the self-attention cache has 64 * 4 + 1 = 257 pages, about 5 GiB for
+large-v3 in bf16. The 2048-page default would use about 40 GiB. The fixed 30-second context
+window is ``max_source_positions`` (1500) tokens, which is 12 pages per request held from
+prefill to the last token, so the context cache has 64 * 12 + 1 = 769 pages, about 15 GiB.
+Sizing the caches is only half of it: ``configs/whisper_large.yaml`` also sets
+``max_concurrent_requests: 64``, so the conductor queues further requests instead of the
+worker offloading decoding requests to admit them. ``WhisperModel.validate_config_yaml``
+refuses at startup a cap that either cache cannot hold after the YAML's ``resources:``
+overrides.
 
 Whisper's ``declare_step`` shows how a write-once context is expressed with spans. The
 context segments have a non-zero span in the prefill step that writes them, and a span of
