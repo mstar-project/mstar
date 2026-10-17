@@ -636,7 +636,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-notes">OmniVoice notes</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-5">Qwen3.5 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b">Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#kokoro-notes">Kokoro notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-tts-notes">Qwen3-TTS notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#nemotron-voicechat-nemotron-duplex-notes">Nemotron VoiceChat (<code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code>) notes</a></li>
@@ -743,67 +743,71 @@ RVQ codec; user speech in, agent text and 22.05 kHz speech out.</p></td>
 <td><p>Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
 attention interleaved with full attention, plus a ViT tower.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">omnivoice</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.8-27B</span></code></p></td>
+<td><p>Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">omnivoice</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">k2-fsa/OmniVoice</span></code></p></td>
 <td><p>Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
 backbone + audio codec. Clones a voice from a reference clip.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-Omni-30B-A3B-Instruct</span></code></p></td>
 <td><p>Omni-modal (text/image/audio/video in, text/audio out): Thinker + Talker + codec.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice</span></code></p></td>
 <td><p>Streaming text-to-speech with built-in speakers: Talker + 12 Hz speech codec.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_1p7b</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_1p7b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice</span></code></p></td>
 <td><p>1.7B CustomVoice: built-in speakers plus style/emotion <code class="docutils literal notranslate"><span class="pre">instruct</span></code> control.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_voicedesign</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_voicedesign</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign</span></code></p></td>
 <td><p>1.7B VoiceDesign: the voice is described by the request’s <code class="docutils literal notranslate"><span class="pre">instruct</span></code> text.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_base</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_base</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-1.7B-Base</span></code></p></td>
 <td><p>1.7B Base: zero-shot voice clone from one reference clip (x-vector, optional in-context transcript).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">facebook/vjepa2-vitl-fpc64-256</span></code></p></td>
 <td><p>V-JEPA 2 video encoder + masked predictor.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">vjepa2-ac-vitg</span></code></p></td>
 <td><p>V-JEPA 2-AC encoder + action-conditioned predictor.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code> <em>(Beta)</em></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3</span></code></p></td>
 <td><p>Encoder-decoder ASR (audio in, transcript out). Beta / un-optimized.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bosonai/higgs-audio-v3-stt</span></code></p></td>
 <td><p>Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code></p></td>
 <td><p>Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">waypoint</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">waypoint</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Overworld/Waypoint-1.5-1B</span></code></p></td>
 <td><p>Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
 frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-4B</span></code></p></td>
 <td><p>FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
 image editing; Qwen3-4B hidden-state text encoder + FLUX.2 VAE. Apache-2.0.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-9B</span></code></p></td>
 <td><p>FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
 the FLUX Non-Commercial License; check it before deploying.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Tongyi-MAI/Z-Image-Turbo</span></code></p></td>
 <td><p>Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
 encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.</p></td>
@@ -839,8 +843,8 @@ sampling loop. Serve it with <code class="docutils literal notranslate"><span cl
 </ul>
 </section>
 </section>
-<section id="qwen3-5-qwen3-5">
-<h2>Qwen3.5 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>)<a class="headerlink" href="#qwen3-5-qwen3-5" title="Link to this heading">#</a></h2>
+<section id="qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b">
+<h2>Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>)<a class="headerlink" href="#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b" title="Link to this heading">#</a></h2>
 <p>Text-and-image chat on the Qwen3.5 dense family (five sizes; MoE variants are
 not supported yet; video is refused). Served on both <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code> and
 <code class="docutils literal notranslate"><span class="pre">/v1/chat/completions</span></code> (image parts included). Images may be interleaved with
@@ -861,6 +865,18 @@ needs FlashInfer’s fused bf16 decode kernel (K = V = 128).</p>
 <code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code> and <code class="docutils literal notranslate"><span class="pre">enable_thinking</span></code> (default true; the template opens
 a <code class="docutils literal notranslate"><span class="pre">&lt;think&gt;</span></code> block) are read by the model but are not OpenAI fields — pass them
 via <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.</p>
+<p>Qwen3.8-27B (<code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>) is the Qwen3.5 architecture and runs on the same
+code, served from <code class="docutils literal notranslate"><span class="pre">configs/qwen3_8_27b_tp4.yaml</span></code> (TP4):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">mstar</span> <span class="n">serve</span> <span class="n">qwen3_8_27b</span> <span class="o">--</span><span class="n">gpus</span> <span class="mi">0</span><span class="p">,</span><span class="mi">1</span><span class="p">,</span><span class="mi">2</span><span class="p">,</span><span class="mi">3</span>
+</pre></div>
+</div>
+<p>Its <code class="docutils literal notranslate"><span class="pre">output_gate_type:</span> <span class="pre">swish</span></code> names the gated DeltaNet norm’s activation,
+which is the SiLU every Qwen3.5 checkpoint already uses. transformers ignores
+the key and hard-codes SiLU, and vLLM reads it the same way. Video is still
+refused and the MTP head is skipped. The chat template’s new
+<code class="docutils literal notranslate"><span class="pre">reasoning_effort</span></code> and <code class="docutils literal notranslate"><span class="pre">preserve_thinking</span></code> are not forwarded: every
+request gets the template’s defaults (<code class="docutils literal notranslate"><span class="pre">xhigh</span></code> and preserved), whatever the
+client sends.</p>
 </section>
 <section id="kokoro-notes">
 <h2>Kokoro notes<a class="headerlink" href="#kokoro-notes" title="Link to this heading">#</a></h2>
@@ -1626,7 +1642,7 @@ fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-notes">OmniVoice notes</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-5">Qwen3.5 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b">Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#kokoro-notes">Kokoro notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-tts-notes">Qwen3-TTS notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#nemotron-voicechat-nemotron-duplex-notes">Nemotron VoiceChat (<code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code>) notes</a></li>
