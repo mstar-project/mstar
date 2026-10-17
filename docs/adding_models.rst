@@ -689,7 +689,13 @@ methods are:
    ``declare_step`` needs a value that ``forward`` does not use, put that value in
    ``resource_step_info``.
 
-``declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None, **kwargs) -> SubmoduleStep | None``
+``get_input_sequence_len(self, graph_walk, fwd_info, inputs, **kwargs) -> InputSeqLenInfo | None`` (optional)
+   Return the length of the row's whole input, before any cached prefix is cut --
+   the engine subtracts what the prefix cache already holds. Return ``None`` for a
+   walk that declares no length, or when the inputs it would measure are absent.
+   Read off input shapes alone: this runs before ``prepare_inputs``.
+
+``declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None, per_request_info=None, **kwargs) -> SubmoduleStep | None``
    Declare what this batch's step does to the node's resources. See
    `Step 4a — Declare the step`_ below.
 
