@@ -226,6 +226,9 @@ CosyVoice3 notes
   ``ref_audio`` clip (with its transcript in ``ref_text`` for zero-shot
   cloning) or a preset from ``voices_dir`` (see ``configs/cosyvoice3.yaml``).
   ``instructions`` carries a style instruction. Output is 24 kHz.
+- Keep the reference clip short, a few seconds like CosyVoice's own 3.5 s
+  prompt clip: with a 23 s clip as the preset, round-trip word error rate rose
+  from 1.4% to 13.4%, with words dropped mid-sentence.
 - The flow's DiT estimator runs in bfloat16 by default; the Euler state, the
   rest of the flow and the HiFT vocoder stay float32 (HiFT's F0 predictor
   float64).

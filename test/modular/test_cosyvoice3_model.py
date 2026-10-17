@@ -440,6 +440,15 @@ def test_adapter_refuses_server_paths_and_leaves_nothing_behind(tmp_path, ref):
     assert not upload.exists() or not any(upload.iterdir())
 
 
+def test_adapter_reports_non_audio_base64_as_not_audio(tmp_path):
+    pytest.importorskip("soundfile")
+    upload = tmp_path / "uploads"
+    blob = base64.b64encode(b"%PDF-1.7 this is not audio" * 8).decode()
+    with pytest.raises(ValueError, match="ref_audio is not audio the server can read"):
+        adapters.CosyVoice3Adapter().speech_to_request(_speech(ref_audio=blob), upload)
+    assert not upload.exists() or not any(upload.iterdir())
+
+
 @pytest.mark.parametrize(
     "error",
     [

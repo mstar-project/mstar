@@ -689,9 +689,11 @@ def _uploaded_ref_audio(ref, upload_dir: Path) -> str:
             return path
         except Exception:  # noqa: BLE001 - not audio the model's loader opens (or no soundfile)
             Path(path).unlink(missing_ok=True)
+    # A path such as /etc/passwd also decodes as base64, so one message covers
+    # both a server path and base64 that is not audio.
     raise ValueError(
-        "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
-        "or base64 audio"
+        "ref_audio is not audio the server can read; send a data URL, an http(s) URL "
+        "or base64 audio (server file paths are refused)"
     )
 
 
