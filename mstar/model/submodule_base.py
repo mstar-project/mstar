@@ -766,13 +766,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
     def declare_inputs_from_spans(
         self, graph_walk: str, spans: Sequence[int], walks: Sequence[str],
+        infos: Sequence[CurrentForwardPassInfo | None],
     ) -> list[NodeInputs] | None:
-        """Rows of these spans and walks to declare a packed step over before
+        """Rows of these spans and walks (and each row's forward info, None
+        for a padding row) to declare a packed step over before
         ``prepare_inputs`` runs, so the step can be pre-planned; None when this
-        walk's ``declare_step`` reads more of a row than its span and walk (the
-        step is then planned inline). Built on the plan thread beside the step
-        in flight, so host-only: no device tensors."""
-        del graph_walk, spans, walks
+        walk's ``declare_step`` reads more of a row than that (the step is then
+        planned inline). Built on the plan thread beside the step in flight,
+        so host-only: no device tensors."""
+        del graph_walk, spans, walks, infos
         return None
 
     def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:

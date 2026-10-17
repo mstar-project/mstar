@@ -682,7 +682,7 @@ class LLMSubmodule(ARNodeSubmodule):
     def speculative_input_seq_len(self, graph_walk, fwd_info):
         return 1 if graph_walk == "decode" else None
 
-    def declare_inputs_from_spans(self, graph_walk, spans, walks):
+    def declare_inputs_from_spans(self, graph_walk, spans, walks, infos):
         # a text row declares its span and walk; its ids only feed the
         # sampler's prompt mask, which a pre-plan leaves alone
         if graph_walk not in ("prefill_text", LLM_MIXED):

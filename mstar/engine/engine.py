@@ -2323,7 +2323,7 @@ class Engine:
         return (
             mgmt.cuda_graph_runner.packs_walk(graph_walk)
             and self.declares_input_sequence_len(node_name)
-            and mgmt.submodule.declare_inputs_from_spans(graph_walk, (), ()) is not None
+            and mgmt.submodule.declare_inputs_from_spans(graph_walk, (), (), ()) is not None
         )
 
     def measure_ahead_spans(
@@ -2425,6 +2425,10 @@ class Engine:
             phase_record("engine.pre_declare", perf_counter() - t0)
         if step is None:
             return False
+        if spans is not None and step.cg_key_info != lease.bucket.cg_key_info:
+            # declared from spans, the step names another capture than the
+            # lease's: a plan staged here would not be the one exec replays
+            return False
         if batch.inputs is not None or (
             not submodule_mgmt.piecewise_runners
             and submodule_mgmt.submodule.step_is_input_free(
@@ -2471,6 +2475,7 @@ class Engine:
         row_walks = [ctx.walk_of(rid) for rid in batch.request_ids] if ctx.request_walks else [walk] * len(spans)
         return submodule.declare_inputs_from_spans(
             walk, (*spans, *(0,) * pad), (*row_walks, *(walk,) * pad),
+            (*(batch.per_request_info[rid] for rid in batch.request_ids), *(None,) * pad),
         )
 
     def preplan_is_stale(self, batch: ExecutingBatch) -> bool:

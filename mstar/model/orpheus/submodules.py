@@ -101,6 +101,19 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             return None
         return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
 
+    def speculative_input_seq_len(self, graph_walk, fwd_info):
+        return 1 if graph_walk == "decode" else None
+
+    def declare_inputs_from_spans(self, graph_walk, spans, walks, infos):
+        # a row declares its span and walk; its ids only feed the sampler's
+        # prompt mask, which a pre-plan leaves alone
+        if graph_walk not in ("prefill", "mixed"):
+            return None
+        return [
+            ARNodeInputs(input_seq_len=span, graph_walk=walk)
+            for span, walk in zip(spans, walks, strict=True)
+        ]
+
     def declare_step(
         self, graph_walk: str,
         request_ids: list[str],

@@ -297,3 +297,22 @@ def test_capture_declares_and_forwards_the_same_guidance(cfg_on):
     assert forwarded["requires_cfg"] is cfg_on, (
         "the forward disagrees with the step it was declared under"
     )
+
+
+@pytest.mark.parametrize("guided", [False, True])
+def test_a_mixed_step_declares_from_spans_as_from_its_rows(guided):
+    submodule = _llm_stub()
+    info = types.SimpleNamespace(step_metadata={"requires_cfg": guided})
+    real = [
+        ARNodeInputs(input_seq_len=4, graph_walk="prefill_text", resource_step_info=guided),
+        ARNodeInputs(input_seq_len=1, graph_walk="decode", resource_step_info=guided),
+    ]
+    ahead = LLMSubmodule.declare_inputs_from_spans(
+        submodule, MIXED_TEXT, (4, 1), ("prefill_text", "decode"), (info, info),
+    )
+
+    from_rows = LLMSubmodule.declare_step(submodule, MIXED_TEXT, ["a", "b"], real)
+    from_spans = LLMSubmodule.declare_step(submodule, MIXED_TEXT, ["a", "b"], ahead)
+
+    assert from_spans.steps["kv"].segments == from_rows.steps["kv"].segments
+    assert from_spans.cg_key_info == from_rows.cg_key_info
