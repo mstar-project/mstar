@@ -246,6 +246,46 @@ def test_a_redeclared_staged_step_unwinds_the_marks_its_pre_admit_set():
     assert kv.offload("a") == 1
 
 
+def test_a_refused_staged_step_drops_its_stage_so_a_retry_admits_afresh():
+    """A refusal of the staged step unwinds what its pre-admit took (here a
+    recurrent slot). The stage has to go with it: left up, a retry of the very
+    same step skips the pre-planning resources as covered and promotes a plan
+    that addresses the slot the unwind freed."""
+    pool, refuser = _pool(max_slots=4), _Refuser()
+    runner = StepRunner({"gdn_state": pool, "z_refuser": refuser})
+    pool.ingest_request("a")
+
+    def declare():
+        return SubmoduleStep(steps={
+            "gdn_state": RecurrentStep(segments=(Segment("a", "main", 1),)),
+            "z_refuser": ResourceStep(),
+        })
+
+    ctx = _ctx("a")
+    staged = declare()
+    staged.set_ctx(ctx)
+    ctx.is_preplan = True
+    assert runner.pre_admit(staged).ok
+    runner.pre_plan(staged)
+    ctx.is_preplan = False
+    assert "main" in pool._slots["a"]
+
+    refuser.refuse = True
+    live = declare()
+    live.set_ctx(ctx)
+    assert not runner.admit(live).ok
+    assert "main" not in pool._slots["a"], "the refused stage kept its slot"
+    assert not runner.staged, "the stage outlived the unwind of its pre-admit"
+
+    refuser.refuse = False
+    retry = declare()
+    retry.set_ctx(ctx)
+    assert runner.admit(retry).ok
+    assert "main" in pool._slots["a"], "the retry ran without a slot"
+    addressing = runner.plan(retry)["gdn_state"]["main"]
+    assert addressing.slot_indices[0].item() == pool._slots["a"]["main"].index
+
+
 # --- one row's admit can be unwound after later rows admitted -----------------
 
 
