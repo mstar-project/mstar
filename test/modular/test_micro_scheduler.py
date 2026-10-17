@@ -787,9 +787,36 @@ def test_a_chain_does_not_yield_to_a_failed_rid():
 # ── round robin ─────────────────────────────────────────────────────────
 
 
+def test_an_empty_step_falls_through_to_the_next_node():
+    """Only the first round-robin pick used to be tried, so a node whose step
+    came out empty left the worker idle for the pass -- and since it is not
+    marked scheduled, round robin picked it again every pass. Under a
+    colocated model that starves the node which frees the first one's pages:
+    snac_decoder waits behind Orpheus's LLM, whose pages only come back once
+    snac_decoder finishes the request."""
+    engine = _Engine(max_bs=8)
+    sched = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda name: engine),
+        parallel_leader_nodes={NODE, "B"},
+    )
+    manager = _Manager(["r0"])
+    manager.per_request_info["r1"] = object()
+    manager.ingest("r1", node="B")
+    # the first key scanned is NODE's; make its step come out empty
+    real = sched._schedule_key
+    sched._schedule_key = lambda rs, key, entries, **kw: (
+        None if key[0] == NODE else real(rs, key, entries, **kw)
+    )
+
+    batch = _next_batch(sched, manager)
+
+    assert batch is not None, "idled behind the node whose step was empty"
+    assert batch.node_name == "B"
+
+
 def test_scheduling_a_batch_advances_the_round_robin_cursor():
     """The regression: the bookkeeping moved out of batch assembly, so every
-    (node, walk) stayed at 0 and `_select_node_rr` kept picking the same one."""
+    (node, walk) stayed at 0 and `_node_rr_order` kept returning it first."""
     sched = _scheduler(_Engine(max_bs=2))
 
     _next_batch(sched, _Manager([f"r{i}" for i in range(4)]))
@@ -1476,3 +1503,73 @@ def test_a_mixing_yield_away_skips_the_whole_combined_walk():
 def test_a_bad_mixing_setting_is_refused(mixes, error):
     with pytest.raises(ValueError, match=error):
         _combined_scheduler(_Engine(max_bs=8), mixes)
+
+
+# ── measured rows ───────────────────────────────────────────────────────
+
+
+class _SizedEngine(_Engine):
+    """Reports each row's length; ``unready`` rows the engine cannot take.
+
+    Readiness does not key on the reported length: admission is the admit
+    path's job, so a declared length never makes a row not-ready.
+    """
+
+    def __init__(self, unready, **kw):
+        super().__init__(**kw)
+        self.unready = set(unready)
+        self.measured = []
+
+    def declares_input_sequence_len(self, node_name):
+        del node_name
+        return True
+
+    def input_sequence_len(self, node_name, graph_walk, request_info, inputs):
+        del node_name, graph_walk, request_info
+        self.measured.append(len(inputs))
+        return SimpleNamespace(seq_len=len(inputs))
+
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True, seq_len_info=None):
+        del seq_len_info
+        if rid in self.unready:
+            return FULL_ADMIT_NOT_READY
+        return super().check_ready(node_name, rid, fwd_info, allow_reload)
+
+
+def test_a_measured_row_is_not_gated_on_its_length():
+    """Every row goes in: a declared length is carried for the step build, it
+    is not an admission decision. The gate that used to live here deadlocked
+    decode, which holds every page and so can never run to free one."""
+    sched = _scheduler(_SizedEngine(unready=set(), max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["r0", "r1", "r2"])
+
+    batch = _next_batch(sched, manager)
+
+    assert list(batch.request_to_worker_graph) == ["r0", "r1", "r2"]
+    assert not sched.backlog
+
+
+def test_a_backlogged_row_the_engine_cannot_take_stays_parked():
+    sched = _scheduler(_SizedEngine(unready={"b1"}, max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
+
+    batch = _next_batch(sched, _Manager([]))
+
+    assert list(batch.request_to_worker_graph) == ["b0"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b1"]
+
+
+def test_a_parked_row_is_measured_once_and_checked_once_per_pass():
+    engine = _SizedEngine(unready={"b1"}, max_bs=8)
+    sched = _scheduler(engine)
+    sched.get_tensor = lambda uuid: uuid
+    sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
+
+    _next_batch(sched, _Manager([]))
+    _next_batch(sched, _Manager([]))
+
+    assert len(engine.measured) == 2, "b0 once, b1 once though it waited two passes"
+    assert engine.checked == ["b0"], "one check per row, with its length"
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b1"]
