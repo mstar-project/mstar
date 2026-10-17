@@ -587,10 +587,7 @@ pub struct GraphRuntime {
         spec_nodes
             .into_iter()
             .filter(|sn| {
-                // The DESTINATION opts out of async scheduling. Mirrors the
-                // source-side check the caller already made; without it a
-                // structurally ineligible destination is picked here and then
-                // dropped per rid.
+                // The destination opts out of async scheduling too.
                 g.node(sn.node).async_enabled
                     && self.async_checker.can_speculate(
                         g.node(source).name, g.node(sn.node).name,
@@ -978,10 +975,8 @@ pub struct GraphRuntime {
         self.node_owner.get(&(w, n)).copied()
     }
 
-    /// Whether ANY worker graph in the deployment runs `node` in `walk`, this
-    /// worker's or another's. `node_owner` only holds the local ones, so it
-    /// cannot tell "somebody else's" from "nobody's"; Python keys its index on
-    /// the conductor's deployment-wide maps and so draws that line for free.
+    /// Whether any worker graph in the deployment, local or remote, runs `node`
+    /// in `walk`.
     fn runs_anywhere(&self, node: &str, walk: &str) -> bool {
         let (Some(n), Some(w)) = (self.interner.get(node), self.interner.get(walk))
         else {
@@ -1536,11 +1531,8 @@ impl GraphRuntime {
         let states: Vec<Vec<Option<RequestState>>> =
             (0..graphs.len()).map(|_| Vec::new()).collect();
 
-        // Local worker graph metadata; the remote ones are appended just below
-        // from `remote_worker_graphs`, which rust.py derives from the
-        // conductor's all_worker_graph_ids_to_* maps. Both halves are in place
-        // before any request arrives, so a lookup over this answers for the
-        // whole deployment and not just what this worker owns.
+        // Local worker graphs; the remote ones are appended below, before any
+        // request arrives.
         let mut all_worker_graphs = Vec::with_capacity(worker_graphs.len());
         let mut walk_to_local_wgs: FxHashMap<Sym, Vec<WgIndex>> = FxHashMap::default();
         for (idx, wga) in worker_graphs.iter().enumerate() {
@@ -2217,12 +2209,8 @@ impl GraphRuntime {
                 graph_walks.len(),
             )));
         }
-        // (worker graph, node) per walk. A walk some OTHER worker owns pops
-        // nothing, but a pair no worker graph anywhere runs is a structural
-        // error -- the split PythonGraphRuntime makes by consulting the
-        // deployment-wide index before its own queues. Collapsing the two into
-        // None let a bad (node, walk) read to the scheduler as "nothing ready
-        // yet", so it retried forever instead of failing.
+        // (worker graph, node) per walk: another worker's walk pops nothing; a
+        // walk no worker graph runs is an error, not "nothing ready yet".
         let mut targets = Vec::with_capacity(graph_walks.len());
         for walk in &graph_walks {
             let Some(wg) = self.owner_of(node_name, walk) else {
@@ -2303,10 +2291,8 @@ impl GraphRuntime {
 
     /// Which nodes could run next, after the current node's outputs land.
     ///
-    /// Takes one sample rid per walk in the batch and returns every walk's
-    /// targets, each naming its walk; the caller picks. Filters for async
-    /// eligibility, per walk; the per-rid loop-completion filter lives in
-    /// prep_spec_rids.
+    /// One sample rid per walk; returns every walk's targets for the caller to
+    /// pick, filtered for async eligibility per walk.
     fn speculate_node(
         &mut self, node_name: &str, graph_walks: Vec<String>, sample_rids: Vec<u32>,
     ) -> PyResult<Vec<(String, String, bool, Option<String>, Vec<String>)>> {
@@ -3650,10 +3636,7 @@ impl GraphRuntime {
                     let wg = self.wg_index(wg_id).ok_or_else(|| {
                         PyValueError::new_err(format!("unknown worker graph id {wg_id}"))
                     })?;
-                    // NOT interner.get(): that is the STRING id, and set_in_flight
-                    // wants the node's index within this worker graph. The two id
-                    // spaces are both u32, so only the Option here made the mix-up
-                    // visible.
+                    // the node's index in this worker graph, not its string id
                     let node_id = self.nid(wg, &node).ok_or_else(|| {
                         PyValueError::new_err(format!(
                             "node {node:?} is not in worker graph {wg_id}"

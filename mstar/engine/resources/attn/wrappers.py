@@ -205,13 +205,8 @@ class FlashInferPrefillWrapper:
         """
         self.dtype = dtype
         if self.use_cuda_graph and paged_kv_indices.device.type != "cuda":
-            # A packed step plans inline on the gpu thread, behind the step
-            # still in flight on the same stream. A copy out of pageable host
-            # memory waits for that step to finish (and FlashInfer copies the
-            # indices blocking regardless), so the plan stalls for the whole
-            # of it. Stage every host array in this wrapper's own page-locked
-            # buffers and copy the indices into the captured buffer ourselves;
-            # FlashInfer's copy_ of that buffer onto itself is then a no-op.
+            # planned inline behind the step in flight, which a pageable copy
+            # would wait for: stage page-locked, copy the indices in ourselves
             qo_indptr, paged_kv_indptr, paged_kv_last_page_len, kv_lens, n = (
                 self._stage_pinned(
                     qo_indptr, paged_kv_indptr, paged_kv_last_page_len,
@@ -539,11 +534,8 @@ class FlashInferMixedWrapper:
         d_last = np.where(dec, last, 1).astype(np.int32)
         d_lens = np.where(dec, lens, 1).astype(np.int32)
 
-        # prefill: the prompt rows, empty rows on the sink page, and a tail row
-        # over every other token of the step (attending as many sink-page
-        # tokens), so its qo_indptr ends at the token count the forward holds:
-        # FlashInfer checks that, and its output is sized by it. The tail's
-        # output is dropped; decode rows and padding take their positions.
+        # prefill: the prompt rows, then a sink-page tail row over the step's
+        # other tokens, so qo_indptr ends at the token count FlashInfer checks
         pad = self._max_prefill_rows - len(prompt)
         prompt_tokens = int(spans[prompt].sum())
         tail = tokens - prompt_tokens

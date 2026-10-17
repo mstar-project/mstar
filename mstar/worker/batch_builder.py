@@ -29,10 +29,8 @@ class BatchBuildRequest:
     blocked_rids: set[int] = field(default_factory=set)
     # The rid whose capture group the step must share, else its first row's.
     capture_group_of: int | None = None
-    # Each walk's cap, before the caller's rows are counted; None (or absent)
-    # is uncapped. Under `graph_walk` for a key of one walk. Under a combined
-    # walk, each real walk's, plus the combined walk's own under `graph_walk`,
-    # which caps a step mixing walks.
+    # Each real walk's cap (None or absent: uncapped); under `graph_walk`, the
+    # cap of a step mixing walks.
     walk_caps: dict[str, int | None] = field(default_factory=dict)
     # Under a combined walk: how many rows of each real walk a step mixing
     # walks may hold (absent is uncapped). A step of one walk is not bound.

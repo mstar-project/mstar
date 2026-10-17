@@ -21,14 +21,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class CombinedSplit:
-    """A combined walk whose captured steps run on two kernels: one-token rows
-    on the decode kernel, prompt rows on a prefill kernel sized to a few rows.
-
-    ``prefill_walks`` are the combined walk's members that bring prompt rows;
-    the rest bring one-token rows. The prefill kernel is captured for as many
-    rows as the scheduler lets those walks hold in one step
-    (``max_rows_in_combined``), an uncapped walk counting the bucket's rows.
-    """
+    """A combined walk run on two kernels: decode for one-token rows, prefill
+    for the rows of ``prefill_walks``, captured for as many as
+    ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows)."""
     combined_walk: str
     prefill_walks: tuple[str, ...]
 

@@ -910,13 +910,8 @@ class LLMSubmodule(ARNodeSubmodule):
         requires_cfg = requires_cfg_for_inputs(inputs)
         labels = self._get_active_labels(graph_walk, requires_cfg)
         spans = tuple(inp.input_seq_len for inp in inputs)
-        # Guidance is a per-REQUEST property, so the labels are too. Reading
-        # one flag for the step was right while a step held one walk: every row
-        # of it was guided or none was. Under a combined walk an unguided
-        # decode row can share a step with a guided prefill, and giving it the
-        # guided row's cfg_text/cfg_img segments puts its tokens in branches it
-        # never asked for -- which changed one of six images and one of six
-        # greedy texts when T2T decoded beside T2I.
+        # Guidance is per request: a combined step can hold guided and unguided
+        # rows, and an unguided row must not land in the cfg branches.
         row_labels = [
             frozenset(self._get_active_labels(graph_walk, bool(inp.resource_step_info)))
             for inp in inputs

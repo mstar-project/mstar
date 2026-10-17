@@ -44,7 +44,7 @@ def _model(walk_nodes: dict[str, list[str]]):
 
 
 def _submodule(caps: dict[str, int | None]):
-    return SimpleNamespace(max_rows_in_combined=lambda walk: caps.get(walk))
+    return SimpleNamespace(max_rows_in_combined=caps.get)
 
 
 def test_a_resource_gets_the_caps_of_its_nodes_walks():

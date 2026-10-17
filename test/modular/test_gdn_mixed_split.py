@@ -21,10 +21,8 @@ requires_gpu = pytest.mark.skipif(
 
 HEADS, DIM, CONV_DIM, WIDTH, SLOTS = 4, 128, 256, 4, 16
 
-# (span, slot, has_state): decode rows, a continuing prompt chunk, a one-token
-# prompt with no state (chunked: the decode kernel would read the stale slot),
-# a fresh prompt, and a padding row (padding is always the tail: the chunked
-# path gives it a borrowed token after the real ones)
+# (span, slot, has_state): decode rows, a continuing chunk, a stateless
+# one-token prompt, a fresh prompt and a tail padding row
 LAYOUT = [
     (1, 3, True), (1, 5, True), (6, 7, True), (1, 9, True),
     (1, 11, False), (4, 12, False), (0, SINK_SLOT, False),

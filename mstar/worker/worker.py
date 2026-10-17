@@ -2372,10 +2372,8 @@ class Worker:
         """
         batch_N = pending.batch
 
-        # One sample rid per real walk; only the chosen target's walk's rids
-        # continue. The runtime applies the async/TP-async eligibility filter,
-        # per walk; the loop-completion filter is per rid and lives in
-        # prep_spec_rids.
+        # One sample rid per real walk; the runtime filters eligibility per walk,
+        # prep_spec_rids the loop completion per rid.
         groups = batch_N.rids_by_walk()
         ready_for_spec = self._graph_runtime.speculate_node(
             batch_N.node_name, list(groups), [rids[0] for rids in groups.values()],
@@ -3265,10 +3263,7 @@ class Worker:
         self, batch_N: PendingBatch, rids: list[int], stored, route_output, signals,
         engine=None, buffered_publish: set[int] | None = None,
     ) -> None:
-        # Both belong to the caller's pass: `engine` materializes this step's
-        # publication for the rids whose frame carries it, and
-        # `buffered_publish` is the set already buffered there, so a rid is
-        # not buffered twice across the per-walk calls.
+        # Shared across the per-walk calls, so a rid is not buffered twice.
         buffered_publish = set() if buffered_publish is None else buffered_publish
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
@@ -3423,10 +3418,7 @@ class Worker:
             return None, []
         if not batch_N.batch.request_walks:
             return self._inline_emit_one_walk(engine, batch_N, host_rows, rids, signals)
-        # Asked per real walk, not under the batch's label: a combined walk
-        # is no walk of the submodule's, and would answer none. The runtime
-        # only takes a row's value where that row's own walk has the signal as
-        # an unpersisted client edge, so the other walks' rows may carry any.
+        # Per real walk: a combined walk is no walk of the submodule's.
         walk_of = batch_N.batch.walk_of
         walks = list(batch_N.batch.rids_by_walk()) or [batch_N.graph_walk]
         candidates: dict[str, tuple[str, set[str]]] = {}

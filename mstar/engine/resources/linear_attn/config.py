@@ -52,10 +52,8 @@ class LinearAttnConfig:
     # (Nemotron-H leaves it open: (0, inf)).
     time_step_limit: tuple[float, float] = (0.0, float("inf"))
 
-    # GDN only: combined walks whose steps run on two kernels
-    # (`GDNMixedWrapper`): the decode kernel for one-token rows that carry
-    # state, the chunked one for the prompt rows. A step of any other walk
-    # takes one kernel for every row.
+    # GDN only: combined walks whose steps run decode rows on the decode kernel
+    # and prompt rows on the chunked one (`GDNMixedWrapper`)
     splits: tuple[CombinedSplit, ...] = ()
 
 
