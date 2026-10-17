@@ -27,6 +27,7 @@ from mstar.model.components.distributed.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from mstar.model.components.distributed.sequence_parallel import heads_to_sequence, sequence_to_heads
 
 # ``(q, k, v) -> out`` over ``[B, L, H, D]`` tensors (``k``/``v`` may have their own
 # ``L``); see ``mstar.model.components.diffusion.attention``.
@@ -42,6 +43,47 @@ class RotaryTable(NamedTuple):
     def heads(self, start: int, count: int) -> "RotaryTable":
         """This rank's slice of the heads (tensor parallelism shards them)."""
         return RotaryTable(self.cos[:, :, start:start + count], self.sin[:, :, start:start + count])
+
+
+class SeqParallel(NamedTuple):
+    """Ulysses sequence parallelism over a ``[B, L, H, D]`` stream, the video: ``sizes``
+    is each rank's share of its ``L``.
+
+    Only an attention whose queries and keys are both the sharded stream needs the
+    exchange: it attends every token over this rank's head-group (``to_heads``), and
+    the output goes back (``from_heads``). A query shard attending a replicated stream
+    needs nothing, and a replicated query attending the sharded keys merges the
+    ranks' partial attentions (``attend_shards``)."""
+
+    group: CommGroup
+    sizes: list[int]
+
+    def to_heads(self, x: torch.Tensor) -> torch.Tensor:
+        return sequence_to_heads(self.group, x, self.sizes, seq_dim=1, head_dim=2)
+
+    def from_heads(self, x: torch.Tensor) -> torch.Tensor:
+        return heads_to_sequence(self.group, x, self.sizes, seq_dim=1, head_dim=2)
+
+    @torch.compiler.disable
+    def attend_shards(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """``q``, the same on every rank, attending the keys of every rank's shard: this
+        rank's attention and its log-sum-exp, the ranks' merged exactly. Moves the
+        query-sized results rather than the keys."""
+        out, lse = attention_with_lse(q, k, v)
+        outs = self.group.all_gather(out.unsqueeze(0), dim=0)
+        lses = self.group.all_gather(lse.unsqueeze(0), dim=0)
+        weights = torch.softmax(lses, dim=0).transpose(2, 3).unsqueeze(-1)
+        return (outs.float() * weights).sum(dim=0).to(q.dtype)
+
+
+def attention_with_lse(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unmasked ``[B, L, H, D]`` attention at ``D ** -0.5``, and its log-sum-exp in the
+    kernel's ``[B, H, L]`` (fp32); both contiguous, as a collective needs them."""
+    q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+    flash = (torch.ops.aten._scaled_dot_product_flash_attention if q.is_cuda
+             else torch.ops.aten._scaled_dot_product_flash_attention_for_cpu)
+    out, lse = flash(q, k, v)[:2]
+    return out.transpose(1, 2).contiguous(), lse.float().contiguous()
 
 
 def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -148,7 +190,10 @@ class GatedAttention(nn.Module):
         context: torch.Tensor | None = None,
         q_rope: RotaryTable | None = None,
         k_rope: RotaryTable | None = None,
+        exchange: SeqParallel | None = None,
     ) -> torch.Tensor:
+        """``exchange``: a self-attention over a sequence-parallel stream, attended over
+        every token on this rank's head-group."""
         local = self.local_heads * self.head_dim
         if self.is_self:
             q, k, v = self.to_qkv(x).split([local, local, local], dim=-1)
@@ -162,7 +207,11 @@ class GatedAttention(nn.Module):
             q = apply_split_rope(q, q_rope.heads(self.head_offset, self.local_heads))
             k_rope = q_rope if k_rope is None else k_rope
             k = apply_split_rope(k, k_rope.heads(self.head_offset, self.local_heads))
+        if exchange is not None:
+            q, k, v = exchange.to_heads(q), exchange.to_heads(k), exchange.to_heads(v)
         out = attend(q, k, v).to(q.dtype)
+        if exchange is not None:
+            out = exchange.from_heads(out)
         if self.to_gate_logits is not None:
             out = out * (2.0 * torch.sigmoid(self.to_gate_logits(x))).unsqueeze(-1)
         return self.to_out(out.flatten(-2))

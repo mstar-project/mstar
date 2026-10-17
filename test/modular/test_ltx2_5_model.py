@@ -15,6 +15,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AttentionStep, RaggedCrossAttentionSpec, RaggedCrossAttentionStep
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -383,6 +384,22 @@ def test_declare_step_spans_and_pairs():
     assert spans == {(r, label): n for r in (11, 12) for label, n in (("video", 24), ("audio", 5), ("text", 16))}
     assert step.cg_key_info == shape
     assert _dit(cfg, use_ragged=False).declare_step("generate_av", [11], inputs[:1]) is None
+
+
+@pytest.mark.parametrize("rank, shard", [(0, 13), (1, 12)])
+def test_declare_step_under_sequence_parallelism(rank, shard):
+    """The video self-attention spans every video token; the cross-attentions attend
+    from this rank's share of them, and the audio queries over the video leave the
+    resource."""
+    cfg = LTX25Config()
+    shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
+    sub = LTXDenoiseSubmodule(nn_stub(), cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True,
+                              sp_group=CommGroup(rank, rank, [0, 1]))
+    step = sub.declare_step("generate_av", [11], [NodeInputs(resource_step_info=shape)])
+    assert [s.span for s in step.steps[VIDEO_ATTN].segments] == [25]
+    for key in (VIDEO_XATTN, AUDIO_XATTN):
+        assert {s.label: s.span for s in step.steps[key].segments}["video"] == shard
+    assert set(step.steps[AUDIO_XATTN].pairs) == {("audio", "text"), ("video", "audio")}
 
 
 def test_distilled_schedule_matches_the_scheduler_recipe():

@@ -12,8 +12,9 @@ from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 
 def _build_ragged(spec, info: EngineResourceInfo, manager_cls):
     config = spec.config
-    if info.joint_comm_group is not None:
-        config.shard(info.joint_comm_group.world_size)
+    joint = info.joint_comm_group
+    if joint is not None:
+        config.shard(joint.world_size if config.shard_over_sp else joint.tp_group.world_size)
     dtype = config.dtype if config.dtype is not None else info.kv_dtype
     if dtype is None:
         raise ValueError(

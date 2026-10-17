@@ -1,0 +1,24 @@
+model: "ltx2_5"
+
+max_seq_len: 1024
+
+# LTX-2.5 distilled, the DiT Ulysses sequence-parallel over both GPUs: each rank
+# holds the full DiT (38 GB) and half the video tokens, and only the video
+# self-attention exchanges them. The Gemma-4 text encoder + connectors on rank 1,
+# both decoders and the latent upsampler on rank 0.
+model_kwargs:
+  attention_backend: flashinfer
+  max_batch_size: 4
+  capture_shapes: [[544, 960, 121, 24]]
+  # the two-stage recipe's stage 2 runs uncaptured (compiled eager)
+  capture_refine_shapes: []
+  capture_batch_sizes: [1, 2]
+
+node_groups:
+  - node_names: [dit]
+    ranks: [0, 1]
+    sp_size: 2
+  - node_names: [text_encoder]
+    ranks: [1]
+  - node_names: [vae_decoder, audio_decoder, latent_upsampler]
+    ranks: [0]
