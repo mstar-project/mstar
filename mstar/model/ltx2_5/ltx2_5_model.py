@@ -206,6 +206,9 @@ class LTX25Model(Model):
                     # one span per label (or per pair) per request
                     max_segments_per_request=1,
                     dtype=torch.bfloat16,
+                    # six labels x two slots: at the 512 MB default, 6 GB the split-KV
+                    # partials of these shapes never come near
+                    workspace_mb=128,
                 ),
             )
             for spec_cls, key, heads, head_dim in (

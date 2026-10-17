@@ -81,6 +81,11 @@ class RaggedAttentionConfig:
     # engine's KV dtype (which is actually a misnamed autocast dtype) is used.
     dtype: torch.dtype | None = None
 
+    # Each label's FlashInfer workspace, per slot; None takes
+    # MSTAR_WORKSPACE_BUFFER_MB. A ragged prefill only spends it on split-KV
+    # partials (tens of MB), so a resource with many labels can declare less.
+    workspace_mb: int | None = None
+
     def __post_init__(self):
         if self.sm_scale is None:
             self.sm_scale = self.head_dim ** -0.5

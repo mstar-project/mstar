@@ -227,11 +227,11 @@ class WorkspacePool:
     these outlive any single step.
     """
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, size_mb: int | None = None):
         self._device = device
-        self._size = int(
-            os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")
-        ) * 1024 * 1024
+        if size_mb is None:
+            size_mb = int(os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512"))
+        self._size = size_mb * 1024 * 1024
         self._buffers: dict[str, torch.Tensor] = {}
 
     def get(self, label: str, cg_slot: int | None = None) -> torch.Tensor:
