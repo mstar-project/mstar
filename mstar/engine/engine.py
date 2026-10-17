@@ -1099,6 +1099,11 @@ class Engine:
                 ctx=ctxs[rid], nvtx=nvtx
             )
             if not admit_outcome.ok:
+                # all or nothing, as a batched step's admit is: the requests
+                # admitted ahead of this one will not run either
+                for earlier in reversed(batch.request_ids[:i]):
+                    if steps[earlier] is not None:
+                        self._runner.rollback_admit(steps[earlier])
                 return merged
 
         # Step 2: drive step, plan -> forward -> commit loop.

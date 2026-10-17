@@ -304,6 +304,9 @@ class _FakeExecEngine:
             )
         return FullAdmitOutcome(AdmitOutcome(ok=True))
 
+    def rollback_admit(self, step):
+        self.events.append(("rollback", step.ctx.request_ids[0]))
+
     # --- engine internals the path calls into
     def _drive_step(
         self, batch, submodule_mgmt, request_ids, inputs, req_info, ctx,
@@ -366,6 +369,20 @@ def test_per_request_runs_nothing_when_a_later_rid_fails_admit():
     assert not any(kind == "run" for kind, _ in engine.events)
     assert out.per_rid_outputs == {"a": {}, "b": {}}
     assert isinstance(batch.admit_error, AllocationFailed)
+
+
+def test_per_request_unwinds_the_rids_admitted_before_a_refusal():
+    """All or nothing, like a batched admit: ``c``'s own refusal is unwound by
+    the runner, and ``a``'s and ``b``'s admits have to be given back too,
+    latest first."""
+    engine = _FakeExecEngine(fail_on="c")
+
+    engine._exec_per_request(_exec_batch(["a", "b", "c"]))
+
+    assert [e for e in engine.events if e[0] != "declare"] == [
+        ("admit", "a"), ("admit", "b"), ("admit", "c"),
+        ("rollback", "b"), ("rollback", "a"),
+    ]
 
 
 def test_a_refused_batch_never_signals_the_launch():
