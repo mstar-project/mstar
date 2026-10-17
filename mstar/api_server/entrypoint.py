@@ -232,14 +232,17 @@ class PendingRequest:
     # Set by the streaming handler on its event loop; the message thread wakes
     # it through these when a chunk or the completion lands, so the handler
     # sleeps between chunks instead of polling every millisecond per request.
+    # collect_results registers them too but only needs the completion, so it
+    # turns off the per-chunk wake (one per decoded token for inline emitters).
     wake: Any | None = None
     loop: Any | None = None
     # The client's request_id. The engine knows the request by its key, so
     # the message thread restamps each chunk with this before the client sees it.
     request_id: str | None = None
+    wake_per_chunk: bool = True
 
     def notify(self) -> None:
-        """Wake the streaming handler, from any thread."""
+        """Wake the waiting handler, from any thread."""
         loop, wake = self.loop, self.wake
         if loop is None or wake is None:
             return
@@ -700,10 +703,6 @@ class APIServer:
                     self._fail_pending_for_dead_conductor(exited)
                     return
             try:
-                with self.request_lock:
-                    if len(self.recently_completed) > 0:
-                        self._prune_recently_completed()
-
                 for message in self.communicator.get_all_new_messages():
                     if not isinstance(message, APIServerMessage):
                         logger.warning("Unexpected message type: %s", type(message))
@@ -853,7 +852,8 @@ class APIServer:
                                 rid, req.request_id,
                             ).encode("utf-8")
                         req.chunks.append(result_chunk)
-                        to_wake[id(req)] = req
+                        if req.wake_per_chunk or result_chunk.modality == "error":
+                            to_wake[id(req)] = req
 
                         if result_chunk.modality == "error":
                             # The data worker failed this request (preprocess,
@@ -872,6 +872,13 @@ class APIServer:
                             self.recently_completed[rid] = time.time()
                 if to_wake:
                     notify_many(to_wake.values())
+
+                # after this pass's messages and chunks, so a request whose
+                # completion and final chunk both just landed is released now
+                # rather than a pass later
+                with self.request_lock:
+                    if len(self.recently_completed) > 0:
+                        self._prune_recently_completed()
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
@@ -1110,7 +1117,18 @@ class APIServer:
         return its chunks. Disconnecting or timing out releases engine state."""
         start = time.time()
         key = self.submission_key(request_id)
+        # Woken by the message thread when the request completes or fails;
+        # the timeout is the backstop for the disconnect and deadline checks.
+        wake = asyncio.Event()
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            if req is not None:
+                req.loop = asyncio.get_running_loop()
+                req.wake = wake
+                req.wake_per_chunk = False
         while True:
+            # cleared before the read, so a completion landing after it stays set
+            wake.clear()
             with self.request_lock:
                 req = self.pending_requests.get(key)
                 done = req.event.is_set() if req else True
@@ -1122,7 +1140,10 @@ class APIServer:
             if raw_request is not None and await raw_request.is_disconnected():
                 self.abort_submission(key)
                 return []
-            await asyncio.sleep(0.005)
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=0.05)
+            except asyncio.TimeoutError:
+                pass
 
         with self.request_lock:
             req = self.pending_requests.pop(key, None)
