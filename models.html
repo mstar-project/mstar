@@ -936,7 +936,8 @@ audio) is read from the checkpoint’s <code class="docutils literal notranslate
 defaults to automatic detection, <code class="docutils literal notranslate"><span class="pre">instruct</span></code> (OpenAI: <code class="docutils literal notranslate"><span class="pre">instructions</span></code>)
 carries a style instruction (1.7B CustomVoice) or the voice description
 (VoiceDesign, required). Base clones a voice from one reference clip: on
-<code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> pass <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> (data URL, URL, path or base64) plus
+<code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> pass <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> (data URL, base64, or an http(s) URL
+when the server sets <code class="docutils literal notranslate"><span class="pre">MSTAR_ALLOW_REMOTE=1</span></code>; paths on the server are refused) plus
 <code class="docutils literal notranslate"><span class="pre">ref_text</span></code> (its transcript) or <code class="docutils literal notranslate"><span class="pre">x_vector_only_mode:</span> <span class="pre">true</span></code>; with the SDK,
 <code class="docutils literal notranslate"><span class="pre">client.tts(text,</span> <span class="pre">reference_audio=&quot;ref.wav&quot;,</span> <span class="pre">ref_text=&quot;...&quot;)</span></code>. The clip’s
 conditioning (x-vector and codec frames) is memoised by content, so a voice

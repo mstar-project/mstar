@@ -23,6 +23,7 @@ mstar.api\_server.media\_io
       png_to_data_url
       resolve_media_ref
       save_base64
+      save_base64_audio
       save_data_url
       save_remote_url
       split_windows

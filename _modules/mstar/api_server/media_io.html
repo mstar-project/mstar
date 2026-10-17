@@ -1108,6 +1108,37 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="save_base64_audio">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_base64_audio">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">save_base64_audio</span><span class="p">(</span><span class="n">b64</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="n">decoder</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Persist bare base64 that ``decoder`` opens as audio; return its path, or</span>
+<span class="sd">    None (leaving nothing behind) when it is not base64 or not loadable audio.</span>
+
+<span class="sd">    ``decoder`` is the library the model's ``load_audio`` uses, ``"soundfile"``</span>
+<span class="sd">    or ``"torchcodec"``, and it opens the saved file the way the model will</span>
+<span class="sd">    (container header only). A path such as ``/etc/passwd`` is valid base64</span>
+<span class="sd">    too, so the alphabet cannot tell them apart; the decoder can.</span>
+<span class="sd">    """</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">_</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">save_base64</span><span class="p">(</span><span class="n">b64</span><span class="p">,</span> <span class="s2">"wav"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">decoder</span> <span class="o">==</span> <span class="s2">"torchcodec"</span><span class="p">:</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">torchcodec.decoders</span><span class="w"> </span><span class="kn">import</span> <span class="n">AudioDecoder</span>
+
+            <span class="n">AudioDecoder</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="kn">import</span><span class="w"> </span><span class="nn">soundfile</span>
+
+            <span class="n">soundfile</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — not loadable here, so the model cannot load it either</span>
+        <span class="n">Path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="n">missing_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">return</span> <span class="n">path</span></div>
+
+
+
 <div class="viewcode-block" id="save_remote_url">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_remote_url">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">save_remote_url</span><span class="p">(</span><span class="n">url</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">30.0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
@@ -1133,23 +1164,22 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="resolve_media_ref">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.resolve_media_ref">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">resolve_media_ref</span><span class="p">(</span><span class="n">ref</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">allow_remote</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""Resolve a media reference (data URL, http(s) URL, or local path).</span>
+<span class="w">    </span><span class="sd">"""Resolve a media reference from a request: a data URL, or an http(s) URL</span>
+<span class="sd">    when remote fetch is allowed. Returns ``(modality, path)``.</span>
 
-<span class="sd">    Returns ``(modality, path)``. Local paths are passed through unchanged</span>
-<span class="sd">    (modality inferred from extension).</span>
+<span class="sd">    A request cannot name a file on the server, not even one under</span>
+<span class="sd">    ``upload_dir``: plain paths and other URL schemes are refused without</span>
+<span class="sd">    accessing client-named server files, so a caller can neither read files nor</span>
+<span class="sd">    probe for them.</span>
 <span class="sd">    """</span>
     <span class="k">if</span> <span class="n">ref</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"data:"</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">save_data_url</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
-    <span class="n">scheme</span> <span class="o">=</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">ref</span><span class="p">)</span><span class="o">.</span><span class="n">scheme</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
-    <span class="k">if</span> <span class="n">scheme</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"http"</span><span class="p">,</span> <span class="s2">"https"</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">ref</span><span class="p">)</span><span class="o">.</span><span class="n">scheme</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"http"</span><span class="p">,</span> <span class="s2">"https"</span><span class="p">):</span>
         <span class="n">allow_remote</span> <span class="o">=</span> <span class="n">allow_remote</span> <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_ALLOW_REMOTE"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">allow_remote</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Remote media fetch is disabled on this server"</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">save_remote_url</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
-    <span class="c1"># Treat as a local filesystem path.</span>
-    <span class="n">suffix</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">ref</span><span class="p">)</span><span class="o">.</span><span class="n">suffix</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
-    <span class="n">rev</span> <span class="o">=</span> <span class="p">{</span><span class="n">v</span><span class="p">:</span> <span class="n">k</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">_MIME_TO_EXT</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
-    <span class="k">return</span> <span class="n">modality_from_mime</span><span class="p">(</span><span class="n">rev</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">suffix</span><span class="p">,</span> <span class="s2">""</span><span class="p">)),</span> <span class="n">ref</span></div>
+    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"server file paths are refused; send media as a data URL or a file upload"</span><span class="p">)</span></div>
 
 
 
