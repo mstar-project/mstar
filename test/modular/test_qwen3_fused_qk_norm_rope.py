@@ -98,7 +98,7 @@ def test_under_compile_from_one_projection(num_tokens):
     eager = _layer(x, w_qkv, wq, wk, pos)
     compiled = torch.compile(_layer, fullgraph=True)(x, w_qkv, wq, wk, pos)
     torch.cuda.synchronize()
-    for a, b in zip(compiled, eager):
+    for a, b in zip(compiled, eager, strict=True):
         torch.testing.assert_close(a, b, atol=2e-2, rtol=2e-2)
 
 
