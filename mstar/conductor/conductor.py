@@ -1101,6 +1101,13 @@ class Conductor:
                     ),
                 )
 
+        # After the loop: a tensor's reader count must cover every worker and
+        # partition it went to before the producer may free it.
+        self._un_persist_tensors(body.request_id, [
+            info for fwd_args in partition_fwd_args.values()
+            for info in fwd_args.unpersist_tensors
+        ])
+
     def _resolve_worker_partition(
         self, worker_graph_ids: list[int],
         partitions: list[PartitionDefinition],

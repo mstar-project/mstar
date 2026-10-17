@@ -30,6 +30,7 @@ test/modular/test_whisper_alignment.py
 test/modular/test_whisper_timestamps.py
 test/modular/test_qwen3_asr_model.py
 test/modular/test_request_failure_propagation.py
+test/modular/test_ingest_unpersist.py
 test/modular/test_api_result_delivery.py
 test/modular/test_api_completion_guard.py
 test/modular/test_speculation_external_inputs.py
@@ -77,6 +78,7 @@ test/modular/test_worker_device_loopback.py
 test/modular/test_gc_freeze.py
 test/modular/test_qwen3_5_bucket_knobs.py
 test/modular/test_fast_tokenize.py
+test/modular/test_qwen3_5_config.py
 test/modular/test_wire_codec.py
 test/modular/test_wire_security.py
 test/modular/test_model_kwargs_tensor_transport.py
@@ -87,3 +89,4 @@ test/modular/test_kv_decode_plan_cache.py
 test/modular/test_kv_pinned_index_ring.py
 test/modular/test_kv_plan_host_lens.py
 test/modular/test_sampler_trash_row.py
+test/modular/test_launch_script_socket_prefix.py

@@ -78,7 +78,7 @@ Finish verifying everything before you post anything.
 
 Keep the body to one short paragraph that names the triggering inputs or state; don't narrate how you traced it. Add a ```` ```suggestion ```` block only when the fix is a small, exact replacement for the anchored lines. The block replaces the whole range, so it must work as a drop-in.
 
-**Summary comment.** Return it as the `summary` field of your structured output, after all inline comments are posted. The workflow posts it, updating your previous summary on the PR rather than adding another. You have no shell and can't post it yourself. Omit any empty section.
+**Summary comment.** Return it as the `summary` field of your structured output, after all inline comments are posted. The workflow posts it as a new comment, below any summary from an earlier run. On a re-review, start it with one sentence on what changed since your previous summary in `pr-conversation.json`: findings fixed, still open or new. You have no shell and can't post it yourself. Omit any empty section.
 
 ```markdown
 ### Automated review

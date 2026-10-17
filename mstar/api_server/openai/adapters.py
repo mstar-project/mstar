@@ -1140,6 +1140,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
 ADAPTER_REGISTRY.update({
     f"qwen3_5_{size}b": Qwen3_5Adapter() for size in QWEN_3_5_DENSE_SIZES
 })
+# Qwen3.8-27B is the Qwen3.5 architecture and chat template family.
+ADAPTER_REGISTRY["qwen3_8_27b"] = Qwen3_5Adapter()
 
 
 def get_adapter(model_name: str) -> OpenAIAdapter | None:
