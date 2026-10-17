@@ -30,9 +30,9 @@ SYMM_ALIGN_BYTES = 16
 # The symm_mem kernels dispatch only these.
 SYMM_DTYPES = (torch.bfloat16, torch.float32)
 # symm_multimem reduces messages up to this size in one kernel that writes the
-# caller's tensor (in 16-byte stores, so that tensor must start 16-byte
-# aligned). Every rank then reads the whole message through the switch, so
-# larger ones take the split kernel and a copy out.
+# sum straight out, in 16-byte stores (so to a 16-byte-aligned tensor). Every
+# rank then reads the whole message through the switch, so larger ones take
+# the split kernel and a copy out.
 MULTIMEM_ONESHOT_MAX_BYTES = 32 * 1024
 
 
@@ -167,13 +167,14 @@ class SymmMemAllReduce(AllReduce):
             flat = input_.view(-1)
         else:
             view.copy_(flat)
-        if (
-            self.mode == "symm_multimem"
-            and view.nbytes <= MULTIMEM_ONESHOT_MAX_BYTES
-            and eager
-            and flat.data_ptr() % 16 == 0
-        ):
-            torch.ops.symm_mem.multimem_one_shot_all_reduce_out(view, "sum", self.group_name, flat)
+        if self.mode == "symm_multimem" and view.nbytes <= MULTIMEM_ONESHOT_MAX_BYTES and eager:
+            # The kernel is the ranks' to agree on, so it can't follow this rank's
+            # alignment: a tensor its 16-byte stores can't take gets the sum in an
+            # aligned one and a copy.
+            out = flat if flat.data_ptr() % 16 == 0 else torch.empty_like(flat)
+            torch.ops.symm_mem.multimem_one_shot_all_reduce_out(view, "sum", self.group_name, out)
+            if out is not flat:
+                flat.copy_(out)
         elif self.mode == "symm_multimem":
             torch.ops.symm_mem.multimem_all_reduce_(view, "sum", self.group_name)
             flat.copy_(view)

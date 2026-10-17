@@ -244,32 +244,54 @@ def test_multimem_needs_multicast(fake_cuda, fake_symm_mem, caplog, mode, multic
     assert any("multicast" in r.getMessage() for r in caplog.records) == (not builds)
 
 
-@pytest.mark.parametrize("extra_bytes, offset, kernel", [
-    (0, 0, "multimem_one_shot_all_reduce_out"),
-    (16, 0, "multimem_all_reduce_"),
-    (0, 4, "multimem_all_reduce_"),  # starts 8 B into its storage
-    (0, 8, "multimem_one_shot_all_reduce_out"),  # 16 B in: aligned
-])
-def test_multimem_kernel_by_size_and_alignment(
-    monkeypatch, fake_symm_mem, extra_bytes, offset, kernel
-):
+def _multimem(monkeypatch, fake_symm_mem, calls: list) -> SymmMemAllReduce:
+    """The real ``SymmMemAllReduce`` in multimem mode, over kernels that record
+    themselves; the one-shot one writes 7s, the sum it would have stored."""
     fake_symm_mem.multicast_ptr = 0x7F0000
-    calls: list = []
+
+    def one_shot(buf, op, group, out):
+        calls.append(("multimem_one_shot_all_reduce_out", out))
+        out.fill_(7)
+
     ops = SimpleNamespace(
-        multimem_one_shot_all_reduce_out=lambda buf, op, group, out: calls.append(
-            ("multimem_one_shot_all_reduce_out", out)),
+        multimem_one_shot_all_reduce_out=one_shot,
         multimem_all_reduce_=lambda buf, op, group: calls.append(("multimem_all_reduce_", buf)),
     )
     monkeypatch.setattr(torch.ops, "symm_mem", ops, raising=False)
-    symm = SymmMemAllReduce(SimpleNamespace(group_name="tp"), torch.device("cpu"), 512 * 1024,
+    return SymmMemAllReduce(SimpleNamespace(group_name="tp"), torch.device("cpu"), 512 * 1024,
                             "symm_multimem")
-    n = (ar.MULTIMEM_ONESHOT_MAX_BYTES + extra_bytes) // 2
-    x = torch.ones(offset + n, dtype=torch.bfloat16)[offset:]
-    assert x.data_ptr() % 16 == 2 * offset % 16
+
+
+@pytest.mark.parametrize("extra_bytes, kernel", [
+    (0, "multimem_one_shot_all_reduce_out"), (16, "multimem_all_reduce_"),
+])
+def test_multimem_kernel_by_size(monkeypatch, fake_symm_mem, extra_bytes, kernel):
+    calls: list = []
+    symm = _multimem(monkeypatch, fake_symm_mem, calls)
+    x = torch.ones((ar.MULTIMEM_ONESHOT_MAX_BYTES + extra_bytes) // 2, dtype=torch.bfloat16)
     assert symm._reduce(x) is x
     assert [name for name, _ in calls] == [kernel]
     if kernel == "multimem_one_shot_all_reduce_out":  # reduces straight into x
         assert calls[0][1].data_ptr() == x.data_ptr()
+
+
+@pytest.mark.parametrize("offset", [0, 4, 8])  # bf16 elements: 0, 8 and 16 B in
+def test_the_multimem_kernel_does_not_follow_alignment(monkeypatch, fake_symm_mem, offset):
+    """Alignment is one rank's fact, and two ranks on different kernels hang the
+    collective. A tensor the one-shot kernel can't store to gets the sum in an
+    aligned one, copied back."""
+    calls: list = []
+    symm = _multimem(monkeypatch, fake_symm_mem, calls)
+    n = ar.MULTIMEM_ONESHOT_MAX_BYTES // 2
+    x = torch.ones(offset + n, dtype=torch.bfloat16)[offset:]
+    aligned = x.data_ptr() % 16 == 0
+    assert aligned == (offset != 4)
+    assert symm._reduce(x) is x
+    assert [name for name, _ in calls] == ["multimem_one_shot_all_reduce_out"]
+    out = calls[0][1]
+    assert out.data_ptr() % 16 == 0
+    assert (out.data_ptr() == x.data_ptr()) == aligned
+    assert bool((x == 7).all()), "the sum lands in x either way"
 
 
 def _multimem_group(monkeypatch, fake_symm_mem, calls: list) -> CommGroup:
