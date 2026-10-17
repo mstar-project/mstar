@@ -516,6 +516,10 @@ class KVManager(AttentionResource):
         # (rid, label) marked step_in_flight by a staged step, so an abandoned
         # one does not leave its streams unevictable
         self._preplan_marked: list[tuple[str, str]] = []
+        # the step those marks name as `marked_by`: exec may re-declare the
+        # staged step as an equal but distinct object, and its unwind has to
+        # find them too
+        self._preplan_step: KVStep | None = None
 
         # (rid, label) -> pages the live reservation freshly acquired, for
         # ``rollback_admit``. One record, not one per pass: only the plan thread
@@ -1425,6 +1429,7 @@ class KVManager(AttentionResource):
                 # entries for the next clear_preplan to act on
                 self._preplan_new_labels = []
                 self._preplan_marked = []
+                self._preplan_step = step
             for (from_label, to_label), extra in forks:
                 for rid in self._forking_rids(step, ctx):
                     # checked before the reservation, which is what creates it
@@ -1507,12 +1512,21 @@ class KVManager(AttentionResource):
         since, the tail can no longer be safely removed.
         """
         self._touch_plan_cache()
+        # the staged step's marks, when this is that step (see `admit`'s early return)
+        staged = (
+            self._preplan_step
+            if self._preplanned and self._preplan_key == self._plan_key(step, ctx)
+            else None
+        )
         with self._lock:
             for segment in step.segments:
                 stream = self._streams.get(
                     segment.request_id, {}
                 ).get(segment.label)
-                if stream is not None and stream.marked_by is step:
+                if stream is None:
+                    continue
+                owner = stream.marked_by
+                if owner is not None and (owner is step or owner is staged):
                     stream.step_in_flight = False
                     stream.marked_by = None
             reserved = self._admit_reserved_pages
@@ -2148,6 +2162,7 @@ class KVManager(AttentionResource):
                     stream.step_in_flight = False
                     stream.marked_by = None
             self._preplan_marked = []
+            self._preplan_step = None
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_key = None
