@@ -1,6 +1,7 @@
 import errno
 import hashlib
 import logging
+import math
 import os
 import platform
 import shutil
@@ -997,13 +998,22 @@ class TensorCommunicationManager(ABC):
             # Canonical layout has shard_dim leading and is contiguous, so a
             # contiguous byte range maps to a contiguous range of rows along
             # dim 0. Slicing along dim 0 keeps the view contiguous.
-            bytes_per_row = canonical_tensor[0].nbytes
-            assert info.offset % bytes_per_row == 0 and info.nbytes % bytes_per_row == 0, (
-                f"slice offset {info.offset} / nbytes {info.nbytes} not aligned "
-                f"to canonical row size {bytes_per_row}"
+            bytes_per_row = (
+                canonical_tensor.element_size()
+                * math.prod(canonical_tensor.shape[1:])
             )
-            start = info.offset // bytes_per_row
-            end = start + info.nbytes // bytes_per_row
+            if bytes_per_row == 0:
+                # Rows of zero bytes (a [4, 0] tensor) carry no offset to
+                # recover the start from, and hold nothing to read: only the
+                # row count matters.
+                start, end = 0, info.dims[0]
+            else:
+                assert info.offset % bytes_per_row == 0 and info.nbytes % bytes_per_row == 0, (
+                    f"slice offset {info.offset} / nbytes {info.nbytes} not aligned "
+                    f"to canonical row size {bytes_per_row}"
+                )
+                start = info.offset // bytes_per_row
+                end = start + info.nbytes // bytes_per_row
             slice_view = canonical_tensor[start:end]
             new_uuid = self._uuid_minter.mint()
             self.uuid_to_shard_dim[new_uuid] = shard_dim
