@@ -486,6 +486,10 @@ class LTX25Model(Model):
         stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1001))
         stream.height, stream.width = frames.shape[1], frames.shape[2]
         stream.pix_fmt = "yuv420p"
+        # As Cosmos3 encodes: CRF 18 is less lossy than libx264's default 23, and the
+        # multithreaded ultrafast preset encodes 121 frames at 544x960 in 0.46 s where the
+        # default takes 1.2 s, all of it on the request's critical path.
+        stream.options = {"crf": "18", "preset": "ultrafast", "threads": "0"}
         for frame in frames:
             for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
                 container.mux(packet)
