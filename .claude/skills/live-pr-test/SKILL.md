@@ -80,6 +80,8 @@ python3 $S/gpu.py ssh <instance> 'bash ~/bootstrap.sh <n> --hf-home <hf_home fro
 
 In cluster mode, run the same script on the cluster with `--workdir` and `--hf-home` from the config.
 
+Installing packages and making new venvs is fine, and expected when a check needs them: a PR that changes dependencies, an extra the shared environment lacks (a G2P package, an older `setuptools`), a pinned torch build, or a library version the code requires (e.g. FlashInfer). Build them in the work directory, never in the shared environment, and name them in `harness-notes.md`. A `--no-deps` overlay put first on `PYTHONPATH` is often enough for one package.
+
 ## 3. Run
 
 Never serve weights straight from FUSE-mounted persistent storage (RunPod's `/workspace` is geesefs): a server mmaps the checkpoint, and random page-ins through FUSE ran at ~4 MB/s per worker, so a 27B TP4 load had not finished after 20 minutes. `bootstrap.sh` detects a FUSE mount and points `HF_HOME` at local disk; run `stage_model <hf repo>` for every model in the plan before its first server start. It downloads from the Hub (52 GB in ~1 min, where a sequential copy off geesefs took ~9) and falls back to the persistent cache for a repo the Hub won't serve. On NFS (the cluster, Lambda) it is a no-op.
