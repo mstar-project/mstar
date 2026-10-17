@@ -9,14 +9,16 @@ A resource's `plan` writes device buffers that a captured graph later reads, whi
 
 ## Which resource for which state
 
+Entries marked *open PR* are not on `main` yet. Check the checkout; if your port needs one, stack on that PR or say in the description which resource you used instead.
+
 | state | resource | expresses |
 |---|---|---|
 | a cache that grows with the request | paged KV (`KVSpec` + `PagedKVConfig`), optionally a `RetentionPolicy` | any length; retention keeps a protected prefix plus the newest pages |
 | attention within one forward, no cache | `RaggedAttentionSpec` | block-diagonal per span, optionally causal |
-| | `RaggedCrossAttentionSpec` | one contiguous key range per query segment |
-| | `RaggedBlockCausalAttentionSpec` (#381) | each block attends its span's prefix of blocks |
-| a fixed-size cache per request: a sink plus a sliding window, optionally after a shared read-only prefix | bounded KV (`BoundedKVSpec`, #383) | rows at any position in one batch; per-row source; a per-distance score term |
-| fixed-size opaque state per request (recurrent, conv tails) | `RecurrentStatePool` | slots read and written through the step's addressing (`gather` / `scatter_`, #383) |
+| | `RaggedCrossAttentionSpec` (#372, *open PR*) | one contiguous key range per query segment |
+| | `RaggedBlockCausalAttentionSpec` (#381, *open PR*) | each block attends its span's prefix of blocks |
+| a fixed-size cache per request: a sink plus a sliding window, optionally after a shared read-only prefix | bounded KV (`BoundedKVSpec`, #383, *open PR*) | rows at any position in one batch; per-row source; a per-distance score term |
+| fixed-size opaque state per request (recurrent, conv tails) | `RecurrentStatePool` | slots read and written through the step's addressing (`gather` / `scatter_`, #383, *open PR*) |
 | frame rings (Waypoint) | `RingKVManager` | to be merged into bounded KV |
 
 A resource that holds per-request state gives models operations driven by the step (`gather` / `scatter_`, `attend` over the current plan). It never asks a model to index its storage or to hold and select rows of its plans.
@@ -54,7 +56,7 @@ KV pages and recurrent (GDN/Mamba) state slots are two forms of the same per-req
 ## Ragged (cacheless) attention
 
 - **A ragged resource plans one layout per label.** A step declares, per request, the spans its layers attend over as `(label, length)` segments; the manager plans each label across the batch and a layer asks for its label's callable. Spans with different head geometries need separate resources, since a resource has one head layout.
-- **Cross-attention between spans of a request is its own kind** (`RaggedCrossAttentionSpec`, #372): its step names `(q_label, kv_label)` pairs and plans each pair under `cross_label(q, kv)`. It keeps the self-attention resource's API unchanged; extending a resource that almost fits this way beats a model calling SDPA (see AGENTS.md invariant 1).
+- **Cross-attention between spans of a request is its own kind** (`RaggedCrossAttentionSpec`, #372, *open PR*): its step names `(q_label, kv_label)` pairs and plans each pair under `cross_label(q, kv)`. It keeps the self-attention resource's API unchanged; extending a resource that almost fits this way beats a model calling SDPA (see AGENTS.md invariant 1).
 
 ## Scope
 

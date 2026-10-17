@@ -43,7 +43,7 @@ Every attention in the DiT should go through a ragged resource, so the model get
 - `attention_segments(bucket_key)` declares every span a request's layers attend over, as `(label, length)`; the default is one `"main"` span of all its tokens. A layer that attends over a sub-span (a refiner over the image tokens alone, a joint model's per-modality self-attention) gets its own label, and `ragged_for(label)` gives that layer its callable.
 - `ragged_for` memoizes one callable per label for the life of a binding. The compiled transformer guards on the identity of the callables it is handed; a fresh one per step recompiles every step.
 - A model with more than one head geometry (LTX-2.5's video 32×128 and audio 32×64 heads) declares one resource per geometry.
-- Cross-attention between spans of the same request (video queries over text keys) is a separate cross-attention resource kind (`RaggedCrossAttentionSpec`, added in #372) whose step names `(q_label, kv_label)` pairs; see "Cross-attention between spans" in `docs/adding_models.rst`. Don't fall back to SDPA for it because the shapes are fixed inside a bucket.
+- Cross-attention between spans of the same request (video queries over text keys) is a separate cross-attention resource kind (`RaggedCrossAttentionSpec`, #372, open PR) whose step names `(q_label, kv_label)` pairs; #372 also adds "Cross-attention between spans" to `docs/adding_models.rst`. Don't fall back to SDPA for it because the shapes are fixed inside a bucket.
 - `joint_attention` in `attention.py` packs per-row q/k/v into the ragged layout (or runs SDPA when no resource is bound, which is what a parity backend uses).
 
 ## Compile and capture
