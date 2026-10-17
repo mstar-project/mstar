@@ -1753,24 +1753,33 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="top_level_entities">
+<a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.top_level_entities">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">top_level_entities</span><span class="p">(</span><span class="n">section</span><span class="p">:</span> <span class="n">GraphSection</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"GraphNode | Loop"</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The "outer-level" nodes and loops of a section, keyed by name: the</span>
+<span class="sd">    entities a registry over it counts toward completion."""</span>
+    <span class="n">entities</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphNode</span> <span class="o">|</span> <span class="n">Loop</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_collect</span><span class="p">(</span><span class="n">sec</span><span class="p">:</span> <span class="n">GraphSection</span><span class="p">):</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sec</span><span class="p">,</span> <span class="n">GraphNode</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sec</span><span class="p">,</span> <span class="n">Loop</span><span class="p">):</span>
+            <span class="c1"># stop here: a Loop's inner entities are owned by its own LoopStateRegistry</span>
+            <span class="n">entities</span><span class="p">[</span><span class="n">sec</span><span class="o">.</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">sec</span>
+            <span class="k">return</span>
+        <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sec</span><span class="p">,</span> <span class="n">Sequential</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sec</span><span class="p">,</span> <span class="n">Parallel</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sec</span><span class="o">.</span><span class="n">sections</span><span class="p">:</span>
+            <span class="n">_collect</span><span class="p">(</span><span class="n">s</span><span class="p">)</span>
+    <span class="n">_collect</span><span class="p">(</span><span class="n">section</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">entities</span></div>
+
+
+
 <div class="viewcode-block" id="GraphStateRegistry">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.GraphStateRegistry">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">GraphStateRegistry</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">graph_section</span><span class="p">:</span> <span class="n">GraphSection</span><span class="p">,</span>
     <span class="p">):</span>
-        <span class="c1"># "Outer-level" nodes and loops</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">managed_entities</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphNode</span><span class="o">|</span><span class="n">Loop</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-
-        <span class="k">def</span><span class="w"> </span><span class="nf">_set_managed_entities</span><span class="p">(</span><span class="n">section</span><span class="p">:</span> <span class="n">GraphSection</span><span class="p">):</span>
-            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">section</span><span class="p">,</span> <span class="n">GraphNode</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">section</span><span class="p">,</span> <span class="n">Loop</span><span class="p">):</span>
-                <span class="c1"># stop here — Loop's inner entities are owned by its own LoopStateRegistry</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">managed_entities</span><span class="p">[</span><span class="n">section</span><span class="o">.</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">section</span>
-                <span class="k">return</span>
-            <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">section</span><span class="p">,</span> <span class="n">Sequential</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">section</span><span class="p">,</span> <span class="n">Parallel</span><span class="p">)</span>
-            <span class="k">for</span> <span class="n">sec</span> <span class="ow">in</span> <span class="n">section</span><span class="o">.</span><span class="n">sections</span><span class="p">:</span>
-                <span class="n">_set_managed_entities</span><span class="p">(</span><span class="n">sec</span><span class="p">)</span>
-        <span class="n">_set_managed_entities</span><span class="p">(</span><span class="n">graph_section</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">managed_entities</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphNode</span><span class="o">|</span><span class="n">Loop</span><span class="p">]</span> <span class="o">=</span> <span class="n">top_level_entities</span><span class="p">(</span><span class="n">graph_section</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">is_done</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_num_completed_entities</span> <span class="o">=</span> <span class="mi">0</span>

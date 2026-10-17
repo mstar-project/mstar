@@ -9,6 +9,12 @@ mstar.graph.base
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      top_level_entities
+   
    
 
    

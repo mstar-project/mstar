@@ -880,7 +880,8 @@ whereas <code class="docutils literal notranslate"><span class="pre">mstar-serve
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">node_groups</span></code></p></td>
 <td><p>List of placements. Each entry assigns <code class="docutils literal notranslate"><span class="pre">node_names</span></code> to <code class="docutils literal notranslate"><span class="pre">ranks</span></code>, optionally
-scoped to specific <code class="docutils literal notranslate"><span class="pre">graph_walks</span></code> and/or sharded with <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>.</p></td>
+scoped to specific <code class="docutils literal notranslate"><span class="pre">graph_walks</span></code> and/or sharded with <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>. Each node of a
+walk must be placed by exactly one entry for that walk.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">resources</span></code></p></td>
 <td><p><em>(optional)</em> Per-resource overrides, keyed by the model’s resource names (see

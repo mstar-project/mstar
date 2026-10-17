@@ -1922,7 +1922,9 @@ embedding and the RoPE gathers left eager because they are data-dependent indexi
 <span id="config-yaml"></span><h2>Step 6 — Write a config YAML<a class="headerlink" href="#step-6-write-a-config-yaml" title="Link to this heading">#</a></h2>
 <p>A config maps nodes to GPU ranks. The value under <code class="docutils literal notranslate"><span class="pre">model:</span></code> is your registry key. Each
 <code class="docutils literal notranslate"><span class="pre">node_groups</span></code> entry assigns one or more <code class="docutils literal notranslate"><span class="pre">node_names</span></code> to <code class="docutils literal notranslate"><span class="pre">ranks</span></code>. An entry can also
-name specific <code class="docutils literal notranslate"><span class="pre">graph_walks</span></code>, which is how prefill-decode disaggregation is expressed.</p>
+name specific <code class="docutils literal notranslate"><span class="pre">graph_walks</span></code>, which is how prefill-decode disaggregation is expressed.
+Every node of a walk must be placed by exactly one entry that applies to that walk; the
+conductor refuses a config that places it twice or not at all.</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"your_model"</span>
 <span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
 <span class="nt">node_groups</span><span class="p">:</span>
@@ -2373,13 +2375,22 @@ Override these methods:</p>
 objects between them, including a <code class="docutils literal notranslate"><span class="pre">chunk_policy_factory</span></code> such as
 <code class="docutils literal notranslate"><span class="pre">SlidingWindowChunkPolicy(window=...,</span> <span class="pre">stride=...)</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">get_partitions()</span></code> declares each <code class="docutils literal notranslate"><span class="pre">PartitionDefinition</span></code>: its walks, its initial walk,
-and the partitions that produce data into it.</p></li>
+and the partitions that produce data into it. Every walk belongs to exactly one
+partition.</p></li>
 <li><p>Route cross-partition tensors with <code class="docutils literal notranslate"><span class="pre">StreamingGraphEdge(next_node=...,</span> <span class="pre">name=...,</span>
 <span class="pre">target_partition=...)</span></code> instead of a plain <code class="docutils literal notranslate"><span class="pre">GraphEdge</span></code>.</p></li>
 </ul>
 <p>The consuming partition’s <code class="docutils literal notranslate"><span class="pre">get_partition_forward_pass_args</span></code> reads
 <code class="docutils literal notranslate"><span class="pre">incoming_connections</span></code>, which provides token counts and a <code class="docutils literal notranslate"><span class="pre">producer_done</span></code> flag, and
 uses them to decide when to run.</p>
+<p>Keep a walk that consumes a stream to one node or one <code class="docutils literal notranslate"><span class="pre">Loop</span></code> on one node group, and move
+later work into a downstream partition fed by its own <code class="docutils literal notranslate"><span class="pre">StreamingGraphEdge</span></code>. A consumer
+whose every input is streamed runs again as soon as the next chunk arrives, and the
+runtime and conductor count passes per worker graph, so the conductor refuses at startup
+such a consumer sharing its worker graph with another top-level node or <code class="docutils literal notranslate"><span class="pre">Loop</span></code>, and a
+stream-consuming walk split over worker graphs, unless every consumer also waits on a
+non-streamed input and all the walk’s worker graphs run on the same workers. That input
+must arrive once per pass (from the conductor, say); startup cannot check this.</p>
 </section>
 <section id="checklist">
 <h2>Checklist<a class="headerlink" href="#checklist" title="Link to this heading">#</a></h2>
