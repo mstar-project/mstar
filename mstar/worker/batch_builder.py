@@ -124,15 +124,23 @@ class FIFOBatchBuilder(BaseBatchBuilder):
     So a fresh row the cap pushed out goes back to its ready queue **only on
     a step that served a backlog**, which is the case main never created. With
     no backlog it parks, exactly as main did, and the remainder keeps its
-    arrival order instead of being re-popped and reordered. A row held back
-    for any other reason -- OOM backoff, pending remove, a foreign capture
-    group -- always parks: it cannot run this step whoever holds it.
+    arrival order instead of being re-popped and reordered. A fresh row of a
+    foreign capture group goes back too when a backlogged row ran: parked, it
+    would hand the key a backlog again, and two groups alternating would keep
+    one there for good, served ahead of every other node. When every
+    backlogged row was blocked it parks instead, so it leads the next step;
+    returned, it would lose the group to the same earlier fresh row every
+    time. A row held back for any other reason -- OOM backoff, pending
+    remove -- always parks: it cannot run this step whoever holds it.
     """
 
     def build_batch(self, request: BatchBuildRequest) -> BatchBuildResult:
         max_bs = request.max_batch_size
-        # both read before `_merged`, which folds `fresh` into `backlog` in place
+        # all read before `_merged`, which folds `fresh` into `backlog` in place
         had_backlog = request.backlog is not None
+        backlog_rids = (
+            set(request.backlog.request_to_worker_graph) if had_backlog else set()
+        )
         fresh_rids = (
             set(request.fresh.request_to_worker_graph) if request.fresh else set()
         )
@@ -147,9 +155,12 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         scheduled, remainder = batch.split_off_first(max_bs, exclude_rids=exclude)
         if remainder is None:
             return BatchBuildResult(scheduled)
+        served_backlog = scheduled is not None and \
+            not backlog_rids.isdisjoint(scheduled.request_to_worker_graph)
+        keep = request.blocked_rids if served_backlog else exclude
         give_back = {
             rid for rid in remainder.request_to_worker_graph
-            if rid in fresh_rids and rid not in exclude
+            if rid in fresh_rids and rid not in keep
         } if had_backlog else set()
         if not give_back:
             return BatchBuildResult(scheduled, backlog=remainder)

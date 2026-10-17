@@ -192,6 +192,9 @@ class MicroScheduler:
 
         # (node, graph walk) -> ScheduledBatch
         self.backlog: dict[tuple[str, str], ScheduledBatch] = {}
+        # The key whose backlog a yield-away pass last served, until another
+        # key gets a step: it is passed over on the next yield-away.
+        self._yield_backlog_served: tuple[str, str] | None = None
 
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
@@ -475,9 +478,18 @@ class MicroScheduler:
         # A backlogged key goes first, oldest first, so a split set drains
         # before anything else starts; its fresh rows ride along. A key whose
         # step comes out empty (every backlogged row blocked) is passed over
-        # rather than leaving the worker idle behind it. `exclude_target` is
-        # only a fairness hint, and finishing a split set beats fairness.
-        keys = [k for k in self.backlog if target is None or k == target]
+        # rather than leaving the worker idle behind it. A backlog under
+        # `exclude_target` is served once, then waits until another key has
+        # had a step: a speculation chain over two capture groups backlogs one
+        # group every step, so serving it on every yield-away would never let
+        # the other nodes in, and skipping it every time gives them a turn per
+        # group rather than per round of groups (the caller falls back to an
+        # unexcluded pass when nothing else is ready).
+        keys = [
+            k for k in self.backlog
+            if (target is None or k == target)
+            and (k != exclude_target or k != self._yield_backlog_served)
+        ]
         rr_key = self._select_node_rr(ready)
         if rr_key is not None and rr_key not in keys:
             keys.append(rr_key)
@@ -489,6 +501,10 @@ class MicroScheduler:
                 capture_group_of=capture_group_of,
             )
             if scheduled is not None:
+                if key == exclude_target:
+                    self._yield_backlog_served = key
+                elif key != self._yield_backlog_served:
+                    self._yield_backlog_served = None
                 return scheduled
         return None
 
