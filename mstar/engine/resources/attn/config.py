@@ -126,5 +126,15 @@ class AttentionStep(ResourceStep):
     # queries attend to the stream's stored context only, not to the tokens this step appends
     # (a draft block over the context the target has produced so far); the step's own
     # `segments` then carry the query counts, the cache's segments the appended counts.
-    # Only the MLA backend reads it.
+    # Only the MLA backend reads it; the others refuse it (`refuse_context_only`).
     context_only: bool = False
+
+
+def refuse_context_only(step: AttentionStep, manager: str) -> None:
+    """For the attention resources that don't read ``context_only``: planned without it,
+    the step's queries would attend to the tokens it appends as well."""
+    if step.context_only:
+        raise ValueError(
+            f"{manager} does not read AttentionStep.context_only; only the "
+            f"{AttnBackend.FLASHINFER_MLA.value!r} backend does"
+        )

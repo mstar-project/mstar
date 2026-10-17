@@ -5,7 +5,7 @@ from collections.abc import Iterable
 import torch
 
 from mstar.engine.resources.attn.base import EagerSlotKey, WorkspacePool
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.attn.ragged.base import RaggedAttnManager
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig
 from mstar.engine.resources.attn.ragged.wrappers import RaggedPrefillWrapper
@@ -116,6 +116,7 @@ class FlashInferRaggedManager(RaggedAttnManager):
 
     # NOTE: can reuse the same AttentionStep dataclass as KV-backed attention
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
 
         lease = ctx.slot_lease

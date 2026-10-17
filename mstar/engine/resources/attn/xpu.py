@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
 
@@ -51,6 +51,7 @@ class XPUPagedAttentionManager(AttentionManager):
         return {self._kv_cache_name}
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         if ctx.slot_lease is not None or ctx.is_preplan:
             raise RuntimeError(
                 "xpu_paged attention is eager-only: its plan metadata is "
