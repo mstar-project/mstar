@@ -596,6 +596,7 @@ class CudaGraphRunner:
             # config order, as it does the captures
             self._comm_group.tp_group.barrier()
             self._comm_group.sp_group.barrier()
+            free = torch.cuda.mem_get_info(self._device)[0]
             try:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
                     if spec.slot == 0:
@@ -610,15 +611,13 @@ class CudaGraphRunner:
                         )
                         if lent:
                             self._lent.add(spec.bucket)
-            except Exception:
-                # a slot that can't run can't be captured, and neither can its bucket
-                self._lent.discard(spec.bucket)
-                if (cost := self._capture_costs.get(spec.bucket)) is not None:
-                    self._capture_costs[spec.bucket] = cost._replace(graph=None)
-                logger.warning(
-                    "CudaGraphRunner[%s]: could not run %s eagerly to size its "
-                    "capture", self._submodule_name, spec, exc_info=True,
-                )
+            except Exception as e:
+                # Fail the boot. A skipped step would leave its peak out of the plan's floor.
+                # A step that cannot run here cannot run once graphs hold memory either.
+                raise RuntimeError(
+                    f"CudaGraphRunner[{self._submodule_name}]: could not run {spec} eagerly to size "
+                    f"its capture, with {free / 2**20:.0f} MiB free before it: {e}"
+                ) from e
         return self._capture_costs
 
     def size_lent_captures(self, wanted: bool) -> dict[BucketKey, CaptureCost]:
@@ -1499,6 +1498,7 @@ class PiecewiseCudaGraphRunner:
                 if self._comm_group is not None:
                     self._comm_group.tp_group.barrier()
                     self._comm_group.sp_group.barrier()
+                free = torch.cuda.mem_get_info(self._device)[0]
                 try:
                     with self._warmed(shape, slot, self.NUM_WARMUP) as warmed:
                         self._output_likes[self._bucket(shape)] = {
@@ -1518,16 +1518,13 @@ class PiecewiseCudaGraphRunner:
                             )
                             if lent:
                                 self._lent.add(self._bucket(shape))
-                except Exception:
+                except Exception as e:
                     # as in `CudaGraphRunner.size_captures`
-                    self._lent.discard(self._bucket(shape))
-                    if (cost := self._capture_costs.get(self._bucket(shape))) is not None:
-                        self._capture_costs[self._bucket(shape)] = cost._replace(graph=None)
-                    logger.warning(
-                        "PiecewiseCudaGraphRunner[%s]: could not run bs=%d total_tokens=%d "
-                        "slot=%d eagerly to size its capture", self._label, shape.bs,
-                        shape.total_tokens, slot, exc_info=True,
-                    )
+                    raise RuntimeError(
+                        f"PiecewiseCudaGraphRunner[{self._label}]: could not run bs={shape.bs} "
+                        f"total_tokens={shape.total_tokens} slot={slot} eagerly to size its capture, "
+                        f"with {free / 2**20:.0f} MiB free before it: {e}"
+                    ) from e
         # hand the pages back: held through the captures, they would shift every
         # admit after them on a node that shares the resource
         self._dummy_rows.release_all()

@@ -59,7 +59,6 @@ class _StubMeasuredRunner:
         self._comm_group = SimpleNamespace(tp_group=group, sp_group=group)
         self.warmed: list[tuple[BucketKey, int]] = []
         self.forwards: list[int] = []
-        self.failing: set[tuple[BucketKey, int]] = set()
 
     def prepare_for_capture(self):
         return [CGSlotSpec(bucket=b, slot=s, config=SimpleNamespace()) for b in self._steps for s in (0, 1)]
@@ -68,8 +67,6 @@ class _StubMeasuredRunner:
     def _warmed(self, spec, forwards):
         self.warmed.append((spec.bucket, spec.slot))
         self.forwards.append(forwards)
-        if (spec.bucket, spec.slot) in self.failing:
-            raise RuntimeError(f"capture admit failed for {spec.bucket}")
         step = self._steps[spec.bucket]
         yield WarmedSpec(
             run=lambda: step, static_inputs={}, static_input_keys=(), dummy_rids=[], dummy_metadata={},
@@ -88,6 +85,7 @@ def measured(monkeypatch):
         return cost.graph
 
     monkeypatch.setattr(cuda_graph_runner, "_capture_thrown_away", capture)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (50 * _GIB, 80 * _GIB))
     monkeypatch.setattr(
         cuda_graph_runner, "capture_into_graph", lambda run, pool, device, autocast_dtype: (None, run()),
     )
@@ -271,18 +269,6 @@ def test_a_spec_is_warmed_up_to_size_it_and_not_again_to_capture_it(measured, mo
         CudaGraphRunner._capture_one(runner, spec)
 
     assert runner.forwards == [2, 2, 0, 0], "a spec sizing warmed up is captured without another forward"
-
-
-def test_a_bucket_whose_second_slot_cannot_run_is_never_planned(measured):
-    """A bucket registers all of its slots or none, so one whose second slot
-    fails its warm-up would be captured at slot 0 for nothing."""
-    runner = _StubMeasuredRunner(torch.device("cuda", 0), {_DECODE: CaptureCost(_GIB, 2 * _GIB, 0, 2)})
-    runner.failing = {(_DECODE, 1)}
-
-    costs = runner.size_captures()
-
-    assert costs[_DECODE].graph is None, "a bucket that can't run every slot must not be planned"
-    assert costs[_DECODE].peak == _GIB, "its eager peak still counts toward the floor"
 
 
 def test_a_cpu_device_never_asks_the_driver(monkeypatch):
