@@ -23,6 +23,7 @@ mstar.engine.resources.attn.ragged.wrappers
 
    .. autosummary::
    
+      RaggedCrossPrefillWrapper
       RaggedPrefillWrapper
    
    

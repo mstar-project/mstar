@@ -904,7 +904,10 @@ plan is keyed by the segment label, and the wrapper behind it is per
 here at construction instead of being a cursor on the resource – which is
 what lets one stack attend over several spans at once (a refiner over the
 image tokens next to a pass over all of them), the case <cite>AttentionCallable</cite>
-says to thread explicitly.</p>
+says to thread explicitly. A cross-attention pair of a
+<code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec</span></code> resource is bound the same way, under
+<code class="docutils literal notranslate"><span class="pre">cross_label(q_label,</span> <span class="pre">kv_label)</span></code>; its <code class="docutils literal notranslate"><span class="pre">k</span></code> / <code class="docutils literal notranslate"><span class="pre">v</span></code> are then the key span’s
+tokens, packed in the same request order as <code class="docutils literal notranslate"><span class="pre">q</span></code>.</p>
 <p>One instance per label, held for the life of the resource binding: a
 compiled transformer region guards on the identity of the callables it is
 handed, so handing it a fresh one per step retraces that frame every step
@@ -912,7 +915,7 @@ until Dynamo gives up.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>attn</strong> (<a class="reference internal" href="mstar.engine.resources.attn.ragged.base.html#mstar.engine.resources.attn.ragged.base.RaggedAttnManager" title="mstar.engine.resources.attn.ragged.base.RaggedAttnManager"><em>RaggedAttnManager</em></a>)</p></li>
+<li><p><strong>attn</strong> (<a class="reference internal" href="mstar.engine.resources.attn.ragged.base.html#mstar.engine.resources.attn.ragged.base.RaggedAttnManager" title="mstar.engine.resources.attn.ragged.base.RaggedAttnManager"><em>RaggedAttnManager</em></a><em> | </em><a class="reference internal" href="mstar.engine.resources.attn.ragged.base.html#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager" title="mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager"><em>RaggedCrossAttnManager</em></a>)</p></li>
 <li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 </ul>
 </dd>

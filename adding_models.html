@@ -642,7 +642,10 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2a-declare-your-resources">Step 2a — Declare your resources</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#two-samplers-on-one-node">Two samplers on one node</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder models)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-attention-between-spans">Cross-attention between spans</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-declare-the-computation-graph">Step 3 — Declare the computation graph</a></li>
@@ -1057,7 +1060,12 @@ defaults to <code class="docutils literal notranslate"><span class="pre">head_di
 CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code> and
 <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
+<td><p>The cross-attention counterpart: one span of each request attends another
+(<code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionStep(pairs=...)</span></code>). Same config. See <a class="reference internal" href="#cross-attention-between-spans">Cross-attention
+between spans</a>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
 <td><p>Position tracking and RoPE. <code class="docutils literal notranslate"><span class="pre">scheme</span></code> is <code class="docutils literal notranslate"><span class="pre">PosScheme.SEQUENTIAL</span></code> or
 <code class="docutils literal notranslate"><span class="pre">PosScheme.BLOCK</span></code>. The RoPE parameters are set here: <code class="docutils literal notranslate"><span class="pre">rope_theta</span></code>,
 <code class="docutils literal notranslate"><span class="pre">rope_scale</span></code>, and the Llama-3.1 parameters <code class="docutils literal notranslate"><span class="pre">low_freq_factor</span></code>,
@@ -1065,7 +1073,7 @@ CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre"
 embeddings also declares this spec, because it needs the position counter. Such a
 model never applies RoPE.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetion_penalty=...)</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetion_penalty=...)</span></code></p></td>
 <td><p>A sampler with its own per-request parameter buffers, philox stream, and optional
 seen-token mask. <code class="docutils literal notranslate"><span class="pre">enable_repetion_penalty</span></code> declares a capability, not an
 intention. It selects which kernel variant is recorded into the captured graph.
@@ -1257,6 +1265,25 @@ previous step’s plan. Because the tower is normally captured as a piecewise re
 declaration lives in the region’s <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>, and names no <code class="docutils literal notranslate"><span class="pre">KVStep</span></code>. See
 <code class="docutils literal notranslate"><span class="pre">mstar/model/bagel/submodules.py</span></code>, region <code class="docutils literal notranslate"><span class="pre">&quot;vit_block_loop&quot;</span></code>, and <a class="reference internal" href="#piecewise-cuda-graphs-capturing-an-inner-loop">Piecewise CUDA
 graphs (capturing an inner loop)</a>.</p>
+<section id="cross-attention-between-spans">
+<h4>Cross-attention between spans<a class="headerlink" href="#cross-attention-between-spans" title="Link to this heading">#</a></h4>
+<p>A diffusion transformer whose streams attend each other (video queries over text keys, or
+audio over video) has several spans per request and no cache either. Declare each span as
+its own label, and the cross-attentions as a <code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec</span></code> beside the
+<code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code> for the self-attention: a resource is one kind of attention. Its
+step names the <code class="docutils literal notranslate"><span class="pre">(q_label,</span> <span class="pre">kv_label)</span></code> pairs:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">RaggedCrossAttentionStep</span><span class="p">(</span>
+    <span class="n">segments</span><span class="o">=</span><span class="n">segments</span><span class="p">,</span>              <span class="c1"># one Segment per (request, label) the pairs use</span>
+    <span class="n">pairs</span><span class="o">=</span><span class="p">((</span><span class="s2">"video"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">),</span> <span class="p">(</span><span class="s2">"audio"</span><span class="p">,</span> <span class="s2">"video"</span><span class="p">)),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>Each pair is planned as its own layout, pairing each request’s <code class="docutils literal notranslate"><span class="pre">q_label</span></code> span with that
+request’s <code class="docutils literal notranslate"><span class="pre">kv_label</span></code> span; cross-attention is never causal. A layer attends through
+<code class="docutils literal notranslate"><span class="pre">RaggedAttentionCallable(resource,</span> <span class="pre">cross_label(q_label,</span> <span class="pre">kv_label))</span></code>, passing the key
+span’s tokens as <code class="docutils literal notranslate"><span class="pre">k</span></code> and <code class="docutils literal notranslate"><span class="pre">v</span></code>. One resource has one head geometry, so a model whose
+attentions differ in head count or head dim declares one spec per (kind, geometry).
+LTX-2.5 is the reference (<code class="docutils literal notranslate"><span class="pre">mstar/model/ltx2_5/submodules.py</span></code>).</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>The eager varlen path is sometimes good to have. The BAGEL ViT has a head dimension of
@@ -1264,6 +1291,7 @@ graphs (capturing an inner loop)</a>.</p>
 us to zero-pad to 128. So that tower attends through the resource only when it is
 replaying a captured graph, and runs flash-attn varlen otherwise.</p>
 </div>
+</section>
 </section>
 </section>
 <section id="step-3-declare-the-computation-graph">
@@ -2486,7 +2514,10 @@ for a full omni-modal model.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2a-declare-your-resources">Step 2a — Declare your resources</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#two-samplers-on-one-node">Two samplers on one node</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder models)</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-attention-between-spans">Cross-attention between spans</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-declare-the-computation-graph">Step 3 — Declare the computation graph</a></li>

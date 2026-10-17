@@ -931,8 +931,22 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">and nothing to carry between steps: the resource holds only planned wrappers.</span>
 <span class="sd">"""</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedAttentionSpec</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedAttentionSpec</span><span class="p">,</span> <span class="n">RaggedCrossAttentionSpec</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionResource</span><span class="p">,</span> <span class="n">EngineResourceInfo</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_build_ragged</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">EngineResourceInfo</span><span class="p">,</span> <span class="n">manager_cls</span><span class="p">):</span>
+    <span class="n">config</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span>
+    <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
+    <span class="n">dtype</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">dtype</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span>
+    <span class="k">if</span> <span class="n">dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"ragged attention </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2">: no activation dtype. Set "</span>
+            <span class="s2">"RaggedAttentionConfig.dtype on a node without a KV-backed attention "</span>
+            <span class="s2">"(the engine has no KV dtype to fall back on)."</span>
+        <span class="p">)</span>
+    <span class="k">return</span> <span class="n">manager_cls</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="RaggedAttnManager">
@@ -954,21 +968,28 @@ window.runMermaid = runMermaid;</script>
             <span class="n">FlashInferRaggedManager</span><span class="p">,</span>
         <span class="p">)</span>
 
-        <span class="n">config</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span>
-        <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
-        <span class="n">dtype</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">dtype</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span>
-        <span class="k">if</span> <span class="n">dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"ragged attention </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2">: no activation dtype. Set "</span>
-                <span class="s2">"RaggedAttentionConfig.dtype on a node without a KV-backed attention "</span>
-                <span class="s2">"(the engine has no KV dtype to fall back on)."</span>
-            <span class="p">)</span>
-        <span class="k">return</span> <span class="n">FlashInferRaggedManager</span><span class="p">(</span>
-            <span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-            <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span>
-        <span class="p">)</span></div>
+        <span class="k">return</span> <span class="n">_build_ragged</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="p">,</span> <span class="n">FlashInferRaggedManager</span><span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="RaggedCrossAttnManager">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.base.html#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaggedCrossAttnManager</span><span class="p">(</span><span class="n">AttentionResource</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Cacheless cross-attention between two spans of each request; see</span>
+<span class="sd">    ``RaggedCrossAttentionSpec``."""</span>
+
+    <span class="n">prefix_skip_safe</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="RaggedCrossAttnManager.build">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.base.html#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager.build">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">build</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">RaggedCrossAttentionSpec</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">EngineResourceInfo</span><span class="p">):</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.flashinfer</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+            <span class="n">FlashInferRaggedCrossManager</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">_build_ragged</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="p">,</span> <span class="n">FlashInferRaggedCrossManager</span><span class="p">)</span></div>
 </div>
 
 </pre></div>

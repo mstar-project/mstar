@@ -926,7 +926,7 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionManager</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedAttnManager</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedAttnManager</span><span class="p">,</span> <span class="n">RaggedCrossAttnManager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVManager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.linear_attn.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">LinearAttnManager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.recurrent.pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">RecurrentStatePool</span>
@@ -1082,7 +1082,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    here at construction instead of being a cursor on the resource -- which is</span>
 <span class="sd">    what lets one stack attend over several spans at once (a refiner over the</span>
 <span class="sd">    image tokens next to a pass over all of them), the case `AttentionCallable`</span>
-<span class="sd">    says to thread explicitly.</span>
+<span class="sd">    says to thread explicitly. A cross-attention pair of a</span>
+<span class="sd">    ``RaggedCrossAttentionSpec`` resource is bound the same way, under</span>
+<span class="sd">    ``cross_label(q_label, kv_label)``; its ``k`` / ``v`` are then the key span's</span>
+<span class="sd">    tokens, packed in the same request order as ``q``.</span>
 
 <span class="sd">    One instance per label, held for the life of the resource binding: a</span>
 <span class="sd">    compiled transformer region guards on the identity of the callables it is</span>
@@ -1090,7 +1093,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    until Dynamo gives up.</span>
 <span class="sd">    """</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">attn</span><span class="p">:</span> <span class="n">RaggedAttnManager</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">attn</span><span class="p">:</span> <span class="n">RaggedAttnManager</span> <span class="o">|</span> <span class="n">RaggedCrossAttnManager</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">attn</span> <span class="o">=</span> <span class="n">attn</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">label</span> <span class="o">=</span> <span class="n">label</span>
 

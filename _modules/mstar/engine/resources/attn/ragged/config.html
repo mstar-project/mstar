@@ -935,17 +935,45 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">ResourceStep</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span>
+
+
+<div class="viewcode-block" id="cross_label">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.cross_label">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">cross_label</span><span class="p">(</span><span class="n">q_label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">kv_label</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The plan a cross-attention pair runs under: ``q_label``'s spans attending</span>
+<span class="sd">    ``kv_label``'s."""</span>
+    <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">q_label</span><span class="si">}</span><span class="s2">&lt;-</span><span class="si">{</span><span class="n">kv_label</span><span class="si">}</span><span class="s2">"</span></div>
+
+
+
+<div class="viewcode-block" id="RaggedCrossAttentionStep">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedCrossAttentionStep">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaggedCrossAttentionStep</span><span class="p">(</span><span class="n">ResourceStep</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A ragged cross-attention step: which spans attend which.</span>
+
+<span class="sd">    Each label in ``segments`` is one span per request (video tokens, text tokens,</span>
+<span class="sd">    ...). Each ``(q_label, kv_label)`` in ``pairs`` is one attention: every request's</span>
+<span class="sd">    ``q_label`` span attends that request's ``kv_label`` span, so both labels must be</span>
+<span class="sd">    declared for the same requests in the same order. Never causal.</span>
+<span class="sd">    """</span>
+
+    <span class="n">pairs</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span></div>
+
 
 
 <div class="viewcode-block" id="RaggedAttentionConfig">
 <a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedAttentionConfig">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">RaggedAttentionConfig</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Varlen self-attention over segments packed into one forward, with no KV</span>
+<span class="w">    </span><span class="sd">"""Varlen attention over segments packed into one forward, with no KV</span>
 <span class="sd">    cache: the whole layout is this step's, and nothing carries to the next.</span>
+<span class="sd">    The config of both ``RaggedAttentionSpec`` (self-attention within each span)</span>
+<span class="sd">    and ``RaggedCrossAttentionSpec`` (one span attending another).</span>
 
 <span class="sd">    Head counts are **pre-sharding**; the engine narrows them to the rank's</span>
 <span class="sd">    slice at build, as it does for a ``KVConfig``.</span>
@@ -1015,20 +1043,12 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="RaggedAttentionSpec">
-<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedAttentionSpec">[docs]</a>
 <span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">RaggedAttentionSpec</span><span class="p">(</span><span class="n">NodeResourceSpec</span><span class="p">):</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">_RaggedSpecBase</span><span class="p">(</span><span class="n">NodeResourceSpec</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The config and deployment overrides both ragged specs share."""</span>
+
     <span class="n">config</span><span class="p">:</span> <span class="n">RaggedAttentionConfig</span>
 
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedAttnManager</span>
-
-        <span class="k">return</span> <span class="n">RaggedAttnManager</span>
-
-<div class="viewcode-block" id="RaggedAttentionSpec.apply_yaml_overrides">
-<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedAttentionSpec.apply_yaml_overrides">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">flashinfer_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -1046,8 +1066,40 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">max_segments_per_request</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_segments_per_request</span> <span class="o">=</span> <span class="n">max_segments_per_request</span>
         <span class="k">if</span> <span class="n">max_tokens_per_request</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_tokens_per_request</span> <span class="o">=</span> <span class="n">max_tokens_per_request</span></div>
-</div>
+            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_tokens_per_request</span> <span class="o">=</span> <span class="n">max_tokens_per_request</span>
+
+
+<div class="viewcode-block" id="RaggedAttentionSpec">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedAttentionSpec">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaggedAttentionSpec</span><span class="p">(</span><span class="n">_RaggedSpecBase</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Cacheless self-attention within each declared span (``AttentionStep``)."""</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedAttnManager</span>
+
+        <span class="k">return</span> <span class="n">RaggedAttnManager</span></div>
+
+
+
+<div class="viewcode-block" id="RaggedCrossAttentionSpec">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedCrossAttentionSpec">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaggedCrossAttentionSpec</span><span class="p">(</span><span class="n">_RaggedSpecBase</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Cacheless cross-attention between two spans of each request: a forward's</span>
+<span class="sd">    ``(q_label, kv_label)`` pairs (``RaggedCrossAttentionStep``), each run through</span>
+<span class="sd">    ``RaggedAttentionCallable(resource, cross_label(q_label, kv_label))``.</span>
+
+<span class="sd">    Separate from ``RaggedAttentionSpec`` so a resource is one kind of attention:</span>
+<span class="sd">    a model with both declares one of each per head geometry.</span>
+<span class="sd">    """</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedCrossAttnManager</span>
+
+        <span class="k">return</span> <span class="n">RaggedCrossAttnManager</span></div>
 
 </pre></div>
 

@@ -9,6 +9,12 @@ mstar.engine.resources.attn.ragged.config
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      cross_label
+   
    
 
    
@@ -19,6 +25,8 @@ mstar.engine.resources.attn.ragged.config
    
       RaggedAttentionConfig
       RaggedAttentionSpec
+      RaggedCrossAttentionSpec
+      RaggedCrossAttentionStep
    
    
 

@@ -18,6 +18,7 @@ mstar.engine.resources.attn.ragged.base
    .. autosummary::
    
       RaggedAttnManager
+      RaggedCrossAttnManager
    
    
 

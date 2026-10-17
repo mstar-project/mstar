@@ -931,16 +931,28 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">EagerSlotKey</span><span class="p">,</span> <span class="n">WorkspacePool</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedAttnManager</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedAttentionConfig</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.wrappers</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedPrefillWrapper</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedAttnManager</span><span class="p">,</span> <span class="n">RaggedCrossAttnManager</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">RaggedAttentionConfig</span><span class="p">,</span>
+    <span class="n">RaggedCrossAttentionStep</span><span class="p">,</span>
+    <span class="n">cross_label</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.wrappers</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">RaggedCrossPrefillWrapper</span><span class="p">,</span>
+    <span class="n">RaggedPrefillWrapper</span><span class="p">,</span>
+    <span class="n">_RaggedPrefillBase</span><span class="p">,</span>
+<span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">CGSlotKey</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">Segment</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">StepContext</span>
 
 
-<div class="viewcode-block" id="FlashInferRaggedManager">
-<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.flashinfer.html#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedManager">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">FlashInferRaggedManager</span><span class="p">(</span><span class="n">RaggedAttnManager</span><span class="p">):</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">_FlashInferRaggedBase</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""What the self- and cross-attention managers share: persistent wrappers per</span>
+<span class="sd">    (bucket, slot, label) and per (label, slot), the preplan protocol, and ``run``.</span>
+<span class="sd">    A subclass names its wrapper class and lays its step out in ``_plan_layouts``."""</span>
+
+    <span class="n">wrapper_class</span><span class="p">:</span> <span class="nb">type</span><span class="p">[</span><span class="n">_RaggedPrefillBase</span><span class="p">]</span>
+
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
@@ -952,14 +964,14 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="n">dtype</span>
 
         <span class="c1"># label -&gt; the wrapper this step's `run` attends through</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">RaggedPrefillWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">_RaggedPrefillBase</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
         <span class="c1"># Persistent, because constructing one allocates FlashInfer's own</span>
         <span class="c1"># buffers and is far from free per step.</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">EagerSlotKey</span><span class="p">,</span> <span class="n">RaggedPrefillWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">CGSlotKey</span><span class="p">,</span> <span class="n">RaggedPrefillWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">EagerSlotKey</span><span class="p">,</span> <span class="n">_RaggedPrefillBase</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">CGSlotKey</span><span class="p">,</span> <span class="n">_RaggedPrefillBase</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">RaggedPrefillWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">_RaggedPrefillBase</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span> <span class="o">=</span> <span class="n">WorkspacePool</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
@@ -982,7 +994,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_cg_wrapper</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RaggedPrefillWrapper</span><span class="p">:</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_RaggedPrefillBase</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""The captured-graph wrapper for one (bucket, slot, label).</span>
 
 <span class="sd">        Built on the first plan for that key, like the paged backend's. Its</span>
@@ -1003,7 +1015,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">max_tokens</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span>
             <span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">max_tokens_for</span><span class="p">(</span><span class="n">bucket</span><span class="o">.</span><span class="n">bs</span><span class="p">)</span> <span class="ow">or</span> <span class="mi">0</span>
         <span class="p">)</span>
-        <span class="n">wrapper</span> <span class="o">=</span> <span class="n">RaggedPrefillWrapper</span><span class="p">(</span>
+        <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">wrapper_class</span><span class="p">(</span>
             <span class="n">workspace_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">),</span>
             <span class="n">use_cuda_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
             <span class="n">max_num_segments</span><span class="o">=</span><span class="n">max_segments</span><span class="p">,</span>
@@ -1013,7 +1025,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
         <span class="k">return</span> <span class="n">wrapper</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_eager_wrapper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RaggedPrefillWrapper</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_eager_wrapper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_RaggedPrefillBase</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""The persistent eager wrapper for one (label, slot).</span>
 
 <span class="sd">        Slotted for the same reason the captured ones are, and on the same</span>
@@ -1022,7 +1034,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">key</span> <span class="o">=</span> <span class="n">EagerSlotKey</span><span class="p">(</span><span class="n">label</span><span class="o">=</span><span class="n">label</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">)</span>
         <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">wrapper</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">RaggedPrefillWrapper</span><span class="p">(</span>
+            <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">wrapper_class</span><span class="p">(</span>
                 <span class="n">workspace_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">slot</span><span class="p">),</span>
                 <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_kwargs</span><span class="p">,</span>
             <span class="p">)</span>
@@ -1041,10 +1053,26 @@ window.runMermaid = runMermaid;</script>
             <span class="n">res</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">seg</span><span class="o">.</span><span class="n">label</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">seg</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">res</span>
 
-    <span class="c1"># NOTE: can reuse the same AttentionStep dataclass as KV-backed attention</span>
-<div class="viewcode-block" id="FlashInferRaggedManager.plan">
-<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.flashinfer.html#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedManager.plan">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_cu_seqlens</span><span class="p">(</span><span class="n">segments</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Segment</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="c1"># On the CPU: FlashInfer's plan wants it there anyway, and building it</span>
+        <span class="c1"># on device would sync (fatally so under preplan). Pinned and freshly</span>
+        <span class="c1"># built per plan: the graph wrapper hands this straight to FlashInfer's</span>
+        <span class="c1"># non-blocking H2D, so a reused buffer could be overwritten while its</span>
+        <span class="c1"># DMA is still in flight. A fresh pinned allocation is held by the</span>
+        <span class="c1"># caching host allocator until the copy retires, keeping the plan async</span>
+        <span class="c1"># without a per-step sync.</span>
+        <span class="n">cu</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">segments</span><span class="p">:</span>
+            <span class="n">cu</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">cu</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">seg</span><span class="o">.</span><span class="n">span</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cu</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">())</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_wrapper_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_RaggedPrefillBase</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cg_wrapper</span><span class="p">(</span><span class="n">lease</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">slot</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">reset_default_cursors</span><span class="p">()</span>
 
         <span class="n">lease</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span>
@@ -1074,52 +1102,25 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># them off, so an undeclared label is unattendable. Clear rather than</span>
         <span class="c1"># update, so last step's wrapper can't be attended through by mistake.</span>
         <span class="n">plan_states</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
-        <span class="c1"># cu_seqlens on the CPU: FlashInfer's plan wants it there anyway, and</span>
-        <span class="c1"># building it on device would sync (fatally so under preplan)</span>
-        <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">segments</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_group_segments_by_label</span><span class="p">(</span>
-            <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">()</span>
-        <span class="p">)</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-            <span class="n">cu</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-            <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">segments</span><span class="p">:</span>
-                <span class="n">cu</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">cu</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">seg</span><span class="o">.</span><span class="n">span</span><span class="p">)</span>
-            <span class="c1"># Pinned and freshly built per plan: the graph wrapper hands this</span>
-            <span class="c1"># straight to FlashInfer's non-blocking H2D, so a reused buffer could</span>
-            <span class="c1"># be overwritten while its DMA is still in flight. A fresh pinned</span>
-            <span class="c1"># allocation is held by the caching host allocator until the copy</span>
-            <span class="c1"># retires, keeping the plan async without a per-step sync.</span>
-            <span class="n">cu_seqlens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
-                <span class="n">cu</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">pin_memory</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span>
-            <span class="p">)</span>
-            <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cg_wrapper</span><span class="p">(</span><span class="n">lease</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_plan_layouts</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">,</span> <span class="n">plan_states</span><span class="p">)</span>
 
-            <span class="c1"># TODO: cache the latest plan state</span>
-            <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="o">=</span><span class="n">cu_seqlens</span><span class="p">,</span> <span class="n">causal</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">)</span>
-            <span class="n">plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span></div>
-
-
-<div class="viewcode-block" id="FlashInferRaggedManager.clear_preplan">
-<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.flashinfer.html#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedManager.clear_preplan">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">clear_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># rebind rather than clear: a consumed preplan dict is the live one</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="o">=</span> <span class="p">{}</span></div>
-
+        <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="o">=</span> <span class="p">{}</span>
 
     <span class="c1">### Submodule-level functionality</span>
 
-<div class="viewcode-block" id="FlashInferRaggedManager.num_segments">
-<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.flashinfer.html#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedManager.num_segments">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_segments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Real (unpadded) segment count this step planned under ``label``."""</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">)</span><span class="o">.</span><span class="n">num_segments</span></div>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">)</span><span class="o">.</span><span class="n">num_segments</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_plan_layouts</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">,</span> <span class="n">plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">_RaggedPrefillBase</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_wrapper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RaggedPrefillWrapper</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_wrapper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_RaggedPrefillBase</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_default_label</span>
         <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
@@ -1131,22 +1132,59 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
         <span class="k">return</span> <span class="n">wrapper</span>
 
-<div class="viewcode-block" id="FlashInferRaggedManager.run">
-<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.flashinfer.html#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedManager.run">[docs]</a>
     <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
         <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""One layer's varlen self-attention over this step's packed segments.</span>
+<span class="w">        </span><span class="sd">"""One layer's attention through the plan for ``label``.</span>
 
 <span class="sd">        Not behind a custom op, unlike the paged backend's ``run``: the ragged</span>
 <span class="sd">        caller (an encoder tower) has no per-layer KV write to keep in the same</span>
 <span class="sd">        graph, so the break this costs is one per layer of a region that is</span>
 <span class="sd">        CUDA-graph captured rather than compiled.</span>
 <span class="sd">        """</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">)</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span></div>
-</div>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">)</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="FlashInferRaggedManager">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.flashinfer.html#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedManager">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">FlashInferRaggedManager</span><span class="p">(</span><span class="n">_FlashInferRaggedBase</span><span class="p">,</span> <span class="n">RaggedAttnManager</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Self-attention: every label in the step is its own layout, each segment</span>
+<span class="sd">    attending within itself."""</span>
+
+    <span class="n">wrapper_class</span> <span class="o">=</span> <span class="n">RaggedPrefillWrapper</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_plan_layouts</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">,</span> <span class="n">plan_states</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">segments</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_group_segments_by_label</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">())</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_for</span><span class="p">(</span><span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span><span class="p">,</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
+            <span class="c1"># TODO: cache the latest plan state</span>
+            <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_cu_seqlens</span><span class="p">(</span><span class="n">segments</span><span class="p">),</span> <span class="n">causal</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">)</span>
+            <span class="n">plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span></div>
+
+
+
+<div class="viewcode-block" id="FlashInferRaggedCrossManager">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.flashinfer.html#mstar.engine.resources.attn.ragged.flashinfer.FlashInferRaggedCrossManager">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">FlashInferRaggedCrossManager</span><span class="p">(</span><span class="n">_FlashInferRaggedBase</span><span class="p">,</span> <span class="n">RaggedCrossAttnManager</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Cross-attention: each ``(q_label, kv_label)`` pair of the step is one plan,</span>
+<span class="sd">    run under ``cross_label(q_label, kv_label)``."""</span>
+
+    <span class="n">wrapper_class</span> <span class="o">=</span> <span class="n">RaggedCrossPrefillWrapper</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_plan_layouts</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">RaggedCrossAttentionStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">,</span> <span class="n">plan_states</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">by_label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_group_segments_by_label</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">())</span>
+        <span class="k">for</span> <span class="n">q_label</span><span class="p">,</span> <span class="n">kv_label</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">pairs</span><span class="p">:</span>
+            <span class="n">q_segments</span><span class="p">,</span> <span class="n">kv_segments</span> <span class="o">=</span> <span class="n">by_label</span><span class="p">[</span><span class="n">q_label</span><span class="p">],</span> <span class="n">by_label</span><span class="p">[</span><span class="n">kv_label</span><span class="p">]</span>
+            <span class="k">if</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">request_id</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">q_segments</span><span class="p">]</span> <span class="o">!=</span> <span class="p">[</span><span class="n">s</span><span class="o">.</span><span class="n">request_id</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">kv_segments</span><span class="p">]:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"ragged cross-attention </span><span class="si">{</span><span class="n">q_label</span><span class="si">!r}</span><span class="s2"> &lt;- </span><span class="si">{</span><span class="n">kv_label</span><span class="si">!r}</span><span class="s2">: the two labels "</span>
+                    <span class="s2">"must be declared for the same requests in the same order"</span>
+                <span class="p">)</span>
+            <span class="n">label</span> <span class="o">=</span> <span class="n">cross_label</span><span class="p">(</span><span class="n">q_label</span><span class="p">,</span> <span class="n">kv_label</span><span class="p">)</span>
+            <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_for</span><span class="p">(</span><span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span><span class="p">,</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
+            <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_cu_seqlens</span><span class="p">(</span><span class="n">q_segments</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cu_seqlens</span><span class="p">(</span><span class="n">kv_segments</span><span class="p">))</span>
+            <span class="n">plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span></div>
 
 </pre></div>
 

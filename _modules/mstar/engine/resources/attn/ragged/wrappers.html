@@ -923,7 +923,9 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.engine.resources.attn.ragged.wrappers</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="c1"># Head dims the FlashInfer prefill kernels are instantiated for. An unsupported</span>
 <span class="c1"># one fails to BUILD (SM90: static_assert in hopper/prefill_sm90.cuh).</span>
@@ -943,12 +945,13 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="RaggedPrefillWrapper">
-<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.wrappers.html#mstar.engine.resources.attn.ragged.wrappers.RaggedPrefillWrapper">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">RaggedPrefillWrapper</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Varlen self-attention over packed segments, with no KV cache; attention</span>
-<span class="sd">    is within variable-length segments packed into one ``[total_tokens, H, D]``</span>
-<span class="sd">    tensor. ``cu_seqlens`` is both ``qo_indptr`` and ``kv_indptr``.</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">_RaggedPrefillBase</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""FlashInfer's ragged prefill with no KV cache: queries and keys packed by</span>
+<span class="sd">    segment into ``[total_tokens, H, D]`` tensors, laid out by ``cu_seqlens``.</span>
+
+<span class="sd">    Holds what the self- and cross-attention wrappers share: the graph-mode static</span>
+<span class="sd">    buffers and their padding, the plan, and ``run``. A subclass's ``plan`` decides</span>
+<span class="sd">    where the key layout comes from.</span>
 <span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
@@ -959,6 +962,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">max_num_segments</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">max_total_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_total_kv_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">),</span>
         <span class="n">use_cuda_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">sm_scale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -976,8 +980,10 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span> <span class="o">=</span> <span class="n">use_cuda_graph</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_num_segments</span> <span class="o">=</span> <span class="n">max_num_segments</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span> <span class="o">=</span> <span class="n">max_total_tokens</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_total_kv_tokens</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">max_total_kv_tokens</span> <span class="k">if</span> <span class="n">max_total_kv_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">max_total_tokens</span>
+        <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_num_segments</span> <span class="o">=</span> <span class="mi">0</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_total_tokens</span> <span class="o">=</span> <span class="mi">0</span>
 
         <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>
 
@@ -1011,7 +1017,7 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
             <span class="c1"># FlashInfer latches max rows on the FIRST plan; prime at the</span>
             <span class="c1"># bucket ceiling so a small first plan can't cap it.</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_max_layout_cu_seqlens</span><span class="p">())</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_prime</span><span class="p">()</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_qo_indptr_buf</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_kv_indptr_buf</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1021,14 +1027,17 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">workspace_buffer</span><span class="p">,</span> <span class="n">kv_layout</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">backend</span>
             <span class="p">)</span>
 
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_prime</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span> <span class="o">...</span>
+
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_segments</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Real (unpadded) segment count from the most recent ``plan``."""</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_segments</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_max_layout_cu_seqlens</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""``max_total_tokens`` spread over all segments, remainder on the first."""</span>
-        <span class="n">n</span><span class="p">,</span> <span class="n">total</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_segments</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_max_layout_cu_seqlens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">total</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``total`` tokens spread over all segments, remainder on the first."""</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_segments</span>
         <span class="n">lens</span> <span class="o">=</span> <span class="p">[</span><span class="n">total</span> <span class="o">//</span> <span class="n">n</span><span class="p">]</span> <span class="o">*</span> <span class="n">n</span>
         <span class="n">lens</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+=</span> <span class="n">total</span> <span class="o">%</span> <span class="n">n</span>
         <span class="n">cu</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span>
@@ -1036,26 +1045,28 @@ window.runMermaid = runMermaid;</script>
             <span class="n">cu</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">cu</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">seg_len</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cu</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_prepare_cu_seqlens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_prepare_cu_seqlens</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">max_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">side</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The layout to hand FlashInfer, and its real token count."""</span>
         <span class="n">n_seg</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="o">.</span><span class="n">numel</span><span class="p">())</span> <span class="o">-</span> <span class="mi">1</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_num_segments</span> <span class="o">=</span> <span class="n">n_seg</span>
-            <span class="k">return</span> <span class="n">cu_seqlens</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+            <span class="c1"># the token count is only needed to zero a graph wrapper's tail, and</span>
+            <span class="c1"># reading it off a device layout would sync</span>
+            <span class="k">return</span> <span class="n">cu_seqlens</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span> <span class="o">-</span><span class="mi">1</span>
 
         <span class="k">if</span> <span class="n">n_seg</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_segments</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"RaggedPrefillWrapper: </span><span class="si">{</span><span class="n">n_seg</span><span class="si">}</span><span class="s2"> segments exceeds the "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">n_seg</span><span class="si">}</span><span class="s2"> segments exceeds the "</span>
                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_num_segments</span><span class="si">}</span><span class="s2"> this graph-mode wrapper was built for"</span>
             <span class="p">)</span>
         <span class="n">host</span> <span class="o">=</span> <span class="n">cu_seqlens</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
         <span class="n">total_tokens</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">host</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
-        <span class="k">if</span> <span class="n">total_tokens</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">total_tokens</span> <span class="o">&gt;</span> <span class="n">max_tokens</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"RaggedPrefillWrapper: </span><span class="si">{</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2"> tokens exceeds the "</span>
-                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span><span class="si">}</span><span class="s2"> this graph-mode wrapper was built for"</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">side</span><span class="si">}</span><span class="s2">tokens exceeds the "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">max_tokens</span><span class="si">}</span><span class="s2"> this graph-mode wrapper was built for"</span>
             <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_num_segments</span> <span class="o">=</span> <span class="n">n_seg</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_total_tokens</span> <span class="o">=</span> <span class="n">total_tokens</span>
         <span class="c1"># FlashInfer's plan copies this into the static device buffer with a</span>
         <span class="c1"># non-blocking H2D that can still be in flight when the next step plans,</span>
         <span class="c1"># so the source must be a fresh buffer per plan (never reused) and, to</span>
@@ -1064,7 +1075,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># captured segment count (padding rows attend nothing), so the fresh</span>
         <span class="c1"># pinned buffer the caller hands us is already the right size: use it.</span>
         <span class="k">if</span> <span class="n">n_seg</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_segments</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">host</span>
+            <span class="k">return</span> <span class="n">host</span><span class="p">,</span> <span class="n">total_tokens</span>
         <span class="c1"># A shorter layout is staged into a fresh pinned buffer padded to size.</span>
         <span class="n">cu</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">max_num_segments</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
@@ -1074,21 +1085,18 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># Repeating the final offset appends zero-length segments — pads the</span>
         <span class="c1"># segment count to the fixed size without adding tokens.</span>
         <span class="n">cu</span><span class="p">[</span><span class="n">n_seg</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:]</span> <span class="o">=</span> <span class="n">total_tokens</span>
-        <span class="k">return</span> <span class="n">cu</span>
+        <span class="k">return</span> <span class="n">cu</span><span class="p">,</span> <span class="n">total_tokens</span>
 
-<div class="viewcode-block" id="RaggedPrefillWrapper.plan">
-<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.wrappers.html#mstar.engine.resources.attn.ragged.wrappers.RaggedPrefillWrapper.plan">[docs]</a>
-    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Plan one packed layout. ``cu_seqlens``: ``[num_segments + 1]``, [0] == 0.</span>
-
-<span class="sd">        CPU tensor preferred; a GPU one costs a sync. Safe to call before every</span>
-<span class="sd">        replay — values are copied through the static buffers, not rebound.</span>
-<span class="sd">        """</span>
-        <span class="n">cu</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_cu_seqlens</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">kv_cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">cu</span><span class="p">,</span> <span class="n">total_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_cu_seqlens</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">kv_cu_seqlens</span> <span class="ow">is</span> <span class="n">cu_seqlens</span><span class="p">:</span>
+            <span class="n">kv_cu</span> <span class="o">=</span> <span class="n">cu</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">kv_cu</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_cu_seqlens</span><span class="p">(</span><span class="n">kv_cu_seqlens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_kv_tokens</span><span class="p">,</span> <span class="s2">"key "</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_num_segments</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="o">.</span><span class="n">numel</span><span class="p">())</span> <span class="o">-</span> <span class="mi">1</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
             <span class="n">cu</span><span class="p">,</span>
-            <span class="n">cu</span><span class="p">,</span>
+            <span class="n">kv_cu</span><span class="p">,</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">padded_head_dim</span><span class="p">,</span>
@@ -1099,22 +1107,21 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_out_buf</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># rows this layout leaves unwritten, zeroed outside the graph where</span>
             <span class="c1"># the real token count is known; see __init__</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_out_buf</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_total_tokens</span><span class="p">:]</span><span class="o">.</span><span class="n">zero_</span><span class="p">()</span></div>
-
+            <span class="bp">self</span><span class="o">.</span><span class="n">_out_buf</span><span class="p">[</span><span class="n">total_tokens</span><span class="p">:]</span><span class="o">.</span><span class="n">zero_</span><span class="p">()</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_pad_head_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">t</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">padded_head_dim</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">t</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">pad</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">padded_head_dim</span> <span class="o">-</span> <span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]))</span>
 
-<div class="viewcode-block" id="RaggedPrefillWrapper.run">
-<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.wrappers.html#mstar.engine.resources.attn.ragged.wrappers.RaggedPrefillWrapper.run">[docs]</a>
     <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Run planned varlen self-attention.</span>
+<span class="w">        </span><span class="sd">"""Run the planned attention.</span>
 
 <span class="sd">        Args:</span>
-<span class="sd">            q, k, v: [total_tokens, num_heads, head_dim], packed by cu_seqlens</span>
+<span class="sd">            q: [total_tokens, num_qo_heads, head_dim], packed by the query layout</span>
+<span class="sd">            k, v: [total_kv_tokens, num_kv_heads, head_dim], packed by the key layout</span>
+<span class="sd">                (the query layout itself, for self-attention)</span>
 <span class="sd">        Returns:</span>
 <span class="sd">            output: [total_tokens, num_qo_heads, head_dim]</span>
 
@@ -1128,7 +1135,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">n</span> <span class="o">=</span> <span class="n">qp</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
             <span class="k">assert</span> <span class="n">n</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span><span class="p">,</span> <span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"RaggedPrefillWrapper: </span><span class="si">{</span><span class="n">n</span><span class="si">}</span><span class="s2"> rows exceeds the "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">n</span><span class="si">}</span><span class="s2"> rows exceeds the "</span>
                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span><span class="si">}</span><span class="s2"> this graph-mode wrapper was built for"</span>
             <span class="p">)</span>
             <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">qp</span><span class="p">,</span> <span class="n">kp</span><span class="p">,</span> <span class="n">vp</span><span class="p">,</span> <span class="n">out</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_out_buf</span><span class="p">[:</span><span class="n">n</span><span class="p">])</span>
@@ -1136,7 +1143,92 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="n">out</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
         <span class="c1"># `out` is the shared buffer the next call overwrites; the padded</span>
         <span class="c1"># branch above already returns a copy</span>
-        <span class="k">return</span> <span class="n">out</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_out_buf</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">out</span></div>
+        <span class="k">return</span> <span class="n">out</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_out_buf</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">out</span>
+
+
+<div class="viewcode-block" id="RaggedPrefillWrapper">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.wrappers.html#mstar.engine.resources.attn.ragged.wrappers.RaggedPrefillWrapper">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaggedPrefillWrapper</span><span class="p">(</span><span class="n">_RaggedPrefillBase</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Varlen self-attention: each segment attends within itself.</span>
+<span class="sd">    ``cu_seqlens`` is both ``qo_indptr`` and ``kv_indptr``."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">workspace_buffer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">num_qo_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">max_num_segments</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_total_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="n">workspace_buffer</span><span class="p">,</span> <span class="n">num_qo_heads</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span>
+            <span class="n">max_num_segments</span><span class="o">=</span><span class="n">max_num_segments</span><span class="p">,</span> <span class="n">max_total_tokens</span><span class="o">=</span><span class="n">max_total_tokens</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_prime</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_max_layout_cu_seqlens</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span><span class="p">))</span>
+
+<div class="viewcode-block" id="RaggedPrefillWrapper.plan">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.wrappers.html#mstar.engine.resources.attn.ragged.wrappers.RaggedPrefillWrapper.plan">[docs]</a>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Plan one packed layout. ``cu_seqlens``: ``[num_segments + 1]``, [0] == 0.</span>
+
+<span class="sd">        CPU tensor preferred; a GPU one costs a sync. Safe to call before every</span>
+<span class="sd">        replay — values are copied through the static buffers, not rebound.</span>
+<span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="p">,</span> <span class="n">causal</span><span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="RaggedCrossPrefillWrapper">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.wrappers.html#mstar.engine.resources.attn.ragged.wrappers.RaggedCrossPrefillWrapper">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaggedCrossPrefillWrapper</span><span class="p">(</span><span class="n">_RaggedPrefillBase</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Varlen cross-attention between two packed layouts: query segment ``i``</span>
+<span class="sd">    attends key segment ``i`` (one pair per request). Never causal.</span>
+
+<span class="sd">    The key side has its own token ceiling in graph mode, ``max_total_kv_tokens``</span>
+<span class="sd">    (defaults to ``max_total_tokens``)."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">workspace_buffer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">num_qo_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">max_num_segments</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_total_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_total_kv_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="n">workspace_buffer</span><span class="p">,</span> <span class="n">num_qo_heads</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span>
+            <span class="n">max_num_segments</span><span class="o">=</span><span class="n">max_num_segments</span><span class="p">,</span> <span class="n">max_total_tokens</span><span class="o">=</span><span class="n">max_total_tokens</span><span class="p">,</span>
+            <span class="n">max_total_kv_tokens</span><span class="o">=</span><span class="n">max_total_kv_tokens</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_prime</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_max_layout_cu_seqlens</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_total_tokens</span><span class="p">),</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_max_layout_cu_seqlens</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_total_kv_tokens</span><span class="p">),</span>
+        <span class="p">)</span>
+
+<div class="viewcode-block" id="RaggedCrossPrefillWrapper.plan">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.wrappers.html#mstar.engine.resources.attn.ragged.wrappers.RaggedCrossPrefillWrapper.plan">[docs]</a>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">q_cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">kv_cu_seqlens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Plan one query layout against one key layout, each ``[num_segments + 1]``</span>
+<span class="sd">        with [0] == 0 and the same segment count. CPU tensors preferred."""</span>
+        <span class="n">n_q</span><span class="p">,</span> <span class="n">n_kv</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">q_cu_seqlens</span><span class="o">.</span><span class="n">numel</span><span class="p">())</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">kv_cu_seqlens</span><span class="o">.</span><span class="n">numel</span><span class="p">())</span> <span class="o">-</span> <span class="mi">1</span>
+        <span class="k">if</span> <span class="n">n_q</span> <span class="o">!=</span> <span class="n">n_kv</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"RaggedCrossPrefillWrapper: </span><span class="si">{</span><span class="n">n_q</span><span class="si">}</span><span class="s2"> query segments but </span><span class="si">{</span><span class="n">n_kv</span><span class="si">}</span><span class="s2"> key "</span>
+                <span class="s2">"segments; a cross-attention plan pairs them one to one"</span>
+            <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">q_cu_seqlens</span><span class="p">,</span> <span class="n">kv_cu_seqlens</span><span class="p">,</span> <span class="n">causal</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span></div>
 </div>
 
 </pre></div>
