@@ -1033,8 +1033,11 @@ class TensorCommunicationManager(ABC):
     # ---- shared: polling & ACKs ----
 
     def _collect_and_send_acks(
-        self, request_id: Rid, graph_edges: list[GraphEdge],
+        self, request_id: Rid | None, graph_edges: list[GraphEdge],
+        wire_request_id: str | None = None,
     ):
+        """``wire_request_id`` overrides ``rid_to_str(request_id)``, for a
+        request that no longer has a handle."""
         acks: dict[str, dict[int, int]] = {}
         for edge in graph_edges:
             for info in edge.tensor_info:
@@ -1045,12 +1048,14 @@ class TensorCommunicationManager(ABC):
         for source_entity, tensors in acks.items():
             if source_entity == self.my_entity_id:
                 continue
+            if wire_request_id is None:
+                wire_request_id = self.rid_to_str(request_id)
             self.communicator.send(
                 source_entity,
                 WorkerMessage(
                     message_type=WorkerMessageType.TENSOR_RECEIVED,
                     body=TensorReceived(
-                        request_id=self.rid_to_str(request_id),
+                        request_id=wire_request_id,
                         successful_tensors=tensors,
                         failed_tensor_ids=[],
                     ),
@@ -1058,14 +1063,15 @@ class TensorCommunicationManager(ABC):
             )
 
     def ack_unread_tensors(
-        self, request_id: Rid, graph_edges: list[GraphEdge],
+        self, request_id: str, graph_edges: list[GraphEdge],
     ):
-        """Ack result tensors for an already-removed request without reading them.
+        """Ack tensors for an already-removed request without reading them.
 
-        The producer holds these output buffers until it gets the
-        TENSOR_RECEIVED ack; emit it here so it can reclaim them.
+        The producer holds these buffers until it gets the TENSOR_RECEIVED ack;
+        emit it here so it can reclaim them. ``request_id`` is the wire string:
+        a removed request has no handle on a worker.
         """
-        self._collect_and_send_acks(request_id, graph_edges)
+        self._collect_and_send_acks(None, graph_edges, wire_request_id=request_id)
 
     def get_ready_tensors(self, graph_walk: str | None=None) -> dict[Rid, list[GraphEdge]]:
         ready: dict[Rid, list[GraphEdge]] = {}

@@ -21,6 +21,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
+from mstar.utils.containers import ExpiringSet
 from mstar.utils.ipc_format import NewRequest, RemoveRequest
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.worker import Worker
@@ -99,6 +100,7 @@ def _worker():
     w._last_active = {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
+    w._removed_rids = ExpiringSet(60.0)
     w.enable_nvtx = False
     return w
 

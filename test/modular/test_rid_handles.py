@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mstar.utils.containers import ExpiringSet
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     MessageSource,
@@ -122,6 +123,8 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
     w.sent = []
     w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
     w.removed_in_runtime = []
+    w._removed_rids = ExpiringSet(60.0)
+    w._unprocessed_messages = {}
 
     def _runtime_remove(h):
         # The handle must be freed only after every worker-side map dropped it.

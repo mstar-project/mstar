@@ -7,6 +7,7 @@ import pytest
 pytest.importorskip("torch")
 
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
+from mstar.utils.containers import ExpiringSet  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 
@@ -46,6 +47,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     w.worker_id = "w0"
     w._draining_rids = set()
     w._unprocessed_messages = {"wire": ["parked"]}
+    w._removed_rids = ExpiringSet(60.0)
     w._last_active = {}
     processed, failed, registered = [], [], []
     w._graph_runtime = SimpleNamespace(

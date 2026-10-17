@@ -53,7 +53,7 @@ from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
-from mstar.utils.containers import ParallelList, RecentSet
+from mstar.utils.containers import ExpiringSet, ParallelList, RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -87,6 +87,14 @@ _HOLD_LOG_INTERVAL = 5.0
 # ``_await_admit_settled``'s safety net, not a tuning knob: the GPU thread
 # releases the event on every exit, so this only fires if that thread died.
 _ADMIT_FENCE_TIMEOUT_S = 10.0
+
+# How long a torn-down request's id is remembered, so that a message landing
+# after the teardown (a duplicate REMOVE, a peer's late stream chunk or
+# STOP_LOOPS) is dropped rather than parked for a NEW_REQUEST that never comes.
+# Such a message trails the teardown by about a loop iteration and a socket hop,
+# so this is a wide margin, not a tuning knob; it matches the conductor's
+# default drain TTL (MSTAR_DRAIN_TTL_S). Memory is the removal rate times this.
+_REMOVED_RID_TTL_S = 120.0
 
 
 def _make_graph_runtime(
@@ -487,6 +495,10 @@ class Worker:
         # Keyed by the string: these arrive before the NEW_REQUEST that mints
         # the handle.
         self._unprocessed_messages: dict[str, list[WorkerMessage]] = {}
+        # Wire ids of requests torn down here (or that the conductor removed
+        # without this worker admitting them): a message for one of these is
+        # dropped instead of parked. Keyed by the string; the handle is gone.
+        self._removed_rids: ExpiringSet[str] = ExpiringSet(_REMOVED_RID_TTL_S)
 
         # CPU offloading: LRU tracking and eviction policy
         self._last_active: dict[tuple[int, str], float] = {}  # (request_id, node_name) -> monotonic timestamp
@@ -669,6 +681,11 @@ class Worker:
         if body.request_id in self._draining_rids:
             # Being torn down (out-of-order NEW after DRAIN); don't start reads.
             return
+        # A client can reuse an id: messages from here on are this request's.
+        # One that outran this NEW_REQUEST while the old id was remembered was
+        # dropped; without a key unique per submission the two requests'
+        # messages can't be told apart, and replaying the old one's is worse.
+        self._removed_rids.discard(body.request_id)
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         # The one place a handle is minted; a request with several partitions
         # on this worker gets the same one for each. Everything below keys on it.
@@ -742,9 +759,30 @@ class Worker:
 
     def _process_unprocessed(self, wire_rid: str) -> None:
         """Process messages for ``wire_rid`` that came in before its NEW_REQUEST."""
-        if wire_rid in self._unprocessed_messages:
-            self._process_message_list(self._unprocessed_messages[wire_rid])
-            del self._unprocessed_messages[wire_rid]
+        # Popped first: a REMOVE among them purges whatever is still parked
+        # for the id, which must not include the messages replayed here.
+        messages = self._unprocessed_messages.pop(wire_rid, None)
+        if messages:
+            self._process_message_list(messages)
+
+    def _mark_removed(self, wire_rid: str) -> None:
+        """Remember a request that will not be admitted here again, and drop
+        what was parked for it."""
+        self._removed_rids.add(wire_rid)
+        for message in self._unprocessed_messages.pop(wire_rid, ()):
+            self._drop_for_removed(message)
+
+    def _drop_for_removed(self, message: WorkerMessage) -> None:
+        """Drop a message for a removed request. Inputs are ACKed unread so the
+        producer can free its source buffers."""
+        logger.debug(
+            "Worker %s: dropping %s for removed request %s",
+            self.worker_id, message.message_type.value, message.body.request_id,
+        )
+        if message.message_type == WorkerMessageType.INPUT_SIGNALS:
+            self.tensor_manager.ack_unread_tensors(
+                message.body.request_id, message.body.inputs,
+            )
 
 
     def _remove_request(self, body: RemoveRequest) -> None:
@@ -815,6 +853,7 @@ class Worker:
         self._draining_rids.discard(body.request_id)
         self._pending_drains.discard(body.request_id)
         self._reads_done_sent.discard(body.request_id)
+        self._mark_removed(body.request_id)
         self.engine_manager.remove_request(request_id)
         if self._stream_buffer_rids:
             self._stream_buffer_rids.discard(request_id)
@@ -951,8 +990,9 @@ class Worker:
         )
         request_id = self._rid(body.request_id)
         if request_id is None:
-            # _process_message_list parks signals for an unknown request, so
-            # this only happens if that changes; there is nothing to route into.
+            # _process_message_list parks or drops signals for an unknown
+            # request, so this only happens if that changes; there is nothing
+            # to route into.
             logger.warning(
                 "Worker %s: dropping input signals for unknown request %s",
                 self.worker_id, body.request_id,
@@ -1062,10 +1102,23 @@ class Worker:
                 self._rid(message.body.request_id)
                 not in self.request_state.per_request_info
             ):
-                # got an out-of-order request
-                self._unprocessed_messages.setdefault(
-                    message.body.request_id, []
-                ).append(message)
+                wire_rid = message.body.request_id
+                if wire_rid in self._removed_rids:
+                    self._drop_for_removed(message)
+                elif (
+                    message.message_type == WorkerMessageType.REMOVE_REQUEST
+                    and message.body.source == MessageSource.CONDUCTOR
+                ):
+                    # The conductor sends a request's NEW_REQUESTs and its
+                    # REMOVE down one FIFO socket and forgets it after, so this
+                    # worker never admitted it, or already tore it down.
+                    self._drop_for_removed(message)
+                    self._mark_removed(wire_rid)
+                else:
+                    # got an out-of-order request
+                    self._unprocessed_messages.setdefault(
+                        wire_rid, []
+                    ).append(message)
                 continue
             if message.message_type == WorkerMessageType.NEW_REQUEST:
                 self._add_new_request(message.body)

@@ -487,6 +487,27 @@ def test_ack_unread_tensors_lets_producer_reclaim_buffer():
         assert not os.path.isfile(shm_path)  # reclaimed -> no leak
 
 
+def test_a_worker_acks_unread_tensors_under_the_wire_id():
+    """A worker installs a handle-to-string ``rid_to_str``, and a removed
+    request has no handle, so the unread ack must carry the wire id as is."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        producer = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        edges, uuid = _produce_registered_output(producer, "req1")
+
+        consumer = _make_manager(tmpdir, entity_id="worker_1")
+
+        def _released(handle):
+            raise KeyError(f"no live request has handle {handle}")
+
+        consumer.rid_to_str = _released
+        consumer.ack_unread_tensors("req1", edges)
+
+        [(entity_id, msg)] = consumer.communicator.sent
+        assert entity_id == "worker_0"
+        assert msg.body.request_id == "req1"
+        assert msg.body.successful_tensors == {uuid: 1}
+
+
 # ---------------------------------------------------------------------------
 # Teardown: cleanup_request (soft) vs force_cleanup_request (hard) + drain gate
 # ---------------------------------------------------------------------------
