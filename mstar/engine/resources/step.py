@@ -71,6 +71,10 @@ class StepContext:
     # None outside a captured replay, where the two are the same. Padding rows
     # carry negative handles, so this stays homogeneous with `request_ids`.
     _padded_request_ids: Sequence[int] | None = None
+    # ``request_ids`` as a set, built on first use after the padded list is
+    # set: the per-row tests below run for every row of every resource on two
+    # threads, and a list scan made each of them linear in the batch.
+    _real_rids: frozenset | None = field(default=None, repr=False)
 
     @property
     def padded_request_ids(self) -> Sequence[int]:
@@ -80,13 +84,26 @@ class StepContext:
 
     def set_padded_rids(self, padded_rids: Sequence[int] | None):
         self._padded_request_ids = padded_rids
+        self._real_rids = None
+
+    def is_real_row(self, rid: str) -> bool:
+        """Whether ``rid`` is one of this step's real requests."""
+        real = self._real_rids
+        if real is None:
+            real = self._real_rids = frozenset(self.request_ids)
+        return rid in real
 
     def is_padding_row(self, rid: str) -> bool:
         """Whether ``rid`` is a replay's padding row rather than a real request.
 
         It carries the template span so shapes match the capture, but a resource
         should reserve, address and commit nothing on its behalf."""
-        return self._padded_request_ids is not None and rid not in self.request_ids
+        if self._padded_request_ids is None:
+            return False
+        real = self._real_rids
+        if real is None:
+            real = self._real_rids = frozenset(self.request_ids)
+        return rid not in real
 
     def set_piecewise_leases(self, leases: "Mapping[str, SlotLease]"):
         self.piecewise_leases = leases

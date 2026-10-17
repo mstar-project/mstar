@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
@@ -43,6 +44,7 @@ from mstar.model.multimodal import (
     check_attachments,
     check_plan,
     find_media_spans,
+    messages_from_parts,
     parts_from_modalities,
     prefill_plan,
     split_around_spans,
@@ -60,6 +62,8 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5VisionConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import drop_stop_tokens
+from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
 
@@ -400,6 +404,7 @@ class Qwen3_5DenseModel(Model):
             input_modalities,
             [p.text or "" for p in prompt_parts if p.modality == TEXT]
             if prompt_parts is not None else prompt,
+            [p.role for p in prompt_parts or ()],
         )
         unsupported = {p.modality for p in parts} - {TEXT, "image"}
         if unsupported:
@@ -416,19 +421,19 @@ class Qwen3_5DenseModel(Model):
         # The released checkpoints are chat models (base ones say `-Base`), so
         # always use the chat template. `enable_thinking=False` emits an empty,
         # pre-closed `<think>` block, which is how Qwen turns reasoning off.
-        content = [
-            {"type": TEXT, "text": part.text or ""} if part.modality == TEXT
-            else {"type": part.modality, part.modality: ""}
-            for part in parts
-        ]
-        text = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": content}],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=kwargs.get("enable_thinking", True),
-        )
-        input_ids = self.tokenizer(text, return_tensors="pt").input_ids[0]
-
+        try:
+            text = self.tokenizer.apply_chat_template(
+                messages_from_parts(parts),
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=kwargs.get("enable_thinking", True),
+            )
+        except TemplateError as exc:
+            # a chat the template refuses (a system message after the first turn,
+            # no user turn) is the client's to fix: a 400, not a 500
+            raise ValueError(f"Qwen3.5's chat template refused the chat: {exc}") from exc
+        # a long prompt is encoded as parallel chunks, identical ids
+        input_ids = torch.tensor(encode_ids(self.tokenizer, text), dtype=torch.long)
         spans = find_media_spans(input_ids, self._placeholder_specs())
         segments = split_around_spans(input_ids, spans)
         check_plan(prefill_plan(parts), spans, len(segments))
@@ -455,7 +460,8 @@ class Qwen3_5DenseModel(Model):
             request_kwargs: dict | None = None,
         ) -> bytes:
             if modality == "text":
-                detok = self.tokenizer.decode(output)
+                ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
+                detok = self.tokenizer.decode(ids)
                 return detok.encode("utf-8")
             raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
 

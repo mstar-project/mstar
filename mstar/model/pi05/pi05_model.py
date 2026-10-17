@@ -142,6 +142,8 @@ class Pi05Model(Model):
     SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
     SUPPORTED_OUTPUT_MODALITIES = frozenset({"action"})
 
+    PREPROCESS_ONLY_KWARGS = ("robot_state",)
+
     PREFILL_WALK = "prefill"
     ACTION_GEN_WALK = "action_gen"
 

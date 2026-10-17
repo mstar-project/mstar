@@ -161,6 +161,10 @@ class VJepa2Model(Model):
     SUPPORTED_INPUT_MODALITIES = frozenset({"video", "text"})
     SUPPORTED_OUTPUT_MODALITIES = frozenset({"video"})
 
+    PREPROCESS_ONLY_KWARGS = (
+        "actions", "states", "extrinsics", "context_mask", "target_mask", "goal_hidden",
+    )
+
     PREFILL_VIDEO = "prefill_video"
     PREFILL_VIDEO_ENCODER_ONLY = "prefill_video_encoder_only"
     PREFILL_VIDEO_ROLLOUT = "prefill_video_rollout"

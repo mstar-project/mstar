@@ -28,6 +28,7 @@ lazy worker-side construction. Heavy weights are not loaded in ``__init__``.
 """
 
 import contextlib
+import hashlib
 import importlib.metadata
 import importlib.util
 import inspect
@@ -71,6 +72,10 @@ from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
     CODE_PRED_SAMPLER,
+    LANGUAGE_ID_KEY,
+    PROMPT_LAYOUT_KEY,
+    REF_CLIP_KEY,
+    SPEAKER_ID_KEY,
     TALKER_ATTN,
     TALKER_KV,
     TALKER_POS,
@@ -80,6 +85,13 @@ from mstar.model.qwen3_tts.config import (
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+
+
+def clip_digest(clip: torch.Tensor) -> str:
+    """Content key of a reference clip (its float32 samples), under which its conditioning is memoised."""
+    samples = clip.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    return hashlib.blake2b(samples.numpy().tobytes(), digest_size=16).hexdigest()
+
 
 # ---------------------------------------------------------------------------
 # Checkpoint discovery
@@ -611,16 +623,17 @@ class Qwen3TTSModel(Model):
     # -----------------------------------------------------------------------
 
     # Prompt templates of the reference ``qwen_tts`` inference wrapper. The
-    # assistant wrapper is fixed at 3 + 5 tokens (see ``_validate_chatml``),
-    # which is how the text span is located inside the tokenized turn.
+    # assistant wrapper is fixed at 3 + 5 tokens (``_check_chatml`` verifies it
+    # on the host), which is how the text span is located inside the tokenized turn.
     ASSISTANT_TEMPLATE = "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
     INSTRUCT_TEMPLATE = "<|im_start|>user\n{instruct}<|im_end|>\n"
     REFERENCE_TEMPLATE = "<|im_start|>assistant\n{text}<|im_end|>\n"
     # API tensors the Talker prefill consumes; the clone prefill adds the
-    # RefEncoder's ``speaker_embed`` and ``ref_codes`` to them.
-    PREFILL_INPUTS = ("text_inputs", "prompt_layout", "speaker_id", "language_id")
-    # API tensors the RefEncoder consumes (reference clip + layout).
-    REF_ENCODER_INPUTS = ("audio_inputs", "prompt_layout")
+    # RefEncoder's ``speaker_embed`` and ``ref_codes`` to them. The layout and
+    # the speaker and language tags ride in step metadata.
+    PREFILL_INPUTS = ("text_inputs",)
+    # API tensors the RefEncoder consumes (the reference clip).
+    REF_ENCODER_INPUTS = ("audio_inputs",)
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         """Decode a reference clip to 24 kHz mono float32 (speaker encoder + codec rate)."""
@@ -768,19 +781,21 @@ class Qwen3TTSModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs: Any,
-    ) -> NameToTensorList | ProcessPromptOutput:
+    ) -> ProcessPromptOutput:
         """Validate a request against the checkpoint variant and tokenize it.
 
         Produces the ``PREFILL_INPUTS`` tensors. ``text_inputs`` is the
         optional instruction turn, the assistant turn and (in-context clone)
-        the reference transcript turn, all in the reference ChatML templates;
-        ``prompt_layout`` is ``[instruct_len, text_len, stream_text,
-        ref_text_len, ref_frames]``. ``stream_text`` follows the reference
-        default per variant (whole text in the prefill for CustomVoice and
-        VoiceDesign, one token per frame for Base) unless the request sets
-        ``non_streaming_mode``. An in-context clone also reports, as
-        ``CODEC_STREAM_LEAD_KEY`` metadata, how many reference frames lead the
-        codec stream (context only; see ``get_initial_forward_pass_args``).
+        the reference transcript turn, all in the reference ChatML templates.
+        The metadata carries, as host values for the prefill's step metadata,
+        ``PROMPT_LAYOUT_KEY`` ``[instruct_len, text_len, stream_text,
+        ref_text_len, ref_frames]``, the codec speaker and language tags, and
+        a clone's ``REF_CLIP_KEY`` digest. ``stream_text`` follows the
+        reference default per variant (whole text in the prefill for
+        CustomVoice and VoiceDesign, one token per frame for Base) unless the
+        request sets ``non_streaming_mode``. An in-context clone also reports,
+        as ``CODEC_STREAM_LEAD_KEY``, how many reference frames lead the codec
+        stream (context only; see ``get_initial_forward_pass_args``).
         """
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
@@ -813,6 +828,7 @@ class Qwen3TTSModel(Model):
         text_len = assistant_ids.numel() - wrapper_len
         if text_len < 1:
             raise ValueError("Qwen3-TTS prompt tokenized to no text tokens")
+        self._check_chatml(assistant_ids)
         instruct_ids = (
             self._tokenize(self.INSTRUCT_TEMPLATE.format(instruct=instruct))
             if instruct
@@ -823,19 +839,35 @@ class Qwen3TTSModel(Model):
             if ref_frames
             else assistant_ids.new_empty(0)
         )
-        outputs = {
-            "text_inputs": [torch.cat([instruct_ids, assistant_ids, ref_ids])],
-            "prompt_layout": [torch.tensor(
-                [instruct_ids.numel(), text_len, int(stream_text), ref_ids.numel(), ref_frames],
-                dtype=torch.long,
-            )],
-            "speaker_id": [torch.tensor([speaker_id], dtype=torch.long)],
-            "language_id": [torch.tensor([language_id], dtype=torch.long)],
+        metadata: dict[str, Any] = {
+            PROMPT_LAYOUT_KEY: [instruct_ids.numel(), text_len, int(stream_text), ref_ids.numel(), ref_frames],
+            SPEAKER_ID_KEY: speaker_id,
+            LANGUAGE_ID_KEY: language_id,
         }
+        clips = (tensors or {}).get("audio_inputs", [])
+        if clips:
+            metadata[REF_CLIP_KEY] = clip_digest(clips[0])
         lead = min(ref_frames, self.config.codec.left_context_frames)
         if lead:
-            return ProcessPromptOutput(outputs, {self.CODEC_STREAM_LEAD_KEY: lead})
-        return outputs
+            metadata[self.CODEC_STREAM_LEAD_KEY] = lead
+        return ProcessPromptOutput(
+            {"text_inputs": [torch.cat([instruct_ids, assistant_ids, ref_ids])]}, metadata
+        )
+
+    @staticmethod
+    def _check_chatml(assistant_ids: torch.Tensor) -> None:
+        """Check the fixed assistant-turn wrapper the text span is sized from."""
+        ids = assistant_ids.tolist()
+        prefix = list(CHATML_ASSISTANT_PREFIX_TOKEN_IDS)
+        suffix = list(CHATML_ASSISTANT_SUFFIX_TOKEN_IDS)
+        if ids[:len(prefix)] != prefix:
+            raise ValueError(
+                f"Qwen3-TTS ChatML assistant prefix changed; expected token IDs {prefix}, got {ids[:len(prefix)]}"
+            )
+        if ids[-len(suffix):] != suffix:
+            raise ValueError(
+                f"Qwen3-TTS ChatML assistant suffix changed; expected token IDs {suffix}, got {ids[-len(suffix):]}"
+            )
 
     # -----------------------------------------------------------------------
     # Conductor partition state machine
@@ -870,8 +902,12 @@ class Qwen3TTSModel(Model):
                 },
             )
             routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
+            step_metadata = self._talker_step_metadata(metadata)
+            for key in (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY):
+                step_metadata[key] = model_kwargs[key]
             if clone:
                 routes += [(name, "RefEncoder") for name in self.REF_ENCODER_INPUTS]
+                step_metadata[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
             inputs = []
             for name, node in routes:
                 edge = GraphEdge(next_node=node, name=name)
@@ -884,7 +920,7 @@ class Qwen3TTSModel(Model):
                     [edge.tensor_info for edge in inputs], start=[]
                 ),
                 request_done="audio" not in output_modalities,
-                step_metadata=self._talker_step_metadata(metadata),
+                step_metadata=step_metadata,
             )
 
         if partition_name == "Codec":

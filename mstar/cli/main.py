@@ -51,6 +51,8 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "higgs_audio": "higgs_audio.yaml",
     "wan22": "wan22.yaml",
     "waypoint": "waypoint.yaml",
+    # Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B).
+    "nemotron_duplex": "nemotron_duplex.yaml",
     "flux2_klein": "flux2_klein.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
@@ -64,6 +66,8 @@ DEFAULT_CONFIGS.update({
 })
 # 27B has no single-GPU form
 DEFAULT_CONFIGS["qwen3_5_27b"] = "qwen3_5_27b_tp4.yaml"
+# Qwen3.8-27B runs on the Qwen3.5 code; TP4 like the 3.5 27B
+DEFAULT_CONFIGS["qwen3_8_27b"] = "qwen3_8_27b_tp4.yaml"
 
 
 def _repo_root() -> Path:

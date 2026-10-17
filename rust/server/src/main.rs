@@ -232,6 +232,16 @@ enum Surface {
     Videos,
 }
 
+/// The OpenAI error `type` for a status: a 4xx is the client's
+/// (`invalid_request_error`), anything else is ours (`server_error`).
+fn error_type(status: u16) -> &'static str {
+    if (400..500).contains(&status) {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    }
+}
+
 fn error(status: u16, message: &str, type_: &str) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
@@ -239,16 +249,6 @@ fn error(status: u16, message: &str, type_: &str) -> Response {
         Json(json!({"error": {"message": message, "type": type_, "code": status}})),
     )
         .into_response()
-}
-
-/// The OpenAI error `type` for a status, as in Python's `openai/_util.py`: a
-/// 4xx is the client's error, anything else is ours.
-fn error_type(status: u16) -> &'static str {
-    if (400..500).contains(&status) {
-        "invalid_request_error"
-    } else {
-        "server_error"
-    }
 }
 
 /// FastAPI-`HTTPException`-shaped error (`{"detail": "..."}`). The native
@@ -320,8 +320,7 @@ fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
 }
 
 /// Delete a request's persisted media 60 s after translation, matching
-/// mstar's deferred upload cleanup. Only files under `upload_dir` are ours to
-/// delete — local paths passed through by reference are left alone.
+/// mstar's deferred upload cleanup. Only files under `upload_dir` are deleted.
 fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
     let files: Vec<PathBuf> = args
         .file_paths
@@ -1013,6 +1012,7 @@ async fn generate_finish(
         input_modalities,
         output_modalities,
         model_kwargs,
+        parts: Vec::new(),
     };
 
     schedule_upload_cleanup(&st.upload_dir, &args);

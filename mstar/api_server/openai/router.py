@@ -51,10 +51,10 @@ def _api():
     return None
 
 
-def _error(status: int, message: str, type_: str = "invalid_request_error") -> JSONResponse:
+def _error(status: int, message: str, type_: str | None = None) -> JSONResponse:
     return JSONResponse(
         status_code=status,
-        content={"error": {"message": message, "type": type_, "code": status}},
+        content={"error": {"message": message, "type": type_ or error_type(status), "code": status}},
     )
 
 
@@ -62,7 +62,7 @@ def _exception_error(e: Exception) -> JSONResponse:
     # ValueError/TypeError are bad requests (e.g. an unsupported modality at
     # intake); anything else is ours
     status = getattr(e, "status_code", 400 if isinstance(e, (ValueError, TypeError)) else 500)
-    return _error(status, str(getattr(e, "detail", e)), error_type(status))
+    return _error(status, str(getattr(e, "detail", e)))
 
 
 def _resolve(require: str):
@@ -70,7 +70,7 @@ def _resolve(require: str):
     when the loaded model can't serve ``require`` (e.g. 'supports_chat')."""
     api = _api()
     if api is None:
-        return None, None, None, _error(503, "Server not ready", "server_error")
+        return None, None, None, _error(503, "Server not ready")
     adapter = get_adapter(api.model_name)
     if adapter is None:
         return api, api.model_name, None, _error(

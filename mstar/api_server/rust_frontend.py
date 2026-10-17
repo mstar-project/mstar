@@ -9,15 +9,16 @@ protocol are untouched):
 
     frontend -> bridge:  {t:"submit", rid, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
-                          streaming} | {t:"abort", rid} | {t:"ping", rid}
+                          prompt_parts, streaming} | {t:"abort", rid} | {t:"ping", rid}
     bridge -> frontend:  {t:"ok", rid} (past intake; sent before any chunk)
                        | {t:"chunk", rid, modality, data(bin), metadata}
                        | {t:"err", rid, msg} | {t:"done", rid} | {t:"pong", rid}
 
 The submit shape is ``APIServer.submit_request``'s signature verbatim — the
-protocol was designed by flattening it. The bridge mesh lives in its own
-socket dir (private to the frontend/bridge pair), so entity names never
-collide with the conductor/worker mesh.
+protocol was designed by flattening it. ``prompt_parts`` travels for a chat
+only, one map of ``PromptPart``'s fields per part. The bridge mesh lives in
+its own socket dir (private to the frontend/bridge pair), so entity names
+never collide with the conductor/worker mesh.
 
 Opt-in: ``mstar-serve --rust-frontend`` replaces ``uvicorn.run`` with the
 ``mstar-server`` binary + this loop. Everything else in the process
@@ -38,6 +39,7 @@ from mstar.communication.rust_communicator import (
     MsgpackCodec,
     RustZMQCommunicator,
 )
+from mstar.model.multimodal import PromptPart
 
 logger = logging.getLogger(__name__)
 
@@ -116,12 +118,14 @@ class RustFrontendBridge:
                            "backend (unset MSTAR_TOKENIZER)")
             return
         try:
+            parts = msg.get("prompt_parts")
             self.server.submit_request(
                 text=msg.get("text"),
                 file_paths=msg.get("file_paths") or None,
                 input_modalities=list(msg.get("input_modalities") or []),
                 output_modalities=list(msg.get("output_modalities") or []),
                 model_kwargs=dict(msg.get("model_kwargs") or {}),
+                prompt_parts=[PromptPart(**p) for p in parts] if parts else None,
                 streaming=bool(msg.get("streaming", True)),
                 request_id=rid,
             )
