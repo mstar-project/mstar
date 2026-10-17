@@ -24,6 +24,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import pytest
+
 from mstar.api_server.entrypoint import APIServer, PendingRequest
 from mstar.api_server.request_types import (
     APIServerMessage,
@@ -181,6 +183,7 @@ def _api_server(messages):
     s = APIServer.__new__(APIServer)
     s.pending_requests = {}
     s.recently_completed = {}
+    s.awaiting_teardown = {}
     s._recently_completed_ttl = 15.0
     s.request_lock = threading.Lock()
     s.running = True
@@ -273,7 +276,19 @@ def _preprocess_thread(model):
     wt.request_output_state = {
         "r1": RequestOutputState(order={"u1": (0, None)}, next_sequence=1),
     }
+    wt._draining_rids = set()
+    wt._reads_done_sent = set()
+    wt.sent = []
+    wt.communicator = SimpleNamespace(send=lambda entity, msg: wt.sent.append((entity, msg)))
     return wt
+
+
+def _failed_in_conductor(wt):
+    return {
+        rid: error for entity, msg in wt.sent
+        if entity == "conductor" and msg.message_type == ConductorMessageType.FAIL_REQUESTS
+        for rid, error in msg.body.errors.items()
+    }
 
 
 def test_output_postprocess_failure_becomes_an_error_chunk():
@@ -303,6 +318,65 @@ def test_output_postprocess_failure_becomes_an_error_chunk():
     assert chunk.metadata["status"] == 500
     # The tensor is still released even though postprocessing died.
     assert dereferenced == ["u1"]
+    # The conductor still runs the request; it is failed there too.
+    assert "decode failed" in _failed_in_conductor(wt)["r1"]
+
+
+@pytest.mark.parametrize("teardown", ["draining", "reads_done_sent"])
+def test_an_output_failure_during_teardown_is_not_reported_to_the_conductor(teardown):
+    # The request is being torn down already; the conductor has nothing to fail.
+    class _BadModel:
+        def postprocess(self, tensor, modality, request_kwargs=None):
+            raise RuntimeError("decode failed")
+
+    wt = _preprocess_thread(_BadModel())
+    {"draining": wt._draining_rids, "reads_done_sent": wt._reads_done_sent}[teardown].add("r1")
+    edge = SimpleNamespace(name="text_output", tensor_info=[SimpleNamespace(uuid="u1")])
+    wt.tensor_manager = SimpleNamespace(
+        get_ready_tensors=lambda: {"r1": [edge]},
+        get_tensor=lambda uuid: object(),
+        dereference=lambda uuid: None,
+    )
+    wt._process_read_tensors()
+    assert wt.out_queue.get_nowait().modality == "error"
+    assert _failed_in_conductor(wt) == {}
+
+
+def test_the_drain_ack_waits_for_every_chunk_still_owed():
+    # A finished read not yet postprocessed still becomes a chunk; ACKed before
+    # it, the conductor may answer for the request and a retry take the id.
+    class _Model:
+        def postprocess(self, tensor, modality, request_kwargs=None):
+            return b"x"
+
+    def _reads_done(wt):
+        return [m for e, m in wt.sent if m.message_type == ConductorMessageType.READS_DONE]
+
+    wt = _preprocess_thread(_Model())
+    edge = SimpleNamespace(name="text_output", tensor_info=[SimpleNamespace(uuid="u1")])
+    wt.tensor_manager = SimpleNamespace(
+        has_inflight_reads=lambda rid: False,
+        get_ready_tensors=lambda: {"r1": [edge]},
+        get_tensor=lambda uuid: object(),
+        dereference=lambda uuid: None,
+    )
+    wt._begin_drain("r1")
+    assert _reads_done(wt) == []
+    wt._process_read_tensors()
+    assert wt.out_queue.get_nowait().data == b"x"
+    wt._complete_drain_if_ready("r1")
+    assert len(_reads_done(wt)) == 1
+
+
+def test_a_preprocessing_failure_is_not_reported_to_the_conductor():
+    # The conductor never got the request.
+    wt = _preprocess_thread(model=None)
+    try:
+        raise ValueError("bad image")
+    except ValueError as exc:
+        wt._fail_request("r1", exc, "preprocessing")
+    assert wt.out_queue.get_nowait().modality == "error"
+    assert _failed_in_conductor(wt) == {}
 
 
 def test_a_failed_output_releases_the_outputs_held_behind_it():

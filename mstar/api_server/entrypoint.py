@@ -185,6 +185,10 @@ class PendingRequest:
     consumed_chunks: int = 0
     error: Any | None = None
     error_status: int = 500
+    # An output from the engine arrived, so the conductor holds the request;
+    # it holds it until it sends request_complete or request_failed.
+    reached_engine: bool = False
+    engine_done: bool = False
     # Set by the streaming handler on its event loop; the message thread wakes
     # it through these when a chunk or the completion lands, so the handler
     # sleeps between chunks instead of polling every millisecond per request.
@@ -320,6 +324,11 @@ class APIServer:
             collections.OrderedDict()
         )
         self._recently_completed_ttl = 15.0
+        # A request whose client has its answer while the conductor still runs
+        # it: rid -> when it was parked. Its id stays refused until the
+        # conductor answers, which it does by the end of its drain TTL.
+        self.awaiting_teardown: dict[str, float] = {}
+        self._drain_ttl_s = float(os.environ.get("MSTAR_DRAIN_TTL_S", "120"))
         self.request_lock = threading.Lock()
         self.running = True
 
@@ -446,7 +455,8 @@ class APIServer:
         Returns the ``request_id``. If a ``request_id`` is provided by the
         caller it is used as-is (useful for deterministic-noise debugging,
         since the conductor's per-request seed is derived from
-        ``hash(request_id)``); otherwise a fresh uuid4 is generated.
+        ``hash(request_id)``); otherwise a fresh uuid4 is generated. An id
+        still held by an earlier request is refused with a 409.
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
@@ -468,6 +478,13 @@ class APIServer:
         with self.request_lock:
             if self.fatal_error is not None:
                 raise HTTPException(status_code=503, detail=self.fatal_error)
+            # A finished request stays in recently_completed until its outputs
+            # drain, and that bookkeeping is keyed by id alone.
+            if (request_id in self.pending_requests or request_id in self.recently_completed
+                    or request_id in self.awaiting_teardown):
+                raise HTTPException(
+                    status_code=409, detail=f"request_id {request_id!r} is already in use"
+                )
             self.pending_requests[request_id] = PendingRequest(
                 streaming=streaming,
                 input_modalities=input_modalities,
@@ -516,7 +533,10 @@ class APIServer:
             )
             if drained or req is None:
                 stale.append((rid, False, drained))
-            elif (now - ts) >= self._recently_completed_ttl:
+            elif (now - ts) >= (
+                self._teardown_hold_s() if req.reached_engine and not req.engine_done
+                else self._recently_completed_ttl
+            ):
                 stale.append((rid, True, drained))
         for rid, lost_outputs, drained in stale:
             # only set the event when there are no more pending chunks
@@ -554,6 +574,75 @@ class APIServer:
             # others make the data worker gate the ACK on its own reads first.
             self.preprocess_worker.finished_reading(rid, drained=drained)
             self.recently_completed.pop(rid, None)
+        if not self.awaiting_teardown:
+            return
+        hold = self._teardown_hold_s()
+        for rid, ts in list(self.awaiting_teardown.items()):
+            if (now - ts) >= hold:
+                logger.error(
+                    "Request %s failed in the data worker and the conductor "
+                    "did not report it torn down within %.0fs; freeing its id",
+                    rid, hold,
+                )
+                self._end_teardown_wait(rid)
+
+    def _teardown_hold_s(self) -> float:
+        """How long a request the data worker failed, while the conductor
+        still runs it, may hold its id. A backstop for a lost answer: the
+        conductor sends request_failed by the end of its drain TTL."""
+        return self._drain_ttl_s + self._recently_completed_ttl
+
+    def _end_teardown_wait(self, request_id: str) -> None:
+        """The conductor is done with a request held in ``awaiting_teardown``
+        (or the TTL gave up): free its id and let the data worker go."""
+        del self.awaiting_teardown[request_id]
+        self.preprocess_worker.finished_reading(request_id, drained=False)
+
+    def _apply_result_chunks(self) -> None:
+        """Hand the data worker's finished chunks to their requests."""
+        # the handlers are woken once per pass, after every chunk of
+        # the pass has been appended, not once per chunk
+        to_wake: dict[int, PendingRequest] = {}
+        for result_chunk in self.preprocess_worker.get_result_chunks():
+            logger.debug(
+                "Got result chunk of %s modality for request %s",
+                result_chunk.modality, result_chunk.request_id
+            )
+            rid = result_chunk.request_id
+            with self.request_lock:
+                req = self.pending_requests.get(rid)
+                if req is None:
+                    # Client already finished (timeout/pop); don't let a
+                    # late chunk KeyError abort the processing tick.
+                    logger.warning(
+                        "Result chunk for %s arrived after the client "
+                        "finished; dropping it", rid,
+                    )
+                    continue
+                now = time.perf_counter()
+                if req.profile.timing.first_chunk_time is None:
+                    req.profile.timing.first_chunk_time = now
+                req.profile.timing.last_chunk_time = now
+                req.chunks.append(result_chunk)
+                to_wake[id(req)] = req
+
+                if result_chunk.modality == "error":
+                    # The data worker failed this request (preprocess,
+                    # or postprocess of a result tensor); release the
+                    # waiting client with the error instead of letting
+                    # it time out.
+                    if req.error is None:
+                        req.error = result_chunk.data.decode("utf-8", "replace")
+                        req.error_status = int(
+                            (result_chunk.metadata or {}).get("status", 500)
+                        )
+                    req.event.set()
+                    # Park the rid so _prune_recently_completed reclaims
+                    # the data worker's per-request state once the
+                    # client lets go of the request.
+                    self.recently_completed[rid] = time.time()
+        if to_wake:
+            notify_many(to_wake.values())
 
     def _process_messages(self) -> None:
         """Drain the ZMQ pull socket and route results to pending requests.
@@ -570,10 +659,17 @@ class APIServer:
                     return
             try:
                 with self.request_lock:
-                    if len(self.recently_completed) > 0:
+                    if self.recently_completed or self.awaiting_teardown:
                         self._prune_recently_completed()
 
-                for message in self.communicator.get_all_new_messages():
+                messages = self.communicator.get_all_new_messages()
+                # The data worker queues a request's every chunk before its
+                # READS_DONE, so before the conductor can answer for it. Taken
+                # here, between reading the socket and applying it, no chunk
+                # is applied after that answer, which can free the id for a
+                # retry. Empty-queue cheap; the pass below picks up the rest.
+                self._apply_result_chunks()
+                for message in messages:
                     if not isinstance(message, APIServerMessage):
                         logger.warning("Unexpected message type: %s", type(message))
                         continue
@@ -585,7 +681,9 @@ class APIServer:
                         queued = False
                         with self.request_lock:
                             for i, rid in enumerate(body.request_ids):
-                                if rid in self.pending_requests:
+                                req = self.pending_requests.get(rid)
+                                if req is not None:
+                                    req.reached_engine = True
                                     # one wake-up for the frame, after every
                                     # request's value is queued
                                     self.preprocess_worker.new_result_token(
@@ -594,7 +692,8 @@ class APIServer:
                                         body.signal, body.modality, wake=False,
                                     )
                                     queued = True
-                                elif rid not in self.recently_completed:
+                                elif (rid not in self.recently_completed
+                                        and rid not in self.awaiting_teardown):
                                     logger.warning(
                                         "Token for unknown request %s dropped", rid,
                                     )
@@ -607,6 +706,7 @@ class APIServer:
                     with self.request_lock:
                         if rid in self.pending_requests:
                             if message.message_type == "result_tensors":
+                                self.pending_requests[rid].reached_engine = True
                                 logger.debug(
                                     "Got new tensors of %s modality for request %s",
                                     message.body.modality, rid
@@ -620,6 +720,7 @@ class APIServer:
                                     rid, message.body.error_message,
                                 )
                                 req = self.pending_requests[rid]
+                                req.engine_done = True
                                 # Don't clobber an earlier, more specific
                                 # error (e.g. a preprocess failure) with a
                                 # downstream one.
@@ -648,6 +749,7 @@ class APIServer:
                                         "until the cleanup TTL", rid,
                                     )
                                 req = self.pending_requests[rid]
+                                req.engine_done = True
                                 req.final_outputs = message.body.final_outputs
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
@@ -672,6 +774,11 @@ class APIServer:
                                 )
                             else:
                                 logger.debug("Late message for completed %s: %s", rid, message.message_type)
+                        elif rid in self.awaiting_teardown:
+                            if message.message_type in ("request_failed", "request_complete"):
+                                self._end_teardown_wait(rid)
+                            elif message.message_type == "result_tensors":
+                                self.preprocess_worker.discard_result_tensors(message.body)
                         else:
                             logger.warning(
                                 "Message for unknown request %s: %s", rid, message.message_type
@@ -689,49 +796,7 @@ class APIServer:
                                 update.preprocess_finish_time
                             req.profile.inputs = update.inputs
 
-                # the handlers are woken once per pass, after every chunk of
-                # the pass has been appended, not once per chunk
-                to_wake: dict[int, PendingRequest] = {}
-                for result_chunk in self.preprocess_worker.get_result_chunks():
-                    logger.debug(
-                        "Got result chunk of %s modality for request %s",
-                        result_chunk.modality, result_chunk.request_id
-                    )
-                    rid = result_chunk.request_id
-                    with self.request_lock:
-                        req = self.pending_requests.get(rid)
-                        if req is None:
-                            # Client already finished (timeout/pop); don't let a
-                            # late chunk KeyError abort the processing tick.
-                            logger.warning(
-                                "Result chunk for %s arrived after the client "
-                                "finished; dropping it", rid,
-                            )
-                            continue
-                        now = time.perf_counter()
-                        if req.profile.timing.first_chunk_time is None:
-                            req.profile.timing.first_chunk_time = now
-                        req.profile.timing.last_chunk_time = now
-                        req.chunks.append(result_chunk)
-                        to_wake[id(req)] = req
-
-                        if result_chunk.modality == "error":
-                            # The data worker failed this request (preprocess,
-                            # or postprocess of a result tensor); release the
-                            # waiting client with the error instead of letting
-                            # it time out.
-                            if req.error is None:
-                                req.error = result_chunk.data.decode("utf-8", "replace")
-                                req.error_status = int(
-                                    (result_chunk.metadata or {}).get("status", 500)
-                                )
-                            req.event.set()
-                            # Park the rid so _prune_recently_completed reclaims
-                            # the data worker's per-request state once the
-                            # client lets go of the request.
-                            self.recently_completed[rid] = time.time()
-                if to_wake:
-                    notify_many(to_wake.values())
+                self._apply_result_chunks()
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
@@ -815,7 +880,11 @@ class APIServer:
                         req = self.pending_requests.get(request_id)
                         if req:
                             remaining = req.chunks[req.consumed_chunks:]
-                            finished_req = self.pending_requests.pop(request_id, None)
+                            finished_req = self._pop_finished(request_id)
+                    # The id is free from here on, and a request that reuses it
+                    # must not get this one's abort if the consumer stops at
+                    # the tail below.
+                    finished = True
                     # Profiling (incl. the optional file write) runs outside the
                     # lock; the popped request is no longer shared with other threads.
                     if finished_req is not None:
@@ -834,7 +903,6 @@ class APIServer:
                         ))
                     if tail:
                         yield tail
-                    finished = True
                     break
 
                 if new_chunks:
@@ -942,7 +1010,7 @@ class APIServer:
             await asyncio.sleep(0.005)
 
         with self.request_lock:
-            req = self.pending_requests.pop(request_id, None)
+            req = self._pop_finished(request_id)
         if req is None:
             return []
         if req.error is not None:
@@ -997,6 +1065,24 @@ class APIServer:
         logger.info("Client cancelled request %s; releasing resources", request_id)
         self.preprocess_worker.abort_request(request_id)
 
+    def _pop_finished(self, request_id: str) -> PendingRequest | None:
+        """Pop a request whose client has its final answer, with
+        ``request_lock`` held, and free its id now: a failed request stays
+        parked in recently_completed until the next prune, and a client
+        retrying the id at once would get a 409 meanwhile."""
+        req = self.pending_requests.pop(request_id, None)
+        if req is not None and request_id in self.recently_completed:
+            parked = self.recently_completed.pop(request_id)
+            if req.reached_engine and not req.engine_done:
+                # The data worker failed it while the conductor still runs it;
+                # the data worker has told the conductor, which answers
+                # request_failed once it is torn down. Until then the id
+                # stays refused, or a retry would run beside the original.
+                self.awaiting_teardown[request_id] = parked
+            else:
+                self.preprocess_worker.finished_reading(request_id, drained=False)
+        return req
+
     def release_request(self, request_id: str) -> None:
         """Drop a request whose results will never be read: abort it if it is
         still running, else just forget it (an ended request needs no abort)."""
@@ -1004,7 +1090,7 @@ class APIServer:
             req = self.pending_requests.get(request_id)
             finished = req is not None and req.event.is_set()
             if finished:
-                self.pending_requests.pop(request_id)
+                self._pop_finished(request_id)
         if not finished:
             self.abort_request(request_id)
 
@@ -1279,7 +1365,8 @@ async def generate_ws(websocket: WebSocket):
     ``{"request_id", "modality", "data", "metadata"}``, followed by
     ``{"request_id", "finish": true}``. A rejected message answers
     ``{"request_id", "error": ...}``, and so does a request that fails after
-    it was accepted (with the HTTP ``status`` it would have had); no finish
+    it was accepted. Both carry the HTTP ``status`` when there is one (409
+    for a ``request_id`` already in flight); no finish
     follows an error. Messages may be pipelined: a client can
     send the next observation before the previous action chunk has returned,
     and the ``request_id`` tells the replies apart. Closing the socket aborts
@@ -1339,10 +1426,15 @@ async def generate_ws(websocket: WebSocket):
             # iterator down, and its ``finally`` aborts the engine request.
             failed = False
             async for chunk in api_server.iter_result_chunks(request_id):
+                if failed:
+                    # A data worker's error is followed by the stream's own.
+                    # The id may be live again by now, so nothing more goes
+                    # out under it; the rest is read so the finished request
+                    # is not aborted.
+                    continue
                 if chunk.modality == "error":
-                    # The request failed after it was accepted. This is the
-                    # iterator's last chunk, so the loop ends here; the error
-                    # is the reply and no finish follows.
+                    # The request failed after it was accepted. The error is
+                    # the reply and no finish follows.
                     failed = True
                     await send({
                         "request_id": request_id,
@@ -1360,8 +1452,11 @@ async def generate_ws(websocket: WebSocket):
             raise
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
             logger.exception("generate/ws request failed")
+            reply = {"request_id": request_id, "error": str(exc)}
+            if isinstance(exc, HTTPException):
+                reply.update(error=exc.detail, status=exc.status_code)
             try:
-                await send({"request_id": request_id, "error": str(exc)}, binary)
+                await send(reply, binary)
             except Exception:  # noqa: BLE001
                 pass
         finally:

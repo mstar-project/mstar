@@ -54,7 +54,7 @@ use protocol::{
     ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest,
     VideoGenerationRequest,
 };
-use serving::{collect, now, result_stream, rid, AppState, Out};
+use serving::{collect, now, result_stream, rid, try_result_stream, AppState, Out};
 
 #[tokio::main]
 async fn main() {
@@ -1011,7 +1011,10 @@ async fn generate_finish(
 
     schedule_upload_cleanup(&st.upload_dir, &args);
     if streaming {
-        let base = result_stream(&st, &args, &request_id, true);
+        let base = match try_result_stream(&st, &args, &request_id, true) {
+            Ok(base) => base,
+            Err((status, message)) => return detail_error(status, &message),
+        };
         let body = base.map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),

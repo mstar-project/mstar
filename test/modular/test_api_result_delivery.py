@@ -162,6 +162,7 @@ def _pending_request():
 def _api_server_stub(preprocess_worker):
     server = object.__new__(APIServer)
     server.recently_completed = collections.OrderedDict()
+    server.awaiting_teardown = {}
     server._recently_completed_ttl = 15.0
     server.pending_requests = {}
     server.preprocess_worker = preprocess_worker

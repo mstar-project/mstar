@@ -38,6 +38,7 @@ from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
     DrainRequest,
+    FailRequests,
     NewRequestConductor,
     ReadsDone,
     RemoveRequest,
@@ -671,7 +672,7 @@ class PreprocessWorkerThread:
 
     def _fail_request(
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
-        sequence: int | None = None,
+        sequence: int | None = None, in_conductor: bool = False,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -683,14 +684,22 @@ class PreprocessWorkerThread:
         ``sequence`` is the output slot the failed tensor held. Its error chunk
         takes that slot in the reorder buffer; put straight on ``out_queue`` it
         would leave every later sequence held in ``pending`` until the TTL.
+
+        ``in_conductor``: the failure is in an output, so the conductor holds
+        the request and would keep running it. It is failed there too, as a
+        worker fails one: the conductor drains every reader, this thread
+        included, and answers ``request_failed`` once it is torn down. A
+        request already draining is being torn down, and one the conductor
+        does not know is ignored there.
         """
         logger.exception("%s failed for request %s", stage, request_id)
         status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
+        error = f"{stage} failed: {type(exc).__name__}: {exc}"
         chunks = [
             ResultChunk(
                 request_id=request_id,
                 modality="error",
-                data=f"{stage} failed: {type(exc).__name__}: {exc}".encode("utf-8"),
+                data=error.encode("utf-8"),
                 metadata={"status": status},
             )
             for _ in range(max(count, 1))
@@ -699,6 +708,15 @@ class PreprocessWorkerThread:
             self._queue_completed_output(request_id, sequence, chunks.pop())
         for chunk in chunks:
             self.out_queue.put(chunk)
+        if (in_conductor and request_id not in self._draining_rids
+                and request_id not in self._reads_done_sent):
+            self.communicator.send(
+                "conductor",
+                ConductorMessage(
+                    message_type=ConductorMessageType.FAIL_REQUESTS,
+                    body=FailRequests(errors={request_id: error}),
+                ),
+            )
 
     def _sequence_unanswered(self, request_id: str, sequence: int) -> bool:
         """True if no chunk has been queued for ``sequence`` yet."""
@@ -757,7 +775,7 @@ class PreprocessWorkerThread:
         except Exception as exc:  # noqa: BLE001 — must reach the client
             self._fail_request(
                 request_id, exc, f"{item.modality} output postprocessing",
-                sequence=sequence,
+                sequence=sequence, in_conductor=True,
             )
 
     def _queue_completed_output(
@@ -885,7 +903,7 @@ class PreprocessWorkerThread:
                     except Exception as exc:  # noqa: BLE001 — must reach the client
                         self._fail_request(
                             request_id, exc, f"{modality} output postprocessing",
-                            sequence=sequence,
+                            sequence=sequence, in_conductor=True,
                         )
                     self.tensor_uuid_to_metadata_per_request.get(
                         request_id, {}
@@ -943,6 +961,13 @@ class PreprocessWorkerThread:
             return
         if self.tensor_manager.has_inflight_reads(request_id):
             return  # let _process_read_tensors resolve the futures; retry
+        state = self.request_output_state.get(request_id)
+        if state is not None and (state.order or state.pending):
+            # A read that finished but is not postprocessed yet, or an output
+            # held in the reorder buffer, still becomes a chunk. After the ACK
+            # the conductor may answer for the request and its id be reused,
+            # so that chunk would land on the next request under it.
+            return
         self._send_reads_done(request_id)
 
     def _send_reads_done(self, request_id: str) -> None:
@@ -1023,6 +1048,7 @@ class PreprocessWorkerThread:
                             result.request_id, exc,
                             f"{result.modality} output transfer",
                             count=len(result.graph_edge.tensor_info),
+                            in_conductor=True,
                         )
                 while not self.abort_request_queue.empty():
                     did_work = True

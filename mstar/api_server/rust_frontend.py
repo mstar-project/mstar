@@ -129,6 +129,18 @@ class RustFrontendBridge:
                 request_id=rid,
             )
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the loop
+            status = getattr(e, "status_code", None)
+            if isinstance(status, int):
+                # An HTTPException (not imported: this bridge runs without
+                # fastapi). An in-band error chunk is the bridge's only form
+                # that carries a status; `t="err"` always surfaces as a 500.
+                detail = getattr(e, "detail", e)
+                logger.warning("submit %s refused (%d): %s", rid, status, detail)
+                self._send({
+                    "t": "chunk", "rid": rid, "modality": "error",
+                    "data": str(detail).encode(), "metadata": {"status": status},
+                })
+                return
             logger.warning("submit %s failed: %r", rid, e)
             self._err(rid, repr(e))
             return
@@ -137,12 +149,22 @@ class RustFrontendBridge:
     async def _relay(self, rid: str) -> None:
         """Forward this request's ResultChunks; terminal err on failure."""
         try:
+            failed = False
             async for chunk in self.server.iter_result_chunks(rid):
+                # The frontend ends the route on the first error, and the id
+                # may be live again by now: anything sent after it (a data
+                # worker's error is followed by the stream's own, or a done)
+                # would land on the new request. The rest is still read so the
+                # finished request is not aborted.
+                if failed:
+                    continue
+                failed = chunk.modality == "error"
                 self._send({
                     "t": "chunk", "rid": rid, "modality": chunk.modality,
                     "data": bytes(chunk.data), "metadata": chunk.metadata,
                 })
-            self._send({"t": "done", "rid": rid})
+            if not failed:
+                self._send({"t": "done", "rid": rid})
         except Exception as e:  # noqa: BLE001 — includes the per-request timeout
             detail = getattr(e, "detail", None) or repr(e)
             logger.warning("request %s failed: %s", rid, detail)

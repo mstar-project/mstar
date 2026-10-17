@@ -81,8 +81,22 @@ pub fn result_stream(
     request_id: &str,
     streaming: bool,
 ) -> OutStream {
-    let base = raw_result_stream(state, args, request_id, streaming);
-    match (&args.tokens, &state.tok) {
+    try_result_stream(state, args, request_id, streaming).unwrap_or_else(|(status, message)| {
+        Box::pin(futures::stream::once(async move { Out::Error { status, message } }))
+    })
+}
+
+/// [`result_stream`], with a submission the bridge refused (an id still in
+/// flight) returned as `Err((status, message))` before any stream exists, so
+/// a streaming handler can still answer with that status.
+pub fn try_result_stream(
+    state: &AppState,
+    args: &SubmitArgs,
+    request_id: &str,
+    streaming: bool,
+) -> Result<OutStream, (u16, String)> {
+    let base = raw_result_stream(state, args, request_id, streaming)?;
+    Ok(match (&args.tokens, &state.tok) {
         (Some(_), Some(tok)) => {
             use futures::StreamExt;
             let detok = IncrementalDecoder::new(tok.clone());
@@ -116,7 +130,7 @@ pub fn result_stream(
             )
         }
         _ => base,
-    }
+    })
 }
 
 fn raw_result_stream(
@@ -124,10 +138,12 @@ fn raw_result_stream(
     args: &SubmitArgs,
     request_id: &str,
     streaming: bool,
-) -> OutStream {
-    match &state.bridge {
+) -> Result<OutStream, (u16, String)> {
+    Ok(match &state.bridge {
         Some(b) => {
-            let rx = b.submit(args, request_id, streaming);
+            let rx = b
+                .submit(args, request_id, streaming)
+                .map_err(|message| (409, message))?;
             let guard = AbortGuard {
                 bridge: b.clone(),
                 rid: request_id.to_string(),
@@ -179,7 +195,7 @@ fn raw_result_stream(
         None => Box::pin(futures::stream::iter(
             mock_chunks(args, state.sample_rate).into_iter().map(Out::Chunk),
         )),
-    }
+    })
 }
 
 /// Gather a non-streaming request's chunks; the first error wins (mstar's

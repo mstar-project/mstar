@@ -325,6 +325,7 @@ def _api_server(conductor_proc, inbox=()):
     server = object.__new__(APIServer)
     server.pending_requests = {}
     server.recently_completed = collections.OrderedDict()
+    server.awaiting_teardown = {}
     server._recently_completed_ttl = 15.0
     server.request_lock = threading.Lock()
     server.running = True

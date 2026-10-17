@@ -198,6 +198,14 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        request reaches the pod (Run:AI serves a workload at
        ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
        every route. Empty by default, so a direct deployment is unaffected.
+   * - ``MSTAR_DRAIN_TTL_S``
+     - ``120``
+     - Seconds the conductor waits for every reader of a torn-down request
+       to report its reads done before it forces the teardown (read in
+       ``Conductor.__init__``). The API server reads it too
+       (``APIServer.__init__``): a request the data worker failed keeps its
+       ``request_id`` refused until the conductor reports it torn down, and
+       frees it anyway after this TTL plus 15 s.
 
 Serving (Rust frontend)
 -----------------------
