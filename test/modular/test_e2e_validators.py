@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "e2e"))
 
 from cases import MODELS, Case, ModelSpec, moving_square_mp4, red_square_png, scene_png  # noqa: E402
 from matrix import Gpu, cases_without_inputs, config_gpus, gap_report, plan  # noqa: E402
-from server import Server, ServerError, free_port  # noqa: E402
+from server import Server, ServerError, free_port, listening_sockets  # noqa: E402
 from validators import (  # noqa: E402
     Expect,
     check_audio,
@@ -513,7 +513,7 @@ def test_a_given_port_taken_while_the_model_loads_fails_clearly(tmp_path):
 @needs_proc
 def test_two_runners_on_one_port_cannot_both_pass(tmp_path):
     port = free_port()
-    first, second = _slow_server(tmp_path, "first", 2, port), _slow_server(tmp_path, "second", 60, port)
+    first, second = _slow_server(tmp_path, "first", 2, port), _slow_server(tmp_path, "second", 5, port)
     entered = {}
     thread = threading.Thread(target=lambda: entered.setdefault("url", first.__enter__()))
     thread.start()
@@ -626,6 +626,137 @@ def test_a_group_that_survives_sigkill_is_not_restarted(tmp_path, monkeypatch):
             _kill_group(proc.pid)
 
 
+# Loads until argv[2] exists, then binds argv[1] and serves /health.
+GATED_SERVER = """
+import http.server, os, sys, time
+while not os.path.exists(sys.argv[2]):
+    time.sleep(0.01)
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Health).serve_forever()
+"""
+
+
+def _gated_server(tmp_path, go: Path) -> Server:
+    return Server(REPO, REPO / "configs/qwen3_5_0.8b.yaml", tmp_path / "log", startup_timeout=30,
+                  command=[sys.executable, "-c", GATED_SERVER, "{port}", str(go)])
+
+
+def _wait_listening(port: int) -> None:
+    deadline = time.monotonic() + 10
+    while not listening_sockets(port) and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+@needs_proc
+@pytest.mark.parametrize("step", ["listening_sockets", "group_sockets"])
+def test_a_server_that_starts_listening_mid_check_is_not_restarted(tmp_path, monkeypatch, step):
+    import server as server_module
+
+    go = tmp_path / "listen"
+    server = _gated_server(tmp_path, go)
+    real_step = getattr(server_module, step)
+
+    def listen_after(*args):
+        result = real_step(*args)
+        if not go.exists():
+            go.touch()
+            _wait_listening(server.port)
+        return result
+
+    monkeypatch.setattr(server_module, step, listen_after)
+    with server as url:
+        assert server.restarts == 0
+        assert requests.get(url + "/health", timeout=5).status_code == 200
+
+
+@needs_proc
+def test_another_listener_seen_while_the_model_loads_does_not_restart_it(tmp_path, monkeypatch):
+    import server as server_module
+
+    go, foreign = tmp_path / "listen", socket.socket()
+    server = _gated_server(tmp_path, go)
+    _record_launches(monkeypatch, after=lambda proc: (foreign.bind(("127.0.0.1", server.port)), foreign.listen()))
+    real_listening, reads = server_module.listening_sockets, []
+
+    def listening_sockets(port):
+        reads.append(port)
+        if len(reads) == 2:  # the first check saw the other listener; it leaves, the model finishes loading
+            foreign.close()
+            go.touch()
+            _wait_listening(port)
+        return real_listening(port)
+
+    monkeypatch.setattr(server_module, "listening_sockets", listening_sockets)
+    try:
+        with server as url:
+            assert server.restarts == 0 and len(reads) >= 2
+            assert requests.get(url + "/health", timeout=5).status_code == 200
+    finally:
+        foreign.close()
+
+
+@needs_proc
+def test_a_health_answer_counts_only_if_the_server_still_listens_after_it(tmp_path, monkeypatch):
+    server = Server(REPO, REPO / "configs/qwen3_5_0.8b.yaml", tmp_path / "log", startup_timeout=3,
+                    command=[sys.executable, "-c", FAKE_SERVER, "{port}"])
+    real_listening, checks = server._listening, []
+
+    def listener_gone_after_the_answer():
+        checks.append(None)
+        return real_listening() if len(checks) % 2 else False
+
+    monkeypatch.setattr(server, "_listening", listener_gone_after_the_answer)
+    with pytest.raises(ServerError, match="not healthy"):
+        server.__enter__()
+    assert len(checks) >= 2
+
+
+@needs_proc
+def test_a_server_that_dies_mid_check_is_reported_not_restarted(tmp_path, monkeypatch):
+    import server as server_module
+
+    go = tmp_path / "listen"
+    go.touch()
+    server = _gated_server(tmp_path, go)
+    real_group_sockets = server_module.group_sockets
+
+    def die_first(pgid):
+        if server_module.listening_sockets(server.port):
+            os.killpg(pgid, signal.SIGKILL)
+            server._proc.wait(timeout=10)
+        return real_group_sockets(pgid)
+
+    monkeypatch.setattr(server_module, "group_sockets", die_first)
+    with pytest.raises(ServerError, match="exited with code -9"):
+        server.__enter__()
+    assert server.restarts == 0
+
+
+@needs_proc
+def test_a_descriptor_closing_mid_scan_hides_no_other_socket(monkeypatch):
+    import server as server_module
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        inode = str(os.fstat(listener.fileno()).st_ino)
+        real_readlink, mine, failed = os.readlink, f"/proc/{os.getpid()}/fd/", []
+
+        def readlink(path):
+            if str(path).startswith(mine) and not failed:
+                failed.append(path)
+                raise FileNotFoundError(path)  # closed since the listing
+            return real_readlink(path)
+
+        monkeypatch.setattr(server_module.os, "readlink", readlink)
+        assert inode in server_module.group_sockets(os.getpgrp()) and failed
+
+
 def _ipv6_listener(v6only: bool) -> socket.socket:
     try:
         listener = socket.socket(socket.AF_INET6)
@@ -709,6 +840,7 @@ def test_exit_code_fails_on_round_trip_errors_and_on_nothing_run():
     passed = {"m": {"status": "passed"}}
     assert exit_code({"models": passed}) == 0
     assert exit_code({"models": passed, "speech_round_trip": {"server_error": "boom"}}) == 1
+    assert exit_code({"models": passed, "speech_round_trip": {"server_exit_code": -9}}) == 1
     assert exit_code({"models": passed, "speech_round_trip": {"skipped": "needs 2 GPUs"}}) == 0
     assert exit_code({"models": {"m": {"status": "skipped"}}}) == 1
     assert exit_code({"models": {}}) == 1
@@ -887,6 +1019,49 @@ def test_a_server_that_dies_mid_run_records_its_exit_code(monkeypatch, tmp_path)
     assert list(result["cases"]) == ["text_to_text"]
     assert result["server_exit_code"] == -9
     assert "exited with code -9 during text_to_text" in result["server_error"]
+
+
+def test_teardown_records_an_exit_it_sees_before_signalling(tmp_path, monkeypatch):
+    import server as server_module
+
+    server = Server(REPO, REPO / "configs/qwen3_5_0.8b.yaml", tmp_path / "log", startup_timeout=60,
+                    command=[sys.executable, "-c", FAKE_SERVER, "{port}"], stop_grace=5, settle=0.2)
+    real_kill, sigints = os.kill, []
+
+    def kill(pid, sig):
+        if sig == signal.SIGINT:
+            sigints.append(pid)
+        return real_kill(pid, sig)
+
+    with server:
+        pid, real_poll = server._proc.pid, server.poll
+
+        def crash_right_after_a_check():
+            code = real_poll()
+            if code is None:  # the server dies just after teardown's check
+                real_kill(pid, signal.SIGKILL)
+                os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+            return code
+
+        monkeypatch.setattr(server, "poll", crash_right_after_a_check)
+        monkeypatch.setattr(server_module.os, "kill", kill)
+    assert server.exit_code == -9 or sigints == [pid]  # skipping SIGINT means the exit was seen, so recorded
+
+
+def test_a_server_that_dies_after_the_last_case_fails_the_profile(monkeypatch, tmp_path):
+    from run import model_status
+    from validators import Verdict
+
+    class DiesBeforeTeardown(_FakeServer):
+        def __exit__(self, *exc):
+            self.exit_code = -9  # what teardown's first poll records
+            return False
+
+    result, run_model = _run_model(monkeypatch, tmp_path, lambda url, case: Verdict(True, "ok"),
+                                   server=DiesBeforeTeardown)
+    run_model()
+    assert result["server_exit_code"] == -9 and "server_error" not in result
+    assert model_status({"source": result}) == "failed"
 
 
 def test_a_group_that_survives_sigkill_fails_the_profile_with_its_pids(monkeypatch, tmp_path):

@@ -50,13 +50,15 @@ If a process of the group survives SIGKILL, the profile fails with its pids
 Ports: by default each server gets a free port, picked just before launch and
 before the VRAM sampler starts, and picked again (up to 10 tries) if it reads as
 busy. The runner only talks to a server that its own process group is listening
-on (checked through `/proc` on Linux). Whether another process holds the port is
-decided by test-binding 127.0.0.1 as the server would, so an IPv6-only listener
-on the same port does not count and a dual-stack one does. If another process
-takes the port while the model loads, the server is restarted once on a fresh
-port (`server_restarts` in the report). With `--port`, a port held by another
-process fails the profile instead. A server that exits on its own has its exit
-code recorded as `server_exit_code`.
+on (checked through `/proc` on Linux). Whether another process holds the port at
+launch is decided by test-binding 127.0.0.1 as the server would, so an IPv6-only
+listener on the same port does not count and a dual-stack one does. If another
+process takes the port while the model loads, the server fails to bind and is
+restarted once on a fresh port (`server_restarts` in the report); what `/proc`
+shows of other processes never restarts it, since that can be stale by the time
+it is read. With `--port`, a port held by another process fails the profile
+instead. A server that exits on its own has its exit code recorded as
+`server_exit_code` and fails the profile.
 
 A runner killed outright (SIGKILL, the OOM killer) cannot tear down. On Linux
 the API server gets SIGKILL when the runner dies (`PR_SET_PDEATHSIG`), and its

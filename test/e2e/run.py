@@ -245,7 +245,7 @@ def model_status(entry: dict) -> str:
     if "skipped" in entry:
         return "skipped"
     runs = [entry[k] for k in ("source", "compare") if k in entry]
-    if any("server_error" in r or "out_of_memory" in r for r in runs):
+    if any(key in r for r in runs for key in ("server_error", "out_of_memory", "server_exit_code")):
         return "failed"
     for name, case in entry["source"]["cases"].items():
         other = entry.get("compare", {}).get("cases", {}).get(name, {"passed": True})
@@ -317,8 +317,10 @@ def main() -> int:
     print(f"\n{'no failures' if not failed else 'failed: ' + ', '.join(failed)}")
     if not_run:
         print(f"not run{' (interrupted)' if report.get('interrupted') else ''}: {', '.join(not_run)}")
-    if "server_error" in report.get("speech_round_trip", {}):
-        print(f"speech round trip failed: {report['speech_round_trip']['server_error']}")
+    round_trip = report.get("speech_round_trip", {})
+    if "server_error" in round_trip or "server_exit_code" in round_trip:
+        reason = round_trip.get("server_error") or f"server exited with code {round_trip['server_exit_code']}"
+        print(f"speech round trip failed: {reason}")
     if not any(e["status"] in ("passed", "failed") for e in report["models"].values()):
         print("no case ran")
     print(f"report: {out / 'report.json'}")
@@ -332,7 +334,7 @@ def exit_code(report: dict) -> int:
         return 1
     if any(s in ("failed", "not run") for s in statuses):
         return 1
-    if "server_error" in report.get("speech_round_trip", {}):
+    if {"server_error", "server_exit_code"} & report.get("speech_round_trip", {}).keys():
         return 1
     return 0 if any(s in ("passed", "failed") for s in statuses) else 1
 

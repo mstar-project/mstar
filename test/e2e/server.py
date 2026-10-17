@@ -127,12 +127,16 @@ def group_sockets(pgid: int) -> set[str]:
     inodes = set()
     for pid in group_pids(pgid) or []:
         try:
-            for fd in Path(f"/proc/{pid}/fd").iterdir():
-                link = os.readlink(fd)
-                if link.startswith("socket:["):
-                    inodes.add(link[8:-1])
+            fds = list(Path(f"/proc/{pid}/fd").iterdir())
         except OSError:
             continue
+        for fd in fds:
+            try:
+                link = os.readlink(fd)
+            except OSError:  # closed since the listing; the others still count
+                continue
+            if link.startswith("socket:["):
+                inodes.add(link[8:-1])
     return inodes
 
 
@@ -241,14 +245,17 @@ class Server:
             self.exit_code = self._proc.returncode
         return self.exit_code
 
-    def _port_owner(self) -> str | None:
-        """Who holds the port: ours, other, None (nobody yet) or unknown (no /proc)."""
+    def _listening(self) -> bool | None:
+        """Whether this server's group listens on the port; None without /proc.
+
+        Reads the listeners before our sockets, so a listener seen in the first
+        read is still open in the second. It never concludes that another
+        process holds the port: snapshots of other processes go stale, and
+        the server's own failed bind is the one conclusive sign."""
         listening = listening_sockets(self.port)
         if listening is None:
-            return "unknown"
-        if listening & group_sockets(self._proc.pid):
-            return "ours"
-        return "other" if port_in_use(self.port) else None
+            return None
+        return bool(listening & group_sockets(self._proc.pid))
 
     def _wait_ready(self):
         start = time.monotonic()
@@ -259,16 +266,16 @@ class Server:
                 if code == BIND_FAILED or "address already in use" in log:
                     raise PortTakenError(f"port {self.port} was taken by another process while the server loaded")
                 raise ServerError(f"server exited with code {code} during startup; see {self.log_path}")
-            owner = self._port_owner()
-            if owner == "other":
-                raise PortTakenError(f"port {self.port} is served by another process, not this server")
-            if owner in ("ours", "unknown"):
+            if self._listening() is not False:  # ours, or no /proc to tell
                 try:
-                    if requests.get(self.url + "/health", timeout=1).status_code == 200:
-                        self.startup_seconds = time.monotonic() - start
-                        return
+                    healthy = requests.get(self.url + "/health", timeout=1).status_code == 200
                 except requests.RequestException:
-                    pass
+                    healthy = False
+                # Listening both before and after the answer, and still running:
+                # only one process can listen on the port, so the answer was ours.
+                if healthy and self.poll() is None and self._listening() is not False:
+                    self.startup_seconds = time.monotonic() - start
+                    return
             if time.monotonic() - start > self.startup_timeout:
                 raise ServerError(f"server not healthy after {self.startup_timeout:.0f} s; see {self.log_path}")
             time.sleep(1)
@@ -316,7 +323,6 @@ class Server:
     def _stop_group(self, pending: list) -> None:
         pgid = self._proc.pid
         try:
-            self.poll()
             self._stop(pgid, pending)
         except BaseException:
             _signal_group(pgid, signal.SIGKILL)
@@ -329,8 +335,9 @@ class Server:
         """SIGINT to the API server, its graceful stop: it shuts its conductor
         down, which stops the workers. The group gets SIGKILL if that has not
         finished within ``stop_grace``, ``settle`` after the API server exits,
-        or as soon as another interrupt arrives."""
-        if self._proc.poll() is None:
+        or as soon as another interrupt arrives. An exit seen by the one check
+        before SIGINT is the server's own, so it is recorded."""
+        if self.poll() is None:
             try:
                 os.kill(pgid, signal.SIGINT)
             except ProcessLookupError:
