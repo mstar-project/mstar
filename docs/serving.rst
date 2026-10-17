@@ -333,7 +333,7 @@ to a file instead of stdout (it implies ``--log-stats``):
    mstar serve bagel --log-stats
    mstar-serve --config configs/orpheus_colocated.yaml --log-stats-file stats.txt
 
-The report has four sections (any that has no data is omitted):
+The report has up to five sections (any that has no data is omitted):
 
 .. code-block:: text
 
@@ -406,6 +406,11 @@ priori which worker will read it (and may register data that is never sent), so 
 per-destination breakdown. ``size`` is total bytes, the time is transport cost (the
 RDMA-read or SHM file-read time on ``rx``; the registration / serialize-and-write time on
 ``tx``), and ``count`` is the number of tensors.
+
+**Read quarantine** — shown only once some process has kept buffers from a failed
+Mooncake/RDMA read. These are process totals, not per request: bytes kept, ``(xN)`` reads,
+and the ``MSTAR_READ_QUARANTINE_BUDGET_MB`` budget, flagged ``OVER BUDGET`` once past it
+(``/health`` then answers 503).
 
 .. note::
 

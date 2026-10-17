@@ -68,6 +68,22 @@ class GraphTiming:
 
 
 @dataclass
+class ReadQuarantine:
+    """A process's buffers kept from failed reads, which a transfer that did
+    not stop may still write into. Workers send it to the API server whenever
+    it grows; the API server shows it under ``--log-stats`` and fails
+    ``/health`` once ``nbytes`` passes ``budget_bytes``."""
+    entity_id: str
+    reads: int
+    nbytes: int
+    budget_bytes: int
+
+    @property
+    def over_budget(self) -> bool:
+        return self.nbytes > self.budget_bytes
+
+
+@dataclass
 class RequestTiming:
     recv_time: float | None = None # all are time.perf_counter
     preprocess_finish_time: float | None = None
@@ -87,3 +103,5 @@ class RequestProfile:
     tx_info: list[TxInfo] = field(default_factory=list)
     inputs: list[InputInfo] = field(default_factory=list)
     outputs: list[OutputInfo] = field(default_factory=list)
+    # process-wide totals at the time the request finished, not per request
+    read_quarantine: list[ReadQuarantine] = field(default_factory=list)

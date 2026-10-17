@@ -205,6 +205,9 @@ class _ReadyTensorManager:
             for request_id, tensors in ready.items()
         }
 
+    def take_failed_reads(self):
+        return []
+
     def start_read_tensors(self, request_id, graph_edges):
         pass
 
@@ -253,6 +256,7 @@ def test_data_worker_emits_complete_metadata_and_monotonic_frame_indices():
     }
     worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     worker.enable_nvtx = False
+    worker._failed_rids = set()
     worker.tensor_manager = _ReadyTensorManager({"request": tensors})
     worker.model = _FrameModel()
     worker.out_queue = queue.Queue()
@@ -280,6 +284,7 @@ def test_data_worker_tracks_interleaved_frame_indices_per_request():
     }
     worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     worker.enable_nvtx = False
+    worker._failed_rids = set()
     worker.tensor_manager = _ReadyTensorManager(tensors)
     worker.tensor_manager.ready = {
         "request-a": {"a-first": frame},
@@ -318,6 +323,7 @@ def test_data_worker_reorders_async_completions_before_frame_emission():
     tensors = {"request": {"first": first, "second": second}}
     worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     worker.enable_nvtx = False
+    worker._failed_rids = set()
     worker.tensor_manager = _ReadyTensorManager(tensors)
     worker.tensor_manager.ready = {}
     worker.model = _FrameModel()
@@ -357,6 +363,7 @@ def test_data_worker_reorders_async_completions_before_frame_emission():
 def test_data_worker_cleanup_drops_all_frame_protocol_state():
     worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     worker.enable_nvtx = False
+    worker._failed_rids = set()
     worker.tensor_manager = _ReadyTensorManager({})
     worker.tensor_uuid_to_metadata_per_request = {
         "reused": {"old": {"producer": "decoder"}},

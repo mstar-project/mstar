@@ -32,6 +32,9 @@ class _RecordingTensorManager:
     def get_ready_tensors(self):
         return {}
 
+    def take_failed_reads(self):
+        return []
+
     def cleanup_request(self, request_id):
         pass
 
@@ -114,6 +117,8 @@ def test_result_reads_drain_ahead_of_preprocess():
     ))
     n_results = 6
     for i in range(n_results):
+        # requests whose preprocessing already ran
+        worker.in_flight_requests.add(f"req-out-{i}")
         worker.result_tensor_queue.put(_result_tensors(f"req-out-{i}"))
 
     thread = threading.Thread(target=worker.run)

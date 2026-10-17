@@ -45,6 +45,10 @@ class _StubAPIServer:
     def __init__(self):
         self.submitted = []
         self.aborted = []
+        self.problem = None
+
+    def health_problem(self):
+        return self.problem
 
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
@@ -212,6 +216,25 @@ def test_health_goes_red_when_the_bridge_dies(stack):
     assert e.value.code == 503
 
 
+def test_health_goes_red_with_the_backends_reason(stack):
+    """The backend answers the ping but reports itself unhealthy (here: kept
+    read buffers past their budget). The Rust /health must fail with that
+    reason, as the Python /health does, and recover when it clears."""
+    port, stub, _bridge, _proc = stack
+    stub.problem = (
+        "worker_0 keeps 1368 bytes of buffers from 7 failed tensor reads, "
+        "past its budget of 1048 bytes"
+    )
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=10)
+    assert e.value.code == 503
+    body = json.loads(e.value.read())
+    assert body == {"status": "unhealthy", "reason": stub.problem}
+
+    stub.problem = None
+    assert _wait_healthy(port)
+
+
 def test_sigterm_drains_and_exits(stack):
     import signal
 
@@ -349,6 +372,27 @@ def test_generate_accepts_both_content_types(stack):
     texts = [s["text"] for s in stub.submitted]
     assert texts.count("hi") == 2, stub.submitted
     assert all(s["mk"] == {"foo": 1} for s in stub.submitted)
+
+
+def test_generate_forwards_a_client_request_id_unchanged(stack):
+    """The bridge must pass a client-supplied id through as-is, including
+    one that looks like an internal id. Resolution to the live request is
+    the Python API server's job (``_lookup_client``)."""
+    import urllib.parse
+
+    port, stub, _bridge, _proc = stack
+    forged = "foo#t-1"
+    data = urllib.parse.urlencode({
+        "text": "hi", "output_modalities": "text",
+        "streaming": "false", "request_id": forged,
+    }).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate", data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        body = json.loads(r.read())
+    assert stub.submitted[-1]["rid"] == forged
+    assert body.get("request_id") == forged
 
 
 _FAKE_MP4 = b"\x00\x00\x00\x18ftypmp42FAKE-MP4-BYTES"

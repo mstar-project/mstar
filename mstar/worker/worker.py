@@ -16,6 +16,7 @@ from time import sleep
 
 import torch
 
+from mstar.api_server.request_types import APIServerMessage
 from mstar.communication.codec import WireCodec
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
@@ -363,6 +364,7 @@ class Worker:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=enable_prof
         )
+        self._reported_quarantine_reads = 0
         kv_shm_dir_factory = None
         if (
             isinstance(
@@ -1255,6 +1257,16 @@ class Worker:
         """Poll for completed RDMA transfers, feed ready graph edges to worker graph queues."""
         self.wakeup_event.drain()
         ready = self.tensor_manager.get_ready_tensors()
+        failed = {
+            f.request_id: f"Error in worker: input tensor read failed: {type(f.error).__name__}: {f.error}"
+            for f in self.tensor_manager.take_failed_reads()
+            if f.request_id not in self.scheduler.failed_rids
+        }
+        if failed:
+            self._fail_requests(failed)
+        # teardown can quarantine too, so compare totals rather than hook each path
+        if self.tensor_manager.quarantined_reads != self._reported_quarantine_reads:
+            self._report_read_quarantine()
         for request_id, edges in ready.items():
             # Separate streaming edges from normal edges
             streaming = [e for e in edges if e.is_streaming]
@@ -3719,6 +3731,16 @@ class Worker:
                     speculation.tp_seq = ya_seq if ya_seq >= 0 else batch.tp_seq
 
         return speculation, yield_away_from_target
+
+    def _report_read_quarantine(self) -> None:
+        """Send the API server this worker's buffers kept from failed reads;
+        it fails ``/health`` once they pass the budget."""
+        quarantine = self.tensor_manager.read_quarantine()
+        self._reported_quarantine_reads = quarantine.reads
+        self.communicator.send(
+            "api_server",
+            APIServerMessage(message_type="read_quarantine", body=quarantine),
+        )
 
     def run(self) -> None:
         switch_interval = os.environ.get("MSTAR_PY_SWITCH_INTERVAL_SEC", "")

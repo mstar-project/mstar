@@ -179,8 +179,12 @@ class RustFrontendBridge:
                         self.server.abort_request(msg["rid"])
                     elif t == "ping":
                         # Deep-health liveness: the frontend's /health goes red
-                        # unless this loop answers.
-                        self._send({"t": "pong", "rid": msg["rid"]})
+                        # unless this loop answers, and with the backend's own
+                        # reason when it reports one.
+                        self._send({
+                            "t": "pong", "rid": msg["rid"],
+                            "msg": self.server.health_problem() or "",
+                        })
                     else:
                         logger.warning("bridge: unknown message type %r", t)
                 except Exception:  # noqa: BLE001 — one bad message must not kill the loop

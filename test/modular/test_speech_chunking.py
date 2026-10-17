@@ -437,12 +437,13 @@ def test_release_request_aborts_only_requests_still_running():
     aborted = []
     done, running = threading.Event(), threading.Event()
     done.set()
-    server = types.SimpleNamespace(
-        request_lock=threading.Lock(),
-        pending_requests={"done": types.SimpleNamespace(event=done),
-                          "running": types.SimpleNamespace(event=running)},
-        abort_request=aborted.append,
-    )
+    # an APIServer for its client-id lookup helpers, without the processes
+    server = APIServer.__new__(APIServer)
+    server.request_lock = threading.Lock()
+    server.pending_requests = {"done": types.SimpleNamespace(event=done),
+                               "running": types.SimpleNamespace(event=running)}
+    server.recently_completed = {}
+    server.abort_request = aborted.append
     APIServer.release_request(server, "done")
     APIServer.release_request(server, "running")
     assert aborted == ["running"] and "done" not in server.pending_requests
