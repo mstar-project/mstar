@@ -337,3 +337,5 @@ class RecurrentStep(ResourceStep):
 
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
+    # the rows the forks apply to; None is every row (as KVStep.fork_rids)
+    fork_rids: frozenset | None = None

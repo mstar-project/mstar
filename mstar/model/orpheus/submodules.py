@@ -9,14 +9,25 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    keep_final_chunk_samples,
+)
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import (
+    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    ChunkingPolicy,
     InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
@@ -48,6 +59,14 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
+    MAX_BATCH_TOKENS = 512
+
+    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
+        if graph_walk == "prefill":
+            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS)
+        if graph_walk == "mixed":
+            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
+        return NO_CHUNKING
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -117,10 +136,10 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             steps={
                 KV_CACHE: KVStep(),
                 ATTN: AttentionStep(causal=True),
-                SAMPLER: SamplerStep(
+                SAMPLER: keep_final_chunk_samples(SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens
-                ),
+                ), request_ids, inputs),
                 ROPE: PositionStep()
             }
         )
@@ -200,6 +219,9 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     ):
         # Metadata-only: rebind output name for graph routing. EOS check
         # moved to check_stop so the GPU thread doesn't sync on .item() here.
+        inputs = kwargs.get("inputs")
+        if inputs is not None and not inputs.is_final_chunk:
+            outputs.pop("new_token", None)  # only the last chunk's token is real
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]

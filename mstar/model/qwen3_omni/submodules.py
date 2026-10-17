@@ -16,6 +16,7 @@ import functools
 import inspect
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Optional
 
 import torch
@@ -25,7 +26,16 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    keep_final_chunk_samples,
+)
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
@@ -51,8 +61,10 @@ from mstar.model.qwen3_omni.config import (
     Qwen3OmniModelConfig,
 )
 from mstar.model.submodule_base import (
+    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
+    ChunkingPolicy,
     InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
@@ -562,6 +574,40 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 }
             )
 
+    MAX_BATCH_TOKENS = 1024
+    # vision runs alone (bs=1 captures), so a larger chunk costs no decode rows a step
+    MAX_VISION_BATCH_TOKENS = 2048
+
+    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
+        if graph_walk in ("prefill_text", "prefill_audio"):
+            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS)
+        if graph_walk == "prefill_vision":
+            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_VISION_BATCH_TOKENS)
+        if graph_walk == THINKER_MIXED:
+            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
+        return NO_CHUNKING
+
+    def split_inputs(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: ARNodeInputs, start: int, end: int,
+    ) -> ARNodeInputs:
+        tensor_inputs = inputs.tensor_inputs
+        unknown = tensor_inputs.keys() - {"masks_for_talker", "deepstack", "mrope_pos_advance"}
+        if unknown:
+            raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
+        cut = super().split_inputs(
+            graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end,
+        )
+        cut.tensor_inputs = {}
+        if (masks := tensor_inputs.get("masks_for_talker")) is not None:
+            cut.tensor_inputs["masks_for_talker"] = masks[:, start:end]  # (2, seq)
+        if (deepstack := tensor_inputs.get("deepstack")) is not None:
+            cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in deepstack]  # (seq, hidden)
+        if "mrope_pos_advance" in tensor_inputs:
+            # the whole span's; declare_step applies it on the final chunk
+            cut.tensor_inputs["mrope_pos_advance"] = tensor_inputs["mrope_pos_advance"]
+        return cut
+
     def declare_step(
         self, graph_walk: str,
         request_ids: list[str],
@@ -592,8 +638,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if "prefill_vision" in row_walks:
             # A vision row's 3D-grid MRoPE span is larger than its token count,
             # so it advances the counter by its own; other rows by their span.
+            # A chunk's positions were cut from the whole span's, so only a
+            # vision row's final chunk advances the counter.
             pos_advance = tuple(
-                int(inp.tensor_inputs.get("mrope_pos_advance", 0))
+                (int(inp.tensor_inputs.get("mrope_pos_advance", 0)) if inp.is_final_chunk else 0)
                 if walk == "prefill_vision" else inp.input_seq_len
                 for inp, walk in zip(inputs, row_walks, strict=True)
             )
@@ -610,11 +658,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
             steps={
                 THINKER_KV: KVStep(),
                 THINKER_ATTN: AttentionStep(causal=True),
-                THINKER_SAMPLER: SamplerStep(
+                THINKER_SAMPLER: keep_final_chunk_samples(SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
                     kept_rids=kept_rids,
-                ),
+                ), request_ids, inputs),
                 THINKER_POS: PositionStep(
                     advance=pos_advance
                 )
@@ -1054,8 +1102,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs
     ):
-        return_token = request_info.graph_walk == "thinker_decode" or \
+        inputs = kwargs.get("inputs")
+        return_token = request_info.graph_walk == "thinker_decode" or (
             request_info.step_metadata.get("is_last_prefill", False)
+            and (inputs is None or inputs.is_final_chunk)
+        )
         if not return_token:
             outputs.pop("new_token", None)
 

@@ -47,6 +47,7 @@ from mstar.engine.resources.sampler.config import (
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
+    keep_final_chunk_samples,
 )
 from mstar.engine.resources.spec import (
     NodeResourceSpec,
@@ -114,6 +115,7 @@ __all__ = [
     "StepRunner",
     "SubmoduleStep",
     "apply_yaml_overrides",
+    "keep_final_chunk_samples",
     "resolve_spec_dependencies",
     "topo_sort",
 ]
