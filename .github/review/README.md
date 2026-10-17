@@ -1,16 +1,23 @@
 # Automated PR review
 
-An advisory LLM reviewer runs on contributors' non-draft PRs. It posts each finding as an inline comment, tagged P0-P3, plus one summary comment that covers the PR description and any open questions, and it updates that summary on each run. It is not a merge gate and does not submit GitHub reviews.
+An advisory LLM reviewer runs on contributors' non-draft PRs, including PRs from forks. It posts each finding as an inline comment, tagged P0-P3, plus one summary comment that covers the PR description and any open questions, and it updates that summary on each run. It is not a merge gate and does not submit GitHub reviews.
 
-"Contributor" means GitHub's author association `OWNER`, `MEMBER`, `COLLABORATOR` or `CONTRIBUTOR`: the team, plus anyone who has had a PR merged here. First-time contributors get no automatic review; a contributor can comment `/review` on their PR to run one.
+"Contributor" means the PR author's GitHub author association is `OWNER`, `MEMBER`, `COLLABORATOR` or `CONTRIBUTOR`: the team, plus anyone who has had a PR merged here. Their PRs are reviewed automatically, and they can comment `/review` on their own PR. Any other request (`/review` on someone else's PR, `/review thorough`, or the label) takes write access to this repo, which the workflow checks against the user's actual permission. Someone with write access can `/review` any PR, including a first-timer's.
 
 | Trigger | Mode |
 | --- | --- |
-| A contributor opens, reopens or marks ready a non-draft PR | `light` (P0-P2), once |
-| A contributor comments exactly `/review` on a PR | `light`, e.g. to re-review after pushes |
-| A contributor comments exactly `/review thorough`, or someone with triage access applies the `ai-review-thorough` label | `thorough` (also P3 improvements and design questions) |
+| A contributor's non-draft PR is opened, reopened or marked ready | `light` (P0-P2, effort `high`), once |
+| Someone with write access comments exactly `/review` on a PR | `light`, e.g. to re-review after pushes |
+| A contributor comments exactly `/review` on their own PR, without the `skip-ai-review` label | `light` |
+| Someone with write access comments exactly `/review thorough`, or applies the `ai-review-thorough` label | `thorough` (also P3 improvements and design questions; effort `xhigh`) |
 
-Pushes don't trigger a review on their own. The `skip-ai-review` label turns off the automatic run; an explicit `/review` still runs.
+Pushes don't trigger a review on their own. The `skip-ai-review` label turns off the automatic run and the author's own `/review`; a `/review` from someone with write access still runs.
+
+The action refuses actors without write access, which is most contributors on a fork. For those runs alone the workflow passes the PR author's login, and nobody else's, as the action's `allowed_non_write_users`.
+
+A stacked PR (one whose base is another feature branch) gets the automatic review only if its base branch has a current copy of the workflow, because `pull_request_target` runs the base branch's workflow file. Comment `/review` on stacked PRs; that always runs `main`'s. Either way the rules are read from `main`.
+
+The bot reacts 👀 to a `/review` comment when it picks it up. A review that doesn't complete (an API error, running out of turns, a fork that no longer exists) leaves a PR comment linking the log, never a red check; a later failure updates that comment rather than adding another. A request the workflow declines (no write access and not the author, or no API key) exits green without commenting.
 
 | File | Role |
 | --- | --- |
@@ -63,8 +70,8 @@ Even then, prefer keeping it advisory: a non-deterministic check shouldn't have 
 
 ## Cost control
 
-Current levers, roughly in order of effect: only contributors' PRs are reviewed automatically, once per PR rather than per push (re-reviews are on request with `/review`); draft PRs are skipped; `concurrency` cancels a run superseded by a newer one on the same PR; in light mode, diffs over about 4,000 lines are triaged rather than covered in full; `--max-turns 40` caps a runaway session. The model is pinned to Opus in the workflow; drop to Sonnet if cost matters more than recall and replay shows it catching the same defects.
+Current levers, roughly in order of effect: only contributors' PRs are reviewed automatically, once per PR rather than per push; re-reviews are on request with `/review`, which takes write access or authorship of the PR (light mode only for authors, and `skip-ai-review` stops them); draft PRs are skipped; `concurrency` cancels a run superseded by a newer one on the same PR; in light mode, diffs over about 4,000 lines are triaged rather than covered in full; `--max-turns 40` caps a runaway session. The model is pinned to Opus in the workflow, at effort `high` for light reviews and `xhigh` for thorough ones (Claude Code's default without `--effort` is medium); lowering light to `medium` is the next cost lever. Drop to Sonnet if cost matters more than recall and replay shows it catching the same defects.
 
 ## Threat model
 
-`pull_request_target` and `issue_comment` run with secrets on PRs from forks, so the PR's contents and comments are untrusted input. A comment only selects the mode, by exact match in the job's `if`; its text never reaches a shell or the prompt. The workflow never executes PR code, checks the PR out only into `pr-head/`, reads its rules from the base tree, disables mutation and network tools, and holds write permission on pull requests alone. The residual risk is prompt injection producing a misleading comment — annoying, not dangerous. Preserve all four properties listed in the workflow header when editing it.
+`pull_request_target` and `issue_comment` run with secrets on PRs from forks, so the PR's contents and comments are untrusted input. A comment only selects the mode, by exact match in the job's `if`; its text never reaches a shell or the prompt. The workflow never executes PR code, checks the PR out only into `pr-head/`, reads its rules from the base tree, gives the model no shell and no mutation or network tools, redacts credential-shaped strings from everything it posts, and holds write permission on pull requests alone. The residual risk is prompt injection producing a misleading comment: annoying, not dangerous. A contributor's run on their own PR reads exactly the content a maintainer's `/review` of that PR would, with the same tools and token, so it adds cost exposure (bounded by the rules above and one run at a time per PR), not new capability. Preserve the rules listed in the workflow header when editing it.
