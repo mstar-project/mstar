@@ -317,9 +317,6 @@ pub struct GraphRuntime {
     /// signals, token counts and emitted signal names -- they accumulate
     /// across sends and flush onto the next completion, so a persist signal
     /// cannot race the message announcing it.
-    ///
-    /// `output_loop_indices` is NOT drained: the conductor keeps it for the
-    /// life of the request, and Python re-sends it on every WGD.
     fn worker_graphs_done_frame(
         &mut self,
         rid: u32,
@@ -342,13 +339,10 @@ pub struct GraphRuntime {
                 .and_then(|p| self.info(rid).map(|i| i.stream_done(p)))
                 .unwrap_or(false);
 
-        let (persist, new_tokens, output_signals, loop_indices) =
+        let (persist, new_tokens, output_signals) =
             match self.requests[rid as usize].as_mut() {
-                Some(info) => {
-                    let (p, n, o) = info.pending.take_for_send();
-                    (p, n, o, info.pending.output_loop_indices.clone())
-                }
-                None => (vec![], vec![], vec![], vec![]),
+                Some(info) => info.pending.take_for_send(),
+                None => (vec![], vec![], vec![]),
             };
         let persist_signals: Vec<(Sym, Vec<crate::tensors::TensorPointerInfo>)> =
             persist.into_iter().map(|(sig, uuids)| (sig, self.infos(&uuids))).collect();
@@ -363,7 +357,6 @@ pub struct GraphRuntime {
             partition_name,
             partition_done,
             stream_tokens_consumed,
-            output_loop_indices: loop_indices,
             resource_publish_info: frames::spliced_value(publication_encoded),
             profiling: frames::split_profiling(profiling_encoded),
         };
@@ -3152,9 +3145,6 @@ impl GraphRuntime {
                 let loop_indices = nested.get(&rid).cloned();
                 if let Some(info) = self.requests[rid as usize].as_mut() {
                     info.pending.output_signals.push(sig);
-                    if let Some(idx) = loop_indices.clone() {
-                        info.pending.set_loop_indices(sig, idx);
-                    }
                 }
                 let bytes = {
                     let bk = self.bookkeeping.lock().unwrap();
@@ -3172,8 +3162,8 @@ impl GraphRuntime {
 
             // Inline emits: one RESULT_TOKENS frame per (signal, modality)
             // per step, with the same per-request bookkeeping as a tensor
-            // emit so the completion report names the signal and its loop
-            // context. Usually one group.
+            // emit so the completion report counts the chunk. Usually one
+            // group.
             if !plan.emit_inline.is_empty() {
                 let mut groups: Vec<((String, String), Vec<(u32, i64)>)> = Vec::new();
                 for (rid, signal, modality, value) in plan.emit_inline {
@@ -3193,9 +3183,6 @@ impl GraphRuntime {
                         let idx = nested.get(&rid).cloned();
                         if let Some(info) = self.requests[rid as usize].as_mut() {
                             info.pending.output_signals.push(sig);
-                            if let Some(i) = idx.clone() {
-                                info.pending.set_loop_indices(sig, i);
-                            }
                         }
                         request_ids.push(request_id);
                         values.push(value);

@@ -115,7 +115,6 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     }
 
 
-NameToLoopIndices = dict[str, NestedLoopIndices]
 
 
 class PreprocessWorker:
@@ -143,7 +142,8 @@ class PreprocessWorker:
         self.wakeup = EventWakeup()
 
         self.per_request_reading_tensors = {}
-        self.output_loop_idxs: dict[str, NameToLoopIndices] = {}
+        # request id -> output name -> chunks received, for received_final_chunks
+        self.received_chunk_counts: dict[str, dict[str, int]] = {}
 
         # Build the communicator + tensor manager here (main thread) and hand
         # them to the worker thread, rather than constructing them inside it.
@@ -196,7 +196,7 @@ class PreprocessWorker:
             wakeup.signal()
 
     def new_request(self, input: PreprocessInput):
-        self.output_loop_idxs[input.request_id] = {}
+        self.received_chunk_counts[input.request_id] = {}
         self.per_request_reading_tensors[input.request_id] = 0
         self.request_input_queue.put(input)
         self._signal()
@@ -209,7 +209,7 @@ class PreprocessWorker:
         # out from under it. Drop only the main-thread bookkeeping here.
         self.abort_request_queue.put(request_id)
         self._signal()
-        self.output_loop_idxs.pop(request_id, None)
+        self.received_chunk_counts.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
     def finished_reading(self, request_id: str, drained: bool = True):
@@ -221,21 +221,20 @@ class PreprocessWorker:
         for any in-flight read."""
         self.reads_done_queue.put((request_id, drained))
         self._signal()
-        self.output_loop_idxs.pop(request_id, None)
+        self.received_chunk_counts.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
     def new_result_tensors(self, input: ResultTensors):
         name = input.graph_edge.name
-        if input.request_id not in self.output_loop_idxs:
+        if input.request_id not in self.received_chunk_counts:
             # Request was removed while this output was still in flight; ack the
             # tensors so the producing worker can reclaim them rather than leak.
             logger.debug("Late result_tensors for cleaned-up request %s, acking and dropping", input.request_id)
             self.discard_result_tensors(input)
             return
 
-        self.output_loop_idxs[input.request_id][name] = input.loop_indices.max(
-            self.output_loop_idxs[input.request_id].get(name, None)
-        )
+        counts = self.received_chunk_counts[input.request_id]
+        counts[name] = counts.get(name, 0) + 1
 
         self.per_request_reading_tensors[input.request_id] += len(input.graph_edge.tensor_info)
         logger.debug(
@@ -254,13 +253,11 @@ class PreprocessWorker:
         transport read and nothing to ack. ``wake=False`` queues without
         ending the thread's idle wait: a frame's caller hands over every
         request's value first and calls ``wake`` once."""
-        if request_id not in self.output_loop_idxs:
+        if request_id not in self.received_chunk_counts:
             logger.debug("Late token for cleaned-up request %s dropped", request_id)
             return
-        if loop_indices is not None:
-            self.output_loop_idxs[request_id][signal] = loop_indices.max(
-                self.output_loop_idxs[request_id].get(signal, None)
-            )
+        counts = self.received_chunk_counts[request_id]
+        counts[signal] = counts.get(signal, 0) + 1
         self.per_request_reading_tensors[request_id] += 1
         self.result_tensor_input_queue.put(
             InlineToken(request_id, value, loop_indices, modality)
@@ -286,18 +283,18 @@ class PreprocessWorker:
 
     def received_final_chunks(
         self, request_id: str,
-        final_outputs: dict[str, NestedLoopIndices],
+        output_chunk_counts: dict[str, int],
     ):
         # Every serving walk reports at least one client-facing output, so an
         # empty dict means the walk emitted nothing (or completion raced ahead
         # of every result). Report not-done and let the TTL backstop close the
         # request rather than completing it instantly with zero chunks.
-        if not final_outputs:
+        if not output_chunk_counts:
             return False
+        received = self.received_chunk_counts.get(request_id, {})
         return all(
-            not loop_iters.label_context_gt( # recv'd loop iters is not less than the final_fwd
-                self.output_loop_idxs[request_id].get(name, None)
-            ) for name, loop_iters in final_outputs.items()
+            received.get(name, 0) >= count
+            for name, count in output_chunk_counts.items()
         )
 
     def get_result_chunks(self)-> list[ResultChunk]:
@@ -350,7 +347,7 @@ class PreprocessWorker:
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
         self._signal()
-        self.output_loop_idxs.pop(request_id, None)
+        self.received_chunk_counts.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
     def shutdown(self):

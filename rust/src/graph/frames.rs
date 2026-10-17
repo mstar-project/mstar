@@ -239,7 +239,6 @@ pub struct WorkerGraphsDone<'a> {
     pub partition_name: &'a str,
     pub partition_done: bool,
     pub stream_tokens_consumed: &'a [(String, i64)],
-    pub output_loop_indices: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
     /// `dict[str, PublishedInfo]` -- abstract, so it stays Python's. Read
     /// encoded by Python and forwarded without interpreting resource types.
     pub resource_publish_info: Option<Value>,
@@ -275,14 +274,6 @@ impl WorkerGraphsDone<'_> {
             str_counts(
                 m.key("stream_tokens_consumed"), self.stream_tokens_consumed,
             );
-            w_map(
-                m.key("output_loop_indices"),
-                self.output_loop_indices.len() as u32,
-            );
-            for (sig, (order, idxs, fwd)) in &self.output_loop_indices {
-                w_str(m.buf(), it.name(*sig));
-                nested_loop_indices(m.buf(), it, order, idxs, *fwd);
-            }
             // Omitted when absent, so the decoder's default stands.
             if let Some(v) = &self.resource_publish_info {
                 w_value(m.key("resource_publish_info"), v);

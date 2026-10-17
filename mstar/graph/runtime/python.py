@@ -105,10 +105,8 @@ class GraphRuntimeRequestInfo:
     # so a persist signal cannot race the message that announces it.
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
     pending_new_token_counts: dict[str, int] = field(default_factory=dict)
+    # one name per chunk emitted to the client; the conductor counts them
     current_output_chunks: list[str] = field(default_factory=list)
-    output_loop_indices: dict[str, NestedLoopIndices] = field(
-        default_factory=dict
-    )
 
 
 class PythonGraphRuntime(GraphRuntime):
@@ -1463,7 +1461,6 @@ class PythonGraphRuntime(GraphRuntime):
                     edge.name for edge in routing.emit_to_client
                 )
                 for edge in routing.emit_to_client:
-                    info.output_loop_indices[edge.name] = nested_idxs.get(rid)
                     self._communicator.send("api_server", APIServerMessage(
                         message_type="result_tensors",
                         body=ResultTensors(
@@ -1572,7 +1569,6 @@ class PythonGraphRuntime(GraphRuntime):
                 partition_name=partition,
                 partition_done=partition_done,
                 stream_tokens_consumed=stream_tokens_consumed,
-                output_loop_indices=info.output_loop_indices,
                 graph_timings=graph_timings,
                 rx_info=rx_info,
                 tx_info=tx_info,

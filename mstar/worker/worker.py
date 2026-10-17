@@ -3100,7 +3100,7 @@ class Worker:
             range_push("worker.send_outputs", synchronize=False)
 
         # The consuming pass (not the earlier ingest) reports the partition
-        # done, so it rides this pass's WGD with the final output loop index.
+        # done, so it rides the WGD that also counts this pass's last chunks.
         for rid in batch_N.node_batch.stream_partition_done_rids:
             self._graph_runtime.mark_stream_partition_done(rid, batch_N.partition)
 

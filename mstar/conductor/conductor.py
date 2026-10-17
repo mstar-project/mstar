@@ -28,7 +28,6 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
-from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
@@ -233,8 +232,9 @@ class RequestData:
     # Per-streaming-connection state (keyed by "from_partition->to_partition")
     streaming_connections: dict[str, StreamingConnectionState] = field(default_factory=dict)
 
-    # for api server recv bookeeping
-    final_outputs: dict[str, NestedLoopIndices] = field(default_factory=dict)
+    # output name -> chunks the workers emitted to the client; the API server
+    # holds the request open until it has received this many of each
+    output_chunk_counts: dict[str, int] = field(default_factory=dict)
 
     # Conductor-side profiling timestamps, in ``time.perf_counter()`` seconds.
     # Comparable with the api-server stamps because perf_counter is
@@ -1340,7 +1340,7 @@ class Conductor:
                 message_type="request_complete",
                 body=RequestComplete(
                     request_id=request_id,
-                    final_outputs=request_data.final_outputs,
+                    output_chunk_counts=request_data.output_chunk_counts,
                     conductor_ingest_time=request_data.conductor_ingest_time,
                     conductor_finish_time=request_data.conductor_finish_time,
                     graph_timings=request_data.graph_timings,
@@ -1400,8 +1400,13 @@ class Conductor:
             for tx in body.tx_info:
                 request_data.tx_info[(tx.source_entity, tx.edge_name)] = tx
 
+        # From every rank: a rank reports only the chunks it sent itself, and
+        # each of those reaches the API server as its own message.
+        counts = request_data.output_chunk_counts
+        for name in body.output_signal_names:
+            counts[name] = counts.get(name, 0) + 1
+
         pstate = request_data.partition_states.get(partition_name)
-        request_data.final_outputs.update(body.output_loop_indices)
         if pstate is None:
             logger.warning(
                 "WorkerGraphsDone for unknown partition %s (request %s)",
@@ -1438,10 +1443,6 @@ class Conductor:
                         continue  # skip producer connections
                     consumed = body.stream_tokens_consumed.get(conn.edge_name, 0)
                     conn.consumed_count = max(conn.consumed_count, consumed)
-
-            request_data.final_outputs.update(body.output_loop_indices)
-
-            pstate.curr_forward_outputs += body.output_signal_names
 
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:

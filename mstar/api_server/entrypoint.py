@@ -181,7 +181,7 @@ class PendingRequest:
     profile: RequestProfile
     event: threading.Event = field(default_factory=threading.Event)
     chunks: list[ResultChunk] = field(default_factory=list)
-    final_outputs: dict = field(default_factory=dict)
+    output_chunk_counts: dict[str, int] = field(default_factory=dict)
     consumed_chunks: int = 0
     error: Any | None = None
     error_status: int = 500
@@ -511,7 +511,7 @@ class APIServer:
                 req is not None
                 and not self.preprocess_worker.has_pending_tensors(rid)
                 and self.preprocess_worker.received_final_chunks(
-                    rid, req.final_outputs
+                    rid, req.output_chunk_counts
                 )
             )
             if drained or req is None:
@@ -641,14 +641,14 @@ class APIServer:
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
 
-                                if not message.body.final_outputs:
+                                if not message.body.output_chunk_counts:
                                     logger.warning(
                                         "Request %s completed with no reported "
                                         "outputs; holding for late results "
                                         "until the cleanup TTL", rid,
                                     )
                                 req = self.pending_requests[rid]
-                                req.final_outputs = message.body.final_outputs
+                                req.output_chunk_counts = message.body.output_chunk_counts
                                 req.profile.timing.conductor_ingest_time = \
                                     message.body.conductor_ingest_time
                                 req.profile.timing.conductor_finish_time = \

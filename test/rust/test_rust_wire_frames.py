@@ -226,10 +226,9 @@ def test_an_emitted_signal_reaches_the_api_server(tmp_path):
             loop_indices=idx, metadata={},
         ),
     ))]
-    # The WGD reports what was emitted, and at which loop index.
+    # The WGD names one entry per emitted chunk, for the conductor to count.
     wgd = got["conductor"][0].body
     assert wgd.output_signal_names == ["out"]
-    assert wgd.output_loop_indices == {"out": idx}
 
 
 def test_a_remote_destination_gets_input_signals(tmp_path):
