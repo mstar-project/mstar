@@ -130,6 +130,7 @@ class LTX25Model(Model):
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 4,
         vae_tile_min_pixels: int = 1280 * 720,
+        vae_compile: bool = False,
         max_video_tokens: int = 64 * 1024,
         async_scheduling: bool = True,
         **kwargs,
@@ -157,6 +158,9 @@ class LTX25Model(Model):
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2])]
         self.max_batch_size = int(max_batch_size)
         self.vae_tile_min_pixels = int(vae_tile_min_pixels)
+        # compile the video VAE decode for the capture and refine shapes (warmed at load);
+        # ~55 dB from the eager decode, so off for bit-exact output
+        self.vae_compile = bool(vae_compile)
         # Largest latent grid (frames x rows x columns) a request may ask for; the DiT's
         # self-attention is quadratic in it, so an unbounded request could hold a worker
         # for minutes. 64k tokens is ~2x the 1080p, 121-frame grid.
@@ -531,6 +535,14 @@ class LTX25Model(Model):
             (REFINE_AV_WALK, shape(*s)) for s in self.capture_refine_shapes
         ]
 
+    def _decode_shapes(self) -> list[LTXShape]:
+        """The video shapes a request decodes at: the single-stage captures and the refine
+        walk's final size."""
+        return [
+            shape_from_metadata(self.config, {"height": h, "width": w, "num_frames": f, "fps": fps})
+            for h, w, f, fps in dict.fromkeys(self.capture_shapes + self.capture_refine_shapes)
+        ]
+
     def get_default_sharding_config(self) -> ShardingConfig:
         # The dit's linears and qk-norms shard by head (tensor parallelism), and its video
         # tokens by rank (Ulysses sequence parallelism); what crosses node edges stays
@@ -580,6 +592,7 @@ class LTX25Model(Model):
             vae = AutoencoderKLLTX2Video.from_pretrained(str(snapshot / "vae"), torch_dtype=torch.bfloat16)
             return LTXVideoDecoderSubmodule(
                 vae.to(device).eval(), self.config, tile_min_pixels=self.vae_tile_min_pixels,
+                compile_decode=self.vae_compile, warmup_shapes=self._decode_shapes(),
             )
         if node_name == UPSAMPLER_NODE:
             from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video

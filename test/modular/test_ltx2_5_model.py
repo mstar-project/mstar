@@ -469,3 +469,35 @@ def test_toy_dit_forward_shapes_and_row_independence():
     torch.testing.assert_close(video[1:], v1, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(audio[1:], a1, rtol=1e-5, atol=1e-5)
     assert torch.isfinite(video).all() and torch.isfinite(audio).all()
+
+
+def test_warmed_vae_decoder_compiles_only_warmed_shapes():
+    """vae_compile: the decoder runs compiled (on its channels_last copy) for the shapes
+    seen while warming, a tiled decode's tiles included, and eager for any other."""
+    from mstar.model.ltx2_5.submodules import _WarmedDecoder
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv3d(2, 3, 1)
+
+        def forward(self, z, temb=None, causal=None):
+            return self.conv(z)
+
+    gate = _WarmedDecoder(Decoder())
+    calls = []
+    gate._compiled = lambda z, temb, causal=None: calls.append(("compiled", tuple(z.shape))) or gate.channels_last(z)
+    eager_forward = gate.eager.forward
+    gate.eager.forward = lambda z, temb=None, causal=None: calls.append(("eager", tuple(z.shape))) or eager_forward(z)
+
+    warm, other = torch.randn(1, 2, 2, 4, 4), torch.randn(1, 2, 2, 4, 6)
+    gate(warm)                       # not yet warmed: eager
+    gate.warming = True
+    gate(warm)
+    gate.warming = False
+    out = gate(warm)
+    gate(other)
+    assert calls == [("eager", warm.shape), ("compiled", warm.shape), ("compiled", warm.shape), ("eager", other.shape)]
+    # the compiled path's copy holds the same weights, in channels_last_3d
+    assert gate.channels_last.conv.weight.is_contiguous(memory_format=torch.channels_last_3d)
+    torch.testing.assert_close(out, gate.eager.conv(warm))
