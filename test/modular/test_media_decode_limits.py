@@ -15,6 +15,7 @@ from mstar.model.media_limits import (
     check_image_size,
     probe_video,
     read_image,
+    read_video_whole_budgeted,
 )
 
 
@@ -279,6 +280,7 @@ def test_qwen3_omni_checks_sampled_frames_before_fetch_video(monkeypatch):
     vision = types.ModuleType("qwen_omni_utils.v2_5.vision_process")
     vision.fetch_video = lambda *a, **k: fetched.append(a)
     vision.smart_nframes = lambda ele, total_frames, video_fps: 64
+    vision.VIDEO_READER_BACKENDS = {"torchvision": fetched.append}
     for name in ("qwen_omni_utils", "qwen_omni_utils.v2_5"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     monkeypatch.setitem(sys.modules, "qwen_omni_utils.v2_5.vision_process", vision)
@@ -286,3 +288,24 @@ def test_qwen3_omni_checks_sampled_frames_before_fetch_video(monkeypatch):
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
         qwen3_omni_model.Qwen3OmniModel.load_video(None, "clip.mp4", "cpu")
     assert fetched == []
+    assert vision.VIDEO_READER_BACKENDS["torchvision"] is read_video_whole_budgeted
+
+
+def test_the_whole_clip_reader_counts_frames_as_it_decodes(tmp_path, monkeypatch):
+    """qwen-omni-utils' torchvision reader decodes the whole clip, not the
+    sampled frames the Qwen3-Omni loader checks; its replacement stops at the
+    budget whatever the header says."""
+    path = _mp4(tmp_path / "clip.mp4", frames=10)
+    vision = types.ModuleType("qwen_omni_utils.v2_5.vision_process")
+    vision.smart_nframes = lambda ele, total_frames, video_fps: 4
+    for name in ("qwen_omni_utils", "qwen_omni_utils.v2_5"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "qwen_omni_utils.v2_5.vision_process", vision)
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(64 * 64 * 4))
+    with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
+        read_video_whole_budgeted({"video": path})
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(64 * 64 * 20))
+    video, metadata, sample_fps = read_video_whole_budgeted({"video": f"file://{path}"})
+    assert video.shape == (4, 3, 64, 64) and video.dtype == torch.uint8
+    assert metadata["total_num_frames"] == 10 and metadata["frames_indices"].tolist() == [0, 3, 6, 9]
+    assert round(metadata["fps"]) == 30 and sample_fps == pytest.approx(4 / 10 * metadata["fps"])

@@ -56,7 +56,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
-from mstar.model.media_limits import VideoBudget, probe_video
+from mstar.model.media_limits import VideoBudget, probe_video, read_video_whole_budgeted
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -1015,9 +1015,11 @@ class Qwen3OmniModel(Model):
         self, filepath: str, device: str
     ) -> TensorAndMetadata:
         # TODO: support audio in video
-        from qwen_omni_utils.v2_5.vision_process import fetch_video, smart_nframes
+        from qwen_omni_utils.v2_5.vision_process import VIDEO_READER_BACKENDS, fetch_video, smart_nframes
 
-        # fetch_video decodes the frames it samples at full size before resizing them
+        # its torchvision reader decodes the whole clip with no bound
+        VIDEO_READER_BACKENDS["torchvision"] = read_video_whole_budgeted
+        # the other readers decode the frames fetch_video samples, at full size before resizing them
         probe = probe_video(filepath)
         if probe is not None:
             total, fps, height, width = probe
