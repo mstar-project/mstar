@@ -271,6 +271,22 @@ def test_a_spec_is_warmed_up_to_size_it_and_not_again_to_capture_it(measured, mo
     assert runner.forwards == [2, 2, 0, 0], "a spec sizing warmed up is captured without another forward"
 
 
+def test_a_sizing_step_that_fails_fails_the_boot(measured):
+    """Qwen3-Omni colocated on a crowded GPU ran out of memory in an eager
+    warm-up, and every CUDA call after it failed. Leaving the failed steps out
+    of the plan would bring the floor to 0."""
+    runner = _StubMeasuredRunner(torch.device("cuda", 0), {_DECODE: CaptureCost(_GIB, 2 * _GIB, 0, 2)})
+
+    def dead_context(spec, forwards):
+        raise RuntimeError("CUDA error: unknown error")
+
+    runner._warmed = dead_context
+    engine = SimpleNamespace(_device=torch.device("cuda", 0), _submodules={"Thinker": None}, _gpu_memory_fraction=None)
+
+    with pytest.raises(RuntimeError, match="slot=0 eagerly to size its capture, with 51200 MiB free before it: CUDA"):
+        Engine._plan_captures(engine, {"Thinker": runner}, {"Thinker": {}})
+
+
 def test_a_cpu_device_never_asks_the_driver(monkeypatch):
     """Asking the CUDA driver for memory fails an XPU or CPU worker at start. A
     CPU device skips the plan even on a host where CUDA exists."""
