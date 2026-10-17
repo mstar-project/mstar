@@ -18,5 +18,5 @@ node_groups:
     ranks: [0]
   - node_names: [text_encoder]
     ranks: [1]
-  - node_names: [vae_decoder, audio_decoder]
+  - node_names: [vae_decoder, audio_decoder, latent_upsampler]
     ranks: [1]
