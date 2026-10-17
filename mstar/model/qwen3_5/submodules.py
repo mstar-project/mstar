@@ -24,7 +24,7 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseCudaGraphConfig,
     PiecewisePackedConfig,
-    distribute_tokens,
+    decode_rows_then_prompt,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.attn.base import AttentionManager
@@ -190,12 +190,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=dummy,
                 capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
-                # decode rows and one prompt, the layout its GDN splits; a
-                # replay's padding rows (no tokens) stay empty
-                token_layout=lambda tokens, bs: (
-                    [1] * (bs - 1) + [tokens - (bs - 1)] if tokens >= bs
-                    else distribute_tokens(tokens, bs)
-                ),
+                # the layout its GDN splits; a replay's padding rows stay empty
+                token_layout=decode_rows_then_prompt,
             ),
             PackedCudaGraphConfig(
                 capture_graph_walk="prefill_vision",

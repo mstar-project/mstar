@@ -125,6 +125,15 @@ def distribute_tokens(total_tokens: int, bs: int) -> list[int]:
     return seq_lens
 
 
+def decode_rows_then_prompt(total_tokens: int, bs: int) -> list[int]:
+    """``bs - 1`` one-token rows and a prompt row of the rest: a mixed step's
+    layout, for kernels that split rows by span. `distribute_tokens` when
+    there are fewer tokens than rows."""
+    if total_tokens < bs:
+        return distribute_tokens(total_tokens, bs)
+    return [1] * (bs - 1) + [total_tokens - (bs - 1)]
+
+
 class PackedCudaGraphConfig(CudaGraphConfig):
     def __init__(
         self,
