@@ -13,9 +13,11 @@ checks each stage against recordings of it.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -36,7 +38,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
-from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
+from mstar.model.components.diffusion.compile_utils import compile_transformer_forward, with_inductor_rounding
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.components.distributed.sequence_parallel import sp_seq_split
@@ -463,6 +465,32 @@ class LTXLatentUpsamplerSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule)
 # decoders
 # ---------------------------------------------------------------------------
 
+class _WarmedDecoder(nn.Module):
+    """The video VAE's decoder compiled per static input shape, for the shapes seen while
+    ``warming`` (whole latents, or a tiled decode's tiles); any other shape runs eager
+    rather than compile inside a request.
+
+    The compiled decoder is a channels_last_3d copy of the weights (777 MB): compiled, that
+    layout decodes 544x960x121 in 240 ms against 286 in the checkpoint's, but eager it takes
+    702 ms against 371, so the eager fallback keeps the original."""
+
+    def __init__(self, decoder: nn.Module):
+        super().__init__()
+        self.eager = decoder
+        self.channels_last = copy.deepcopy(decoder).to(memory_format=torch.channels_last_3d)
+        self._compiled = with_inductor_rounding(torch.compile(self.channels_last, dynamic=False), eager_rounding=True)
+        self._warmed: set[tuple[int, ...]] = set()
+        self.warming = False
+
+    def forward(self, z: torch.Tensor, temb: torch.Tensor | None = None, causal: bool | None = None):
+        key = tuple(z.shape)
+        if self.warming:
+            self._warmed.add(key)
+        if key in self._warmed:
+            return self._compiled(z.contiguous(memory_format=torch.channels_last_3d), temb, causal=causal)
+        return self.eager(z, temb, causal=causal)
+
+
 class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
     """Packed fp32 video latents ``[Lv, 128]`` -> uint8 frames ``[3, F, H, W]``, through the
     convolutional VAE. The reference casts the final latents to bf16 before
@@ -472,7 +500,8 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
     output_keys = (VIDEO_OUTPUT,)
 
     def __init__(self, vae: nn.Module, config: LTX25Config, max_batch_size: int = 2,
-                 tile_min_pixels: int = 1280 * 720):
+                 tile_min_pixels: int = 1280 * 720, compile_decode: bool = False,
+                 warmup_shapes: Sequence[LTXShape] = ()):
         super().__init__()
         self.vae = vae
         self.config = config
@@ -481,6 +510,38 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
         # 1088x1920 stage-2 decode); smaller ones decode whole, as the single-stage
         # pipeline does. Tiling changes the output near tile seams.
         self.tile_min_pixels = int(tile_min_pixels)
+        # torch.compile (default mode: autotuning conv3d took over 10 minutes per shape) of the
+        # decoder takes the 544x960x121 decode from 371 to 240 ms on an H100 and the tiled
+        # 1088x1920 one from 1988 to 1315 ms, ~55 dB from eager (inductor's GroupNorm / SiLU),
+        # so it is a deployment knob and stays off for the bit-exact parity path. The decoder,
+        # not ``vae.decode``, is compiled: a tiled decode calls it once per tile, so four tile
+        # shapes cover 1088x1920 (dynamo would unroll the tile loop of ``vae.decode`` into one
+        # enormous graph).
+        if compile_decode:
+            # before the warm-up: dynamo guards on requires_grad (see KleinVaeDecoderSubmodule)
+            vae.requires_grad_(False)
+            vae.decoder = _WarmedDecoder(vae.decoder)
+            self.warmup(warmup_shapes)
+
+    def _tiled(self, shape: LTXShape) -> bool:
+        sc = self.config.geometry.spatial_compression
+        return shape.height * sc * shape.width * sc > self.tile_min_pixels
+
+    def warmup(self, shapes: Sequence[LTXShape]) -> None:
+        """Decode zeros at every batch size for every shape at load, so the compiles happen
+        before the first request."""
+        decoder = self.vae.decoder
+        decoder.warming = True
+        try:
+            for shape in shapes:
+                self.vae.use_tiling = self._tiled(shape)
+                for bs in range(1, self._max_batch_size + 1):
+                    x = torch.zeros(bs, self.config.geometry.latent_channels, shape.frames, shape.height,
+                                    shape.width, device=self.get_device(), dtype=self.vae.dtype)
+                    with torch.no_grad():
+                        self.vae.decode(x, None, return_dict=False)
+        finally:
+            decoder.warming = False
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         return NodeInputs(
@@ -498,8 +559,7 @@ class LTXVideoDecoderSubmodule(_ShapeBatchedBase, BatchedRows, NodeSubmodule):
         mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(x.device, dtype)
         std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(x.device, dtype)
         x = x * std / self.vae.config.scaling_factor + mean
-        sc = self.config.geometry.spatial_compression
-        self.vae.use_tiling = shape.height * sc * shape.width * sc > self.tile_min_pixels
+        self.vae.use_tiling = self._tiled(shape)
         video = self.vae.decode(x, None, return_dict=False)[0]
         frames = ((video / 2 + 0.5).clamp(0, 1).float() * 255).round().to(torch.uint8)
         return {VIDEO_OUTPUT: frames}

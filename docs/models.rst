@@ -1244,15 +1244,17 @@ Performance (2x H100, warm; diffusers with the same recipe and seeds):
 ======================================  ================  ================  ================
                                         diffusers         ``ltx2_5_tp2``    ``ltx2_5_sp2``
 ======================================  ================  ================  ================
-544x960x121, one request                7.87 s            4.09 s            3.57 s
-544x960x121, 4 concurrent               7.6 videos/min    18.7 videos/min   20.8 videos/min
-two-stage 1088x1920x121, one request    21.6 s            12.5 s            11.3 s
-two-stage, 2 concurrent                 2.8 videos/min    5.4 videos/min    6.1 videos/min
+544x960x121, one request                7.87 s            3.70 s            3.15 s
+544x960x121, 4 concurrent               7.6 videos/min    19.6 videos/min   22.3 videos/min
+two-stage 1088x1920x121, one request    21.6 s            11.0 s            11.3 s
+two-stage, 2 concurrent                 2.8 videos/min    5.9 videos/min    6.1 videos/min
 ======================================  ================  ================  ================
 
 The DiT is compiled and its denoise step captured per shape (``capture_shapes``,
 ``capture_refine_shapes``); other shapes run the compiled eager path, and the first
-request of a new shape pays its compile.
+request of a new shape pays its compile. ``vae_compile`` (on in these configs) compiles the
+video VAE's decoder for the same shapes at load (~55 dB from the eager decode; other shapes
+decode eager); the SP2 config captures no refine shape, so its two-stage decode stays eager.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------
