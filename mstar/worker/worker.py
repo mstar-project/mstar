@@ -1286,9 +1286,10 @@ class Worker:
     ) -> int | None:
         """Offload one request's state for ``node_name``, freeing room to retry.
 
-        Prefers a victim outside *batch_ids*; falls back to one inside it (the
-        caller then excludes it from execution). Returns the victim, or None
-        when nothing could be reclaimed.
+        Tries victims outside *batch_ids* first, then ones inside it (the
+        caller then excludes it from execution), each in LRU order, until one
+        frees something. Returns the victim, or None when nothing could be
+        reclaimed.
         """
         engine = self.engine_manager.get_engine(node_name)
         if not engine.evictable(node_name):
@@ -1319,39 +1320,50 @@ class Worker:
             )
             return None
 
-        # prefer evicting requests that aren't currently executing
+        # prefer evicting requests that aren't currently executing. A victim
+        # that frees nothing refuses for its own reasons (its streams don't fit
+        # what is left of the host pool, or a step is admitted against its
+        # pages) and nothing about it changes before the retry, so move on to
+        # the next one rather than re-pick it every time
         external = [rid for rid in candidates if rid not in batch_ids]
-        victim_id = self._select_eviction_victim(node_name, external or candidates)
-        freed = engine.offload_request(node_name, victim_id)
-        if freed <= 0:
-            # A victim was found and would not move. The usual cause is the host
-            # pool being full (see ``CPUPagePool.offload_stream``) — different
-            # from having no candidate, and fixed by a larger
-            # ``cpu_offload_pages`` rather than by scheduling less.
-            logger.warning(
-                "Eviction victim %s on %s freed nothing — the host pool is "
-                "most likely full. Raise cpu_offload_pages for the resource "
-                "that ran out.", victim_id, node_name,
-            )
-            return None
-        logger.info(
-            "Offloaded request %s from %s (%d reclaimed, policy=%s, in_batch=%s)",
-            victim_id, node_name, freed, self.eviction_policy.value,
-            victim_id in batch_ids,
+        internal = [rid for rid in candidates if rid in batch_ids]
+        order = (
+            self._eviction_order(node_name, external)
+            + self._eviction_order(node_name, internal)
         )
-        return victim_id
+        for victim_id in order:
+            freed = engine.offload_request(node_name, victim_id)
+            if freed > 0:
+                logger.info(
+                    "Offloaded request %s from %s (%d reclaimed, policy=%s, "
+                    "in_batch=%s)",
+                    victim_id, node_name, freed, self.eviction_policy.value,
+                    victim_id in batch_ids,
+                )
+                return victim_id
 
-    def _select_eviction_victim(
+        # Every candidate would not move. The usual cause is the host pool
+        # being full (see ``CPUPagePool.offload_stream``) — different from
+        # having no candidate, and fixed by a larger ``cpu_offload_pages``
+        # rather than by scheduling less.
+        logger.warning(
+            "None of the %d eviction candidates on %s freed anything — the "
+            "host pool is most likely full. Raise cpu_offload_pages for the "
+            "resource that ran out.", len(order), node_name,
+        )
+        return None
+
+    def _eviction_order(
         self, node_name: str, candidates: list[int]
-    ) -> int:
-        """Pick a victim from *candidates*.
+    ) -> list[int]:
+        """*candidates* in the order to try them as victims.
 
         LRU only today; ``EvictionPolicy`` has no other member yet. Oldest
         last_active first — a candidate the worker has never run sorts oldest,
         which is what we want once the caller has filtered out the ones
         holding nothing.
         """
-        return min(
+        return sorted(
             candidates,
             key=lambda rid: self._last_active.get((rid, node_name), 0.0),
         )

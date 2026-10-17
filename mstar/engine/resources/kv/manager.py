@@ -2162,6 +2162,15 @@ class KVManager(AttentionResource):
             # victims. the eviction retries once the step commits
             if any(stream.step_in_flight for stream in streams.values()):
                 return [], []
+            # refuse a request none of whose streams fits the host pool before
+            # claiming it: the claim waits on its in-flight reads, which would
+            # block the caller for a victim that frees nothing
+            sizes = [
+                len(stream.page_indices) for stream in streams.values()
+                if not stream.offloaded and stream.page_indices
+            ]
+            if sizes and min(sizes) > self._cpu_pool.num_free_pages:
+                return [], []
             for label, stream in streams.items():
                 if stream.offloaded or not stream.page_indices:
                     continue
