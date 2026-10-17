@@ -485,7 +485,9 @@ class LTX25Model(Model):
         import av
 
         fps = self.resolve_request(request_kwargs or {})["fps"]
-        frames = (output[0] if output.ndim == 5 else output).permute(1, 2, 3, 0).cpu().numpy()
+        # one contiguous [F, H, W, 3] copy: PyAV converting per-frame strided views of the
+        # [3, F, H, W] tensor took 190 ms of a 420 ms encode (121 frames at 544x960)
+        frames = (output[0] if output.ndim == 5 else output).permute(1, 2, 3, 0).contiguous().cpu().numpy()
         buffer = io.BytesIO()
         container = av.open(buffer, mode="w", format="mp4")
         # PyAV wants a rational rate: 24 -> 24, 23.976 -> 2997/125
@@ -493,8 +495,8 @@ class LTX25Model(Model):
         stream.height, stream.width = frames.shape[1], frames.shape[2]
         stream.pix_fmt = "yuv420p"
         # As Cosmos3 encodes: CRF 18 is less lossy than libx264's default 23, and the
-        # multithreaded ultrafast preset encodes 121 frames at 544x960 in 0.46 s where the
-        # default takes 1.2 s, all of it on the request's critical path.
+        # multithreaded ultrafast preset is several times faster than the default (121 frames
+        # at 544x960 in 0.23 s), all of it on the request's critical path.
         stream.options = {"crf": "18", "preset": "ultrafast", "threads": "0"}
         for frame in frames:
             for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
