@@ -49,7 +49,7 @@ class _FlashInferRaggedBase:
         self._preplan_states: dict[str, _RaggedPrefillBase] = {}
         self._preplanned = False
 
-        self._workspaces = WorkspacePool(device)
+        self._workspaces = WorkspacePool(device, config.workspace_mb)
 
         self._kwargs = dict(
             device=device,

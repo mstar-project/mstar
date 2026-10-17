@@ -87,3 +87,4 @@ test/modular/test_kv_plan_host_lens.py
 test/modular/test_sampler_trash_row.py
 test/modular/test_launch_script_socket_prefix.py
 test/modular/test_ltx2_5_model.py
+test/modular/test_ltx2_5_sequence_parallel.py
