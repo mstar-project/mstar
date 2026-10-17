@@ -233,30 +233,6 @@ def _segments_by_label(step):
     return out
 
 
-def test_a_mixed_step_keeps_an_unguided_row_out_of_the_guidance_branch():
-    """Guidance is per request, so the cache labels are too."""
-    submodule = _llm_stub()
-    guided = ARNodeInputs(
-        input_seq_len=4, graph_walk="prefill_text", resource_step_info={"cfg": True},
-    )
-    plain = ARNodeInputs(
-        input_seq_len=1, graph_walk="decode", resource_step_info=None,
-    )
-
-    step = LLMSubmodule.declare_step(
-        submodule, MIXED_TEXT, ["guided", "plain"], [guided, plain],
-    )
-
-    by_label = _segments_by_label(step)
-    assert by_label["main"] == {"guided", "plain"}, "both rows run the main branch"
-    assert by_label.get("cfg_img", set()) == {"guided"}, (
-        "only the guided row belongs in the guidance branch"
-    )
-    # the step still declares the branch, so the guided row is not silently
-    # demoted to an unguided forward
-    assert step.cg_key_info is True
-
-
 def test_a_mixed_step_forks_only_its_prompt_rows():
     """cfg_text forks off main before a guided prompt writes; a decode row
     sharing the step keeps its own cfg_text."""

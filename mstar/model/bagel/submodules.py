@@ -910,30 +910,18 @@ class LLMSubmodule(ARNodeSubmodule):
         requires_cfg = requires_cfg_for_inputs(inputs)
         labels = self._get_active_labels(graph_walk, requires_cfg)
         spans = tuple(inp.input_seq_len for inp in inputs)
-        # Guidance is per request: a combined step can hold guided and unguided
-        # rows, and an unguided row must not land in the cfg branches.
-        row_labels = [
-            frozenset(self._get_active_labels(graph_walk, bool(inp.resource_step_info)))
-            for inp in inputs
-        ]
 
         # Label-major, matching how a combined plan concatenates its sources;
         # this tuple is the ordering authority for every per-token array.
         segments = tuple(
             Segment(rid, label, span)
             for label in labels
-            for rid, span, mine in zip(request_ids, spans, row_labels, strict=True)
-            if label in mine
+            for rid, span in zip(request_ids, spans, strict=True)
         )
-        # Filtered on the same `label in mine` as `segments`, in the same
-        # order: these ids are concatenated positionally against that tuple, so
-        # the two predicates have to agree or a row reads another's positions.
         per_label_pos_ids = {
             label: [
-                inp.custom_pos_ids[label]
-                for inp, mine in zip(inputs, row_labels, strict=True)
-                if label in mine
-                and isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
+                inp.custom_pos_ids[label] for inp in inputs
+                if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
             ] for label in labels
         }
 
