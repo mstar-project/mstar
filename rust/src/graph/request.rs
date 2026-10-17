@@ -109,17 +109,46 @@ pub struct PendingOutputs {
     pub output_signals: Vec<Sym>,
     /// signal -> the loop context it was emitted at.
     pub output_loop_indices: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
+    /// stream edge -> destination worker -> items sent, local ones included.
+    /// The conductor forwards the totals with `producer_done`, so a consumer
+    /// whose done signal overtakes the last items waits for them.
+    pub stream_items: Vec<(Sym, Vec<(Sym, i64)>)>,
 }
+
+/// What one WORKER_GRAPHS_DONE drains: persist signals, token counts,
+/// emitted signal names and stream item counts.
+pub type TakenOutputs = (
+    Vec<(Sym, Vec<u64>)>,
+    Vec<(String, i64)>,
+    Vec<Sym>,
+    Vec<(Sym, Vec<(Sym, i64)>)>,
+);
 
 impl PendingOutputs {
     /// Everything but `output_loop_indices`, which the conductor keeps for the
     /// life of the request -- Python re-sends it on every WGD.
-    pub fn take_for_send(&mut self) -> (Vec<(Sym, Vec<u64>)>, Vec<(String, i64)>, Vec<Sym>) {
+    pub fn take_for_send(&mut self) -> TakenOutputs {
         (
             std::mem::take(&mut self.persist),
             std::mem::take(&mut self.new_tokens),
             std::mem::take(&mut self.output_signals),
+            std::mem::take(&mut self.stream_items),
         )
+    }
+
+    pub fn add_stream_items(&mut self, edge: Sym, worker: Sym, n: i64) {
+        let i = match self.stream_items.iter().position(|(e, _)| *e == edge) {
+            Some(i) => i,
+            None => {
+                self.stream_items.push((edge, Vec::new()));
+                self.stream_items.len() - 1
+            }
+        };
+        let per_worker = &mut self.stream_items[i].1;
+        match per_worker.iter_mut().find(|(w, _)| *w == worker) {
+            Some((_, v)) => *v += n,
+            None => per_worker.push((worker, n)),
+        }
     }
 
     /// Every uuid of a signal, in order and deduped, matching Python: a loop
@@ -294,6 +323,18 @@ mod tests {
         p.add_persist(2, vec![20]);
         p.add_persist(1, vec![11, 10]);
         assert_eq!(p.persist, vec![(1, vec![10, 11]), (2, vec![20])]);
+    }
+
+    #[test]
+    fn stream_items_add_up_per_edge_and_worker_and_drain() {
+        let mut p = PendingOutputs::default();
+        p.add_stream_items(1, 10, 2);
+        p.add_stream_items(1, 11, 1);
+        p.add_stream_items(1, 10, 3);
+        p.add_stream_items(2, 10, 1);
+        let (_, _, _, items) = p.take_for_send();
+        assert_eq!(items, vec![(1, vec![(10, 5), (11, 1)]), (2, vec![(10, 1)])]);
+        assert!(p.stream_items.is_empty());
     }
 
     #[test]

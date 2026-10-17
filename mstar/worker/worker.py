@@ -965,11 +965,14 @@ class Worker:
         # Handle producer_done signal: mark all StreamBuffers for this request as done
         if body.producer_done:
             if req_info:
-                for sbuf in req_info.stream_buffers.values():
-                    if sbuf.from_partition in body.producer_done:
-                        # If we have multiple consumer partitions colocated, we need to signal
-                        # the right one
-                        sbuf.signal_done()
+                for edge_name, sbuf in req_info.stream_buffers.items():
+                    # With several consumer partitions colocated, each gets its
+                    # own signal carrying only its own streams' counts.
+                    if (
+                        sbuf.from_partition in body.producer_done
+                        and self._stream_partition.get(edge_name) == body.partition_name
+                    ):
+                        sbuf.signal_done(body.producer_done_items.get(edge_name, 0))
 
         # Separate streaming edges — they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)

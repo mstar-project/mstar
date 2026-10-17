@@ -79,6 +79,10 @@ class StreamBuffer:
 
     _num_tensors_registered = 0
     _num_buffer_writes = 0
+    # Items the producer sent this worker in total, as the done signal reports
+    # it. The signal comes through the conductor and the items come straight
+    # from the producer, so the signal can arrive first.
+    _num_items_expected = 0
 
     def prime_context(self, context_items: int) -> None:
         """The first ``context_items`` items the producer sends are context only
@@ -105,12 +109,18 @@ class StreamBuffer:
             self._num_buffer_writes += 1
             del self._id_to_tensor[tensor_id]
 
-    def signal_done(self) -> None:
-        """Producer signals no more items will arrive."""
+    def signal_done(self, num_items: int = 0) -> None:
+        """Producer signals no more items will arrive after the ``num_items``
+        it sent in total."""
         self.producer_done = True
+        self._num_items_expected = num_items
 
     def _producer_done_and_all_read(self) -> bool:
-        return self.producer_done and self._num_buffer_writes >= self._num_tensors_registered
+        return (
+            self.producer_done
+            and self._num_tensors_registered >= self._num_items_expected
+            and self._num_buffer_writes >= self._num_tensors_registered
+        )
 
     def pop_waiting_edge(self) -> StreamingEdge | None:
         if len(self._waiting_graph_edges) > 0:

@@ -83,6 +83,9 @@ class InputSignals(MessageBody):
     # untyped on the wire, so an empty set a Rust sender writes came back a
     # list.
     producer_done: set[str] = field(default_factory=set)
+    # Stream edge -> items its producer sent this worker in total. The stream
+    # ends only once that many have arrived.
+    producer_done_items: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -233,6 +236,9 @@ class WorkerGraphsDone(MessageBody):
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)
     stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
+    # Stream edge -> destination worker -> items sent since the last report.
+    # Every rank reports its own.
+    stream_items_sent: dict[str, dict[str, int]] = field(default_factory=dict)
     output_loop_indices: dict[str, NestedLoopIndices] = field(default_factory=dict)
     graph_timings: GraphTimings = field(default_factory=dict)
     rx_info: list[RxInfo] = field(default_factory=list)
