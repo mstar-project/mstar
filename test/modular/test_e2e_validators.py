@@ -834,6 +834,17 @@ def test_every_server_gets_the_same_environment_flags():
     assert server_env(SimpleNamespace(offline=False, eager=False)) == {"PYTHONHASHSEED": "0"}
 
 
+def test_an_autotune_shared_memory_rejection_is_not_out_of_memory():
+    from run import ran_out_of_memory
+
+    autotune = ("E1017 04:57:20.964000 19461 torch/_inductor/select_algorithm.py:4888] [6/5_1] No valid triton "
+                "configs. OutOfMemoryError: out of resource: triton_mm Required: 262144 Hardware limit:232448 "
+                "Reducing block sizes or `num_stages` may help..")
+    assert not ran_out_of_memory(autotune + "\nINFO ready\n")
+    assert ran_out_of_memory(autotune + "\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB")
+    assert ran_out_of_memory("RuntimeError: CUBLAS_STATUS_ALLOC_FAILED when calling cublasCreate(handle)")
+
+
 def test_exit_code_fails_on_round_trip_errors_and_on_nothing_run():
     from run import exit_code
 

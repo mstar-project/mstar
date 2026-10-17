@@ -51,6 +51,13 @@ from validators import (  # noqa: E402
 
 REPO = HERE.parents[1]
 OOM_MARKERS = ("CUDA out of memory", "OutOfMemoryError", "CUBLAS_STATUS_ALLOC_FAILED")
+# Inductor's autotuner logs a candidate kernel that needs more shared memory than
+# the GPU has as "OutOfMemoryError: out of resource: ..." and skips it.
+AUTOTUNE_REJECT = "out of resource"
+
+
+def ran_out_of_memory(log: str) -> bool:
+    return any(m in line and AUTOTUNE_REJECT not in line for line in log.splitlines() for m in OOM_MARKERS)
 
 
 def git_info(path: Path) -> dict:
@@ -164,7 +171,7 @@ def run_model(spec: ModelSpec, cases: tuple[Case, ...], source: Path, config: Pa
         result["peak_vram_gb"] = round(sampler.peak, 1)
         _await_release(spec.name, sampler, result)
     text = log.read_text(errors="replace") if log.exists() else ""
-    if any(m in text for m in OOM_MARKERS):
+    if ran_out_of_memory(text):
         result["out_of_memory"] = True
     if spec.peak_vram_gb and sampler.peak > spec.peak_vram_gb * VRAM_HEADROOM:
         result["vram_warning"] = f"peak {sampler.peak:.1f} GB exceeds the recorded {spec.peak_vram_gb} GB"
