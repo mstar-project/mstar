@@ -118,7 +118,8 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - The union of the index-hosted dependencies from every model extra above.
        Convenient for a machine that serves multiple models; heavier and slower to
        install than a single family's extra. It excludes the separately installed
-       TAEHV and ``flash-attn`` packages; see below and `flash-attn (Qwen3-Omni)`_.
+       TAEHV, ``flash-attn`` and ``qwen-tts`` packages; see below,
+       `flash-attn (Qwen3-Omni)`_ and `qwen-tts (Qwen3-TTS)`_.
 
 Combine extras as needed (keep ``--torch-backend=auto`` on every install):
 
@@ -152,7 +153,8 @@ Or, in an existing Python 3.12 environment:
 
    If you're just getting started or have the disk/time to spare, ``.[all]`` installs all
    index-hosted model dependencies in one shot. Waypoint still needs the pinned TAEHV
-   command above, and Qwen3-Omni still needs ``flash-attn``:
+   command above, Qwen3-Omni still needs ``flash-attn``, and Qwen3-TTS still needs
+   ``qwen-tts`` (see `qwen-tts (Qwen3-TTS)`_):
 
    .. code-block:: bash
 
