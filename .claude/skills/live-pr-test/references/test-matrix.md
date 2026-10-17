@@ -33,6 +33,9 @@ PR vs `main`, back to back per model, two or more server restarts per arm (bench
 
 Use the Qwen3.5 0.8B row for anything that could add host work on the critical path (per-step Python, extra syncs, serialization, scheduler bookkeeping). It is the most host-bound model in the repo, so it shows CPU overhead first. Run `benchmark.worker_phases` on both arms when it moves, to say whether the change is in `event_sync` (GPU) or host phases.
 
+- **Run it for every PR that touches the worker, engine, resources or graph runtime, correctness fixes included.** A fix that adds bookkeeping to admit, plan, commit or the scheduling pass can cost host time that no functional check shows. The full row is c=1/8/32/64/128; 8/32/128 is enough when time is short, but c=32 and c=128 must be in it, since that is where host overhead appears.
+- **Skip it only for a change that is compute-neutral on the per-step path**: per-request bookkeeping in the API server or data worker (a counter per request, a queue drained once per submit), startup-only code, or error paths a normal request never reaches. Read the diff to decide, and say in one clause of the report why the row was skipped.
+
 Prefer Orpheus TP over Qwen3-Omni full TP when the question is TP itself and GPUs are scarce: it is two GPUs and quicker to start.
 
 Verify the exact config, client name and flags against the PR's checkout before running: configs move between branches (benchmarking skill: "A/B a branch against main"), and server and client model names differ.
@@ -48,7 +51,7 @@ Verify the exact config, client name and flags against the PR's checkout before 
 ## Concurrency
 
 - Text and speech output: 1, 8, 32 (`closed_loop`, at least 5× the concurrency in requests, warmup counted in waves).
-- Qwen3.5 0.8B CPU-overhead row: add 64 and 128.
+- Qwen3.5 0.8B CPU-overhead row: add 64 and 128 (at minimum 8 / 32 / 128).
 - Image and video: 1 (and 4 for BAGEL), unless the PR is about batching or concurrency for those modalities, in which case sweep what it claims.
 - `--ignore-eos` with fixed output lengths for text, except Qwen3-Omni (its talker misbehaves past EOS).
 
