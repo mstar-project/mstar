@@ -149,16 +149,37 @@ class _Runtime:
 
 
 class _Engine:
-    def __init__(self, signals):
+    def __init__(self, signals, walks=("decode",)):
         self._signals = signals
+        self._walks = walks
 
     def inline_client_signals(self, node_name, graph_walk):
-        return self._signals
+        # as the submodule: a walk it does not inline, and a combined label, get none
+        return self._signals if graph_walk in self._walks else {}
+
+
+class _Scheduled:
+    def __init__(self, walks):
+        self._walks = walks
+        # rid -> real walk on a mixed step only, as ScheduledBatch keeps it
+        self.request_walks = dict(walks) if len(set(walks.values())) > 1 else {}
+
+    def walk_of(self, rid):
+        return self._walks.get(rid, "decode")
+
+    def rids_by_walk(self):
+        out = {}
+        for rid, walk in self._walks.items():
+            out.setdefault(walk, []).append(rid)
+        return out or {"decode": []}
 
 
 class _Batch:
     node_name = "LLM"
-    graph_walk = "decode"
+
+    def __init__(self, walks=None, label="decode"):
+        self.graph_walk = label
+        self.batch = _Scheduled(walks or {})
 
 
 def _worker(runtime=_Runtime()):
@@ -190,3 +211,27 @@ def test_inline_values_fall_back_when_a_rid_has_no_row_or_nothing_applies():
     assert _worker(_NoInline())._inline_emit_values(
         eng, _Batch(), rows, [7, 8], ["text_inputs"],
     ) == none
+
+
+def test_a_mixed_step_inlines_its_decode_rows():
+    # labelled by the combined walk, which the submodule does not inline; its
+    # decode rows still go inline, and the prefill row carries its own token
+    rows = HostRows((7, 8, 9), {"new_token": torch.tensor([[70], [80], [90]])})
+    batch = _Batch({7: "decode", 8: "prefill_text", 9: "decode"}, label="mixed")
+    sig, vals = _worker()._inline_emit_values(
+        _Engine({"text_inputs": "new_token"}), batch, rows, [7, 8, 9], ["text_inputs"],
+    )
+    assert sig == "text_inputs" and vals == [70, 80, 90]
+
+
+def test_a_mixed_step_falls_back_when_a_decode_row_has_no_value():
+    rows = HostRows((7,), {"new_token": torch.tensor([[70]])})
+    batch = _Batch({7: "prefill_text", 9: "decode"}, label="mixed")
+    assert _worker()._inline_emit_values(
+        _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
+    ) == (None, [])
+    # a row of a walk that sends no inline value needs none
+    batch = _Batch({7: "decode", 9: "prefill_text"}, label="mixed")
+    assert _worker()._inline_emit_values(
+        _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
+    ) == ("text_inputs", [70, 0])

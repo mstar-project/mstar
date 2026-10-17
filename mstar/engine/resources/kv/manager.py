@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 
@@ -617,7 +618,9 @@ class KVManager(AttentionResource):
         ):
             return
         walks = self._keyed_walks.get(segment.label)
-        if walks is not None and ctx.graph_walk not in walks:
+        if walks is not None and (
+            ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
+        ) not in walks:
             # another walk wrote this span (an edit's image, say), which the keys do not describe
             stream.chain = None
             return
@@ -791,8 +794,8 @@ class KVManager(AttentionResource):
             stream.chain.extend(sampled[0].flatten().tolist(), self.config.page_size)
 
     def extend_prefix_chains_batch(
-        self, request_ids: list[str], node_name: str, graph_walk: str,
-        host_rows,
+        self, request_ids: list[str], node_name: str,
+        walk_of: Callable[[str], str] | str, host_rows,
     ) -> None:
         """``extend_prefix_chain`` for a step, from the stop check's row
         buffers (``HostRows``: row i of every buffer belongs to
@@ -803,12 +806,19 @@ class KVManager(AttentionResource):
         request with all its tokens since the last flush, so the per-row Python
         runs once per batch of steps instead of every step. A key can thus
         appear a few steps late and is indexed by a later commit, as the
-        single-request path allows. Removals and resets flush first."""
+        single-request path allows. Removals and resets flush first.
+
+        The walk is per row, so a step mixing walks keys each row under its
+        own: a step carries its rows' walks, in ``request_ids`` order. A step
+        of one walk passes that walk rather than a function."""
         if self._chain_lazy_steps <= 1:
-            self._extend_chains_eager(request_ids, node_name, graph_walk, host_rows)
+            self._extend_chains_eager(request_ids, node_name, walk_of, host_rows)
             return
         step = (
-            tuple(host_rows.request_ids), node_name, graph_walk, tuple(request_ids),
+            tuple(host_rows.request_ids), node_name,
+            (walk_of,) * len(request_ids) if isinstance(walk_of, str)
+            else tuple(walk_of(rid) for rid in request_ids),
+            tuple(request_ids),
             {
                 name: buf.reshape(buf.shape[0], -1).cpu().numpy().copy()
                 for name, buf in host_rows.buffers.items()
@@ -824,8 +834,8 @@ class KVManager(AttentionResource):
                 self.flush_chain_backlog()
 
     def _extend_chains_eager(
-        self, request_ids: list[str], node_name: str, graph_walk: str,
-        host_rows,
+        self, request_ids: list[str], node_name: str,
+        walk_of: Callable[[str], str] | str, host_rows,
     ) -> None:
         """The per-step extension (MSTAR_KV_CHAIN_LAZY_STEPS=1): one lock,
         one ``tolist`` per buffer instead of one per request. The round-2
@@ -835,8 +845,9 @@ class KVManager(AttentionResource):
         buffers = host_rows.buffers
         rows_of: dict[str, list] = {}
         page_size = self.config.page_size
-        key = (node_name, graph_walk)
         lookup = self._chain_lookup
+        # a step of one walk keys every row alike
+        step_key = (node_name, walk_of) if isinstance(walk_of, str) else None
         with self._lock:
             for rid in request_ids:
                 # the label and buffer name do not change over a request's
@@ -845,9 +856,11 @@ class KVManager(AttentionResource):
                 per_rid = lookup.get(rid)
                 if per_rid is None:
                     per_rid = lookup[rid] = {}
+                key = step_key or (node_name, walk_of(rid))
                 entry = per_rid.get(key)
                 if entry is None:
-                    label = self._keyed_label(rid, node_name, graph_walk)
+                    walk = key[1]
+                    label = self._keyed_label(rid, node_name, walk)
                     tensor = (
                         (self._overrides[rid].prefix_decode or {}).get(label)
                         if label is not None else None
@@ -915,9 +928,10 @@ class KVManager(AttentionResource):
         if not parts:
             return
         st0 = parts[0][0]
-        entry = self._chain_lookup.get(rid, {}).get((st0[1], st0[2]))
+        walk = st0[2][st0[3].index(rid)]  # the rid's own walk in that step
+        entry = self._chain_lookup.get(rid, {}).get((st0[1], walk))
         if entry is None:
-            label = self._keyed_label(rid, st0[1], st0[2])
+            label = self._keyed_label(rid, st0[1], walk)
             tensor = (
                 (self._overrides[rid].prefix_decode or {}).get(label)
                 if label is not None else None
@@ -943,13 +957,12 @@ class KVManager(AttentionResource):
     def _extend_chains_from(self, steps: list, drained: set[str] = frozenset()) -> None:
         """Under the lock: one extend per request with the tokens of
         ``steps`` (same rows and batch) in step order."""
-        rows, node_name, graph_walk, request_ids, _ = steps[0]
+        rows, node_name, walks, request_ids, _ = steps[0]
         row_of = {rid: i for i, rid in enumerate(rows)}
         page_size = self.config.page_size
-        key = (node_name, graph_walk)
         lookup = self._chain_lookup
         cols: dict[str, object] = {}
-        for rid in request_ids:
+        for rid, walk in zip(request_ids, walks, strict=True):
             if rid in drained:
                 continue
             # the label and buffer name do not change over a request's
@@ -958,9 +971,10 @@ class KVManager(AttentionResource):
             per_rid = lookup.get(rid)
             if per_rid is None:
                 per_rid = lookup[rid] = {}
+            key = (node_name, walk)
             entry = per_rid.get(key)
             if entry is None:
-                label = self._keyed_label(rid, node_name, graph_walk)
+                label = self._keyed_label(rid, node_name, walk)
                 tensor = (
                     (self._overrides[rid].prefix_decode or {}).get(label)
                     if label is not None else None
@@ -1200,9 +1214,7 @@ class KVManager(AttentionResource):
                 self._preplan_new_labels = []
                 self._preplan_marked = []
             for (from_label, to_label), extra in forks:
-                for rid in ctx.padded_request_ids:
-                    if ctx.is_padding_row(rid):
-                        continue
+                for rid in self._forking_rids(step, ctx):
                     # checked before the reservation, which is what creates it
                     if (
                         ctx.is_preplan
@@ -1736,9 +1748,7 @@ class KVManager(AttentionResource):
 
     def _maybe_apply_forks(self, step: KVStep, ctx: StepContext):
         for (from_label, to_label) in step.pre_forks:
-            for rid in ctx.padded_request_ids:
-                if ctx.is_padding_row(rid):
-                    continue
+            for rid in self._forking_rids(step, ctx):
                 self._apply_fork(rid, from_label, to_label)
 
     def _pending_fork_state(
@@ -1753,9 +1763,7 @@ class KVManager(AttentionResource):
         pending: dict[tuple[str, str], tuple[int, int]] = {}
         with self._lock:
             for (from_label, to_label) in step.pre_forks:
-                for rid in ctx.padded_request_ids:
-                    if ctx.is_padding_row(rid):
-                        continue
+                for rid in self._forking_rids(step, ctx):
                     labels = self._streams.get(rid, {})
                     src = labels.get(from_label)
                     dst = labels.get(to_label)
@@ -1847,7 +1855,16 @@ class KVManager(AttentionResource):
         """What identifies the step a pre-plan was staged for: its segments
         and the replay slot it was leased on."""
         lease = ctx.slot_lease
-        return tuple(step.segments), (lease.slot if lease is not None else None)
+        return tuple(step.segments), (lease.slot if lease is not None else None), step.fork_rids
+
+    @staticmethod
+    def _forking_rids(step: KVStep, ctx: StepContext):
+        """The step's real rows its forks apply to: all of them unless it names some."""
+        return [
+            rid for rid in ctx.padded_request_ids
+            if not ctx.is_padding_row(rid)
+            and (step.fork_rids is None or rid in step.fork_rids)
+        ]
 
     def clear_preplan(self, promoted: bool = False):
         if not promoted:
@@ -1946,9 +1963,7 @@ class KVManager(AttentionResource):
             # post-forks copy what this step just wrote, so they land after the
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
-                for rid in ctx.padded_request_ids:
-                    if ctx.is_padding_row(rid):
-                        continue
+                for rid in self._forking_rids(step, ctx):
                     self._apply_fork(rid, from_label, to_label)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()

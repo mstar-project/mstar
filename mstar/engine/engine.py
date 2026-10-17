@@ -301,6 +301,11 @@ class ExecutingBatch:
     # the inline emit and the speculation splice read the rows instead.
     rows_only: bool = False
 
+    # A mixed step's rows whose own walk keeps every output signal on the
+    # device: such a row loops back as it would in a step of its walk alone,
+    # while the step's other rows route tensors.
+    loopback_rids: frozenset = frozenset()
+
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
     outputs: BatchedModelOutput = field(default_factory=BatchedModelOutput)
@@ -497,6 +502,9 @@ class Engine:
                     dependencies={
                         key: specs_by_key[key] for key in spec.depends_on()
                     },
+                    max_rows_in_combined=self._max_rows_in_combined(
+                        spec.resource_key, relevant_nodes, submodules, model,
+                    ),
                 ),
             )
 
@@ -759,7 +767,6 @@ class Engine:
         submodule = mgmt.submodule
         node_inputs: list[NodeInputs] = []
         # hoisted out of the per-request loop: the same for every row
-        walk = batch.step_context.graph_walk
         prepare = submodule.prepare_inputs
         resources = mgmt.resources
         wrapped = batch.per_request_info_wrapped
@@ -767,11 +774,17 @@ class Engine:
         metadata = batch.per_request_input_metadata
         final_rids = batch.final_stream_rids
         # only a keyed walk probes the prefix cache (see _skip_cached_prefix);
-        # read leniently, as the probe itself was only reached per prepared row
-        keyed = getattr(self, "_keyed_walks", None)
-        probe_prefix = bool(keyed) and walk in keyed.get(batch.node_name, ())
+        # read leniently, as the probe itself was only reached per prepared row.
+        # Under a combined walk each row has its own walk, so a mixed step
+        # probes, prepares and stamps per row, and takes no uniform path.
+        walk = batch.step_context.graph_walk
+        mixed = bool(batch.step_context.request_walks)
+        walk_of = batch.step_context.walk_of
+        keyed_walks = (getattr(self, "_keyed_walks", None) or {}).get(
+            batch.node_name, (),
+        )
         loopback = self._loopback_rows(batch)
-        if not probe_prefix:
+        if not mixed and walk not in keyed_walks:
             uniform = submodule.uniform_row_inputs(
                 walk, has_loopback=loopback is not None and all(loopback),
             )
@@ -785,10 +798,14 @@ class Engine:
                     batch=batch, model_inputs=node_inputs
                 )
                 return
+        # a step of one walk probes (or not) for every row alike
+        step_probes = not mixed and walk in keyed_walks
         for i, rid in enumerate(batch.request_ids):
+            row_walk = walk_of(rid) if mixed else walk
+            probe_prefix = (row_walk in keyed_walks) if mixed else step_probes
             try:
                 req_inputs = prepare(
-                    graph_walk=walk,
+                    graph_walk=row_walk,
                     fwd_info=wrapped[rid],
                     inputs=tensors.get(rid, {}),
                     resources=resources,
@@ -799,12 +816,16 @@ class Engine:
                     input_metadata=metadata.get(rid, EMPTY_INPUT_METADATA),
                     has_loopback=loopback is not None and loopback[i],
                 )
-                if req_inputs is not None and probe_prefix:
-                    req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
+                if req_inputs is not None:
+                    if probe_prefix:
+                        req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
+                    if probe_prefix or mixed:
+                        # the submodule reads a mixed step's rows by their own walk
+                        req_inputs.graph_walk = row_walk
             except Exception as error:
                 logger.exception(
                     "prepare_inputs failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, batch.step_context.graph_walk,
+                    rid, batch.node_name, row_walk,
                 )
                 batch.register_failure(rid, error)
                 continue
@@ -825,8 +846,14 @@ class Engine:
         steps = self._loopback_steps
         if not steps:
             return None
-        key = (batch.node_name, batch.step_context.graph_walk)
         get = steps.get
+        ctx = batch.step_context
+        if ctx.request_walks:
+            # a mixed step: a row's token is on the device if its own walk's
+            # last step kept it there, whatever this step is labelled
+            node, walk_of = batch.node_name, ctx.walk_of
+            return [get(rid) == (node, walk_of(rid)) for rid in batch.request_ids]
+        key = (batch.node_name, ctx.graph_walk)
         return [get(rid) == key for rid in batch.request_ids]
 
     def _record_loopback(self, batch: ExecutingBatch) -> None:
@@ -835,6 +862,17 @@ class Engine:
             steps.update(dict.fromkeys(
                 batch.request_ids, (batch.node_name, batch.step_context.graph_walk),
             ))
+        elif batch.loopback_rids:
+            # a mixed step: a row looped back under its own walk, so the next
+            # step of that walk finds its token on the device
+            keep, node, walk_of = (
+                batch.loopback_rids, batch.node_name, batch.step_context.walk_of,
+            )
+            for rid in batch.request_ids:
+                if rid in keep:
+                    steps[rid] = (node, walk_of(rid))
+                else:
+                    steps.pop(rid, None)
         elif steps:
             for rid in batch.request_ids:
                 steps.pop(rid, None)
@@ -866,18 +904,23 @@ class Engine:
         keys = self._runner.prefix_chain_keys(batch.node_name)
         if not keys:
             return
-        walk = batch.step_context.graph_walk
+        # The batch call keys each row under its own walk, so a combined-walk
+        # step takes it too; only the absence of host rows falls through.
         if host_rows is not None:
+            ctx = batch.step_context
             self._runner.extend_prefix_chains_batch(
-                batch.request_ids, batch.node_name, walk, host_rows, outputs,
-                keys=keys,
+                batch.request_ids, batch.node_name,
+                # a step of one walk passes the walk: no call per row
+                ctx.walk_of if ctx.request_walks else ctx.graph_walk,
+                host_rows, outputs, keys=keys,
             )
             return
         for rid in batch.request_ids:
             per_rid = outputs.get(rid)
             if isinstance(per_rid, dict):
                 self._runner.extend_prefix_chains(
-                    rid, batch.node_name, walk, per_rid, keys=keys,
+                    rid, batch.node_name, batch.step_context.walk_of(rid), per_rid,
+                    keys=keys,
                 )
 
     def _skip_cached_prefix(
@@ -888,7 +931,7 @@ class Engine:
         Only the keyed walk is probed, and only when `split_inputs` can cut its
         inputs; a guided walk writes two labels from one input, so it is skipped.
         """
-        walk = batch.step_context.graph_walk
+        walk = batch.step_context.walk_of(rid)
         if walk not in self._keyed_walks.get(batch.node_name, ()):
             return inputs
         assert isinstance(inputs, ARNodeInputs) and inputs.custom_pos_ids is None, (
@@ -950,12 +993,14 @@ class Engine:
                 if not batch.running_batched and lease is None:
                     # the unbatched forward has per-request outputs: no rows to stay on
                     batch.rows_only = False
+                    batch.loopback_rids = frozenset()
                 if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
             if batch.admit_error is None:
                 self._record_loopback(batch)
+                batch.outputs.loopback_rids = batch.loopback_rids
             batch.outputs_ready.set()
             return batch.outputs
         except Exception:
@@ -1483,8 +1528,10 @@ class Engine:
         submodule = self._submodules[batch.node_name].submodule
         if host_rows is not None:
             try:
+                ctx = batch.step_context
                 batched = submodule.check_stop_batched(
                     batch.request_ids, batch.per_request_info_wrapped, host_rows,
+                    step_walk=None if ctx.request_walks else ctx.graph_walk,
                 )
             except Exception:
                 logger.debug(
@@ -1533,6 +1580,7 @@ class Engine:
                     rids,
                     node_name=batch.node_name,
                     graph_walk=batch.step_context.graph_walk,
+                    request_walks=batch.step_context.request_walks,
                 )
                 return batch.resource_publish_info
             # Returns rid -> {resource label -> published info}
@@ -1540,6 +1588,7 @@ class Engine:
                 rids,
                 node_name=batch.node_name,
                 graph_walk=batch.step_context.graph_walk,
+                request_walks=batch.step_context.request_walks,
             )
             for rid, info in batch.per_request_info.items():
                 if rid not in published:
@@ -1568,6 +1617,7 @@ class Engine:
             snaps, todo,
             node_name=batch.node_name,
             graph_walk=batch.step_context.graph_walk,
+            request_walks=batch.step_context.request_walks,
         )
         for rid in todo:
             per_key = published.get(rid) or {}
@@ -1586,6 +1636,7 @@ class Engine:
             request_ids,
             node_name=batch.node_name,
             graph_walk=batch.step_context.graph_walk,
+            request_walks=batch.step_context.request_walks,
         )
         for rid in request_ids:
             rid_published = published.get(rid, {})
@@ -1795,6 +1846,34 @@ class Engine:
             graph_walk, {request_id: request_info},
         )
 
+    @staticmethod
+    def _max_rows_in_combined(
+        resource_key: str,
+        nodes: set[str],
+        submodules: dict[str, NodeSubmodule],
+        model: "Model | None",
+    ) -> dict[str, int | None]:
+        """Each walk of ``nodes`` to its ``max_rows_in_combined``, one value a
+        walk across the nodes a resource serves."""
+        if model is None:
+            return {}
+        caps: dict[str, int | None] = {}
+        for walk, graph in model.get_graph_walk_graphs().items():
+            for node in sorted(nodes & set(graph.get_nodes())):
+                cap = submodules[node].max_rows_in_combined(walk)
+                if walk in caps and caps[walk] != cap:
+                    raise ValueError(
+                        f"resource {resource_key!r}: the nodes it serves cap "
+                        f"walk {walk!r} differently in a combined step "
+                        f"({caps[walk]} and {cap})"
+                    )
+                caps[walk] = cap
+        return caps
+
+    def get_max_rows_in_combined(self, node_name: str, graph_walk: str) -> int | None:
+        """Rows of ``graph_walk`` a step mixing it with another walk may hold."""
+        return self._submodules[node_name].submodule.max_rows_in_combined(graph_walk)
+
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """Most requests this node will take in one step, or None for no cap.
 
@@ -1881,6 +1960,7 @@ class Engine:
         )
         if lease is not None:
             batch.lease_slot(lease)
+            batch.step_context.force_prefill = cg_runner.is_packed(lease)
         return lease
 
     def can_pre_plan(self, node_name: str) -> bool:

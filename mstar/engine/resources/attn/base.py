@@ -96,6 +96,8 @@ class AttentionManager(AttentionResource):
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
+                splits=spec.config.splits,
+                max_rows_in_combined=info.max_rows_in_combined,
             )
 
         if backend == AttnBackend.FLEX:
