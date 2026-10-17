@@ -436,6 +436,13 @@ class PreprocessWorkerThread:
         # and those we've already ACKed READS_DONE for (avoid double-ACK).
         self._draining_rids: set[str] = set()
         self._reads_done_sent: set[str] = set()
+        # Requests under each rid that started here and are not removed yet
+        # (by REMOVE_REQUEST, or by failing before they reached the conductor).
+        # A release (finished_reading or an abort) for a rid with none must not
+        # enter the sets above: its request is gone and no REMOVE_REQUEST
+        # follows. A count, since a client can reuse a rid before the last
+        # request under it is removed.
+        self._live_requests: dict[str, int] = {}
 
         self.stop_event = stop_event
         self.device = device
@@ -497,6 +504,7 @@ class PreprocessWorkerThread:
     ):
         tensors: NameToTensorList = {}
         input_metadata = {}
+        self._live_requests[input.request_id] = self._live_requests.get(input.request_id, 0) + 1
         self.in_flight_requests.add(input.request_id)
 
         # First, load raw modality tensors from file_paths (images, audio, video)
@@ -925,6 +933,8 @@ class PreprocessWorkerThread:
         away — the happy path pays nothing. Otherwise delivery was abandoned
         (TTL, client gone) with reads possibly still running, so gate the ACK on
         them; ACKing there would let the conductor unlink under a read."""
+        if request_id not in self._live_requests:
+            return
         if drained:
             self._send_reads_done(request_id)
         else:
@@ -963,10 +973,41 @@ class PreprocessWorkerThread:
     def _hard_cleanup(self, request_id: str) -> None:
         """Phase-2 teardown: unconditionally drop all tensor state for the rid
         (unlink the input-signal SHM). Safe now that every reader has drained."""
-        self._draining_rids.discard(request_id)
-        self._reads_done_sent.discard(request_id)
+        self._removed(request_id)
         self.tensor_manager.force_cleanup_request(request_id)
         self._drop_request_state(request_id)
+
+    def _removed(self, request_id: str) -> None:
+        """A request under the rid is gone: no REMOVE_REQUEST comes for it again."""
+        self._draining_rids.discard(request_id)
+        self._reads_done_sent.discard(request_id)
+        live = self._live_requests.pop(request_id, 0) - 1
+        if live > 0:
+            self._live_requests[request_id] = live
+
+    def _process_releases(self) -> bool:
+        """Apply the API server's aborts and finished_reading calls."""
+        did_work = False
+        while not self.abort_request_queue.empty():
+            did_work = True
+            rid = self.abort_request_queue.get()
+            self.communicator.send(
+                "conductor",
+                ConductorMessage(
+                    message_type=ConductorMessageType.ABORT_REQUEST,
+                    body=AbortRequest(request_id=rid),
+                ),
+            )
+            # Begin draining our own reads immediately, overlapping with
+            # the conductor round-trip (it also sends a DrainRequest).
+            # None live: already removed, or still queued in in_queue,
+            # where the abort above makes the conductor drop it.
+            if rid in self._live_requests:
+                self._begin_drain(rid)
+        while not self.reads_done_queue.empty():
+            did_work = True
+            self._finish_reading(*self.reads_done_queue.get())
+        return did_work
 
     def _idle_wait(self):
         """How a pass that found nothing waits: on the communicator's poll,
@@ -1024,22 +1065,7 @@ class PreprocessWorkerThread:
                             f"{result.modality} output transfer",
                             count=len(result.graph_edge.tensor_info),
                         )
-                while not self.abort_request_queue.empty():
-                    did_work = True
-                    rid = self.abort_request_queue.get()
-                    self.communicator.send(
-                        "conductor",
-                        ConductorMessage(
-                            message_type=ConductorMessageType.ABORT_REQUEST,
-                            body=AbortRequest(request_id=rid),
-                        ),
-                    )
-                    # Begin draining our own reads immediately, overlapping with
-                    # the conductor round-trip (it also sends a DrainRequest).
-                    self._begin_drain(rid)
-                while not self.reads_done_queue.empty():
-                    did_work = True
-                    self._finish_reading(*self.reads_done_queue.get())
+                did_work = self._process_releases() or did_work
                 while not self.discard_tensor_queue.empty():
                     did_work = True
                     self._discard_result_tensor(self.discard_tensor_queue.get())
@@ -1054,6 +1080,9 @@ class PreprocessWorkerThread:
                 if not self.in_queue.empty():
                     did_work = True
                     pre_input = self.in_queue.get()
+                    # Releases queued before this request was submitted belong
+                    # to an earlier request under its id: apply them first.
+                    self._process_releases()
                     try:
                         self._process_input(pre_input)
                     except Exception as exc:  # noqa: BLE001 — any failure must reach the client
@@ -1069,6 +1098,7 @@ class PreprocessWorkerThread:
                         # readers to race: hard-drop the (possibly persisted)
                         # input signals directly.
                         self._cleanup_request_state(pre_input.request_id, force=True)
+                        self._removed(pre_input.request_id)
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
 
