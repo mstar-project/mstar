@@ -38,6 +38,7 @@ vision-language-action policies, and world models — through a **Python SDK**, 
 
    architecture
    models
+   asr
    api
    environment_variables
 

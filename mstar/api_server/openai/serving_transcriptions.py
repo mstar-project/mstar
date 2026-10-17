@@ -275,15 +275,19 @@ def _submit(api, adapter, req, window: Window, streaming: bool, inflight: set[st
     return request_id
 
 
-async def _collect(api, window: Window, inflight: set[str], raw_request=None) -> str:
-    """The window's raw text; collect_results releases the request on every
-    path but cancellation, which the caller's ``_release`` covers."""
+async def _collect(api, window: Window, inflight: set[str], raw_request=None) -> str | None:
+    """The window's raw text, or None once the client is gone (collect_results
+    aborted the window and returned nothing). collect_results releases the
+    request on every path but cancellation, which the caller's ``_release``
+    covers."""
     try:
         chunks = await api.collect_results(window.request_id, raw_request)
     except HTTPException:
         inflight.discard(window.request_id)
         raise
     inflight.discard(window.request_id)
+    if not chunks and raw_request is not None and await raw_request.is_disconnected():
+        return None
     return _text_of(chunks)
 
 
@@ -340,7 +344,10 @@ async def _sequential(api, adapter, req, planner: WindowPlanner, inflight: set[s
             if temperature != (req.temperature or 0.0):
                 attempt = attempt.model_copy(update={"temperature": temperature})
             _submit(api, adapter, attempt, window, streaming=False, inflight=inflight)
-            window.raw_text = await _collect(api, window, inflight, raw_request)
+            text = await _collect(api, window, inflight, raw_request)
+            if text is None:
+                return  # the client is gone, submit nothing more
+            window.raw_text = text
             parsed = adapter.parse_transcript(window.raw_text, attempt)
             window.temperature = temperature
             window.compression_ratio = compression_ratio(parsed.text)
@@ -523,7 +530,10 @@ async def _parallel(api, adapter, req, windows: list[Window], inflight: set[str]
         while submitted < min(len(windows), index + PARALLEL_INFLIGHT):
             _submit(api, adapter, req, windows[submitted], streaming=False, inflight=inflight)
             submitted += 1
-        window.raw_text = await _collect(api, window, inflight, raw_request)
+        text = await _collect(api, window, inflight, raw_request)
+        if text is None:
+            return  # the client is gone, submit nothing more
+        window.raw_text = text
         yield window
 
 
