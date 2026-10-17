@@ -234,15 +234,7 @@ def _segments_by_label(step):
 
 
 def test_a_mixed_step_keeps_an_unguided_row_out_of_the_guidance_branch():
-    """Guidance is a per-request property, so the cache labels are too.
-
-    `requires_cfg` is read with `any()` over the rows, which was right while a
-    step held one walk -- every row of it was guided or none was. Under the
-    combined walk an unguided decode row can share a step with a guided
-    prefill, and it used to be handed the guided row's cfg_img segments: with
-    T2T requests decoding beside seeded T2I, one of six images and one of six
-    greedy texts changed, where on main both were identical to the alone runs.
-    """
+    """Guidance is per request, so the cache labels are too."""
     submodule = _llm_stub()
     guided = ARNodeInputs(
         input_seq_len=4, graph_walk="prefill_text", resource_step_info={"cfg": True},
@@ -263,6 +255,26 @@ def test_a_mixed_step_keeps_an_unguided_row_out_of_the_guidance_branch():
     # the step still declares the branch, so the guided row is not silently
     # demoted to an unguided forward
     assert step.cg_key_info is True
+
+
+def test_a_mixed_step_forks_only_its_prompt_rows():
+    """cfg_text forks off main before a guided prompt writes; a decode row
+    sharing the step keeps its own cfg_text."""
+    submodule = _llm_stub()
+    guided = ARNodeInputs(
+        input_seq_len=4, graph_walk="prefill_text", resource_step_info={"cfg": True},
+    )
+    decoding = ARNodeInputs(
+        input_seq_len=1, graph_walk="decode", resource_step_info={"cfg": True},
+    )
+
+    step = LLMSubmodule.declare_step(
+        submodule, MIXED_TEXT, ["guided", "decoding"], [guided, decoding],
+    )
+
+    kv = step.steps["kv"]
+    assert kv.pre_forks == (("main", "cfg_text"),)
+    assert kv.fork_rids == {"guided"}
 
 
 def test_a_mixed_step_of_unguided_rows_declares_no_branch():

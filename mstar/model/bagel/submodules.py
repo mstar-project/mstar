@@ -981,11 +981,17 @@ class LLMSubmodule(ARNodeSubmodule):
 
         pre_forks: tuple = ()
         post_forks: tuple = ()
+        fork_rids = None
         row_walks = [inp.graph_walk or graph_walk for inp in inputs]
         if requires_cfg:
             if "prefill_text" in row_walks:
                 # cfg_text keeps the pre-text context, so it forks before
-                # anything plans or writes.
+                # anything plans or writes: the prompt rows only, not a
+                # decode row sharing the step
+                fork_rids = frozenset(
+                    rid for rid, walk in zip(request_ids, row_walks, strict=True)
+                    if walk == "prefill_text"
+                )
                 pre_forks = (("main", "cfg_text"),)
             elif graph_walk in ("prefill_vit", "prefill_vae"):
                 # cfg_text tracks the context including this image, so it
@@ -1029,6 +1035,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 commit=writes,
                 pre_forks=pre_forks,
                 post_forks=post_forks,
+                fork_rids=fork_rids,
             ),
             "attn": AttentionStep(
                 segments=segments,
