@@ -673,6 +673,12 @@ The spec types are:
        when none is given. ``gather`` / ``scatter_`` need the sink, so leave
        ``disable_sink_slot`` unset. Parakeet's transducer decode is the example.
 
+The ``backend`` fields above default to ``auto``. Leave them there unless the model
+needs a particular kernel. The engine picks the platform's kernels when it builds the
+resource, and :ref:`architecture:Hardware platforms` lists what ``auto`` turns into on
+NVIDIA and AMD GPUs. A deployment can still pin a backend in its YAML (see `Tuning
+resources per deployment`_).
+
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
 
@@ -1553,6 +1559,11 @@ BAGEL shows the case of two captures for one walk. It captures ``decode`` twice,
 ``additional_key_info=False`` and once with ``additional_key_info=True``. A decode step
 with guidance enabled and a decode step with guidance disabled declare different segments
 over the same token count. BAGEL's ``cg_key_info`` reports which of the two a batch is.
+
+A resource can also turn a bucket down. If its kernel can't run some bucket inside a
+graph (AITER's chunked GDN prefill on AMD GPUs, for one), ``Resource.capture_refusal``
+returns the reason, the runner logs it and skips that capture, and the bucket runs
+eagerly. ``MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1`` counts a refused bucket as a failed one.
 
 Piecewise CUDA graphs (capturing an inner loop)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
