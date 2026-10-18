@@ -1,5 +1,5 @@
 """RustZMQCommunicator interop with the pyzmq ZMQCommunicator: same
-mesh, pickle wire, eventfd wakeup, lossless readiness polls.
+mesh, data-only wire, eventfd wakeup, lossless readiness polls.
 Skipped unless the ``mstar_rust`` extension (built from ``rust/``) is
 installed."""
 import os
@@ -33,7 +33,7 @@ def pair():
     return orig, rust
 
 
-def test_pickle_interop_both_directions(pair):
+def test_unregistered_payload_interop_both_directions(pair):
     orig, rust = pair
     payload = {"op": "execute", "rids": [1, 2, 3], "nested": {"f": 1.5}}
     orig.send("rust", payload)

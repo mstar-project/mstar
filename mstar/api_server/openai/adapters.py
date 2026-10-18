@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -76,44 +76,53 @@ class Transcript:
 
 
 def flatten_messages(
-    messages: list, upload_dir: Path, allow_remote: bool = True
+    messages: list, upload_dir: Path, allow_remote: bool = False
 ) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
     """Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities, parts).
 
     ``parts`` is the ordered sequence as written; the other three derive from
     it — text newline-joined, attachments persisted under ``upload_dir`` and
     grouped by modality, ``input_modalities`` the per-part modality sequence.
-    So an attachment's position and a repeated modality both survive.
-    (Multi-turn role structure is flattened — a v1 simplification; the models
-    apply their own prompt formatting in ``process_prompt``.)
+    So an attachment's position and a repeated modality both survive. Each
+    text part carries its message's role, so a reply stays its own turn.
     """
     parts: list[PromptPart] = []
     file_paths: dict[str, list[str]] = {}
 
     def add_file(modality: str, path: str) -> None:
+        # shortcut: always a user turn, so the model can't tell an image it made from one it was
+        # sent, and a reply that is only an image leaves no assistant turn; a feature like
+        # multi-turn editing would give the turn break between two attachments a text slot
         paths = file_paths.setdefault(modality, [])
-        parts.append(PromptPart(modality=modality, index=len(paths)))
+        parts.append(PromptPart(modality=modality, index=len(paths), role="user"))
         paths.append(path)
 
-    def add_text(text: str) -> None:
+    def add_text(text: str, role: str) -> None:
         # Adjacent text parts were newline-joined before ordering was kept;
-        # merge them here so only text an attachment separates gets its own
-        # part, and the rendered prompt keeps the separator it used to have.
-        if parts and parts[-1].modality == "text":
-            parts[-1] = PromptPart(
-                modality="text", text=f"{parts[-1].text}\n{text}"
-            )
+        # merge them here, across messages of one role too (the layout has no
+        # slot for the boundary between them), so only text an attachment or a
+        # role change separates gets its own part, and the rendered prompt
+        # keeps the separator it used to have.
+        if parts and parts[-1].modality == "text" and parts[-1].role == role:
+            parts[-1] = replace(parts[-1], text=f"{parts[-1].text}\n{text}")
             return
-        parts.append(PromptPart(modality="text", text=text))
+        parts.append(PromptPart(modality="text", text=text, role=role))
 
     for msg in messages or []:
         # Messages may be pydantic ChatMessage objects or plain dicts.
-        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        if isinstance(msg, dict):
+            role, content = msg.get("role"), msg.get("content")
+        else:
+            role, content = getattr(msg, "role", None), getattr(msg, "content", None)
+        if role == "developer":  # OpenAI's newer name for system
+            role = "system"
+        elif role not in ("system", "user", "assistant"):
+            raise ValueError(f"a message's role must be system, developer, user or assistant, not {role!r}")
         if content is None:
             continue
         if isinstance(content, str):
             if content:
-                add_text(content)
+                add_text(content, role)
             continue
         for part in content:
             if not isinstance(part, dict):
@@ -121,7 +130,7 @@ def flatten_messages(
             ptype = part.get("type")
             if ptype == "text":
                 if part.get("text"):
-                    add_text(part["text"])
+                    add_text(part["text"], role)
             elif ptype == "image_url":
                 url = (part.get("image_url") or {}).get("url", "")
                 if url:
@@ -154,6 +163,29 @@ def _passthrough(req) -> dict:
     flow through verbatim as model_kwargs."""
     extra = getattr(req, "model_extra", None) or {}
     return dict(extra)
+
+
+def _refuse_tool_calls(req) -> None:
+    """Refuse a chat that asks the model to call a tool.
+
+    No adapter here parses a tool call out of a reply, so a client sent plain
+    text takes it for the model declining every tool. An empty ``tools`` and a
+    ``tool_choice`` of ``none`` or ``auto`` ask for no call; clients send them
+    by default. A ``tool_choice`` of ``none`` asks for no call even when
+    ``tools`` lists some. Their older names, ``functions`` and
+    ``function_call``, follow the same rules.
+    """
+    extra = req.model_extra or {}
+    choice = extra.get("tool_choice")
+    function_call = extra.get("function_call")
+    if (
+        (extra.get("tools") not in (None, []) and choice != "none")
+        or (extra.get("functions") not in (None, []) and function_call != "none")
+        or choice == "required"
+        or isinstance(choice, dict)
+        or function_call not in (None, "none", "auto")
+    ):
+        raise ValueError("tool calling is not supported for this model")
 
 
 def _apply_sampling(
@@ -294,6 +326,7 @@ class BagelAdapter(OpenAIAdapter):
     supports_images = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -351,6 +384,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         return getattr(req, "voice", None)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         # Speech output also emits text, so request both modalities when audio is asked for.
@@ -401,6 +435,7 @@ class Qwen3_5Adapter(OpenAIAdapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -471,10 +506,7 @@ class OmniVoiceAdapter(OpenAIAdapter):
         ref_audio = mk.pop("ref_audio", None)
         input_modalities = ["text"]
         if ref_audio:
-            # A data URL, a base64 blob, a local path or (when allowed) a URL.
-            path, _mime = media_io.resolve_media_ref(
-                ref_audio, upload_dir, allow_remote=True
-            )
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="torchcodec")
             # Keyed by modality: the data worker iterates the dict and
             # loads each group through the matching loader.
             file_paths = {"audio": [path]}
@@ -518,17 +550,14 @@ class Qwen3TTSAdapter(OpenAIAdapter):
         if instructions:
             mk.setdefault("instruct", instructions)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
-        # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL, a
-        # local path or bare base64 (vLLM-Omni's field). It becomes the
+        # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL (when
+        # the server allows it) or bare base64 (vLLM-Omni's field). It becomes the
         # request's audio input for one request; ``ref_text`` and
         # ``x_vector_only_mode`` ride along as model kwargs. Named, persisted
         # voices come with the shared voice registry (engine/voice-registry).
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            if ref_audio.startswith(("data:", "http://", "https://")) or Path(ref_audio).suffix:
-                _, path = media_io.resolve_media_ref(ref_audio, upload_dir)
-            else:
-                _, path = media_io.save_base64(ref_audio, "wav", "audio", upload_dir)
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")
             return SubmitArgs(
                 text=req.input,
                 file_paths={"audio": [path]},
@@ -573,17 +602,21 @@ class KokoroAdapter(OpenAIAdapter):
         )
 
 
-def _refuse_server_path(ref: str, upload_dir: Path) -> None:
-    """A plain path must name a file the server stored itself, under
-    ``upload_dir``; checked before anything is opened, so it cannot probe the disk."""
+def _resolve_ref_audio(ref: str, upload_dir: Path, decoder: str) -> str:
+    """A reference voice clip from the request: a data URL, an http(s) URL (only
+    when the server allows remote fetch), or bare base64 that ``decoder`` (the
+    model's audio loader) can open. Returns its path."""
     if not isinstance(ref, str):
-        raise ValueError(f"ref_audio must be a data URL or an http(s) URL, got {type(ref).__name__}")
+        raise ValueError(f"ref_audio must be a data URL or base64 string, got {type(ref).__name__}")
     if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
-        return
-    if not Path(ref).resolve().is_relative_to(Path(upload_dir).resolve()):
-        raise ValueError(
-            "ref_audio must be a data URL or an http(s) URL; paths on the server are refused"
-        )
+        return media_io.resolve_media_ref(ref, upload_dir)[1]
+    path = media_io.save_base64_audio(ref, upload_dir, decoder)
+    if path:
+        return path
+    raise ValueError(
+        "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
+        "or base64 audio the model can decode"
+    )
 
 
 class ChatterboxAdapter(OpenAIAdapter):
@@ -613,9 +646,10 @@ class ChatterboxAdapter(OpenAIAdapter):
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            _refuse_server_path(ref_audio, upload_dir)
+            if not isinstance(ref_audio, str):
+                raise ValueError(f"ref_audio must be a data URL, got {type(ref_audio).__name__}")
             # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
-            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir, allow_remote=False)
+            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir)
             file_paths = {"audio": [path]}
             input_modalities = ["text", "audio"]
         return SubmitArgs(
@@ -712,6 +746,7 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -779,6 +814,41 @@ class Wan22Adapter(OpenAIAdapter):
             text=req.prompt,
             input_modalities=["text"],
             output_modalities=["video"],
+            model_kwargs=mk,
+        )
+
+
+class LTX25Adapter(OpenAIAdapter):
+    """LTX-2.5: text-to-audio+video generation.
+
+    Returns one mp4 with the generated audio muxed in as an AAC track by default;
+    ``audio: false`` in ``extra_body`` asks for video alone. ``size`` ("WxH") maps to
+    the model's ``width`` / ``height``; ``seed``, ``num_frames`` and ``fps`` are
+    first-class fields, and any other knobs pass through via
+    ``extra_body``. No image or video conditioning yet.
+    """
+
+    supports_videos = True
+
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        if getattr(req, "image", None) or getattr(req, "video", None):
+            raise ValueError("LTX-2.5 (this port) is text-to-video only; omit 'image' and 'video'.")
+        mk = _passthrough(req)
+        with_audio = mk.pop("audio", True)
+        if getattr(req, "size", None):
+            try:
+                width, height = (int(v) for v in req.size.lower().split("x"))
+            except ValueError:
+                raise ValueError(f"size must be 'WxH' (e.g. '960x544'); got {req.size!r}") from None
+            mk.setdefault("width", width)
+            mk.setdefault("height", height)
+        for name in ("seed", "num_frames", "fps"):
+            if getattr(req, name, None) is not None:
+                mk.setdefault(name, getattr(req, name))
+        return SubmitArgs(
+            text=req.prompt,
+            input_modalities=["text"],
+            output_modalities=["video", "audio"] if with_audio else ["video"],
             model_kwargs=mk,
         )
 
@@ -1018,6 +1088,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_super_i2v_4step": Cosmos3Adapter(),
     "cosmos3_super_t2i_4step": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
+    "ltx2_5": LTX25Adapter(),
     "whisper_large": WhisperAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
     "flux2_klein": DiffusionImageAdapter(),
@@ -1029,6 +1100,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
 ADAPTER_REGISTRY.update({
     f"qwen3_5_{size}b": Qwen3_5Adapter() for size in QWEN_3_5_DENSE_SIZES
 })
+# Qwen3.8-27B is the Qwen3.5 architecture and chat template family.
+ADAPTER_REGISTRY["qwen3_8_27b"] = Qwen3_5Adapter()
 
 
 def get_adapter(model_name: str) -> OpenAIAdapter | None:
