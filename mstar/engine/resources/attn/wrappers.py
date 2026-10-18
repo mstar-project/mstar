@@ -218,6 +218,7 @@ class FlashInferDecodeWrapper:
         max_num_pages: required for CUDA graph mode (max pages across all requests)
         device: torch device
         use_cuda_graph: if True, pre-allocate static buffers for graph capture
+        use_tensor_cores: run decode on the prefill kernel's tensor-core path
     """
 
     def __init__(
@@ -233,6 +234,7 @@ class FlashInferDecodeWrapper:
         use_cuda_graph: bool = False,
         enable_nvtx: bool = False,
         backend: str = "auto",
+        use_tensor_cores: bool = True,
     ):
         check_flashinfer_head_dim(head_dim, device)
         self.device = device
@@ -267,7 +269,7 @@ class FlashInferDecodeWrapper:
                 workspace_buffer,
                 "NHD",
                 use_cuda_graph=True,
-                use_tensor_cores=True,
+                use_tensor_cores=use_tensor_cores,
                 paged_kv_indptr_buffer=self._paged_kv_indptr_buf,
                 paged_kv_indices_buffer=self._paged_kv_indices_buf,
                 paged_kv_last_page_len_buffer=self._paged_kv_last_page_len_buf,
@@ -276,7 +278,7 @@ class FlashInferDecodeWrapper:
         else:
             self.attn_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD",
-                use_tensor_cores=True,
+                use_tensor_cores=use_tensor_cores,
                 backend=backend,
             )
 
