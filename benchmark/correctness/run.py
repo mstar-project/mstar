@@ -170,7 +170,7 @@ def main(argv=None) -> int:
                                            "overrides", "versions", "startup_s", "started", "runs", "limit",
                                            "served_heads", "reference_build_error", "passes")}
         header.update(reference=fam.reference_description() if fam.ref_outputs(ref_dir) else "missing",
-                      protocol=fam.protocol(), rescored=_now())
+                      protocol=fam.protocol(), rescored=_now(), family_opts=fam.opts)
         header["finished"] = _now()
         runs = [run_dir / name for name in (prev.get("runs") or {f"r{k}": None for k in range(1, restarts + 1)})]
         return _score_and_report(fam, sset, runs, ref_dir, run_dir, header, device)
