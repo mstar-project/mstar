@@ -932,6 +932,20 @@ window.runMermaid = runMermaid;</script>
 <span class="p">}</span>
 
 
+<div class="viewcode-block" id="resolve_attn_backend">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.resolve_attn_backend">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">resolve_attn_backend</span><span class="p">(</span><span class="n">backend</span><span class="p">:</span> <span class="n">AttnBackend</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AttnBackend</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The concrete backend for ``backend`` on ``device``.</span>
+
+<span class="sd">    ``AUTO`` becomes the platform's default, FlashInfer on every platform for</span>
+<span class="sd">    now. A backend named in the spec or YAML is returned as is.</span>
+<span class="sd">    """</span>
+    <span class="k">if</span> <span class="n">backend</span> <span class="ow">is</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">AUTO</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span>
+    <span class="k">return</span> <span class="n">backend</span></div>
+
+
+
 <div class="viewcode-block" id="AttentionManager">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.AttentionManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AttentionManager</span><span class="p">(</span><span class="n">AttentionResource</span><span class="p">):</span>
@@ -957,7 +971,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># the KV resource's own config, not a copy; per-rank head counts, and</span>
         <span class="c1"># `shard` is idempotent so both builders can call it</span>
         <span class="n">kv_config</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">dependency</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">)</span><span class="o">.</span><span class="n">config</span>
-        <span class="n">backend</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span>
+        <span class="n">backend</span> <span class="o">=</span> <span class="n">resolve_attn_backend</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
         <span class="c1"># Before `shard`, so a mismatch is reported rather than half-applied to</span>
         <span class="c1"># a config the KV resource also holds.</span>
         <span class="k">if</span> <span class="n">backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">_BACKEND_KV_CONFIG</span><span class="p">:</span>
@@ -975,10 +989,10 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">DENSE</span><span class="p">:</span>
             <span class="c1"># A dense backend needs the FlashAttention-3 kernel; where the</span>
             <span class="c1"># wheel does not match the installed torch/CUDA build, degrade to</span>
-            <span class="c1"># the paged backend rather than failing to serve. The two are</span>
-            <span class="c1"># drop-in for each other: the step declaration is identical</span>
-            <span class="c1"># (see DenseAttentionManager) and `requires_kv_write` tells the</span>
-            <span class="c1"># layer which one it is talking to.</span>
+            <span class="c1"># the paged backend AUTO picks rather than failing to serve.</span>
+            <span class="c1"># The two are drop-in for each other: the step declaration is</span>
+            <span class="c1"># identical (see DenseAttentionManager) and `requires_kv_write`</span>
+            <span class="c1"># tells the layer which one it is talking to.</span>
             <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.dense</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
                 <span class="n">DenseAttentionManager</span><span class="p">,</span>
                 <span class="n">_fa3_unavailable_reason</span><span class="p">,</span>
@@ -993,8 +1007,8 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">,</span>
                     <span class="n">kv_config</span><span class="o">=</span><span class="n">kv_config</span><span class="p">,</span>
                 <span class="p">)</span>
-            <span class="n">_warn_dense_fallback</span><span class="p">(</span><span class="n">reason</span><span class="p">)</span>
-            <span class="n">backend</span> <span class="o">=</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span>
+            <span class="n">backend</span> <span class="o">=</span> <span class="n">resolve_attn_backend</span><span class="p">(</span><span class="n">AttnBackend</span><span class="o">.</span><span class="n">AUTO</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+            <span class="n">_warn_dense_fallback</span><span class="p">(</span><span class="n">reason</span><span class="p">,</span> <span class="n">backend</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span><span class="p">:</span>
             <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.flashinfer</span><span class="w"> </span><span class="kn">import</span> <span class="n">FlashInferManager</span>

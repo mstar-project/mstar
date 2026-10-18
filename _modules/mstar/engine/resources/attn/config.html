@@ -920,6 +920,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="AttnBackend">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.AttnBackend">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AttnBackend</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+    <span class="c1"># the platform's default, decided when the resource is built</span>
+    <span class="n">AUTO</span> <span class="o">=</span> <span class="s2">"auto"</span>
     <span class="n">FLASHINFER</span> <span class="o">=</span> <span class="s2">"flashinfer"</span>
     <span class="n">DENSE</span> <span class="o">=</span> <span class="s2">"dense"</span>
     <span class="n">FLEX</span> <span class="o">=</span> <span class="s2">"flex"</span>
@@ -932,7 +934,7 @@ window.runMermaid = runMermaid;</script>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">AttentionConfig</span><span class="p">:</span>
     <span class="n">kv_cache</span><span class="p">:</span> <span class="nb">str</span> <span class="c1"># name of the KV cache</span>
-    <span class="n">backend</span><span class="p">:</span> <span class="n">AttnBackend</span> <span class="o">=</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span>
+    <span class="n">backend</span><span class="p">:</span> <span class="n">AttnBackend</span> <span class="o">=</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">AUTO</span>
     <span class="n">flashinfer_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span></div>
 
 
@@ -999,7 +1001,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">kv_cache</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># name of the KV cache holding the context</span>
     <span class="n">query_kv_cache</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>  <span class="c1"># KV cache driving the queries, if any</span>
     <span class="n">context_label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"context"</span>
-    <span class="n">backend</span><span class="p">:</span> <span class="n">AttnBackend</span> <span class="o">=</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span>
+    <span class="n">backend</span><span class="p">:</span> <span class="n">AttnBackend</span> <span class="o">=</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">AUTO</span>
     <span class="n">flashinfer_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span></div>
 
 

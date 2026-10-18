@@ -909,7 +909,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionManager</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">AttnBackend</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">PagedKVConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVPlanOutput</span><span class="p">,</span> <span class="n">KVPlanOutputs</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">StepContext</span>
@@ -944,11 +944,11 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="nd">@functools</span><span class="o">.</span><span class="n">cache</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">_warn_dense_fallback</span><span class="p">(</span><span class="n">reason</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_warn_dense_fallback</span><span class="p">(</span><span class="n">reason</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">fallback</span><span class="p">:</span> <span class="n">AttnBackend</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
     <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
         <span class="s2">"Attention backend 'dense' requested but no varlen kernel is "</span>
-        <span class="s2">"available (</span><span class="si">%s</span><span class="s2">); using the paged 'flashinfer' backend instead."</span><span class="p">,</span>
-        <span class="n">reason</span><span class="p">,</span>
+        <span class="s2">"available (</span><span class="si">%s</span><span class="s2">); using the paged </span><span class="si">%r</span><span class="s2"> backend instead."</span><span class="p">,</span>
+        <span class="n">reason</span><span class="p">,</span> <span class="n">fallback</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
     <span class="p">)</span>
 
 

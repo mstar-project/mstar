@@ -619,6 +619,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttnManager.prefix_skip_safe</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend"><code class="docutils literal notranslate"><span class="pre">resolve_ragged_attn_backend()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -637,6 +638,15 @@
 backed by a KV cache, e.g., an encoder tower attending within variable-length
 segments of one packed forward. There is nothing to page, nothing to advance,
 and nothing to carry between steps: the resource holds only planned wrappers.</p>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend" title="mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_ragged_attn_backend</span></code></a>(backend, device)</p></td>
+<td><p>Ragged counterpart of <code class="docutils literal notranslate"><span class="pre">attn.base.resolve_attn_backend</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -699,6 +709,23 @@ and nothing to carry between steps: the resource holds only planned wrappers.</p
 
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.ragged.base.</span></span><span class="sig-name descname"><span class="pre">resolve_ragged_attn_backend</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">backend</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/base.html#resolve_ragged_attn_backend"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend" title="Link to this definition">#</a></dt>
+<dd><p>Ragged counterpart of <code class="docutils literal notranslate"><span class="pre">attn.base.resolve_attn_backend</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>backend</strong> (<a class="reference internal" href="mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.attn.ragged.config.RaggedAttnBackend" title="mstar.engine.resources.attn.ragged.config.RaggedAttnBackend"><em>RaggedAttnBackend</em></a>)</p></li>
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.attn.ragged.config.RaggedAttnBackend" title="mstar.engine.resources.attn.ragged.config.RaggedAttnBackend"><em>RaggedAttnBackend</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -758,6 +785,7 @@ and nothing to carry between steps: the resource holds only planned wrappers.</p
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.RaggedCrossAttnManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttnManager.prefix_skip_safe</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.ragged.base.resolve_ragged_attn_backend"><code class="docutils literal notranslate"><span class="pre">resolve_ragged_attn_backend()</span></code></a></li>
 </ul>
   </nav></div>
 

@@ -911,6 +911,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">EagerSlotKey</span><span class="p">,</span>
     <span class="n">PlanCacheKey</span><span class="p">,</span>
     <span class="n">WorkspacePool</span><span class="p">,</span>
+    <span class="n">resolve_attn_backend</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">AttentionStep</span><span class="p">,</span>
@@ -957,9 +958,10 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">build</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">CrossAttentionSpec</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">EngineResourceInfo</span><span class="p">):</span>
         <span class="c1"># the context cache's own head counts; see AttentionManager.build</span>
         <span class="n">kv_config</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">dependency</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">)</span><span class="o">.</span><span class="n">config</span>
+        <span class="n">backend</span> <span class="o">=</span> <span class="n">resolve_attn_backend</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">kv_config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">FlashInferCrossManager</span><span class="p">(</span>
                 <span class="n">kv_cache</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">,</span>
                 <span class="n">query_kv_cache</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">query_kv_cache</span><span class="p">,</span>
@@ -969,9 +971,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">kv_config</span><span class="o">=</span><span class="n">kv_config</span><span class="p">,</span>
                 <span class="n">backend</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">,</span>
             <span class="p">)</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">"Unknown cross attention backend </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">"</span>
-        <span class="p">)</span></div>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown cross attention backend </span><span class="si">{</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
 </div>
 
 

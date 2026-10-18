@@ -907,6 +907,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
@@ -924,6 +925,15 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""The plan a cross-attention pair runs under: ``q_label``'s spans attending</span>
 <span class="sd">    ``kv_label``'s."""</span>
     <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">q_label</span><span class="si">}</span><span class="s2">&lt;-</span><span class="si">{</span><span class="n">kv_label</span><span class="si">}</span><span class="s2">"</span></div>
+
+
+
+<div class="viewcode-block" id="RaggedAttnBackend">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.RaggedAttnBackend">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaggedAttnBackend</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+    <span class="c1"># the platform's default, decided when the resource is built</span>
+    <span class="n">AUTO</span> <span class="o">=</span> <span class="s2">"auto"</span>
+    <span class="n">FLASHINFER</span> <span class="o">=</span> <span class="s2">"flashinfer"</span></div>
 
 
 
@@ -973,6 +983,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># bucket's own token count is the ceiling and this stays None.</span>
     <span class="n">max_tokens_per_request</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="n">backend</span><span class="p">:</span> <span class="n">RaggedAttnBackend</span> <span class="o">=</span> <span class="n">RaggedAttnBackend</span><span class="o">.</span><span class="n">AUTO</span>
     <span class="n">flashinfer_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span>
 
     <span class="c1"># Activation dtype of the q / k / v the node hands the kernel (and of its</span>
@@ -1028,6 +1039,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
+        <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">RaggedAttnBackend</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">flashinfer_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">max_segments_per_request</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">max_tokens_per_request</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -1038,6 +1050,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        The two ceilings are here rather than on the model because they size</span>
 <span class="sd">        CUDA-graph buckets, which is a deployment's memory/coverage trade.</span>
 <span class="sd">        """</span>
+        <span class="k">if</span> <span class="n">backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span> <span class="o">=</span> <span class="n">RaggedAttnBackend</span><span class="p">(</span><span class="n">backend</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">flashinfer_backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span> <span class="o">=</span> <span class="n">flashinfer_backend</span>
         <span class="k">if</span> <span class="n">max_segments_per_request</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>

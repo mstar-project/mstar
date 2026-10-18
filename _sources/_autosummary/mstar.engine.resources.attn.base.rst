@@ -9,6 +9,12 @@ mstar.engine.resources.attn.base
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      resolve_attn_backend
+   
    
 
    

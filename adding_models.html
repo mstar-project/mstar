@@ -1017,24 +1017,27 @@ Ring storage is currently paired with FlexAttention.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec(config=AttentionConfig(kv_cache=...))</span></code></p></td>
 <td><p>Self-attention planned over the named cache. <code class="docutils literal notranslate"><span class="pre">backend</span></code> selects
-<code class="docutils literal notranslate"><span class="pre">AttnBackend.FLASHINFER</span></code> (the default), <code class="docutils literal notranslate"><span class="pre">AttnBackend.DENSE</span></code> or
-<code class="docutils literal notranslate"><span class="pre">AttnBackend.FLEX</span></code>. FlashInfer and dense attention require a
+<code class="docutils literal notranslate"><span class="pre">AttnBackend.AUTO</span></code> (the default, which lets the engine pick the platform’s
+paged backend, FlashInfer for now), <code class="docutils literal notranslate"><span class="pre">AttnBackend.FLASHINFER</span></code>,
+<code class="docutils literal notranslate"><span class="pre">AttnBackend.DENSE</span></code> or <code class="docutils literal notranslate"><span class="pre">AttnBackend.FLEX</span></code>. Leave it at <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> unless the
+model needs a specific kernel. FlashInfer and dense attention require a
 <code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code>; FlexAttention requires a <code class="docutils literal notranslate"><span class="pre">RingKVConfig</span></code>.
 <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> selects a kernel generation: <code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;fa2&quot;</span></code> or
 <code class="docutils literal notranslate"><span class="pre">&quot;fa3&quot;</span></code> when the FlashInfer backend is selected.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec(config=CrossAttentionConfig(...))</span></code></p></td>
-<td><p>Attention over a paged context that is written once and never extended. Only
-the FlashInfer backend is implemented. See <a class="reference internal" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder
-models)</a>.</p></td>
+<td><p>Attention over a paged context that is written once and never extended.
+<code class="docutils literal notranslate"><span class="pre">backend</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">AttnBackend.AUTO</span></code>. Only FlashInfer is implemented.
+See <a class="reference internal" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder models)</a>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
 <td><p>Cacheless (ragged) varlen self-attention over the segments packed into one
 forward. Nothing is paged, and nothing carries to the next step.
 <code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>, <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code> and
 <code class="docutils literal notranslate"><span class="pre">head_dim</span></code> (all pre-sharding, as in <code class="docutils literal notranslate"><span class="pre">KVConfig</span></code>), an <code class="docutils literal notranslate"><span class="pre">sm_scale</span></code> that
-defaults to <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">**</span> <span class="pre">-0.5</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>, and the two
-CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code> and
+defaults to <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">**</span> <span class="pre">-0.5</span></code>, <code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.AUTO</span></code>, the
+default, or <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.FLASHINFER</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>, and the
+two CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code> and
 <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
@@ -1949,18 +1952,18 @@ that a misspelled setting is never silently ignored:</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">num_sessions</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> / <code class="docutils literal notranslate"><span class="pre">dense</span></code> / <code class="docutils literal notranslate"><span class="pre">flex</span></code>),
+<td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> / <code class="docutils literal notranslate"><span class="pre">dense</span></code> / <code class="docutils literal notranslate"><span class="pre">flex</span></code> / <code class="docutils literal notranslate"><span class="pre">xpu_paged</span></code>),
 <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (only <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> is implemented), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
+<td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
 (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>)</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>),
-<code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. The two ceilings size
-CUDA-graph buckets, which is a memory-against-coverage trade the deployment makes,
-not the model.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
+(<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>,
+<code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. The two ceilings size CUDA-graph buckets, which is a
+memory-against-coverage trade the deployment makes, not the model.</p></td>
 </tr>
 </tbody>
 </table>

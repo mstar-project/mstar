@@ -920,6 +920,7 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">BucketKey</span><span class="p">,</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">Resource</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">StepContext</span><span class="p">,</span> <span class="n">StepRunner</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">BatchedModelOutput</span><span class="p">,</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span><span class="p">,</span> <span class="n">NodeSubmodule</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms.compile</span><span class="w"> </span><span class="kn">import</span> <span class="n">with_inductor_overrides</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">profiler</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
@@ -1599,6 +1600,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        compiled code by shape, so every bucket of a config shares a cache and</span>
 <span class="sd">        the second slot's identical shapes are free. A wrapper per capture</span>
 <span class="sd">        would recompile — and re-autotune — all of them.</span>
+
+<span class="sd">        The platform's inductor overrides wrap that shared callable per bucket,</span>
+<span class="sd">        so each bucket compiles on its first call under the overrides for its</span>
+<span class="sd">        own token count.</span>
 <span class="sd">        """</span>
         <span class="n">forward</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodule</span><span class="p">,</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">capture_forward_method</span><span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">compile</span><span class="p">:</span>
@@ -1610,7 +1615,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">fullgraph</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">dynamic</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
             <span class="p">)</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_compiled_forwards</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">]</span>
+        <span class="k">return</span> <span class="n">with_inductor_overrides</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_compiled_forwards</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">],</span> <span class="n">spec</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span>
+        <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_dummy_engine_inputs</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">dummy_rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
@@ -2305,8 +2312,11 @@ window.runMermaid = runMermaid;</script>
 
         <span class="n">fn</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">capture_fn</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">compile</span><span class="p">:</span>
-            <span class="n">fn</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
-                <span class="n">fn</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"max-autotune-no-cudagraphs"</span><span class="p">,</span> <span class="n">fullgraph</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">dynamic</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+            <span class="n">fn</span> <span class="o">=</span> <span class="n">with_inductor_overrides</span><span class="p">(</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
+                    <span class="n">fn</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"max-autotune-no-cudagraphs"</span><span class="p">,</span> <span class="n">fullgraph</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">dynamic</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                <span class="p">),</span>
+                <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span>
             <span class="p">)</span>
 
         <span class="k">def</span><span class="w"> </span><span class="nf">run_fn</span><span class="p">():</span>

@@ -25,6 +25,7 @@ mstar.engine.resources.attn.ragged.config
    
       RaggedAttentionConfig
       RaggedAttentionSpec
+      RaggedAttnBackend
       RaggedCrossAttentionSpec
       RaggedCrossAttentionStep
    
