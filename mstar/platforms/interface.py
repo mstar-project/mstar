@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import torch
@@ -95,6 +95,17 @@ class Platform:
         platform doesn't report an address."""
         return frozenset(a for i in range(torch.accelerator.device_count())
                          if (a := self.pci_address(i)) is not None)
+    def visible_devices_env(
+        self, devices: str | None, environ: Mapping[str, str],
+    ) -> dict[str, str]:
+        """Env vars that limit this process and its children to ``devices``
+        (``mstar serve --gpus``). With None, check the current env and keep it,
+        raising ValueError if it picks devices inconsistently.
+
+        Runs before the first device call, so like process_env_defaults it is
+        asked of the platform torch was built for.
+        """
+        return {} if devices is None else {"CUDA_VISIBLE_DEVICES": devices}
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
@@ -179,6 +190,21 @@ class RocmPlatform(Platform):
 
     def pci_address(self, device_index: int) -> str | None:
         return _torch_pci_address(device_index)
+    def visible_devices_env(
+        self, devices: str | None, environ: Mapping[str, str],
+    ) -> dict[str, str]:
+        # HIP (and torch on ROCm) prefer HIP_VISIBLE_DEVICES over
+        # CUDA_VISIBLE_DEVICES, so set both or a stale value wins.
+        if devices is not None:
+            return {"CUDA_VISIBLE_DEVICES": devices, "HIP_VISIBLE_DEVICES": devices}
+        hip = environ.get("HIP_VISIBLE_DEVICES")
+        cuda = environ.get("CUDA_VISIBLE_DEVICES")
+        if hip is not None and cuda is not None and hip != cuda:
+            raise ValueError(
+                f"HIP_VISIBLE_DEVICES={hip!r} and CUDA_VISIBLE_DEVICES={cuda!r} "
+                "disagree and HIP uses the first. Unset one or pass --gpus"
+            )
+        return {}
 
 
 class XpuPlatform(Platform):
