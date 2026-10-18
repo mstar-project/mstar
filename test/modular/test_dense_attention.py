@@ -4,8 +4,8 @@ The dense backend is the first resource to cache something *derived from the
 contents* of a KV stream across steps. Nothing else in v1 does that, so the two
 things worth pinning are the layout it builds off the KV plan, and the
 invalidation: a cached gather must not survive a fork, a reset, or a page-table
-move. Both run on CPU with no kernel — the FlashAttention-3 call itself is the
-only part that needs a GPU.
+move. Both run on CPU with no kernel — the varlen kernel call itself (FA3, or
+AITER's on ROCm) is the only part that needs a GPU.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.dense import (
     DenseAttentionManager,
-    _fa3_unavailable_reason,
+    _varlen_unavailable_reason,
 )
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.base import EngineResourceInfo
@@ -234,7 +234,7 @@ class TestPrefixGather:
 
 
 class TestBackendSelection:
-    def test_dense_spec_builds_dense_when_fa3_is_there(self):
+    def test_dense_spec_builds_dense_when_a_varlen_kernel_is_there(self):
         """...and degrades to the paged backend when it is not: the two are
         drop-in for each other, so a missing wheel costs speed, not serving."""
         spec = AttentionSpec(
@@ -255,7 +255,7 @@ class TestBackendSelection:
             ),
         )
         expected = (
-            DenseAttentionManager if _fa3_unavailable_reason() is None
+            DenseAttentionManager if _varlen_unavailable_reason() is None
             else FlashInferManager
         )
         assert isinstance(manager, expected)
