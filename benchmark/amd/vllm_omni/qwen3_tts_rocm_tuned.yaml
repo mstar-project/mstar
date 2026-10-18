@@ -1,0 +1,15 @@
+# vllm-omni "tuned" arm for Qwen3-TTS on ROCm (image rocm/vllm-omni a8576ccb = vllm-omni v0.30.0).
+# Overlays the model's own deploy file in the image, so everything not named here is the default.
+#  - Code2Wav (stage 1) is not forced eager. This is the alternative recipes/Qwen/Qwen3-TTS.md documents
+#    for "1x AMD MI300X", run with MIOPEN_FIND_MODE=FAST (the arm sets it).
+#  - The talker (stage 0) runs ROCM_AITER_FA, the backend vLLM's AMD guide recommends. vllm-omni only
+#    picks it when a stage names it; otherwise _apply_rocm_attention_backend in
+#    vllm_omni/engine/stage_init_utils.py ends on TRITON_ATTN even with VLLM_ROCM_USE_AITER=1.
+base_config: /app/vllm-omni/vllm_omni/deploy/qwen3_tts.yaml
+platforms:
+  rocm:
+    stages:
+      - stage_id: 0
+        attention_backend: ROCM_AITER_FA
+      - stage_id: 1
+        enforce_eager: false
