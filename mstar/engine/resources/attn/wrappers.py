@@ -455,6 +455,7 @@ class FlashInferDecodeWrapper:
         max_num_pages: required for CUDA graph mode (max pages across all requests)
         device: torch device
         accelerator_graph: if True, pre-allocate static buffers for graph capture
+        use_tensor_cores: run decode on the prefill kernel's tensor-core path
     """
 
     def __init__(
@@ -870,6 +871,7 @@ class FlashInferMixedWrapper:
         max_prefill_rows: int,
         device: torch.device,
         backend: str = "auto",
+        # the decode half's; see `FlashInferDecodeWrapper`
         use_tensor_cores: bool = True,
         decode_wrapper: "FmhaDecodeWrapper | None" = None,
     ):
