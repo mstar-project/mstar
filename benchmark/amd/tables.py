@@ -14,7 +14,7 @@ class Workload:
     family: str
     request_type: str  # benchmark.runner --request-type
     concurrency: tuple[int, ...]
-    # Prompt source: a text file (one prompt per line, repo-relative) or "set:<name>", one of WS-K's sample sets.
+    # Prompt source: a text file (one prompt per line, repo-relative) or "set:<name>", a correctness runner set.
     prompts: str
     output_len: int | None = None  # fixed output length in tokens (sent with ignore_eos)
     unique_prompts: bool = False  # runner --unique-prompts, so no request reuses a cached prefix
@@ -35,10 +35,10 @@ WORKLOADS: dict[str, Workload] = {w.name: w for w in [
     # ~1k-token prompts, 64 output tokens: prefill-heavy. Unique prompt tags keep prefix caches out of it.
     Workload("text-long-1k", "text", "text_to_text", (1, 4, 16, 64), LONG_PROMPTS, output_len=64,
              unique_prompts=True, primary=("tok_s", True)),
-    # Seed-TTS read-aloud sentences (WS-K's tts_seedtts_v1), model defaults, natural stop.
+    # Seed-TTS read-aloud sentences (tts_seedtts_v1), model defaults, natural stop.
     Workload("tts-seed", "tts", "text_to_speech", (1, 8, 32, 64), "set:tts_seedtts_v1", min_requests=40,
              primary=("audio_s_per_s", True)),
-    # LibriSpeech test-clean utterances (WS-K's asr_librispeech_v1).
+    # LibriSpeech test-clean utterances (asr_librispeech_v1).
     # min_requests = the set size, so the first run at concurrency 1 covers every item for the WER check.
     Workload("asr-libri", "asr", "audio_to_text", (1, 8, 32), "set:asr_librispeech_v1", min_requests=100,
              primary=("rtfx", True)),
