@@ -351,15 +351,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         logits = self.lm_head(hidden)  # (bs, vocab)
         return self._sample(engine_inputs, logits)
 
-    # Keyed by request id, so outside dynamo: traced, the engine's compiled fallback guards
-    # on the ids and recompiles this tail for every new request (the sampler runs eager
-    # either way).
+    # Outside dynamo, like the sampler's own eager path.
     @torch.compiler.disable
     def _sample(
         self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor,
     ) -> BatchedModelOutput:
-        new_tokens = engine_inputs.resources[SAMPLER_RESOURCE].sample(
-            list(engine_inputs.request_ids), logits=logits)
+        new_tokens = engine_inputs.resources[SAMPLER_RESOURCE].sample(logits)
         # Row i is request i: one clone and one D2H copy per step, not one per request
         return BatchedModelOutput(
             row_outputs={"new_token": new_tokens},
