@@ -37,6 +37,8 @@ def upstream_sincos_table(embed_dim: int, h: int, w: int) -> np.ndarray:
 
 
 def upstream_navit_ids(h: int, w: int, side: int) -> torch.Tensor:
+    # h and w are rows of the processor's int32 tgt_sizes
+    h, w = torch.tensor(h, dtype=torch.int32), torch.tensor(w, dtype=torch.int32)
     boundaries = torch.arange(1 / side, 1.0, 1 / side)
     bh = torch.bucketize(torch.arange(0, 1 - 1e-6, 1 / h), boundaries, right=True)
     bw = torch.bucketize(torch.arange(0, 1 - 1e-6, 1 / w), boundaries, right=True)
@@ -57,7 +59,7 @@ def test_sincos_keys_match_upstream_table(hw):
     assert torch.allclose(got, want, atol=1e-6, rtol=0)
 
 
-@pytest.mark.parametrize("hw", [(26, 40), (32, 32), (7, 69), (70, 70), (100, 3)])
+@pytest.mark.parametrize("hw", [(26, 40), (32, 32), (7, 69), (70, 70), (100, 3), (1, 25), (13, 49)])
 def test_navit_position_buckets_match_upstream(hw):
     assert torch.equal(navit_position_ids(*hw, 70), upstream_navit_ids(*hw, 70))
 
@@ -121,6 +123,30 @@ def test_audio_placeholders_line_up_with_pooled_tokens(model):
     assert out["audio_positions"][0].numel() == sum(model.config.audio.pooled_tokens(n) for n in lens)
     # audio anywhere turns upstream's speech template on: the prompt ends on <|tts_bos|>
     assert out["text_inputs"][0][-1].item() == model.tokenizer.convert_tokens_to_ids("<|tts_bos|>")
+
+
+@needs_ckpt
+@pytest.mark.parametrize("seconds", [(30.05,), (60.01,), (0.06,), (1.05, 1.05), (0.06, 2.0)])
+def test_audio_placeholders_line_up_for_any_clips(model, seconds):
+    """Pieces that pool to nothing (a sliver past a 30 s cut, a clip under
+    ~0.1 s) are left out, and clips of one message are encoded one by one, as
+    their placeholders are sized."""
+    from mstar.model.multimodal import PromptPart
+
+    clips = [a_clip(s) for s in seconds]
+    out = model.process_prompt(
+        None, ["text"] + ["audio"] * len(clips), ["text"],
+        tensors={"audio_inputs": clips},
+        prompt_parts=[PromptPart("text", "Transcribe.")] + [PromptPart("audio")] * len(clips),
+    )
+    audio = model.config.audio
+    if "audio_feature_lens" not in out:  # nothing long enough to encode
+        assert seconds == (0.06,)
+        return
+    lens = out["audio_feature_lens"][0].tolist()
+    assert min(audio.pooled_tokens(n) for n in lens) > 0
+    assert out["audio_positions"][0].numel() == sum(audio.pooled_tokens(n) for n in lens)
+    assert out["audio_features"][0].shape[-1] == sum(lens)
 
 
 @needs_ckpt

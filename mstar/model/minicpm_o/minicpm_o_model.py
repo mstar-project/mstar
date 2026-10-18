@@ -278,8 +278,10 @@ class MiniCPMOModel(Model):
         enable_thinking: bool,
         system_prompt: str | None,
     ) -> tuple[str, list[int]]:
-        """The chat string as upstream's `chat` renders it, and which message
-        each audio sits in (the processor merges audios of one message)."""
+        """The chat string as upstream's `chat` renders it, and a part id per
+        audio. Each clip gets its own: the processor encodes clips that share an
+        id as one, but sizes their placeholders clip by clip, and the two round
+        differently (upstream's own `chat` fails on such prompts)."""
         msgs: list[dict] = []
         audio_parts: list[int] = []
         if system_prompt:
@@ -292,7 +294,7 @@ class MiniCPMOModel(Model):
                 user.append("<image>./</image>")
             elif part.modality == "audio":
                 user.append("<audio>./</audio>")
-                audio_parts.append(len(msgs))
+                audio_parts.append(len(audio_parts))
         msgs.append({"role": "user", "content": "\n".join(user)})
         text = self.tokenizer.apply_chat_template(
             msgs,
@@ -367,7 +369,11 @@ class MiniCPMOModel(Model):
         if audios:
             lens = out["audio_feature_lens"][0].reshape(-1).long()
             feats = out["audio_features"]
-            pieces = [feats[i, :, :n] for i, n in enumerate(lens.tolist())]
+            # a piece shorter than one pooling step (a clip under ~0.1 s, or what
+            # is left of a long one past its last 30 s cut) pools to no tokens
+            keep = [i for i, n in enumerate(lens.tolist()) if self.config.audio.pooled_tokens(n) > 0]
+            lens = lens[keep]
+            pieces = [feats[i, :, :n] for i, n in zip(keep, lens.tolist(), strict=True)]
             positions = _bound_positions(out["audio_bounds"][0])
             tokens = sum(self.config.audio.pooled_tokens(n) for n in lens.tolist())
             if positions.numel() != tokens:
@@ -377,9 +383,10 @@ class MiniCPMOModel(Model):
                     f"audio placeholders ({positions.numel()}) do not match the "
                     f"{tokens} tokens its {len(pieces)} piece(s) encode to"
                 )
-            result["audio_features"] = [torch.cat(pieces, dim=-1).to(torch.bfloat16)]
-            result["audio_feature_lens"] = [lens]
-            result["audio_positions"] = [positions]
+            if pieces:  # else the clips are all too short to encode, and the prompt is text only
+                result["audio_features"] = [torch.cat(pieces, dim=-1).to(torch.bfloat16)]
+                result["audio_feature_lens"] = [lens]
+                result["audio_positions"] = [positions]
         return result
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
