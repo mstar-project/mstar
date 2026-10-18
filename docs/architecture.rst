@@ -206,7 +206,8 @@ step.
   come with a measured win.
 - **Process environment.** ``Platform.process_env_defaults()`` is applied with
   ``os.environ.setdefault`` in the conductor before it spawns workers, so values you
-  export win. It's empty on every platform today.
+  export win. ROCm turns off MIOpen's split-K conv solver there (see
+  :doc:`environment_variables`); the other platforms set nothing.
 - **Capture refusal.** A resource whose kernel can't run some capture bucket inside a
   graph returns a reason from ``Resource.capture_refusal(spec)``. Both graph runners ask
   before capturing, and a refused bucket runs eagerly. Answer from the spec and the
