@@ -194,8 +194,7 @@ def render(data: dict) -> str:
         lines += ["## Correctness (WS-K sample sets and references)", "", "| row/arm | verdict | details |",
                   "|---|---|---|"]
         for k, v in data["correctness"].items():
-            details = {kk: vv for kk, vv in v.items() if kk != "verdict"}
-            lines.append(f"| {k} | {v.get('verdict')} | {json.dumps(details, default=str)[:300]} |")
+            lines.append(f"| {k} | {v.get('verdict')} | {_correctness_details(v)} |")
         lines.append("")
     lines += ["## Health per arm", "", "| row/arm | verdict | reasons and notes |", "|---|---|---|"]
     for k, a in data["arms"].items():
@@ -204,6 +203,24 @@ def render(data: dict) -> str:
         lines.append(f"| {k} | {h.get('status', '-')} | {txt} |")
     lines.append("")
     return "\n".join(lines)
+
+
+def _correctness_details(c: dict) -> str:
+    parts = []
+    for key, label in (("exact_vs_reference", "exact vs reference"), ("unexplained_divergences",
+                       "divergences not at near ties"), ("wer_percent", "WER %"), ("reference_wer_percent",
+                       "reference WER %"), ("wer_minus_reference_pt", "WER - reference (pt)")):
+        if c.get(key) is not None:
+            v = c[key]
+            parts.append(f"{label} {v[0] if isinstance(v, list) and len(v) == 1 else v}")
+    for key, label in (("duration_ratio", "duration ratio median"), ("log_mel_distance_db", "log-mel dB median")):
+        if isinstance(c.get(key), dict) and c[key].get("median") is not None:
+            parts.append(f"{label} {c[key]['median']:.3f}")
+    if c.get("reference") == "missing":
+        parts.append("no reference")
+    if c.get("error"):
+        parts.append(f"error: {c['error'][:120]}")
+    return "; ".join(parts)
 
 
 def _correctness_text(c: dict) -> str:
