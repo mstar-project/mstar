@@ -996,41 +996,11 @@ def _bytes_to_data_url(image_bytes: bytes, image_path: str | None) -> str:
         return f"data:{mime};base64,{encoded}"
 
 
-class VLLMOmni(InferenceSystem):
-    """
-    Benchmark adapter for the vllm-omni OpenAI-compatible server.
-
-    Uses native aiohttp + iter_any()-based SSE parsing. Two important
-    implementation details that took a while to track down:
-
-    1. vllm-omni's audio SSE chunks can be very large (~200KB base64 WAV per
-       chunk). aiohttp's default line iterator (`async for line in
-       resp.content`) has an 8 KB max-line limit and silently drops oversized
-       lines. We use `iter_any()` + manual `\\n\\n` message buffering instead
-       (matches `vllm_omni/benchmarks/patch/patch.py:391`).
-    2. vllm-omni's audio chunks carry BOTH a populated `usage` field (with
-       `completion_tokens=0`) AND `choices[0].delta.content` with the audio
-       bytes. We must NOT `continue` after reading usage — that drops the
-       audio. Read usage AND process choices on every chunk.
-
-    `modalities=[output_mod]` only when `output_mod != "text"` (matches
-    vllm-omni's expected behavior: `["audio"]` streams audio-only; absence
-    streams text+audio because the talker runs unconditionally).
-    """
-
-    # Chat template arguments (e.g. enable_thinking), set by the runner.
-    chat_template_kwargs: Optional[dict] = None
-
-    def _extra_fields(self) -> dict:
-        return {"chat_template_kwargs": self.chat_template_kwargs} if self.chat_template_kwargs else {}
-
-    def _finish_payload(self, payload: dict, output_mod: str) -> dict:
-        payload["modalities"] = [output_mod]
-        return payload
+class SpeechRoute:
+    """``/v1/audio/speech`` with streamed PCM16, for the OpenAI-style adapters."""
 
     def _speech_fields(self) -> dict:
-        # vllm-omni streams raw PCM only with stream_format=audio (benchmark/tts_speech_bench.py).
-        return {"stream_format": "audio"}
+        return {}
 
     async def _send_request_audio_speech(
         self,
@@ -1097,6 +1067,43 @@ class VLLMOmni(InferenceSystem):
         else:
             metrics.record_completion()
         return metrics
+
+
+class VLLMOmni(SpeechRoute, InferenceSystem):
+    """
+    Benchmark adapter for the vllm-omni OpenAI-compatible server.
+
+    Uses native aiohttp + iter_any()-based SSE parsing. Two important
+    implementation details that took a while to track down:
+
+    1. vllm-omni's audio SSE chunks can be very large (~200KB base64 WAV per
+       chunk). aiohttp's default line iterator (`async for line in
+       resp.content`) has an 8 KB max-line limit and silently drops oversized
+       lines. We use `iter_any()` + manual `\\n\\n` message buffering instead
+       (matches `vllm_omni/benchmarks/patch/patch.py:391`).
+    2. vllm-omni's audio chunks carry BOTH a populated `usage` field (with
+       `completion_tokens=0`) AND `choices[0].delta.content` with the audio
+       bytes. We must NOT `continue` after reading usage — that drops the
+       audio. Read usage AND process choices on every chunk.
+
+    `modalities=[output_mod]` only when `output_mod != "text"` (matches
+    vllm-omni's expected behavior: `["audio"]` streams audio-only; absence
+    streams text+audio because the talker runs unconditionally).
+    """
+
+    # Chat template arguments (e.g. enable_thinking), set by the runner.
+    chat_template_kwargs: Optional[dict] = None
+
+    def _extra_fields(self) -> dict:
+        return {"chat_template_kwargs": self.chat_template_kwargs} if self.chat_template_kwargs else {}
+
+    def _finish_payload(self, payload: dict, output_mod: str) -> dict:
+        payload["modalities"] = [output_mod]
+        return payload
+
+    def _speech_fields(self) -> dict:
+        # vllm-omni streams raw PCM only with stream_format=audio (benchmark/tts_speech_bench.py).
+        return {"stream_format": "audio"}
 
     async def send_request(
         self,
@@ -1400,7 +1407,7 @@ class VLLMOmni(InferenceSystem):
         return metrics
 
 
-class SGLangOmni(InferenceSystem):
+class SGLangOmni(SpeechRoute, InferenceSystem):
     """
     Benchmark adapter for the sglang-omni OpenAI-compatible server.
 
@@ -1434,6 +1441,15 @@ class SGLangOmni(InferenceSystem):
             type=req_type,
             expected_output_modalities=[output_mod],
         )
+        if output_mod == "audio" and isinstance(model, Qwen3TTS):
+            return await self._send_request_audio_speech(
+                session=session,
+                req_input=req_input,
+                base_url=base_url,
+                model=model,
+                metrics=metrics,
+                additional_model_kwargs=additional_model_kwargs,
+            )
 
         try:
             # Same logic as VLLMOmni: audio output needs ["text", "audio"] so
@@ -1564,6 +1580,43 @@ class OpenAIText(VLLMOmni):
         return payload
 
 
+class OpenAITranscribe(InferenceSystem):
+    """ASR over OpenAI ``/v1/audio/transcriptions`` (vLLM's Whisper, mstar's ``/v1``). Not streamed,
+    so the time to the first text is the whole request."""
+
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        metrics = RequestMetrics(request_id=request_id, type=req_input.req_type, expected_output_modalities=["text"])
+        try:
+            form = aiohttp.FormData()
+            form.add_field("file", req_input.get_bytes("audio"), filename=req_input.get_filename("audio") or "a.wav",
+                           content_type="audio/wav")
+            form.add_field("model", model.get_hf_url())
+            form.add_field("language", "en")
+            form.add_field("temperature", "0")
+            form.add_field("response_format", "json")
+            metrics.start_time = time.monotonic()
+            async with session.post(f"{base_url}/v1/audio/transcriptions", data=form,
+                                    timeout=aiohttp.ClientTimeout(total=None, sock_read=300)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+                text = (await resp.json()).get("text", "")
+                metrics.record_output_chunk("text", base64.b64encode(text.encode()).decode(),
+                                            arrival_time=time.monotonic())
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
+
 class OrpheusVLLM(InferenceSystem):
     """Orpheus served the way the ``orpheus-speech`` package serves it: a plain vLLM server streams
     the LM's audio tokens over ``/v1/completions`` and this client turns them into 24 kHz audio with
@@ -1680,7 +1733,7 @@ class OursOpenAI(VLLMOmni):
         return dict(self.chat_template_kwargs or {})
 
     def _speech_fields(self) -> dict:
-        return {}
+        return {}  # plain PCM, no vllm-omni stream_format
 
     async def send_request(
         self,
