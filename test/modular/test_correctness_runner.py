@@ -235,3 +235,34 @@ def test_cosmos3_modes_and_image_size_override(tmp_path):
     vid = sets.Item(id="00", prompt="a cat", files={"image": "image/00.png"}, params={"seed": 0})
     (r,) = i2v.requests(sets.SampleSet("video_v1", tmp_path, {}, [vid]))
     assert r.files == [tmp_path / "image/00.png"] and r.input_modalities == "image,text"
+
+
+def test_math_sdpa_reference_spread_is_reported(tmp_path):
+    from PIL import Image
+
+    from benchmark.correctness.families import ZImageTurboImage
+
+    fam = ZImageTurboImage("z_image_turbo", {}, {})
+    math = ZImageTurboImage("z_image_turbo", {}, {"ref_sdpa": "math"})
+    assert math.reference_id() == fam.reference_id() + "-sdpa-math"
+    items = [sets.Item(id=f"{i:02d}", prompt="p", params={"seed": i, "height": 16, "width": 16}) for i in range(2)]
+    sset = sets.SampleSet("image_v1", tmp_path, {}, items)
+    rng = np.random.default_rng(0)
+    ref = tmp_path / "references" / fam.reference_id() / "image_v1"
+    alt = tmp_path / "references" / math.reference_id() / "image_v1"
+    run = tmp_path / "run" / "r1"
+    for d in (ref / "outputs", alt / "outputs", run / "outputs"):
+        d.mkdir(parents=True)
+    for d in (ref, alt):
+        (d / "meta.json").write_text("{}")
+    for it in items:
+        img = rng.integers(0, 256, (16, 16, 3), dtype=np.uint8)
+        for d in (ref / "outputs", run / "outputs"):
+            Image.fromarray(img).save(d / f"{it.id}.png")
+        Image.fromarray(np.clip(img.astype(int) + 4, 0, 255).astype(np.uint8)).save(alt / "outputs" / f"{it.id}.png")
+    work = tmp_path / "work"
+    work.mkdir()
+    sc = fam.score(sset, [run], ref, work, "cpu")
+    spread = sc.metrics["reference_vs_math_sdpa_reference_psnr_db"]
+    assert spread["n"] == 2 and 30 < spread["median"] < 40
+    assert math.math_reference_dir(ref) is None and fam.math_reference_dir(ref) == alt
