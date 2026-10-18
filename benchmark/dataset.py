@@ -87,6 +87,8 @@ class SampleSetDataset(BaseDataset):
         with open(os.path.join(root, "manifest.json"), encoding="utf-8") as f:
             manifest = json.load(f)
         modality = req_type.get_input_modalities()
+        # Generators also take the item's seed and size.
+        params_out = req_type.get_output_modalities() in ("image", "video_file")
         self.item_ids = []
         self.items = []
         for it in manifest["items"]:
@@ -94,10 +96,15 @@ class SampleSetDataset(BaseDataset):
             media = {}
             if modality in ("image", "audio", "video"):
                 if modality not in files:
-                    raise ValueError(f"item {it['id']} of {root} has no {modality} file")
+                    continue  # a mixed set (image, audio and video questions): keep this modality's items
                 media[f"{modality}_path"] = os.path.join(root, files[modality])
+            params = it.get("params") or {}
+            kwargs = {k: params[k] for k in ("seed", "height", "width") if params_out and k in params}
             self.item_ids.append(it["id"])
-            self.items.append(RequestInput(req_type=req_type, prompt=it.get("prompt", ""), **media))
+            self.items.append(RequestInput(req_type=req_type, prompt=it.get("prompt", ""), model_kwargs=kwargs,
+                                           **media))
+        if not self.items:
+            raise ValueError(f"no item of {root} has a {modality} file")
         self._num_requests = num_requests
         self.items = self._resize_data(self.items)
 

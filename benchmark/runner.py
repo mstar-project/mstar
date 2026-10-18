@@ -34,6 +34,7 @@ from benchmark.request import (
     OurSystem,
     RequestInput,
     RequestMetrics,
+    SGLangDiffusion,
     SGLangOmni,
     VLLMOmni,
     VoxServe,
@@ -63,6 +64,7 @@ class InferenceSystemType(Enum):
     SGLANG = "sglang"
     ORPHEUS_VLLM = "orpheus_vllm"
     TRANSCRIBE = "openai_transcribe"
+    SGLANG_DIFFUSION = "sglang_diffusion"
 
     def instantiate(self) -> InferenceSystem:
         if self == InferenceSystemType.OURS:
@@ -81,6 +83,8 @@ class InferenceSystemType(Enum):
             return OrpheusVLLM()
         elif self == InferenceSystemType.TRANSCRIBE:
             return OpenAITranscribe()
+        elif self == InferenceSystemType.SGLANG_DIFFUSION:
+            return SGLangDiffusion()
 
 
 class ProfilingType(Enum):
@@ -147,6 +151,10 @@ class BenchmarkConfig:
     # Prefix every prompt with a tag unique to this run and send, so no request can reuse
     # another's cached prefix (warmup sends the same prompts as the measured requests).
     unique_prompts: bool = False
+    # Settings merged into every request (e.g. steps and frame count for a generator).
+    request_kwargs: Optional[dict] = None
+    # Audio format asked of chat replies with speech (vllm-omni sends WAV segments by default).
+    chat_audio_format: Optional[str] = None
 
 
 class Benchmark:
@@ -157,6 +165,10 @@ class Benchmark:
             if not hasattr(self.inference_system, "chat_template_kwargs"):
                 raise ValueError(f"--chat-template-kwargs is not supported by {config.inference_system.value}")
             self.inference_system.chat_template_kwargs = config.chat_template_kwargs
+        if config.chat_audio_format is not None:
+            if not hasattr(self.inference_system, "chat_audio_format"):
+                raise ValueError(f"--chat-audio-format is not supported by {config.inference_system.value}")
+            self.inference_system.chat_audio_format = config.chat_audio_format
         self._prompt_salt = os.urandom(4).hex()
 
     def _tag_prompt(self, req: RequestInput, tag: str) -> RequestInput:
@@ -519,6 +531,9 @@ class Benchmark:
             # make even multiple of batch size
             self.config.num_requests = ((self.config.num_requests + bs - 1) // bs) * bs
         requests = dataset.get_requests()[: self.config.num_requests]
+        if self.config.request_kwargs:
+            requests = [dataclasses.replace(r, model_kwargs={**r.model_kwargs, **self.config.request_kwargs})
+                        for r in requests]
         self._assign_output_lengths(requests)
         measured = [self._tag_prompt(r, f"m{i}") for i, r in enumerate(requests)]
 
@@ -702,6 +717,17 @@ def parse_args() -> BenchmarkConfig:
         action="store_true",
         help="Prefix each prompt with a tag unique to the run and send, so no request reuses a cached prefix.",
     )
+    parser.add_argument(
+        "--request-kwargs",
+        type=json.loads,
+        default=None,
+        help='JSON settings merged into every request, e.g. \'{"num_inference_steps": 4}\'.',
+    )
+    parser.add_argument(
+        "--chat-audio-format",
+        default=None,
+        help="Audio format for chat replies with speech, e.g. pcm (vllm-omni defaults to WAV segments).",
+    )
 
     args = parser.parse_args()
 
@@ -787,6 +813,8 @@ def parse_args() -> BenchmarkConfig:
         output_len_seed=args.output_len_seed,
         chat_template_kwargs=args.chat_template_kwargs,
         unique_prompts=args.unique_prompts,
+        request_kwargs=args.request_kwargs,
+        chat_audio_format=args.chat_audio_format,
     )
 
 
