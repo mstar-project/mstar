@@ -403,6 +403,15 @@ def run_rows(plan: Plan, rows: list[Row], gpus: list[int], parallel: int, port_b
         t.join()
 
 
+def refuse_mixed_chips(prev: dict, node: dict, run_dir: Path) -> None:
+    """A resumed run continues on the chip it started on, so a table never holds two."""
+    was, now = prev.get("node_type"), node.get("node_type")
+    was_gpus, now_gpus = set((prev.get("gpu_names") or {}).values()), set((node.get("gpu_names") or {}).values())
+    if was != now or (was_gpus and now_gpus and was_gpus != now_gpus):
+        raise SystemExit(f"{run_dir} ran on {was} {sorted(map(str, was_gpus))}; this node is {now} "
+                         f"{sorted(map(str, now_gpus))}. Start a new run id instead.")
+
+
 def check_node(plan: Plan, node_type: str) -> dict:
     part = os.environ.get("SLURM_JOB_PARTITION", "")
     rec = host_record(plan.gpus)
@@ -468,6 +477,11 @@ def main(argv=None) -> int:
                 correctness=not args.no_correctness, numa=args.numa, resume=args.resume,
                 expect_gpus=args.expect_gpus)
     node = check_node(plan, args.node_type)
+    prev = json.loads((run_dir / "sweep.json").read_text()) if (run_dir / "sweep.json").is_file() else None
+    if prev:
+        refuse_mixed_chips(prev.get("node") or {}, node, run_dir)
+        if bool(prev.get("dry")) != args.dry:
+            raise SystemExit(f"{run_dir} is a {'dry' if prev.get('dry') else 'timed'} run; resume it the same way")
     if plan.correctness:
         from benchmark.amd import correctness
         plan.correctness_src = correctness.prepare_source(run_dir, args.correctness_src)
@@ -478,11 +492,17 @@ def main(argv=None) -> int:
             "worktree": str(plan.worktree), "driver": str(REPO), "argv": sys.argv,
             "correctness_src": str(plan.correctness_src) if plan.correctness_src else None,
             "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    if prev:
+        meta["started"] = prev.get("started", meta["started"])
+        meta["resumed"] = [*prev.get("resumed", []), {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                                                       "host": node.get("host"), "job": job}]
     (run_dir / "sweep.json").write_text(json.dumps(meta, indent=1, default=str))
     plan.log(f"table {table.name} -> {run_dir}")
 
     if not args.skip_health:
-        res = health.check(run_dir / "health", args.expect_gpus, gpus, name="check_before")
+        # A resumed run keeps the first check and adds one per resume.
+        name = f"check_resume{len(meta['resumed'])}" if meta.get("resumed") else "check_before"
+        res = health.check(run_dir / "health", args.expect_gpus, gpus, name=name)
         plan.log(f"node health: {res['verdict']['status']} {'; '.join(res['verdict']['reasons'])[:400]}")
         if res["verdict"]["status"] == "FAIL":
             if not args.dry:
