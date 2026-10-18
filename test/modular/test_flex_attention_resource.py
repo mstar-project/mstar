@@ -461,6 +461,24 @@ def test_capture_plan_requires_preallocated_mask_addresses():
 # ---------------------------------------------------------------------------
 
 
+class _Platform:
+    def __init__(self, rocm: bool):
+        self._rocm = rocm
+
+    def is_rocm(self) -> bool:
+        return self._rocm
+
+
+def test_make_block_mask_is_the_same_with_the_rocm_dense_copy(monkeypatch):
+    visible = visible_row((0, 2))
+    masks = {}
+    for rocm in (False, True):
+        monkeypatch.setattr(flex_module, "current_platform", _Platform(rocm))
+        masks[rocm] = make_block_mask(TPF, KV_LEN, visible)
+    for name in ("full_kv_num_blocks", "full_kv_indices", "kv_num_blocks", "kv_indices"):
+        assert torch.equal(getattr(masks[False], name), getattr(masks[True], name)), name
+
+
 def test_make_block_mask_rejects_unaligned_and_non_multiple_lengths():
     """Both constraints are real rather than defensive: the mask has no partial
     blocks, so a length or a row that does not land on a block boundary would
