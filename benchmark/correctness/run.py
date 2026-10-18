@@ -141,23 +141,21 @@ def main(argv=None) -> int:
     sset.items = items
     ref_dir = args.data_root / "references" / fam.reference_id() / fam.set_name
 
+    reference_error = None
     if args.reference_only or (args.make_reference and fam.ref_outputs(ref_dir) is None):
         if fam.ref_outputs(ref_dir) is not None and args.reference_only:
             print(f"reference exists: {ref_dir}")
         else:
             if args.limit:
                 raise SystemExit("--limit with a reference build would save a partial reference; refusing")
-            print(f"building reference {fam.reference_id()} for {fam.set_name} on {device} -> {ref_dir}",
-                  flush=True)
-            tmp = ref_dir.with_name(ref_dir.name + ".partial")
-            shutil.rmtree(tmp, ignore_errors=True)
-            (tmp / "outputs").mkdir(parents=True)
-            t0 = time.monotonic()
-            fam.make_reference(sset, tmp, device)
-            print(f"reference built in {time.monotonic() - t0:.0f}s", flush=True)
-            if ref_dir.exists():
-                shutil.rmtree(ref_dir)
-            tmp.rename(ref_dir)
+            try:
+                _build_reference(fam, sset, ref_dir, device)
+            except Exception:
+                if args.reference_only:
+                    raise
+                # The served run still says something (sanity, noise floor), so keep going.
+                reference_error = traceback.format_exc()
+                print(f"reference build failed, serving without it:\n{reference_error}", file=sys.stderr, flush=True)
         if args.reference_only:
             return 0
 
@@ -182,6 +180,7 @@ def main(argv=None) -> int:
     print(f"run dir {run_dir}", flush=True)
 
     header = {"config": config_name, "model": model_key, "run_id": run_id, "set": sset.name, "n_items": len(items),
+              "reference_build_error": reference_error,
               "limit": args.limit, "restarts": restarts, "concurrency": concurrency, "overrides": overrides,
               "worktree": str(worktree), "gpus": args.gpus, "port": args.port, "started": t_start,
               "reference": fam.reference_description() if fam.ref_outputs(ref_dir) else
@@ -239,6 +238,19 @@ def main(argv=None) -> int:
         print(f"verdict {verdict}: {run_dir / 'report.md'}")
         return EXIT[verdict]
     return _score_and_report(fam, sset, runs, ref_dir, run_dir, header, device, error)
+
+
+def _build_reference(fam, sset, ref_dir: Path, device: str) -> None:
+    print(f"building reference {fam.reference_id()} for {fam.set_name} on {device} -> {ref_dir}", flush=True)
+    tmp = ref_dir.with_name(ref_dir.name + ".partial")
+    shutil.rmtree(tmp, ignore_errors=True)
+    (tmp / "outputs").mkdir(parents=True)
+    t0 = time.monotonic()
+    fam.make_reference(sset, tmp, device)
+    print(f"reference built in {time.monotonic() - t0:.0f}s", flush=True)
+    if ref_dir.exists():
+        shutil.rmtree(ref_dir)
+    tmp.rename(ref_dir)
 
 
 def _score_and_report(fam, sset, runs, ref_dir, run_dir, header, device, error=None) -> int:
