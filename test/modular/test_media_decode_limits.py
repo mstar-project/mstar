@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from mstar.model.base import Model
+from mstar.model.components import media_io
 from mstar.model.media_limits import (
     DEFAULT_MAX_IMAGE_PIXELS,
     MIN_FRAME_PIXELS,
@@ -250,6 +251,22 @@ def _fake_torchcodec(monkeypatch, pulled, metadata=None, opened=None):
     decoders.VideoDecoder = FakeDecoder
     monkeypatch.setitem(sys.modules, "torchcodec", types.ModuleType("torchcodec"))
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    _media_io_with_torchcodec(monkeypatch)
+
+
+def _media_io_with_torchcodec(monkeypatch):
+    """The loaders' decoders where torchcodec works."""
+    monkeypatch.setattr(
+        media_io, "_decoders", lambda: media_io._Decoders(media_io._TorchcodecAudio(), media_io._TorchcodecVideo()),
+    )
+
+
+def _media_io_without_torchcodec(monkeypatch):
+    """The loaders' decoders where torchcodec does not load (ROCm, no FFmpeg): PyAV."""
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
+    monkeypatch.setattr(
+        media_io, "_decoders", lambda: media_io._Decoders(media_io._FallbackAudio(), media_io._PyAVVideo()),
+    )
 
 
 def test_base_video_loader_stops_at_the_budget(monkeypatch):
@@ -301,7 +318,7 @@ def test_cosmos3_pyav_fallback_stops_at_the_budget(tmp_path, monkeypatch):
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 
     path = _mp4(tmp_path / "clip.mp4", frames=10)
-    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)  # take the PyAV path
+    _media_io_without_torchcodec(monkeypatch)
     model = object.__new__(Cosmos3Model)
     monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(64 * 64 * 4))
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
@@ -328,7 +345,7 @@ def test_cosmos3_pyav_fallback_counts_tiny_frames(tmp_path, monkeypatch):
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 
     path = _mp4(tmp_path / "tiny.mp4", frames=30, side=16)
-    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)  # take the PyAV path
+    _media_io_without_torchcodec(monkeypatch)
     model = object.__new__(Cosmos3Model)
     # 30 frames of 16x16 are 7,680 pixels by area, but 30 minimum frames are over 20
     monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(MIN_FRAME_PIXELS * 20))
@@ -351,6 +368,7 @@ def test_qwen3_omni_checks_sampled_frames_before_fetch_video(monkeypatch):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     monkeypatch.setitem(sys.modules, "qwen_omni_utils.v2_5.vision_process", vision)
     monkeypatch.setattr(qwen3_omni_model, "probe_video", lambda _path: (10_000, 30.0, 4320, 7680))
+    _media_io_with_torchcodec(monkeypatch)
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
         qwen3_omni_model.Qwen3OmniModel.load_video(None, "clip.mp4", "cpu")
     assert fetched == []
@@ -388,7 +406,9 @@ def test_qwen3_omni_without_a_header_count_decodes_with_the_counting_reader(tmp_
     for name in ("qwen_omni_utils", "qwen_omni_utils.v2_5"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     monkeypatch.setitem(sys.modules, "qwen_omni_utils.v2_5.vision_process", vision)
-    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)  # probe with PyAV
+    # fetch_video's readers run where torchcodec works; the probe still reads with PyAV
+    _media_io_with_torchcodec(monkeypatch)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
 
     mkv = _mp4(tmp_path / "clip.mkv", frames=10)
     assert probe_video(mkv) is None
@@ -406,6 +426,28 @@ def test_qwen3_omni_without_a_header_count_decodes_with_the_counting_reader(tmp_
     load_video(None, mp4, "cpu")
     assert sampled == [mp4]
     assert vision.VIDEO_READER_BACKENDS["decord"].__wrapped__ is decord
+
+
+def test_qwen3_omni_without_torchcodec_counts_the_frames_it_samples(tmp_path, monkeypatch):
+    """Where torchcodec does not load, Qwen3-Omni samples its frames through
+    media_io rather than fetch_video, and each one counts as it decodes."""
+    try:
+        from mstar.model.qwen3_omni import qwen3_omni_model
+    except ImportError as exc:
+        pytest.skip(f"Qwen3-Omni does not import here: {exc}")
+
+    vision = types.ModuleType("qwen_omni_utils.v2_5.vision_process")
+    vision.fetch_video = lambda *a, **k: pytest.fail("fetch_video ran without torchcodec")
+    vision.calculate_video_frame_range = lambda ele, total, fps: (0, total - 1, total)
+    vision.smart_nframes = lambda ele, total_frames, video_fps: 4
+    for name in ("qwen_omni_utils", "qwen_omni_utils.v2_5"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "qwen_omni_utils.v2_5.vision_process", vision)
+    _media_io_without_torchcodec(monkeypatch)
+    path = _mp4(tmp_path / "clip.mp4", frames=10)
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(64 * 64 * 3))
+    with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
+        qwen3_omni_model.Qwen3OmniModel.load_video(None, path, "cpu")
 
 
 def test_the_whole_clip_reader_counts_frames_as_it_decodes(tmp_path, monkeypatch):
