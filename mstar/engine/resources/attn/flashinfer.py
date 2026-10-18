@@ -42,8 +42,8 @@ class FlashInferManager(AttentionManager):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
         self._max_rows_in_combined = max_rows_in_combined or {}
-        # off where the build's decode-without-tensor-cores kernel is the
-        # faster one (FlashInfer on ROCm); see `flashinfer_kwargs`
+        # False where decode without tensor cores is faster (FlashInfer on
+        # ROCm, see `flashinfer_kwargs`)
         self._decode_tensor_cores = decode_tensor_cores
         self._device = device
         self._dtype = dtype
