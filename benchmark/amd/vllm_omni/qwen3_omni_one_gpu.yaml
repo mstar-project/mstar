@@ -1,0 +1,14 @@
+# Qwen3-Omni on one GPU in vllm-omni, next to mstar's qwen3omni_colocated config. Only the placement
+# differs from vllm_omni/deploy/qwen3_omni_moe.yaml: every stage on device 0, with the memory split so
+# the three engines fit (the default gives the thinker 0.9 of its own GPU).
+base_config: /app/vllm-omni/vllm_omni/deploy/qwen3_omni_moe.yaml
+stages:
+  - stage_id: 0
+    devices: "0"
+    gpu_memory_utilization: 0.55
+  - stage_id: 1
+    devices: "0"
+    gpu_memory_utilization: 0.25
+  - stage_id: 2
+    devices: "0"
+    gpu_memory_utilization: 0.08
