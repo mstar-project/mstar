@@ -1760,6 +1760,7 @@ class Qwen3OmniModel(Model):
             Qwen3OmniMoeAudioEncoder,
         )
 
+        from mstar.model.components.hf_attention import build_hf_encoder
         from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
@@ -1773,15 +1774,13 @@ class Qwen3OmniModel(Model):
         audio_config = config.thinker_config.audio_config
 
         # Build the audio encoder from config.
-        # IMPORTANT: pass attn_implementation="flash_attention_2" so the
-        # encoder uses the cu_seqlens FA2 path. With the HF default
-        # (which resolves to "sdpa"), Qwen3OmniMoeAudioAttention runs
-        # SDPA on the full packed sequence (no per-segment fusion),
-        # which is significantly slower than FA2's varlen path.
+        # IMPORTANT: the encoder must get a varlen attention implementation
+        # (FA2, or mstar's varlen kernel where flash_attn is not installed)
+        # so it uses the cu_seqlens path. With the HF default (which resolves
+        # to "sdpa"), Qwen3OmniMoeAudioAttention runs SDPA once per window,
+        # which is significantly slower than the varlen path.
         patch_hf_fa2_int_maxlen()
-        audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(
-            audio_config, attn_implementation="flash_attention_2"
-        )
+        audio_encoder = build_hf_encoder(Qwen3OmniMoeAudioEncoder, audio_config)
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
@@ -1801,6 +1800,7 @@ class Qwen3OmniModel(Model):
             Qwen3OmniMoeVisionEncoder,
         )
 
+        from mstar.model.components.hf_attention import build_hf_encoder
         from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
@@ -1814,19 +1814,18 @@ class Qwen3OmniModel(Model):
         vision_config = config.thinker_config.vision_config
 
         # Build the vision encoder.
-        # CRITICAL: pass attn_implementation="flash_attention_2". Without
-        # this, vision_config._attn_implementation defaults to None and is
+        # CRITICAL: give it a varlen attention implementation (FA2, or
+        # mstar's varlen kernel where flash_attn is not installed). Without
+        # one, vision_config._attn_implementation defaults to None and is
         # resolved to "sdpa" at runtime (modeling_utils.py:1889). With
         # "sdpa", Qwen3OmniMoeVisionAttention.forward falls into the
         # per-segment Python loop (modeling_qwen3_omni_moe.py:892-913),
         # which issues N sequential attention calls per layer for an
-        # N-frame video and makes V2T/V2S TTFT far slower. With
-        # "flash_attention_2", a single varlen FA2 call
-        # per layer handles all frames at once via cu_seqlens.
+        # N-frame video and makes V2T/V2S TTFT far slower. With a varlen
+        # implementation, a single call per layer handles all frames at once
+        # via cu_seqlens.
         patch_hf_fa2_int_maxlen()
-        vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(
-            vision_config, attn_implementation="flash_attention_2"
-        )
+        vision_encoder = build_hf_encoder(Qwen3OmniMoeVisionEncoder, vision_config)
 
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,
