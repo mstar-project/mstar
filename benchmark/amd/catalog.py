@@ -21,7 +21,7 @@ class Row:
     """One model served on ``gpus`` GPUs. ``name`` is also the mstar config name."""
 
     name: str
-    family: str  # text, tts or asr
+    family: str  # text, tts, asr, omni, image or video
     hf_id: str
     runner_model: str  # benchmark.runner --model
     gpus: int = 1
@@ -64,6 +64,12 @@ ROWS: dict[str, Row] = {r.name: r for r in [
         engine_args={"vllm-omni-tuned": ("--deploy-config", str(VLLM_OMNI_DEPLOY / "qwen3_omni_rocm_tuned.yaml"))},
         engine_env={"vllm-omni": {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}}, cost=3.0),
     Row("whisper_large", "asr", "openai/whisper-large-v3", "whisper_large", max_len=448),
+    Row("flux2_klein", "image", "black-forest-labs/FLUX.2-klein-4B", "flux2_klein"),
+    Row("z_image_turbo", "image", "Tongyi-MAI/Z-Image-Turbo", "z_image_turbo"),
+    Row("wan22", "video", "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "wan22", cost=4.0),
+    # vllm-omni's Cosmos3 recipe serves without the guardrail models (recipes/cosmos3/Cosmos3-Nano.md).
+    Row("cosmos3_nano", "video", "nvidia/Cosmos3-Nano", "cosmos3_nano", cost=4.0,
+        engine_args={"vllm-omni": ("--no-guardrails",)}),
 ]}
 
 
@@ -79,8 +85,10 @@ class Arm:
     tp_env: dict = field(default_factory=dict)  # added when tp > 1
     tp_args: tuple[str, ...] = ()
     recipe: str = ""
-    # Why the arm does not compute the same thing as mstar, for the table's "not comparable because" column.
+    # Why the arm does not compute the same thing as mstar, for the table's "not comparable because" column,
+    # for every family or per family.
     differs: str = ""
+    differs_for: dict = field(default_factory=dict)
     models: tuple[str, ...] = ()  # rows (by runner model) this arm serves; empty means any row of its families
     # The server takes the first ``server_gpus`` of the row's GPUs; the client gets the next one (or the
     # first if none is left) for work it does on a GPU, such as decoding audio.
@@ -96,7 +104,8 @@ SGLANG_COOKBOOK = "sglang v0.5.22 docs/cookbook/autoregressive/Qwen/Qwen3.5.mdx,
 SGLANG_CI = "sglang v0.5.22 test/registered/amd/accuracy/mi30x/test_qwen35_eval_amd.py (AMD CI launch flags)"
 
 ARMS: dict[str, Arm] = {a.name: a for a in [
-    Arm("mstar", "mstar", ("text", "tts", "asr"), client="ours_openai", env={"MSTAR_SHM_ARENA": "1"},
+    Arm("mstar", "mstar", ("text", "tts", "asr", "omni", "image", "video"), client="ours_openai",
+        env={"MSTAR_SHM_ARENA": "1"},
         recipe="configs/<row>.yaml unchanged; MSTAR_SHM_ARENA=1 as .claude/skills/benchmarking asks for numbers"),
     Arm("vllm", "vllm", ("text",), client="vllm", image="vllm",
         recipe="image defaults (v0.31.0 picks ROCM_ATTN on gfx942, AITER off)"),
@@ -123,14 +132,20 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
               "--trust-remote-code"),
         tp_args=("--enable-aiter-allreduce-fusion",), recipe=SGLANG_COOKBOOK,
         differs="bf16 GDN state (mstar and vLLM keep the checkpoint's fp32)"),
-    Arm("sglang-diffusion", "sglang-diffusion", ("image", "video"), image="sglang",
+    Arm("sglang-whisper", "sglang", ("asr",), client="openai_transcribe", image="sglang",
+        args=("--attention-backend", "aiter"),
+        recipe="sglang v0.5.22: aiter attention named explicitly, since its auto-selector picks FlashInfer for "
+               "Whisper (DESIGN.md section 11; research/competitors_matrix.md 2.2)"),
+    Arm("sglang-diffusion", "sglang-diffusion", ("image", "video"), client="sglang_diffusion", image="sglang",
+        models=("flux2_klein", "z_image_turbo"),
         args=("--dit-cpu-offload", "false", "--text-encoder-cpu-offload", "false", "--vae-cpu-offload", "false"),
         recipe="SGLang Diffusion with every CPU offload off (DESIGN.md section 11; benchmark/wan22/reproduce.sh)"),
-    Arm("vllm-omni", "vllm-omni", ("tts", "omni"), client="vllm_omni", image="vllm-omni",
-        models=("qwen3_tts", "qwen3omni"), args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"),
+    Arm("vllm-omni", "vllm-omni", ("tts", "omni", "image", "video"), client="vllm_omni", image="vllm-omni",
+        models=("qwen3_tts", "qwen3omni", "flux2_klein", "z_image_turbo", "wan22", "cosmos3_nano"),
+        args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"),
         recipe="vllm-omni v0.30.0 defaults on ROCm: the model's deploy YAML with its platforms.rocm section "
                "(AR stages on TRITON_ATTN, Code2Wav eager)",
-        differs="Code2Wav runs eager on ROCm"),
+        differs_for={"tts": "Code2Wav runs eager on ROCm", "omni": "Code2Wav runs eager on ROCm"}),
     Arm("vllm-omni-tuned", "vllm-omni", ("tts", "omni"), client="vllm_omni", image="vllm-omni",
         models=("qwen3_tts", "qwen3omni"), env={"VLLM_ROCM_USE_AITER": "1", "MIOPEN_FIND_MODE": "FAST"},
         args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"),
