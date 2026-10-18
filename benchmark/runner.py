@@ -29,6 +29,7 @@ from benchmark.request import (
     AggregateMetrics,
     InferenceSystem,
     OpenAIText,
+    OpenAITranscribe,
     OrpheusVLLM,
     OursOpenAI,
     OurSystem,
@@ -62,6 +63,7 @@ class InferenceSystemType(Enum):
     VLLM = "vllm"
     SGLANG = "sglang"
     ORPHEUS_VLLM = "orpheus_vllm"
+    TRANSCRIBE = "openai_transcribe"
 
     def instantiate(self) -> InferenceSystem:
         if self == InferenceSystemType.OURS:
@@ -78,6 +80,8 @@ class InferenceSystemType(Enum):
             return OpenAIText()
         elif self == InferenceSystemType.ORPHEUS_VLLM:
             return OrpheusVLLM()
+        elif self == InferenceSystemType.TRANSCRIBE:
+            return OpenAITranscribe()
 
 
 class ProfilingType(Enum):
