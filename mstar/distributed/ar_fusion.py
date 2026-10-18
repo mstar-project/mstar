@@ -58,7 +58,18 @@ def create_workspace(
                            backend, exc_info=True)
         # Every rank must use the same backend, or the next collective
         # deadlocks: keep one only if it built on all of them.
-        if _all_ranks(ws is not None, cpu_group):
+        try:
+            agreed = _all_ranks(ws is not None, cpu_group)
+        except RuntimeError:
+            # A rank failed between FlashInfer's own collectives, so this vote
+            # met a different one; the gloo timeout closes the group on every
+            # member, and every rank falls back here.
+            logger.exception("TP ranks lost sync building the fusion workspace; "
+                             "keeping NCCL all-reduce + separate norm")
+            if ws is not None:
+                ws.destroy()
+            return None
+        if agreed:
             _WORKSPACES.append(ws)
             logger.info("all-reduce fusion workspace: %s (backend %r), up to "
                         "%d tokens x %d", type(ws).__name__, backend,
