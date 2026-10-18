@@ -159,6 +159,11 @@ class Launch:
 
     # --- what runs ---------------------------------------------------------------------------
     @property
+    def startup_wait(self) -> int:
+        """Seconds to wait for /health: the launch's limit, or longer where the arm or the model needs it."""
+        return max(self.startup_timeout, self.arm.startup_timeout or 0, self.row.startup_timeout or 0)
+
+    @property
     def server_gpus(self) -> list[int]:
         return self.gpus[: self.arm.server_gpus] if self.arm.server_gpus else self.gpus
 
@@ -318,9 +323,8 @@ class Launch:
             versions["gpu_occupancy_before"] = occ
             (self.run_dir / "versions.json").write_text(json.dumps(versions, indent=1, default=str))
             t0 = time.monotonic()
-            timeout = max(self.startup_timeout, self.arm.startup_timeout or 0)
             p = subprocess.run([str(SERVER_SH), "start", self.name, str(self.port), "--timeout",
-                                str(timeout), "--log", str(self.run_dir / "server.log"), "--", *cmd],
+                                str(self.startup_wait), "--log", str(self.run_dir / "server.log"), "--", *cmd],
                                cwd=self.worktree if self.arm.engine == "mstar" else self.run_dir, env=env,
                                capture_output=True, text=True, check=False)
             ready_s = time.monotonic() - t0
