@@ -1471,66 +1471,122 @@ Running on AMD GPUs
 Models use the same code and configs on AMD Instinct MI300X/MI325X (``gfx942``), and the
 engine picks ROCm kernels for them (see :ref:`architecture:Hardware platforms` and
 :ref:`installation:ROCm (AMD Instinct MI300X/MI325X, gfx942)`). The table lists what has
-been run on an MI300X and checked against a reference. "Not yet run" means nobody has
-checked, not that it fails.
+been run on one MI300X and checked against a reference, usually the model's Hugging Face,
+diffusers or package implementation on the same GPU. Speech is scored by Whisper's word
+error rate (WER). Cold start is the time to a healthy server with empty compile caches on
+a 16-vCPU MI300X VM. A saved cache brings most models down to 2-6 minutes (see
+:ref:`installation:ROCm (AMD Instinct MI300X/MI325X, gfx942)`). "Not yet run" means nobody
+has checked, not that it fails.
 
 .. list-table::
    :header-rows: 1
-   :widths: 22 16 62
+   :widths: 20 12 54 14
 
-   * - Model
+   * - Model (config)
      - Status
-     - Notes
-   * - ``kokoro``
-     - Works
-     - ``kokoro.yaml``. On 40 TTS prompts the Whisper word error rate of its speech
-       matched the reference ``kokoro`` package's (1.97%).
-   * - ``orpheus``
-     - Works
-     - ``orpheus_colocated.yaml`` (one GPU). On 40 prompts its WER was 1.75%, against
-       1.97% for the Hugging Face reference. Attention runs on AITER, and norms, RoPE and
-       sampling on AMD's FlashInfer. ``orpheus.yaml`` (two GPUs) and ``orpheus_tp2.yaml``
-       haven't been run.
-   * - ``qwen3_tts``
-     - Works
-     - ``qwen3tts.yaml`` (0.6B CustomVoice). 96 requests at concurrency 16 all succeeded,
-       and Whisper got one word wrong across 10 sampled outputs. The 1.7B configs
-       haven't been run.
+     - Evidence
+     - Cold start
    * - ``qwen3_5_{0.8,2,4,9}b``
-     - Works, text only
-     - One GPU. Greedy output matched Hugging Face transformers over the first 64 tokens
-       on 7, 7, 5 and 8 of 8 prompts (0.8B, 2B, 4B, 9B). Every mismatch started where
-       transformers' own bf16 logits for the top two tokens were tied. Image input,
-       ``qwen3_5_9b_tp2``, ``qwen3_5_27b_tp4`` and ``qwen3_8_27b`` haven't been run.
+     - Works
+     - Text and image questions against transformers. Every divergence is a near tie (the
+       token is in transformers' top 8, within 1 nat of its pick), and all long-context
+       needles are found.
+     - 7-10 min
    * - ``whisper_large``
      - Works
-     - ``whisper_large.yaml``. On 50 LibriSpeech test-clean clips the WER was 3.17%, and
-       all 50 transcripts matched Hugging Face transformers'. torchcodec has no ROCm
-       build, so audio is decoded with soundfile or PyAV.
+     - WER 1.69% on 100 LibriSpeech clips, same as transformers, and all 100 transcripts
+       match.
+     - 4 min
    * - ``higgs_audio``
      - Works
-     - ``higgs_audio.yaml``. WER 1.64% on the same 50 clips.
-   * - ``chatterbox``
+     - WER 1.48% against the LibriSpeech transcripts. Its own reference code needs
+       transformers 4.51, so it wasn't compared.
+     - 3 min
+   * - ``kokoro``
+     - Works
+     - WER 1.97% on 40 prompts, same as the ``kokoro`` package.
+     - 15-21 min
+   * - ``orpheus`` (``orpheus_colocated``)
+     - Works
+     - WER 0.66-1.31% against 1.97% for transformers plus SNAC.
+     - 15-24 min
+   * - ``qwen3_tts`` (``qwen3tts``)
+     - Works
+     - WER 0.66-0.87% against 0.87% for the ``qwen-tts`` package.
+     - 7 min
+   * - ``qwen3_tts_1p7b``
+     - Works, caveat
+     - WER 0.9-1.3 points above ``qwen-tts``. Both sides sample, and the extra errors are
+       proper nouns.
+     -
+   * - ``chatterbox``, ``chatterbox_turbo``
+     - Works
+     - WER equal to ``chatterbox-tts`` for the base model and 0.66 points above it for
+       Turbo.
+     - 1 min
+   * - ``chatterbox_multilingual``
+     - Works, caveat
+     - WER 0.9-1.5% against 5.9% for ``chatterbox-tts``, whose clips add speech the text
+       doesn't have. M*'s clips are shorter as a result (median duration ratio 0.80).
+     - 1 min
+   * - ``omnivoice``
+     - Works
+     - WER 0.22%, same as the ``omnivoice`` package.
+     - under 1 min, first requests compile
+   * - ``qwen3_omni`` (``qwen3omni_colocated``)
+     - Works, caveat
+     - Image, audio and video questions are near ties against the transformers Thinker,
+       and spoken replies match their text (median WER 0%). In text, one prompt run in 64
+       diverged for real, still being looked at.
+     - over 40 min (Code2Wav buckets take 6.5-8 min each), 6 min warm
+   * - ``cosmos3`` (``cosmos3_nano``)
+     - Works, caveat
+     - Text-to-image 35.8-37.2 dB against the fused reference, captured denoise 37.1 dB.
+       Text-to-video is 24.7-26.0 dB, under the 30 dB bar set on H100, but the reference
+       moves about as far (25 dB) when only its attention kernel changes on ROCm.
+     -
+   * - ``cosmos3_edge``, ``cosmos3_droid``, ``cosmos3_edge_droid``
      - Runs
-     - ``chatterbox.yaml``. Only three sentences checked, Whisper transcribed all of
-       them correctly.
+     - They serve on one MI300X. Not compared with a reference yet.
+     -
+   * - ``flux2_klein``
+     - Works
+     - 30.3 dB against diffusers, which moves 23.2 dB against itself when only its
+       attention runs math SDPA. Edits 33.0 dB.
+     - 25 min
+   * - ``z_image_turbo``
+     - Works
+     - 25.3 dB against diffusers, which moves 25.5 dB against itself with math SDPA.
+     - 20 min
+   * - ``wan22``
+     - Works, caveat
+     - Text embeddings and the CFG trajectory match the reference bit for bit, and the
+       video is 27.9 dB from the reference mp4. The VAE decode isn't bit-repeatable from
+       call to call (MIOpen's split-K conv solver).
+     -
+   * - ``waypoint`` (``waypoint_360p``)
+     - Works
+     - Self-consistency tests pass, and same-seed rollouts are byte-identical. There's no
+       independent reference.
+     -
    * - ``vjepa2``
-     - Runs, not matched yet
-     - On a UCF101 clip the predictor output's cosine similarity to Hugging Face's fp32
-       model was 0.998, but the encoder output's only 0.93 (transformers' own bf16 run
-       gets 0.97).
-   * - ``cosmos3`` and its variants
+     - Open
+     - Predictor output cosine 0.998 against transformers in fp32, but the encoder's only
+       0.93 (transformers' own bf16 run gets 0.97).
+     -
+   * - ``bagel``, ``nemotron_duplex``, ``pi05``, ``vjepa2_ac``, ``flux2_klein_9b``,
+       ``cosmos3_super``, ``qwen3_tts_base``, ``qwen3_tts_voicedesign``, ``waypoint``
+       (720p), and every multi-GPU config
      - Not yet run
-     - Dense attention's AITER kernel matches an fp32 reference, but no full model run
-       has been checked yet.
-   * - ``bagel``, ``flux2_klein``, ``nemotron_duplex``, ``omnivoice``, ``pi05``,
-       ``qwen3_omni``, ``wan22``, ``waypoint``, ``z_image_turbo``
-     - Not yet run
+     -
      -
 
 A few things apply to every model on AMD GPUs:
 
 - Only single-GPU configs have been run so far. Tensor-parallel ones, including the fused
   all-reduce + RMSNorm, haven't been checked on AMD GPUs yet.
-- The first start compiles a lot. With empty caches on a 16-vCPU MI300X VM it took about
-  4 minutes for Kokoro and 17 to 24 for Orpheus.
+- Greedy output can differ between two server processes at near-tied tokens. For
+  Qwen3.5, two instances agreed on 16 to 31 of 32 prompts, and every difference was a
+  near tie.
+- On AMD GPUs Qwen3-Omni's routed experts can also run on AITER (``moe_backend: aiter``,
+  see `Qwen3-Omni notes`_). Triton stays the default.
