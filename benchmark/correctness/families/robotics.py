@@ -28,6 +28,12 @@ class ArrayOutputFamily(Family):
     out_modality = "action"
     repro_pass, repro_warn = 0.05, 0.2  # max-abs difference between two server instances, same seed
 
+    def select_items(self, items: list) -> list:
+        """--family-opt skip_empty_prompt=1 drops episodes without a task string (two of the ten in droid_v1)."""
+        if self.opt("skip_empty_prompt", "0") in ("1", "true", "True"):
+            return [it for it in items if it.prompt.strip()]
+        return items
+
     def to_array(self, raw: np.ndarray, resp: Response | None = None) -> np.ndarray:
         return raw
 
