@@ -135,7 +135,7 @@ class _DecodeModel:
 
 
 class _Greedy:
-    def sample(self, request_ids, logits):
+    def sample(self, logits):
         return logits.argmax(-1)
 
 

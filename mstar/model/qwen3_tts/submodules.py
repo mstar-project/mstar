@@ -631,11 +631,10 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         talker_sampler: SamplerResource = engine_inputs.resources[TALKER_SAMPLER]
         code_pred_sampler: SamplerResource = engine_inputs.resources[CODE_PRED_SAMPLER]
-        request_ids = engine_inputs.request_ids
 
         # The repetition penalty applies to group 0 only (its SamplerStep sets
         # apply_penalty); the depth loop's sampler declares no penalty.
-        layer0_codes = talker_sampler.sample(request_ids, logits)
+        layer0_codes = talker_sampler.sample(logits)
 
         piecewise = self._run_depth_loop_piecewise(
             engine_inputs, last_hidden, layer0_codes
@@ -643,7 +642,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         if piecewise is not None:
             all_codes, codec_embed_sum = piecewise
         else:
-            all_codes, codec_embed_sum = self._run_depth(last_hidden, layer0_codes, code_pred_sampler, request_ids)
+            all_codes, codec_embed_sum = self._run_depth(last_hidden, layer0_codes, code_pred_sampler)
 
         return {
             "talker_input_embeds": codec_embed_sum,
@@ -652,14 +651,14 @@ class TalkerSubmodule(ARNodeSubmodule):
         }
 
     def _run_depth(
-        self, last_hidden: torch.Tensor, layer0_codes: torch.Tensor, sampler: SamplerResource, request_ids: list[str],
+        self, last_hidden: torch.Tensor, layer0_codes: torch.Tensor, sampler: SamplerResource,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`_depth_loop`'s outputs, from the frame kernel when it holds the rows and can draw as ``sampler`` would."""
         frame, batch_size = self._depth_frame, layer0_codes.shape[0]
         draw = sampler.fused_draw_args() if frame is not None and batch_size <= frame.max_rows else None
         if draw is None:
             return self._depth_loop(
-                last_hidden, layer0_codes, lambda cp_logits: sampler.sample(request_ids, cp_logits),
+                last_hidden, layer0_codes, sampler.sample,
             )
         talker_table = self.model.model.codec_embedding.weight
         all_codes = torch.empty(
@@ -704,7 +703,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         code_pred_sampler: SamplerResource = call.resources[CODE_PRED_SAMPLER]
         all_codes, codec_embed_sum = self._run_depth(
             call.static_inputs["last_hidden"], call.static_inputs["layer0_codes"], code_pred_sampler,
-            call.engine_inputs.request_ids,
         )
         return {"all_codes": all_codes, "codec_embed_sum": codec_embed_sum}
 

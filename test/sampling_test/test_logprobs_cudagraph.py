@@ -41,12 +41,12 @@ class _Captured:
         self.logits = _logits(99)
         for _ in range(3):  # autotune outside the capture, re-planned as the runner does
             self._plan(rids)
-            res.sample(list(rids), self.logits)
+            res.sample(self.logits)
         ctx = self._plan(rids)
         torch.cuda.synchronize()
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
-            self.tokens = res.sample(list(rids), self.logits)
+            self.tokens = res.sample(self.logits)
         res.commit(SamplerStep(apply_penalty=False), ctx)
 
     def _plan(self, rids):
@@ -146,7 +146,7 @@ def test_captured_and_eager_agree_on_a_greedy_row():
     step = SamplerStep(apply_penalty=False)
     ctx = StepContext(request_ids=(0, 1), graph_walk="decode", slot=0, capture=False)
     eager.plan(step, ctx)
-    eager_tokens = eager.sample([0, 1], logits)
+    eager_tokens = eager.sample(logits)
     eager_rows = eager.step_host_rows()[SAMPLED_LOGPROB].cpu()
 
     res = _resource()
@@ -164,7 +164,7 @@ def _eager_step(res, rids, logits, apply_penalty=False):
     step = SamplerStep(apply_penalty=apply_penalty)
     ctx = StepContext(request_ids=tuple(rids), graph_walk="decode", slot=0, capture=False)
     res.plan(step, ctx)
-    tokens = res.sample(list(rids), logits, apply_penalty=apply_penalty)
+    tokens = res.sample(logits)
     rows = res.step_host_rows()[SAMPLED_LOGPROB].cpu()
     res.commit(step, ctx)
     return tokens, rows
