@@ -80,7 +80,7 @@ class CrossAttentionManager(AttentionResource):
             )
         raise ValueError(f"Unknown cross attention backend {backend!r}")
 
-    # The context and the query packing do not depend on the kernel; every
+    # Context views and query packing are the same for every kernel. Each
     # backend sets ``_kv_cache_name``, ``_query_kv_cache_name``,
     # ``_context_label`` and ``_kv_config``.
 
