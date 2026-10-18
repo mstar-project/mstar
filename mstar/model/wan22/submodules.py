@@ -645,23 +645,14 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
             )
 
     def _decode_dtype(self):
-        # TODO: pull conv3d-dtype resolution into a common helper shared with
-        # cosmos3 (same cuDNN-version issue there).
-        # cuDNN ships fast bf16 conv3d for this VAE decode only from 9.16. On
-        # older builds bf16 is 2-10x SLOWER than fp32/TF32, so read the live cuDNN
-        # version and pick accordingly; an upgrade then flips the choice on its own.
-        # WAN22_VAE_DECODE_FP32 forces fp32.
+        # see wan_vae.decode_dtype, WAN22_VAE_DECODE_FP32 overrides
         if self._decode_dtype_cached is not None:
             return self._decode_dtype_cached
-        override = os.environ.get("WAN22_VAE_DECODE_FP32")
-        if override is not None:
-            on = override.lower() not in ("0", "false", "no", "off")
-            self._decode_dtype_cached = torch.float32 if on else torch.bfloat16
-        else:
-            ver = torch.backends.cudnn.version() or 0
-            self._decode_dtype_cached = torch.bfloat16 if ver >= 91600 else torch.float32
-        logger.info("Wan2.2 VAE decode dtype = %s (cuDNN %s)",
-                    self._decode_dtype_cached, torch.backends.cudnn.version())
+        from mstar.model.components import wan_vae
+
+        self._decode_dtype_cached = wan_vae.decode_dtype("WAN22_VAE_DECODE_FP32")
+        logger.info("Wan2.2 VAE decode dtype = %s (%s)",
+                    self._decode_dtype_cached, wan_vae.conv_library_version())
         return self._decode_dtype_cached
 
     def prepare_inputs(

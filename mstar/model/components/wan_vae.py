@@ -14,11 +14,14 @@ conv3d kernels run in, so no conv pays a layout conversion on the way in or out.
 from __future__ import annotations
 
 import contextlib
+import os
 
 import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanUpsample, unpatchify
 from torch import nn
+
+from mstar.platforms import current_platform
 
 
 class ChannelsLastCausalConv3d(WanCausalConv3d):
@@ -312,3 +315,26 @@ def cudnn_benchmark(enabled: bool):
         yield
     finally:
         torch.backends.cudnn.benchmark = previous
+
+
+def decode_dtype(override_env: str) -> torch.dtype:
+    """Dtype for the Wan VAE decode.
+
+    If ``override_env`` is set it wins (truthy means fp32). On CUDA bf16
+    conv3d is only fast from cuDNN 9.16, older versions are 2-10x slower than
+    fp32. On ROCm bf16 is the fast one (3.5x vs fp32 on an MI300X), and
+    cudnn.version() there is MIOpen's, so it can't be compared to 9.16.
+    """
+    override = os.environ.get(override_env)
+    if override is not None:
+        return torch.float32 if override.lower() not in ("0", "false", "no", "off") else torch.bfloat16
+    if current_platform.is_rocm():
+        return torch.bfloat16
+    version = torch.backends.cudnn.version() or 0
+    return torch.bfloat16 if version >= 91600 else torch.float32
+
+
+def conv_library_version() -> str:
+    """Conv library name and version, for logging."""
+    library = "MIOpen" if current_platform.is_rocm() else "cuDNN"
+    return f"{library} {torch.backends.cudnn.version()}"
