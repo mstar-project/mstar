@@ -44,6 +44,9 @@ CTR_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "SLURM_JOB_ID", "
 CTR_FORWARDED = ("VLLM_", "SGLANG_", "AITER_", "HSA_", "NCCL_", "RCCL_", "MIOPEN_", "TORCH_", "TORCHINDUCTOR_",
                  "PYTORCH_", "HF_", "DIFFUSION_", "OMNI_", "HIP_")
 VRAM_BUSY_MB = 4096
+# Server log lines that say which attention backend an engine picked (vLLM, SGLang).
+BACKEND_PATTERNS = (re.compile(r"Using (\w+) backend \(selected"), re.compile(r"Overriding with (\w+) out of"),
+                    re.compile(r"'attention_backend': '(\w+)'"), re.compile(r"Using (\w+/?\w*) GDN prefill kernel"))
 TTS_VOICE = {"kokoro": "af_heart", "orpheus": "tara", "qwen3_tts": "vivian"}
 
 
@@ -324,6 +327,7 @@ class Launch:
                 self._point_locks_at(pid)
             first_s, first_err = first_request(self)
             startup = {"ready_s": round(ready_s, 1), "first_request_s": first_s, "first_request_error": first_err,
+                       "backends": backends_in_log(self.run_dir / "server.log"),
                        "server_pid": pid, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                        "ipc_dir": str(self.ipc_dir), "upload_dir": str(self.upload_dir)}
             (self.run_dir / "startup.json").write_text(json.dumps(startup, indent=1))
@@ -368,6 +372,19 @@ class Launch:
         if self.run_dir.is_dir():
             (self.run_dir / "stopped").write_text(json.dumps(info, indent=1))
         return info
+
+
+def backends_in_log(path: Path) -> list[str]:
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return []
+    found = []
+    for pat in BACKEND_PATTERNS:
+        for m in pat.finditer(text):
+            if m.group(1) not in found:
+                found.append(m.group(1))
+    return found[:6]
 
 
 def session_processes(sid: int) -> list[int]:
