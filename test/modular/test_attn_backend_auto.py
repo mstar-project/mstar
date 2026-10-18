@@ -1,10 +1,11 @@
 """``AUTO`` attention backends: the default every attention config declares,
 resolved to a concrete backend when the resource is built.
 
-Every platform resolves ``AUTO`` to FlashInfer, which is what each config
-defaulted to before ``AUTO`` existed, and a backend named explicitly in a spec
-or a deployment's YAML is built as named. Builds run on the CPU device: the
-managers allocate nothing until their first plan.
+NVIDIA, Intel and CPU processes resolve ``AUTO`` to FlashInfer, which is what
+each config defaulted to before ``AUTO`` existed; ROCm resolves it to AITER, or
+to AMD's FlashInfer build where AITER would be unsafe or is missing. A backend
+named explicitly in a spec or a deployment's YAML is built as named. Builds run
+on the CPU device: the managers allocate nothing until their first plan.
 """
 
 import logging
@@ -12,6 +13,7 @@ import logging
 import pytest
 import torch
 
+from mstar import platforms
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -25,10 +27,21 @@ from mstar.engine.resources import (
     RaggedCrossAttentionSpec,
     apply_yaml_overrides,
 )
+from mstar.engine.resources.attn import aiter as rocm_attn
 from mstar.engine.resources.attn import dense as dense_module
-from mstar.engine.resources.attn.base import AttentionManager, resolve_attn_backend
+from mstar.engine.resources.attn.aiter import AiterCrossManager, AiterPagedAttentionManager
+from mstar.engine.resources.attn.base import (
+    AttentionManager,
+    flashinfer_kwargs,
+    resolve_attn_backend,
+)
 from mstar.engine.resources.attn.cross import CrossAttentionManager, FlashInferCrossManager
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
+from mstar.engine.resources.attn.ragged import aiter as rocm_ragged
+from mstar.engine.resources.attn.ragged.aiter import (
+    AiterRaggedCrossManager,
+    AiterRaggedManager,
+)
 from mstar.engine.resources.attn.ragged.base import resolve_ragged_attn_backend
 from mstar.engine.resources.attn.ragged.flashinfer import (
     FlashInferRaggedCrossManager,
@@ -36,8 +49,16 @@ from mstar.engine.resources.attn.ragged.flashinfer import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.config import PagedKVConfig, RingKVConfig, RingKVLayerConfig
+from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform
 
 CPU = torch.device("cpu")
+
+
+@pytest.fixture(autouse=True)
+def cpu_process(monkeypatch):
+    """Resolve as a process without a GPU unless a test says otherwise, so the
+    suite answers the same on a GPU node."""
+    monkeypatch.setattr(platforms, "resolve_platform", CpuPlatform)
 
 
 def paged_config() -> PagedKVConfig:
@@ -140,7 +161,7 @@ def test_cross_attention_rejects_a_backend_it_does_not_implement():
         CrossAttentionManager.build(cross_spec(backend=AttnBackend.FLEX), kv_info(paged_config()))
 
 
-@pytest.mark.parametrize("backend", list(RaggedAttnBackend), ids=str)
+@pytest.mark.parametrize("backend", [RaggedAttnBackend.AUTO, RaggedAttnBackend.FLASHINFER], ids=str)
 @pytest.mark.parametrize(
     ("spec_class", "manager_class"),
     [
@@ -181,10 +202,178 @@ def test_yaml_names_a_ragged_backend(value, expected):
 
 
 def test_yaml_rejects_an_unknown_backend():
-    with pytest.raises(ValueError, match="'aiter' is not a valid AttnBackend"):
-        attention_spec().apply_yaml_overrides(backend="aiter")
-    with pytest.raises(ValueError, match="'aiter' is not a valid AttnBackend"):
-        cross_spec().apply_yaml_overrides(backend="aiter")
+    with pytest.raises(ValueError, match="'aitre' is not a valid AttnBackend"):
+        attention_spec().apply_yaml_overrides(backend="aitre")
+    with pytest.raises(ValueError, match="'aitre' is not a valid AttnBackend"):
+        cross_spec().apply_yaml_overrides(backend="aitre")
     ragged = RaggedAttentionSpec(resource_key="ragged", nodes={"node"}, config=ragged_config())
-    with pytest.raises(ValueError, match="'aiter' is not a valid RaggedAttnBackend"):
-        ragged.apply_yaml_overrides(backend="aiter")
+    with pytest.raises(ValueError, match="'aitre' is not a valid RaggedAttnBackend"):
+        ragged.apply_yaml_overrides(backend="aitre")
+
+
+# --- ROCm: AITER by default, FlashInfer's ROCm build where AITER would be unsafe ---
+
+
+
+@pytest.fixture
+def rocm(monkeypatch):
+    """A ROCm process whose AITER and FlashInfer-ROCm installs each import or not."""
+
+    def setup(aiter: bool = True, flashinfer: bool = True, varlen: bool = True):
+        monkeypatch.setattr(platforms, "resolve_platform", RocmPlatform)
+        monkeypatch.setattr(
+            rocm_attn, "aiter_paged_unavailable_reason",
+            lambda: None if aiter else "ImportError: no aiter",
+        )
+        monkeypatch.setattr(
+            rocm_attn, "flashinfer_rocm_unavailable_reason",
+            lambda: None if flashinfer else "ImportError: no flashinfer.rocm",
+        )
+        monkeypatch.setattr(
+            rocm_ragged, "aiter_varlen_unavailable_reason",
+            lambda: None if varlen else "ImportError: no aiter",
+        )
+
+    return setup
+
+
+def paged(page_size: int, num_qo_heads: int = 4, num_kv_heads: int = 2) -> PagedKVConfig:
+    return PagedKVConfig(
+        num_layers=2, num_kv_heads=num_kv_heads, head_dim=64, num_qo_heads=num_qo_heads,
+        max_seq_len=1024, max_num_pages=16, page_size=page_size,
+    )
+
+
+@pytest.mark.parametrize("page_size", [128, 256, 96])
+def test_rocm_auto_is_aiter_where_it_masks_page_tails(rocm, page_size):
+    rocm()
+    assert resolve_attn_backend(AttnBackend.AUTO, CPU, page_size) is AttnBackend.AITER
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_rocm_auto_prefers_flashinfer_where_aiter_reads_page_tails_unmasked(rocm, page_size):
+    rocm()
+    assert resolve_attn_backend(AttnBackend.AUTO, CPU, page_size) is AttnBackend.FLASHINFER
+    rocm(flashinfer=False)
+    assert resolve_attn_backend(AttnBackend.AUTO, CPU, page_size) is AttnBackend.AITER
+
+
+def test_rocm_auto_without_aiter_is_flashinfer(rocm):
+    rocm(aiter=False)
+    assert resolve_attn_backend(AttnBackend.AUTO, CPU, 128) is AttnBackend.FLASHINFER
+
+
+def test_rocm_auto_with_neither_is_a_startup_error(rocm):
+    rocm(aiter=False, flashinfer=False)
+    with pytest.raises(RuntimeError, match="amd-aiter.*amd-flashinfer"):
+        resolve_attn_backend(AttnBackend.AUTO, CPU, 128)
+
+
+def test_an_explicit_backend_is_kept_on_rocm(rocm):
+    rocm(aiter=False, flashinfer=False)
+    for backend in AttnBackend:
+        if backend is not AttnBackend.AUTO:
+            assert resolve_attn_backend(backend, CPU, 128) is backend
+
+
+def test_cuda_never_asks_for_the_rocm_kernels(monkeypatch):
+    monkeypatch.setattr(platforms, "resolve_platform", CudaPlatform)
+
+    def probe():
+        raise AssertionError("a CUDA process probed a ROCm kernel library")
+
+    monkeypatch.setattr(rocm_attn, "aiter_paged_unavailable_reason", probe)
+    monkeypatch.setattr(rocm_attn, "flashinfer_rocm_unavailable_reason", probe)
+    monkeypatch.setattr(rocm_ragged, "aiter_varlen_unavailable_reason", probe)
+    assert resolve_attn_backend(AttnBackend.AUTO, CPU, 64) is AttnBackend.FLASHINFER
+    assert resolve_ragged_attn_backend(RaggedAttnBackend.AUTO, CPU) is RaggedAttnBackend.FLASHINFER
+    assert flashinfer_kwargs(paged(128), "auto") == {"backend": "auto"}
+
+
+@pytest.mark.parametrize(
+    ("heads", "tensor_cores"), [((4, 2), False), ((24, 8), False), ((8, 8), False), ((12, 2), True)],
+)
+def test_flashinfer_on_rocm_is_fa2_without_tensor_cores_where_it_dispatches(rocm, heads, tensor_cores):
+    rocm()
+    kwargs = flashinfer_kwargs(paged(128, *heads), "auto")
+    assert kwargs == {"backend": "fa2", "decode_tensor_cores": tensor_cores}
+    # a backend the deployment named is kept
+    assert flashinfer_kwargs(paged(128, *heads), "aiter")["backend"] == "aiter"
+
+
+def test_flashinfer_on_rocm_without_the_amd_build_names_the_alternatives(rocm):
+    rocm(flashinfer=False)
+    with pytest.raises(RuntimeError, match="'aiter' or 'auto'"):
+        AttentionManager.build(attention_spec(backend=AttnBackend.FLASHINFER), kv_info(paged(128)))
+
+
+def test_rocm_builds_aiter_for_paged_and_cross_attention(rocm):
+    rocm()
+    manager = AttentionManager.build(attention_spec(), kv_info(paged(128)))
+    assert type(manager) is AiterPagedAttentionManager
+    cross = CrossAttentionManager.build(cross_spec(), kv_info(paged(128)))
+    assert type(cross) is AiterCrossManager
+
+
+def test_rocm_flashinfer_manager_is_pinned_to_fa2(rocm):
+    rocm()
+    manager = AttentionManager.build(attention_spec(), kv_info(paged(64)))
+    assert type(manager) is FlashInferManager
+    assert manager._wrapper_kv_kwargs["backend"] == "fa2"
+    assert manager._decode_tensor_cores is False
+
+
+def test_aiter_is_refused_off_rocm(monkeypatch):
+    monkeypatch.setattr(platforms, "resolve_platform", CudaPlatform)
+    with pytest.raises(RuntimeError, match="runs on AMD GPUs"):
+        AttentionManager.build(attention_spec(backend=AttnBackend.AITER), kv_info(paged(128)))
+
+
+def test_aiter_refuses_what_its_kernel_was_not_checked_for(rocm):
+    rocm()
+    big = PagedKVConfig(
+        num_layers=1, num_kv_heads=2, head_dim=512, max_seq_len=64, max_num_pages=4, page_size=128,
+    )
+    with pytest.raises(ValueError, match="head_dim 512"):
+        AttentionManager.build(attention_spec(backend=AttnBackend.AITER), kv_info(big))
+    info = EngineResourceInfo(
+        device=CPU, kv_dtype=torch.float32,
+        dependencies={"kv": KVSpec(resource_key="kv", nodes={"node"}, config=paged(128))},
+    )
+    with pytest.raises(ValueError, match="KV dtype"):
+        AttentionManager.build(attention_spec(backend=AttnBackend.AITER), info)
+
+
+@pytest.mark.parametrize(
+    ("varlen", "flashinfer", "expected"),
+    [(True, True, RaggedAttnBackend.AITER), (False, True, RaggedAttnBackend.FLASHINFER)],
+)
+def test_rocm_ragged_auto(rocm, varlen, flashinfer, expected):
+    rocm(varlen=varlen, flashinfer=flashinfer)
+    assert resolve_ragged_attn_backend(RaggedAttnBackend.AUTO, CPU) is expected
+
+
+def test_rocm_ragged_with_neither_is_a_startup_error(rocm):
+    rocm(varlen=False, flashinfer=False)
+    with pytest.raises(RuntimeError, match="No ragged attention backend"):
+        resolve_ragged_attn_backend(RaggedAttnBackend.AUTO, CPU)
+
+
+@pytest.mark.parametrize(
+    ("spec_class", "manager_class"),
+    [(RaggedAttentionSpec, AiterRaggedManager), (RaggedCrossAttentionSpec, AiterRaggedCrossManager)],
+)
+def test_rocm_ragged_builds_aiter(rocm, spec_class, manager_class):
+    rocm()
+    spec = spec_class(resource_key="ragged", nodes={"node"}, config=ragged_config())
+    manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
+    assert type(manager) is manager_class
+
+
+def test_yaml_names_the_aiter_backends():
+    spec = attention_spec()
+    spec.apply_yaml_overrides(backend="aiter")
+    assert spec.config.backend is AttnBackend.AITER
+    ragged = RaggedAttentionSpec(resource_key="ragged", nodes={"node"}, config=ragged_config())
+    ragged.apply_yaml_overrides(backend="aiter")
+    assert ragged.config.backend is RaggedAttnBackend.AITER
