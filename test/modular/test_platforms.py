@@ -49,6 +49,16 @@ def test_current_platform_follows_resolution(resolve):
     assert repr(current_platform) == "CpuPlatform()"
 
 
+def test_resolving_caches_the_platform():
+    platforms.resolve_platform()
+    assert platforms.resolve_platform.cache_info().currsize == 1
+
+
+def test_the_next_test_starts_with_no_platform_cached():
+    # test/modular/conftest.py clears the cache around every test
+    assert platforms.resolve_platform.cache_info().currsize == 0
+
+
 def test_current_platform_is_an_instance_of_the_resolved_class(resolve):
     resolve(cuda=True, hip="7.0")
     assert isinstance(current_platform, RocmPlatform)
