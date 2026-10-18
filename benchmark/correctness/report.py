@@ -101,7 +101,9 @@ def write_reports(run_dir: Path, header: dict, score: FamilyScore | None, error:
               f"flashinfer {stack.get('flashinfer')}",
               f"- config overrides: {header.get('overrides') or 'none'}",
               f"- protocol: {header.get('protocol')}",
-              f"- reference: {header.get('reference')}",
+              f"- reference: {header.get('reference')}"
+              + (" (BUILD FAILED, see report.json reference_build_error)" if header.get("reference_build_error")
+                 else ""),
               f"- server startup in seconds, per instance (includes any cold compile): {header.get('startup_s')}", ""]
     if error:
         lines += ["## Error", "", "```", error[-6000:], "```", ""]
