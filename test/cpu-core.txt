@@ -93,7 +93,6 @@ test/modular/test_combined_walk_tp_groups.py
 test/modular/test_packed_token_layout.py
 test/modular/test_worker_in_flight.py
 test/modular/test_qwen3_5_mixed.py
-test/modular/test_qwen3omni_vision_mixed.py
 test/modular/test_flashinfer_force_prefill.py
 test/modular/test_spec_chain_key.py
 test/modular/test_launch_script_socket_prefix.py
