@@ -105,3 +105,5 @@ test/modular/test_media_paths.py
 test/modular/test_whisper_kv_sizing.py
 test/modular/test_kokoro_chunk_loop.py
 test/modular/test_transcription_utf8.py
+test/modular/test_correctness_metrics.py
+test/modular/test_correctness_runner.py
