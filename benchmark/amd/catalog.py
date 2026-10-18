@@ -33,6 +33,8 @@ class Row:
     engine_args: dict = field(default_factory=dict)
     engine_env: dict = field(default_factory=dict)
     cost: float = 1.0  # rough relative run time, so the sweep starts the long rows first
+    # How long the launcher waits for /health when a cold start of this model runs past its default.
+    startup_timeout: int | None = None
 
 
 def _qwen(size: str, gpus: int = 1, tp: int = 1, name: str | None = None) -> Row:
@@ -60,15 +62,16 @@ ROWS: dict[str, Row] = {r.name: r for r in [
     _qwen3tts("qwen3tts", "0.6B", "qwen3_tts", "qwen3_tts_0_6b_customvoice.yaml"),
     _qwen3tts("qwen3tts_1p7b", "1.7B", "qwen3_tts_1p7b", "qwen3_tts_1_7b_customvoice.yaml"),
     # Qwen3-Omni speaks its answers. vllm-omni's own layout is two GPUs; the one-GPU row places its stages
-    # on one device to sit next to mstar's colocated config.
+    # on one device to sit next to mstar's colocated config. mstar's cold start ran past 2400 s on an MI300X
+    # slice with an empty MIOpen DB (correctness campaign), hence the longer wait.
     Row("qwen3omni_colocated", "omni", "Qwen/Qwen3-Omni-30B-A3B-Instruct", "qwen3omni",
         engine_args={"vllm-omni": ("--deploy-config", str(VLLM_OMNI_DEPLOY / "qwen3_omni_one_gpu.yaml")),
                      "vllm-omni-tuned": ("--deploy-config",
                                          str(VLLM_OMNI_DEPLOY / "qwen3_omni_one_gpu_rocm_tuned.yaml"))},
-        engine_env={"vllm-omni": {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}}, cost=3.0),
+        engine_env={"vllm-omni": {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}}, cost=3.0, startup_timeout=5400),
     Row("qwen3omni_2gpu", "omni", "Qwen/Qwen3-Omni-30B-A3B-Instruct", "qwen3omni", gpus=2,
         engine_args={"vllm-omni-tuned": ("--deploy-config", str(VLLM_OMNI_DEPLOY / "qwen3_omni_rocm_tuned.yaml"))},
-        engine_env={"vllm-omni": {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}}, cost=3.0),
+        engine_env={"vllm-omni": {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}}, cost=3.0, startup_timeout=5400),
     Row("whisper_large", "asr", "openai/whisper-large-v3", "whisper_large", max_len=448),
     Row("flux2_klein", "image", "black-forest-labs/FLUX.2-klein-4B", "flux2_klein"),
     Row("z_image_turbo", "image", "Tongyi-MAI/Z-Image-Turbo", "z_image_turbo"),
