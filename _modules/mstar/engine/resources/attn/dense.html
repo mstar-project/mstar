@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 17, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 18, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -896,7 +896,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.engine.resources.attn.dense</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""Attention as one dense FlashAttention-3 varlen pass."""</span>
+<span></span><span class="sd">"""Attention as one dense varlen pass: FlashAttention-3, or AITER on ROCm."""</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">functools</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
@@ -909,6 +909,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">PagedKVConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVPlanOutput</span><span class="p">,</span> <span class="n">KVPlanOutputs</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">StepContext</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms</span><span class="w"> </span><span class="kn">import</span> <span class="n">current_platform</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -917,22 +918,32 @@ window.runMermaid = runMermaid;</script>
     <span class="kn">from</span><span class="w"> </span><span class="nn">fa3_fwd_interface</span><span class="w"> </span><span class="kn">import</span> <span class="n">flash_attn_varlen_func</span>
 <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">_fa3_exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
     <span class="n">flash_attn_varlen_func</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">_FA3_IMPORT_ERROR</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">_fa3_exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">_fa3_exc</span><span class="si">}</span><span class="s2">"</span>
+    <span class="n">_VARLEN_IMPORT_ERROR</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">_fa3_exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">_fa3_exc</span><span class="si">}</span><span class="s2">"</span>
 <span class="k">else</span><span class="p">:</span>
-    <span class="n">_FA3_IMPORT_ERROR</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">_VARLEN_IMPORT_ERROR</span> <span class="o">=</span> <span class="kc">None</span>
+
+<span class="c1"># ROCm has no FA3; AITER's varlen FMHA takes the same call, so dense runs on it</span>
+<span class="c1"># there instead of degrading to the paged backend</span>
+<span class="k">if</span> <span class="n">flash_attn_varlen_func</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">current_platform</span><span class="o">.</span><span class="n">is_rocm</span><span class="p">():</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">aiter</span><span class="w"> </span><span class="kn">import</span> <span class="n">flash_attn_varlen_func</span>
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">_aiter_exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
+        <span class="n">_VARLEN_IMPORT_ERROR</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">_VARLEN_IMPORT_ERROR</span><span class="si">}</span><span class="s2">; aiter: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">_aiter_exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">_aiter_exc</span><span class="si">}</span><span class="s2">"</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">_VARLEN_IMPORT_ERROR</span> <span class="o">=</span> <span class="kc">None</span>
 
 
 <span class="nd">@functools</span><span class="o">.</span><span class="n">cache</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">_fa3_unavailable_reason</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""verify flash attention 3 fwd kernel imports"""</span>
-    <span class="k">return</span> <span class="n">_FA3_IMPORT_ERROR</span>
+<span class="w">    </span><span class="sd">"""why no varlen kernel imported: fa3-fwd, and AITER on ROCm"""</span>
+    <span class="k">return</span> <span class="n">_VARLEN_IMPORT_ERROR</span>
 
 
 <span class="nd">@functools</span><span class="o">.</span><span class="n">cache</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">_warn_dense_fallback</span><span class="p">(</span><span class="n">reason</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
     <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-        <span class="s2">"Attention backend 'dense' requested but the fa3-fwd kernel is "</span>
-        <span class="s2">"unavailable (</span><span class="si">%s</span><span class="s2">); using the paged 'flashinfer' backend instead."</span><span class="p">,</span>
+        <span class="s2">"Attention backend 'dense' requested but no varlen kernel is "</span>
+        <span class="s2">"available (</span><span class="si">%s</span><span class="s2">); using the paged 'flashinfer' backend instead."</span><span class="p">,</span>
         <span class="n">reason</span><span class="p">,</span>
     <span class="p">)</span>
 
@@ -978,7 +989,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="DenseAttentionManager">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.dense.html#mstar.engine.resources.attn.dense.DenseAttentionManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">DenseAttentionManager</span><span class="p">(</span><span class="n">AttentionManager</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""Attention as one dense FlashAttention-3 varlen pass over a contiguous</span>
+<span class="w">    </span><span class="sd">"""Attention as one dense varlen pass (FA3, AITER on ROCm) over a contiguous</span>
 <span class="sd">    [frozen prefix | fresh tokens] sequence.</span>
 
 <span class="sd">    For a workload that recomputes every one of its K/V every step and only</span>
@@ -1258,7 +1269,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 17, 2026.
+  Last updated on Oct 18, 2026.
   <br/>
 </p>
   </div>

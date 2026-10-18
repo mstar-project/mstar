@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 17, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 18, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -646,12 +646,12 @@
                   
   <section id="module-mstar.engine.resources.attn.dense">
 <span id="mstar-engine-resources-attn-dense"></span><h1>mstar.engine.resources.attn.dense<a class="headerlink" href="#module-mstar.engine.resources.attn.dense" title="Link to this heading">#</a></h1>
-<p>Attention as one dense FlashAttention-3 varlen pass.</p>
+<p>Attention as one dense varlen pass: FlashAttention-3, or AITER on ROCm.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.dense.DenseAttentionManager" title="mstar.engine.resources.attn.dense.DenseAttentionManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DenseAttentionManager</span></code></a>(kv_cache, device, ...)</p></td>
-<td><p>Attention as one dense FlashAttention-3 varlen pass over a contiguous [frozen prefix | fresh tokens] sequence.</p></td>
+<td><p>Attention as one dense varlen pass (FA3, AITER on ROCm) over a contiguous [frozen prefix | fresh tokens] sequence.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.dense.DensePlan" title="mstar.engine.resources.attn.dense.DensePlan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DensePlan</span></code></a>(segments, cu_q, cu_k, max_q, ...)</p></td>
 <td><p>dense plan layout.</p></td>
@@ -666,7 +666,7 @@
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.dense.DenseAttentionManager">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.dense.</span></span><span class="sig-name descname"><span class="pre">DenseAttentionManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv_cache</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/dense.html#DenseAttentionManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.dense.DenseAttentionManager" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.AttentionManager" title="mstar.engine.resources.attn.base.AttentionManager"><code class="xref py py-class docutils literal notranslate"><span class="pre">AttentionManager</span></code></a></p>
-<p>Attention as one dense FlashAttention-3 varlen pass over a contiguous
+<p>Attention as one dense varlen pass (FA3, AITER on ROCm) over a contiguous
 [frozen prefix | fresh tokens] sequence.</p>
 <p>For a workload that recomputes every one of its K/V every step and only
 reuses a small frozen prefix — diffusion denoise, where the prefix is the
@@ -1006,7 +1006,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 17, 2026.
+  Last updated on Oct 18, 2026.
   <br/>
 </p>
   </div>

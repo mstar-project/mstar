@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 17, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 18, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1198,7 +1198,8 @@ by precision, eager vs. CUDA graph; <code class="docutils literal notranslate"><
 prefill, the captured CUDA graphs, and multi-request batches.</p></li>
 <li><p>The default denoise attention backend is <code class="docutils literal notranslate"><span class="pre">dense_gen</span></code>
 (<code class="docutils literal notranslate"><span class="pre">Cosmos3Config.attention_backend</span></code>), which runs bs=1 eager generation
-attention as one FlashAttention-3 varlen kernel from the <code class="docutils literal notranslate"><span class="pre">fa3-fwd</span></code> wheel.
+attention as one FlashAttention-3 varlen kernel from the <code class="docutils literal notranslate"><span class="pre">fa3-fwd</span></code> wheel
+(AITER’s varlen kernel on ROCm).
 That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
 exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
 one matching your environment. When it is not importable, the engine logs a
@@ -1659,7 +1660,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 17, 2026.
+  Last updated on Oct 18, 2026.
   <br/>
 </p>
   </div>

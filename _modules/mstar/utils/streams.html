@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 17, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 18, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -907,6 +907,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms</span><span class="w"> </span><span class="kn">import</span> <span class="n">current_platform</span>
+
 
 <div class="viewcode-block" id="reset_device_scheduling">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.streams.html#mstar.utils.streams.reset_device_scheduling">[docs]</a>
@@ -919,7 +921,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    """</span>
     <span class="kn">import</span><span class="w"> </span><span class="nn">ctypes</span>
 
-    <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+    <span class="c1"># goes through the CUDA driver API: NVIDIA only</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">current_platform</span><span class="o">.</span><span class="n">is_cuda</span><span class="p">():</span>
         <span class="k">return</span>
     <span class="n">dev</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">dev</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
@@ -984,7 +987,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 17, 2026.
+  Last updated on Oct 18, 2026.
   <br/>
 </p>
   </div>
