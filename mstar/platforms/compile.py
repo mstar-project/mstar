@@ -1,8 +1,7 @@
-"""Platform settings applied around compiled callables and kernel calls."""
+"""The platform's inductor settings, applied to one compiled callable."""
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Callable
 from typing import Any
 
@@ -35,23 +34,3 @@ def with_inductor_overrides(
             return fn(*args, **kwargs)
 
     return forward
-
-
-@contextlib.contextmanager
-def deterministic_convs():
-    """Deterministic conv kernels inside the block on ROCm, a no-op elsewhere.
-
-    MIOpen's split-K implicit-GEMM conv solver is not deterministic, so the
-    same input can give a different result on each call.
-    """
-    if not current_platform.is_rocm():
-        yield
-        return
-    import torch
-
-    previous = torch.backends.cudnn.deterministic
-    torch.backends.cudnn.deterministic = True
-    try:
-        yield
-    finally:
-        torch.backends.cudnn.deterministic = previous
