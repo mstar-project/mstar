@@ -172,8 +172,9 @@ def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
     """Persist bare base64 that ``decoder`` opens as audio; return its path, or
     None (leaving nothing behind) when it is not base64 or not loadable audio.
 
-    ``decoder`` is the library the model's ``load_audio`` uses, ``"soundfile"``
-    or ``"torchcodec"``, and it opens the saved file the way the model will
+    ``decoder`` names what the model's ``load_audio`` decodes with:
+    ``"soundfile"``, or ``"media"`` for ``mstar.model.components.media_io``
+    (torchcodec, else PyAV). It opens the saved file the way the model will
     (container header only). A path such as ``/etc/passwd`` is valid base64
     too, so the alphabet cannot tell them apart; the decoder can.
     """
@@ -182,10 +183,10 @@ def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
     except ValueError:
         return None
     try:
-        if decoder == "torchcodec":
-            from torchcodec.decoders import AudioDecoder
+        if decoder == "media":
+            from mstar.model.components import media_io as model_media
 
-            AudioDecoder(path)
+            model_media.audio_duration(path)
         else:
             import soundfile
 
@@ -242,7 +243,7 @@ def decode_audio(path: str, sample_rate: int = 16000):
     """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``.
 
     libsndfile (``soundfile``) first — no FFmpeg needed for wav/flac/ogg/mp3 —
-    then torchcodec for the rest (m4a, webm, ...).
+    then the models' FFmpeg-backed decoders for the rest (m4a, webm, ...).
     """
     try:
         import soundfile as sf
@@ -250,9 +251,9 @@ def decode_audio(path: str, sample_rate: int = 16000):
         audio, sr = sf.read(path, dtype="float32", always_2d=True)
         audio = audio.mean(axis=1)
     except Exception:  # noqa: BLE001 — not a libsndfile container
-        from torchcodec.decoders import AudioDecoder
+        from mstar.model.components import media_io as model_media
 
-        frames = AudioDecoder(path, sample_rate=sample_rate, num_channels=1).get_all_samples()
+        frames = model_media.decode_audio(path, sample_rate=sample_rate, num_channels=1)
         return frames.data[0].numpy().astype(np.float32)
     if sr != sample_rate:
         try:

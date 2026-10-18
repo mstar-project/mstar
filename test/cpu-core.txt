@@ -101,3 +101,4 @@ test/modular/test_startup_graph_validation.py
 test/modular/test_media_paths.py
 test/modular/test_correctness_metrics.py
 test/modular/test_correctness_runner.py
+test/modular/test_media_decode.py

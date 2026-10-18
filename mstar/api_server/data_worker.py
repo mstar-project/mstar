@@ -10,14 +10,6 @@ from dataclasses import dataclass, field
 
 import torch
 
-from mstar.graph.loop_indices import NestedLoopIndices
-
-try:
-    import torchaudio  # noqa: F401 — probes availability; real usage in callers
-    from torchcodec.decoders import VideoDecoder
-except (ImportError, RuntimeError, OSError):
-    VideoDecoder = None
-
 from mstar.api_server.request_types import (
     DataWorkerProfile,
     PreprocessInput,
@@ -30,6 +22,7 @@ from mstar.communication.tensors import NameToTensorList, create_tensor_communic
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.spec import apply_yaml_overrides
+from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, ProcessPromptOutput
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils import profiler
