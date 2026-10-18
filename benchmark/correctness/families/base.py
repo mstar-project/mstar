@@ -99,6 +99,24 @@ class MathSdpaReference:
 
         return sdpa_kernel(SDPBackend.MATH)
 
+    CALIBRATION_DB = 3.0
+
+    def calibrated_verdict(self, sc, spread: list[float], served_median: float | None) -> None:
+        """ROCm verdict next to the raw gate: the served median has to reach the reference's own math-SDPA
+        spread (median) minus CALIBRATION_DB. Recorded as a metric, so the raw verdict stays the CUDA gate."""
+        import statistics
+
+        if not spread or served_median is None:
+            return
+        spread_median = statistics.median(spread)
+        floor = spread_median - self.CALIBRATION_DB
+        verdict = "PASS" if served_median >= floor else "FAIL"
+        sc.metrics["rocm_calibrated"] = {"spread_median_db": round(spread_median, 2), "floor_db": round(floor, 2),
+                                         "served_median_db": round(served_median, 2), "verdict": verdict}
+        sc.notes.append(f"Calibrated ROCm verdict {verdict}: served median {served_median:.2f} dB against a floor of "
+                        f"{floor:.2f} dB ({self.CALIBRATION_DB:g} dB under the reference's math-SDPA spread, median "
+                        f"{spread_median:.2f} dB). The raw verdict above is the CUDA-derived gate.")
+
     def math_reference_dir(self, ref_dir: Path | None) -> Path | None:
         """The math-SDPA sibling of the default reference, when it was built."""
         if ref_dir is None or self.ref_sdpa_math:
