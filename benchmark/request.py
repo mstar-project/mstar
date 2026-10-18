@@ -15,7 +15,7 @@ from typing import Optional
 import aiohttp
 import numpy as np
 
-from benchmark.base import Bagel, Chatterbox, Kokoro, Model, Orpheus, Qwen3TTS, RequestType, Status
+from benchmark.base import Bagel, Chatterbox, DiffusionModel, Kokoro, Model, Orpheus, Qwen3TTS, RequestType, Status
 from benchmark.utils import _write_wav
 
 
@@ -123,6 +123,7 @@ class RequestMetrics:
     # Robotics outputs: raw float32 bytes per chunk
     _action_chunks: list[bytes] = field(default_factory=list, repr=False)
     _video_chunks: list[bytes] = field(default_factory=list, repr=False)
+    _video_file_chunks: list[bytes] = field(default_factory=list, repr=False)  # an encoded clip (mp4)
 
     def __post_init__(self):
         # `start_time` is intentionally NOT set here. The adapter must set it
@@ -179,6 +180,8 @@ class RequestMetrics:
             self._action_chunks.append(data)
         elif modality == "video":
             self._video_chunks.append(data)
+        elif modality == "video_file":
+            self._video_file_chunks.append(data)
 
     def record_token(self, modality: str, nbytes: int, arrival_time: float | None = None, n_tokens: int = 1):
         """
@@ -275,6 +278,10 @@ class RequestMetrics:
             arr = np.frombuffer(raw, dtype=np.float32)
             path = os.path.join(output_dir, f"req_{self.request_id}_actions.npy")
             np.save(path, arr)
+            n_outputs += 1
+        if self._video_file_chunks:
+            with open(os.path.join(output_dir, f"req_{self.request_id}.mp4"), "wb") as f:
+                f.write(b"".join(self._video_file_chunks))
             n_outputs += 1
         if self._video_chunks:
             # World-model outputs are latent float32 tensors, not renderable video.
@@ -1068,7 +1075,100 @@ class SpeechRoute:
         return metrics
 
 
-class VLLMOmni(SpeechRoute, InferenceSystem):
+def _media_fields(model: Model, req_input: RequestInput, additional_model_kwargs: dict) -> dict:
+    """Generation settings for the image and video routes. ``height``/``width`` become the OpenAI
+    ``size`` ("WxH") every engine here reads."""
+    fields = {**model.get_model_kwargs(req_input.req_type), **req_input.model_kwargs, **additional_model_kwargs}
+    height, width = fields.pop("height", None), fields.pop("width", None)
+    if height and width:
+        fields["size"] = f"{width}x{height}"
+    return fields
+
+
+class MediaRoutes:
+    """Image generation over ``/v1/images/generations`` and video generation, either mstar's synchronous
+    ``/v1/videos/generations`` or the job API of vllm-omni and SGLang Diffusion (``POST /v1/videos``,
+    poll, ``GET /content``), the shapes benchmark/flux2_klein/bench_images.py and
+    benchmark/wan22/video_bench_wan22.py use for these engines."""
+
+    video_poll_s = 0.1
+
+    async def _send_request_image(self, session, req_input, base_url, model, metrics, additional_model_kwargs):
+        body = {"model": model.get_served_model_name(), "prompt": req_input.prompt, "n": 1,
+                "response_format": "b64_json", **_media_fields(model, req_input, additional_model_kwargs)}
+        try:
+            metrics.start_time = time.monotonic()
+            async with session.post(f"{base_url}/v1/images/generations", json=body,
+                                    timeout=aiohttp.ClientTimeout(total=None, sock_read=1800)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+                data = (await resp.json()).get("data") or []
+                b64 = data[0].get("b64_json") if data else None
+                if not b64:
+                    raise Exception("no image in the response")
+                metrics.record_output_chunk("image", b64, arrival_time=time.monotonic())
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
+    async def _send_request_video_sync(self, session, req_input, base_url, model, metrics, additional_model_kwargs):
+        body = {"model": model.get_served_model_name(), "prompt": req_input.prompt,
+                **_media_fields(model, req_input, additional_model_kwargs)}
+        try:
+            metrics.start_time = time.monotonic()
+            async with session.post(f"{base_url}/v1/videos/generations", json=body,
+                                    timeout=aiohttp.ClientTimeout(total=None, sock_read=3600)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+                data = (await resp.json()).get("data") or []
+                b64 = data[0].get("b64_json") if data else None
+                if not b64:
+                    raise Exception("no video in the response")
+                metrics.record_output_chunk("video_file", b64, arrival_time=time.monotonic())
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
+    async def _send_request_video_job(self, session, req_input, base_url, model, metrics, additional_model_kwargs):
+        form = aiohttp.FormData()  # these servers reject a JSON body on /v1/videos
+        fields = {"model": model.get_hf_url(), "prompt": req_input.prompt,
+                  **_media_fields(model, req_input, additional_model_kwargs)}
+        for k, v in fields.items():
+            form.add_field(k, str(v))
+        try:
+            metrics.start_time = time.monotonic()
+            async with session.post(f"{base_url}/v1/videos", data=form) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+                job = await resp.json()
+            vid = job.get("id") or job.get("video_id")
+            while True:
+                async with session.get(f"{base_url}/v1/videos/{vid}") as resp:
+                    info = await resp.json()
+                status = info.get("status")
+                if status == "completed":
+                    break
+                if status in ("failed", "error", "cancelled"):
+                    raise Exception(f"job {status}: {str(info.get('error'))[:200]}")
+                await asyncio.sleep(self.video_poll_s)
+            async with session.get(f"{base_url}/v1/videos/{vid}/content",
+                                   timeout=aiohttp.ClientTimeout(total=None, sock_read=600)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status} on /content")
+                mp4 = await resp.read()
+            metrics.record_output_chunk("video_file", base64.b64encode(mp4), arrival_time=time.monotonic())
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+        return metrics
+
+
+class VLLMOmni(MediaRoutes, SpeechRoute, InferenceSystem):
     """
     Benchmark adapter for the vllm-omni OpenAI-compatible server.
 
@@ -1092,17 +1192,24 @@ class VLLMOmni(SpeechRoute, InferenceSystem):
 
     # Chat template arguments (e.g. enable_thinking), set by the runner.
     chat_template_kwargs: Optional[dict] = None
+    # Audio format asked of a chat reply with speech (vllm-omni's default sends WAV segments).
+    chat_audio_format: Optional[str] = None
 
     def _extra_fields(self) -> dict:
         return {"chat_template_kwargs": self.chat_template_kwargs} if self.chat_template_kwargs else {}
 
     def _finish_payload(self, payload: dict, output_mod: str) -> dict:
         payload["modalities"] = [output_mod]
+        if output_mod == "audio" and self.chat_audio_format:
+            payload["audio"] = {"format": self.chat_audio_format}
         return payload
 
     def _speech_fields(self) -> dict:
         # vllm-omni streams raw PCM only with stream_format=audio (benchmark/tts_speech_bench.py).
         return {"stream_format": "audio"}
+
+    def _video_sender(self):
+        return self._send_request_video_job
 
     async def send_request(
         self,
@@ -1142,6 +1249,9 @@ class VLLMOmni(SpeechRoute, InferenceSystem):
                 metrics=metrics,
                 additional_model_kwargs=additional_model_kwargs,
             )
+        if isinstance(model, DiffusionModel):
+            send = self._send_request_image if output_mod == "image" else self._video_sender()
+            return await send(session, req_input, base_url, model, metrics, additional_model_kwargs)
 
         try:
             user_message = _build_openai_user_message(req_input.prompt, input_mod, req_input)
@@ -1566,6 +1676,31 @@ class SGLangOmni(SpeechRoute, InferenceSystem):
         return metrics
 
 
+class SGLangDiffusion(MediaRoutes, InferenceSystem):
+    """SGLang Diffusion (``sglang serve``): images and the video job API, like vllm-omni."""
+
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        output_mod = req_input.req_type.get_output_modalities()
+        metrics = RequestMetrics(request_id=request_id, type=req_input.req_type,
+                                 expected_output_modalities=[output_mod])
+        if output_mod == "image":
+            return await self._send_request_image(session, req_input, base_url, model, metrics,
+                                                  additional_model_kwargs)
+        if output_mod == "video_file":
+            return await self._send_request_video_job(session, req_input, base_url, model, metrics,
+                                                      additional_model_kwargs)
+        metrics.record_error(f"sglang_diffusion does not serve {output_mod} requests")
+        return metrics
+
+
 class OpenAIText(VLLMOmni):
     """Plain OpenAI-compatible text servers (vLLM, SGLang).
 
@@ -1732,6 +1867,9 @@ class OursOpenAI(VLLMOmni):
 
     def _speech_fields(self) -> dict:
         return {}  # plain PCM, no vllm-omni stream_format
+
+    def _video_sender(self):
+        return self._send_request_video_sync
 
     async def send_request(
         self,
