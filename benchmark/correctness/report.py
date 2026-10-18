@@ -91,7 +91,8 @@ def write_reports(run_dir: Path, header: dict, score: FamilyScore | None, error:
     lines = [f"# Correctness: `{header.get('config')}` — **{verdict}**", ""]
     lines += [f"- run `{header.get('run_id')}`, {header.get('started')} to {header.get('finished')}",
               f"- family {score.family if score else '?'}, set `{header.get('set')}` with {header.get('n_items')} "
-              f"items, {header.get('restarts')} server instance(s), concurrency {header.get('concurrency')}"]
+              f"items, {header.get('restarts')} server instance(s) x {header.get('passes') or 1} pass(es), "
+              f"concurrency {header.get('concurrency')}"]
     v = header.get("versions") or {}
     stack = v.get("stack", {})
     lines += [f"- code `{v.get('git_branch')}` at `{v.get('git_describe')}` in `{v.get('worktree')}`"
