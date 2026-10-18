@@ -98,6 +98,7 @@ test/modular/test_kv_prefix_batch.py
 test/modular/test_data_worker_wakeup.py
 test/modular/test_data_worker_late_release.py
 test/modular/test_sampler_last_token.py
+test/modular/test_sampler_eager_recompiles.py
 test/modular/test_qwen3_5_device_loopback.py
 test/modular/test_worker_device_loopback.py
 test/modular/test_gc_freeze.py
