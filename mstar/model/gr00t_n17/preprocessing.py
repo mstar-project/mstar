@@ -7,6 +7,7 @@ driven by the checkpoint's ``processor_config.json``, ``statistics.json`` and
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ _REQUIRED = {
     "clip_outliers": True,
     "use_albumentations": True,  # the eval transform below; torchvision's differs
     "letter_box_transform": False,
+    "formalize_language": True,
 }
 
 
@@ -33,6 +35,7 @@ class Gr00tN17Preprocessor:
         embodiment_ids: dict[str, int],
         max_state_dim: int,
         max_action_horizon: int,
+        processor=None,
     ):
         bad = {k: processor_kwargs.get(k) for k, v in _REQUIRED.items() if processor_kwargs.get(k, v) != v}
         modality_configs = processor_kwargs["modality_configs"]
@@ -44,6 +47,7 @@ class Gr00tN17Preprocessor:
             raise ValueError(f"unsupported GR00T N1.7 processor variant: {bad}")
 
         lo, hi = "q01", "q99"
+        self.video_keys = {tag: mc["video"]["modality_keys"] for tag, mc in modality_configs.items()}
         self.state_keys = {tag: mc["state"]["modality_keys"] for tag, mc in modality_configs.items()}
         self.state_bounds = {
             tag: {
@@ -57,13 +61,26 @@ class Gr00tN17Preprocessor:
         self.image_edge = processor_kwargs["shortest_image_edge"]
         self.crop_fraction = processor_kwargs["crop_fraction"]
         self.max_state_dim = max_state_dim
+        # the backbone's Qwen3VLProcessor; left padding as the reference sets it
+        self.processor = processor
+        if processor is not None:
+            processor.tokenizer.padding_side = "left"
         self.max_action_horizon = max_action_horizon
         too_long = {t: h for t, h in self.action_horizon.items() if h > max_action_horizon}
         if too_long:
             raise ValueError(f"action horizons {too_long} exceed the model's {max_action_horizon}")
 
     @classmethod
-    def from_pretrained(cls, path: str | Path, max_state_dim: int, max_action_horizon: int):
+    def from_pretrained(
+        cls, path: str | Path, max_state_dim: int, max_action_horizon: int, backbone_path: str | Path | None = None,
+    ):
+        """``backbone_path`` (Cosmos-Reason2-2B) loads the text/image processor;
+        without it only ``state``/``image``/``embodiment_id``/``action_mask`` work."""
+        processor = None
+        if backbone_path is not None:
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(backbone_path)
         path = Path(path)
         return cls(
             processor_kwargs=json.loads((path / "processor_config.json").read_text())["processor_kwargs"],
@@ -71,6 +88,7 @@ class Gr00tN17Preprocessor:
             embodiment_ids=json.loads((path / "embodiment_id.json").read_text()),
             max_state_dim=max_state_dim,
             max_action_horizon=max_action_horizon,
+            processor=processor,
         )
 
     def _tag(self, embodiment_tag: str) -> str:
@@ -146,3 +164,41 @@ class Gr00tN17Preprocessor:
         if scale == 1.0:
             return img
         return cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+
+    def __call__(
+        self,
+        embodiment_tag: str,
+        video: dict[str, np.ndarray],
+        language: list[str],
+        state: dict[str, np.ndarray],
+    ) -> dict[str, torch.Tensor]:
+        """A batch of observations -> the model's inputs, as the reference's
+        ``process_observation``. ``video[view]`` is uint8 ``(B, T, H, W, 3)``,
+        ``language`` one instruction per item, ``state[key]`` ``(B, T, D)``."""
+        tag = self._tag(embodiment_tag)
+        views = [np.asarray(video[v]) for v in self.video_keys[tag]]
+        batch, steps = views[0].shape[:2]
+        if len(language) != batch:
+            raise ValueError(f"{len(language)} instructions for a batch of {batch}")
+        texts, frames = [], []
+        for b in range(batch):
+            # time-major, views in modality order: (t0, v0), (t0, v1), (t1, v0), ...
+            item = [
+                torch.from_numpy(np.ascontiguousarray(self.image(v[b, t]))).permute(2, 0, 1)
+                for t in range(steps)
+                for v in views
+            ]
+            # formalize_language: lowercase, strip punctuation
+            text = re.sub(r"[^\w\s]", "", language[b].lower())
+            conversation = [{
+                "role": "user",
+                "content": [*({"type": "image", "image": f} for f in item), {"type": "text", "text": text}],
+            }]
+            texts.append(self.processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False))
+            frames.extend(item)
+        # one call over the batch, so padding (left) is shared as in the reference
+        out = dict(self.processor(text=texts, images=frames, return_tensors="pt", padding=True))
+        out["state"] = self.state(tag, state)
+        out["embodiment_id"] = self.embodiment_id(tag, batch)
+        out["action_mask"] = self.action_mask(tag, batch)
+        return out

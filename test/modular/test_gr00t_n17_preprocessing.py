@@ -1,4 +1,5 @@
 import copy
+import types
 from pathlib import Path
 
 import numpy as np
@@ -9,14 +10,18 @@ from mstar.model.gr00t_n17.preprocessing import Gr00tN17Preprocessor
 
 _GR00T = Path.home() / (".cache/huggingface/hub/models--nvidia--GR00T-N1.7-3B/snapshots/"
                         "2fc962b973bccdd5d8ce4f67cc63b264d6886495")
+_COSMOS = Path.home() / (".cache/huggingface/hub/models--nvidia--Cosmos-Reason2-2B/snapshots/"
+                         "9ce19a195e423419c349abfc86fd07178b230561")
 
 # Tiny two-embodiment checkpoint. "grip" is constant under q01/q99 but not under min/max.
 KWARGS = {
     "use_percentiles": True, "use_mean_std": False, "apply_sincos_state_encoding": False, "exclude_state": False,
     "shortest_image_edge": 256, "crop_fraction": 0.95,
     "modality_configs": {
-        "bot": {"state": {"modality_keys": ["arm", "grip"]}, "action": {"delta_indices": [0, 1, 2]}},
-        "other": {"state": {"modality_keys": ["j"]}, "action": {"delta_indices": list(range(5))}},
+        "bot": {"video": {"modality_keys": ["front", "wrist"]}, "state": {"modality_keys": ["arm", "grip"]},
+                "action": {"delta_indices": [0, 1, 2]}},
+        "other": {"video": {"modality_keys": ["cam"]}, "state": {"modality_keys": ["j"]},
+                  "action": {"delta_indices": list(range(5))}},
     },
 }
 STATS = {
@@ -103,6 +108,7 @@ def _set(path, value):
     (_set(["clip_outliers"], False), "unsupported"),
     (_set(["use_albumentations"], False), "unsupported"),
     (_set(["letter_box_transform"], True), "unsupported"),
+    (_set(["formalize_language"], False), "unsupported"),
     (_set(["modality_configs", "bot", "state", "mean_std_embedding_keys"], ["arm"]), "unsupported"),
     (_set(["modality_configs", "other", "action", "delta_indices"], list(range(7))), "exceed"),
 ])
@@ -165,3 +171,67 @@ def test_the_checkpoint_loads():
     s = pre.state(tag, {k: lo[None] for k, lo in lows.items()})
     n = sum(lo.size for lo in lows.values())
     assert s.shape == (1, 132) and torch.all(s[:, :n] <= 0) and torch.all(s[:, n:] == 0)
+
+
+class _StubProcessor:
+    """Records what the preprocessor hands the backbone processor."""
+
+    def __init__(self):
+        self.tokenizer = types.SimpleNamespace(padding_side="right")
+        self.conversations, self.calls = [], []
+
+    def apply_chat_template(self, conversation, tokenize, add_generation_prompt):
+        self.conversations.append(conversation)
+        return conversation[0]["content"][-1]["text"]
+
+    def __call__(self, text, images, **kwargs):
+        self.calls.append((text, images))
+        return {"input_ids": torch.zeros(len(text), 3, dtype=torch.long)}
+
+
+def _video(b, t, view):  # constant frames, one colour per (item, step, view)
+    x = np.zeros((b, t, 180, 320, 3), np.uint8)
+    for i in range(b):
+        for j in range(t):
+            x[i, j] = 100 * i + 10 * j + view
+    return x
+
+
+def test_call_feeds_the_processor_in_reference_order():
+    pytest.importorskip("cv2")
+    stub = _StubProcessor()
+    pre = Gr00tN17Preprocessor(KWARGS, STATS, IDS, 5, 6, processor=stub)
+    assert stub.tokenizer.padding_side == "left"
+    video = {"wrist": _video(2, 2, 1), "front": _video(2, 2, 0)}  # dict order is not modality order
+    state = {"arm": np.zeros((2, 1, 2)), "grip": np.zeros((2, 1, 1))}
+    out = pre("bot", video, ["Pick up the RED cup!", "go."], state)
+    [(texts, images)] = stub.calls  # one call for the whole batch
+    assert texts == ["pick up the red cup", "go"]
+    content = stub.conversations[0][0]["content"]
+    assert [c["type"] for c in content] == ["image"] * 4 + ["text"]
+    # time-major, views in modality order, item after item; constant frames stay constant
+    assert [int(f[0, 0, 0]) for f in images] == [100 * b + 10 * t + v for b in (0, 1) for t in (0, 1) for v in (0, 1)]
+    assert all(f.shape == (3, 256, 455) and torch.all(f == f[0, 0, 0]) for f in images)
+    assert out["input_ids"].shape[0] == 2 and out["state"].shape == (2, 1, 5)
+    assert out["embodiment_id"].tolist() == [7, 7] and out["action_mask"].shape == (2, 6)
+
+
+def test_call_rejects_language_batch_mismatch():
+    pre = Gr00tN17Preprocessor(KWARGS, STATS, IDS, 5, 6, processor=_StubProcessor())
+    with pytest.raises(ValueError, match="instructions for a batch of 2"):
+        pre("other", {"cam": _video(2, 1, 0)}, ["only one"], {"j": np.zeros((2, 1, 1))})
+
+
+@pytest.mark.skipif(not (_GR00T.exists() and _COSMOS.exists()), reason="checkpoints not cached")
+def test_call_with_the_real_processor():
+    pytest.importorskip("cv2")
+    pre = Gr00tN17Preprocessor.from_pretrained(_GR00T, 132, 40, backbone_path=_COSMOS)
+    tag = "oxe_droid_relative_eef_relative_joint"
+    video = {k: np.zeros((2, 2, 180, 320, 3), np.uint8) for k in pre.video_keys[tag]}
+    state = {k: np.zeros((2, 1, lo.size)) for k, (lo, _) in pre.state_bounds[tag].items()}
+    out = pre(tag, video, ["pick up the red cup and put it in the bowl", "stop"], state)
+    L = out["input_ids"].shape[1]
+    assert out["input_ids"].shape == out["attention_mask"].shape == (2, L)
+    assert out["attention_mask"][1, 0] == 0 and out["attention_mask"][:, -1].tolist() == [1, 1]  # left padding
+    assert out["image_grid_thw"].tolist() == [[1, 16, 28]] * 8
+    assert out["pixel_values"].shape[0] == 8 * 448
