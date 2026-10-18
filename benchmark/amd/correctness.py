@@ -1,11 +1,12 @@
-"""Correctness column of the tables, on WS-K's sample sets, references and metrics (benchmark/correctness).
+"""Correctness column of the tables, from the correctness runner's sample sets, references and metrics
+(benchmark/correctness).
 
-Text arms get their own greedy pass on the set right after the server starts. mstar receives the
-correctness runner's own /generate requests; vLLM and SGLang get the same prompts as chat
-completions with per-token logprobs, which turn back into one chunk per token, the form the
-text metrics compare. TTS and ASR arms are scored on the outputs of their first timed run at
-concurrency 1 (the same set, one pass over it). Every pass is saved in the correctness runner's
-layout (r1/outputs, r1/responses.jsonl) and scored with its family code.
+Text arms get a greedy pass on the set right after the server starts. mstar gets the correctness
+runner's own /generate requests. vLLM and SGLang get the same prompts as chat completions with
+per-token logprobs, turned back into one chunk per token as the text metrics expect. TTS and ASR
+arms are scored on the outputs of their first timed run at concurrency 1, which covers the set
+once. Every pass is saved in the correctness runner's layout (r1/outputs, r1/responses.jsonl)
+and scored with its family code.
 
     python -m benchmark.amd.correctness score RUN_DIR      # what the sweep runs at the end
 """
@@ -28,20 +29,21 @@ from benchmark.amd.launch import REPO
 
 WORK = Path("/work1/stephaniewang/atindra")
 SETS_ROOT = WORK / "amd/results/correctness/data"
-WSK_REF = "users/atindra/ws-k-correctness"
 MAIN_REPO = WORK / "mstar"
 
 
 def prepare_source(run_dir: Path, src: str | None) -> Path:
-    """Directory whose benchmark/correctness the run imports. This tree if it has one; otherwise
-    ``src`` (a checkout, or a git ref exported once into the run dir so a later rebase can't
-    change what a run scored with)."""
-    if src is None and (REPO / "benchmark/correctness/__init__.py").is_file():
+    """Directory whose benchmark/correctness the run imports: this tree by default, else ``src``, a
+    checkout or a git ref. A ref is exported once into the run dir, so a later rebase can't change
+    what a run was scored with."""
+    if src is None:
+        if not (REPO / "benchmark/correctness/__init__.py").is_file():
+            raise SystemExit("this tree has no benchmark/correctness; pass --correctness-src")
         return REPO
-    if src and (Path(src) / "benchmark/correctness/__init__.py").is_file():
+    if (Path(src) / "benchmark/correctness/__init__.py").is_file():
         return Path(src).resolve()
-    ref = src or WSK_REF
-    dest = run_dir / "wsk_src"
+    ref = src
+    dest = run_dir / "correctness_src"
     if not (dest / "benchmark/correctness/__init__.py").is_file():
         dest.mkdir(parents=True, exist_ok=True)
         commit = subprocess.run(["git", "-C", str(MAIN_REPO), "rev-parse", ref], capture_output=True, text=True,
