@@ -285,7 +285,10 @@ def _sound_scenario():
     from mstar.model.cosmos3.components.packing import tokenize_prompt
 
     device, dtype, mpipe, model = base["device"], base["dtype"], base["mpipe"], base["model"]
-    cond_ids, uncond_ids = tokenize_prompt(model.tokenizer, PROMPT, "", num_frames=FRAMES, height=H, width=W)
+    cond_ids, uncond_ids = tokenize_prompt(
+        model.tokenizer, PROMPT, "", num_frames=FRAMES, height=H, width=W,
+        use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
+    )
     lat_t = 1 + (FRAMES - 1) // mpipe.vae_scale_temporal
     _, t_s = model.get_submodule("dit")._resolve_sound_frames({"num_frames": FRAMES, "fps": 24.0})
     gen = torch.Generator(device=device).manual_seed(SEED)
