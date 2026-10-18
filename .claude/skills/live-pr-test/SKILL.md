@@ -77,7 +77,7 @@ python3 $S/gpu.py push <instance> .claude/skills/benchmarking/scripts/server.sh 
 python3 $S/gpu.py ssh <instance> 'bash ~/bootstrap.sh <n> --hf-home <hf_home from wait> > ~/bootstrap.log 2>&1; tail -20 ~/bootstrap.log'
 ```
 
-`bootstrap.sh` builds two arms, `~/live-pr/pr` and `~/live-pr/main`, each with its own venv and its own `mstar_rust` build, and writes `~/live-pr/env.sh` (HF home, local caches, `MSTAR_SHM_ARENA=1`, and the `arm pr|main`, `stage_model` and `save_caches` helpers). It takes a few minutes, and restores the Inductor, Triton and FlashInfer compile caches from a tarball on persistent storage when one exists for the box's compute capability. Pass `--base <branch>` for a stacked PR, and `--no-main` when nothing in the plan compares against the base. Read `results/env.txt`: a non-empty dependency diff between the arms has to be explained before any A/B number means anything.
+`bootstrap.sh` builds two arms, `~/live-pr/pr` and `~/live-pr/main`, each with its own venv and its own `mstar_rust` build, and writes `~/live-pr/env.sh` (HF home, local caches, `MSTAR_SHM_ARENA=1`, and the `arm pr|main`, `stage_model` and `save_caches` helpers). It takes a few minutes, and restores the Inductor, Triton and FlashInfer compile caches from a tarball on persistent storage when one exists for the box's compute capability. Pass `--base <branch>` for a stacked PR, and `--no-main` when nothing in the plan compares against the base. Read `results/env.txt`: a non-empty dependency diff between the arms has to be explained before any A/B number means anything. Also check each arm's installed versions against the repo's floors (`pyproject.toml`, and the docs' install notes for packages installed separately, such as Mooncake): a dependency below its floor can fail in ways the PR never touches. Upgrade it, or flag it in the report's header line.
 
 In cluster mode, run the same script on the cluster with `--workdir` and `--hf-home` from the config.
 
@@ -98,6 +98,7 @@ MSTAR_TP_ASYNC_SCHED=1 ~/server.sh start pr 8100 --timeout 2400 \
   mstar serve <model> --config configs/<cfg>.yaml --gpus 0,1,2 --port 8100 --socket-path-prefix /tmp/mstar_pr
 ```
 
+- Start servers with `mstar serve` (or `python -m mstar.cli.main serve`), whose tensor transport defaults to SHM. `python -m mstar.api_server.entrypoint` defaults `--tensor-comm-protocol` to RDMA, so a run through it exercises Mooncake, and can fail there, even when the PR doesn't touch transport. Pick another transport only when the PR is about transport, and record the transport in the report's header line either way.
 - Run anything longer than a couple of minutes detached on the box (`nohup ... > log 2>&1 &`, or tmux if present), then poll its log. An ssh drop must not kill a sweep.
 - Order: functional checks of the claims first, cheapest suites before expensive ones, so an early failure is found before an hour of benchmarks.
 - Each A/B model: main and PR back to back, restart the server between repeats, then the next model. When nothing is being timed, the two arms may run in parallel on disjoint GPUs.

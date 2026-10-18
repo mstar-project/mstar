@@ -21,7 +21,7 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 
 **<verdict in one or two sentences, e.g. "Works; no regressions outside noise." / "The port works, but claim 2 doesn't hold.">**
 
-<N>x <GPU>, <TP/config> · PR head `<sha>` vs <base> `<sha>`
+<N>x <GPU>, <TP/config>, <tensor transport> · PR head `<sha>` vs <base> `<sha>` · <only if any: a dependency below the repo's floor, e.g. "Mooncake 0.3.8.post1, below the 0.3.13.post1 floor">
 
 ### Claims
 
@@ -51,11 +51,14 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 
 - ✅ held, ❌ failed on the setup it was measured on, ⚠️ held only partly (some cells, some restarts).
 - ➖ not exercised here, with the reason: the base bug didn't fire on this box (so neither arm can show the fix), or the claim's number came from another GPU, harness or metric and this run can't stand in for it ("not comparable: B200 claim, host-bound H200"). Never ⚠️ for these; ⚠️ says the PR fell short.
+- ➖ inconclusive, too, when an output changes by no more than base's own run-to-run variation and there is no reference to say which side is right. Better: add a reference arm when one is cheap (fp32, `'highest'` matmul precision, or the reference implementation).
+- Before marking a description claim ❌, check which test, harness and inputs the claim was measured with. When your run used a different one (the PR's stricter new test run on base, say), name both in the row, so the ❌ explains itself.
 - A case the description hands to another open PR is "owned by #N" with a link, not a ⚠️ here. Test it on that PR, or on both merged, if it matters to the verdict.
 
 ## Rules
 
-- No cost, price, provider, region, driver/library versions or wall time. The hardware line is enough. (Competitor engine versions are fine in the performance table.)
+- No cost, price, provider, region, driver/library versions or wall time. The hardware line is enough. (Competitor engine versions are fine in the performance table, and a dependency below the repo's floor goes in the header line.)
+- A rate claim (stalls, hangs, failures per run) states the counts on each arm and whether they separate: a one-sided Fisher exact test at p < 0.05 is the rule. When they don't, say "not separable at N runs per arm" and, if cheap, how many runs would be needed; don't call it fixed or broken.
 - A section with nothing in it is left out, not filled with "none".
 - No methodology paragraphs: the protocol follows the benchmarking skill unless a deviation changes how a number reads, and then it's one clause in the caveats line.
 - Every number carries its harness, config and concurrency (AGENTS.md invariant 10), via the table it sits in. A mechanism you inferred but did not check is labeled a hypothesis.
