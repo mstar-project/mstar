@@ -520,7 +520,7 @@ class OmniVoiceAdapter(OpenAIAdapter):
         ref_audio = mk.pop("ref_audio", None)
         input_modalities = ["text"]
         if ref_audio:
-            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="torchcodec")
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="media")
             # Keyed by modality: the data worker iterates the dict and
             # loads each group through the matching loader.
             file_paths = {"audio": [path]}
