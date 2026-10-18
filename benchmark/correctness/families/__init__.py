@@ -194,6 +194,7 @@ UNSUPPORTED: dict[str, str] = {
     "omnilingual_asr_ctc_3b": _OMNILINGUAL,
     "omnilingual_asr_ctc_7b": _OMNILINGUAL,
     "test_text_session": "test-only config (session plumbing), no model output to verify",
+    "ltx2_5": "no family yet, its joint audio+video output needs its own reference and scoring",
 }
 
 
