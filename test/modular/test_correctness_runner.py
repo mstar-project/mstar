@@ -210,3 +210,28 @@ def test_duplex_questions_get_trailing_silence(tmp_path):
     x, sr = M.read_wav(req.files[0])
     assert sr == 16000 and len(x) == 3 * 16000 and np.abs(x[16000:]).max() == 0
     assert req.files[0].parent == tmp_path / "derived" / "omni_v1-trailing2s"
+
+
+def test_cosmos3_modes_and_image_size_override(tmp_path):
+    from benchmark.correctness.families import Cosmos3I2V, Cosmos3T2I, Cosmos3Video
+
+    cfg = yaml.safe_load((REPO / "configs/cosmos3_nano.yaml").read_text())
+    t2v = family_for_config("cosmos3_nano", "cosmos3", cfg, {})
+    t2i = family_for_config("cosmos3_nano", "cosmos3", cfg, {"mode": "t2i", "size": "480x832"})
+    i2v = family_for_config("cosmos3_nano", "cosmos3", cfg, {"mode": "i2v"})
+    assert type(t2v) is Cosmos3Video and isinstance(t2i, Cosmos3T2I) and isinstance(i2v, Cosmos3I2V)
+    assert len({t2v.reference_id(), i2v.reference_id(), t2i.reference_id()}) == 3
+    assert t2i.ref_call_kwargs["use_system_prompt"] is False and t2i.generator_device == "cuda"
+    items = [sets.Item(id=f"{i:02d}_{h}x{w}", prompt=f"p{i}", params={"seed": i, "height": h, "width": w})
+             for h, w in ((1024, 1024), (768, 1344)) for i in range(2)]
+    picked = t2i.select_items(items)
+    assert [it.id for it in picked] == ["00_1024x1024", "01_1024x1024"]
+    assert all((it.params["height"], it.params["width"]) == (480, 832) for it in picked)
+    (req, _) = t2i.requests(sets.SampleSet("image_v1", tmp_path, {}, picked))
+    kw = req.model_kwargs
+    assert (kw["height"], kw["width"], kw["num_inference_steps"]) == (480, 832, 35)
+    assert kw["flow_shift"] == 1.0 and kw["guidance_interval"] == [0.0, 1000.0]
+    assert t2i.pipeline_kwargs(picked[0])["num_frames"] == 1
+    vid = sets.Item(id="00", prompt="a cat", files={"image": "image/00.png"}, params={"seed": 0})
+    (r,) = i2v.requests(sets.SampleSet("video_v1", tmp_path, {}, [vid]))
+    assert r.files == [tmp_path / "image/00.png"] and r.input_modalities == "image,text"
