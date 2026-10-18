@@ -46,6 +46,7 @@ gh pr diff <n>
 - Size the box: GPU count from the largest config in the plan, 80 GB-class Hopper or newer. Prefer the GPU type the claimed numbers came from when it fits the budget.
 - If nothing needs a GPU (docs, CPU-only tests, benchmark scripts without a claimed number), say so and stop.
 - Reference (transformers) parity is for new model code or changes to a model's forward. A PR that serves a new checkpoint on an existing architecture's code inherits that architecture's parity; list it under "Not tested" with that reason.
+- Fetching the reference implementation or a competitor engine is allowed, so a model-add PR gets a parity row and a perf claim gets its competitor arm. Use the official repository, pinned to a commit or release (the one the PR's description used, if it names one); a checkpoint's own `trust_remote_code` files count as its reference. Read the code that will run for network access, file writes outside its directory and environment reads before running it. Install it in a venv of its own, never the shared environment, and record the repository and commit in `harness-notes.md`. Fetch it once into the work directory, outside the timed runs.
 
 Show the plan before provisioning: claims → checks, suites, concurrency, the box, the estimated hours and cost. Then proceed without waiting unless the run would exceed the budget (below) or the trust check failed.
 
