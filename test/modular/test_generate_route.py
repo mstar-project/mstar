@@ -42,3 +42,32 @@ def test_generate_does_not_mislabel_downstream_json_errors(monkeypatch):
 
     assert response.status_code == 500
     assert response.json()["detail"].startswith("downstream failure")
+
+
+def test_generate_turns_an_intake_rejection_into_a_400(monkeypatch):
+    class RejectingServer:
+        def submit_request(self, **kwargs):
+            raise entrypoint.UnsupportedModalityError("model 'bagel' does not support: 'audio' (input)")
+
+    monkeypatch.setattr(entrypoint, "api_server", RejectingServer())
+
+    response = TestClient(entrypoint.app).post("/generate", data={"text": "hi"})
+
+    assert response.status_code == 400
+    assert "does not support" in response.json()["detail"]
+
+
+def test_generate_leaves_an_unnamed_output_to_the_model(monkeypatch):
+    seen = {}
+
+    class RecordingServer:
+        def submit_request(self, **kwargs):
+            seen.update(kwargs)
+            raise entrypoint.UnsupportedModalityError("stop here")
+
+    monkeypatch.setattr(entrypoint, "api_server", RecordingServer())
+
+    TestClient(entrypoint.app).post("/generate", data={"text": "hi"})
+
+    # submit_request fills in the model's default (not a hard-coded "text")
+    assert seen["output_modalities"] == []

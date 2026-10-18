@@ -21,6 +21,7 @@ from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, WorkerGraphStateRegistry
+from mstar.model.base import TensorAndMetadata
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.pi05.pi05_model import Pi05Model
 from mstar.model.vjepa2.vjepa2_model import VJepa2Model
@@ -53,11 +54,19 @@ def _manager(tmp_path, entity, device, communicator):
     return manager
 
 
+def _decoded(tensor):
+    """A loader that returns ``tensor``: CI has no codec, so no file is opened."""
+    return lambda filepath, device: TensorAndMetadata(tensor.to(device))
+
+
 def _case(name, convert):
+    """The model, its kwargs, the tensors they should arrive as, and the media
+    its walk needs: V-JEPA 2 and Pi0.5 refuse a request without them."""
     if name == "pi05":
         model = Pi05Model("unused", skip_weight_loading=True)
         model.tokenizer = _Tokenizer()
-        return model, {"robot_state": convert(np.linspace(-1, 1, 32).tolist())}, {}
+        model.load_image = _decoded(torch.rand(3, 32, 32))
+        return model, {"robot_state": convert(np.linspace(-1, 1, 32).tolist())}, {}, ["image"]
     if name == "cosmos":
         model = Cosmos3Model("unused", skip_weight_loading=True)
         action = convert([[0.1 * i] * 7 for i in range(2)])
@@ -65,11 +74,12 @@ def _case(name, convert):
             "action": action, "action_mode": "forward_dynamics", "domain_id": 0,
             "action_chunk_size": 3, "num_frames": 4, "guidance_scale": 1.0,
             "height": 64, "width": 64,
-        }, {"action_inputs": torch.as_tensor(action)}
+        }, {"action_inputs": torch.as_tensor(action)}, []
     model = VJepa2Model(
         "unused", skip_weight_loading=True,
         predictor_kind="masked" if name == "masked" else "ac",
     )
+    model.load_video = _decoded(torch.rand(2, 3, 32, 32))
     if name == "masked":
         kwargs = {"context_mask": convert([0, 1]), "target_mask": convert([2, 3])}
     else:
@@ -80,7 +90,7 @@ def _case(name, convert):
         if name == "mpc":
             kwargs.update(goal_hidden=convert([[0.4] * 8]), mpc=True)
     tensors = {k: torch.as_tensor(v) for k, v in kwargs.items() if k != "mpc"}
-    return model, kwargs, tensors
+    return model, kwargs, tensors, ["video"]
 
 
 @pytest.mark.parametrize("case", ["ac", "extrinsics", "masked", "mpc", "pi05", "cosmos"])
@@ -101,7 +111,7 @@ def test_model_kwargs_reach_workers_through_preprocessing_and_shm(
         "list": lambda v: v,
         "numpy": np.asarray,
     }[representation]
-    model, kwargs, expected_tensors = _case(case, convert)
+    model, kwargs, expected_tensors, media = _case(case, convert)
     original_kwargs = dict(kwargs)
     communicator = _Communicator()
     sender = _manager(tmp_path, "api_server", device, communicator)
@@ -113,7 +123,10 @@ def test_model_kwargs_reach_workers_through_preprocessing_and_shm(
         communicator=communicator, tensor_manager=sender, model=model,
     )
     try:
-        worker._process_input(PreprocessInput("r", "Pick up the cup", None, [], ["video"], kwargs))
+        file_paths = {modality: [f"in.{modality}"] for modality in media} or None
+        worker._process_input(PreprocessInput(
+            "r", "Pick up the cup", file_paths, media, ["video"], kwargs,
+        ))
         request = next(msg.body for entity, msg in communicator.sent if entity == "conductor")
         for name, value in original_kwargs.items():
             assert kwargs[name] is value
@@ -162,7 +175,7 @@ def test_cosmos_worker_prepares_action_values(device):
     from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
     from mstar.model.cosmos3.tests.test_action import _cfg
 
-    model, kwargs, _ = _case("cosmos", lambda v: torch.tensor(v, device=device))
+    model, kwargs, _, _ = _case("cosmos", lambda v: torch.tensor(v, device=device))
     output = model.process_prompt("Pick up the cup", [], ["video"], **kwargs)
     conductor_kwargs = {k: v for k, v in kwargs.items() if k not in model.PREPROCESS_ONLY_KWARGS}
     conductor_kwargs.update(output.metadata)
@@ -194,7 +207,7 @@ def test_cosmos_prefill_without_action_has_ready_empty_input():
 def test_cosmos_tokenized_prompt_infers_action_width_before_routing(monkeypatch):
     from mstar.model.cosmos3.components import packing
 
-    model, kwargs, _ = _case("cosmos", torch.tensor)
+    model, kwargs, _, _ = _case("cosmos", torch.tensor)
     model.tokenizer = object()
     monkeypatch.setattr(packing, "tokenize_prompt", lambda *args, **kw: ([1, 2, 3], [1, 2, 3]))
     output = model.process_prompt("Pick up the cup", [], ["video"], **kwargs)

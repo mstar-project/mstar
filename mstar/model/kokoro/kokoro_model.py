@@ -71,6 +71,10 @@ def _resolve_snapshot(repo_id: str, cache_dir: str | None, allow_patterns: list[
 class KokoroModel(Model):
     """Model contract for Kokoro-82M (``hexgrad/Kokoro-82M``)."""
 
+    # TTS: text (or phonemes in model_kwargs) in, audio out; no voice cloning.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"audio"})
+
     def __init__(
         self,
         model_path_hf: str,

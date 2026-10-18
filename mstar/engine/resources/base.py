@@ -199,6 +199,11 @@ class Resource(ABC):
         """record step consumption"""
         return
 
+    def abort_step(self, step: ResourceStep, ctx: StepContext) -> None:
+        """drop per-step state held since admit/plan, for a step that will
+        never commit: its admit was refused, or it raised. consumes nothing"""
+        return
+
     def publish(self, request_id: str) -> "PublishedInfo | None":
         return None
 

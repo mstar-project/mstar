@@ -128,6 +128,10 @@ class ChatterboxModel(Model):
     """Model contract: prompt processing, graph, partitions, resources and the
     per-partition state machine. No GPU compute lives here."""
 
+    # TTS: text plus an optional reference clip in, audio out
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "audio"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"audio"})
+
     def __init__(
         self,
         model_path_hf: str,

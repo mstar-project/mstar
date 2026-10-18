@@ -83,6 +83,10 @@ ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 class Flux2KleinModel(Model):
     """FLUX.2 [klein] (4B by default; the 9B checkpoint loads through the same class)."""
 
+    # T2I and edit: text plus optional reference images in, image out
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"image"})
+
     def __init__(
         self,
         model_path_hf: str = FLUX2_KLEIN_4B,

@@ -15,8 +15,8 @@
 //!   frontend -> conductor: SubmitMsg {t:"submit", rid, text, file_paths,
 //!       input_modalities, output_modalities, model_kwargs, prompt_parts,
 //!       streaming}, `prompt_parts` present for a chat only
-//!   conductor -> frontend: {t:"chunk", rid, modality, data(bin), metadata}
-//!                        | {t:"done",  rid}
+//!   conductor -> frontend: {t:"ok", rid} (intake passed) | {t:"chunk", rid, modality,
+//!       data(bin), metadata} | {t:"err", rid, msg} | {t:"done", rid} | {t:"pong", rid}
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -41,6 +41,9 @@ pub struct ResultChunk {
 /// request's serving task.
 #[derive(Debug)]
 pub enum StreamItem {
+    /// The backend took the request past intake; its output follows. Only a
+    /// streaming response waits on it (see `admitted_result_stream`).
+    Accepted,
     Chunk(ResultChunk),
     /// The backend failed this request (worker exception, bad input);
     /// terminal — the route is removed. `status` is the HTTP status the
@@ -76,7 +79,7 @@ fn no_parts(parts: &&[Part]) -> bool {
     parts.is_empty()
 }
 
-/// Inbound message; `t` selects chunk / err / done. `data` is msgpack binary.
+/// Inbound message; `t` selects ok / chunk / err / done / pong. `data` is msgpack binary.
 #[derive(Deserialize)]
 struct Inbound {
     t: String,
@@ -160,6 +163,7 @@ impl Bridge {
                     })),
                     false,
                 ),
+                "ok" => (Some(StreamItem::Accepted), false),
                 // Legacy out-of-band error (the bridge relay caught an exception
                 // and sent `t="err"`); no status carried, default to 500.
                 "err" => (

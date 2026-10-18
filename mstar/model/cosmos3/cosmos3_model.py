@@ -162,6 +162,12 @@ def encode_mp4_pyav(frames: torch.Tensor, fps: float, crf: int = 18, preset: str
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
+    # Text prompt with optional image/video conditioning; emits an image, a video
+    # (the sound walk adds audio), actions, or text where the reasoner is served
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image", "video"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"image", "video", "audio", "action", "text"})
+    DEFAULT_OUTPUT_MODALITIES = ("image",)
+
     PREPROCESS_ONLY_KWARGS = ("action",)
 
     PREFILL_WALK = constants.PREFILL_WALK
@@ -195,6 +201,9 @@ class Cosmos3Model(Model):
         # against whichever tokenizer is bound; see ``postprocess``).
         self._detokenizer = None
         self.config: Cosmos3Config = self._load_config()
+        if not self._reasoner_enabled():
+            # text comes only from the reasoner
+            self.SUPPORTED_OUTPUT_MODALITIES = self.SUPPORTED_OUTPUT_MODALITIES - {"text"}
         self.tokenizer = self._load_tokenizer()
 
         self._submodule_cache: dict[str, torch.nn.Module | None] = {}
@@ -831,7 +840,8 @@ class Cosmos3Model(Model):
                 prompt, input_modalities, tensors or {}, prompt_parts, input_metadata or {}, kwargs,
             )
         if prompt is None:
-            return self._action_prompt_output({}, kwargs)
+            # every prefill walk waits on text_inputs, so this would hang
+            raise ValueError("Cosmos3 requires a text prompt")
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             return self._action_prompt_output({
@@ -1146,6 +1156,9 @@ class Cosmos3Model(Model):
                     f"Unsupported Cosmos3 action_mode={mk.get('action_mode')!r}; "
                     f"expected one of {sorted(ACTION_MODES)}."
                 )
+            # an image output would run the image walk on an action prefill
+            if not {"action", "video"} & set(output_modalities or []):
+                raise ValueError("A Cosmos3 action_mode request needs an action or video output.")
 
         if action_mode is not None:
             # An action request predicts one action token per frame, so the
@@ -1308,8 +1321,12 @@ class Cosmos3Model(Model):
                 params["action_fps"] = mk["action_fps"]
         # Opt-in sound generation: video-only (image and action requests carry
         # no sound band), and only when the served checkpoint/config enable it.
-        if mk.get("generate_sound") or mk.get("sound_gen"):
-            if num_frames <= 1 or action_mode is not None:
+        # Asking for audio out is the same opt-in
+        out = output_modalities or []
+        if mk.get("generate_sound") or mk.get("sound_gen") or "audio" in out:
+            # the sound walk is picked off a video output, so a multi-frame
+            # request without one would pack a sound band into an image walk
+            if num_frames <= 1 or action_mode is not None or "video" not in out:
                 raise ValueError(
                     "Cosmos3 sound generation is supported only for video requests "
                     "(num_frames > 1, no action mode)."

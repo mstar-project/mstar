@@ -943,6 +943,7 @@ class _ForwardingLeader:
             clear_rid=lambda rid, wire_rid: None,
             clear_wire_rid=lambda rid: None,
             last_consumed_tp_seq=-1,
+            pending_tp_follow_count={},
         )
         self.sent: list = []
         self.communicator = SimpleNamespace(

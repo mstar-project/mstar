@@ -99,6 +99,11 @@ _VARIANT_FACTORIES = {
 class WaypointModel(Model):
     """Waypoint-1.5-1B (720P by default; the 360P sibling shares the class)."""
 
+    # A seed image in, raw RGB frames out (streaming only); the controller
+    # stream rides in model_kwargs and the checkpoint takes no prompt.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"video_frame"})
+
     PRIME_WALK = PRIME_WALK
     ROLLOUT_WALK = ROLLOUT_WALK
 
