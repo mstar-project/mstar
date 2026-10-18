@@ -202,7 +202,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        JIT or CUDA-graph capture can exceed that default.
    * - ``tp_allreduce``
      - *(optional)* Small-message all-reduce path of every TP and SP group:
-       ``nccl`` (default), ``symm_oneshot`` or ``symm_multimem``. The last two send
+       ``nccl`` (default), ``symm_oneshot`` or ``symm_multimem``; any other value
+       fails at startup. The last two send
        contiguous bf16 and fp32 CUDA messages up to ``tp_allreduce_max_kb`` through
        torch symmetric memory: one-shot reads every peer's buffer over NVLink and
        reduces locally, multimem uses NVLS multicast (NVSwitch and driver support).

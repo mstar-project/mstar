@@ -15,30 +15,41 @@ import torch.distributed as dist
 sys.path.insert(0, ".")
 
 import mstar.distributed.all_reduce as ar
-from mstar.distributed.all_reduce import AllReduce, SymmMemAllReduce
+from mstar.distributed.all_reduce import (
+    AllReduce,
+    MultimemAllReduce,
+    OneShotAllReduce,
+    SymmMemAllReduce,
+)
 from mstar.distributed.communication import (
     CommGroup,
     GlobalParallelConfig,
     WorkerParallelGroups,
 )
 
+_REAL_BACKENDS = dict(ar.SYMM_BACKENDS)
+
 
 class _FakeSymm(AllReduce):
-    """Stands in for ``SymmMemAllReduce``: records what it was built with."""
+    """Stands in for a ``SymmMemAllReduce`` subclass: records what it was built with."""
 
     instances: list[_FakeSymm] = []
 
-    def __init__(self, device_group, device, max_bytes, mode):
+    def __init__(self, device_group, device, max_bytes):
         super().__init__(device_group)
         self.device = device
         self.max_bytes = max_bytes
-        self.mode = mode
         _FakeSymm.instances.append(self)
 
 
 class _RaisingSymm(_FakeSymm):
     def __init__(self, *a, **k):
         raise RuntimeError("no multicast support")
+
+
+def _fakes(base: type[AllReduce]) -> dict[str, type[AllReduce]]:
+    """``SYMM_BACKENDS`` with each mode's backend a ``base`` of that mode."""
+    return {mode: type(base.__name__, (base,), {"mode": mode}) for mode in _REAL_BACKENDS}
 
 
 @dataclass
@@ -63,7 +74,7 @@ class _CudaTensor:
 
 @pytest.fixture(autouse=True)
 def _one_process(monkeypatch):
-    monkeypatch.setattr(ar, "SymmMemAllReduce", _FakeSymm)
+    monkeypatch.setattr(ar, "SYMM_BACKENDS", _fakes(_FakeSymm))
     # one process: every rank is this one
     monkeypatch.setattr(ar, "_all_ranks_agree", lambda flag, cpu_group: flag)
     _FakeSymm.instances.clear()
@@ -116,7 +127,7 @@ def test_single_rank_and_no_cuda_skip(monkeypatch):
 
 
 def test_setup_failure_falls_back_to_nccl_with_warning(monkeypatch, fake_cuda, caplog):
-    monkeypatch.setattr(ar, "SymmMemAllReduce", _RaisingSymm)
+    monkeypatch.setattr(ar, "SYMM_BACKENDS", _fakes(_RaisingSymm))
     with caplog.at_level(logging.WARNING, logger=ar.__name__):
         backend = AllReduce.new(_group(), "symm_multimem")
     assert type(backend) is AllReduce
@@ -170,11 +181,11 @@ def test_init_dist_sets_up_every_comm_group(monkeypatch, fake_cuda):
 @pytest.mark.parametrize("config, want", [
     ("symm_multimem", "symm_multimem"),
     ("symm_oneshot", "symm_oneshot"),
-    ("nccl", None),
-    (None, None),
+    ("nccl", "nccl"),
+    (None, "nccl"),
 ])
 def test_config_mode(fake_cuda, config, want):
-    assert getattr(AllReduce.new(_group(), config), "mode", None) == want
+    assert AllReduce.new(_group(), config).mode == want
 
 
 @pytest.mark.parametrize("config_kb, want_kb", [(None, 512), (64, 64), (32768, 32768), (0, None)])
@@ -184,11 +195,11 @@ def test_config_max_kb(fake_cuda, config_kb, want_kb):
     assert getattr(backend, "max_bytes", None) == (want_kb and want_kb * 1024)
 
 
-def test_unknown_config_mode_warns_and_is_nccl(fake_cuda, caplog):
-    with caplog.at_level(logging.WARNING, logger=ar.__name__):
-        backend = AllReduce.new(_group(), "symm_twoshot")
-    assert type(backend) is AllReduce
-    assert any("unknown all-reduce mode" in r.getMessage() for r in caplog.records)
+def test_an_unknown_config_mode_is_refused(fake_cuda):
+    # a typo would otherwise serve on NCCL behind a warning
+    with pytest.raises(ValueError, match="tp_allreduce='symm_twoshot'"):
+        AllReduce.new(_group(), "symm_twoshot")
+    assert _FakeSymm.instances == []
 
 
 def test_init_dist_takes_the_config_mode(monkeypatch, fake_cuda):
@@ -220,14 +231,14 @@ def test_global_config_hands_it_to_every_worker(tp_allreduce):
 
 @pytest.fixture
 def fake_symm_mem(monkeypatch):
-    """The real ``SymmMemAllReduce`` over a faked symm_mem module; the
-    returned handle's ``multicast_ptr`` is 0 as on a box without NVLS."""
+    """The real backends over a faked symm_mem module; the returned handle's
+    ``multicast_ptr`` is 0 as on a box without NVLS."""
     symm = pytest.importorskip("torch.distributed._symmetric_memory")
     handle = SimpleNamespace(multicast_ptr=0)
     monkeypatch.setattr(symm, "enable_symm_mem_for_group", lambda name: None)
     monkeypatch.setattr(symm, "empty", lambda n, dtype, device: torch.empty(n, dtype=dtype))
     monkeypatch.setattr(symm, "rendezvous", lambda buf, name: handle)
-    monkeypatch.setattr(ar, "SymmMemAllReduce", SymmMemAllReduce)
+    monkeypatch.setattr(ar, "SYMM_BACKENDS", _REAL_BACKENDS)
     return handle
 
 
@@ -244,9 +255,9 @@ def test_multimem_needs_multicast(fake_cuda, fake_symm_mem, caplog, mode, multic
     assert any("multicast" in r.getMessage() for r in caplog.records) == (not builds)
 
 
-def _multimem(monkeypatch, fake_symm_mem, calls: list) -> SymmMemAllReduce:
-    """The real ``SymmMemAllReduce`` in multimem mode, over kernels that record
-    themselves; the one-shot one writes 7s, the sum it would have stored."""
+def _multimem(monkeypatch, fake_symm_mem, calls: list) -> MultimemAllReduce:
+    """A real ``MultimemAllReduce`` over kernels that record themselves; the
+    one-shot one writes 7s, the sum it would have stored."""
     fake_symm_mem.multicast_ptr = 0x7F0000
 
     def one_shot(buf, op, group, out):
@@ -258,8 +269,7 @@ def _multimem(monkeypatch, fake_symm_mem, calls: list) -> SymmMemAllReduce:
         multimem_all_reduce_=lambda buf, op, group: calls.append(("multimem_all_reduce_", buf)),
     )
     monkeypatch.setattr(torch.ops, "symm_mem", ops, raising=False)
-    return SymmMemAllReduce(SimpleNamespace(group_name="tp"), torch.device("cpu"), 512 * 1024,
-                            "symm_multimem")
+    return MultimemAllReduce(SimpleNamespace(group_name="tp"), torch.device("cpu"), 512 * 1024)
 
 
 @pytest.mark.parametrize("extra_bytes, kernel", [
@@ -294,16 +304,25 @@ def test_the_multimem_kernel_does_not_follow_alignment(monkeypatch, fake_symm_me
     assert bool((x == 7).all()), "the sum lands in x either way"
 
 
+def test_one_shot_writes_the_sum_into_the_input(monkeypatch, fake_symm_mem):
+    monkeypatch.setattr(torch.ops, "symm_mem", SimpleNamespace(
+        one_shot_all_reduce=lambda buf, op, group: torch.full_like(buf, 7),
+    ), raising=False)
+    symm = OneShotAllReduce(SimpleNamespace(group_name="tp"), torch.device("cpu"), 512 * 1024)
+    x = torch.ones(8, dtype=torch.bfloat16)
+    assert symm._reduce(x) is x
+    assert bool((x == 7).all())
+
+
 def _multimem_group(monkeypatch, fake_symm_mem, calls: list) -> CommGroup:
-    """A group over the real ``SymmMemAllReduce`` (CPU buffer, faked kernels)."""
+    """A group over a real ``MultimemAllReduce`` (CPU buffer, faked kernels)."""
     fake_symm_mem.multicast_ptr = 0x7F0000
     monkeypatch.setattr(torch.ops, "symm_mem", SimpleNamespace(
         multimem_one_shot_all_reduce_out=lambda buf, op, group, out: calls.append(("one_shot", out)),
         multimem_all_reduce_=lambda buf, op, group: calls.append(("split", None)),
     ), raising=False)
     g = _group()
-    g._all_reduce = SymmMemAllReduce(g.device_group, torch.device("cpu"), 512 * 1024,
-                                     "symm_multimem")
+    g._all_reduce = MultimemAllReduce(g.device_group, torch.device("cpu"), 512 * 1024)
     return g
 
 
@@ -376,12 +395,12 @@ def test_a_compiled_forward_traces_the_symm_path_in_one_graph(monkeypatch, fake_
 
 @pytest.fixture
 def symm_group(monkeypatch, fake_symm_mem):
-    """A group over the real ``SymmMemAllReduce``, whose symmetric path records
+    """A group over a real ``OneShotAllReduce``, whose symmetric path records
     the tensors routed to it."""
 
     def make(max_bytes: int = 1024) -> tuple[CommGroup, list]:
         g = _group()
-        backend = SymmMemAllReduce(g.device_group, torch.device("cpu"), max_bytes, "symm_oneshot")
+        backend = OneShotAllReduce(g.device_group, torch.device("cpu"), max_bytes)
         routed: list = []
         monkeypatch.setattr(backend, "_reduce", lambda t: routed.append(t) or t)
         g._all_reduce = backend

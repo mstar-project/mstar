@@ -1,13 +1,13 @@
-"""All-reduce backends of a ``CommGroup``.
+"""All-reduce backends of a ``CommGroup``, one per ``tp_allreduce`` mode.
 
 ``AllReduce`` is NCCL. ``SymmMemAllReduce`` sends the small messages it can take
-through torch symmetric memory (NVLink one-shot or NVLS multicast) and the rest
-through NCCL. ``AllReduce.new`` picks one from the deployment config's
-``tp_allreduce``.
+through torch symmetric memory and the rest through NCCL; its subclasses are the
+two kernels, NVLink one-shot and NVLS multicast. ``AllReduce.new`` picks one.
 """
 
 import logging
 import math
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,10 +18,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The ``tp_allreduce`` modes past "nccl", the default. Opt-in: their reduction
-# order differs from NCCL's, so bf16 can differ at the last bit.
-SYMM_MODES = ("symm_oneshot", "symm_multimem")
-# The largest message, in KiB, the symmetric path takes without a ``tp_allreduce_max_kb``
+# The largest message, in KiB, the symmetric path takes without a ``tp_allreduce_max_kb``.
 DEFAULT_SYMM_MAX_KB = 512
 # The symm_mem ops check the message byte size is aligned (at least
 # max(4, element_size)) and vectorize at 16; anything else raises inside
@@ -44,7 +41,9 @@ def _all_ranks_agree(flag: bool, cpu_group) -> bool:
 
 
 class AllReduce:
-    """NCCL for every message; the fallback of the backends below."""
+    """NCCL for every message, and the fallback of the backends below."""
+
+    mode = "nccl"
 
     def __init__(self, device_group):
         self.device_group = device_group
@@ -55,22 +54,24 @@ class AllReduce:
     ) -> "AllReduce":
         """The backend the config's ``tp_allreduce`` (``mode``) names for ``group``,
         sized by ``tp_allreduce_max_kb`` (``max_kb``). Collective across the group
-        (rendezvous): every member calls it at the same point. NCCL unless every
-        rank could set symmetric memory up."""
+        (rendezvous): every member calls it at the same point. Refuses a mode it
+        doesn't know, and stays on NCCL unless every rank could set symmetric
+        memory up."""
         mode = (mode or "nccl").strip().lower()
-        if mode not in SYMM_MODES:
-            if mode != "nccl":
-                logger.warning("unknown all-reduce mode %r; using NCCL", mode)
+        if mode == "nccl":
             return AllReduce(group.device_group)
+        backend_cls = SYMM_BACKENDS.get(mode)
+        if backend_cls is None:
+            raise ValueError(f"tp_allreduce={mode!r} is not one of {['nccl', *SYMM_BACKENDS]}")
         max_kb = DEFAULT_SYMM_MAX_KB if max_kb is None else int(max_kb)
         if (group.world_size == 1 or group.device_group is None or max_kb <= 0
                 or not torch.cuda.is_available()):
             return AllReduce(group.device_group)
         backend = None
         try:
-            backend = SymmMemAllReduce(
+            backend = backend_cls(
                 group.device_group, torch.device("cuda", torch.cuda.current_device()),
-                max_kb * 1024, mode,
+                max_kb * 1024,
             )
         except Exception as exc:  # noqa: BLE001 — fall back to NCCL, loudly
             logger.warning(
@@ -101,26 +102,23 @@ class AllReduce:
         return input_
 
 
-class SymmMemAllReduce(AllReduce):
+class SymmMemAllReduce(AllReduce, ABC):
     """One persistent symmetric-memory buffer per group; small messages are
-    reduced through it (copy in, reduce, result back in the input — in-place
-    semantics, except for an input that is the buffer itself)."""
+    reduced through it (copy in, the subclass's kernel sums it across the group,
+    result back in the input — in-place semantics, except for an input that is
+    the buffer itself). The kernels' reduction order differs from NCCL's, so
+    bf16 results can differ at the last bit."""
 
-    def __init__(self, device_group, device: torch.device, max_bytes: int, mode: str):
+    def __init__(self, device_group, device: torch.device, max_bytes: int):
         import torch.distributed._symmetric_memory as symm
 
         super().__init__(device_group)
-        self.mode = mode
         self.max_bytes = max_bytes
         self.group_name = device_group.group_name
         symm.enable_symm_mem_for_group(self.group_name)
         # Raw byte buffer; viewed per dtype at call time.
         self._buf = symm.empty(max_bytes, dtype=torch.uint8, device=device)
-        handle = symm.rendezvous(self._buf, self.group_name)
-        # Without NVLS the multimem kernel raises at its first call; fail
-        # here instead, where the caller falls back to NCCL.
-        if mode == "symm_multimem" and not handle.multicast_ptr:
-            raise RuntimeError("no NVLink multicast for this group")
+        self._handle = symm.rendezvous(self._buf, self.group_name)
 
     def _fits(self, nbytes: int, dtype: torch.dtype) -> bool:
         return (
@@ -156,9 +154,9 @@ class SymmMemAllReduce(AllReduce):
         n = input_.numel()
         flat = input_.view(-1)
         view = self._buf[: n * input_.element_size()].view(input_.dtype)
-        # data_ptr() breaks a torch.compile graph at every call, so a compiled
-        # forward reads neither: it never gets the buffer (``buffer``) and
-        # takes the split kernel.
+        # data_ptr() breaks a torch.compile graph at every call, so only eager code
+        # checks pointers: a compiled forward never gets the buffer (``buffer``),
+        # and multimem takes its split kernel there.
         eager = not torch.compiler.is_compiling()
         if eager and flat.data_ptr() == view.data_ptr():
             # The producer wrote into the buffer, and the next call reuses it,
@@ -167,18 +165,50 @@ class SymmMemAllReduce(AllReduce):
             flat = input_.view(-1)
         else:
             view.copy_(flat)
-        if self.mode == "symm_multimem" and view.nbytes <= MULTIMEM_ONESHOT_MAX_BYTES and eager:
-            # The kernel is the ranks' to agree on, so it can't follow this rank's
-            # alignment: a tensor its 16-byte stores can't take gets the sum in an
-            # aligned one and a copy.
-            out = flat if flat.data_ptr() % 16 == 0 else torch.empty_like(flat)
-            torch.ops.symm_mem.multimem_one_shot_all_reduce_out(view, "sum", self.group_name, out)
-            if out is not flat:
-                flat.copy_(out)
-        elif self.mode == "symm_multimem":
-            torch.ops.symm_mem.multimem_all_reduce_(view, "sum", self.group_name)
-            flat.copy_(view)
-        else:
-            out = torch.ops.symm_mem.one_shot_all_reduce(view, "sum", self.group_name)
-            flat.copy_(out)
+        self._sum_into(view, flat, eager)
         return input_
+
+    @abstractmethod
+    def _sum_into(self, buf: torch.Tensor, out: torch.Tensor, eager: bool) -> None:
+        """Write the sum of every rank's ``buf`` (a view of the symm buffer) to ``out``."""
+
+
+class OneShotAllReduce(SymmMemAllReduce):
+    """Each rank reads every peer's buffer over NVLink and sums locally."""
+
+    mode = "symm_oneshot"
+
+    def _sum_into(self, buf: torch.Tensor, out: torch.Tensor, eager: bool) -> None:
+        out.copy_(torch.ops.symm_mem.one_shot_all_reduce(buf, "sum", self.group_name))
+
+
+class MultimemAllReduce(SymmMemAllReduce):
+    """The NVSwitch sums the buffer through NVLS multicast."""
+
+    mode = "symm_multimem"
+
+    def __init__(self, device_group, device: torch.device, max_bytes: int):
+        super().__init__(device_group, device, max_bytes)
+        # Without NVLS the kernel raises at its first call; fail here instead,
+        # where ``AllReduce.new`` falls back to NCCL.
+        if not self._handle.multicast_ptr:
+            raise RuntimeError("no NVLink multicast for this group")
+
+    def _sum_into(self, buf: torch.Tensor, out: torch.Tensor, eager: bool) -> None:
+        if eager and buf.nbytes <= MULTIMEM_ONESHOT_MAX_BYTES:
+            # Every rank must run the same kernel, so the choice can't follow this
+            # rank's alignment: an ``out`` the kernel's 16-byte stores can't take
+            # gets the sum in an aligned tensor, then a copy.
+            dst = out if out.data_ptr() % 16 == 0 else torch.empty_like(out)
+            torch.ops.symm_mem.multimem_one_shot_all_reduce_out(buf, "sum", self.group_name, dst)
+            if dst is not out:
+                out.copy_(dst)
+        else:
+            torch.ops.symm_mem.multimem_all_reduce_(buf, "sum", self.group_name)
+            out.copy_(buf)
+
+
+# ``tp_allreduce`` -> its backend; "nccl" is ``AllReduce`` itself
+SYMM_BACKENDS: dict[str, type[SymmMemAllReduce]] = {
+    backend.mode: backend for backend in (OneShotAllReduce, MultimemAllReduce)
+}
