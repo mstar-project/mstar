@@ -18,6 +18,7 @@ from mstar.model.waypoint.components.taehv import (
     validate_taehv_architecture,
 )
 from mstar.model.waypoint.config import WaypointConfig
+from mstar.platforms.compile import deterministic_convs
 
 logger = logging.getLogger(__name__)
 
@@ -463,13 +464,15 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         else:
             raise ValueError(f"Unknown Waypoint graph walk: {graph_walk!r}")
 
-        frames, updated = self._decode_latent(
-            self.taehv,
-            out.squeeze(1),
-            histories,
-            output_size=self.pixel_size,
-            initialize=graph_walk == PRIME_WALK,
-        )
+        # MIOpen's split-K implicit-GEMM conv solver is not deterministic
+        with deterministic_convs():
+            frames, updated = self._decode_latent(
+                self.taehv,
+                out.squeeze(1),
+                histories,
+                output_size=self.pixel_size,
+                initialize=graph_walk == PRIME_WALK,
+            )
         result: NameToTensorList = {
             "video_output": [frames],
             # Loop-back edge for next iteration's "clock" input; see
@@ -688,9 +691,11 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         outright, so it never needs a real request's ids, captured or not."""
         del graph_walk, kwargs
         del engine_inputs
-        latent = encode_seed_clip(
-            self.taehv, image, output_size=self.encoded_size
-        )
+        # MIOpen's split-K implicit-GEMM conv solver is not deterministic
+        with deterministic_convs():
+            latent = encode_seed_clip(
+                self.taehv, image, output_size=self.encoded_size
+            )
         # [B, C, h, w] -> [B, 1, C, h, w]: the dit's frame axis, added where the
         # reference adds it (``WorldEngine.append_frame``).
         return {"latent": [latent.unsqueeze(1)]}

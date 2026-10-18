@@ -968,3 +968,40 @@ def test_controller_input_embedding_concat_order_is_mouse_button_scroll():
     assert torch.equal(packed[..., 258:259], scroll), "field 258:259 is not scroll"
     # Sensitivity check: a permuted order really would produce a different vector.
     assert not torch.equal(packed, torch.cat((mouse, scroll, button), dim=-1))
+
+
+@pytest.mark.parametrize("rocm", [False, True])
+def test_taehv_encode_and_decode_run_with_deterministic_convs(monkeypatch, rocm):
+    from types import SimpleNamespace
+
+    from mstar import platforms
+    from mstar.model.waypoint import submodules
+
+    platform = platforms.RocmPlatform() if rocm else platforms.CudaPlatform()
+    monkeypatch.setattr(platforms, "resolve_platform", lambda: platform)
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", False)
+    seen = {}
+
+    def fake_encode(taehv, image, output_size):
+        seen["encode"] = torch.backends.cudnn.deterministic
+        return torch.zeros(1, 4, 2, 2)
+
+    def fake_decode(taehv, latent, histories, output_size, initialize):
+        seen["decode"] = torch.backends.cudnn.deterministic
+        return torch.zeros(1, 1, 2, 2, 3, dtype=torch.uint8), histories
+
+    monkeypatch.setattr(submodules, "encode_seed_clip", fake_encode)
+    encoder = SimpleNamespace(taehv=None, encoded_size=(2, 2))
+    submodules.WaypointVaeEncoderSubmodule.forward(encoder, "prime", None, image=torch.zeros(1, 3, 4, 4))
+
+    dit = SimpleNamespace(
+        dit=SimpleNamespace(append_frame=lambda latent, pos, **kw: torch.zeros(1, 1, 4, 2, 2)),
+        _decode_latent=fake_decode, taehv=None, pixel_size=(2, 2),
+    )
+    histories = {f"{submodules.DECODER_HISTORY_PREFIX}{i}": torch.zeros(1) for i in range(9)}
+    submodules.WaypointDitSubmodule.forward(
+        dit, submodules.PRIME_WALK, None, frame_pos=torch.zeros(1, dtype=torch.int64),
+        mouse=None, button=None, scroll=None, latent=torch.zeros(1, 1, 4, 2, 2), **histories,
+    )
+    assert seen == {"encode": rocm, "decode": rocm}
+    assert torch.backends.cudnn.deterministic is False

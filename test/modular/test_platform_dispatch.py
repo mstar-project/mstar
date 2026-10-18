@@ -16,7 +16,7 @@ from mstar import platforms
 from mstar.engine.cuda_graph_runner import CudaGraphRunner
 from mstar.engine.engine import Engine
 from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform
-from mstar.platforms.compile import with_inductor_overrides
+from mstar.platforms.compile import deterministic_convs, with_inductor_overrides
 from mstar.platforms.dispatch import PlatformDispatch
 
 
@@ -284,3 +284,15 @@ def test_compiled_submodule_forwards_take_overrides_for_any_token_count(
         assert platform.queries == [None, None]
     else:
         assert isinstance(mgmt.forward, functools.partial)
+
+
+# --- deterministic_convs ----------------------------------------------------
+
+
+@pytest.mark.parametrize("platform", [CudaPlatform(), RocmPlatform(), CpuPlatform()], ids=repr)
+def test_deterministic_convs_sets_the_flag_on_rocm_only(on_platform, monkeypatch, platform):
+    on_platform(platform)
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", False)
+    with deterministic_convs():
+        assert torch.backends.cudnn.deterministic is platform.is_rocm()
+    assert torch.backends.cudnn.deterministic is False
