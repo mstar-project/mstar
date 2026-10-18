@@ -2903,8 +2903,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
             return self._decode_dtype_cached
         # COSMOS3_VAE_DECODE_FP32 forces fp32, or bf16 when it is 0/false/no/off
         self._decode_dtype_cached = _wan_vae().decode_dtype("COSMOS3_VAE_DECODE_FP32")
-        logger.info("Cosmos3 VAE decode dtype = %s (cuDNN %s)",
-                    self._decode_dtype_cached, torch.backends.cudnn.version())
+        logger.info("Cosmos3 VAE decode dtype = %s (%s)",
+                    self._decode_dtype_cached, _wan_vae().conv_library_version())
         return self._decode_dtype_cached
 
     def _vae_input(self, latents: torch.Tensor) -> torch.Tensor:
