@@ -30,6 +30,7 @@ from mstar.utils.fused_moe.config import (
 class MoEBackend(str, enum.Enum):
     AUTO = "auto"
     TRITON = "triton"  # mstar's Triton grouped GEMM, any GPU Triton targets
+    AITER = "aiter"  # AITER's CK / asm fused MoE, AMD Instinct GPUs
 
 
 class FusedMoEBackend:
@@ -109,4 +110,8 @@ def make_moe_backend(kind: MoEBackend | str, problem: MoEProblem) -> FusedMoEBac
     kind = MoEBackend(kind)
     if kind in (MoEBackend.AUTO, MoEBackend.TRITON):
         return TritonFusedMoE(problem)
+    if kind is MoEBackend.AITER:
+        from mstar.utils.fused_moe.backend_aiter import AiterFusedMoE
+
+        return AiterFusedMoE(problem)
     raise ValueError(f"unknown MoE backend {kind!r}")
