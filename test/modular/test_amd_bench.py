@@ -263,3 +263,68 @@ def test_runner_tags_prompts_and_chat_template_kwargs():
     assert ours._finish_payload({}, "text") == {"modalities": ["text"]}
     with pytest.raises(ValueError):
         make(InferenceSystemType.OURS, False)
+
+
+def test_gpu_query_parsers():
+    from benchmark import gpu_query
+
+    assert gpu_query.parse_nvidia_processes("11, 100\n\n12, 2.5\n") == [(11, 100.0), (12, 2.5)]
+    doc = [{"gpu": 1, "process_list": [{"process_info": {"pid": 7, "memory_usage": {
+        "vram_mem": {"value": 2 * 2**20, "unit": "B"}}}}]}, {"gpu": 0, "process_list": []}]
+    assert gpu_query.parse_amd_processes(doc, 1) == [(7, 2.0)]
+    assert gpu_query.parse_amd_processes(doc, 0) == []
+    assert gpu_query._mib({"value": 3, "unit": "GB"}) == 3072 and gpu_query._mib(5) == 5.0
+
+
+def test_onnx_providers():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "benchmark/kokoro_onnx_baselines.py"
+    spec = importlib.util.spec_from_file_location("kokoro_onnx_baselines", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    amd = ["MIGraphXExecutionProvider", "ROCMExecutionProvider", "CPUExecutionProvider"]
+    assert mod.onnx_providers("auto", amd) == ["MIGraphXExecutionProvider", "CPUExecutionProvider"]
+    assert mod.onnx_providers("rocm", amd) == ["ROCMExecutionProvider", "CPUExecutionProvider"]
+    assert mod.onnx_providers("cpu", amd) == ["CPUExecutionProvider"]
+    assert mod.onnx_providers("auto", ["CPUExecutionProvider"]) == ["CPUExecutionProvider"]
+    with pytest.raises(RuntimeError):
+        mod.onnx_providers("cuda", amd)
+
+
+def test_reference_arms_only_serve_their_model_and_split_gpus(tmp_path):
+    names = ["mstar", "ref-kokoro", "ref-orpheus-vllm"]
+    assert [a.name for a in catalog.arms_for(catalog.ROWS["kokoro"], names)] == ["mstar", "ref-kokoro"]
+    assert [a.name for a in catalog.arms_for(catalog.ROWS["orpheus"], names)] == ["mstar", "ref-orpheus-vllm"]
+    wt = Path(__file__).resolve().parents[2]
+    arm = catalog.ARMS["ref-orpheus-vllm"]
+    two = Launch(arm, catalog.ROWS["orpheus"], [6, 7], 8400, tmp_path / "a", worktree=wt)
+    assert two.server_gpus == [6] and two.client_gpu == 7 and two.environment()["GPUS"] == "6"
+    one = Launch(arm, catalog.ROWS["orpheus_colocated"], [3], 8400, tmp_path / "b", worktree=wt)
+    assert one.server_gpus == [3] and one.client_gpu == 3
+    env = sweep.client_env(arm, catalog.ROWS["orpheus"], [6, 7])
+    assert env["HIP_VISIBLE_DEVICES"] == "7" and catalog.REFENV in env["PYTHONPATH"].split(":")
+    assert sweep.client_env(catalog.ARMS["vllm"], catalog.ROWS["qwen3_5_2b"], [1])["HIP_VISIBLE_DEVICES"] == ""
+
+
+def test_orpheus_vllm_decode_window():
+    import torch
+
+    from benchmark.request import OrpheusVLLM
+
+    seen = {}
+
+    class FakeSnac:
+        def decode(self, levels):
+            seen["levels"] = [lv.tolist() for lv in levels]
+            return torch.linspace(-1, 1, 8192).view(1, 1, -1)
+
+    c = OrpheusVLLM(device="cpu")
+    c._torch, c._snac = torch, FakeSnac()
+    codes = list(range(1, 29))
+    pcm = c._decode(codes)
+    assert seen["levels"][0] == [[1, 8, 15, 22]]
+    assert seen["levels"][1] == [[2, 5, 9, 12, 16, 19, 23, 26]]
+    assert seen["levels"][2][0][:4] == [3, 4, 6, 7]
+    assert len(pcm) == 2 * 2048  # the middle 2048 samples, int16
+    assert c._decode([5000] + codes[1:]) is None

@@ -71,7 +71,9 @@ def kokoro_cell(set_dir: Path, out: Path, repeats: int, warmup: int, voice: str,
         audio = np.concatenate(parts) if parts else np.zeros(0, np.float32)
         return audio, first, time.monotonic() - t0
 
-    for w in range(warmup):
+    # Warm up on every sentence once: MIOpen tunes each new convolution shape on first use, which
+    # would otherwise land in the timed pass (mstar's own decoder shapes are captured at startup).
+    for w in range(warmup if warmup >= 0 else len(items)):
         synth(items[w % len(items)]["prompt"], w)
     reps = []
     for k in range(1, repeats + 1):
@@ -149,7 +151,7 @@ def main(argv=None) -> int:
     ap.add_argument("--set-dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--warmup", type=int, default=5)
+    ap.add_argument("--warmup", type=int, default=-1, help="warmup requests (default: one pass over the set)")
     ap.add_argument("--voice", default="af_heart")
     ap.add_argument("--correctness-src", default=str(REPO))
     args = ap.parse_args(argv)
