@@ -142,8 +142,7 @@ class GreedySampler(Resource):
     def build(cls, spec, info):
         raise NotImplementedError("test helper; construct directly")
 
-    def sample(self, request_ids, logits, **kwargs):
-        del request_ids, kwargs
+    def sample(self, logits):
         return logits.argmax(dim=-1)
 
 

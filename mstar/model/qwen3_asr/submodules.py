@@ -425,7 +425,7 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
                 # device loop-back: every row is its request's last sampled
                 # token, read by slot (padding rows read slot 0)
                 sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-                ids = sampler.loopback_tokens(engine_inputs.request_ids)
+                ids = sampler.loopback_tokens()
                 # rows whose last step ran elsewhere brought their token
                 routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None]
                 if routed:
@@ -448,7 +448,7 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         hidden = self.model(input_embeds, label="main")
         if graph_walk != DECODE_WALK:
             hidden = attn.select_last_hidden(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+        return sampler.sample(self.model.logits(hidden))
 
     def forward(
         self,

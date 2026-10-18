@@ -849,9 +849,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         # Decode: produce logits for text token sampling
         if graph_walk == "thinker_decode" or request_info.step_metadata.get("is_last_prefill", False):
             logits = self.model.lm_head(hidden[-1:, :])
-            result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(
-                engine_inputs.request_ids, logits=logits
-            )]
+            result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(logits)]
 
         # Pack thinker_states for Talker conditioning ONLY when audio output
         # is requested.  For text-only requests we skip this entirely to
@@ -1040,7 +1038,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if is_prefill:
             last_hidden = attn_manager.select_last_hidden(hidden)
             logits = self.model.lm_head(last_hidden)  # (padded_bs, vocab)
-            new_tokens = sampler.sample(request_ids, logits)
+            new_tokens = sampler.sample(logits)
             if layer_n_hidden is not None:
                 thinker_states = torch.cat(
                     [layer_0_embed, layer_n_hidden], dim=-1,
@@ -1061,7 +1059,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         # thinker_decode (existing behavior)
         logits = self.model.lm_head(hidden)  # (batch, vocab)
-        new_tokens = sampler.sample(request_ids, logits)
+        new_tokens = sampler.sample(logits)
 
         if layer_n_hidden is not None:
             thinker_states = torch.cat(
@@ -1513,7 +1511,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         return {}
 
     def _forward_decode_like(
-        self, request_ids: list[str],
+        self,
         talker_sampler: SamplerResource,
         code_pred_sampler: SamplerResource,
         suppress_mask: torch.Tensor,
@@ -1551,9 +1549,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Apply the repetition penalty to the Talker's layer-0 codes (the code
         # predictor depth loop below samples through its own aux config and
         # stays penalty-free). The penalty is baked into the captured graph.
-        layer0_codes = talker_sampler.sample(
-            request_ids, logits
-        )
+        layer0_codes = talker_sampler.sample(logits)
 
         # code predictor section
         embed = self.talker_code_emb(layer0_codes)  # [bs, hidden]
@@ -1585,9 +1581,7 @@ class TalkerSubmodule(ARNodeSubmodule):
 
             # Params come from the "code_predictor" aux sampler's static
             # buffers, so per-request values survive graph replay.
-            tokens = code_pred_sampler.sample(
-                request_ids, logits,
-            )
+            tokens = code_pred_sampler.sample(logits)
             all_codes[:, group_idx] = tokens
             embed = codec_embedding[group_idx - 1](tokens)
             codec_emb_sum.add_(embed)
@@ -1610,7 +1604,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                 input_embeds=input_embeds
             )
         return self._forward_decode_like(
-            request_ids=engine_inputs.request_ids,
             talker_sampler=engine_inputs.resources[TALKER_SAMPLER],
             code_pred_sampler=engine_inputs.resources[CODE_PRED_SAMPLER],
             input_embeds=input_embeds,
@@ -1660,7 +1653,6 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
 
         fwd_out = self._forward_decode_like(
-            request_ids=engine_inputs.request_ids,
             talker_sampler=engine_inputs.resources[TALKER_SAMPLER],
             code_pred_sampler=engine_inputs.resources[CODE_PRED_SAMPLER],
             is_batched_decode=True,
