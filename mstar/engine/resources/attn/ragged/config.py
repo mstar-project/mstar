@@ -27,6 +27,8 @@ class RaggedAttnBackend(Enum):
     # the platform's default, decided when the resource is built
     AUTO = "auto"
     FLASHINFER = "flashinfer"
+    # ROCm: AITER's varlen flash attention
+    AITER = "aiter"
 
 
 @dataclass(frozen=True)
