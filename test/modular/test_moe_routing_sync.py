@@ -33,9 +33,12 @@ HIDDEN, INTER, NUM_EXPERTS, TOP_K, TOKENS, WORLD = 32, 16, 8, 2, 6, 2
 
 
 def _naive_kernels() -> types.ModuleType:
-    """``mstar.utils.fused_moe`` as ``_dispatch_tp`` imports it, on the naive CPU dispatch."""
+    """``mstar.utils.fused_moe`` and its ``runner``, which the block's Triton backend imports
+    ``fused_experts`` from, on the naive CPU dispatch."""
 
-    def fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, reduce_results=True, skip_invalid=False):
+    def fused_experts(
+        hidden_states, w1, w2, topk_weights, topk_ids, reduce_results=True, skip_invalid=False, alignment=None,
+    ):
         out = dispatch_experts_fused(
             hidden_states, w1, w2, w1.shape[0], topk_ids, topk_weights, skip_invalid=skip_invalid,
         )
@@ -46,7 +49,18 @@ def _naive_kernels() -> types.ModuleType:
 
     module = types.ModuleType("mstar.utils.fused_moe")
     module.fused_experts, module.moe_sum_reduce_triton = fused_experts, moe_sum_reduce_triton
+    module.runner = types.ModuleType("mstar.utils.fused_moe.runner")
+    module.runner.fused_experts = fused_experts
     return module
+
+
+def _install_naive_kernels(setitem=None) -> None:
+    module = _naive_kernels()
+    for name, mod in (("mstar.utils.fused_moe", module), ("mstar.utils.fused_moe.runner", module.runner)):
+        if setitem is None:
+            sys.modules[name] = mod
+        else:
+            setitem(sys.modules, name, mod)
 
 
 def _randn(*shape, seed):
@@ -117,7 +131,7 @@ class _RecordingGroup(CommGroup):
     (ExpertParallelSparseMoeBlock, True),
 ])
 def test_only_expert_parallel_syncs_routing(monkeypatch, cls, syncs_routing):
-    monkeypatch.setitem(sys.modules, "mstar.utils.fused_moe", _naive_kernels())
+    _install_naive_kernels(monkeypatch.setitem)
     group = _RecordingGroup()
     with torch.no_grad():
         _block(cls, group)(_randn(TOKENS, HIDDEN, seed=5))
@@ -131,7 +145,7 @@ def _lockstep_worker(rank: int, cls, store: str, out_dir: str) -> None:
         "gloo", init_method=f"file://{store}", rank=rank, world_size=WORLD, timeout=timedelta(seconds=60),
     )
     torch.set_num_threads(1)
-    sys.modules["mstar.utils.fused_moe"] = _naive_kernels()
+    _install_naive_kernels()
     try:
         group = CommGroup(rank, rank, list(range(WORLD)))
         group.device_group = dist.group.WORLD
