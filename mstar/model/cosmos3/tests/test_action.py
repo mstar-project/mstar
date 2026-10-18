@@ -333,7 +333,9 @@ def test_action_engine_matches_fused() -> None:
     a_noise[..., raw:] = 0
 
     from mstar.model.cosmos3.components.packing import tokenize_prompt
-    cond_ids, _ = tokenize_prompt(model.tokenizer, prompt, "", num_frames=nf, height=h, width=w, fps=fps)
+    cond_ids, _ = tokenize_prompt(model.tokenizer, prompt, "", num_frames=nf, height=h, width=w, fps=fps,
+                                  use_system_prompt=False, add_resolution_template=False,
+                                  add_duration_template=False)
     rid = "ra"
     md = {"height": h, "width": w, "num_frames": nf, "fps": fps, "action_fps": fps, "guidance_scale": 1.0,
           "num_inference_steps": steps, "action_mode": "inverse_dynamics", "action_chunk_size": chunk,
