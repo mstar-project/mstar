@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import sys
 import types
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,6 +40,7 @@ from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, Publish
 from mstar.engine.resources.step import Segment, StepContext  # noqa: E402
 from mstar.model.base import PrefixStream  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule  # noqa: E402
+from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     PrefixHit,
     ScheduleTPNode,
@@ -46,6 +48,7 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerMessageType,
 )
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
+from mstar.worker.worker import Worker  # noqa: E402
 
 PAGE_SIZE = 16
 ROOT = b"a root"
@@ -605,6 +608,69 @@ def test_a_follower_that_allocated_other_pages_than_rank_0_is_a_loud_error(monke
     with pytest.raises(RuntimeError, match=rf"KV kv: .*{NODE}/{WALK}, tp seq 7"):
         _follow(follower, head)
 
+
+def _decode(preplan: bool = False) -> tuple[KVStep, StepContext]:
+    ctx = StepContext(request_ids=("a", "b"), graph_walk="decode", slot=0, capture=False, is_preplan=preplan)
+    return KVStep(segments=(Segment("a", "main", 1), Segment("b", "main", 1))), ctx
+
+
+def test_a_follower_pre_plans_a_head_its_failed_step_voids_as_rank_0_did(monkeypatch):
+    """Rank 0 pre-plans step N+1 while N runs: a takes the last free page, and b takes a
+    cached page by evicting it. N then fails b, so N+1 never runs. A follower whose N
+    finished before the head arrived has to pre-plan the head too, or its next allocation
+    takes other pages than rank 0's."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    ranks = leader, follower = _manager(0, max_num_pages=9), _manager(1, max_num_pages=9)
+    # a's and b's tokens in N+1 each start a page, and the pool has one free page
+    prompts = {"old": _tokens(3 * PAGE_SIZE, seed=29), "a": _tokens(2 * PAGE_SIZE - 1, seed=30),
+               "b": _tokens(2 * PAGE_SIZE - 1, seed=31)}
+    for kv in ranks:
+        for rid, tokens in prompts.items():
+            _ingest(kv, rid, tokens)
+            _run(kv, rid, tokens)
+        kv.remove_request("old")
+        step, ctx = _decode()
+        assert kv.admit(step, ctx).ok
+        kv.plan(step, ctx)
+        kv.commit(step, ctx)
+    assert leader.admit(*_decode(preplan=True)).ok
+
+    scheduler = MicroScheduler(engine_manager=None, parallel_leader_nodes=set())
+    scheduler.register_tp_follow(ScheduleTPNode(
+        NODE, "decode", ["a", "b"], speculative=True, spec_seq=5, spec_from_seq=4,
+    ))
+
+    def _build(pending):
+        scheduler.pop_tp_follow_head()
+        return _decode(preplan=True)
+
+    worker = Worker.__new__(Worker)
+    worker.worker_id = 1
+    worker._tp_nospec = RecentSet(1)
+    worker.scheduler = scheduler
+    worker._try_follow_speculation = _build
+    step_n = Future()
+    step_n.set_result({})
+    pending = SimpleNamespace(
+        tp_seq=4, future=step_n,
+        node_batch=SimpleNamespace(admit_error=None, failed_requests={"b": "boom"}),
+    )
+    _, armed = Worker._await_tp_follow_step(worker, pending, lambda head: follower.admit(*head))
+
+    # the main loop drops the pre-plan, then fails b
+    leader.clear_preplan()
+    if armed is not None:
+        follower.clear_preplan()
+    for kv in ranks:
+        kv.remove_request("b")
+
+    assert _pages(leader, "a") == _pages(follower, "a"), "a holds a page on rank 0 only"
+    free = [list(kv._arena.allocator.free_pages.queue) for kv in ranks]
+    assert free[0] == free[1], "the next allocation would hand the ranks different pages"
+    assert sorted(leader._index.pages()) == sorted(follower._index.pages()), (
+        "rank 0's pre-plan evicted a cached page the follower still holds"
+    )
+    assert leader.page_trail() == follower.page_trail(), "the follower would raise at rank 0's next step"
 
 def test_with_the_debug_flag_off_no_trail_is_kept_or_sent(monkeypatch):
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
