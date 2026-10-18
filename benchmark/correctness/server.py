@@ -226,6 +226,10 @@ def _git(worktree: Path, *args: str) -> str:
     return p.stdout.strip() if p.returncode == 0 else f"(git {' '.join(args)} failed: {p.stderr.strip()[:200]})"
 
 
+def git_short(worktree: Path) -> str:
+    return _git(worktree, "rev-parse", "--short", "HEAD")
+
+
 def collect_versions(spec: ServerSpec) -> dict:
     """Git state of the worktree and package versions as the server sees them."""
     info = {
