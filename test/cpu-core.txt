@@ -62,6 +62,7 @@ test/modular/test_wan_vae_decode.py
 mstar/model/cosmos3/tests/test_windowed_decode.py
 test/modular/test_wan22_fast_decode.py
 mstar/model/cosmos3/tests/test_dit_step_guard.py
+test/modular/test_cosmos3_missing_prompt.py
 test/modular/test_bench_summary.py
 test/modular/test_amd_bench.py
 test/modular/test_psnr_tool.py
