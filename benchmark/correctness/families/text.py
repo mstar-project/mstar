@@ -185,7 +185,7 @@ class TextFamily(Family):
         mismatched_encode = []
         for it in sset.items:
             ids = self.prompt_ids(tok, it.prompt)
-            if not _same_as_mstar_encode(tok, it.prompt, ids, self):
+            if not self.same_as_server_encode(tok, it.prompt, ids):
                 mismatched_encode.append(it.id)
             rec = generate_reference(model, tok, ids, int(it.params.get("max_new_tokens", 128)), device, eos)
             (ref_dir / "outputs" / f"{it.id}.json").write_text(json.dumps(rec, ensure_ascii=False))
@@ -193,6 +193,10 @@ class TextFamily(Family):
                   flush=True)
         write_meta(ref_dir, family=self.name, reference=self.reference_description(), set=sset.name,
                    hf_id=self.hf_id, topk=TOPK, eos=eos, prompt_ids_differ_from_mstar_encode_ids=mismatched_encode)
+
+    def same_as_server_encode(self, tok, prompt: str, ids: list[int]) -> bool:
+        """Whether the server's chunked encoder gives the same ids (Qwen3.5)."""
+        return _same_as_mstar_encode(tok, prompt, ids, self)
 
     # --- scoring --------------------------------------------------------------------------------
     def score(self, sset: SampleSet, runs: list[Path], ref_dir: Path | None, work: Path,
