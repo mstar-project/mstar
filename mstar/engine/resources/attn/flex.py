@@ -28,6 +28,7 @@ from mstar.engine.resources.base import CGSlotSpec
 from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.ring.manager import RingPlan
 from mstar.engine.resources.step import StepContext
+from mstar.platforms import current_platform
 
 __all__ = ["FlexAttentionManager", "flex_attention_masked", "make_block_mask"]
 
@@ -115,6 +116,12 @@ flex_attention_masked = torch.compile(
 )
 
 
+@torch.compiler.assume_constant_result
+def _argsort_needs_dense_input() -> bool:
+    # torch's ROCm GPU sort rejects an expanded (stride-0) input
+    return current_platform.is_rocm()
+
+
 def make_block_mask(q_len: int, kv_len: int, written: Tensor) -> BlockMask:
     """Build the query-uniform, full-blocks-only ``BlockMask`` over ``written``.
 
@@ -151,6 +158,8 @@ def make_block_mask(q_len: int, kv_len: int, written: Tensor) -> BlockMask:
 
     full_bm = block_any[None, :].expand(q_blocks, kv_blocks)
     full_kv_num_blocks = full_bm.sum(dim=-1, dtype=torch.int32)[None, None].contiguous()
+    if _argsort_needs_dense_input():
+        full_bm = full_bm.contiguous()
     # Stable descending argsort: the visited list is this truncated to
     # full_kv_num_blocks, so unwritten blocks sort to the tail and are never
     # read. That is exactly why compacting the global ring is bit-exact.
