@@ -2724,16 +2724,6 @@ class Worker:
         if head is not None and head.speculative and head.spec_from_seq == pending.tp_seq:
             self.scheduler.pop_tp_follow_head()
 
-    @staticmethod
-    def _step_voids_head(pending: PendingBatch) -> str | None:
-        """Why N's verdict voids a head built on it, or ``None``. Both fields are
-        final once N's future is done; the leader clears on exactly these two."""
-        if pending.node_batch.admit_error is not None:
-            return "admit_error"
-        if pending.node_batch.failed_requests:
-            return "failed rids"
-        return None
-
     def _await_tp_follow_step(
         self, pending: PendingBatch, arm: Callable[[Speculation], None],
     ) -> tuple[dict[int, NameToTensorList] | None, Speculation | None]:
@@ -2751,15 +2741,9 @@ class Worker:
                 return outputs, None
             head = self.scheduler.peek_tp_follow()
             if head is not None and head.speculative and head.spec_from_seq == s:
-                void = self._step_voids_head(pending) if outputs is not None else None
-                if void is not None:
-                    # The leader clears its speculation on this verdict too.
-                    self.scheduler.pop_tp_follow_head()
-                    logger.debug(
-                        "Worker %s: dropped speculative head seq %d (parent %d %s)",
-                        self.worker_id, head.spec_seq, s, void,
-                    )
-                    return outputs, None
+                # Build the head even when N's verdict voids it. The leader
+                # pre-plans every head it sends, and this rank's pages have to
+                # move as the leader's do.
                 spec = self._try_follow_speculation(pending)
                 if spec is not None:
                     arm(spec)
