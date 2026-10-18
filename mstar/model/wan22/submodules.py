@@ -601,8 +601,8 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
         from mstar.model.components import wan_vae
 
         self._decode_dtype_cached = wan_vae.decode_dtype("WAN22_VAE_DECODE_FP32")
-        logger.info("Wan2.2 VAE decode dtype = %s (cuDNN %s)",
-                    self._decode_dtype_cached, torch.backends.cudnn.version())
+        logger.info("Wan2.2 VAE decode dtype = %s (%s)",
+                    self._decode_dtype_cached, wan_vae.conv_library_version())
         return self._decode_dtype_cached
 
     def prepare_inputs(
