@@ -6,8 +6,9 @@ Requirements
 
 - **Python 3.12+**.
 - **Linux with an NVIDIA GPU** and a recent **CUDA** toolkit for the GPU model
-  families, or **Intel GPUs with XPU PyTorch** for BAGEL
-  (see `Using Docker image on Intel GPU`_).
+  families, an **AMD Instinct MI300X/MI325X** with **ROCm**, whose install differs
+  (see `ROCm (AMD Instinct MI300X/MI325X, gfx942)`_), or **Intel GPUs with XPU
+  PyTorch** for BAGEL (see `Using Docker image on Intel GPU`_).
   A CPU-only machine can exercise the graph/worker plumbing in *dummy mode*
   (submodules return ``None``) for development and the modular tests, but not real model
   inference.
@@ -242,7 +243,8 @@ Or, in an existing Python 3.12 environment:
 GPU libraries
 -------------
 
-The GPU model families depend on:
+On NVIDIA GPUs the model families depend on the libraries below. AMD GPUs use others (see
+`ROCm (AMD Instinct MI300X/MI325X, gfx942)`_).
 
 - **FlashInfer** (``flashinfer-python``) — paged attention and continuous batching for the
   autoregressive backbones (every model with a ``KV_CACHE`` node runs attention through it).
@@ -458,6 +460,213 @@ newest release (0.17 at the time of writing), which fails to load next to torch 
 is the release built against it.
 The ``[asr]`` extra pins that pair itself (``torch`` 2.10 with ``torchcodec`` 0.10, as in the
 Docker images), so installing it puts ``torch`` on 2.10.
+
+ROCm (AMD Instinct MI300X/MI325X, gfx942)
+-----------------------------------------
+
+M* runs on AMD Instinct MI300X and MI325X GPUs (``gfx942``) through PyTorch's ROCm
+build. Model code and configs are the same as on NVIDIA. What changes is the set of GPU
+libraries, and which kernel each engine resource picks (see :ref:`architecture:Hardware
+platforms`). :ref:`models:Running on AMD GPUs` lists which models have been run there.
+Other AMD GPUs are untested. AITER's prebuilt kernels and AMD's FlashInfer build only
+target ``gfx942`` and ``gfx950``.
+
+This is the stack M* was tested with:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
+
+   * - Component
+     - Version
+   * - Driver and ROCm
+     - The amdgpu driver from the ROCm 7.2 release (6.16.13), and ROCm 7.2 on the host. torch
+       loads its own HIP runtime, RCCL, hipBLASLt and MIOpen. The system ROCm is there
+       for ``hipcc``, which AITER and FlashInfer use to compile kernels at run time.
+   * - PyTorch
+     - ``torch 2.12.1+rocm7.2``, ``torchvision 0.27.1+rocm7.2``,
+       ``torchaudio 2.11.0+rocm7.2`` and torch's Triton (``triton-rocm 3.7.1``), from
+       ``https://download.pytorch.org/whl/rocm7.2``
+   * - AITER
+     - ``amd-aiter 0.1.25``, the release wheel built for ROCm 7.2, with ``flydsl 0.3.4.1``
+   * - FlashInfer
+     - ``amd-flashinfer 0.6.18+amd.1``, AMD's ROCm fork. It installs as ``flashinfer``.
+   * - pybind11
+     - ``3.0.4`` (keep it on 3.0.x, see below)
+
+**1. ROCm and torch.** Put the system ROCm on ``PATH`` so the run-time kernel builds find
+``hipcc``, then install torch from the ROCm index. Name the ROCm backend instead of
+``--torch-backend=auto``:
+
+.. code-block:: bash
+
+   export ROCM_PATH=/opt/rocm-7.2.0 ROCM_HOME=/opt/rocm-7.2.0 PATH=/opt/rocm-7.2.0/bin:$PATH
+
+   uv venv --python 3.12 --seed
+   source .venv/bin/activate
+   uv pip install --torch-backend rocm7.2 \
+       torch==2.12.1 torchvision==0.27.1 torchaudio==2.11.0
+
+**2. M* without the CUDA-only packages.** Several extras pull in packages that are CUDA
+builds (table below). Leave them out with a uv overrides file, and pin the torch stack
+with a constraints file so the extras can't replace it:
+
+.. code-block:: bash
+
+   cat > rocm-constraints.txt <<'END'
+   torch==2.12.1+rocm7.2
+   torchvision==0.27.1+rocm7.2
+   torchaudio==2.11.0+rocm7.2
+   triton-rocm==3.7.1
+   pybind11==3.0.4
+   END
+
+   cat > rocm-overrides.txt <<'END'
+   fa3-fwd; sys_platform == "never"
+   flashinfer-python; sys_platform == "never"
+   triton; sys_platform == "never"
+   mooncake-transfer-engine; sys_platform == "never"
+   torchcodec; sys_platform == "never"
+   vllm-xpu-kernels; sys_platform == "never"
+   END
+
+   uv pip install --torch-backend rocm7.2 -c rocm-constraints.txt \
+       --overrides rocm-overrides.txt -e ".[kokoro,orpheus,qwen3_tts,dev]"
+
+Pick the extras for the models you serve. From PyPI, install ``"mstar-ai[...]"`` the same
+way instead of ``-e``. The never-true marker drops a package from the resolution.
+
+.. list-table:: Packages left out on ROCm
+   :header-rows: 1
+   :widths: 26 40 34
+
+   * - Package
+     - Why
+     - Used instead
+   * - ``fa3-fwd``
+     - FlashAttention-3 for Hopper, a CUDA binary
+     - AITER's ``flash_attn_varlen_func`` for dense attention
+   * - ``flashinfer-python``
+     - Upstream FlashInfer compiles its kernels with ``nvcc``
+     - ``amd-flashinfer`` (step 4)
+   * - ``triton``
+     - PyPI's build is for NVIDIA and would replace the ``triton`` module that comes
+       with torch
+     - ``triton-rocm``, installed with torch
+   * - ``mooncake-transfer-engine``
+     - Links the CUDA runtime, and there is no ROCm build
+     - SHM or TCP tensor transport, on one node (:doc:`serving`)
+   * - ``torchcodec``
+     - The PyPI wheels link the CUDA runtime, and there is no ROCm build
+     - Nothing yet, see :ref:`models:Running on AMD GPUs` for what this affects
+   * - ``vllm-xpu-kernels``
+     - Intel GPUs only
+     -
+
+``flash-attn`` and ``flash-attn-4`` aren't installed by any extra and have no ROCm build
+that M* uses. Without ``flash-attn-4``, Waypoint's flex attention runs its Triton kernel
+(see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
+
+**3. AITER.** Install the release wheel, not a source or editable build. The wheel ships
+AITER's kernels prebuilt for ``gfx942`` and ``gfx950``. A source install compiles each
+kernel module the first time it's called, which takes minutes per module, and some first
+calls only happen on a live request. Dense attention, for example, never runs during
+warmup, so its first request would wait for the build. Even the wheel doesn't cover
+everything (some attention head sizes, for one), and those kernels still compile on
+first use.
+
+.. code-block:: bash
+
+   uv pip install -c rocm-constraints.txt pybind11 ninja pandas einops psutil packaging \
+       "flydsl==0.3.4.1"
+   WHEEL=amd_aiter-0.1.25+rocm7.2.manylinux.2.28-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+   curl -sSLO "https://github.com/ROCm/aiter/releases/download/v0.1.25/${WHEEL/+/%2B}"
+   sha256sum "$WHEEL"   # 544469800fdfd81a31493f7f635472d9c05ca4b14c69202fa91394076eea1333
+   python -m pip install --no-deps "$WHEEL"
+
+Keep pybind11 on 3.0.x. AITER compiles the kernels it doesn't ship against the pybind11
+headers in the environment, and it refuses to load a module built with a different
+pybind11 ABI than its prebuilt core. pybind11 3.1 changed that ABI.
+
+By default AITER loads its prebuilt modules from the installed package and compiles the
+missing ones into the package directory (``~/.aiter`` if that isn't writable). A few
+template kernels build under ``AITER_ROOT_DIR`` (default ``~/.aiter``), and FlyDSL reads
+the kernel cache bundled in the wheel. To keep all of that out of a shared or read-only
+environment, give each AITER version and GPU architecture its own directories. Once
+``AITER_JIT_DIR`` is set, AITER imports modules only from there, so copy the wheel's
+prebuilt modules in first, and seed ``FLYDSL_RUNTIME_CACHE_DIR`` the same way:
+
+.. code-block:: bash
+
+   C=$HOME/.cache/aiter/0.1.25-rocm7.2/gfx942      # any persistent path
+   export AITER_JIT_DIR=$C/jit AITER_ROOT_DIR=$C/root FLYDSL_RUNTIME_CACHE_DIR=$C/flydsl
+
+   AITER_PKG=$(python -c "import importlib.util, os; print(os.path.dirname(importlib.util.find_spec('aiter').origin))")
+   mkdir -p "$AITER_JIT_DIR" "$AITER_ROOT_DIR" "$FLYDSL_RUNTIME_CACHE_DIR"
+   cp -n "$AITER_PKG"/jit/*.so "$AITER_JIT_DIR"/
+   cp -rn "$AITER_PKG"/jit/flydsl_cache/. "$FLYDSL_RUNTIME_CACHE_DIR"/
+
+Export the same three variables wherever M* runs. AITER and FlashInfer detect the GPU's
+architecture. To build on a machine without one, set ``GPU_ARCHS=gfx942`` for AITER and
+``FLASHINFER_ROCM_ARCH_LIST=gfx942`` for FlashInfer.
+
+**4. FlashInfer (AMD's fork).** On ROCm M* runs RMSNorm, the fused add + RMSNorm, RoPE
+and sampling on it, along with some paged attention (see :ref:`architecture:Hardware
+platforms`), so in practice every autoregressive model needs it. It's Python plus HIP
+sources and compiles nothing at install time:
+
+.. code-block:: bash
+
+   git clone --branch "v0.6.18+amd.1" https://github.com/ROCm/flashinfer.git amd-flashinfer
+   # the version override skips a slow walk over every git tag
+   SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AMD_FLASHINFER=0.6.18+amd.1 \
+       uv pip install -c rocm-constraints.txt --overrides rocm-overrides.txt ./amd-flashinfer
+
+Its kernels compile with ``hipcc`` on first use, into ``~/.cache/flashinfer``
+(``FLASHINFER_WORKSPACE_BASE`` moves it). M* runs FlashInfer's paged attention with the
+``fa2`` kernels on ROCm. A spec that leaves ``flashinfer_backend`` at ``auto`` gets
+``fa2``.
+
+``import flashinfer`` fails if the current GPU isn't a ``gfx942`` or ``gfx950``, an MI210
+for instance. Hide the GPUs for CPU-only work such as the test suite
+(``HIP_VISIBLE_DEVICES=`` with an empty value), or select a supported GPU. With no GPU
+visible, the fork takes the architecture from ``FLASHINFER_ROCM_ARCH_LIST``.
+
+**5. Rust extension.** Same as on NVIDIA (`Optional: Rust support`_).
+
+**Caches.** MIOpen (convolutions), Inductor and Triton cache compiled kernels and tuning
+results, by default in ``~/.config/miopen``, ``~/.cache/miopen``,
+``/tmp/torchinductor_$USER`` and ``~/.triton/cache``. If home is on a shared network
+filesystem, give each job its own node-local copies. MIOpen's lock files are node-local,
+so a database shared between nodes isn't protected from concurrent writers, and caches
+shared by concurrent jobs have broken that way. Copy a warm cache in at job start
+if you want to reuse one.
+
+.. code-block:: bash
+
+   export MIOPEN_USER_DB_PATH=/tmp/$USER/miopen MIOPEN_CUSTOM_CACHE_DIR=/tmp/$USER/miopen
+   export TORCHINDUCTOR_CACHE_DIR=/tmp/$USER/inductor TRITON_CACHE_DIR=/tmp/$USER/triton
+
+**Picking GPUs.** ``mstar serve --gpus 0,1`` sets ``CUDA_VISIBLE_DEVICES``, which HIP
+honours. HIP uses ``HIP_VISIBLE_DEVICES`` instead whenever that is set, so unset it (or
+set it to the same list) when you pass ``--gpus``.
+
+**Check the install.** On a node with an MI300X or MI325X:
+
+.. code-block:: bash
+
+   python -c "from mstar.platforms import current_platform; print(current_platform, current_platform.arch())"
+   # RocmPlatform() gfx942
+   python -c "import aiter, flashinfer.rocm; print('aiter and amd-flashinfer import')"
+   pytest test/rocm -q   # kernels vs torch references, skipped without an AMD GPU
+
+   mstar serve kokoro --gpus 0
+   # in another shell, once the server is up
+   curl -s localhost:8000/v1/audio/speech -H 'Content-Type: application/json' \
+       -d '{"model": "kokoro", "input": "Hello from an MI300X.", "voice": "af_bella"}' -o hello.wav
+
+The first start compiles a lot (Inductor, Triton, FlyDSL, FlashInfer), so it takes
+several minutes even for Kokoro. A warm cache makes later starts faster.
 
 Verify the install
 ------------------
