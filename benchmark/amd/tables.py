@@ -39,7 +39,8 @@ WORKLOADS: dict[str, Workload] = {w.name: w for w in [
     Workload("tts-seed", "tts", "text_to_speech", (1, 8, 32, 64), "set:tts_seedtts_v1", min_requests=40,
              primary=("audio_s_per_s", True)),
     # LibriSpeech test-clean utterances (WS-K's asr_librispeech_v1).
-    Workload("asr-libri", "asr", "audio_to_text", (1, 8, 32), "set:asr_librispeech_v1", min_requests=40,
+    # min_requests = the set size, so the first run at concurrency 1 covers every item for the WER check.
+    Workload("asr-libri", "asr", "audio_to_text", (1, 8, 32), "set:asr_librispeech_v1", min_requests=100,
              primary=("rtfx", True)),
 ]}
 
@@ -59,10 +60,12 @@ TABLES: dict[str, Table] = {t.name: t for t in [
     Table("qwen35-dense", ("qwen3_5_0.8b", "qwen3_5_2b", "qwen3_5_4b", "qwen3_5_9b", "qwen3_5_9b_tp2"),
           ("mstar", "vllm", "vllm-aiter", "sglang-aiter"), ("text-chat-256", "text-long-1k"),
           note="Qwen3.5 dense, text in and out, greedy, fixed output length"),
-    Table("tts-reference", ("kokoro", "orpheus"), ("mstar", "ref-kokoro"), ("tts-seed",),
+    Table("tts-reference", ("kokoro", "orpheus"), ("mstar", "ref-kokoro", "ref-orpheus-vllm"), ("tts-seed",),
           note="TTS against reference implementations"),
     # Functional runs on one dev slice: every cell type once, no timing value.
     Table("dry-text", ("qwen3_5_0.8b",), ("mstar", "vllm-aiter", "sglang-aiter"), ("text-chat-256",), repeats=1),
-    Table("dry-tts", ("kokoro", "orpheus_colocated"), ("mstar", "ref-kokoro"), ("tts-seed",), repeats=1),
+    Table("dry-tts", ("kokoro", "orpheus_colocated"), ("mstar", "ref-kokoro", "ref-orpheus-vllm"), ("tts-seed",),
+          repeats=1),
+    Table("dry-omni", ("qwen3tts",), ("vllm-omni",), ("tts-seed",), repeats=1),
     Table("dry-asr", ("whisper_large",), ("mstar",), ("asr-libri",), repeats=1),
 ]}
