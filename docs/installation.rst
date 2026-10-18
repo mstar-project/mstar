@@ -604,9 +604,25 @@ if you want to reuse one.
    export MIOPEN_USER_DB_PATH=/tmp/$USER/miopen MIOPEN_CUSTOM_CACHE_DIR=/tmp/$USER/miopen
    export TORCHINDUCTOR_CACHE_DIR=/tmp/$USER/inductor TRITON_CACHE_DIR=/tmp/$USER/triton
 
+A cold cache is most of a first start. On one MI300X, orpheus took 959-988 s to come up
+cold and 107-124 s warm, Qwen3.5-9B 582 s cold and 156 s from a copied-in cache, and
+kokoro 1272 s cold and 171-177 s warm. Nearly all of the difference is Inductor compiling
+and autotuning the captured buckets (about 750 s of orpheus's goes to its SNAC decoder).
+Keep a saved copy per GPU model and per torch, HIP and Triton version, because autotuning
+results are measured on the GPU that made them, so don't share one between MI300X and
+MI325X. Copy back into the saved copy from one job at a time, and only from a job that
+started from it. MIOpen keeps one database file per architecture, so a cold job's copy
+would replace the saved one instead of adding to it.
+
 **Picking GPUs.** On ROCm ``mstar serve --gpus 0,1`` sets both ``CUDA_VISIBLE_DEVICES``
 and ``HIP_VISIBLE_DEVICES``, since HIP and torch read ``HIP_VISIBLE_DEVICES`` first.
 Without ``--gpus``, ``mstar serve`` won't start if the two are set to different lists.
+
+**Numerics.** hipBLASLt can give a row a slightly different result at a different batch
+size (up to 3e-2 in bf16 on MI300X), and the fp32 matmul precision mstar sets (``high``)
+makes fp32 matmuls run at reduced precision on gfx942 (7.8e-4 relative error against
+8e-7 at ``highest``). Tests that compare batched and single-row outputs bit for bit don't
+hold on ROCm.
 
 **Check the install.** On a node with an MI300X or MI325X:
 
