@@ -13,10 +13,13 @@ from __future__ import annotations
 import builtins
 import logging
 import math
+import re
 
 import pytest
 import torch
 
+from mstar.api_server.openai import adapters
+from mstar.api_server.openai.speech_chunking import split_sentences
 from mstar.model.cosyvoice3.components.text_frontend import CosyVoice3TextFrontend, close_sentences
 from mstar.model.cosyvoice3.config import END_OF_PROMPT, END_OF_PROMPT_ID, SYSTEM_PROMPT
 from mstar.model.cosyvoice3.cosyvoice3_model import CosyVoice3Model
@@ -155,6 +158,42 @@ def test_without_inflect_digits_pass_through_with_one_warning(monkeypatch, caplo
         assert frontend.normalize("Flight 247") == "Flight 247."
         assert frontend.normalize("Gate 12") == "Gate 12."
     assert sum("inflect" in r.getMessage() for r in caplog.records) == 1
+
+
+# -- piece sizing in the API server ----------------------------------------------------
+
+_IDS = ", ".join(str(48213907 + 7919 * i) for i in range(35))[:319]  # about 31 8-digit IDs
+_tokens = adapters.CosyVoice3Adapter._estimated_tokens
+
+
+class _TenfoldDigits:
+    """A frontend that spells each digit as ten characters, without ``inflect``."""
+
+    def normalize(self, text: str) -> str:
+        return re.sub(r"\d", "x" * 10, text)
+
+
+def test_pieces_are_sized_on_the_spelled_out_text(monkeypatch):
+    """The reference splits after normalizing, so its pieces never grow; a piece
+    of digits that fits 80 tokens as written must still fit once spelled out."""
+    monkeypatch.setattr(adapters.CosyVoice3Adapter, "_frontend", _TenfoldDigits())
+    adapter = adapters.CosyVoice3Adapter()
+    pieces = adapter.split_speech_text(_IDS)
+    assert len(pieces) > 1
+    assert all(_tokens(_TenfoldDigits().normalize(p)) <= 80 for p in pieces)
+    assert " ".join(pieces).split() == _IDS.split()
+    words = "Several members raised concerns about the budget. " * 6
+    assert adapter.split_speech_text(words) == split_sentences(words, max_chars=320, min_chars=80)
+
+
+def test_digit_heavy_pieces_fit_the_model_with_inflect(monkeypatch):
+    pytest.importorskip("inflect")
+    monkeypatch.setattr(adapters.CosyVoice3Adapter, "_frontend", None)
+    frontend = CosyVoice3TextFrontend()
+    pieces = adapters.CosyVoice3Adapter().split_speech_text(_IDS)
+    assert len(frontend.normalize(_IDS)) > 2000, "the example no longer grows when spelled out"
+    assert all(_tokens(frontend.normalize(p)) <= 80 for p in pieces)
+    assert " ".join(pieces).split() == _IDS.split()
 
 
 # -- through process_prompt ----------------------------------------------------------

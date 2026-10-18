@@ -831,7 +831,9 @@ class CosyVoice3Adapter(OpenAIAdapter):
     A Chinese piece over 300 characters is cut again at its commas.
     In one request the LM ends long text early or garbles its end. Without Chinese, an estimate of the Qwen2 BPE token
     count stands in for the reference's real one, so Hangul, kana and
-    Cyrillic pieces stay near 80 tokens as English ones do.
+    Cyrillic pieces stay near 80 tokens as English ones do. The estimate is
+    taken on the text with its digits spelled out, the text the model
+    tokenizes, as the reference splits after normalizing.
     """
 
     supports_speech = True
@@ -839,6 +841,7 @@ class CosyVoice3Adapter(OpenAIAdapter):
     speech_chunk_max_chars = 80 * _CHARS_PER_TOKEN
     # nothing shorter than the smallest piece (80 characters of Chinese) is split
     speech_chunk_min_chars = 81
+    _frontend = None
 
     # A sentence of the reference's ``split_paragraph(lang="zh")``: up to a CJK
     # sentence or clause mark (with a closing quote), or a Latin one before a
@@ -859,7 +862,8 @@ class CosyVoice3Adapter(OpenAIAdapter):
         # by script (Hangul or kana about 1.5, Cyrillic about 2.7, English about 4.7).
         chars_per_token = len(text) / max(1.0, self._estimated_tokens(text))
         max_chars = min(self.speech_chunk_max_chars, max(80, int(80 * chars_per_token)))
-        return split_sentences(text, max_chars=max_chars, min_chars=int(20 * chars_per_token))
+        pieces = split_sentences(text, max_chars=max_chars, min_chars=int(20 * chars_per_token))
+        return [p for piece in pieces for p in self._fit_spoken(piece, max_chars)]
 
     @classmethod
     def _split_chinese(cls, text: str) -> list[str]:
@@ -906,6 +910,26 @@ class CosyVoice3Adapter(OpenAIAdapter):
         return sum(
             1 / cls._CHARS_PER_TOKEN if ord(ch) < 0x80 else 0.5 if ord(ch) < 0x800 else 1.0 for ch in text
         )
+
+    def _fit_spoken(self, piece: str, cap: int) -> list[str]:
+        """Re-split ``piece`` until each part's spelled-out text is estimated at 80 tokens or fewer.
+
+        The cap never drops below the piece's longest word, so a number is
+        never cut; a single word that spells out longer stays one piece.
+        """
+        if not any(c.isdecimal() for c in piece):
+            return [piece]
+        if CosyVoice3Adapter._frontend is None:
+            from mstar.model.cosyvoice3.components.text_frontend import CosyVoice3TextFrontend
+
+            CosyVoice3Adapter._frontend = CosyVoice3TextFrontend()
+        spoken = self._estimated_tokens(CosyVoice3Adapter._frontend.normalize(piece))
+        floor = max(map(len, piece.split()))
+        if spoken <= 80 or cap <= floor:
+            return [piece]
+        cap = max(floor, min(cap - 1, int(cap * self._estimated_tokens(piece) / spoken)))
+        parts = split_sentences(piece, max_chars=cap, min_chars=0)
+        return [p for part in parts for p in self._fit_spoken(part, cap)]
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
