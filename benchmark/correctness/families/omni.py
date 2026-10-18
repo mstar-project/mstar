@@ -189,6 +189,10 @@ class OmniText(TextFamily):
                     {"role": "user", "content": [{"type": "text", "text": prompt}]}]
         return list(tok(proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)).input_ids)
 
+    def same_as_server_encode(self, tok, prompt: str, ids: list[int]) -> bool:
+        # process_prompt in mstar/model/qwen3_omni tokenizes the same rendered text with the same call.
+        return True
+
     def model_kwargs(self, i: int, item) -> dict:
         n = int(item.params.get("max_new_tokens", 128))
         return {"thinker_temperature": 0.0, "max_output_tokens": n, "seed": i}
