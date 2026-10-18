@@ -187,6 +187,7 @@ FAMILIES: dict[str, type[Family]] = {
 
 UNSUPPORTED: dict[str, str] = {
     "test_text_session": "test-only config (session plumbing), no model output to verify",
+    "ltx2_5": "no family yet, its joint audio+video output needs its own reference and scoring",
     # models main added after this harness's families; a family is a follow-up
     "cosyvoice3": "no correctness family yet (landed on main after this harness's families)",
     "glm5_next": "no correctness family yet (landed on main after this harness's families)",
