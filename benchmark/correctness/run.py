@@ -162,7 +162,8 @@ def main(argv=None) -> int:
     if args.rescore:
         restarts = prev.get("restarts", 1)
         header = {k: prev.get(k) for k in ("config", "run_id", "set", "n_items", "restarts", "concurrency",
-                                           "overrides", "versions", "startup_s", "started", "runs", "limit")}
+                                           "overrides", "versions", "startup_s", "started", "runs", "limit",
+                                           "served_heads", "reference_build_error")}
         header.update(reference=fam.reference_description() if fam.ref_outputs(ref_dir) else "missing",
                       protocol=fam.protocol(), rescored=_now())
         header["finished"] = _now()
