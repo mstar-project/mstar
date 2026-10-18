@@ -100,6 +100,8 @@ def write_reports(run_dir: Path, header: dict, score: FamilyScore | None, error:
               f"{stack.get('host')}, transformers {stack.get('transformers')}, aiter {stack.get('aiter')}, "
               f"flashinfer {stack.get('flashinfer')}",
               f"- config overrides: {header.get('overrides') or 'none'}",
+              f"- served commit per server instance: {header.get('served_heads')}"
+              + (" (CHANGED BETWEEN INSTANCES)" if len(set(header.get("served_heads") or [])) > 1 else ""),
               f"- protocol: {header.get('protocol')}",
               f"- reference: {header.get('reference')}"
               + (" (BUILD FAILED, see report.json reference_build_error)" if header.get("reference_build_error")
