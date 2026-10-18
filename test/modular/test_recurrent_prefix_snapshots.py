@@ -25,6 +25,7 @@ from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.linear_attn.gdn import GDNManager
+from mstar.engine.resources.linear_attn.gdn_kernels import FlashInferGDNKernels
 from mstar.engine.resources.recurrent.config import (
     DeltaNetGeometry,
     RecurrentBlockConfig,
@@ -596,6 +597,7 @@ def _gdn() -> tuple[GDNManager, list[tuple]]:
         ),
         geometry=DeltaNetGeometry(num_k_heads=1, num_v_heads=1, head_k_dim=2, head_v_dim=2, conv_kernel_size=2),
         num_layers=1, state_dtype=torch.float32, has_sink=True, device=torch.device("cpu"),
+        kernels=FlashInferGDNKernels(sm_scale=None, qk_l2norm=True, has_sink=True),
     )
     gdn.bind_dependencies({"state": _StubKeyedWalks({WALK})})
     gdn.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=8 * PAGE)
