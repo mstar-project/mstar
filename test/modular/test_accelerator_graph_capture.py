@@ -7,7 +7,8 @@ slots — registering a partial one would hand both to the same buffers, and
 under a lower index than the one it captured under.
 
 Capture failure is also a per-rank event, so the barrier count must not depend
-on whether a capture succeeded.
+on whether a capture succeeded. Nor may the TP group's capture scope, which can
+finish a capture with a collective of its own.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.distributed.ar_fusion import GraphCaptureScope
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
 from mstar.engine.accelerator_graph_runner import (
@@ -36,16 +38,38 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
-class _Group:
-    """A one-rank comm group, or a two-rank one whose peer's flags are given."""
+class _Scope(GraphCaptureScope):
+    """A capture scope that can declare a capture unusable, as a strategy
+    does when the ranks recorded different collectives."""
 
-    def __init__(self, peer_flags: list[bool] | None = None):
+    def __init__(self, drop: bool):
+        super().__init__()
+        self._drop = drop
+
+    def __exit__(self, exc_type, exc, tb):
+        super().__exit__(exc_type, exc, tb)
+        self.usable = self.usable and not self._drop
+        return False
+
+
+class _Group:
+    """A one-rank comm group, or a two-rank one whose peer's flags are given.
+    ``drop_scopes`` names, by entry order, captures its scope rejects."""
+
+    def __init__(self, peer_flags: list[bool] | None = None, drop_scopes=()):
         self.count = 0
+        self.scopes = 0
         self.world_size = 1 if peer_flags is None else 2
         self._peer = peer_flags
+        self._drop_scopes = set(drop_scopes)
 
     def barrier(self):
         self.count += 1
+
+    def graph_capture(self):
+        scope = _Scope(drop=self.scopes in self._drop_scopes)
+        self.scopes += 1
+        return scope
 
     def all_gather(self, tensor, dim=0):
         del dim
@@ -63,7 +87,7 @@ class _FakeRunner:
 
     def __init__(
         self, specs, fail: set[tuple[str, int]] = frozenset(), num_slots=2,
-        peer_flags: list[bool] | None = None,
+        peer_flags: list[bool] | None = None, drop_scopes=(),
     ):
         # only carries the rank-agreement flag vector; nothing is captured here
         self._device = torch.device("cpu")
@@ -82,7 +106,7 @@ class _FakeRunner:
         self._memory_pool = None
         self._blocked_buckets = []
         self._executables = {}
-        self.barrier = _Group(peer_flags)
+        self.barrier = _Group(peer_flags, drop_scopes)
         self._comm_group = SimpleNamespace(
             tp_group=self.barrier, sp_group=self.barrier
         )
@@ -177,6 +201,31 @@ def test_every_rank_barriers_once_per_spec_whatever_happens():
     assert failed.barrier.count == clean.barrier.count == 2 * len(_specs(
         walks=("decode", "prefill")
     ))
+
+
+def test_every_rank_enters_the_capture_scope_once_per_spec_whatever_happens():
+    """The scope may agree on the capture across ranks on exit, so a failing
+    rank must enter and leave it as often as the others."""
+    clean = _FakeRunner(_specs(walks=("decode", "prefill")))
+    failed = _FakeRunner(_specs(walks=("decode", "prefill")), fail={("decode", 0)})
+
+    clean.warmup_and_capture()
+    failed.warmup_and_capture()
+
+    assert failed.barrier.scopes == clean.barrier.scopes == len(_specs(
+        walks=("decode", "prefill")
+    ))
+
+
+def test_a_capture_its_scope_rejects_drops_the_whole_bucket():
+    """A graph whose collectives could not be finished across ranks must not
+    replay, and its bucket cannot run on the remaining slot."""
+    # specs run largest-first in the given order: decode slot 0 is entry 0
+    runner = _FakeRunner(_specs(walks=("decode", "prefill")), drop_scopes={0})
+
+    runner.warmup_and_capture()
+
+    assert [key.graph_walk for key in runner._buckets] == ["prefill"]
 
 
 def test_a_bucket_another_rank_dropped_is_dropped_here_too():
