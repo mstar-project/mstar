@@ -705,9 +705,9 @@ def filter_top_k_top_p(
             BLOCK=triton.next_power_of_2(vocab), num_warps=FUSED_FILTER_WARPS,
         )
         return out
-    n = _kept(flashinfer.sampling.top_p_renorm_probs(
-        flashinfer.sampling.top_k_renorm_probs(probs, first_k), top_p,
-    ))
+    first = flashinfer.sampling.top_k_renorm_probs(probs, first_k)
+    # FlashInfer's top-p expects p in (0, 1); p = 1 removes nothing
+    n = torch.where(top_p >= 1.0, _kept(first), _kept(flashinfer.sampling.top_p_renorm_probs(first, top_p)))
     if order is not None:
         n = torch.maximum(n, order.min_keep)
     return flashinfer.sampling.top_k_renorm_probs(probs, torch.minimum(n.to(torch.int32), k))
