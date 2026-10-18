@@ -65,10 +65,9 @@ from mstar.model.base import (
     Model,
     ProcessPromptOutput,
     TensorAndMetadata,
-    video_metadata_dict,
 )
 from mstar.model.components.video_decode import decode_frames_at
-from mstar.model.media_limits import VideoBudget, video_decode_threads
+from mstar.model.media_limits import VideoBudget
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
@@ -624,19 +623,32 @@ class VJepa2Model(Model):
         request's only media-budget check: the decode in ``process_prompt``
         runs outside ``RequestMediaBudget.file()`` and charges nothing.
         """
-        from torchcodec.decoders import VideoDecoder
+        from mstar.model.components.media_io import decode_video, video_metadata
 
-        target_frames = self.config.frames_per_clip
-        decoder = VideoDecoder(filepath, num_ffmpeg_threads=video_decode_threads())
+        logger.info("load_video: opening %s", filepath)
+        # torchcodec where it loads, else PyAV (`media_io`)
+        metadata = dict(video_metadata(filepath))
+        indices = self._sample_indices(metadata.get("num_frames"), filepath)
+        height, width = metadata.get("height"), metadata.get("width")
+        if not (height and width):
+            # a header without the frame size: one frame says
+            height, width = decode_video(filepath, indices[:1]).data.shape[-2:]
+        # charged for every sampled frame, though a rollout decodes fewer
+        VideoBudget().add(height, width, len(indices))
 
-        metadata_obj = getattr(decoder, "metadata", None)
-        total = None
-        if metadata_obj is not None:
-            total = getattr(metadata_obj, "num_frames", None)
+        metadata["sampled_indices"] = indices
+        metadata["original_num_frames"] = int(metadata["num_frames"])
+        with open(filepath, "rb") as f:  # one copy of the upload, into a writable buffer the tensor shares
+            encoded = bytearray(os.fstat(f.fileno()).st_size)
+            f.readinto(encoded)
+        return TensorAndMetadata(data=torch.frombuffer(encoded, dtype=torch.uint8), metadata=metadata)
+
+    def _sample_indices(self, total: int | None, filepath: str) -> list[int]:
+        """The frames ``load_video`` keeps out of ``total``."""
         if total is None:
-            total = len(decoder)
+            raise ValueError(f"Video has no frame count: {filepath}")
         total = int(total)
-
+        target_frames = self.config.frames_per_clip
         # ``frames_per_clip`` is an architectural config (also feeds
         # ``grid_depth`` for the predictor's attention mask) and must stay
         # at the trained value (64). For AC rollout requests the input
@@ -647,24 +659,13 @@ class VJepa2Model(Model):
         target_frames = min(target_frames, total)
         step = total / target_frames
         indices = torch.arange(0, total, step).to(torch.int64)[:target_frames].tolist()
-
-        height = getattr(metadata_obj, "height", None)
-        width = getattr(metadata_obj, "width", None)
-        if not (height and width):
-            height, width = decoder[indices[0]].shape[-2:]
-        # charged for every sampled frame, though a rollout decodes fewer
-        VideoBudget().add(height, width, len(indices))
-
-        try:
-            metadata = video_metadata_dict(metadata_obj) if metadata_obj is not None else {}
-        except TypeError:
-            metadata = {}
-        metadata["sampled_indices"] = indices
-        metadata["original_num_frames"] = total
-        with open(filepath, "rb") as f:  # one copy of the upload, into a writable buffer the tensor shares
-            encoded = bytearray(os.fstat(f.fileno()).st_size)
-            f.readinto(encoded)
-        return TensorAndMetadata(data=torch.frombuffer(encoded, dtype=torch.uint8), metadata=metadata)
+        logger.info(
+            "load_video: sampling indices=%s...%s (step=%.2f)",
+            indices[:3],
+            indices[-3:],
+            step,
+        )
+        return indices
 
     def process_prompt(
         self,
