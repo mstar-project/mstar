@@ -19,9 +19,7 @@ from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 def resolve_ragged_attn_backend(
     backend: RaggedAttnBackend, device: torch.device,
 ) -> RaggedAttnBackend:
-    """The backend a ragged spec's ``backend`` runs on ``device``; see
-    ``attn.base.resolve_attn_backend``, which this mirrors for cacheless
-    attention."""
+    """Ragged counterpart of ``attn.base.resolve_attn_backend``."""
     if backend is RaggedAttnBackend.AUTO:
         return RaggedAttnBackend.FLASHINFER
     return backend

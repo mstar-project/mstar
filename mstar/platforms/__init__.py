@@ -50,8 +50,8 @@ def resolve_platform() -> Platform:
 class _CurrentPlatform:
     """Forwards to ``resolve_platform()``, so importing this probes no device.
 
-    ``__class__`` is forwarded too, as ``unittest.mock`` does, so
-    ``isinstance(current_platform, RocmPlatform)`` holds on ROCm.
+    It forwards ``__class__`` too, like ``unittest.mock``, so
+    ``isinstance(current_platform, RocmPlatform)`` works.
     """
 
     @property
@@ -65,7 +65,7 @@ class _CurrentPlatform:
         return repr(resolve_platform())
 
     def __reduce__(self):
-        # by name: pickling through the forwarded __class__ would fail
+        # pickle by name, since the forwarded __class__ breaks default pickling
         return "current_platform"
 
 
@@ -73,7 +73,7 @@ current_platform = cast(Platform, _CurrentPlatform())
 
 
 def _built_for() -> Platform:
-    """The platform torch was built for, which takes no device call to know."""
+    """The platform torch was built for. Needs no device call."""
     if torch.version.hip is not None:
         return RocmPlatform()
     if torch.version.cuda is not None:
@@ -86,11 +86,10 @@ def _built_for() -> Platform:
 def apply_process_env_defaults() -> None:
     """Set the platform's ``process_env_defaults``, keeping any value already set.
 
-    Call before the process's first device call: the HIP and CUDA runtimes
-    read much of their environment when they initialize, and resolving
-    ``current_platform`` counts devices, which initializes them. So the
-    platform asked here is the one torch was built for. A process that spawns
-    workers calls it first too, since a child inherits ``os.environ``.
+    Call it before the first device call, since the HIP and CUDA runtimes read
+    much of their environment at init. Resolving ``current_platform`` counts
+    devices, which initializes the runtime, so this asks the platform torch was
+    built for instead.
     """
     for key, value in _built_for().process_env_defaults().items():
         os.environ.setdefault(key, value)

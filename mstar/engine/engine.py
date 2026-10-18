@@ -560,7 +560,7 @@ class Engine:
                 continue
 
             try:
-                # no token count: these serve every eager batch, of any size
+                # no token count, these serve eager batches of any size
                 submodule_mgmt.forward = with_inductor_overrides(torch.compile(
                     submodule.forward,
                     fullgraph=False,

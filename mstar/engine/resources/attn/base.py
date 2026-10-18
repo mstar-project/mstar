@@ -31,12 +31,10 @@ _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
 
 
 def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBackend:
-    """The backend a spec's ``backend`` runs on ``device``.
+    """The concrete backend for ``backend`` on ``device``.
 
-    The one place ``AUTO`` becomes a kernel choice: a platform whose paged
-    attention is better served by another backend answers differently here,
-    for every model that left the choice to the engine. Any other value is
-    returned as is, so a spec or YAML that names a backend gets that backend.
+    ``AUTO`` becomes the platform's default, FlashInfer on every platform for
+    now. A backend named in the spec or YAML is returned as is.
     """
     if backend is AttnBackend.AUTO:
         return AttnBackend.FLASHINFER
@@ -79,7 +77,7 @@ class AttentionManager(AttentionResource):
         if backend == AttnBackend.DENSE:
             # A dense backend needs the FlashAttention-3 kernel; where the
             # wheel does not match the installed torch/CUDA build, degrade to
-            # the paged backend AUTO stands for rather than failing to serve.
+            # the paged backend AUTO picks rather than failing to serve.
             # The two are drop-in for each other: the step declaration is
             # identical (see DenseAttentionManager) and `requires_kv_write`
             # tells the layer which one it is talking to.

@@ -1,10 +1,8 @@
-"""``AUTO`` attention backends: the default every attention config declares,
-resolved to a concrete backend when the resource is built.
+"""``AUTO`` attention backends, resolved when the resource is built.
 
-Every platform resolves ``AUTO`` to FlashInfer, which is what each config
-defaulted to before ``AUTO`` existed, and a backend named explicitly in a spec
-or a deployment's YAML is built as named. Builds run on the CPU device: the
-managers allocate nothing until their first plan.
+``AUTO`` resolves to FlashInfer on every platform, the old default, and a
+backend named in a spec or YAML is built as named. Builds use the CPU device
+since the managers allocate nothing until their first plan.
 """
 
 import logging

@@ -113,8 +113,8 @@ def test_cuda_arch_and_capability(monkeypatch, capability, arch, hopper):
 def test_env_defaults_come_from_the_build_without_a_device_call(
     monkeypatch, hip, cuda, xpu, expected,
 ):
-    """The runtimes read their environment when they initialize, and resolving
-    ``current_platform`` counts devices, which initializes them."""
+    """Resolving ``current_platform`` would initialize the runtime, which reads
+    its environment at init."""
 
     def device_call():
         raise AssertionError("a device call before the environment was set")
@@ -186,9 +186,8 @@ def test_a_spawned_child_inherits_the_env_defaults(rocm_env_default):
 
 
 def test_the_conductor_sets_env_defaults_before_spawning_workers(monkeypatch, rocm_env_default):
-    """A spawned worker unpickles the model, importing its modules, before its
-    target runs; only what the parent's environment holds at spawn is in
-    place by then."""
+    """A spawned worker imports the model's modules while unpickling, before
+    its target runs, so the defaults have to be in the parent's environment."""
     from mstar.conductor import conductor
 
     seen = []

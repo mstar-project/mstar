@@ -46,24 +46,20 @@ class Platform:
         return capability is not None and capability >= (major, minor)
 
     def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
-        """``torch._inductor.config`` values patched in while the engine compiles
-        a forward that serves ``num_tokens`` tokens (a capture bucket's count;
-        ``None`` for a forward compiled for any count).
+        """``torch._inductor.config`` values to patch in while the engine
+        compiles a forward for ``num_tokens`` tokens, a capture bucket's count,
+        or ``None`` when the forward serves any count.
 
-        Facts about how inductor's code generation performs on this stack, such
-        as which GEMM backends autotune well at small sizes; which kernel a
-        resource runs is not decided here. Empty keeps inductor's defaults, and
-        the compiled forward is then called unwrapped.
+        Meant for inductor codegen settings on this stack (say, which GEMM
+        backends to autotune at small sizes), not for picking kernels. Empty
+        keeps inductor's defaults.
         """
         return {}
 
     def process_env_defaults(self) -> dict[str, str]:
-        """Environment a worker process sets with ``os.environ.setdefault``
-        before its first device call, so a value already exported wins.
-
-        For settings a runtime or library reads once, when it initializes.
-        ``apply_process_env_defaults`` asks the platform torch was built for,
-        since resolving ``current_platform`` is itself a device call.
+        """Environment variables for settings a runtime or library reads once
+        at init. Workers apply them with ``os.environ.setdefault`` before their
+        first device call, so a value the user exported wins.
         """
         return {}
 
@@ -96,11 +92,11 @@ class RocmPlatform(Platform):
         return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
 
     def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
-        # inductor's defaults: an override lands only with a measured win on AMD GPUs
+        # none until one is measured to help on AMD GPUs
         return {}
 
     def process_env_defaults(self) -> dict[str, str]:
-        # none: a default lands only with a measured win on AMD GPUs
+        # none until one is measured to help on AMD GPUs
         return {}
 
 

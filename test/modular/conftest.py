@@ -56,8 +56,8 @@ if "triton" not in sys.modules:
 
 @pytest.fixture(autouse=True)
 def _fresh_platform():
-    """Resolve the platform afresh in every test, so a test that stubs
-    ``torch.cuda`` cannot leave its platform cached for the tests after it."""
+    """Clear the cached platform, so a test that stubs ``torch.cuda`` can't
+    leak its platform into later tests."""
     resolve_platform.cache_clear()
     yield
     resolve_platform.cache_clear()

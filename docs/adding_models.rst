@@ -383,17 +383,17 @@ The spec types are:
        Ring storage is currently paired with FlexAttention.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
-       ``AttnBackend.AUTO`` (the default: the platform's paged backend, which is
-       FlashInfer), ``AttnBackend.FLASHINFER``, ``AttnBackend.DENSE`` or
-       ``AttnBackend.FLEX``. Leave it at ``AUTO`` unless the model needs a
-       particular kernel. FlashInfer and dense attention require a
+       ``AttnBackend.AUTO`` (the default, which lets the engine pick the platform's
+       paged backend, FlashInfer for now), ``AttnBackend.FLASHINFER``,
+       ``AttnBackend.DENSE`` or ``AttnBackend.FLEX``. Leave it at ``AUTO`` unless the
+       model needs a specific kernel. FlashInfer and dense attention require a
        ``PagedKVConfig``; FlexAttention requires a ``RingKVConfig``.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
        ``"fa3"`` when the FlashInfer backend is selected.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
-       ``backend`` defaults to ``AttnBackend.AUTO``; only the FlashInfer backend is
-       implemented. See `Cross-attention (encoder-decoder models)`_.
+       ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
+       See `Cross-attention (encoder-decoder models)`_.
    * - ``RaggedAttentionSpec(config=RaggedAttentionConfig(...))``
      - Cacheless (ragged) varlen self-attention over the segments packed into one
        forward. Nothing is paged, and nothing carries to the next step.
@@ -1367,12 +1367,11 @@ that a misspelled setting is never silently ignored:
    * - ``KVSpec`` with ``RingKVConfig``
      - ``num_sessions``
    * - ``AttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``;
-       ``auto`` is the platform's default),
+     - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
    * - ``CrossAttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer``; only FlashInfer is implemented),
-       ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
+     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
+       (``auto`` / ``fa2`` / ``fa3``)
    * - ``RaggedAttentionSpec``
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,

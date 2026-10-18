@@ -1,8 +1,6 @@
-"""Choosing an implementation per platform, and the platform's inductor
-settings at the engine's compile sites.
-
-Both resolve against ``current_platform``, which these tests point at a chosen
-``Platform`` instance, so they run without any accelerator.
+"""``PlatformDispatch``, and the platform's inductor overrides at the engine's
+compile sites. ``current_platform`` is pointed at a chosen ``Platform``, so no
+accelerator is needed.
 """
 
 import functools
@@ -212,8 +210,8 @@ class _Submodule:
 
 @pytest.fixture
 def fake_compile(monkeypatch):
-    """``torch.compile`` returning a distinct callable that runs eagerly, so a
-    call reads the inductor config it ran under. Returns what it compiled."""
+    """Swap ``torch.compile`` for one that returns a new eager callable, so a
+    call sees the inductor config it ran under. Gives the list of compiled fns."""
     compiled = []
 
     def compile_(fn, **kwargs):

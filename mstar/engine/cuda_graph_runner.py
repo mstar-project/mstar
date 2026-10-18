@@ -646,9 +646,9 @@ class CudaGraphRunner:
         the second slot's identical shapes are free. A wrapper per capture
         would recompile — and re-autotune — all of them.
 
-        The platform's inductor overrides are applied per bucket, around that
-        shared wrapper: each bucket's shape is traced on its own first call,
-        under its own token count.
+        The platform's inductor overrides wrap that shared callable per bucket,
+        so each bucket compiles on its first call under the overrides for its
+        own token count.
         """
         forward = getattr(self._submodule, spec.config.capture_forward_method)
         if not spec.config.compile:
