@@ -77,7 +77,8 @@ def apply_process_env_defaults() -> None:
     Call before the process's first device call: the HIP and CUDA runtimes
     read much of their environment when they initialize, and resolving
     ``current_platform`` counts devices, which initializes them. So the
-    platform asked here is the one torch was built for.
+    platform asked here is the one torch was built for. A process that spawns
+    workers calls it first too, since a child inherits ``os.environ``.
     """
     for key, value in _built_for().process_env_defaults().items():
         os.environ.setdefault(key, value)

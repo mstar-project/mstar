@@ -1,5 +1,6 @@
 """``mstar.platforms``: which hardware the process runs on."""
 
+import multiprocessing
 import os
 from types import SimpleNamespace
 
@@ -134,3 +135,56 @@ def test_a_worker_sets_its_env_defaults_before_anything_else(monkeypatch):
     monkeypatch.setattr(conductor, "apply_process_env_defaults", apply)
     with pytest.raises(AppliedError):
         conductor._worker_process_target(*[None] * 12)
+
+
+@pytest.fixture
+def rocm_env_default(monkeypatch):
+    """A ROCm build whose platform defaults PLATFORM_ENV_TEST, which is unset."""
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    monkeypatch.setattr(RocmPlatform, "process_env_defaults", lambda self: {"PLATFORM_ENV_TEST": "default"})
+    # set then deleted, so teardown removes what the test sets
+    monkeypatch.setenv("PLATFORM_ENV_TEST", "")
+    monkeypatch.delenv("PLATFORM_ENV_TEST")
+    return "PLATFORM_ENV_TEST"
+
+
+def test_a_spawned_child_inherits_the_env_defaults(rocm_env_default):
+    platforms.apply_process_env_defaults()
+    check = f"import os, sys; sys.exit(0 if os.environ.get({rocm_env_default!r}) == 'default' else 3)"
+    child = multiprocessing.get_context("spawn").Process(target=exec, args=(check,))
+    child.start()
+    child.join(timeout=120)
+    assert child.exitcode == 0
+
+
+def test_the_conductor_sets_env_defaults_before_spawning_workers(monkeypatch, rocm_env_default):
+    """A spawned worker unpickles the model, importing its modules, before its
+    target runs; only what the parent's environment holds at spawn is in
+    place by then."""
+    from mstar.conductor import conductor
+
+    seen = []
+
+    class Process:
+        def __init__(self, **kwargs):
+            seen.append(os.environ.get(rocm_env_default))
+
+        def start(self):
+            seen.append(os.environ.get(rocm_env_default))
+
+    monkeypatch.setattr(conductor, "mp", SimpleNamespace(get_context=lambda method: SimpleNamespace(Process=Process)))
+    monkeypatch.setattr(conductor, "atexit", SimpleNamespace(register=lambda fn: None))
+    workers = ["w0", "w1"]
+    spawner = SimpleNamespace(
+        _sorted_ranks=[0, 1], worker_ids=workers, _worker_processes=[],
+        _per_worker_graphs=dict.fromkeys(workers), per_worker_sharding_config=dict.fromkeys(workers),
+        parallel_config=SimpleNamespace(per_worker_config=dict.fromkeys(workers)),
+        model_config={}, _all_worker_graph_ids_to_graph_walks={}, _all_worker_graph_ids_to_nodes={},
+        _all_worker_graph_ids_to_dyn_loops={}, hostname="host", socket_path_prefix="/tmp/x",
+        _dist_init_method="", model=None, enable_nvtx=False, enable_prof=False, device_type="cuda",
+        rank_devices=None, log_level="INFO", tensor_comm_protocol=None, tcp_transfer_device="",
+        shutdown=None,
+    )
+    conductor.Conductor._launch_workers(spawner)
+    assert seen == ["default"] * 4
+    assert len(spawner._worker_processes) == 2

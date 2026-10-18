@@ -549,6 +549,10 @@ class Conductor:
 
     def _launch_workers(self):
         """Spawn one process per worker rank using spawn context."""
+        # Here as well as in the worker: a spawned child inherits os.environ,
+        # and it imports the model's modules (and any kernel library they
+        # import) while unpickling its arguments, before its target runs.
+        apply_process_env_defaults()
         ctx = mp.get_context("spawn")
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
