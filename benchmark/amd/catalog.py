@@ -26,6 +26,7 @@ class Row:
     # Context length every engine is given (mstar's max_seq_len), so KV sizing starts from the same place.
     max_len: int | None = None
     runner_model_id: bool = False  # pass --model-id (the runner's Qwen3.5 class serves several sizes)
+    engine_args: dict = field(default_factory=dict)  # engine -> flags this model needs on it
 
 
 def _qwen(size: str, gpus: int = 1, tp: int = 1, name: str | None = None) -> Row:
@@ -42,7 +43,9 @@ ROWS: dict[str, Row] = {r.name: r for r in [
     Row("kokoro", "tts", "hexgrad/Kokoro-82M", "kokoro"),
     Row("orpheus", "tts", "canopylabs/orpheus-3b-0.1-ft", "orpheus", gpus=2),
     Row("orpheus_colocated", "tts", "canopylabs/orpheus-3b-0.1-ft", "orpheus"),
-    Row("qwen3tts", "tts", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "qwen3_tts"),
+    Row("qwen3tts", "tts", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "qwen3_tts",
+        engine_args={"sglang-omni": ("--config", "/workspace/sglang-omni/examples/configs/"
+                                                 "qwen3_tts_0_6b_customvoice.yaml")}),
     Row("whisper_large", "asr", "openai/whisper-large-v3", "whisper_large", max_len=448),
 ]}
 
@@ -87,7 +90,7 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
     Arm("vllm-aiter-unified", "vllm", ("text",), client="vllm", image="vllm", env={"VLLM_ROCM_USE_AITER": "1"},
         args=("--attention-backend", "ROCM_AITER_UNIFIED_ATTN"), tp_env={"NCCL_MIN_NCHANNELS": "112"},
         recipe=VLLM_GUIDE + ": the AITER unified attention backend, the same kernel mstar uses for paged attention"),
-    Arm("vllm-whisper", "vllm", ("asr",), client="vllm_transcribe", image="vllm",
+    Arm("vllm-whisper", "vllm", ("asr",), client="openai_transcribe", image="vllm",
         env={"VLLM_ROCM_USE_AITER": "1", "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
              "PYTHONPATH": f"{CONTAINERS}/pyext/vllm-audio"},
         args=("--attention-backend", "TRITON_ATTN"),
@@ -103,6 +106,9 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
               "--trust-remote-code"),
         tp_args=("--enable-aiter-allreduce-fusion",), recipe=SGLANG_COOKBOOK,
         differs="bf16 GDN state (mstar and vLLM keep the checkpoint's fp32)"),
+    Arm("sglang-diffusion", "sglang-diffusion", ("image", "video"), image="sglang",
+        args=("--dit-cpu-offload", "false", "--text-encoder-cpu-offload", "false", "--vae-cpu-offload", "false"),
+        recipe="SGLang Diffusion with every CPU offload off (DESIGN.md section 11; benchmark/wan22/reproduce.sh)"),
     Arm("vllm-omni", "vllm-omni", ("tts",), client="vllm_omni", image="vllm-omni", models=("qwen3_tts",),
         args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"),
         recipe="vllm-omni v0.30.0 defaults on ROCm (AR stages on TRITON_ATTN, Code2Wav eager)",
@@ -141,7 +147,7 @@ def arms_for(row: Row, names: list[str]) -> list[Arm]:
 
 def server_args(arm: Arm, row: Row) -> tuple[list[str], dict]:
     """Engine flags and environment for one (arm, row), without port or GPU selection."""
-    args, env = list(arm.args), dict(arm.env)
+    args, env = list(arm.args) + list(row.engine_args.get(arm.engine, ())), dict(arm.env)
     if row.tp > 1:
         args += list(arm.tp_args)
         env.update(arm.tp_env)
