@@ -21,7 +21,8 @@ set -euo pipefail
 
 WS=${WS:-$(cd "$(dirname "$0")/../../.." && pwd)}
 MSTAR=${MSTAR:-$WS/mstar}
-SENTENCES=${SENTENCES:-/scratch/m000137-pm06/atj10/mstar-ws/commons/bench/data/tts/sentences_200.txt}
+# One sentence per line; e.g. python -m benchmark.amd.prompts tts_seedtts_v1 --out sentences.txt
+SENTENCES=${SENTENCES:?set SENTENCES to a sentence file (python -m benchmark.amd.prompts tts_seedtts_v1 --out FILE)}
 RESULTS=${RESULTS:-$WS/results/$(date +%F)}
 VOICE=${VOICE:-Abigail.wav}
 VOICES_DIR=${VOICES_DIR:-$WS/refs/Chatterbox-TTS-Server/voices}
