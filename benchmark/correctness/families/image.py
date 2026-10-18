@@ -14,12 +14,18 @@ from pathlib import Path
 
 from benchmark.correctness import metrics as M
 from benchmark.correctness.client import Request, Response
-from benchmark.correctness.families.base import Family, failed_items, self_consistency_check, write_meta
+from benchmark.correctness.families.base import (
+    Family,
+    MathSdpaReference,
+    failed_items,
+    self_consistency_check,
+    write_meta,
+)
 from benchmark.correctness.report import FamilyScore, band
 from benchmark.correctness.sets import SampleSet
 
 
-class ImageFamily(Family):
+class ImageFamily(MathSdpaReference, Family):
     name = "image"
     set_name = "image_v1"
     default_concurrency = 1
@@ -69,7 +75,8 @@ class ImageFamily(Family):
     # --- reference ------------------------------------------------------------------------------
     def reference_id(self) -> str:
         return (f"diffusers-{self.hf_id.replace('/', '--')}" + (f"-s{self.steps}" if self.steps else "")
-                + (f"-{self.size[0]}x{self.size[1]}" if self.size else ""))
+                + (f"-{self.size[0]}x{self.size[1]}" if self.size else "")
+                + (self.MATH_SUFFIX if self.ref_sdpa_math else ""))
 
     def reference_description(self) -> str:
         return (f"diffusers pipeline for {self.hf_id}, bf16, {self.generator_device}-generator seed, "
@@ -97,7 +104,7 @@ class ImageFamily(Family):
         for it in sset.items:
             gen = torch.Generator(self.generator_device if self.generator_device == "cpu" else device)
             gen.manual_seed(int(it.params["seed"]))
-            with torch.inference_mode():
+            with torch.inference_mode(), self.sdpa_context():
                 img = self.reference_image(pipe, it.prompt, gen, self.pipeline_kwargs(it))
             img.save(ref_dir / "outputs" / f"{it.id}.png")
             print(f"  ref {it.id}", flush=True)
@@ -154,6 +161,15 @@ class ImageFamily(Family):
         elif not self.self_consistency_only:
             sc.notes.append(f"No reference images in {ref_dir}.")
             sc.check("PSNR vs reference", None, "NO_REFERENCE", "needs diffusers reference images")
+        math_dir = self.math_reference_dir(ref_dir)
+        if ref_out and math_dir:
+            spread = [round(M.psnr(M.load_image(ref_out / f"{it.id}.png"), M.load_image(math_dir / "outputs" /
+                                                                                     f"{it.id}.png")), 2)
+                      for it in sset.items if (math_dir / "outputs" / f"{it.id}.png").is_file()]
+            sc.metrics["reference_vs_math_sdpa_reference_psnr_db"] = M.distribution(spread)
+            sc.notes.append("The reference against itself with math SDPA: median "
+                            f"{sc.metrics['reference_vs_math_sdpa_reference_psnr_db'].get('median')} dB. A served "
+                            "image this far from the reference is inside the kernel spread.")
         repro = [r["psnr_r1_r2"] for r in sc.rows if r.get("psnr_r1_r2") is not None]
         if repro:
             sc.metrics["psnr_r1_vs_r2_db"] = M.distribution(repro)
