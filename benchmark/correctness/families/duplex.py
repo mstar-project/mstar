@@ -10,6 +10,8 @@ import json
 import statistics
 from pathlib import Path
 
+import numpy as np
+
 from benchmark.correctness import metrics as M
 from benchmark.correctness.client import Request, Response
 from benchmark.correctness.families import asr_judge
@@ -25,11 +27,28 @@ class NemotronDuplex(Family):
     default_restarts = 2
     self_consistency_only = True
 
+    @property
+    def trailing_s(self) -> float:
+        """Silence after each question. The agent answers in the frames after the user stops
+        (test/nemotron_duplex/_audio_prep.py pads 6 s too)."""
+        return self.opt("trailing_s", 6.0, float)
+
     def select_items(self, items: list) -> list:
         return [it for it in items if it.params.get("modality") == "audio"]
 
+    def padded_clip(self, sset: SampleSet, it) -> Path:
+        """The question with trailing silence, written once next to the sets."""
+        out = sset.root.parent.parent / "derived" / f"{sset.name}-trailing{self.trailing_s:g}s" / f"{it.id}.wav"
+        if not out.is_file():
+            x, sr = M.read_wav(sset.path(it.files["audio"]))
+            out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(".tmp.wav")
+            M.write_wav(tmp, np.concatenate([x, np.zeros(int(sr * self.trailing_s), np.float32)]), sr)
+            tmp.rename(out)
+        return out
+
     def requests(self, sset: SampleSet) -> list[Request]:
-        return [Request(it.id, files=[sset.path(it.files["audio"])], input_modalities="audio",
+        return [Request(it.id, files=[self.padded_clip(sset, it)], input_modalities="audio",
                         output_modalities="text,audio", model_kwargs={"temperature": 0.0, "seed": i})
                 for i, it in enumerate(sset.items)]
 
@@ -45,7 +64,8 @@ class NemotronDuplex(Family):
         return "nemotron-duplex-no-independent-reference"
 
     def reference_description(self) -> str:
-        return "none independent of mstar, parity_compare.py runs mstar's own offline path"
+        return (f"none independent of mstar, parity_compare.py runs mstar's own offline path; questions get "
+                f"{self.trailing_s:g} s of trailing silence")
 
     def score(self, sset: SampleSet, runs: list[Path], ref_dir: Path | None, work: Path,
               device: str) -> FamilyScore:
