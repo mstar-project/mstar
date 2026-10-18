@@ -470,23 +470,35 @@ class AcceleratorGraphRunner:
         # one shape, so a bucket holding only some of them would silently hand
         # pre-plan and replay the same buffers.
         captured: dict[BucketKey, dict[int, tuple[CGSlotSpec, AcceleratorGraphSlot]]] = {}
+        # buckets a resource cannot run inside a graph; they run eagerly
+        refused: set[BucketKey] = set()
         for spec in slot_specs:
             # every rank barriers once per spec, pass or fail — a rank that
             # stopped early here would leave the others waiting
             self._comm_group.tp_group.barrier()
             self._comm_group.sp_group.barrier()
 
+            refusal = self._capture_refusal(spec)
+            if refusal is not None and spec.bucket not in refused:
+                refused.add(spec.bucket)
+                logger.warning(
+                    "Accelerator graph bucket %s for %s runs eagerly: %s",
+                    spec.bucket, self._submodule_name, refusal,
+                )
+
             # entered on every rank, pass or fail: finishing a capture can
-            # itself be collective (see GraphCaptureScope)
+            # itself be collective (see GraphCaptureScope). A refused spec
+            # leaves it uncaptured, which every rank agrees on.
             with self._comm_group.tp_group.graph_capture() as capture:
-                try:
-                    slot = self._capture_one(spec)
-                    capture.captured = True
-                except Exception:
-                    logger.error(
-                        "Failed to capture accelerator graph for %s: %s",
-                        self._submodule_name, spec, exc_info=True
-                    )
+                if refusal is None:
+                    try:
+                        slot = self._capture_one(spec)
+                        capture.captured = True
+                    except Exception:
+                        logger.error(
+                            "Failed to capture accelerator graph for %s: %s",
+                            self._submodule_name, spec, exc_info=True
+                        )
             if not capture.usable:
                 continue
 
@@ -517,25 +529,33 @@ class AcceleratorGraphRunner:
 
         self._dummy_rows.release_all()
         self._report_dropped(
-            [spec.bucket for spec in slot_specs if spec.slot == 0], agreed
+            [spec.bucket for spec in slot_specs if spec.slot == 0], agreed, refused,
         )
 
         mem_after = self._graph_backend.memory_allocated()
         self._log_memory(mem_before, mem_after)
 
-    def _report_dropped(self, wanted: list, kept) -> None:
+    def _report_dropped(self, wanted: list, kept, refused=frozenset()) -> None:
         """Say loudly which buckets run eagerly. A dropped bucket is a silent
         10-20x latency cliff otherwise, and one failure used to take every
-        later bucket with it."""
+        later bucket with it. A refused one is listed too, but was explained
+        when it was refused, so the error names only the failures."""
         wanted = list(dict.fromkeys([*self._blocked_buckets, *wanted]))
         self.dropped_buckets = [key for key in wanted if key not in kept]
-        if self.dropped_buckets:
+        failed = [key for key in self.dropped_buckets if key not in refused]
+        if failed:
             logger.error(
                 "AcceleratorGraphRunner[%s]: captured %d of %d buckets; these run "
                 "eagerly: %s",
                 self._submodule_name, len(wanted) - len(self.dropped_buckets),
-                len(wanted), self.dropped_buckets,
+                len(wanted), failed,
             )
+
+    def _capture_refusal(self, spec: CGSlotSpec) -> str | None:
+        """Why one of this node's resources cannot run ``spec`` in a graph."""
+        return self._step_runner.capture_refusal(
+            spec, node_name=self._submodule_name,
+        )
 
     def _buckets_captured_everywhere(
         self,
@@ -1288,8 +1308,20 @@ class PiecewiseAcceleratorGraphRunner:
             shapes, key=lambda s: (s.bs, s.total_tokens), reverse=True
         )
         captured: list[bool] = []
+        # shapes a resource cannot run inside a graph; they run eagerly
+        refused: set[tuple[int, int]] = set()
         for shape in ordered:
             shape_captured = True
+            refusal = self._step_runner.capture_refusal(
+                CGSlotSpec(bucket=self._bucket(shape), slot=0, config=self._config),
+                node_name=self._node_name,
+            )
+            if refusal is not None:
+                refused.add((shape.bs, shape.total_tokens))
+                logger.warning(
+                    "PiecewiseAcceleratorGraphRunner[%s]: bs=%d total_tokens=%d runs "
+                    "eagerly: %s", self._label, shape.bs, shape.total_tokens, refusal,
+                )
             for slot in range(self._num_slots):
                 # keep ranks in lockstep: the region may hold collectives, and a
                 # rank still in pre-capture setup would mismatch one already in the
@@ -1302,15 +1334,16 @@ class PiecewiseAcceleratorGraphRunner:
                 else:
                     capture = GraphCaptureScope()
                 with capture:
-                    try:
-                        self._capture_one(shape, slot)
-                        capture.captured = True
-                    except Exception:
-                        logger.error(
-                            "PiecewiseAcceleratorGraphRunner[%s]: failed to capture bs=%d "
-                            "total_tokens=%d slot=%d", self._label, shape.bs,
-                            shape.total_tokens, slot, exc_info=True,
-                        )
+                    if refusal is None:
+                        try:
+                            self._capture_one(shape, slot)
+                            capture.captured = True
+                        except Exception:
+                            logger.error(
+                                "PiecewiseAcceleratorGraphRunner[%s]: failed to capture "
+                                "bs=%d total_tokens=%d slot=%d", self._label,
+                                shape.bs, shape.total_tokens, slot, exc_info=True,
+                            )
                 # an unusable slot fails the shape, which drops it everywhere
                 if not capture.usable:
                     shape_captured = False
@@ -1344,12 +1377,12 @@ class PiecewiseAcceleratorGraphRunner:
                     self._label, shape.bs, shape.total_tokens, dropped,
                 )
             self.dropped_shapes.append((shape.bs, shape.total_tokens))
-        if self.dropped_shapes:
+        failed = [shape for shape in self.dropped_shapes if shape not in refused]
+        if failed:
             logger.error(
                 "PiecewiseAcceleratorGraphRunner[%s]: captured %d of %d shapes; these "
                 "run eagerly: %s", self._label,
-                len(ordered) - len(self.dropped_shapes), len(ordered),
-                self.dropped_shapes,
+                len(ordered) - len(self.dropped_shapes), len(ordered), failed,
             )
 
     def _capture_one(self, shape: PiecewiseCaptureShape, slot: int) -> None:
