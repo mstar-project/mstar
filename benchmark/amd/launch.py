@@ -185,6 +185,9 @@ class Launch:
         elif e == "sglang":
             cmd = [str(CTR_SH), self.arm.image, "python3", "-m", "sglang.launch_server", "--model-path",
                    self.row.hf_id, "--host", "127.0.0.1", "--port", str(self.port), *args]
+        elif e == "sglang-diffusion":
+            cmd = [str(CTR_SH), self.arm.image, "sglang", "serve", "--model-path", self.row.hf_id, "--host",
+                   "127.0.0.1", "--port", str(self.port), *args]
         elif e == "sglang-omni":
             cmd = [str(CTR_SH), self.arm.image, "python3", "-m", "sglang_omni.cli", "serve", "--model-path",
                    self.row.hf_id, "--port", str(self.port), *args]
