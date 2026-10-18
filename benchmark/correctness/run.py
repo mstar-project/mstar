@@ -64,6 +64,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="dotted YAML override on a copy of the config, e.g. resources.attn.flashinfer_backend=fa2")
     ap.add_argument("--restarts", type=int, default=None,
                     help="server instances to run the set on (default: the family's; >= 2 gives a noise floor)")
+    ap.add_argument("--passes", type=int, default=1,
+                    help="passes over the set per server instance; with --restarts 1 and 2 passes the noise floor "
+                         "compares repeats within one instance")
     ap.add_argument("--concurrency", type=int, default=None, help="in-flight requests (default: the family's)")
     ap.add_argument("--limit", type=int, default=None, help="first N items only (smoke runs; not a verdict)")
     ap.add_argument("--warmup", type=int, default=0, help="untimed requests before each pass (default 0)")
@@ -163,11 +166,11 @@ def main(argv=None) -> int:
         restarts = prev.get("restarts", 1)
         header = {k: prev.get(k) for k in ("config", "run_id", "set", "n_items", "restarts", "concurrency",
                                            "overrides", "versions", "startup_s", "started", "runs", "limit",
-                                           "served_heads", "reference_build_error")}
+                                           "served_heads", "reference_build_error", "passes")}
         header.update(reference=fam.reference_description() if fam.ref_outputs(ref_dir) else "missing",
                       protocol=fam.protocol(), rescored=_now())
         header["finished"] = _now()
-        runs = [run_dir / f"r{k}" for k in range(1, restarts + 1)]
+        runs = [run_dir / name for name in (prev.get("runs") or {f"r{k}": None for k in range(1, restarts + 1)})]
         return _score_and_report(fam, sset, runs, ref_dir, run_dir, header, device)
 
     restarts = args.restarts or fam.default_restarts
@@ -181,7 +184,7 @@ def main(argv=None) -> int:
     print(f"run dir {run_dir}", flush=True)
 
     header = {"config": config_name, "model": model_key, "run_id": run_id, "set": sset.name, "n_items": len(items),
-              "reference_build_error": reference_error,
+              "reference_build_error": reference_error, "passes": args.passes,
               "limit": args.limit, "restarts": restarts, "concurrency": concurrency, "overrides": overrides,
               "worktree": str(worktree), "gpus": args.gpus, "port": args.port, "started": t_start,
               "reference": fam.reference_description() if fam.ref_outputs(ref_dir) else
@@ -215,14 +218,18 @@ def main(argv=None) -> int:
                       f"(concurrency {concurrency})", flush=True)
                 base = f"http://127.0.0.1:{args.port}"
                 client.warmup(base, requests, args.warmup)
-                t0 = time.monotonic()
-                responses = client.send_all(base, requests, concurrency=concurrency, timeout_s=fam.request_timeout_s)
-                out = run_dir / f"r{k}"
-                summary = _save_run(fam, sset, responses, out)
-                summary["wall_s"] = round(time.monotonic() - t0, 1)
-                header.setdefault("runs", {})[f"r{k}"] = summary
-                runs.append(out)
-                print(f"[r{k}] {summary['ok']} ok, {summary['failed']} failed in {summary['wall_s']}s", flush=True)
+                for p in range(1, args.passes + 1):
+                    name = f"r{k}" if p == 1 else f"r{k}p{p}"
+                    t0 = time.monotonic()
+                    responses = client.send_all(base, requests, concurrency=concurrency,
+                                                timeout_s=fam.request_timeout_s)
+                    out = run_dir / name
+                    summary = _save_run(fam, sset, responses, out)
+                    summary["wall_s"] = round(time.monotonic() - t0, 1)
+                    header.setdefault("runs", {})[name] = summary
+                    runs.append(out)
+                    print(f"[{name}] {summary['ok']} ok, {summary['failed']} failed in {summary['wall_s']}s",
+                          flush=True)
             finally:
                 try:
                     server.stop(spec)
