@@ -199,8 +199,17 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
         slot_lease: SlotLease | None = None,
         piecewise_leases: Mapping[str, SlotLease] | None = None,
+        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
+        kept_rids = None
+        if graph_walk != "decode":
+            # only the last prefill's token survives `postprocess`
+            info = per_request_info or {}
+            kept_rids = frozenset(
+                rid for rid in request_ids
+                if rid in info and info[rid].step_metadata.get("is_last_prefill", False)
+            )
         return SubmoduleStep(
             segments=[
                 Segment(
@@ -212,7 +221,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
             steps={
                 KV_CACHE: KVStep(),
                 ATTN: AttentionStep(causal=True),
-                SAMPLER: SamplerStep(apply_penalty=False),
+                SAMPLER: SamplerStep(apply_penalty=False, kept_rids=kept_rids),
                 ROPE: PositionStep(),
             },
         )

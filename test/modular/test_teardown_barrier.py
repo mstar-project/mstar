@@ -9,9 +9,10 @@ the abort/fail path (drain all workers + preprocess worker, then Remove).
 import types
 from collections import deque
 
+import pytest
 import torch
 
-from mstar.conductor.conductor import Conductor, RequestData
+from mstar.conductor.conductor import Conductor, RequestData, _req_id_to_seed, _request_seed
 from mstar.graph.base import TensorPointerInfo
 from mstar.utils.ipc_format import (
     FailRequests,
@@ -38,14 +39,14 @@ def _request_data(workers=("w0",), persist_signals=None, ref_cnts=None):
     )
 
 
-def _new_request(rid):
+def _new_request(rid, model_kwargs=None):
     return NewRequestConductor(
         request_id=rid,
         initial_signals={},
         initial_input_modalities=["text"],
         initial_output_modalities=["text"],
         input_metadata={},
-        model_kwargs={},
+        model_kwargs=model_kwargs or {},
     )
 
 
@@ -66,6 +67,8 @@ def _conductor(requests, drain_ttl_s=120.0):
     c._early_abort_deadlines = deque()
     c.waiting_queue = []
     c.enable_prof = False
+    c.enable_nvtx = False
+    c.max_concurrent_requests = None
     c._try_admit_waiting = lambda: setattr(c, "admits", c.admits + 1)
     return c
 
@@ -245,6 +248,88 @@ def test_abort_racing_ingest_discards_its_early_reads_done():
     c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
     c._ingest_request(_new_request("r1"))
     assert "r1" not in c._early_reads_done
+
+
+# ── ingest failures ─────────────────────────────────────────────────────────
+
+def _failures(c, rid):
+    return [m.body for e, m in _by_type(c, "request_failed") if m.body.request_id == rid]
+
+
+def test_request_seed_takes_an_int64_or_derives_one():
+    assert _request_seed({"seed": 7}, "r1") == 7
+    assert _request_seed({"seed": -(2**63)}, "r1") == -(2**63)
+    assert _request_seed({}, "r1") == _req_id_to_seed("r1")
+
+
+@pytest.mark.parametrize("seed", ["abc", "7", 1.5, True, 2**63, -(2**63) - 1, [1]])
+def test_bad_seed_is_rejected_with_400_not_dropped(seed):
+    """A bad seed used to raise in the run loop: logged, never answered."""
+    c = _conductor({})
+    c._do_ingest_request = lambda body: pytest.fail("a bad seed must not be dispatched")
+    c._ingest_request(_new_request("r1", {"seed": seed}))
+    assert "r1" not in c.requests and c.waiting_queue == []
+    assert _remove_targets(c, "r1") == {PREPROCESS}
+    [failure] = _failures(c, "r1")
+    assert failure.status == 400 and "seed" in failure.error_message
+
+
+def test_ingest_error_before_dispatch_fails_the_request():
+    c = _conductor({})
+
+    def boom(body):
+        raise RuntimeError("model hook broke")
+    c._do_ingest_request = boom
+    c._ingest_request(_new_request("r1"))
+    assert _remove_targets(c, "r1") == {PREPROCESS}
+    [failure] = _failures(c, "r1")
+    assert failure.status == 500 and "model hook broke" in failure.error_message
+
+
+def test_bad_value_registered_but_not_dispatched_is_a_400():
+    """A config that fails validation is refused after registration but before
+    any NewRequest: no worker holds it, so it is dropped, not drained."""
+    c = _conductor({})
+
+    def bad_config(body):
+        c.requests[body.request_id] = _request_data(workers=("w0",))
+        raise ValueError("top_p must be a finite number in (0, 1]; got -1")
+    c._do_ingest_request = bad_config
+    c._ingest_request(_new_request("r1"))
+    assert "r1" not in c.requests and c.draining == {}
+    assert _remove_targets(c, "r1") == {PREPROCESS}
+    [failure] = _failures(c, "r1")
+    assert failure.status == 400 and "top_p" in failure.error_message
+
+
+def test_ingest_error_after_dispatch_drains_like_a_worker_failure():
+    c = _conductor({})
+
+    def boom(body):
+        c.requests[body.request_id] = _request_data(workers=("w0",))
+        c.requests[body.request_id].dispatched = True
+        raise ValueError("half dispatched")
+    c._do_ingest_request = boom
+    c._ingest_request(_new_request("r1"))
+    assert _drain_targets(c, "r1") == {"w0", PREPROCESS}
+    assert _failures(c, "r1") == []  # the client hears once the barrier completes
+    for entity in ("w0", PREPROCESS):
+        c._handle_reads_done(ReadsDone(request_id="r1", entity_id=entity))
+    [failure] = _failures(c, "r1")
+    assert failure.status == 500 and "half dispatched" in failure.error_message
+
+
+def test_queued_request_failing_admission_is_answered():
+    """Admission from the waiting queue goes through the same fail-safe."""
+    c = _conductor({})
+    c.waiting_queue = [_new_request("r1")]
+
+    def boom(body):
+        raise ValueError("bad temperature")
+    c._do_ingest_request = boom
+    Conductor._try_admit_waiting(c)
+    [failure] = _failures(c, "r1")
+    assert failure.status == 400 and c.waiting_queue == []
 
 
 # ── expiry sweeps ───────────────────────────────────────────────────────────

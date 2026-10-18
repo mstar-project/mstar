@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from jinja2 import TemplateError
 
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -328,6 +329,20 @@ def test_edge_chat_adapter(tmp_path) -> None:
     assert args.model_kwargs["max_output_tokens"] == 64
     assert args.model_kwargs["enable_thinking"] is False
     assert [p.modality for p in args.prompt_parts] == ["image", "text"]
+
+
+class _StubRefusingTokenizer:
+    """The released template refuses no chat, but a checkpoint can ship its own."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        raise TemplateError("System message must be at the beginning.")
+
+
+def test_a_chat_the_template_refuses_is_a_bad_request(tmp_path) -> None:
+    model = _model(tmp_path)
+    model.tokenizer = _StubRefusingTokenizer()
+    with pytest.raises(ValueError, match="System message must be at the beginning"):
+        model.process_prompt("What is ahead?", ["text"], ["text"])
 
 
 def test_forward_pass_args_type(tmp_path) -> None:

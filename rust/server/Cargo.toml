@@ -10,7 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 # The vendored transport/arena library crate (rust/) — rlib target.
-mstar-rust = { path = "..", package = "mstar-rust" }
+# Executables must link libpython; extension-module suppresses that linkage.
+mstar-rust = { path = "..", package = "mstar-rust", default-features = false }
 axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }

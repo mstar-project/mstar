@@ -1,3 +1,5 @@
+from abc import ABC, abstractmethod
+
 import torch
 
 # Head dims the FlashInfer prefill kernels are instantiated for. An unsupported
@@ -15,7 +17,7 @@ def padded_head_dim(head_dim: int) -> int:
     )
 
 
-class _RaggedPrefillBase:
+class _RaggedPrefillBase(ABC):
     """FlashInfer's ragged prefill with no KV cache: queries and keys packed by
     segment into ``[total_tokens, H, D]`` tensors, laid out by ``cu_seqlens``.
 
@@ -54,7 +56,6 @@ class _RaggedPrefillBase:
             max_total_kv_tokens if max_total_kv_tokens is not None else max_total_tokens
         )
         self._num_segments = 0
-        self._total_tokens = 0
 
         import flashinfer
 
@@ -98,8 +99,8 @@ class _RaggedPrefillBase:
                 workspace_buffer, kv_layout, backend=backend
             )
 
-    def _prime(self) -> None:
-        raise NotImplementedError
+    @abstractmethod
+    def _prime(self) -> None: ...
 
     @property
     def num_segments(self) -> int:
@@ -117,7 +118,7 @@ class _RaggedPrefillBase:
         return torch.tensor(cu, dtype=torch.int32)
 
     def _prepare_cu_seqlens(
-        self, cu_seqlens: torch.Tensor, max_tokens: int | None = None, side: str = "",
+        self, cu_seqlens: torch.Tensor, max_tokens: int, side: str = "",
     ) -> tuple[torch.Tensor, int]:
         """The layout to hand FlashInfer, and its real token count."""
         n_seg = int(cu_seqlens.numel()) - 1
@@ -165,8 +166,6 @@ class _RaggedPrefillBase:
         else:
             kv_cu, _ = self._prepare_cu_seqlens(kv_cu_seqlens, self.max_total_kv_tokens, "key ")
         self._num_segments = int(cu_seqlens.numel()) - 1
-        if self.use_cuda_graph:
-            self._total_tokens = total_tokens
         self.attn_wrapper.plan(
             cu,
             kv_cu,
@@ -180,7 +179,7 @@ class _RaggedPrefillBase:
         if self._out_buf is not None:
             # rows this layout leaves unwritten, zeroed outside the graph where
             # the real token count is known; see __init__
-            self._out_buf[self._total_tokens:].zero_()
+            self._out_buf[total_tokens:].zero_()
 
     def _pad_head_dim(self, t: torch.Tensor) -> torch.Tensor:
         if t.shape[-1] == self.padded_head_dim:

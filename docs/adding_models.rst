@@ -72,25 +72,33 @@ A typical model lives in its own package under ``mstar/model/<your_model>/``:
    ├── submodules.py        # NodeSubmodule subclasses (the compute wrappers)
    └── components/          # the actual nn.Modules (attention, decoder, etc.)
 
-Plus two things outside that package:
+Plus a handful of things outside that package:
 
-- an entry in ``mstar/model/registry.py`` so the model is discoverable, and
-- a config YAML in ``configs/`` mapping nodes to ranks.
+- an entry in ``mstar/model/registry.py`` so the model is discoverable,
+- a config YAML in ``configs/`` mapping nodes to ranks,
+- an entry in ``DEFAULT_CONFIGS`` (``mstar/cli/main.py``) so ``mstar serve`` knows the name,
+- a row in ``docs/models.rst``, and
+- an OpenAI adapter, only if the model needs OpenAI-compatible routes.
+
+Step 1 covers all of them.
 
 Step 1 — Register the model
 ---------------------------
 
-Open ``mstar/model/registry.py`` and add your class to ``MODEL_REGISTRY`` (and, if it
+Open ``mstar/model/registry.py`` and add your model to ``MODEL_REGISTRY`` (and, if it
 loads weights from Hugging Face, to ``HF_MODELS``). The dict key is the string you put
 under ``model:`` in a config YAML.
 
+The value is a ``(module_path, class_name)`` tuple, not an imported class: the module is
+imported lazily through ``import_module`` when the model is actually used, which keeps
+``mstar.model.registry`` cheap to import. A direct class import here would pull every
+model's dependencies into every process.
+
 .. code-block:: python
 
-   from mstar.model.your_model.your_model_model import YourModel
-
-   MODEL_REGISTRY: dict[str, type[Model]] = {
+   MODEL_REGISTRY: dict[str, tuple[str, str]] = {
        # ...
-       "your_model": YourModel,
+       "your_model": ("mstar.model.your_model.your_model_model", "YourModel"),
    }
 
    HF_MODELS: dict[str, dict] = {
@@ -98,8 +106,22 @@ under ``model:`` in a config YAML.
        "your_model": {"model_path_hf": "org/your-model-id"},
    }
 
-This is the only wiring step. There is no plugin scan. The registry import is the single
-source of truth.
+There is no plugin scan, so the registry is the only place the class is discovered — but it
+is **not** the only wiring step. A model also needs:
+
+- ``DEFAULT_CONFIGS`` in ``mstar/cli/main.py``, mapping the name to its default config file.
+  Without it, ``mstar serve <your_model>`` exits with ``error: unknown model`` before
+  anything loads.
+- a row in ``docs/models.rst``, which is the model list users read.
+- an ``OpenAIAdapter`` subclass in ``ADAPTER_REGISTRY``
+  (``mstar/api_server/openai/adapters.py``), *only* if the model maps onto OpenAI semantics
+  such as ``chat.completions``, ``audio.speech`` or ``images.generate``. A model reached
+  only through ``POST /generate`` needs none.
+- the client-example tuples further down ``mstar/cli/main.py``, so ``mstar serve`` prints a
+  usage snippet. Cosmetic, but user-visible.
+
+``test/modular/test_model_registration.py`` enforces the registry, CLI and docs entries, so
+CI fails rather than shipping a model nobody can reach.
 
 Step 2 — Implement the ``Model`` class
 --------------------------------------
@@ -172,6 +194,16 @@ You must implement these abstract methods:
    starts reading such a field from ``model_kwargs`` — the way ``ignore_eos`` is
    read — also delete the key from ``_STRIP_KEYS``, or requests arriving through
    the Dynamo frontend will silently lose it.
+
+.. note::
+
+   ``model_kwargs`` cross the control plane to the conductor as plain data, so a
+   value that ``process_prompt`` moves onto a tensor edge must not travel there
+   too. List those kwargs in ``PREPROCESS_ONLY_KWARGS``: the data worker keeps the
+   originals for ``postprocess`` and leaves them out of the conductor's copy. Pi0.5
+   lists ``robot_state``, and Cosmos3 lists ``action`` (it passes only the shape on as
+   ``action_shape`` metadata). A tensor left in ``model_kwargs`` fails at send
+   with an error that names the kwarg.
 
 The following methods have defaults and are optional to override:
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
@@ -1315,6 +1347,8 @@ Step 6 — Write a config YAML
 A config maps nodes to GPU ranks. The value under ``model:`` is your registry key. Each
 ``node_groups`` entry assigns one or more ``node_names`` to ``ranks``. An entry can also
 name specific ``graph_walks``, which is how prefill-decode disaggregation is expressed.
+Every node of a walk must be placed by exactly one entry that applies to that walk; the
+conductor refuses a config that places it twice or not at all.
 
 .. code-block:: yaml
 
@@ -1708,11 +1742,18 @@ The ``SamplerSpec`` sets ``enable_repetion_penalty=False``, because ASR transcri
 decodes greedily.
 
 The page counts show how to size a cache for a specific model instead of using the
-default. A sequence is at most ``max_target_positions`` (448) tokens, which is 4 pages per
-request. 128 pages therefore support about 32 concurrent requests and use about 2.7 GB.
-The 2048-page default would use about 43 GB. The fixed 30-second context window is
-``max_source_positions`` (1500) tokens, which is 12 pages per request, so 192 pages
-support about 16 concurrent requests.
+default. Both caches use 128-token pages and hold ``WhisperModel.MAX_CONCURRENT_REQUESTS``
+(64) requests at full length, plus the sink page that every ``KVManager`` keeps out of
+circulation. A sequence is at most ``max_target_positions`` (448) tokens, which is 4 pages
+per request, so the self-attention cache has 64 * 4 + 1 = 257 pages, about 5 GiB for
+large-v3 in bf16. The 2048-page default would use about 40 GiB. The fixed 30-second context
+window is ``max_source_positions`` (1500) tokens, which is 12 pages per request held from
+prefill to the last token, so the context cache has 64 * 12 + 1 = 769 pages, about 15 GiB.
+Sizing the caches is only half of it: ``configs/whisper_large.yaml`` also sets
+``max_concurrent_requests: 64``, so the conductor queues further requests instead of the
+worker offloading decoding requests to admit them. ``WhisperModel.validate_config_yaml``
+refuses at startup a cap that either cache cannot hold after the YAML's ``resources:``
+overrides.
 
 Whisper's ``declare_step`` shows how a write-once context is expressed with spans. The
 context segments have a non-zero span in the prefill step that writes them, and a span of
@@ -1801,13 +1842,23 @@ Override these methods:
   objects between them, including a ``chunk_policy_factory`` such as
   ``SlidingWindowChunkPolicy(window=..., stride=...)``.
 - ``get_partitions()`` declares each ``PartitionDefinition``: its walks, its initial walk,
-  and the partitions that produce data into it.
+  and the partitions that produce data into it. Every walk belongs to exactly one
+  partition.
 - Route cross-partition tensors with ``StreamingGraphEdge(next_node=..., name=...,
   target_partition=...)`` instead of a plain ``GraphEdge``.
 
 The consuming partition's ``get_partition_forward_pass_args`` reads
 ``incoming_connections``, which provides token counts and a ``producer_done`` flag, and
 uses them to decide when to run.
+
+Keep a walk that consumes a stream to one node or one ``Loop`` on one node group, and move
+later work into a downstream partition fed by its own ``StreamingGraphEdge``. A consumer
+whose every input is streamed runs again as soon as the next chunk arrives, and the
+runtime and conductor count passes per worker graph, so the conductor refuses at startup
+such a consumer sharing its worker graph with another top-level node or ``Loop``, and a
+stream-consuming walk split over worker graphs, unless every consumer also waits on a
+non-streamed input and all the walk's worker graphs run on the same workers. That input
+must arrive once per pass (from the conductor, say); startup cannot check this.
 
 Checklist
 ---------
@@ -1831,8 +1882,14 @@ Checklist
          [ ] get_submodule
          [ ] (optional) get_request_resource_configs
          [ ] (optional) prefix_key_streams + checkpoint_path   — cross-request prefix reuse
-   [ ] mstar/model/registry.py                    — add to MODEL_REGISTRY (+ HF_MODELS)
+   [ ] mstar/model/registry.py                    — (module_path, class_name) in MODEL_REGISTRY
+         [ ] HF_MODELS too, if weights come from Hugging Face
    [ ] configs/<your_model>.yaml                  — node_groups → ranks (+ resources: overrides)
+   [ ] mstar/cli/main.py DEFAULT_CONFIGS          — else `mstar serve <name>` says "unknown model"
+         [ ] the client-example tuples lower down (cosmetic, user-visible)
+   [ ] docs/models.rst                            — one row in the registry-key table
+   [ ] (optional) mstar/api_server/openai/adapters.py — only for OpenAI-compatible routes
+   [ ] (optional) pyproject.toml extra            — if it needs deps the base install lacks
    [ ] (optional) async partitions if pipelined
 
 Testing
