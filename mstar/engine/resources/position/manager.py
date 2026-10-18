@@ -31,6 +31,21 @@ from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
 from mstar.platforms import current_platform
 
 
+def _cos_sin_cache_key(
+    rotary_dim: int, rope_scale: float, rope_theta: float, llama31_params: dict,
+) -> tuple:
+    """What determines a cos/sin cache's angles. Llama 3.1's blend of the scaled
+    and unscaled frequency changes nothing at ``rope_scale == 1``, so it drops
+    out there (attention layers pass default Llama 3.1 arguments)."""
+    llama31 = tuple(
+        llama31_params.get(name)
+        for name in ("low_freq_factor", "high_freq_factor", "old_context_len")
+    )
+    if None in llama31 or rope_scale == 1.0:
+        llama31 = None
+    return (rotary_dim, rope_scale, rope_theta, llama31)
+
+
 @dataclass
 class PublishedPositionInfo(PublishedInfo):
     """Where each of a request's streams has reached. label -> next position."""
@@ -126,16 +141,16 @@ class RopeManager(PositionManager):
                     "RoPE on AMD GPUs needs PositionConfig.rotary_dim or the "
                     "dependent KV cache's head_dim"
                 )
-            llama31 = tuple(config.llama31_params.values()) or None
-            self._rope_cache_key = (
-                rotary_dim, config.rope_scale, config.rope_theta, llama31,
+            self._rope_cache_key = _cos_sin_cache_key(
+                rotary_dim, config.rope_scale, config.rope_theta,
+                config.llama31_params,
             )
             self._rope_cache = self._build_rope_cache(
                 rotary_dim,
                 config.rope_scale,
                 config.rope_theta,
                 torch.float32,
-                llama31=llama31,
+                llama31=self._rope_cache_key[3],
                 compute_dtype=torch.float64,
             )
         # CUDA rotates from this table instead of in-kernel angles when set.
@@ -617,22 +632,14 @@ class RopeManager(PositionManager):
                 dtype=torch.long,
             )
         elif self._rope_cache is not None:
-            rotary_dim = rotary_dim or q.shape[-1]
-            llama31 = tuple(
-                llama31_params.get(name)
-                for name in ("low_freq_factor", "high_freq_factor", "old_context_len")
+            # The cache serves the arguments it was built from. A layer that
+            # passes others (its own theta, say) gets the kernel that computes
+            # the angles from them, as NVIDIA GPUs do for every call.
+            cache_key = _cos_sin_cache_key(
+                rotary_dim or q.shape[-1], rope_scale, rope_theta, llama31_params,
             )
-            cache_key = (
-                rotary_dim, rope_scale, rope_theta,
-                None if None in llama31 else llama31,
-            )
-            if cache_key != self._rope_cache_key:
-                raise RuntimeError(
-                    "RoPE runtime arguments do not match the cache built "
-                    f"from PositionConfig: runtime={cache_key}, "
-                    f"configured={self._rope_cache_key}"
-                )
-            cos_sin_cache = self._rope_cache
+            if cache_key == self._rope_cache_key:
+                cos_sin_cache = self._rope_cache
         torch.ops.mstar.rope_apply_qk_inplace(
             q,
             k,
