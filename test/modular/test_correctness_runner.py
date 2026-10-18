@@ -197,3 +197,16 @@ def test_image_question_set_for_vision_text_models(tmp_path):
     assert req.model_kwargs["temperature"] == 0.0 and req.model_kwargs["max_output_tokens"] == 128
     duplex = family_for_config("nemotron_duplex", "nemotron_duplex", {}, {})
     assert [it.id for it in duplex.select_items(items)] == ["aud_00"]
+
+
+def test_duplex_questions_get_trailing_silence(tmp_path):
+    root = tmp_path / "sets" / "omni_v1"
+    (root / "audio").mkdir(parents=True)
+    M.write_wav(root / "audio" / "00.wav", np.full(16000, 0.1, np.float32), 16000)
+    sset = sets.SampleSet("omni_v1", root, {}, [
+        sets.Item(id="aud_00", prompt="q", files={"audio": "audio/00.wav"}, params={"modality": "audio"})])
+    fam = family_for_config("nemotron_duplex", "nemotron_duplex", {}, {"trailing_s": "2"})
+    (req,) = fam.requests(sset)
+    x, sr = M.read_wav(req.files[0])
+    assert sr == 16000 and len(x) == 3 * 16000 and np.abs(x[16000:]).max() == 0
+    assert req.files[0].parent == tmp_path / "derived" / "omni_v1-trailing2s"
