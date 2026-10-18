@@ -97,13 +97,23 @@ def test_summary_spread():
     assert sweep.spread(s, "missing") is None
 
 
-def test_assign_lanes():
-    rows = [catalog.ROWS[n] for n in ("qwen3_5_0.8b", "qwen3_5_2b", "qwen3_5_9b_tp2", "qwen3_5_4b")]
-    lanes = sweep.assign_lanes(rows, [0, 1, 2, 3], 2)
-    assert [g for g, _ in lanes] == [[0, 1], [2, 3]]
-    assert sorted(r.name for _, rs in lanes for r in rs) == sorted(r.name for r in rows)
-    with pytest.raises(ValueError):
-        sweep.assign_lanes(rows, [0, 1, 2], 3)
+def test_run_rows_shares_the_gpu_pool(monkeypatch):
+    seen, lock = [], __import__("threading").Lock()
+
+    def fake_row(plan, row, index, gpus, port):
+        with lock:
+            seen.append((row.name, tuple(gpus), port))
+
+    monkeypatch.setattr(sweep, "run_row", fake_row)
+    rows = [catalog.ROWS[n] for n in ("qwen3_5_0.8b", "qwen3_5_9b_tp2", "qwen3_5_2b", "qwen3_5_4b")]
+    plan = type("P", (), {"log": staticmethod(lambda m: None)})()
+    sweep.run_rows(plan, rows, [4, 5, 6], 2, 8400)
+    assert sorted(n for n, _, _ in seen) == sorted(r.name for r in rows)
+    assert [g for n, g, _ in seen if n == "qwen3_5_9b_tp2"] == [(4, 5)]  # wide row first
+    assert len({p for _, _, p in seen}) == 4
+    seen.clear()
+    sweep.run_rows(plan, [catalog.ROWS["qwen3_5_9b_tp2"]], [0], 1, 8400)
+    assert seen == []  # does not fit, skipped
 
 
 def test_health_check_scopes_other_gpus():
