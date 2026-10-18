@@ -69,7 +69,7 @@ class NodeTests(unittest.TestCase):
         )
 
     def test_packed_prefill_selects_each_requests_last_token_and_decode_routes_rows(self):
-        sampler = SimpleNamespace(sample=Mock(side_effect=lambda rids, logits: logits.argmax(-1)))
+        sampler = SimpleNamespace(sample=Mock(side_effect=lambda logits: logits.argmax(-1)))
         attention = SimpleNamespace(select_last_hidden=Mock(side_effect=lambda x, label: x[[2, 4]]))
         engine = ModelInputsFromEngine(["a", "b"], {}, {LOCAL_ATTN: attention, SAMPLER: sampler})
         for walk, rows, expected in (
@@ -88,7 +88,8 @@ class NodeTests(unittest.TestCase):
             self.assertEqual(set(tracked), {"a", "b"} if walk == "prefill" else set())
             output = self.node.forward_batched(walk, engine, **self.node.preprocess(walk, engine, inputs))
             self.assertEqual([output[rid]["new_token"][0].item() for rid in engine.request_ids], expected)
-            self.assertEqual(sampler.sample.call_args.args[0], engine.request_ids)
+            # one row of logits per request; the sampler takes the rows from its planned step
+            self.assertEqual(sampler.sample.call_args.args[0].shape[0], len(engine.request_ids))
         attention.select_last_hidden.assert_called_once()
 
     def test_prefill_publishes_a_decode_seed_without_reading_the_token(self):
@@ -144,7 +145,7 @@ class NodeTests(unittest.TestCase):
         torch.testing.assert_close(cut.input_embeds, image_embeds)
         self.assertEqual(cut.input_ids.tolist(), [image, image])
 
-        sampler = SimpleNamespace(sample=Mock(side_effect=lambda rids, logits: logits.argmax(-1)))
+        sampler = SimpleNamespace(sample=Mock(side_effect=lambda logits: logits.argmax(-1)))
         attention = SimpleNamespace(select_last_hidden=lambda x, label: x[-1:])
         engine = ModelInputsFromEngine(["a"], {}, {LOCAL_ATTN: attention, SAMPLER: sampler})
         step = self.node.declare_step("prefill_image", ["a"], [inputs])
@@ -208,7 +209,7 @@ class ModelIntegrationTests(unittest.TestCase):
         node = self.model.get_submodule("LLM", autocast_dtype=torch.float32)
         kv, pos, local, global_ = bind_test_resources(node.language_model.model, self.model.config)
         local.select_last_hidden = lambda hidden, label: hidden[-1:]
-        sampler = SimpleNamespace(sample=lambda request_ids, logits: logits.argmax(-1))
+        sampler = SimpleNamespace(sample=lambda logits: logits.argmax(-1))
         resources = {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_, SAMPLER: sampler}
         node.bind_node_resources(resources)
         engine = ModelInputsFromEngine(["a"], {}, resources)

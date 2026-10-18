@@ -134,7 +134,7 @@ class EncoderDecoderNode(TokenStepNode):
             # packed prefill: one hidden per request, at its last token
             hidden = attn.select_last_hidden(hidden)
         logits = self.process_logits(self.decoder.lm_head(hidden), graph_walk)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+        return sampler.sample(logits)
 
     def forward(
         self,

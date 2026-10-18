@@ -209,7 +209,7 @@ class Runtime:
         if iteration == 0:
             hidden = self.resources[LOCAL_ATTN].select_last_hidden(hidden, label="main")
         logits = lm.compute_logits(hidden)
-        tokens = self.resources[SAMPLER].sample(rids, logits=logits)
+        tokens = self.resources[SAMPLER].sample(logits)
         self.runner.commit(step)
         torch.cuda.synchronize()
         return logits, tokens, dict(planning_ms=(planned-started)*1000,

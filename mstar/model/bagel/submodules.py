@@ -699,32 +699,26 @@ class LLMSubmodule(ARNodeSubmodule):
 
     _NODE_TO_CFG_LABEL = NODE_TO_CFG_LABEL
 
-    def _sample_tokens(
-        self, request_ids: list[str], logits: torch.Tensor,
-    ) -> torch.Tensor:
+    def _sample_tokens(self, logits: torch.Tensor) -> torch.Tensor:
         """One token per row of this step's ``[rows, vocab]`` logits.
 
-        ``request_ids`` is the batch the forward ran on, so under capture it is
-        the slot's padding ids and ``logits`` has the padded row count — which
-        is what the graph sampler's per-row params were gathered for. The
-        engine maps the entries back onto the real ids.
+        The rows are the batch the forward ran on, so under capture ``logits``
+        has the slot's padded row count, which is what the graph sampler's
+        per-row params were gathered for. The engine maps the entries back
+        onto the real ids.
         """
-        tokens = self.node_resources["sampler"].sample(request_ids, logits)
+        tokens = self.node_resources["sampler"].sample(logits)
         # FlashInfer reuses its sampling output buffer across calls, so a view
         # held past the next step aliases that step's token.
         return tokens.clone()
 
-    def _sample_one(
-        self, request_ids: list[str], logits: torch.Tensor,
-    ) -> NameToTensorList:
+    def _sample_one(self, logits: torch.Tensor) -> NameToTensorList:
         """The single-request forward's output shape: one flat name -> tensors."""
-        return {"new_token": [self._sample_tokens(request_ids, logits)]}
+        return {"new_token": [self._sample_tokens(logits)]}
 
-    def _sample_per_request(
-        self, request_ids: list[str], logits: torch.Tensor,
-    ) -> BatchedModelOutput:
+    def _sample_per_request(self, logits: torch.Tensor) -> BatchedModelOutput:
         """The batched forward's output: row i of ``new_token`` is request i."""
-        return BatchedModelOutput(row_outputs={"new_token": self._sample_tokens(request_ids, logits)})
+        return BatchedModelOutput(row_outputs={"new_token": self._sample_tokens(logits)})
 
     def __init__(
         self,
@@ -1167,7 +1161,7 @@ class LLMSubmodule(ARNodeSubmodule):
         # A prefill hands back logits only when it is meant to sample this step
         # (`sample_prefill_token`); decode always does.
         if _LOGITS in out:
-            return self._sample_one(engine_inputs.request_ids, out.pop(_LOGITS)[0])
+            return self._sample_one(out.pop(_LOGITS)[0])
         return out
 
     def _forward_prefill_text(
@@ -1566,8 +1560,6 @@ class LLMSubmodule(ARNodeSubmodule):
         Concatenates inputs across requests, runs a single LLM forward with
         one batched attention plan, then splits outputs back per-request.
         """
-        request_ids = engine_inputs.request_ids
-
         if graph_walk == "decode":
             out = self._forward_decode_batched(
                 input_ids=input_ids,
@@ -1595,7 +1587,7 @@ class LLMSubmodule(ARNodeSubmodule):
         # `sample_prefill_token` off, which hands back no logits.
         if _LOGITS in out:
             # one `[bs, vocab]` sample for the whole batch, split per request
-            return self._sample_per_request(request_ids, out.pop(_LOGITS)[0])
+            return self._sample_per_request(out.pop(_LOGITS)[0])
         return out
 
     def _forward_decode_batched(
