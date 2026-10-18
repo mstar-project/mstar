@@ -1,0 +1,287 @@
+"""Correctness column of the tables, on WS-K's sample sets, references and metrics (benchmark/correctness).
+
+Text arms get their own greedy pass on the set right after the server starts. mstar receives the
+correctness runner's own /generate requests; vLLM and SGLang get the same prompts as chat
+completions with per-token logprobs, which turn back into one chunk per token, the form the
+text metrics compare. TTS arms are scored on the audio of their first timed run at concurrency 1
+(the same sentences, one pass over the set). Every pass is saved in the correctness runner's
+layout (r1/outputs, r1/responses.jsonl) and scored with its family code.
+
+    python -m benchmark.amd.correctness score RUN_DIR      # what the sweep runs at the end
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import yaml
+
+from benchmark.amd.launch import REPO
+
+WORK = Path("/work1/stephaniewang/atindra")
+SETS_ROOT = WORK / "amd/results/correctness/data"
+WSK_REF = "users/atindra/ws-k-correctness"
+MAIN_REPO = WORK / "mstar"
+
+
+def prepare_source(run_dir: Path, src: str | None) -> Path:
+    """Directory whose benchmark/correctness the run imports. This tree if it has one; otherwise
+    ``src`` (a checkout, or a git ref exported once into the run dir so a later rebase can't
+    change what a run scored with)."""
+    if src is None and (REPO / "benchmark/correctness/__init__.py").is_file():
+        return REPO
+    if src and (Path(src) / "benchmark/correctness/__init__.py").is_file():
+        return Path(src).resolve()
+    ref = src or WSK_REF
+    dest = run_dir / "wsk_src"
+    if not (dest / "benchmark/correctness/__init__.py").is_file():
+        dest.mkdir(parents=True, exist_ok=True)
+        commit = subprocess.run(["git", "-C", str(MAIN_REPO), "rev-parse", ref], capture_output=True, text=True,
+                                check=True).stdout.strip()
+        archive = subprocess.run(["git", "-C", str(MAIN_REPO), "archive", commit, "benchmark/correctness"],
+                                 capture_output=True, check=True).stdout
+        subprocess.run(["tar", "-x", "-C", str(dest)], input=archive, check=True)
+        (dest / "COMMIT").write_text(f"{ref} {commit}\n")
+    return dest
+
+
+def load(src: Path):
+    """Import benchmark.correctness from ``src`` and return its modules."""
+    import benchmark
+
+    pkg = str(src / "benchmark")
+    if src != REPO and pkg not in benchmark.__path__:
+        benchmark.__path__.append(pkg)
+    mods = {}
+    for name in ("client", "sets", "families", "report"):
+        mods[name] = importlib.import_module(f"benchmark.correctness.{name}")
+    return type("WSK", (), mods)
+
+
+def _family(C, worktree: Path, row_name: str):
+    cfg = yaml.safe_load((worktree / "configs" / f"{row_name}.yaml").read_text()) or {}
+    return C.families.family_for_config(row_name, cfg.get("model"), cfg, {}), cfg
+
+
+def _write_pass(C, fam, sset, responses, out_dir: Path, header: dict, cfg: dict) -> dict:
+    run = out_dir / "r1"
+    if run.exists():
+        shutil.rmtree(run)
+    (run / "outputs").mkdir(parents=True)
+    with open(run / "responses.jsonl", "w") as f:
+        for r in responses:
+            f.write(json.dumps(r.summary(), default=str) + "\n")
+    fam.save(sset, responses, run / "outputs")
+    (out_dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    ok = sum(r.ok for r in responses)
+    header.update(n_items=len(sset.items), set=sset.name, ok=ok, failed=len(responses) - ok,
+                  errors={r.item_id: r.error for r in responses if not r.ok})
+    (out_dir / "pass.json").write_text(json.dumps(header, indent=1, default=str))
+    return {"ok": ok, "failed": len(responses) - ok, "set": sset.name}
+
+
+# --- text ------------------------------------------------------------------------------------
+
+def openai_bodies(fam, sset, hf_id: str, engine: str) -> list[dict]:
+    """Chat completion bodies with the text family's prompts and settings, plus per-token logprobs."""
+    bodies = []
+    for i, it in enumerate(sset.items):
+        n = int(it.params.get("max_new_tokens", 128))
+        body = {"model": hf_id, "messages": [{"role": "user", "content": [{"type": "text", "text": it.prompt}]}],
+                "max_tokens": n, "temperature": 0.0, "seed": i, "logprobs": True, "top_logprobs": 0,
+                "chat_template_kwargs": {"enable_thinking": fam.thinking}}
+        if engine == "vllm":
+            body["return_tokens_as_token_ids"] = True
+        bodies.append(body)
+    return bodies
+
+
+def chunks_from_chat(body: bytes, tok, eos_ids: set[int]) -> tuple[list[str], int | None]:
+    """One decoded string per generated token from a chat completion with logprobs, the form
+    mstar streams. vLLM names tokens ``token_id:N``; SGLang sends each token's own text. Returns
+    the chunks and the prompt token count."""
+    doc = json.loads(body)
+    choice = doc["choices"][0]
+    content = (choice.get("logprobs") or {}).get("content") or []
+    specials = {tok.decode([i]) for i in eos_ids}
+    chunks = []
+    for entry in content:
+        t = entry.get("token", "")
+        if t.startswith("token_id:"):
+            tid = int(t.split(":", 1)[1])
+            if tid in eos_ids:
+                break
+            chunks.append(tok.decode([tid]))
+        else:
+            if t in specials:
+                break
+            chunks.append(t)
+    return chunks, (doc.get("usage") or {}).get("prompt_tokens")
+
+
+def text_pass(plan, row, arm, port: int, out_dir: Path) -> dict:
+    C = load(plan.correctness_src)
+    fam, cfg = _family(C, plan.worktree, row.name)
+    sset = C.sets.load_set(fam.set_name, SETS_ROOT)
+    base = f"http://127.0.0.1:{port}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.monotonic()
+    if arm.engine == "mstar":
+        responses = C.client.send_all(base, fam.requests(sset), concurrency=fam.default_concurrency,
+                                      timeout_s=fam.request_timeout_s, progress=False)
+    else:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(fam.hf_id)
+        eos = {i for i in (tok.eos_token_id, tok.convert_tokens_to_ids("<|im_end|>"),
+                           tok.convert_tokens_to_ids("<|endoftext|>")) if isinstance(i, int) and i >= 0}
+        reqs = [C.client.Request(it.id, route="/v1/chat/completions", json_body=b)
+                for it, b in zip(sset.items, openai_bodies(fam, sset, row.hf_id, arm.engine), strict=True)]
+        responses = C.client.send_all(base, reqs, concurrency=fam.default_concurrency,
+                                      timeout_s=fam.request_timeout_s, progress=False)
+        prompt_tokens = {}
+        for r in responses:
+            if not r.ok:
+                continue
+            try:
+                chunks, prompt_tokens[r.item_id] = chunks_from_chat(r.body, tok, eos)
+            except (ValueError, KeyError, IndexError) as e:
+                r.ok, r.error = False, f"unreadable response: {e}"
+                continue
+            r.text_chunks = [c.encode("utf-8") for c in chunks]
+        (out_dir / "prompt_tokens.json").write_text(json.dumps(prompt_tokens, indent=1))
+    header = {"config": row.name, "model": cfg.get("model"), "arm": arm.name, "engine": arm.engine,
+              "restarts": 1, "concurrency": fam.default_concurrency, "family_opts": {},
+              "seconds": round(time.monotonic() - t0, 1), "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    return _write_pass(C, fam, sset, responses, out_dir, header, cfg)
+
+
+# --- TTS from a timed run ---------------------------------------------------------------------
+
+def tts_pass_from_cell(C, worktree: Path, row_name: str, arm_name: str, cell_dir: Path, out_dir: Path) -> dict:
+    """The correctness pass of a TTS arm: the first timed run at concurrency 1, one request per item."""
+    fam, cfg = _family(C, worktree, row_name)
+    sset = C.sets.load_set(fam.set_name, SETS_ROOT)
+    run = cell_dir / "a1r1"
+    results = json.loads((run / "results.json").read_text())
+    ok_ids = {r["request_id"] for r in results.get("per_request", [])}
+    responses = []
+    for i, it in enumerate(sset.items):
+        r = C.client.Response(it.id)
+        wav = run / f"req_{i}.wav"
+        if i in ok_ids and wav.is_file():
+            r.ok = True
+        else:
+            r.error = "no audio in the timed run"
+        responses.append(r)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_out = out_dir / "r1"
+    if run_out.exists():
+        shutil.rmtree(run_out)
+    (run_out / "outputs").mkdir(parents=True)
+    for i, (it, r) in enumerate(zip(sset.items, responses, strict=True)):
+        if r.ok:
+            shutil.copyfile(run / f"req_{i}.wav", run_out / "outputs" / f"{it.id}.wav")
+    with open(run_out / "responses.jsonl", "w") as f:
+        for r in responses:
+            f.write(json.dumps(r.summary(), default=str) + "\n")
+    (out_dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    ok = sum(r.ok for r in responses)
+    header = {"config": row_name, "model": cfg.get("model"), "arm": arm_name, "restarts": 1, "concurrency": 1,
+              "set": sset.name, "n_items": len(sset.items), "ok": ok, "failed": len(responses) - ok,
+              "source": str(run)}
+    (out_dir / "pass.json").write_text(json.dumps(header, indent=1))
+    return header
+
+
+# --- scoring --------------------------------------------------------------------------------
+
+def _key_metrics(score) -> dict:
+    m = score.metrics
+    out = {"verdict": score.verdict}
+    for k in ("exact_vs_reference", "wer_percent", "reference_wer_percent", "duration_ratio",
+              "log_mel_distance_db"):
+        if k in m:
+            out[k] = m[k]
+    for c in score.checks:
+        if c.name.startswith("divergences vs reference"):
+            out["unexplained_divergences"] = c.value
+        if c.name.startswith("WER - reference WER"):
+            out["wer_minus_reference_pt"] = c.value
+    return out
+
+
+def score_dir(C, worktree: Path, corr_dir: Path, device: str) -> dict:
+    header = json.loads((corr_dir / "pass.json").read_text())
+    fam, _ = _family(C, worktree, header["config"])
+    sset = C.sets.load_set(fam.set_name, SETS_ROOT)
+    ref_dir = SETS_ROOT / "references" / fam.reference_id() / fam.set_name
+    ref = ref_dir if fam.ref_outputs(ref_dir) is not None else None
+    work = corr_dir / "scoring"
+    work.mkdir(exist_ok=True)
+    header.update(reference=fam.reference_description() if ref else f"missing ({ref_dir})", protocol=fam.protocol(),
+                  run_id=corr_dir.parent.name, finished=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    try:
+        score = fam.score(sset, [corr_dir / "r1"], ref, work, device)
+    except Exception as e:  # recorded in the report
+        C.report.write_reports(corr_dir, header, None, f"{type(e).__name__}: {e}")
+        return {"verdict": "ERROR", "error": f"{type(e).__name__}: {e}"}
+    C.report.write_reports(corr_dir, header, score)
+    out = _key_metrics(score)
+    if ref is None:
+        out["reference"] = "missing"
+    (corr_dir / "summary.json").write_text(json.dumps(out, indent=1, default=str))
+    return out
+
+
+def score(run_dir: Path, device: str = "cuda:0") -> dict:
+    meta = json.loads((run_dir / "sweep.json").read_text())
+    worktree = Path(meta["worktree"])
+    C = load(Path(meta["correctness_src"]))
+    results = {}
+    for arm_json in sorted(run_dir.glob("*/*/arm.json")):
+        arm_dir = arm_json.parent
+        info = json.loads(arm_json.read_text())
+        corr = arm_dir / "correctness"
+        if not (corr / "pass.json").is_file():
+            cell = arm_dir / "cells" / "tts-seed" / "c1"
+            if (cell / "a1r1" / "results.json").is_file():
+                tts_pass_from_cell(C, worktree, info["row"], info["arm"], cell, corr)
+        if (corr / "pass.json").is_file():
+            results[f"{info['row']}/{info['arm']}"] = score_dir(C, worktree, corr, device)
+    (run_dir / "correctness.json").write_text(json.dumps(results, indent=1, default=str))
+    return results
+
+
+def score_run(run_dir: Path, gpu: int, log=print) -> None:
+    """Score in a child process that sees only ``gpu`` (the driver itself never opens a GPU)."""
+    env = {**os.environ, "HIP_VISIBLE_DEVICES": str(gpu), "CUDA_VISIBLE_DEVICES": str(gpu), "HF_HUB_OFFLINE": "1",
+           "PYTHONPATH": os.pathsep.join([str(REPO), os.environ.get("PYTHONPATH", "")])}
+    with open(run_dir / "correctness.log", "w") as f:
+        p = subprocess.run([sys.executable, "-m", "benchmark.amd.correctness", "score", str(run_dir)], cwd=REPO,
+                           env=env, stdout=f, stderr=subprocess.STDOUT, check=False)
+    log(f"correctness scoring rc {p.returncode} (log {run_dir / 'correctness.log'})")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("score")
+    s.add_argument("run_dir")
+    s.add_argument("--device", default="cuda:0")
+    args = ap.parse_args(argv)
+    res = score(Path(args.run_dir), args.device)
+    print(json.dumps(res, indent=1, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
