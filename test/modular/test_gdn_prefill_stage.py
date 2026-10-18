@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.engine.resources.linear_attn import gdn_stage, wrappers
+from mstar.engine.resources.linear_attn import gdn_kernels, gdn_stage
+from mstar.engine.resources.linear_attn.gdn_kernels import FlashInferGDNKernels
 from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies, stage_gdn_prefill_inputs
 from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
@@ -55,9 +56,13 @@ def test_guard_refuses_head_dims_the_kernel_does_not_take(blackwell):
     assert not gdn_stage_applies(_CUDA, _geometry(head_k_dim=1024, head_v_dim=1024))
 
 
+def _kernels(stage_inputs):
+    return FlashInferGDNKernels(has_sink=True, stage_inputs=stage_inputs)
+
+
 def _prefill(stage_inputs, **kwargs):
     return GDNPrefillWrapper(
-        device=torch.device("cpu"), pad_slot_id=PAD_SLOT_ID, stage_inputs=stage_inputs, **kwargs,
+        device=torch.device("cpu"), pad_slot_id=PAD_SLOT_ID, kernels=_kernels(stage_inputs), **kwargs,
     )
 
 
@@ -70,13 +75,13 @@ def test_a_staged_wrapper_tells_the_caller_not_to_prepare():
 @pytest.mark.parametrize("stage_inputs", [False, True])
 def test_mixed_wrapper_normalizes_decode_rows_once(stage_inputs):
     mixed = GDNMixedWrapper(
-        device=torch.device("cpu"), pad_slot_id=PAD_SLOT_ID, stage_inputs=stage_inputs,
+        device=torch.device("cpu"), pad_slot_id=PAD_SLOT_ID, kernels=_kernels(stage_inputs),
     )
     assert mixed.qk_l2norm_in_kernel is stage_inputs
     # with the stage the caller skips the norm, so the decode kernel does it;
     # without it, the caller did, and doing it again would change the values
-    assert mixed._decode._qk_l2norm is stage_inputs
-    assert mixed._prefill._stage_inputs is stage_inputs
+    assert mixed._decode.qk_l2norm_in_kernel is stage_inputs
+    assert mixed._prefill._kernel.masks_padded_tail is stage_inputs
     assert mixed.takes_strided_inputs is stage_inputs
 
 
@@ -90,7 +95,7 @@ def test_run_goes_through_the_stage_with_the_plan_mask(monkeypatch):
     mask = torch.ones(34)
     wrapper._plan_state = SimpleNamespace(
         slots=torch.zeros(2, dtype=torch.int32), has_state=torch.zeros(2, dtype=torch.bool),
-        num_rows=2, cu_seqlens=torch.tensor([0, 16, 32]), token_mask=mask,
+        num_rows=2, cu_seqlens=torch.tensor([0, 16, 32]), token_mask=mask, every=0,
     )
     seen = {}
 
@@ -102,7 +107,7 @@ def test_run_goes_through_the_stage_with_the_plan_mask(monkeypatch):
         seen["alpha"] = kw["g"]
         return kw["v"], torch.zeros_like(kw["initial_state"])
 
-    monkeypatch.setattr(wrappers, "stage_gdn_prefill_inputs", stage)
+    monkeypatch.setattr(gdn_kernels, "stage_gdn_prefill_inputs", stage)
     # the wrapper imports the kernel lazily; a fake module serves it whether or not flashinfer is installed
     gdn_prefill = types.ModuleType("flashinfer.gdn_prefill")
     gdn_prefill.chunk_gated_delta_rule = chunk
