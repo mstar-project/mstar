@@ -33,6 +33,10 @@ class Family:
         self.opts = dict(opts or {})
 
     # --- serving ---------------------------------------------------------------------------
+    def select_items(self, items: list) -> list:
+        """The items of the set this family runs. Default: all of them."""
+        return items
+
     def requests(self, sset: SampleSet) -> list[Request]:
         raise NotImplementedError
 

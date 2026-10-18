@@ -231,6 +231,61 @@ class TextFamily(Family):
         return sc
 
 
+class TextImageFamily(TextFamily):
+    """Image plus a question on the 20 image items of omni_v1 (--family-opt set=image).
+
+    The server decodes the file with torchvision and runs the checkpoint's image processor on the
+    uint8 pixels, so the reference does the same and only the model math differs.
+    """
+
+    set_name = "omni_v1"
+    default_concurrency = 4
+
+    def select_items(self, items: list) -> list:
+        return [it for it in items if it.params.get("modality") == "image"]
+
+    def requests(self, sset: SampleSet) -> list[Request]:
+        return [Request(it.id, text=it.prompt, files=[sset.path(it.files["image"])], input_modalities="image,text",
+                        output_modalities="text", model_kwargs=self.model_kwargs(i, it))
+                for i, it in enumerate(sset.items)]
+
+    def reference_id(self) -> str:
+        return f"hf-{self.hf_id.replace('/', '--')}-image-greedy-bf16" + ("-think" if self.thinking else "")
+
+    def reference_description(self) -> str:
+        return (f"HF transformers {self.hf_id} (bf16, sdpa, eager) with its processor on torchvision-decoded "
+                f"images, greedy, enable_thinking={self.thinking}, top-{TOPK} logprobs per step")
+
+    def make_reference(self, sset: SampleSet, ref_dir: Path, device: str) -> None:
+        import torch
+        import torchvision
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        proc = AutoProcessor.from_pretrained(self.hf_id)
+        tok = proc.tokenizer
+        model = AutoModelForImageTextToText.from_pretrained(self.hf_id, dtype=torch.bfloat16,
+                                                            attn_implementation="sdpa").to(device).eval()
+        eos = sorted({*_as_list(getattr(model.generation_config, "eos_token_id", None)), tok.eos_token_id} - {None})
+        for it in sset.items:
+            # Model.load_image and _as_hwc_uint8 on the server: uint8 CHW from torchvision, then HWC.
+            img = torchvision.io.decode_image(str(sset.path(it.files["image"]))).permute(1, 2, 0).contiguous().numpy()
+            messages = [{"role": "user", "content": [{"type": "image", "image": ""},
+                                                     {"type": "text", "text": it.prompt}]}]
+            text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                           enable_thinking=self.thinking)
+            inputs = proc(text=[text], images=[img], return_tensors="pt").to(device)
+            ids = inputs.pop("input_ids")[0].tolist()
+            inputs.pop("attention_mask", None)
+            extra = {k: (v.to(torch.bfloat16) if v.is_floating_point() else v) for k, v in inputs.items()
+                     if hasattr(v, "is_floating_point")}
+            rec = generate_reference(model, tok, ids, int(it.params.get("max_new_tokens", 128)), device, eos, **extra)
+            (ref_dir / "outputs" / f"{it.id}.json").write_text(json.dumps(rec, ensure_ascii=False))
+            print(f"  ref {it.id}: {len(ids)} prompt tokens, {len(rec['ids'])} generated, stopped={rec['stopped']}",
+                  flush=True)
+        write_meta(ref_dir, family=self.name, reference=self.reference_description(), set=sset.name,
+                   hf_id=self.hf_id, topk=TOPK, eos=eos)
+
+
 def _as_list(v) -> list:
     return v if isinstance(v, list) else ([v] if v is not None else [])
 
