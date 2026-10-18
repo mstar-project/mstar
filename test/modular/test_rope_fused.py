@@ -64,11 +64,15 @@ def test_fused_refuses_overrides_its_table_ignores():
     fused = _manager(True, "cuda", rope_theta=10000.0)
     fused._current_pos_ids["main"] = torch.zeros(2, dtype=torch.int32, device="cuda")
     q, k = torch.randn(2, 2, 64, device="cuda"), torch.randn(2, 2, 64, device="cuda")
-    fused.apply_qk(q, k, label="main", rope_theta=10000.0, rope_scale=1.0, low_freq_factor=None)
+    # what the shared attention layer passes: Llama 3.1's factors at scale 1, a no-op
+    fused.apply_qk(q, k, label="main", rope_theta=10000.0, rope_scale=1.0,
+                   low_freq_factor=1.0, high_freq_factor=4.0, old_context_len=8192)
     with pytest.raises(ValueError, match="rope_theta"):
         fused.apply_qk(q, k, label="main", rope_theta=1e6)
     with pytest.raises(ValueError, match="rotary_dim"):
         fused.apply_qk(q, k, label="main", rotary_dim=32)
+    with pytest.raises(ValueError, match="low_freq_factor"):
+        fused.apply_qk(q, k, label="main", rope_scale=8.0, low_freq_factor=1.0)
 
 
 @pytest.mark.parametrize("fused", [True, False])

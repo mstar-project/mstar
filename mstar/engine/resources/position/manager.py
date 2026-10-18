@@ -502,9 +502,12 @@ class RopeManager(PositionManager):
             "rope_scale": (rope_scale, config.rope_scale),
             "rope_theta": (rope_theta, config.rope_theta),
             "rope_dtype": (rope_dtype, torch.float32),
-            **{key: (kwargs.get(key), None) for key in ("low_freq_factor", "high_freq_factor", "old_context_len")},
         }
         differ = sorted(key for key, (value, built) in given.items() if value is not None and value != built)
+        # Llama 3.1's factors change nothing at scale 1, which the shared layers pass by default
+        llama31 = [k for k in ("low_freq_factor", "high_freq_factor", "old_context_len") if kwargs.get(k) is not None]
+        if llama31 and (rope_scale if rope_scale is not None else config.rope_scale) != 1:
+            differ += llama31
         if differ:
             raise ValueError(f"fused RoPE is built from the PositionConfig; this call overrides {differ}")
 
