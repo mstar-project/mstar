@@ -43,11 +43,14 @@ CTR_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "SLURM_JOB_ID", "
 # Prefixes ctr.sh forwards into the container. Anything else has to go through CTR_ENV.
 CTR_FORWARDED = ("VLLM_", "SGLANG_", "AITER_", "HSA_", "NCCL_", "RCCL_", "MIOPEN_", "TORCH_", "TORCHINDUCTOR_",
                  "PYTORCH_", "HF_", "DIFFUSION_", "OMNI_", "HIP_")
+# ctr.sh's own settings: read by ctr.sh on the host, not passed into the container.
+CTR_OWN = ("CTR_PWD", "CTR_BIND")
 VRAM_BUSY_MB = 4096
-# Server log lines that say which attention backend an engine picked (vLLM, SGLang).
+# Server log lines that say which attention backend an engine picked (vLLM, SGLang, sglang-omni).
 BACKEND_PATTERNS = (re.compile(r"Using (\w+) backend \(selected"), re.compile(r"Overriding with (\w+) out of"),
-                    re.compile(r"'attention_backend': '(\w+)'"), re.compile(r"Using (\w+/?\w*) GDN prefill kernel"))
-TTS_VOICE = {"kokoro": "af_heart", "orpheus": "tara", "qwen3_tts": "vivian"}
+                    re.compile(r"'attention_backend': '(\w+)'"), re.compile(r"Using (\w+/?\w*) GDN prefill kernel"),
+                    re.compile(r"\battention_backend=(\w+)"))
+TTS_VOICE = {"kokoro": "af_heart", "orpheus": "tara", "qwen3_tts": "vivian", "qwen3_tts_1p7b": "vivian"}
 
 
 def gpu_list(text: str) -> list[int]:
@@ -193,7 +196,8 @@ class Launch:
                    "127.0.0.1", "--port", str(self.port), *args]
         elif e == "sglang-omni":
             cmd = [str(CTR_SH), self.arm.image, "python3", "-m", "sglang_omni.cli", "serve", "--model-path",
-                   self.row.hf_id, "--port", str(self.port), *args]
+                   self.row.hf_id, "--host", "127.0.0.1", "--port", str(self.port),
+                   "--endpoints.base_path", str(self.ipc_dir), *args]
         else:
             raise ValueError(f"engine {e!r} has no server")
         if self.numa_node is not None:
@@ -218,7 +222,7 @@ class Launch:
                 env["CTR_SCRATCH"] = f"/tmp/{USER}/ctr-{job}-{sif}-{self.lane}"
             extra = [f"CUDA_VISIBLE_DEVICES={self.gpu_text}"]
             for k, v in arm_env.items():
-                if k.startswith(CTR_FORWARDED):
+                if k.startswith(CTR_FORWARDED) or k in CTR_OWN:
                     env[k] = v
                 else:
                     extra.append(f"{k}={v}")
@@ -314,8 +318,9 @@ class Launch:
             versions["gpu_occupancy_before"] = occ
             (self.run_dir / "versions.json").write_text(json.dumps(versions, indent=1, default=str))
             t0 = time.monotonic()
+            timeout = max(self.startup_timeout, self.arm.startup_timeout or 0)
             p = subprocess.run([str(SERVER_SH), "start", self.name, str(self.port), "--timeout",
-                                str(self.startup_timeout), "--log", str(self.run_dir / "server.log"), "--", *cmd],
+                                str(timeout), "--log", str(self.run_dir / "server.log"), "--", *cmd],
                                cwd=self.worktree if self.arm.engine == "mstar" else self.run_dir, env=env,
                                capture_output=True, text=True, check=False)
             ready_s = time.monotonic() - t0
@@ -413,7 +418,7 @@ def first_request(launch: Launch, timeout: float = 3600) -> tuple[float | None, 
         url, body = f"{base}/v1/audio/speech", {
             "model": row.name if launch.arm.engine == "mstar" else row.hf_id, "input": "Hello there, this is a test.",
             "response_format": "pcm", "voice": TTS_VOICE.get(row.runner_model)}
-        if row.runner_model == "qwen3_tts":
+        if row.runner_model.startswith("qwen3_tts"):
             body["language"] = "English"
     elif launch.arm.engine == "vllm" and row.family == "tts":
         # A plain LM behind a TTS client (Orpheus): one short completion.
