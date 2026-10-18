@@ -21,6 +21,17 @@ LLM_SAMPLER = "llm_sampler"
 VISION_ATTN = "vision_attn"
 RESAMPLER_ATTN = "resampler_attn"
 AUDIO_ATTN = "audio_attn"
+TTS_KV = "tts_kv"
+TTS_ATTN = "tts_attn"
+TTS_POS = "tts_pos"
+TTS_SAMPLER = "tts_sampler"
+T2W_STATE = "t2w_state"
+# prepared custom voices (only with the ``custom_voices`` model kwarg)
+T2W_VOICES = "t2w_voices"
+# the vocoder walk that prepares a request's custom voice into it, before its first chunk
+T2W_VOICE = "t2w_voice"
+# token2wav attention caches, one resource per ``token2wav.CACHE_FAMILIES`` entry
+T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}
 
 # ragged span labels
 PATCHES = "patches"
@@ -145,3 +156,21 @@ class MiniCPMOConfig:
             audio=audio,
             tts_config=raw.get("tts_config", {}),
         )
+
+
+@dataclass(frozen=True)
+class TTSSampling:
+    """Upstream's ``TTSSamplingParams`` defaults and ``MiniCPMTTS.generate``
+    limits for the ``chat`` path."""
+    temperature: float = 0.8
+    top_p: float = 0.85
+    top_k: int = 25
+    # HF's TopPLogitsWarper min_tokens_to_keep in upstream's sampler
+    top_p_min_keep: int = 3
+    repetition_penalty: float = 1.05
+    # the frequency penalty counts the last this-many codes
+    penalty_window: int = 16
+    # EOS is masked until this many codes exist
+    min_new_tokens: int = 50
+    # upstream's 2048-step loop returns at most 2047 codes
+    max_new_tokens: int = 2047
