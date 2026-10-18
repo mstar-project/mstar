@@ -46,6 +46,24 @@ def _stub_missing_espeak() -> None:
     misaki.espeak = stub
 
 
+def _stub_unused_qwen_tts_deps() -> None:
+    """qwen_tts imports its 25 Hz tokenizer eagerly, which needs sox and onnxruntime. The 12 Hz
+    checkpoints never call into it, so empty modules are enough when those aren't installed."""
+    import importlib.util
+    import types
+
+    for name in ("sox", "onnxruntime"):
+        if name in sys.modules or importlib.util.find_spec(name) is not None:
+            continue
+        stub = types.ModuleType(name)
+
+        def _missing(attr, name=name):
+            raise RuntimeError(f"{name} is not installed (only qwen_tts' 25 Hz tokenizer uses it)")
+
+        stub.__getattr__ = _missing
+        sys.modules[name] = stub
+
+
 class KokoroTts(TtsFamily):
     """Kokoro-82M. Nothing is sampled, so durations should match the kokoro package."""
 
@@ -196,6 +214,7 @@ class Qwen3Tts(TtsFamily):
         return f"`qwen-tts` 0.1.1 Qwen3TTSModel {self.HF[self.model_key]} (bf16, sdpa), checkpoint sampling defaults"
 
     def reference_synthesize(self, sset: SampleSet, device: str):
+        _stub_unused_qwen_tts_deps()
         import torch
         from qwen_tts import Qwen3TTSModel
 
