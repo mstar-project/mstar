@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 from benchmark.amd import catalog, tables
 
+# This workstream's marker in the job's active/<job>.users directory; anything else there is a co-tenant.
+OWN_MARKER = "ws-j"
 # (summary key, header, scale, decimals) per family; the workload's primary metric also gets [min-max].
 COLUMNS = {
     "text": [("tok_s", "out tok/s", 1, 0), ("ttft_p50_s", "TTFT p50 ms", 1e3, 1), ("ttft_p95_s", "TTFT p95 ms", 1e3, 1),
@@ -52,11 +55,25 @@ def _fmt(v, scale=1.0, dec=1) -> str:
     return f"{v * scale:.{dec}f}"
 
 
+def _cotenants(arm_dir: Path) -> dict:
+    """Other workstreams' markers and the peak load average recorded before each of an arm's runs
+    (per repeat for served arms, once per cell for a reference arm)."""
+    markers, load = set(), None
+    for p in arm_dir.glob("cells/*/c*/**/cotenants.json"):
+        c = _load(p) or {}
+        markers.update(m for m in c.get("markers", []) if m != OWN_MARKER)
+        if c.get("loadavg"):
+            load = max(load or 0.0, c["loadavg"][0])
+    return {"markers": sorted(markers), "peak_load": load}
+
+
 def collect(run_dir: Path) -> dict:
     meta = _load(run_dir / "sweep.json") or {}
     corr = _load(run_dir / "correctness.json") or {}
     data = {"meta": meta, "health": {}, "arms": {}, "cells": [], "correctness": corr}
-    for name in ("check_before", "check_after"):
+    resumes = sorted((p.stem for p in (run_dir / "health").glob("check_resume*.json")
+                      if re.fullmatch(r"check_resume\d+", p.stem)), key=lambda n: int(n[len("check_resume"):]))
+    for name in ("check_before", *resumes, "check_after"):
         h = _load(run_dir / "health" / f"{name}.json")
         if h:
             data["health"][name] = h
@@ -80,7 +97,7 @@ def collect(run_dir: Path) -> dict:
             "command": versions.get("command"), "git": versions.get("git"),
             "recipe": arm.recipe if arm else versions.get("recipe"),
             "differs": arm.differs if arm else versions.get("differs"),
-            "host": (versions.get("host") or {}).get("host"),
+            "host": (versions.get("host") or {}).get("host"), "cotenants": _cotenants(d),
         }
         for cell_json in sorted(d.glob("cells/*/c*/cell.json")):
             cell = _load(cell_json)
@@ -139,6 +156,8 @@ def render(data: dict) -> str:
               "output length per request."]
     if meta.get("note"):
         lines.append(f"- {meta['note']}")
+    for r in meta.get("resumed") or []:
+        lines.append(f"- resumed {r.get('at')} on {r.get('host')} (job {r.get('job')}); finished arms and cells kept")
     for name, h in data["health"].items():
         v = h["verdict"]
         lines.append(f"- node health {name}: {v['status']}" + (f" ({'; '.join(v['reasons'])[:300]})"
@@ -146,7 +165,8 @@ def render(data: dict) -> str:
     lines.append("")
 
     lines += ["## Arms", "", "| row | arm | status | engine / image | versions | env | attention (server log) | recipe "
-              "| cold start: ready s, first request s |", "|---|---|---|---|---|---|---|---|---|"]
+              "| cold start: ready s, first request s | co-tenants during cells |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
     for a in data["arms"].values():
         im = a.get("image") or {}
         src = im.get("source") or {}
@@ -167,8 +187,12 @@ def render(data: dict) -> str:
         cold = f"{st.get('ready_s', '-')}, {st.get('first_request_s', '-')}" if st else "-"
         status = a["status"] + (f": {a['error'][0][:80]}" if a.get("error") else "")
         backends = ", ".join(st.get("backends") or []) or ("AUTO (platform default)" if a["arm"] == "mstar" else "")
+        co = a.get("cotenants") or {}
+        co_txt = ", ".join(co.get("markers") or []) or "none"
+        if co.get("peak_load") is not None:
+            co_txt += f"; peak load {co['peak_load']:.0f}"
         lines.append(f"| {a['row']} | {a['arm']} | {status} | {what} | {ver} | {env} | {backends} | "
-                     f"{a.get('recipe') or ''} | {cold} |")
+                     f"{a.get('recipe') or ''} | {cold} | {co_txt} |")
     lines.append("")
 
     for wl_name in meta.get("workloads", []):
