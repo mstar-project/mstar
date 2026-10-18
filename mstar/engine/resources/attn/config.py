@@ -22,6 +22,8 @@ class AttnBackend(Enum):
     DENSE = "dense"
     FLEX = "flex"
     XPU_PAGED = "xpu_paged"
+    # ROCm: AITER's Triton unified attention over the paged cache
+    AITER = "aiter"
 
 
 @dataclass
@@ -31,7 +33,8 @@ class AttentionConfig:
     flashinfer_backend: str = "auto"
     # FlashInfer only: combined walks whose captured steps plan their
     # one-token rows on the decode wrapper and their prompt rows on a prefill
-    # wrapper sized to them (`FlashInferMixedWrapper`)
+    # wrapper sized to them (`FlashInferMixedWrapper`). AITER runs such a step
+    # in one launch and ignores them.
     splits: tuple[CombinedSplit, ...] = ()
 
 
