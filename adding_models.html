@@ -2271,11 +2271,18 @@ embeddings, so the planned ids index an <code class="docutils literal notranslat
 The <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> sets <code class="docutils literal notranslate"><span class="pre">enable_repetion_penalty=False</span></code>, because ASR transcription
 decodes greedily.</p>
 <p>The page counts show how to size a cache for a specific model instead of using the
-default. A sequence is at most <code class="docutils literal notranslate"><span class="pre">max_target_positions</span></code> (448) tokens, which is 4 pages per
-request. 128 pages therefore support about 32 concurrent requests and use about 2.7 GB.
-The 2048-page default would use about 43 GB. The fixed 30-second context window is
-<code class="docutils literal notranslate"><span class="pre">max_source_positions</span></code> (1500) tokens, which is 12 pages per request, so 192 pages
-support about 16 concurrent requests.</p>
+default. Both caches use 128-token pages and hold <code class="docutils literal notranslate"><span class="pre">WhisperModel.MAX_CONCURRENT_REQUESTS</span></code>
+(64) requests at full length, plus the sink page that every <code class="docutils literal notranslate"><span class="pre">KVManager</span></code> keeps out of
+circulation. A sequence is at most <code class="docutils literal notranslate"><span class="pre">max_target_positions</span></code> (448) tokens, which is 4 pages
+per request, so the self-attention cache has 64 * 4 + 1 = 257 pages, about 5 GiB for
+large-v3 in bf16. The 2048-page default would use about 40 GiB. The fixed 30-second context
+window is <code class="docutils literal notranslate"><span class="pre">max_source_positions</span></code> (1500) tokens, which is 12 pages per request held from
+prefill to the last token, so the context cache has 64 * 12 + 1 = 769 pages, about 15 GiB.
+Sizing the caches is only half of it: <code class="docutils literal notranslate"><span class="pre">configs/whisper_large.yaml</span></code> also sets
+<code class="docutils literal notranslate"><span class="pre">max_concurrent_requests:</span> <span class="pre">64</span></code>, so the conductor queues further requests instead of the
+worker offloading decoding requests to admit them. <code class="docutils literal notranslate"><span class="pre">WhisperModel.validate_config_yaml</span></code>
+refuses at startup a cap that either cache cannot hold after the YAML’s <code class="docutils literal notranslate"><span class="pre">resources:</span></code>
+overrides.</p>
 <p>Whisper’s <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> shows how a write-once context is expressed with spans. The
 context segments have a non-zero span in the prefill step that writes them, and a span of
 0 in every later step. The <code class="docutils literal notranslate"><span class="pre">commit</span></code> in the prefill step converts the reservation into
