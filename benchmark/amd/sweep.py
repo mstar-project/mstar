@@ -200,6 +200,15 @@ def client_env(arm: Arm, row: Row, gpus: list[int]) -> dict:
     return env
 
 
+def run_client(cmd: list[str], env: dict, log_path: Path) -> tuple[int, float]:
+    """Run one benchmark.runner invocation; returns its exit code and CPU seconds (user + system)."""
+    with open(log_path, "w") as log:
+        p = subprocess.Popen(cmd, cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT)
+        _, status, usage = os.wait4(p.pid, 0)
+        p.returncode = os.waitstatus_to_exitcode(status)
+    return p.returncode, usage.ru_utime + usage.ru_stime
+
+
 def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, arm_dir: Path,
              gpus: list[int]) -> dict:
     cell_dir = arm_dir / "cells" / wl.name / f"c{c}"
@@ -223,14 +232,16 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
             (rdir / "command.txt").write_text(shlex.join(cmd) + "\n")
             env = client_env(arm, row, gpus)
             t0 = time.monotonic()
-            with open(rdir / "bench.log", "w") as log:
-                p = subprocess.run(cmd, cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT, check=False)
+            rc, cpu_s = run_client(cmd, env, rdir / "bench.log")
+            wall = time.monotonic() - t0
             res_path = rdir / "results.json"
-            if p.returncode != 0 or not res_path.is_file():
-                reps.append({"error": f"runner rc {p.returncode}", "dir": str(rdir)})
+            if rc != 0 or not res_path.is_file():
+                reps.append({"error": f"runner rc {rc}", "dir": str(rdir)})
                 continue
             st = repeat_stats(json.loads(res_path.read_text()), row.family, input_seconds, wl.output_len)
-            st.update(dir=str(rdir), client_wall_s=round(time.monotonic() - t0, 1))
+            # A client that spends most of the run on its own CPU limits what it can measure.
+            st.update(dir=str(rdir), client_wall_s=round(wall, 1), client_cpu_s=round(cpu_s, 1),
+                      client_cpu_frac=round(cpu_s / wall, 3) if wall > 0 else None)
             if st.get("failed"):
                 st["error"] = f"{st['failed']} failed requests"
             reps.append(st)
@@ -245,6 +256,8 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
         plan.log(f"  {arm.name} {row.name} {wl.name} c={c}: spread {sp:.1%} > {plan.table.spread_limit:.0%}, re-run")
     last = attempts[-1]
     flags = []
+    if any((r.get("client_cpu_frac") or 0) > 0.9 for r in last["repeats"]):
+        flags.append("client-bound")
     if len(attempts) > 1:
         flags.append("rerun")
         if last["spread"] is not None and last["spread"] > plan.table.spread_limit:
