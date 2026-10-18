@@ -52,7 +52,9 @@ def test_qwen3_omni_tokenizer_and_processor_without_remote_code(qwen3_omni, monk
     tok_calls, proc_calls = [], []
     monkeypatch.setattr(qwen3_omni, "_resolve_local_hf_snapshot", lambda *a, **k: str(tmp_path))
     monkeypatch.setattr(qwen_config.Qwen3OmniModelConfig, "from_pretrained",
-                        classmethod(lambda cls, path: types.SimpleNamespace()))
+                        classmethod(lambda cls, path: types.SimpleNamespace(
+                            thinker_text=types.SimpleNamespace(), talker_text=types.SimpleNamespace(),
+                        )))
     _patch_from_pretrained(monkeypatch, AutoTokenizer, tok_calls)
     _patch_from_pretrained(monkeypatch, AutoProcessor, proc_calls)
 
