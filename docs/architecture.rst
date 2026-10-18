@@ -109,7 +109,7 @@ field (norms, RoPE, sampling) pick their kernel by platform on first call.
    :header-rows: 1
    :widths: 24 34 42
 
-   * - Resource
+   * - Component
      - NVIDIA
      - AMD (ROCm)
    * - Paged attention (``AttentionSpec``)
@@ -159,6 +159,21 @@ field (norms, RoPE, sampling) pick their kernel by platform on first call.
      - AITER's custom all-reduce with its fused RMSNorm (one-stage kernel, TP 2/4/8,
        up to 80 tokens and fewer at TP4/TP8, AITER 0.1.19.post1 or newer). Anything
        else gets RCCL plus a separate norm.
+   * - MoE routed experts (``moe_backend`` in the model's ``model_kwargs``)
+     - M*'s Triton fused-MoE kernels, with a launch config tuned for the GPU when
+       ``mstar/utils/fused_moe/configs/`` has one
+     - The same Triton kernels (the align op is hipified when it builds). MI300X configs
+       ship for Qwen3-Omni's experts. AITER's fused MoE is opt-in (``moe_backend:
+       aiter``) because its output isn't bitwise reproducible, see
+       :ref:`models:Qwen3-Omni notes`.
+   * - Media decoding (``Model.load_audio`` / ``load_video``, the API server)
+     - torchcodec
+     - PyAV, and soundfile for plain PCM/FLAC audio. torchcodec has no ROCm build. The
+       choice is made once per process (``mstar/model/components/media_io.py``).
+   * - Encoder attention (Qwen3-Omni's audio and vision towers, BAGEL's ViT)
+     - flash-attn's varlen kernel (``flash_attention_2``)
+     - ``mstar::varlen_attention``, which runs AITER's ``flash_attn_varlen_func``. With
+       neither flash-attn nor AITER, SDPA one segment at a time.
 
 When nothing on ROCm can serve a resource (neither AITER nor AMD's FlashInfer imports),
 the worker fails at startup and the error says what to install.
@@ -184,8 +199,11 @@ step.
 - **Inductor settings.** The engine wraps each ``torch.compile`` it does in
   ``with_inductor_overrides(fn, num_tokens)``, which patches in
   ``current_platform.inductor_overrides(num_tokens)`` (``num_tokens`` is the capture
-  bucket's token count). No platform sets any today. An override should come with a
-  measured win.
+  bucket's token count). On ROCm, captured buckets of up to 32 tokens autotune their
+  GEMMs over ATen (hipBLASLt) only. At decode sizes inductor's autotuner couldn't pick
+  reliably between its Triton templates and hipBLASLt, and a bad pick cost Orpheus 10%
+  of its decode step. Everything else keeps inductor's defaults. A new override should
+  come with a measured win.
 - **Process environment.** ``Platform.process_env_defaults()`` is applied with
   ``os.environ.setdefault`` in the conductor before it spawns workers, so values you
   export win. It's empty on every platform today.
@@ -198,8 +216,9 @@ Capture and compile on ROCm
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 CUDA graphs on ROCm are hipGraphs, captured and replayed through ``torch.cuda.graph`` with
-the same capture configs as on NVIDIA. ``torch.compile`` settings are the same too. The
-differences are in what each kernel can do inside a graph.
+the same capture configs as on NVIDIA. ``torch.compile`` runs in the same mode, with the
+small-bucket GEMM override above. The rest of the differences are in what each kernel can
+do inside a graph.
 
 - AITER's chunked GDN prefill builds its chunk schedule on the host, so it can't be
   captured. Prefill buckets up to ``linear_attn.max_captured_prefill_tokens`` (512 by
