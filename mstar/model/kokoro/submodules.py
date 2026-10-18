@@ -141,7 +141,7 @@ class KokoroSynthSubmodule(NodeSubmodule):
     ) -> NodeInputs | None:
         """Select this iteration's chunk; ``None`` once the request has none left."""
         del graph_walk, kwargs
-        state = self.request_state(fwd_info.request_id)
+        state = self.request_state(fwd_info.rid_handle)
         if "chunk_lengths" not in state:
             # One host read per request: the chunk lengths size every later slice.
             state.add("chunk_lengths", inputs[PHONEME_LENS][0].tolist())

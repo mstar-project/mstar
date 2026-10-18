@@ -221,7 +221,7 @@ def test_speech_adapter_fetches_a_reference_url_only_when_the_server_allows(tmp_
     assert fetched == ["http://example.invalid/ref.wav"] and args.file_paths == {"audio": ["/x.wav"]}
 
 
-def test_speech_adapter_refuses_paths_outside_the_upload_dir(tmp_path):
+def test_speech_adapter_refuses_server_paths(tmp_path):
     from mstar.api_server.openai.adapters import ChatterboxAdapter
 
     uploads = tmp_path / "uploads"
@@ -237,10 +237,10 @@ def test_speech_adapter_refuses_paths_outside_the_upload_dir(tmp_path):
         )
         return ChatterboxAdapter().speech_to_request(req, uploads)
 
-    for ref in ("/etc/hostname", str(elsewhere), str(uploads / ".." / "elsewhere.wav"), str(uploads / "escape.wav")):
-        with pytest.raises(ValueError, match="paths on the server are refused"):
+    for ref in ("/etc/hostname", str(elsewhere), str(uploads / ".." / "elsewhere.wav"), str(uploads / "escape.wav"),
+                str(uploads / "mine.wav")):
+        with pytest.raises(ValueError, match="server file paths are refused"):
             request(ref)
-    assert request(str(uploads / "mine.wav")).file_paths == {"audio": [str(uploads / "mine.wav")]}
 
 
 def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
@@ -257,15 +257,14 @@ def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
     assert args.model_kwargs["exaggeration"] == 0.8 and args.model_kwargs["cfg_weight"] == 0.3
     assert args.model_kwargs["temperature"] == 0.7 and args.model_kwargs["seed"] == 3
 
-    clip = tmp_path / "ref.wav"
-    clip.write_bytes(b"RIFF")
     req = SimpleNamespace(
         input="Hi", voice=None, temperature=None, top_p=None, seed=None,
-        model_extra={"ref_audio": str(clip)},
+        model_extra={"ref_audio": "data:audio/wav;base64,UklGRg=="},
     )
     args = ChatterboxAdapter().speech_to_request(req, tmp_path)
     assert args.input_modalities == ["text", "audio"]
-    assert args.file_paths == {"audio": [str(clip)]}
+    (path,) = args.file_paths["audio"]
+    assert path.startswith(str(tmp_path)) and open(path, "rb").read() == b"RIFF"
     assert "ref_audio" not in args.model_kwargs
 
 

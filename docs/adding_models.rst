@@ -400,6 +400,10 @@ The spec types are:
        defaults to ``head_dim ** -0.5``, ``flashinfer_backend``, and the two
        CUDA-graph ceilings ``max_segments_per_request`` and
        ``max_tokens_per_request``. See `Cacheless attention (encoder towers)`_.
+   * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
+     - The cross-attention counterpart: one span of each request attends another
+       (``RaggedCrossAttentionStep(pairs=...)``). Same config. See `Cross-attention
+       between spans`_.
    * - ``PositionSpec(config=PositionConfig(kv_cache=...))``
      - Position tracking and RoPE. ``scheme`` is ``PosScheme.SEQUENTIAL`` or
        ``PosScheme.BLOCK``. The RoPE parameters are set here: ``rope_theta``,
@@ -606,6 +610,29 @@ previous step's plan. Because the tower is normally captured as a piecewise regi
 declaration lives in the region's ``declare_step``, and names no ``KVStep``. See
 ``mstar/model/bagel/submodules.py``, region ``"vit_block_loop"``, and `Piecewise CUDA
 graphs (capturing an inner loop)`_.
+
+Cross-attention between spans
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A diffusion transformer whose streams attend each other (video queries over text keys, or
+audio over video) has several spans per request and no cache either. Declare each span as
+its own label, and the cross-attentions as a ``RaggedCrossAttentionSpec`` beside the
+``RaggedAttentionSpec`` for the self-attention: a resource is one kind of attention. Its
+step names the ``(q_label, kv_label)`` pairs:
+
+.. code-block:: python
+
+   RaggedCrossAttentionStep(
+       segments=segments,              # one Segment per (request, label) the pairs use
+       pairs=(("video", "text"), ("audio", "video")),
+   )
+
+Each pair is planned as its own layout, pairing each request's ``q_label`` span with that
+request's ``kv_label`` span; cross-attention is never causal. A layer attends through
+``RaggedAttentionCallable(resource, cross_label(q_label, kv_label))``, passing the key
+span's tokens as ``k`` and ``v``. One resource has one head geometry, so a model whose
+attentions differ in head count or head dim declares one spec per (kind, geometry).
+LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
 
 .. note::
 
@@ -1287,6 +1314,8 @@ Step 6 — Write a config YAML
 A config maps nodes to GPU ranks. The value under ``model:`` is your registry key. Each
 ``node_groups`` entry assigns one or more ``node_names`` to ``ranks``. An entry can also
 name specific ``graph_walks``, which is how prefill-decode disaggregation is expressed.
+Every node of a walk must be placed by exactly one entry that applies to that walk; the
+conductor refuses a config that places it twice or not at all.
 
 .. code-block:: yaml
 
@@ -1680,11 +1709,18 @@ The ``SamplerSpec`` sets ``enable_repetion_penalty=False``, because ASR transcri
 decodes greedily.
 
 The page counts show how to size a cache for a specific model instead of using the
-default. A sequence is at most ``max_target_positions`` (448) tokens, which is 4 pages per
-request. 128 pages therefore support about 32 concurrent requests and use about 2.7 GB.
-The 2048-page default would use about 43 GB. The fixed 30-second context window is
-``max_source_positions`` (1500) tokens, which is 12 pages per request, so 192 pages
-support about 16 concurrent requests.
+default. Both caches use 128-token pages and hold ``WhisperModel.MAX_CONCURRENT_REQUESTS``
+(64) requests at full length, plus the sink page that every ``KVManager`` keeps out of
+circulation. A sequence is at most ``max_target_positions`` (448) tokens, which is 4 pages
+per request, so the self-attention cache has 64 * 4 + 1 = 257 pages, about 5 GiB for
+large-v3 in bf16. The 2048-page default would use about 40 GiB. The fixed 30-second context
+window is ``max_source_positions`` (1500) tokens, which is 12 pages per request held from
+prefill to the last token, so the context cache has 64 * 12 + 1 = 769 pages, about 15 GiB.
+Sizing the caches is only half of it: ``configs/whisper_large.yaml`` also sets
+``max_concurrent_requests: 64``, so the conductor queues further requests instead of the
+worker offloading decoding requests to admit them. ``WhisperModel.validate_config_yaml``
+refuses at startup a cap that either cache cannot hold after the YAML's ``resources:``
+overrides.
 
 Whisper's ``declare_step`` shows how a write-once context is expressed with spans. The
 context segments have a non-zero span in the prefill step that writes them, and a span of
@@ -1773,13 +1809,23 @@ Override these methods:
   objects between them, including a ``chunk_policy_factory`` such as
   ``SlidingWindowChunkPolicy(window=..., stride=...)``.
 - ``get_partitions()`` declares each ``PartitionDefinition``: its walks, its initial walk,
-  and the partitions that produce data into it.
+  and the partitions that produce data into it. Every walk belongs to exactly one
+  partition.
 - Route cross-partition tensors with ``StreamingGraphEdge(next_node=..., name=...,
   target_partition=...)`` instead of a plain ``GraphEdge``.
 
 The consuming partition's ``get_partition_forward_pass_args`` reads
 ``incoming_connections``, which provides token counts and a ``producer_done`` flag, and
 uses them to decide when to run.
+
+Keep a walk that consumes a stream to one node or one ``Loop`` on one node group, and move
+later work into a downstream partition fed by its own ``StreamingGraphEdge``. A consumer
+whose every input is streamed runs again as soon as the next chunk arrives, and the
+runtime and conductor count passes per worker graph, so the conductor refuses at startup
+such a consumer sharing its worker graph with another top-level node or ``Loop``, and a
+stream-consuming walk split over worker graphs, unless every consumer also waits on a
+non-streamed input and all the walk's worker graphs run on the same workers. That input
+must arrive once per pass (from the conductor, say); startup cannot check this.
 
 Checklist
 ---------

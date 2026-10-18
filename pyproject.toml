@@ -38,7 +38,11 @@ dependencies = [
     # uvicorn serves WebSockets (/v1/realtime) only with a ws library installed
     "websockets",
     "gdown",
-    "datasets",
+    # Floor only: every release from 2.14.5 caps fsspec, so once a newer fsspec
+    # is picked, an unbounded datasets backtracks to 1.2.1, whose tqdm<4.50 pulls
+    # transformers back to 5.10, which then fails to import GenerationMixin.
+    # 3.0 also needs tqdm>=4.66.3.
+    "datasets>=3",
 ]
 
 [project.urls]

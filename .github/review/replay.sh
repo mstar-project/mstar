@@ -18,6 +18,8 @@
 #   HEAD=<full sha> to review the PR as it was at an earlier commit, e.g. the one a
 #   human reviewer flagged a bug on; existing comments are then left out so the
 #   reviewer can't read the answer
+#   REMOTE=<git remote> that has mstar-project/mstar's PR refs (default: origin; in a fork clone, the
+#   remote pointing at mstar-project/mstar, e.g. REMOTE=upstream)
 #   needs: gh (authenticated), the `claude` CLI, ANTHROPIC_API_KEY
 
 set -euo pipefail
@@ -27,6 +29,7 @@ OUT="${2:-/tmp/mstar-review-$PR.md}"
 REPO="${REPO:-mstar-project/mstar}"
 MODEL="${MODEL:-claude-sonnet-5-5}"
 MODE="${MODE:-light}"
+REMOTE="${REMOTE:-origin}"
 
 ROOT="$(git rev-parse --show-toplevel)"
 WORK="$(mktemp -d)"
@@ -46,7 +49,7 @@ echo "PR #$PR: $title" >&2
 echo "base $base -> head $head" >&2
 
 # refs/pull/N/head works for fork PRs, where the head sha is not on origin.
-git -C "$ROOT" fetch -q origin "refs/pull/$PR/head" "$base" ${HEAD:+"$HEAD"}
+git -C "$ROOT" fetch -q "$REMOTE" "refs/pull/$PR/head" "$base" ${HEAD:+"$HEAD"}
 git -C "$ROOT" worktree add -q --detach "$WORK/base" "$base"
 
 # The PR tree as a plain directory: no git metadata, nothing runnable wired up.
