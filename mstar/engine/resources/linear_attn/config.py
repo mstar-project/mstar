@@ -26,14 +26,21 @@ class LinearAttnVariant(Enum):
 
 
 class LinearAttnBackend(Enum):
+    # the platform's default, decided when the resource is built
+    AUTO = "auto"
+    # FlashInfer's CUTLASS GDN kernels (NVIDIA)
     FLASHINFER = "flashinfer"
+    # AITER's Triton and FlyDSL GDN kernels (AMD)
+    AITER = "aiter"
 
 
 @dataclass
 class LinearAttnConfig:
     recurrent_state: str  # name of the recurrent state pool
     variant: LinearAttnVariant
-    backend: LinearAttnBackend = LinearAttnBackend.FLASHINFER
+    # Which kernel library runs a GDN layer; Mamba-2 runs mstar's own Triton
+    # kernels under every backend.
+    backend: LinearAttnBackend = LinearAttnBackend.AUTO
 
     # Defaults to head_k_dim ** -0.5 off the pool's geometry, as the kernels'
     # own default does.
@@ -53,8 +60,14 @@ class LinearAttnConfig:
     time_step_limit: tuple[float, float] = (0.0, float("inf"))
 
     # GDN only: combined walks whose steps run decode rows on the decode kernel
-    # and prompt rows on the chunked one (`GDNMixedWrapper`)
+    # and prompt rows on the prefill one (`GDNMixedWrapper`)
     splits: tuple[CombinedSplit, ...] = ()
+
+    # The largest prefill capture bucket, in tokens, a backend whose chunked
+    # prefill cannot be captured serves with its sequential kernel; larger
+    # buckets run eagerly. None takes the backend's own bound. A capture-safe
+    # chunked prefill (FlashInfer's) has no bound and ignores this.
+    max_captured_prefill_tokens: int | None = None
 
 
 @dataclass
@@ -76,11 +89,21 @@ class LinearAttnSpec(NodeResourceSpec):
         return LinearAttnManager
 
     def apply_yaml_overrides(
-        self, backend: str | LinearAttnBackend | None = None,
+        self,
+        backend: str | LinearAttnBackend | None = None,
+        max_captured_prefill_tokens: int | None = None,
     ):
-        """Let the deployment pick the backend; slot capacity is tuned on the pool."""
+        """Let the deployment pick the backend and how far prefill capture
+        reaches; slot capacity is tuned on the pool."""
         if backend is not None:
             self.config.backend = LinearAttnBackend(backend)
+        if max_captured_prefill_tokens is not None:
+            if max_captured_prefill_tokens < 0:
+                raise ValueError(
+                    "max_captured_prefill_tokens must be >= 0, got "
+                    f"{max_captured_prefill_tokens}"
+                )
+            self.config.max_captured_prefill_tokens = max_captured_prefill_tokens
 
 
 @dataclass(frozen=True)
