@@ -398,6 +398,9 @@ def first_request(launch: Launch, timeout: float = 3600) -> tuple[float | None, 
             "response_format": "pcm", "voice": TTS_VOICE.get(row.runner_model)}
         if row.runner_model == "qwen3_tts":
             body["language"] = "English"
+    elif launch.arm.engine == "vllm":
+        # A plain LM behind a TTS client (Orpheus): one short completion.
+        url, body = f"{base}/v1/completions", {"model": row.hf_id, "prompt": "Hello", "max_tokens": 8}
     else:
         return None, None
     t0 = time.monotonic()
