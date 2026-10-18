@@ -450,3 +450,29 @@ def test_omni_chat_body_and_stream():
               {"choices": [{"delta": {"audio": {"data": base64.b64encode(pcm).decode()}}}]}]
     stream = b"".join(b"data: " + json.dumps(e).encode() + b"\n\n" for e in events) + b"data: [DONE]\n\n"
     assert correctness.parse_omni_stream(stream) == (["Pas", "ta"], pcm + pcm)
+
+
+def test_long_prompt_cuts_phase_records_by_cell_window():
+    import datetime
+
+    from benchmark.amd import long_prompt
+
+    def line(t, bs, exec_ms, sync_ms, it_ms):
+        ts = datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        return (f"{ts} INFO [worker_0] mstar.worker.worker: Worker worker_0 phase-timing iter={int(t)} bs={bs}: "
+                f"iter_total: p50={it_ms}ms p95={it_ms}ms mean={it_ms}ms n=20 | "
+                f"worker.gpu_thread.exec: p50={exec_ms}ms p95={exec_ms}ms mean={exec_ms}ms n=20 | "
+                f"worker.postprocess.event_sync: p50={sync_ms}ms p95={sync_ms}ms mean={sync_ms}ms n=20")
+
+    t = 1_800_000_000.0
+    log = "\n".join([line(t + k, 1.0, 40.0, 1.0, 50.0) for k in range(4)]
+                    + [line(t + 100 + k, 1.0, 5.0, 1.0, 10.0) for k in range(4)])
+    cut = long_prompt.cut_by_window(log, {"prefill-long": (t - 1, t + 10), "prefill-short": (t + 99, t + 110),
+                                          "burst-long": (t + 500, t + 510)})
+    assert cut["prefill-long"]["phases"]["worker.gpu_thread.exec"]["mean_ms"] == 40.0
+    assert cut["burst-long"]["phases"] == {}
+    out = long_prompt.readout(cut, refusals=3)
+    assert out["prefill-long"]["exec_share"] == 0.8 and out["prefill-long"]["event_sync_share"] == 0.02
+    assert out["exec_ratio_long_over_short"] == 8.0 and out["prefill_buckets_running_eagerly"] == 3
+    names = [wl.name for wl, _ in long_prompt.cells(Path("/tmp/p400.txt"))]
+    assert names == ["prefill-long", "prefill-short", "burst-long", "burst-short"]
