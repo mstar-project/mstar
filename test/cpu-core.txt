@@ -98,3 +98,5 @@ test/modular/test_sampler_trash_row.py
 test/modular/test_launch_script_socket_prefix.py
 test/modular/test_startup_graph_validation.py
 test/modular/test_media_paths.py
+test/modular/test_correctness_metrics.py
+test/modular/test_correctness_runner.py
