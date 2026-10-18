@@ -30,6 +30,8 @@ class AttnBackend(Enum):
     # Multi-head Latent Attention over a ``KVLayout.MLA`` cache (FlashInfer's
     # ``BatchMLAPagedAttentionWrapper``); queries are the absorbed latent form
     FLASHINFER_MLA = "flashinfer_mla"
+    # ROCm: AITER's Triton unified attention over the paged cache
+    AITER = "aiter"
 
 
 @dataclass
@@ -44,7 +46,8 @@ class AttentionConfig:
     # FlashInfer only: combined walks whose captured steps run their leading
     # one-token rows on a decode half and their prompt rows on a prefill
     # wrapper sized to them (`FlashInferMixedWrapper`); the engine orders
-    # every step of those walks decode first
+    # every step of those walks decode first. AITER runs such a step in one
+    # launch and ignores them.
     splits: tuple[CombinedSplit, ...] = ()
     # FlashInfer only: run one-token decode rows on the tensor-core kernel.
     # False picks the CUDA-core decode kernel, which can win for MHA and
