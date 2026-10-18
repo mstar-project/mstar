@@ -13,6 +13,7 @@ _GR00T = Path.home() / (".cache/huggingface/hub/models--nvidia--GR00T-N1.7-3B/sn
 # Tiny two-embodiment checkpoint. "grip" is constant under q01/q99 but not under min/max.
 KWARGS = {
     "use_percentiles": True, "use_mean_std": False, "apply_sincos_state_encoding": False, "exclude_state": False,
+    "shortest_image_edge": 256, "crop_fraction": 0.95,
     "modality_configs": {
         "bot": {"state": {"modality_keys": ["arm", "grip"]}, "action": {"delta_indices": [0, 1, 2]}},
         "other": {"state": {"modality_keys": ["j"]}, "action": {"delta_indices": list(range(5))}},
@@ -91,6 +92,8 @@ def _set(path, value):
     (_set(["exclude_state"], True), "unsupported"),
     (_set(["use_percentiles"], False), "unsupported"),
     (_set(["clip_outliers"], False), "unsupported"),
+    (_set(["use_albumentations"], False), "unsupported"),
+    (_set(["letter_box_transform"], True), "unsupported"),
     (_set(["modality_configs", "bot", "state", "mean_std_embedding_keys"], ["arm"]), "unsupported"),
     (_set(["modality_configs", "other", "action", "delta_indices"], list(range(7))), "exceed"),
 ])
@@ -98,6 +101,46 @@ def test_rejects_a_variant_it_does_not_implement(kwargs, match):
     with pytest.raises(ValueError, match=match):
         _pre(kwargs)
 
+
+
+@pytest.mark.parametrize("hw, out_hw", [
+    ((180, 320), (256, 455)),  # 256x455 -> crop 243x432 at (6, 11) -> 256x455
+    ((320, 180), (455, 256)),  # portrait
+    ((256, 256), (256, 256)),  # first resize skipped (scale 1)
+    ((512, 512), (256, 256)),
+    ((1, 4), (256, 1024)),     # tiny frame: crop keeps >= 1 px
+    ((512, 513), (256, 256)),  # 256.5 rounds half to even; half-up would give 257 wide
+])
+def test_image_output_size(hw, out_hw):
+    pytest.importorskip("cv2")
+    out = _pre().image(np.zeros((*hw, 3), np.uint8))
+    assert out.shape == (*out_hw, 3) and out.dtype == np.uint8
+
+
+def test_image_constant_frame_stays_constant():
+    pytest.importorskip("cv2")
+    out = _pre().image(np.full((180, 320, 3), (10, 128, 250), np.uint8))
+    assert np.all(out == np.array([10, 128, 250], np.uint8))
+
+
+@pytest.mark.parametrize("hw", [(180, 320), (256, 256), (480, 640)])
+def test_image_matches_hand_written_area_chain(hw):
+    cv2 = pytest.importorskip("cv2")
+    img = np.random.default_rng(0).integers(0, 256, (*hw, 3), dtype=np.uint8)
+
+    def chain(interp):
+        def edge(x):
+            h, w = x.shape[:2]
+            s = 256 / min(h, w)
+            return x if s == 1 else cv2.resize(x, (round(w * s), round(h * s)), interpolation=interp)
+        x = edge(img)
+        h, w = x.shape[:2]
+        ch, cw = int(h * 0.95), int(w * 0.95)
+        return edge(x[(h - ch) // 2 : (h - ch) // 2 + ch, (w - cw) // 2 : (w - cw) // 2 + cw])
+
+    out = _pre().image(img)
+    assert np.array_equal(out, chain(cv2.INTER_AREA))
+    assert not np.array_equal(out, chain(cv2.INTER_LINEAR))  # negative control: the filter matters
 
 @pytest.mark.skipif(not _GR00T.exists(), reason="checkpoint not cached")
 def test_the_checkpoint_loads():
