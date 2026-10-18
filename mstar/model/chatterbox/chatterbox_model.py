@@ -561,10 +561,9 @@ class ChatterboxModel(Model):
         """``[T]`` float32 at 24 kHz, mono.
 
         libsndfile (bundled with ``soundfile``) covers WAV/FLAC/OGG/MP3 without
-        any system library; torchcodec needs FFmpeg's shared libraries, which
-        the nodes may not have, so it is only the fallback for other codecs.
+        any system library; other codecs go to FFmpeg (torchcodec, else PyAV).
         """
-        from mstar.api_server.media_io import AudioRefusedError, decode_torchcodec_capped, read_soundfile_capped
+        from mstar.api_server.media_io import AudioRefusedError, decode_media_capped, read_soundfile_capped
 
         try:
             data, sr = read_soundfile_capped(filepath)
@@ -572,16 +571,17 @@ class ChatterboxModel(Model):
         except AudioRefusedError:
             raise
         except Exception as exc:  # noqa: BLE001 - any decode failure falls through
-            logger.debug("soundfile could not decode %s (%s); trying torchcodec", filepath, exc)
-            # an undecodable upload is the client's error (400); a missing
-            # decoder library above still surfaces as a server error
+            logger.debug("soundfile could not decode %s (%s); trying FFmpeg", filepath, exc)
+            # an undecodable upload is the client's error (400)
             try:
-                return decode_torchcodec_capped(filepath, S3GEN_SR).float()
-            except RuntimeError as decode_exc:
+                return decode_media_capped(filepath, S3GEN_SR).float()
+            except AudioRefusedError:
+                raise
+            except (RuntimeError, ValueError) as decode_exc:
                 # the decoder's message names the server's upload path; the client gets none of it
-                logger.info("torchcodec could not decode %s: %s", filepath, decode_exc)
+                logger.info("could not decode %s: %s", filepath, decode_exc)
                 raise ValueError(
-                    "Could not decode the reference audio: not a format soundfile or torchcodec can read"
+                    "Could not decode the reference audio: not a format soundfile, torchcodec or PyAV can read"
                 ) from None
         if wav.numel() == 0:
             # before the resampler, which cannot reshape an empty clip

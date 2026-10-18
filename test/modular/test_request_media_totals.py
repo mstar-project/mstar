@@ -191,6 +191,31 @@ def test_probe_reads_the_header(tmp_path):
     assert probe_audio_seconds(str(junk)) is None
 
 
+def test_probe_reads_an_ffmpeg_header_without_torchcodec(tmp_path, monkeypatch):
+    """Where torchcodec does not load, PyAV reads the header of a format
+    libsndfile cannot (AAC in MP4), so the clip is still charged before the
+    loader decodes it."""
+    av = pytest.importorskip("av")
+    np = pytest.importorskip("numpy")
+    from mstar.model.components import media_io
+    from mstar.model.media_limits import probe_audio_seconds
+
+    monkeypatch.setattr(
+        media_io, "_decoders", lambda: media_io._Decoders(media_io._FallbackAudio(), media_io._PyAVVideo()),
+    )
+    path = str(tmp_path / "clip.m4a")
+    with av.open(path, "w", format="mp4") as out:
+        stream = out.add_stream("aac", rate=RATE, layout="mono")
+        for start in range(0, 2 * RATE, 1024):
+            frame = av.AudioFrame.from_ndarray(np.zeros((1, 1024), dtype=np.float32), format="fltp", layout="mono")
+            frame.sample_rate, frame.pts = RATE, start
+            for packet in stream.encode(frame):
+                out.mux(packet)
+        for packet in stream.encode(None):
+            out.mux(packet)
+    assert probe_audio_seconds(path) == pytest.approx(2.0, abs=0.2)
+
+
 def _flac_without_sample_count(path, seconds, rate=RATE):
     """A real FLAC whose STREAMINFO carries no sample count, as a stream
     written to a pipe is: libsndfile reports 2**63 - 1 frames for it."""
