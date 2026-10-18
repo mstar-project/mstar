@@ -239,6 +239,16 @@ def score_dir(C, worktree: Path, corr_dir: Path, device: str) -> dict:
     out = _key_metrics(score)
     if ref is None:
         out["reference"] = "missing"
+    # The engine's own prompt token count (usage.prompt_tokens) against the reference's: a mismatch means it
+    # tokenized the prompt differently, which explains a divergence on that item.
+    pt_file = corr_dir / "prompt_tokens.json"
+    if ref is not None and pt_file.is_file():
+        differs = []
+        for item_id, n in json.loads(pt_file.read_text()).items():
+            r = ref / "outputs" / f"{item_id}.json"
+            if n is not None and r.is_file() and json.loads(r.read_text()).get("prompt_len") not in (None, n):
+                differs.append(item_id)
+        out["prompt_tokens_differ"] = differs
     (corr_dir / "summary.json").write_text(json.dumps(out, indent=1, default=str))
     return out
 

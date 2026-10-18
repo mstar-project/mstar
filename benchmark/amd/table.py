@@ -222,6 +222,8 @@ def _correctness_details(c: dict) -> str:
             parts.append(f"{label} {c[key]['median']:.3f}")
     if c.get("reference") == "missing":
         parts.append("no reference")
+    if c.get("prompt_tokens_differ"):
+        parts.append(f"prompt tokenized differently from the reference on {', '.join(c['prompt_tokens_differ'])}")
     if c.get("error"):
         parts.append(f"error: {c['error'][:120]}")
     return "; ".join(parts)
@@ -242,6 +244,8 @@ def _correctness_text(c: dict) -> str:
         parts.append(f"({c['wer_minus_reference_pt']:+} pt vs ref)")
     if c.get("reference") == "missing":
         parts.append("no reference")
+    if c.get("prompt_tokens_differ"):
+        parts.append(f"(prompt tokenized differently: {', '.join(c['prompt_tokens_differ'][:3])})")
     return " ".join(str(p) for p in parts)
 
 
