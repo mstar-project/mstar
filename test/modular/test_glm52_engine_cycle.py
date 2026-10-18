@@ -293,7 +293,7 @@ def test_a_stop_token_from_the_prefill_ends_the_reply(ignore_eos, caplog):
     sampler = driver.resources[SAMPLER_RESOURCE]
     greedy = sampler.sample
 
-    def eos_once(rids, logits, **kw):
+    def eos_once(logits):
         sampler.sample = greedy
         return torch.full((logits.shape[0],), eos)
 

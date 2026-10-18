@@ -1,6 +1,6 @@
 
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 
 import torch
@@ -120,6 +120,10 @@ class SamplerResource(Resource):
         self._cached_prefix: dict[str, dict[int, torch.Tensor]] = {}
         # this step's `SamplerStep.kept_rids`, for the eager draw
         self._kept_rids: frozenset[int] | None = None
+        # the rows the forward runs this step (`ctx.padded_request_ids`), which
+        # `sample` and the loop-back reads use so the forward passes no ids. Set
+        # by a non-preplan `plan`, cleared by `commit`.
+        self._step_rids: tuple[int, ...] | None = None
         # row indices for `overwrite_rows`, H2D from a ring of pinned buffers
         self._row_stager: PinnedStager | None = None
 
@@ -362,6 +366,7 @@ class SamplerResource(Resource):
         self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan:
             self._kept_rids = step.kept_rids
+            self._step_rids = tuple(ctx.padded_request_ids)
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
@@ -449,6 +454,7 @@ class SamplerResource(Resource):
             self._history.gather_step(ctx.request_ids, padded_bs)
 
     def commit(self, step: SamplerStep, ctx: StepContext):
+        self._step_rids = None
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return
@@ -492,18 +498,16 @@ class SamplerResource(Resource):
 
     ### Submodule-level functionality
 
-    # Out of the caller's compiled frame: dynamo would guard on the ids it passes on.
+    # Kept out of dynamo, and given no ids: a traced call guards on the ids it
+    # is handed (their count at least), so every new batch recompiles it.
     @torch.compiler.disable
-    def sample(
-        self, request_ids: list[str], logits: torch.Tensor, **kwargs
-    ):
-        """One token per row of ``logits``, in ``request_ids`` order.
-
-        Called from the forward, so the batch it ran on is the batch to hand
-        here: under capture that is the slot's padded rows and its dummy ids,
-        which is what the graph sampler's per-row params were gathered for.
-        The eager sampler keys off request ids and sees the real batch only.
+    def sample(self, logits: torch.Tensor) -> torch.Tensor:
+        """One token per row of ``logits``, for the rows this step was planned
+        with: under capture the slot's padded rows and its dummy ids, which is
+        what the graph sampler's per-row params were gathered for, and on an
+        eager step the real batch.
         """
+        request_ids = self._planned_rows(logits.shape[0])
         if self._cg_sampler is not None:
             # The capability flag, not the liveness one. Under a replay this
             # argument is inert (the kernel variant was baked at capture), and
@@ -517,10 +521,20 @@ class SamplerResource(Resource):
             )
         return self._sample_eager(request_ids, logits)
 
-    # Kept out of dynamo: the eager sampler looks up each row's config by request
-    # id, so a traced call guards on the ids and every new batch recompiles it.
-    @torch.compiler.disable
-    def _sample_eager(self, request_ids: list[str], logits: torch.Tensor) -> torch.Tensor:
+    def _planned_rows(self, num_rows: int | None = None) -> tuple[int, ...]:
+        rows = self._step_rids
+        if rows is None:
+            raise RuntimeError(
+                "sampler read outside a planned step: the forward's step must "
+                "declare a SamplerStep for this resource"
+            )
+        if num_rows is not None and num_rows != len(rows):
+            raise RuntimeError(
+                f"sampler got {num_rows} rows of logits for a step planned with {len(rows)}"
+            )
+        return rows
+
+    def _sample_eager(self, request_ids: Sequence[int], logits: torch.Tensor) -> torch.Tensor:
         tokens = self._sampler.sample(
             request_ids, logits, apply_penalty=self._apply_penalty_this_step,
             apply_filters=self._apply_filters_this_step, kept_rids=self._kept_rids,
@@ -550,20 +564,25 @@ class SamplerResource(Resource):
         loop-back needs. False on an eager-only node or with the knob off."""
         return self._cg_buffers is not None and self._keep_last_token
 
-    def loopback_tokens(self, request_ids: list[str]) -> torch.Tensor:
+    def loopback_tokens(self) -> torch.Tensor:
         """The last sampled token of each row of this step, as its input ids,
         read on the device. Under a slot lease the planned slot's index row
         orders them (padding rows read slot 0); an eager step looks its
-        requests up by slot. Call after ``plan``."""
+        planned rows up by slot. Call after ``plan``."""
         bufs = self._cg_buffers
         if bufs is None:
             raise RuntimeError("device loop-back needs the sampler's slot masters")
         if self._cg_sampler is not None and self._step_slot is not None:
             cg_slot, padded_bs = self._step_slot
             return bufs.gather_last_tokens(cg_slot, padded_bs)
-        return bufs.last_tokens_for(request_ids)
+        return self._eager_loopback_tokens()
 
-    def loopback_state(self, name: str, request_ids: list[str]) -> torch.Tensor:
+    # the slot lookup keys off request ids, so it stays out of a traced forward
+    @torch.compiler.disable
+    def _eager_loopback_tokens(self) -> torch.Tensor:
+        return self._cg_buffers.last_tokens_for(self._planned_rows())
+
+    def loopback_state(self, name: str) -> torch.Tensor:
         """``[rows, width]``: each row's declared loop-back state ``name``
         (``SamplerSpec.loopback_state``), read like ``loopback_tokens``. A row
         whose slot was just (re)registered reads the state's default. Call
@@ -574,13 +593,17 @@ class SamplerResource(Resource):
         if self._cg_sampler is not None and self._step_slot is not None:
             cg_slot, padded_bs = self._step_slot
             return bufs.gather_loopback(name, cg_slot, padded_bs)
-        return bufs.loopback_for(name, request_ids)
+        return self._eager_loopback_state(name)
 
     @torch.compiler.disable
-    def store_loopback_state(self, name: str, request_ids: list[str], values: torch.Tensor) -> None:
-        """This step's new state ``name`` for every row, from the forward.
-        Under a lease it lands in the slot's per-step row (captured with the
-        step) and commit persists it, when the step declares it in
+    def _eager_loopback_state(self, name: str) -> torch.Tensor:
+        return self._cg_buffers.loopback_for(name, self._planned_rows())
+
+    @torch.compiler.disable
+    def store_loopback_state(self, name: str, values: torch.Tensor) -> None:
+        """This step's new state ``name`` for every planned row, from the
+        forward. Under a lease it lands in the slot's per-step row (captured
+        with the step) and commit persists it, when the step declares it in
         ``SamplerStep.loopback_writes``; an eager step writes the slots by
         request."""
         bufs = self._cg_buffers
@@ -590,7 +613,7 @@ class SamplerResource(Resource):
             cg_slot, padded_bs = self._step_slot
             bufs.loopback[name].slot_view(cg_slot, padded_bs).copy_(values)
         else:
-            bufs.write_loopback(name, request_ids, values)
+            bufs.write_loopback(name, self._planned_rows(values.shape[0]), values)
 
     def overwrite_rows(self, rows: list[int], *updates: tuple[torch.Tensor, torch.Tensor]) -> None:
         """``dst[rows] = src`` for each ``(dst, src)``: the rows of a
