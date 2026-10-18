@@ -1,10 +1,10 @@
 """``AUTO`` attention backends, resolved when the resource is built.
 
-NVIDIA, Intel and CPU processes resolve ``AUTO`` to FlashInfer, which is what
-each config defaulted to before ``AUTO`` existed; ROCm resolves it to AITER, or
-to AMD's FlashInfer build where AITER would be unsafe or is missing. A backend
-named explicitly in a spec or a deployment's YAML is built as named. Builds run
-on the CPU device: the managers allocate nothing until their first plan.
+``AUTO`` resolves to FlashInfer on NVIDIA, Intel and CPU processes, the old
+default. On ROCm it resolves to AITER, or to AMD's FlashInfer build where AITER
+is unsafe or missing. A backend named in a spec or YAML is built as named.
+Builds use the CPU device since the managers allocate nothing until their
+first plan.
 """
 
 import logging
@@ -278,12 +278,12 @@ def test_an_explicit_backend_is_kept_on_rocm(rocm):
 def test_cuda_never_asks_for_the_rocm_kernels(monkeypatch):
     monkeypatch.setattr(platforms, "resolve_platform", CudaPlatform)
 
-    def probe():
-        raise AssertionError("a CUDA process probed a ROCm kernel library")
+    def unexpected_import():
+        raise AssertionError("a CUDA process checked for a ROCm kernel library")
 
-    monkeypatch.setattr(rocm_attn, "aiter_paged_unavailable_reason", probe)
-    monkeypatch.setattr(rocm_attn, "flashinfer_rocm_unavailable_reason", probe)
-    monkeypatch.setattr(rocm_ragged, "aiter_varlen_unavailable_reason", probe)
+    monkeypatch.setattr(rocm_attn, "aiter_paged_unavailable_reason", unexpected_import)
+    monkeypatch.setattr(rocm_attn, "flashinfer_rocm_unavailable_reason", unexpected_import)
+    monkeypatch.setattr(rocm_ragged, "aiter_varlen_unavailable_reason", unexpected_import)
     assert resolve_attn_backend(AttnBackend.AUTO, CPU, 64) is AttnBackend.FLASHINFER
     assert resolve_ragged_attn_backend(RaggedAttnBackend.AUTO, CPU) is RaggedAttnBackend.FLASHINFER
     assert flashinfer_kwargs(paged(128), "auto") == {"backend": "auto"}

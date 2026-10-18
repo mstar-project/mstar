@@ -20,9 +20,9 @@ from mstar.platforms import current_platform
 def resolve_ragged_attn_backend(
     backend: RaggedAttnBackend, device: torch.device,
 ) -> RaggedAttnBackend:
-    """The backend a ragged spec's ``backend`` runs on ``device``; see
-    ``attn.base.resolve_attn_backend``, which this mirrors for cacheless
-    attention. On ROCm, ``AUTO`` is AITER's varlen flash attention."""
+    """The concrete ragged backend for ``backend`` on ``device``, as in
+    ``attn.base.resolve_attn_backend``. On ROCm, ``AUTO`` is AITER's varlen
+    flash attention, or AMD's FlashInfer build if AITER is missing."""
     if backend is not RaggedAttnBackend.AUTO:
         return backend
     if current_platform.is_rocm():
