@@ -2,6 +2,7 @@
 
 has ownership of per-(request,label) position counter"""
 
+import math
 from dataclasses import dataclass, field, fields
 
 import torch
@@ -27,6 +28,7 @@ from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
+from mstar.platforms import current_platform
 
 
 @dataclass
@@ -113,6 +115,28 @@ class RopeManager(PositionManager):
                 config.rope_scale,
                 config.rope_theta,
                 cache_dtype,
+            )
+        elif device.type == "cuda" and current_platform.is_rocm():
+            # The ROCm kernel reads cos/sin from an fp32 cache with every
+            # frequency rule (scale, Llama 3.1) already applied; see
+            # `position/rocm.py`.
+            rotary_dim = config.rotary_dim or head_dim
+            if rotary_dim is None:
+                raise ValueError(
+                    "RoPE on AMD GPUs needs PositionConfig.rotary_dim or the "
+                    "dependent KV cache's head_dim"
+                )
+            llama31 = tuple(config.llama31_params.values()) or None
+            self._rope_cache_key = (
+                rotary_dim, config.rope_scale, config.rope_theta, llama31,
+            )
+            self._rope_cache = self._build_rope_cache(
+                rotary_dim,
+                config.rope_scale,
+                config.rope_theta,
+                torch.float32,
+                llama31=llama31,
+                compute_dtype=torch.float64,
             )
         # CUDA rotates from this table instead of in-kernel angles when set.
         self._rope_table: torch.Tensor | None = None
@@ -486,14 +510,21 @@ class RopeManager(PositionManager):
         rope_scale: float,
         rope_theta: float,
         dtype: torch.dtype,
+        llama31: tuple[float, float, float] | None = None,
+        compute_dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
-        positions = (
-            torch.arange(
-                self._max_seq_len,
-                device=self._device,
-                dtype=torch.float32,
-            )
-            / rope_scale
+        """``[max_seq_len, rotary_dim]``: cos of each position's angles, then sin.
+
+        The angles follow FlashInfer's kernels: frequency ``theta ** (-2i / d)``
+        divided by ``rope_scale``, or with ``llama31 = (low_freq_factor,
+        high_freq_factor, old_context_len)`` Llama 3.1's blend of the scaled
+        and unscaled frequency. An fp32 angle is off by up to ``angle * 2**-24``
+        (2e-3 rad at position 32k); ``compute_dtype=torch.float64`` removes that.
+        """
+        positions = torch.arange(
+            self._max_seq_len,
+            device=self._device,
+            dtype=compute_dtype,
         )
         inv_freq = 1.0 / (
             rope_theta
@@ -503,11 +534,20 @@ class RopeManager(PositionManager):
                     rotary_dim,
                     2,
                     device=self._device,
-                    dtype=torch.float32,
+                    dtype=compute_dtype,
                 )
                 / rotary_dim
             )
         )
+        if llama31 is None:
+            positions = positions / rope_scale
+        else:
+            low, high, old_context_len = llama31
+            smooth = (
+                inv_freq * (old_context_len / (2 * math.pi * (high - low)))
+                - low / (high - low)
+            ).clamp(0.0, 1.0)
+            inv_freq = (1 - smooth) * inv_freq / rope_scale + smooth * inv_freq
         freqs = torch.outer(positions, inv_freq)
         return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(dtype)
 
@@ -576,6 +616,23 @@ class RopeManager(PositionManager):
                 device=q.device,
                 dtype=torch.long,
             )
+        elif self._rope_cache is not None:
+            rotary_dim = rotary_dim or q.shape[-1]
+            llama31 = tuple(
+                llama31_params.get(name)
+                for name in ("low_freq_factor", "high_freq_factor", "old_context_len")
+            )
+            cache_key = (
+                rotary_dim, rope_scale, rope_theta,
+                None if None in llama31 else llama31,
+            )
+            if cache_key != self._rope_cache_key:
+                raise RuntimeError(
+                    "RoPE runtime arguments do not match the cache built "
+                    f"from PositionConfig: runtime={cache_key}, "
+                    f"configured={self._rope_cache_key}"
+                )
+            cos_sin_cache = self._rope_cache
         torch.ops.mstar.rope_apply_qk_inplace(
             q,
             k,
