@@ -266,6 +266,9 @@ def test_math_sdpa_reference_spread_is_reported(tmp_path):
     spread = sc.metrics["reference_vs_math_sdpa_reference_psnr_db"]
     assert spread["n"] == 2 and 30 < spread["median"] < 40
     assert math.math_reference_dir(ref) is None and fam.math_reference_dir(ref) == alt
+    cal = sc.metrics["rocm_calibrated"]  # served == reference here, so it clears the floor
+    assert cal["verdict"] == "PASS" and cal["floor_db"] == round(spread["median"] - 3.0, 2)
+    assert sc.verdict == "PASS"  # the raw gate is unchanged
 
 
 def test_robotics_can_skip_episodes_without_a_task():
