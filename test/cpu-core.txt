@@ -146,3 +146,5 @@ test/modular/test_transport_microbench.py
 test/modular/test_dynamo_compose.py
 test/modular/test_rendezvous_store.py
 test/modular/test_mooncake_requirement.py
+test/modular/test_correctness_metrics.py
+test/modular/test_correctness_runner.py
