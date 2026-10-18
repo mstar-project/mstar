@@ -1,23 +1,22 @@
-"""Paged attention on AMD GPUs through AITER's Triton unified attention.
+"""Paged attention on AMD GPUs with AITER's Triton unified attention.
 
-One launch per layer covers a whole mixed batch (prefill, extend, decode) over
-the paged cache, read in place through the layer's NHD views (``[:, 0]`` and
-``[:, 1]``). The kernel takes a dense block table rather than FlashInfer's CSR,
-so ``plan`` turns the KV plan's indptrs into the kernel's int32 inputs and
-stages them from page-locked host memory in one copy per label.
+One launch per layer covers a mixed batch (prefill, extend, decode) and reads
+the paged cache in place. The kernel wants a dense block table instead of
+FlashInfer's CSR, so ``plan`` converts the KV plan's indptrs and stages them
+from pinned host memory in one copy per label.
 
-The kernel is causal only. A lone query attends its whole row under the causal
-mask, so a non-causal step whose rows carry one query each runs here too, and
-so does cross-attention, one kernel row per query token. A non-causal step
-with longer rows (DiT denoise, prefix-LM) goes to FlashInfer's fa2 kernels
-where AMD's FlashInfer build is installed: AITER's paged CK varlen, the other
-non-causal candidate, cannot generate its module in AITER 0.1.25.
+The kernel is causal only. A single query sees its whole row under the causal
+mask, so non-causal steps with one query per row run here too, and so does
+cross-attention (one kernel row per query token). Non-causal steps with longer
+rows (DiT denoise, prefix-LM) go to AMD's FlashInfer build (fa2), because
+AITER 0.1.25's paged CK varlen kernel fails to generate its module
+(ROCm/aiter#4456).
 
-A step of a combined walk (decode rows beside a prompt) is one launch too, so
-this backend needs no ``AttentionConfig.splits``: it ignores them, and a packed
-capture plans for its whole token count whatever its rows hold.
+A combined walk's step (decode rows beside a prompt) is one launch too, so this
+backend ignores ``AttentionConfig.splits``, and a packed capture plans for its
+whole token count whatever its rows hold.
 
-AITER and FlashInfer are imported on first use; nothing here runs on NVIDIA.
+AITER and FlashInfer are imported on first use. Nothing here runs on NVIDIA.
 """
 
 import functools
@@ -38,13 +37,13 @@ from mstar.engine.resources.step import SlotLease, StepContext
 
 logger = logging.getLogger(__name__)
 
-# The kernel reads the block table a whole KV tile at a time, so a row's table
-# has to cover its last tile even where that runs past its last page. Tiles are
-# at most this many tokens in AITER's configs.
+# The kernel reads the block table one KV tile at a time, so a row's table must
+# cover its last tile even past the row's last page. AITER's tiles are at most
+# this many tokens.
 _TILE_TOKENS = 128
-# int32 slots: every section of a staged plan starts 64-byte aligned
+# in int32s, so each section of a staged plan starts 64-byte aligned
 _ALIGN = 16
-# dtypes and head dims the kernel was checked against a torch reference for
+# dtypes and head dims checked against a torch reference
 _DTYPES = (torch.bfloat16, torch.float16)
 _MIN_HEAD_DIM, _MAX_HEAD_DIM = 32, 256
 # GQA groups FlashInfer-ROCm's fa2 decode dispatches without tensor cores
@@ -53,7 +52,7 @@ FLASHINFER_ROCM_DECODE_GROUPS = frozenset({1, 2, 3, 4, 8})
 
 @functools.cache
 def aiter_paged_unavailable_reason() -> str | None:
-    """Why AITER's unified attention cannot be imported here; None if it can."""
+    """Why AITER's unified attention can't be imported, or None."""
     try:
         from aiter.ops.triton.attention.unified_attention import (  # noqa: F401
             unified_attention,
@@ -65,10 +64,10 @@ def aiter_paged_unavailable_reason() -> str | None:
 
 @functools.cache
 def flashinfer_rocm_unavailable_reason() -> str | None:
-    """Why AMD's FlashInfer build cannot be imported here; None if it can.
+    """Why AMD's FlashInfer build can't be imported, or None.
 
-    Upstream FlashInfer imports on ROCm and fails on its first JIT build; the
-    AMD fork is the build that ships ``flashinfer.rocm``.
+    Upstream FlashInfer imports on ROCm and then fails on its first JIT build,
+    so this also imports ``flashinfer.rocm``, which only the AMD fork has.
     """
     try:
         importlib.import_module("flashinfer")
@@ -81,8 +80,8 @@ def flashinfer_rocm_unavailable_reason() -> str | None:
 def nan_safe_page_size(page_size: int) -> bool:
     """Whether the kernel masks K/V loads past a row's length at this page size.
 
-    It drops the mask when its KV tile equals the page, and its tiles are 16 to
-    64 tokens, so at a power-of-two page of up to 64 a non-finite value left in
+    The kernel skips that mask when its KV tile equals the page size. Its tiles
+    are 16 to 64 tokens, so at a power-of-two page size up to 64, a NaN left in
     the tail of a row's last page reaches P·V (0 * NaN = NaN).
     """
     return not (page_size <= 64 and page_size & (page_size - 1) == 0)
@@ -109,9 +108,9 @@ def _aiter_unified_attention(
 ) -> None:
     """Causal paged attention of ``q`` [tokens, Hq, D] into ``out``.
 
-    ``max_seqlen_q`` and ``max_seqlen_k`` pick the kernel variant and its grid
-    on the host and bound nothing: the kernel reads the real lengths off
-    ``cu_seqlens_q`` and ``seqused_k``.
+    ``max_seqlen_q`` and ``max_seqlen_k`` only pick the kernel variant and grid
+    on the host. The kernel reads the real lengths from ``cu_seqlens_q`` and
+    ``seqused_k``.
     """
     _unified_attention()(
         q=q, k=k_cache, v=v_cache, out=out,
@@ -123,9 +122,9 @@ def _aiter_unified_attention(
     )
 
 
-# One op with a fake, so a traced caller sees one node. Defined through
-# `Library` rather than `torch.library.custom_op`: the latter's Python
-# wrapping cost about 45 us per eager call on MI300X hosts, this about 14.
+# One op with a fake, so a traced caller sees one node. Defined with `Library`
+# instead of `torch.library.custom_op`, whose Python wrapper cost about 45 us
+# per eager call on an MI300X host (this one costs about 14).
 _LIB = torch.library.Library("mstar", "FRAGMENT")
 _LIB.define(
     "aiter_unified_attention(Tensor q, Tensor k_cache, Tensor v_cache, Tensor(a!) out, "
@@ -144,7 +143,7 @@ def _aiter_unified_attention_fake(
 
 
 def check_aiter_paged(kv_config: PagedKVConfig, dtype: torch.dtype) -> None:
-    """Refuse, at build, a cache the kernel was not checked for."""
+    """Refuse at build time a cache the kernel wasn't checked for."""
     reason = aiter_paged_unavailable_reason()
     if reason is not None:
         raise RuntimeError(
@@ -174,23 +173,23 @@ def _round(n: int) -> int:
 
 
 class _Staged(NamedTuple):
-    """One plan label's kernel inputs: device views and the host ints that pick
-    the kernel variant. A NamedTuple: built per label per step."""
+    """One plan label's kernel inputs, device views plus the host ints that
+    pick the kernel variant. Built per label per step, hence a NamedTuple."""
     cu_seqlens_q: torch.Tensor  # [rows + 1]
     seqused_k: torch.Tensor  # [rows]
     block_table: torch.Tensor  # [rows, width]
     max_seqlen_q: int
     max_seqlen_k: int
-    num_tokens: int  # query tokens the kernel reads; q may be longer (a bucket)
+    num_tokens: int  # query tokens the kernel reads (q can be longer, padded to a bucket)
 
 
 class _PlanImage:
-    """A page-locked host image of one plan's int32 inputs and its device copy:
-    ``[cu_seqlens_q | seqused_k | block_table]``, sent in one copy.
+    """Pinned host buffer for one plan's int32 inputs, ``[cu_seqlens_q |
+    seqused_k | block_table]``, and the device buffer it is sent to in one copy.
 
-    Rewritten in place by every plan for its key. Entries of a table row past
-    the row's pages and its tail tile keep whatever an earlier plan left there:
-    the kernel never reads them.
+    Every plan for the same key rewrites it in place. Table entries past a row's
+    pages and tail tile keep stale values from earlier plans, which is fine
+    because the kernel never reads them.
     """
 
     def __init__(self, numel: int, device: torch.device):
@@ -203,7 +202,7 @@ class _PlanImage:
         self._pending = False
 
     def wait(self) -> None:
-        """Hold off until the last copy out of the host image has landed."""
+        """Block until the last copy out of the host buffer has finished."""
         if self._pending:
             self._copied.synchronize()
             self._pending = False
@@ -230,8 +229,8 @@ class _Rows(NamedTuple):
 
 
 def row_kv_lens(kv_indptr: np.ndarray, last_page_len: np.ndarray, page_size: int) -> np.ndarray:
-    """Each row's KV length off FlashInfer's CSR, as the kernel takes it: at
-    least 1, since a row with no pages still points at ``SINK_PAGE``."""
+    """Each row's KV length from FlashInfer's CSR. At least 1, since a row with
+    no pages still points at ``SINK_PAGE``."""
     counts = kv_indptr[1:] - kv_indptr[:-1]
     lens = (counts - 1) * page_size + last_page_len
     return np.where(counts > 0, lens, 1).astype(np.int32)
@@ -250,9 +249,9 @@ def kernel_rows(ip: PagedIndptrs, page_size: int) -> _Rows:
 def per_query_rows(rows: _Rows, num_rows: int | None = None) -> _Rows:
     """One kernel row per query token, over its request's pages.
 
-    Under the causal mask a lone query attends every key of its row, so this
-    is non-causal attention, exactly. ``num_rows`` pads with rows that point
-    at ``SINK_PAGE`` (a captured bucket's fixed width).
+    A single query attends every key of its row even under the causal mask, so
+    this computes non-causal attention. ``num_rows`` pads to a captured
+    bucket's row count with rows that point at ``SINK_PAGE``.
     """
     spans = np.diff(rows.qo_indptr)
     tokens = int(rows.qo_indptr[-1])
@@ -285,8 +284,8 @@ def stage_plan(
 ) -> _Staged:
     """Write one plan into ``image``, send it, and return its device views.
 
-    Row ``i`` of the block table holds the row's pages, then ``pad_cols``
-    entries of ``SINK_PAGE`` so its tail tile reads a valid page.
+    Each block table row holds the row's pages, then ``pad_cols`` entries of
+    ``SINK_PAGE`` so its tail tile reads a valid page.
     """
     num_rows = rows.qo_indptr.shape[0] - 1
     kv_indptr = rows.kv_indptr
@@ -321,14 +320,14 @@ def stage_plan(
 
 
 def single_query_rows(qo_indptr: np.ndarray) -> bool:
-    """Whether every row of a plan carries exactly one query token."""
+    """Whether every row of a plan has one query token."""
     return bool(
         qo_indptr[-1] == qo_indptr.shape[0] - 1 and (np.diff(qo_indptr) == 1).all()
     )
 
 
 class _UnifiedPlans:
-    """Staging and the kernel call both AITER managers share."""
+    """Staging and the kernel call, shared by both AITER managers."""
 
     _device: torch.device
     _dtype: torch.dtype
@@ -341,7 +340,7 @@ class _UnifiedPlans:
         image = self._eager_images.get(key)
         if image is None or image.numel < numel:
             if image is not None:
-                # its host memory goes with it; nothing may still copy out
+                # its pinned memory goes with it, so no copy may still read it
                 image.wait()
             image = self._eager_images[key] = _PlanImage(max(numel, 4096), self._device)
         return image
@@ -361,8 +360,8 @@ class _UnifiedPlans:
     def _unified(
         self, q: torch.Tensor, plan: _Staged, kv_cache_layer: torch.Tensor,
     ) -> torch.Tensor:
-        # the kernel reads q for every row it plans; a shorter q is read past
-        # its end, which surfaces later as an asynchronous memory fault
+        # a q shorter than the plan is read past its end, which shows up
+        # later as an async memory fault
         assert q.shape[0] >= plan.num_tokens, (
             f"AITER attention: q has {q.shape[0]} tokens, the plan covers "
             f"{plan.num_tokens}"
@@ -377,20 +376,19 @@ class _UnifiedPlans:
         return out if out.dtype == q.dtype else out.to(q.dtype)
 
 
-# a plan label the non-causal fallback serves this step
+# marks a plan label that the non-causal fallback runs this step
 _DELEGATED = object()
 
 
 class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
-    """Paged attention on AITER's unified attention; see the module docstring.
+    """Paged attention on AITER's unified attention (see the module docstring).
 
-    A captured step stages into static buffers per (bucket, slot, label): the
-    block table is as wide as the pool (a row can hold any number of its
-    pages), and ``max_seqlen_q``/``max_seqlen_k`` are pinned to the bucket's
-    query length and the cache's max context, so the kernel variant a capture
-    records is the one every replay of the bucket needs. An eager step stages
-    into buffers per (label, slot), sized to the step, with the batch's own
-    maxima.
+    A captured step stages into static buffers per (bucket, slot, label). The
+    block table is as wide as the pool, and ``max_seqlen_q``/``max_seqlen_k``
+    are pinned to the bucket's query length and the cache's max context, so
+    every replay needs the kernel variant its capture recorded. An eager step
+    stages into per-(label, slot) buffers sized to the step, with the batch's
+    own maxima.
     """
 
     def __init__(
@@ -411,8 +409,8 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
 
         self._cg_images: dict[CGSlotKey, _PlanImage] = {}
         self._eager_images: dict[EagerSlotKey, _PlanImage] = {}
-        # (kernel rows, max_seqlen_q), or the fallback, per captured key as
-        # first planned: a replay must need the kernel its capture recorded
+        # the (kernel rows, max_seqlen_q) or fallback each captured key was
+        # first planned with, since a replay must run what its capture recorded
         self._cg_kinds: dict[CGSlotKey, object] = {}
 
         self._current_plans: dict[str, object] = {}
@@ -431,7 +429,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
 
     @property
     def force_double_buffer(self):
-        # plan copies host images into device buffers a replay reads
+        # plan copies into device buffers that a replay reads
         return True
 
     def _noncausal_fallback(self) -> AttentionManager:
@@ -468,7 +466,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
             "planning a different step ahead"
         )
         if self._preplanned:
-            # staged a step early against this same step's KV plan; promote
+            # this step was preplanned, so promote it
             if self._preplan_delegated:
                 self._fallback.plan(step, ctx)
             self._current_plans = self._preplan_plans
@@ -524,9 +522,9 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         self, label: str, rows: _Rows, lease: SlotLease, force_prefill: bool,
     ) -> _Staged:
         num_rows = rows.qo_indptr.shape[0] - 1
-        # every replay of a decode bucket has one token per row; a row of a
-        # packed bucket can hold all of its tokens, even in a bucket with as
-        # many rows as tokens, which replays mixed steps (`force_prefill`)
+        # a decode bucket always has one token per row, while one row of a
+        # packed bucket can hold all of its tokens, even when the bucket has
+        # as many rows as tokens and replays mixed steps (`force_prefill`)
         num_tokens = lease.bucket.num_tokens
         max_q = 1 if num_rows == num_tokens and not force_prefill else num_tokens
         if max_q == 1 and not single_query_rows(rows.qo_indptr):
@@ -555,7 +553,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
     def clear_preplan(self):
         if self._preplan_delegated and self._fallback is not None:
             self._fallback.clear_preplan()
-        # rebind rather than clear: a consumed preplan dict is the live one
+        # rebind instead of clear, since a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_delegated = False
         self._preplan_plans = {}
@@ -601,13 +599,12 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
 
 
 class AiterCrossManager(_UnifiedPlans, CrossAttentionManager):
-    """Non-causal attention over a context written once, on AITER's unified
+    """Non-causal attention over a write-once context, on AITER's unified
     attention with one kernel row per query token (see ``per_query_rows``).
 
-    A decode step is one query per request already; a prompt spreads its
-    tokens over as many rows, so the table grows with the query span, which
-    cross-attention keeps short. A captured step's rows are the bucket's token
-    count, the padding rows pointing at ``SINK_PAGE``.
+    The block table grows with the query span, which cross-attention keeps
+    short (one token per request at decode). A captured step has one row per
+    bucket token, the padding rows pointing at ``SINK_PAGE``.
     """
 
     def __init__(
@@ -700,7 +697,7 @@ class AiterCrossManager(_UnifiedPlans, CrossAttentionManager):
         kv_cache_layer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One layer's cross attention. ``kv_cache_layer`` is a layer of the
-        *context* cache; nothing is written to it here."""
+        context cache, and is only read."""
         if label is None:
             label = self._default_label
         return self._attend(q, label, kv_cache_layer)

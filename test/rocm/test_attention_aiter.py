@@ -1,10 +1,10 @@
 """AITER attention managers against a torch reference on an AMD GPU.
 
-Drives the managers the way the engine does — a KV plan in, ``plan``, then
-``run`` per layer, captured and replayed where a bucket would be — over a cache
-laid out as mstar's (``[pages, 2, page, Hkv, D]``, K and V interleaved), with
-page 0 the sink. The reference is fp32 SDPA per request with the causal mask
-aligned bottom-right (new queries are the last positions).
+Drives the managers like the engine does (KV plan, ``plan``, then ``run`` per
+layer, captured and replayed where a bucket would be) over a cache in mstar's
+layout, ``[pages, 2, page, Hkv, D]`` with page 0 as the sink. The reference is
+fp32 SDPA per request with the causal mask aligned bottom-right, since new
+queries are the last positions.
 
     pytest test/rocm/test_attention_aiter.py
 """
@@ -37,8 +37,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 DEV = torch.device("cuda")
-# bf16 output against an fp32 reference: a row attending one key returns that
-# V row, so the error scales with the output (bf16 spacing is 2**-7 relative)
+# bf16 output vs an fp32 reference. A row attending one key returns that V
+# row, so the error scales with the output (bf16 spacing is 2**-7 relative).
 ATOL, RTOL = 1e-2, 1.6e-2
 NUM_PAGES = 160
 
@@ -126,8 +126,8 @@ def layout(cache, mix):
 
 
 def max_err(out, ref):
-    """(largest error over the tolerance's scale, non-finite outputs); below 1
-    means every element is within ``ATOL + RTOL * |ref|``."""
+    """Largest error relative to the tolerance, and the count of non-finite
+    outputs. Below 1 means every element is within ``ATOL + RTOL * |ref|``."""
     o = out[: ref.shape[0]].float()
     scaled = ((o - ref).abs() / (ATOL + RTOL * ref.abs())).nan_to_num(nan=float("inf"))
     return scaled.max().item(), int((~torch.isfinite(o)).sum())
@@ -163,8 +163,8 @@ def test_paged_parity_fp16_and_odd_geometry():
 
 
 def test_dense_aiter_varlen_aligns_causal_bottom_right():
-    """``attn/dense.py`` hands a causal walk to AITER's varlen kernel with the
-    fresh queries after a frozen prefix; FlashAttention semantics put them last."""
+    """``attn/dense.py`` passes causal walks to AITER's varlen kernel with new
+    queries after a frozen prefix, which needs the bottom-right causal mask."""
     from aiter import flash_attn_varlen_func
 
     gen = torch.Generator(device=DEV).manual_seed(0)
@@ -198,9 +198,9 @@ def test_page_128_masks_non_finite_page_tails(mix):
 
 
 def test_page_64_reads_page_tails_unmasked_so_auto_avoids_it():
-    """At page 64 the kernel's tile is the page and its V load is unmasked; this
-    pins the exposure that ``nan_safe_page_size`` routes AUTO around. If it
-    starts passing, AITER masks the tail and the rule can go."""
+    """At page 64 the kernel's tile equals the page and its V load is unmasked.
+    ``nan_safe_page_size`` steers AUTO away from this case. If the assertion
+    below starts failing, AITER masks the tail now and the rule can go."""
     from mstar.engine.resources.attn.aiter import nan_safe_page_size
 
     assert not nan_safe_page_size(64) and nan_safe_page_size(128)
@@ -271,7 +271,7 @@ def test_capture_once_replay_new_lengths(page, kind):
 
 
 def test_preplanned_slot_replays_while_the_live_one_is_untouched():
-    """Pre-plan stages N+1 on the other slot; promotion hands it to ``run``."""
+    """Preplan stages step N+1 on the other slot, and promotion hands it to ``run``."""
     hq, hkv, d, page = 16, 4, 128, 128
     m = paged_manager(page, hq, hkv, d)
     cache = Cache(page, hkv, d)

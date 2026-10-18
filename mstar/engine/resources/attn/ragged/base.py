@@ -22,7 +22,8 @@ def resolve_ragged_attn_backend(
     backend: RaggedAttnBackend, device: torch.device,
 ) -> RaggedAttnBackend:
     """Ragged counterpart of ``attn.base.resolve_attn_backend``. On ROCm,
-    ``AUTO`` is AITER's varlen flash attention."""
+    ``AUTO`` is AITER's varlen flash attention, or AMD's FlashInfer build if
+    AITER is missing."""
     if backend is not RaggedAttnBackend.AUTO:
         return backend
     if current_platform.is_rocm():
