@@ -1,37 +1,33 @@
 """Multi-rank harness for the fused TP all-reduce + residual + RMSNorm on ROCm.
 
-One process per GPU builds the TP group as a worker does (RCCL default group,
-gloo twin, TCPStore default store) and drives ``CommGroup.allreduce_add_rmsnorm``,
-which runs AITER's one-stage kernel where ``AiterARFusion`` accepts the shape
-and RCCL + a separate norm elsewhere. Every result is checked against a
-reference built from all ranks' gathered inputs (fp32 sum rounded once, as the
-kernel does, then add and norm in fp32), and every call is run twice and
-compared bitwise: the cross-rank races this kernel family has had show up as
-a few wrong rows that move between runs, not as a uniform error.
+One process per GPU sets up the TP group like a worker does (RCCL default
+group, gloo twin, TCPStore) and calls ``CommGroup.allreduce_add_rmsnorm``. That
+runs AITER's one-stage kernel where ``AiterARFusion`` accepts the input and
+RCCL + norm otherwise. Results are compared with a reference built from all
+ranks' inputs, and every call runs twice and must match bitwise. Races in this
+kernel family have shown up as a few wrong rows that change between runs.
 
 Modes (``--mode``):
-  parity   eager, over token counts and hidden sizes, gemma on/off; also
-           reports each rank's memory cost of the workspace
-  capture  chains of calls captured in one graph and replayed on fresh inputs,
-           with captured inputs copied into AITER's pool or registered
-  timing   per-call time inside a captured graph: fused (copy-in, registered)
-           against RCCL + a compiled add+norm
-  stages   AITER's kernels called directly, one-stage and two-stage, beyond
-           the shapes mstar fuses (for the investigation of corrupt outputs;
-           runs against whatever ``aiter`` is importable, any version)
-  drift    a residual stream through 2 x ``--layers`` steps, each adding the
-           all-reduce of fresh partial sums as a decoder layer does, through
-           AITER's one-stage kernel and through RCCL + add, against an fp64
-           stream fed the same sums: how far rounding moves the residual, and
-           whether it shrinks it (AITER's kernel build picks its rounding)
+  parity   eager, over token counts, hidden sizes and gemma on/off, plus the
+           workspace's memory per rank
+  capture  chains of calls captured in one graph and replayed on new inputs,
+           with captured inputs either copied into AITER's pool or registered
+  timing   time per call inside a graph, fused (copy-in and registered) vs
+           RCCL + a compiled add+norm
+  stages   AITER's one- and two-stage kernels called directly, outside what
+           mstar fuses. Works with any importable ``aiter`` version.
+  drift    a residual stream over 2 x ``--layers`` steps, each adding the
+           all-reduce of new partial sums like a decoder layer. Runs AITER's
+           kernel and RCCL + add next to an fp64 stream and reports how far
+           each moves and whether it shrinks. The kernel build sets the rounding.
 
-pytest runs parity and capture at 2, 4 and 8 ranks when that many GPUs are
-visible. From the command line, e.g.::
+pytest runs parity and capture at 2, 4 and 8 ranks if that many GPUs are
+visible. From the command line, for example::
 
     python test/rocm/test_ar_fusion_tp.py --world 4 --mode parity --hidden 5120
 
-Every rank needs its own GPU: two processes sharing one GPU get wrong sums and
-illegal accesses from AITER's IPC kernels, so that is no stand-in.
+Each rank needs its own GPU. Two processes on one GPU get wrong sums and
+illegal memory accesses from AITER's IPC kernels.
 """
 
 from __future__ import annotations
@@ -108,7 +104,7 @@ class _Ranks:
 
     def __init__(self, rank: int, world: int, port: int, opts: Options):
         self.rank, self.world, self.opts = rank, world, opts
-        # every rank is local; the hostname can resolve to an unroutable
+        # all ranks are local, and the hostname can resolve to an unroutable
         # link-local address on these nodes
         os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
         torch.cuda.set_device(rank)
@@ -138,7 +134,7 @@ class _Ranks:
         return out
 
     def inputs(self, tokens: int, hidden: int, gemma: bool, seed: int):
-        """``x`` differs per rank; residual and weight are the same everywhere."""
+        """``x`` differs per rank, residual and weight are the same on all."""
         shared = torch.Generator(device=self.device).manual_seed(seed)
         own = torch.Generator(device=self.device).manual_seed(seed * 1009 + self.rank + 1)
         x = torch.randn(tokens, hidden, generator=own, device=self.device).to(self.dtype)
@@ -148,9 +144,9 @@ class _Ranks:
         return x, res, w
 
     def reference(self, x, res, w, eps, weight_bias, path="fused"):
-        """``((norm, residual), (norm_tol, residual_tol))`` from every rank's
-        ``x``. The bounds are the probe's (the kernel's truncation); RCCL's
-        ring rounds each partial sum, so its path gets that much more."""
+        """Returns ``((norm, residual), (norm_tol, residual_tol))`` built from
+        every rank's ``x``. Same tolerances as the startup check, plus some
+        extra for RCCL, whose ring rounds each partial sum."""
         from mstar.distributed.ar_fusion import _reference
 
         xs = self.gather(x)
@@ -172,7 +168,7 @@ class _Ranks:
         row.max_err_norm = max(row.max_err_norm, err_n.max().item())
         row.max_err_res = max(row.max_err_res, err_r.max().item())
         row.bad_rows += int(bad.sum().item())
-        # which way the residual's rounding differences go (truncation: shrinks)
+        # which way the residual's rounding differences go (truncation shrinks)
         differs = r.float() != r_ref.float()
         shrunk = (r.float().abs() < r_ref.float().abs()) & differs
         row.extra["differ"] = row.extra.get("differ", 0) + int(differs.sum().item())
@@ -212,8 +208,8 @@ def _parity(ranks: _Ranks) -> list[Row]:
                 fused_here = fusion is not None and fusion.accepts(x, res, wb)
                 row.path = "fused" if fused_here else "rccl+norm"
                 # RCCL reduces the partial sum in place (the caller is done
-                # with it), so each call gets its own copy; the fused op is
-                # out of place and is handed the original
+                # with it), so each call gets a copy. The fused op is out of
+                # place and gets the original.
                 outs = [group.allreduce_add_rmsnorm(
                             x if fused_here else x.clone(), res, w, eps, wb)
                         for _ in range(ranks.opts.repeats)]
@@ -295,7 +291,7 @@ def _capture_case(ranks, group, pool, hidden, tokens, gemma, registered, plain_s
         last = [t.clone() for t in steps[-1][2:]]
         if rep == 0:
             previous = (fresh.clone(), fresh_res.clone(), last)
-    # replaying the first inputs again must reproduce the first outputs exactly
+    # replaying the first inputs again must give the same outputs bit for bit
     x0.copy_(previous[0])
     res0.copy_(previous[1])
     graph.replay()
@@ -316,7 +312,7 @@ def _add_rmsnorm(x, residual, w, eps: float, weight_bias: float):
 
 def _timing(ranks: _Ranks) -> list[Row]:
     rows = []
-    # one specialization per shape, as the engine compiles per bucket
+    # one compile per input size, like the engine does per bucket
     torch._dynamo.config.recompile_limit = 1024
     torch._dynamo.config.accumulated_recompile_limit = 4096
     compiled = torch.compile(_add_rmsnorm, dynamic=False)
@@ -328,8 +324,8 @@ def _timing(ranks: _Ranks) -> list[Row]:
         for tokens in ranks.opts.tokens:
             x, res, w = ranks.inputs(tokens, hidden, False, seed=hidden + tokens)
 
-            # in place, as CommGroup's fallback reduces the partial sum (the
-            # values grow over replays; the timing does not depend on them)
+            # in place, like CommGroup's fallback. The values grow over
+            # replays, which doesn't change the timing.
             def unfused(y=x.clone(), res=res, w=w):
                 dist.all_reduce(y)
                 return compiled(y, res, w, 1e-6, 0.0)
@@ -485,7 +481,7 @@ def _free_port() -> int:
 
 
 def launch(world: int, opts: Options) -> list[Row]:
-    """Run ``opts.mode`` on ``world`` ranks; returns every rank's rows."""
+    """Runs ``opts.mode`` on ``world`` ranks and returns every rank's rows."""
     with tempfile.TemporaryDirectory(prefix="arfusion-") as out_dir:
         ctx = mp.start_processes(
             _entry, args=(world, _free_port(), opts, out_dir), nprocs=world,
@@ -505,7 +501,7 @@ def launch(world: int, opts: Options) -> list[Row]:
 
 
 def merge(rows: list[Row]) -> list[Row]:
-    """One row per case, worst over ranks (timing: slowest rank)."""
+    """One row per case, worst over ranks (for timing, the slowest rank)."""
     merged: dict[tuple, Row] = {}
     for row in rows:
         key = (row.mode, row.hidden, row.tokens, row.gemma, row.path)
