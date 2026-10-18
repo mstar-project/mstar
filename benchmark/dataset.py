@@ -77,6 +77,41 @@ class TxtFileDataset(BaseDataset):
         return self.items[idx]
 
 
+class SampleSetDataset(BaseDataset):
+    """Items of a fixed sample set: a directory with a ``manifest.json`` whose items carry a
+    prompt and media files relative to the directory (the correctness runner's sets). The
+    request type's input modality picks the file sent with each prompt."""
+
+    def __init__(self, set_dir: str, num_requests: int, req_type: RequestType):
+        root = os.path.abspath(set_dir)
+        with open(os.path.join(root, "manifest.json"), encoding="utf-8") as f:
+            manifest = json.load(f)
+        modality = req_type.get_input_modalities()
+        self.item_ids = []
+        self.items = []
+        for it in manifest["items"]:
+            files = it.get("files") or {}
+            media = {}
+            if modality in ("image", "audio", "video"):
+                if modality not in files:
+                    raise ValueError(f"item {it['id']} of {root} has no {modality} file")
+                media[f"{modality}_path"] = os.path.join(root, files[modality])
+            self.item_ids.append(it["id"])
+            self.items.append(RequestInput(req_type=req_type, prompt=it.get("prompt", ""), **media))
+        self._num_requests = num_requests
+        self.items = self._resize_data(self.items)
+
+    @property
+    def num_requests(self):
+        return self._num_requests
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> RequestInput:
+        return self.items[idx]
+
+
 VBENCH_UND_PROMPT = "Describe this image in detail."
 
 
