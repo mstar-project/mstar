@@ -95,14 +95,46 @@ def test_rope_matches_flashinfer_semantics(case, tokens):
         assert torch.equal(out_q[..., rotary_dim:], ref_q[..., rotary_dim:].bfloat16())
 
 
-def test_runtime_arguments_must_match_the_cache():
+@pytest.mark.parametrize("llama31_defaults", [False, True])
+def test_arguments_off_the_cache_run_the_on_the_fly_kernel(llama31_defaults):
+    """Attention layers pass their own theta, and default Llama 3.1 arguments
+    (1, 1, 8192) that change nothing at scale 1; the result must follow them."""
     config = PositionConfig(kv_cache="kv", rope_theta=10000.0)
-    manager = RopeManager(config, DEV, max_seq_len=128, head_dim=64)
-    manager._current_pos_ids[LABEL] = torch.arange(4, device=DEV)
-    q = torch.randn(4, 2, 64, device=DEV, dtype=torch.bfloat16)
-    k = torch.randn(4, 2, 64, device=DEV, dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="do not match the cache"):
-        manager.apply_qk(q, k, LABEL, rope_theta=1e6)
+    manager = RopeManager(config, DEV, max_seq_len=32768, head_dim=128)
+    pos = torch.randint(0, 32768, (37,), device=DEV)
+    manager._current_pos_ids[LABEL] = pos
+    q = torch.randn(37, 8, 128, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(37, 2, 128, device=DEV, dtype=torch.bfloat16)
+    inv = _inv_freq(128, 1e6, 1.0, None)
+    ref_q, ref_k = _reference(q, pos, 128, False, inv), _reference(k, pos, 128, False, inv)
+    extra = dict(low_freq_factor=1.0, high_freq_factor=1.0, old_context_len=8192) if llama31_defaults else {}
+    out_q, out_k = manager.apply_qk(q, k, LABEL, rope_theta=1e6, **extra)
+    for out, ref in ((out_q, ref_q), (out_k, ref_k)):
+        ref = ref.to(out.dtype)
+        rel = ((out.double() - ref.double()).norm() / ref.double().norm()).item()
+        assert rel < 2e-3, f"relative error {rel:.2e}"
+
+
+def test_default_llama31_arguments_still_hit_the_cache():
+    config = PositionConfig(kv_cache="kv", rope_theta=1e6)
+    manager = RopeManager(config, DEV, max_seq_len=1024, head_dim=128)
+    manager._current_pos_ids[LABEL] = torch.arange(5, device=DEV)
+    q = torch.randn(5, 4, 128, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(5, 2, 128, device=DEV, dtype=torch.bfloat16)
+    seen = []
+    original = torch.ops.mstar.rope_apply_qk_inplace
+
+    def spy(*args, **kwargs):
+        seen.append(args[3])
+        return original(*args, **kwargs)
+
+    torch.ops.mstar.rope_apply_qk_inplace = spy
+    try:
+        manager.apply_qk(q, k, LABEL, rope_theta=1e6, low_freq_factor=1.0,
+                         high_freq_factor=1.0, old_context_len=8192)
+    finally:
+        torch.ops.mstar.rope_apply_qk_inplace = original
+    assert seen[0] is manager._rope_cache
 
 
 def test_rope_under_graph_capture():

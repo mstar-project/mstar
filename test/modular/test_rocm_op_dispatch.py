@@ -233,13 +233,6 @@ def test_amd_rope_reads_the_cos_sin_cache(stack, interleave):
     assert args == (pos, q, k, 8, cache) and kwargs == {"is_neox": not interleave}
 
 
-def test_amd_rope_without_a_cache_is_an_error(stack):
-    stack(RocmPlatform())
-    with pytest.raises(RuntimeError, match="cos/sin cache"):
-        rope_ops._rope(torch.ones(1, 1, 8), torch.ones(1, 1, 8), torch.arange(1), None,
-                       None, False, 1.0, 1e4, None, None, None)
-
-
 def test_amd_without_the_fork_names_it(stack):
     stack(RocmPlatform(), rocm_fork=False)
     with pytest.raises(RuntimeError, match="amd-flashinfer"):
@@ -274,7 +267,7 @@ def test_only_amd_rope_builds_a_cache(monkeypatch, platform):
     assert manager._rope_cache_key == (128, 32.0, 5e5, (1.0, 4.0, 8192))
 
 
-def test_amd_rope_checks_runtime_arguments_against_the_cache(monkeypatch):
+def test_amd_rope_takes_the_cache_only_for_its_own_arguments(monkeypatch):
     rocm = RocmPlatform()
     monkeypatch.setattr(platforms, "resolve_platform", lambda: rocm)
     monkeypatch.setattr(RopeManager, "_build_rope_cache", _CacheRecorder())
@@ -286,15 +279,27 @@ def test_amd_rope_checks_runtime_arguments_against_the_cache(monkeypatch):
     manager = RopeManager(config, torch.device("cuda"), max_seq_len=4, head_dim=64)
     manager._current_pos_ids["text"] = torch.arange(3)
     q, k = torch.ones(3, 2, 64, dtype=torch.bfloat16), torch.ones(3, 1, 64, dtype=torch.bfloat16)
-    manager.apply_qk(q, k, "text", rope_theta=1e4, low_freq_factor=None,
-                     high_freq_factor=None, old_context_len=None)
-    [args] = calls
-    assert args[3] is manager._rope_cache
-    with pytest.raises(RuntimeError, match="do not match the cache"):
-        manager.apply_qk(q, k, "text", rope_theta=1e6)
-    with pytest.raises(RuntimeError, match="do not match the cache"):
-        manager.apply_qk(q, k, "text", low_freq_factor=1.0, high_freq_factor=4.0,
-                         old_context_len=8192)
+    # attention layers pass Llama 3.1 defaults, a no-op at scale 1
+    manager.apply_qk(q, k, "text", rope_theta=1e4, low_freq_factor=1.0,
+                     high_freq_factor=1.0, old_context_len=8192)
+    manager.apply_qk(q, k, "text", rope_theta=1e6)
+    manager.apply_qk(q, k, "text", rope_scale=8.0, low_freq_factor=1.0,
+                     high_freq_factor=4.0, old_context_len=8192)
+    assert [args[3] is manager._rope_cache for args in calls] == [True, False, False]
+    assert [args[3] for args in calls[1:]] == [None, None]
+
+
+def test_amd_rope_off_the_cache_runs_flashinfers_on_the_fly_kernels(stack):
+    rec = stack(RocmPlatform())
+    q, k, pos = torch.ones(2, 4, 8), torch.ones(2, 2, 8), torch.arange(2)
+    rope_ops._rope(q, k, pos, None, 8, False, 1.0, 1e6, 1.0, 1.0, 8192)
+    rope_ops._rope(q, k, pos, None, 8, False, 32.0, 5e5, 1.0, 4.0, 8192)
+    names = [name for name, _, _ in rec.calls]
+    assert names == [
+        "rope.apply_rope_pos_ids_inplace",  # the Llama 3.1 blend is a no-op at scale 1
+        "rope.apply_llama31_rope_pos_ids_inplace",
+    ]
+    assert rec.calls[0][2]["rope_theta"] == 1e6
 
 
 def test_llama31_cache_matches_flashinfers_frequencies():
