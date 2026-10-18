@@ -39,10 +39,11 @@ from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
-# The largest prefill capture bucket served by the sequential kernel. It costs
-# about 1.8 us per token of the bucket's longest row per layer on MI300X, where
-# an eager chunked call costs about 270 us of host time per layer; see
-# `AiterGDNKernels.uncapturable_prefill`.
+# The largest prefill capture bucket served by the sequential kernel, whose
+# cost grows with the bucket's longest row (~1.8 us per token per layer on
+# MI300X) while an eager step is host-bound and nearly flat in length. On
+# Qwen3.5 a captured 1024-token bucket beat eager prefill on 0.8B but not on
+# 9B; deployments of small models can raise it.
 DEFAULT_MAX_CAPTURED_PREFILL_TOKENS = 512
 
 # Chunk length of AITER's chunked kernels; their HIP and FlyDSL stages are
