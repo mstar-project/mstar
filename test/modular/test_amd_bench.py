@@ -97,6 +97,15 @@ def test_summary_spread():
     assert sweep.spread(s, "missing") is None
 
 
+def test_resume_refuses_another_chip(tmp_path):
+    mi325 = {"node_type": "mi325x", "gpu_names": {"0": "AMD Instinct MI325X"}}
+    mi300 = {"node_type": "mi300x", "gpu_names": {"0": "AMD Instinct MI300X"}}
+    sweep.refuse_mixed_chips(mi325, {**mi325, "host": "other"}, tmp_path)
+    for now in (mi300, {**mi325, "gpu_names": {"0": "AMD Instinct MI300X"}}):
+        with pytest.raises(SystemExit):
+            sweep.refuse_mixed_chips(mi325, now, tmp_path)
+
+
 def test_run_rows_shares_the_gpu_pool(monkeypatch):
     seen, lock = [], __import__("threading").Lock()
 
@@ -203,7 +212,11 @@ def test_sglang_omni_launch(tmp_path):
     # ctr.sh reads CTR_PWD on the host; the SGLANG_ limits reach the container by prefix.
     assert env["CTR_PWD"] == "/workspace/sglang-omni" and "CTR_PWD" not in env["CTR_ENV"]
     assert env["SGLANG_OMNI_STARTUP_TIMEOUT"] == "2700" and env["SGLANG_OMNI_WARMUP_TIMEOUT"] == "1800"
-    assert arm.startup_timeout >= 2700 + 1800
+    assert s.startup_wait >= 2700 + 1800
+    omni = Launch(catalog.ARMS["mstar"], catalog.ROWS["qwen3omni_colocated"], [3], 8404, tmp_path / "om", worktree=wt)
+    assert omni.startup_wait == 5400
+    assert Launch(catalog.ARMS["mstar"], catalog.ROWS["kokoro"], [3], 8405, tmp_path / "ko",
+                  worktree=wt).startup_wait == 3600
     t = tables.TABLES["tts"]
     assert [a.name for a in catalog.arms_for(row, list(t.arms))] == ["mstar", "vllm-omni", "vllm-omni-tuned",
                                                                      "sglang-omni"]
@@ -233,9 +246,14 @@ def test_table_render(tmp_path):
     run = tmp_path / "run"
     meta = {"table": "qwen35-dense", "run_id": "x", "dry": False, "rows": ["qwen3_5_0.8b"],
             "arms": ["mstar", "vllm-aiter"], "workloads": ["text-chat-256"], "repeats": 3, "spread_limit": 0.05,
-            "node": {"gpu_names": {"0": "AMD Instinct MI325X"}, "host": "h", "partition": "mi3258x"}, "gpus": [0]}
+            "node": {"gpu_names": {"0": "AMD Instinct MI325X"}, "host": "h", "partition": "mi3258x"}, "gpus": [0],
+            "resumed": [{"at": "2026-10-19T09:00:00-0500", "host": "h", "job": "1"}]}
     run.mkdir()
     (run / "sweep.json").write_text(json.dumps(meta))
+    (run / "health").mkdir()
+    for name in ("check_before", "check_resume1"):
+        (run / "health" / f"{name}.json").write_text(json.dumps({"verdict": {"status": "PASS", "reasons": []}}))
+    (run / "health" / "check_resume1.raw.json").write_text("{}")
     for arm, tok, out_tok in (("mstar", 1000.0, 256), ("vllm-aiter", 900.0, 300)):
         d = run / "qwen3_5_0.8b" / arm
         (d / "cells/text-chat-256/c8").mkdir(parents=True)
@@ -246,10 +264,17 @@ def test_table_render(tmp_path):
         (d / "cells/text-chat-256/c8/cell.json").write_text(json.dumps(
             {"arm": arm, "row": "qwen3_5_0.8b", "workload": "text-chat-256", "concurrency": 8, "summary": summ,
              "flags": ["rerun"] if arm == "mstar" else [], "errors": [], "status": "done"}))
+        # Served arms record co-tenants per repeat, reference arms once per cell.
+        rec = d / "cells/text-chat-256/c8" / ("a1r1" if arm == "mstar" else "")
+        rec.mkdir(exist_ok=True)
+        (rec / "cotenants.json").write_text(json.dumps(
+            {"markers": ["ws-j", "ws-j-moe-tune"] if arm == "mstar" else ["ws-j"], "loadavg": [12.4, 9.0, 7.0]}))
     (run / "correctness.json").write_text(json.dumps({"qwen3_5_0.8b/mstar": {"verdict": "PASS",
                                                                              "exact_vs_reference": "30/32"}}))
     md = table.write(run).read_text()
     assert "AMD Instinct MI325X" in md and "1000 [995-1005]" in md and "rerun" in md
+    assert "resumed 2026-10-19T09:00:00-0500 on h (job 1)" in md and "node health check_resume1: PASS" in md
+    assert "| ws-j-moe-tune; peak load 12 |" in md and "| none; peak load 12 |" in md
     assert "PASS exact 30/32" in md and "output tokens/request 300 vs mstar 256" in md
     assert json.loads((run / "table.json").read_text())["meta"]["table"] == "qwen35-dense"
 
