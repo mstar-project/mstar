@@ -116,12 +116,22 @@ class RocmPlatform(Platform):
         # "gfx942:sramecc+:xnack-": what follows the colon are target features
         return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
 
+    # captured buckets up to this many tokens autotune GEMMs over ATen (hipBLASLt) only
+    ATEN_GEMM_MAX_TOKENS = 32
+
     def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
-        # none until one is measured to help on AMD GPUs
+        # At decode sizes inductor's autotuner can't reliably pick between its
+        # Triton GEMM templates and hipBLASLt on MI300X. Its timings (12-17 us)
+        # sit above the real kernel time in a graph (6-13 us) and move up to 30%
+        # between compiles, so different compiles pick different kernels. On
+        # orpheus a bad pick cost 10% of the decode step at concurrency 4.
+        # hipBLASLt alone was the same or better at 1, 4, 16 and 64.
+        if num_tokens is not None and num_tokens <= self.ATEN_GEMM_MAX_TOKENS:
+            return {"max_autotune_gemm_backends": "ATEN"}
         return {}
 
     def process_env_defaults(self) -> dict[str, str]:
-        # none until one is measured to help on AMD GPUs
+        # nothing yet, no candidate measured a win on MI300X
         return {}
 
     def visible_devices_env(
