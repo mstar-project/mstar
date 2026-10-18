@@ -64,7 +64,7 @@ def _step(res: SamplerResource, step: SamplerStep, graph: bool) -> torch.Tensor:
     )
     res.plan(step, ctx)
     logits = torch.randn(2, V).to(res._device)
-    tokens = res.sample([KEPT, DROPPED], logits)
+    tokens = res.sample(logits)
     res.commit(step, ctx)
     torch.accelerator.synchronize(res._device)
     return tokens
