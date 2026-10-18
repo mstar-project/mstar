@@ -279,6 +279,36 @@ def test_table_render(tmp_path):
     assert json.loads((run / "table.json").read_text())["meta"]["table"] == "qwen35-dense"
 
 
+def test_moe_configs_reach_the_table(tmp_path):
+    from benchmark.amd.launch import moe_configs_in_log
+
+    thinker = "E=128,N=768,K=2048,topk=8,device_name=AMD_Instinct_MI325X.json"
+    log = tmp_path / "server.log"
+    log.write_text(f"INFO [worker_0] mstar.utils.fused_moe.config: fused MoE: tuned Triton configs from {thinker}\n"
+                   "INFO Using configuration from /v/configs/E=128,N=768,device_name=AMD_Instinct_MI325X.json for "
+                   "MoE layer.\nWARNING Using default MoE config. Performance might be sub-optimal! Config file not "
+                   "found at /u/E=128,N=384,device_name=AMD_Instinct_MI325X.json, "
+                   "/v/configs/E=128,N=384,device_name=AMD_Instinct_MI325X.json\n")
+    got = moe_configs_in_log(log)
+    assert got == {"tuned": [thinker, "E=128,N=768,device_name=AMD_Instinct_MI325X.json"],
+                   "default": ["E=128,N=384,device_name=AMD_Instinct_MI325X.json"]}
+    # mstar logs only the tables it finds: a missing Talker table is flagged, not passed over.
+    run = tmp_path / "run"
+    meta = {"table": "omni", "run_id": "x", "rows": ["qwen3omni_colocated"], "arms": ["mstar"],
+            "workloads": ["omni-text-speech"], "node": {"gpu_names": {"0": "AMD Instinct MI325X"}}}
+    d = run / "qwen3omni_colocated" / "mstar"
+    (d / "cells/omni-text-speech/c1").mkdir(parents=True)
+    (run / "sweep.json").write_text(json.dumps(meta))
+    (d / "arm.json").write_text(json.dumps({"arm": "mstar", "row": "qwen3omni_colocated", "status": "done",
+                                            "startup": {"moe_configs": {"tuned": [thinker], "default": []}}}))
+    (d / "cells/omni-text-speech/c1/cell.json").write_text(json.dumps(
+        {"arm": "mstar", "row": "qwen3omni_colocated", "workload": "omni-text-speech", "concurrency": 1,
+         "summary": {}, "flags": [], "errors": [], "status": "done"}))
+    md = table.write(run).read_text()
+    assert "MoE E=128,N=768,K=2048,topk=8: AMD_Instinct_MI325X table" in md
+    assert "MoE E=128,N=384,K=1024,topk=6: NO tuned table, default launch config" in md and "moe-untuned" in md
+
+
 def test_sample_set_dataset(tmp_path):
     from benchmark.base import RequestType
     from benchmark.dataset import SampleSetDataset

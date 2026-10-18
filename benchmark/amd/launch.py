@@ -50,6 +50,11 @@ VRAM_BUSY_MB = 4096
 BACKEND_PATTERNS = (re.compile(r"Using (\w+) backend \(selected"), re.compile(r"Overriding with (\w+) out of"),
                     re.compile(r"'attention_backend': '(\w+)'"), re.compile(r"Using (\w+/?\w*) GDN prefill kernel"),
                     re.compile(r"\battention_backend=(\w+)"))
+# Server log lines naming the fused-MoE launch-config files an engine loaded (mstar's tuned tables, vLLM's
+# configs), and vLLM's note that it found none and runs its default config.
+MOE_TUNED_PATTERNS = (re.compile(r"fused MoE: tuned Triton configs from (\S+\.json)"),
+                      re.compile(r"Using configuration from (\S+\.json) for MoE layer"))
+MOE_DEFAULT_PATTERN = re.compile(r"Using default MoE config\..*?Config file not found at (.+)")
 TTS_VOICE = {"kokoro": "af_heart", "orpheus": "tara", "qwen3_tts": "vivian", "qwen3_tts_1p7b": "vivian"}
 
 
@@ -337,6 +342,7 @@ class Launch:
             first_s, first_err = first_request(self)
             startup = {"ready_s": round(ready_s, 1), "first_request_s": first_s, "first_request_error": first_err,
                        "backends": backends_in_log(self.run_dir / "server.log"),
+                       "moe_configs": moe_configs_in_log(self.run_dir / "server.log"),
                        "server_pid": pid, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                        "ipc_dir": str(self.ipc_dir), "upload_dir": str(self.upload_dir)}
             (self.run_dir / "startup.json").write_text(json.dumps(startup, indent=1))
@@ -394,6 +400,17 @@ def backends_in_log(path: Path) -> list[str]:
             if m.group(1) not in found:
                 found.append(m.group(1))
     return found[:6]
+
+
+def moe_configs_in_log(path: Path) -> dict:
+    """Fused-MoE config files the server loaded ("tuned") and the ones it looked for in vain ("default")."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return {"tuned": [], "default": []}
+    tuned = {Path(m).name for pat in MOE_TUNED_PATTERNS for m in pat.findall(text)}
+    default = {Path(p.strip()).name for m in MOE_DEFAULT_PATTERN.findall(text) for p in m.split(", ")}
+    return {"tuned": sorted(tuned), "default": sorted(default)}
 
 
 def session_processes(sid: int) -> list[int]:
