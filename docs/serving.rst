@@ -83,6 +83,12 @@ mstar serve
      - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
        Needs ``.[metrics]``.
 
+The server creates the socket and upload directories with mode 0700 and
+refuses to start if one already exists as a symlink, belongs to another user,
+or is writable by group or others; remove it or pass another path. Uploaded
+files are written 0600. The same holds for ``python -m
+mstar.api_server.entrypoint`` and the Rust frontend.
+
 Each model maps to a default config (override with ``--config``):
 
 .. list-table::

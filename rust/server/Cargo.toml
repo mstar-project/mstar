@@ -31,6 +31,8 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 subtle = "2"
 # `\p{M}` and the printable classes for the Python-rule text code; already in the tree through tokenizers.
 regex = "1"
+# geteuid for the runtime-dir owner check (std has none).
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

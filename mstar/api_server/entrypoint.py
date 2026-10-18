@@ -75,6 +75,7 @@ from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.logging_config import log_off_thread, quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
+from mstar.utils.runtime_dir import ensure_private_dir, write_private_file
 from mstar.utils.socket_prefix import per_port_socket_prefix
 from mstar.utils.threads import Thread, pin_thread
 
@@ -440,8 +441,7 @@ class APIServer:
         enable_nvtx: bool = False,
         model_config: dict | None = None,
     ):
-        self.upload_dir = Path(upload_dir)
-        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        self.upload_dir = ensure_private_dir(upload_dir)
         self.timeout_seconds = timeout_seconds
 
         # The result-delivery path runs on this process, not the worker's, so its
@@ -2097,7 +2097,7 @@ def _decode_ws_files(
                 raise ValueError(f"file {name!r} carries no data")
             base = os.path.basename(name) or "upload"
             save_path = upload_dir / f"{uuid.uuid4()}_{base}"
-            save_path.write_bytes(bytes(data))
+            write_private_file(save_path, bytes(data))
             saved.append(save_path)
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
@@ -2632,7 +2632,7 @@ async def generate(
             save_name = f"{uuid.uuid4()}_{base}"
             save_path = api_server.upload_dir / save_name
             content = await f.read()
-            await run_in_threadpool(save_path.write_bytes, content)
+            await run_in_threadpool(write_private_file, save_path, content)
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
             paths.append(str(save_path))

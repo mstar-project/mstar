@@ -95,9 +95,9 @@ fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
 }
 
 fn save_bytes(raw: &[u8], mime: &str, upload_dir: &Path) -> std::io::Result<(String, String)> {
-    std::fs::create_dir_all(upload_dir)?;
+    crate::runtime_dir::ensure_private_dir(upload_dir)?;
     let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext_for(mime)));
-    std::fs::write(&path, raw)?;
+    crate::runtime_dir::write_private_file(&path, raw)?;
     Ok((modality_from_mime(mime).to_string(), path.to_string_lossy().into_owned()))
 }
 
@@ -130,7 +130,7 @@ pub fn save_base64(
     modality_hint: &str,
     upload_dir: &Path,
 ) -> Result<(String, String), String> {
-    std::fs::create_dir_all(upload_dir).map_err(|e| e.to_string())?;
+    crate::runtime_dir::ensure_private_dir(upload_dir).map_err(|e| e.to_string())?;
     let raw = decode_b64_lenient(b64)
         .map_err(|e| format!("input_audio base64 decode failed: {e}"))?;
     // Sanitize the client-controlled `format`: keep only alphanumerics, so
@@ -147,7 +147,7 @@ pub fn save_base64(
         format!(".{clean}")
     };
     let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext));
-    std::fs::write(&path, &raw).map_err(|e| e.to_string())?;
+    crate::runtime_dir::write_private_file(&path, &raw).map_err(|e| e.to_string())?;
     Ok((modality_hint.to_string(), path.to_string_lossy().into_owned()))
 }
 

@@ -31,6 +31,7 @@ mod bridge;
 mod media;
 mod protocol;
 mod refusals;
+mod runtime_dir;
 mod serving;
 mod speech_chunking;
 mod tokenizer;
@@ -38,7 +39,7 @@ mod utf8;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -99,11 +100,11 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
     let socket_dir = std::env::args().nth(3);
-    let upload_dir = PathBuf::from(
-        std::env::args()
+    let upload_dir = private_dir_or_exit(Path::new(
+        &std::env::args()
             .nth(4)
             .unwrap_or_else(|| "/tmp/mstar_uploads".to_string()),
-    );
+    ));
     let sample_rate: u32 = std::env::var("MSTAR_SAMPLE_RATE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -121,6 +122,7 @@ async fn main() {
         parse_max_images(std::env::var("MSTAR_MAX_IMAGES_PER_REQUEST").ok().as_deref());
 
     let bridge = socket_dir.map(|dir| {
+        private_dir_or_exit(Path::new(&dir));
         eprintln!("bridging to conductor at {dir}");
         Arc::new(Bridge::new(&dir).expect("bind bridge"))
     });
@@ -231,6 +233,13 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+}
+
+fn private_dir_or_exit(path: &Path) -> PathBuf {
+    runtime_dir::ensure_private_dir(path).unwrap_or_else(|e| {
+        eprintln!("mstar-server: {e}");
+        std::process::exit(1);
+    })
 }
 
 /// SIGTERM/SIGINT: stop accepting, drain in-flight requests, exit — with a
@@ -1002,7 +1011,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         _ => return error(400, "images/edits requires an 'image' file upload", "invalid_request_error"),
     };
     // Persist the uploaded image so the data-worker's loader can read it by path.
-    if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
+    if let Err(e) = runtime_dir::ensure_private_dir(&st.upload_dir) {
         return error(500, &e.to_string(), "server_error");
     }
     let ext = image_filename
@@ -1010,7 +1019,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         .and_then(|f| PathBuf::from(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
         .unwrap_or_else(|| ".png".to_string());
     let image_path = st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext));
-    if let Err(e) = std::fs::write(&image_path, &image_bytes) {
+    if let Err(e) = runtime_dir::write_private_file(&image_path, &image_bytes) {
         return error(500, &e.to_string(), "server_error");
     }
 
@@ -1156,7 +1165,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                     return detail_error(status, &msg);
                 }
             };
-            if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
+            if let Err(e) = runtime_dir::ensure_private_dir(&st.upload_dir) {
                 return detail_error(500, &e.to_string());
             }
             // Sanitize: take ONLY the final path component of the
@@ -1170,7 +1179,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 .filter(|s| !s.is_empty())
                 .unwrap_or("upload");
             let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe));
-            if let Err(e) = std::fs::write(&save_path, &bytes) {
+            if let Err(e) = runtime_dir::write_private_file(&save_path, &bytes) {
                 return detail_error(500, &e.to_string());
             }
             uploads

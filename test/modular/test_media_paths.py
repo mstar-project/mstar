@@ -18,7 +18,7 @@ WAV_BYTES = b"RIFF....WAVEfmt " + bytes(64)
 @pytest.fixture
 def dirs(tmp_path):
     uploads = tmp_path / "uploads"
-    uploads.mkdir()
+    uploads.mkdir(mode=0o700)
     secret = tmp_path / "secret.png"
     secret.write_bytes(b"\x89PNG\r\n\x1a\n")
     (uploads / "escape.png").symlink_to(secret)
