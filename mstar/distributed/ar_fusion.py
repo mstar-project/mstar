@@ -204,6 +204,26 @@ def _round_up(n: int, multiple: int) -> int:
     return -(-n // multiple) * multiple
 
 
+def _reference(xs: torch.Tensor, res: torch.Tensor, w: torch.Tensor,
+               weight_bias: float, eps: float):
+    """``(norm, residual)`` for the stacked per-rank inputs ``xs`` as the kernel
+    computes them (the fp32 sum rounded once, then the add rounded), and the
+    error each may carry: on gfx942 AITER rounds to bf16 by truncation, so a
+    value can sit a unit in the last place of the magnitude rounded at each
+    step away from this round-to-nearest reference."""
+    dtype = xs.dtype
+    a = xs.float().sum(0)
+    r = (a.to(dtype).float() + res.float()).to(dtype)
+    v = r.float()
+    scale = torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
+    w_eff = w.float() + weight_bias
+    normed = (v * scale * w_eff).to(dtype)
+    step = a.abs() + v.abs()
+    rel = 2.0 ** -6  # two bf16 units in the last place
+    return (normed, r), (rel * (normed.float().abs() + scale * w_eff.abs() * step) + 1e-6,
+                         rel * step + 1e-6)
+
+
 class AiterARFusion(ARFusion):
     """AITER's custom all-reduce with its one-stage fused RMSNorm.
 
@@ -356,11 +376,8 @@ class AiterARFusion(ARFusion):
                 xs = torch.randn(world_size, tokens, hidden, generator=gen).to(dtype)
                 res = torch.randn(tokens, hidden, generator=gen).to(dtype)
                 w = (torch.randn(hidden, generator=gen) * 0.1).to(dtype)
-                r_ref = (xs.float().sum(0).to(dtype).float() + res.float()).to(dtype)
-                v = r_ref.float()
-                v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + 1e-6)
                 for gemma in (False, True):
-                    out_ref = (v * (w.float() + float(gemma))).to(dtype)
+                    want, tol = _reference(xs, res, w, float(gemma), 1e-6)
                     out = torch.full(
                         (tokens, hidden), float("nan"), dtype=dtype, device=device,
                     )
@@ -370,10 +387,11 @@ class AiterARFusion(ARFusion):
                         w=w.to(device), eps=1e-6, registered=False,
                         use_1stage=True, gemma_norm=gemma,
                     )
-                    for name, got, want in (("residual", r, r_ref), ("norm", out, out_ref)):
-                        got, want = got.float().cpu(), want.float()
-                        err = (got - want).abs().nan_to_num(float("inf"))
-                        if (err > 5e-3 + 2e-2 * want.abs()).any():
+                    for name, got, ref, bound in zip(
+                        ("norm", "residual"), (out, r), want, tol, strict=True,
+                    ):
+                        err = (got.float().cpu() - ref.float()).abs().nan_to_num(float("inf"))
+                        if (err > bound).any():
                             return (f"{name} at tokens={tokens} gemma={gemma}: "
                                     f"max |err| {err.max().item():.3g}")
         except Exception as e:  # noqa: BLE001
