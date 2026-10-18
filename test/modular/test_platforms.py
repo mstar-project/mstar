@@ -1,12 +1,13 @@
 """``mstar.platforms``: which hardware the process runs on."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from mstar import platforms
-from mstar.platforms import CudaPlatform, RocmPlatform, current_platform
+from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform, XpuPlatform, current_platform
 
 
 @pytest.fixture
@@ -69,3 +70,67 @@ def test_cuda_arch_and_capability(monkeypatch, capability, arch, hopper):
     assert platform.arch() == arch
     assert platform.has_cuda_capability(9) is hopper
     assert platform.has_cuda_capability(*capability)
+
+
+@pytest.mark.parametrize(
+    ("hip", "cuda", "xpu", "expected"),
+    [
+        ("7.0", None, None, RocmPlatform),
+        (None, "12.8", None, CudaPlatform),
+        (None, None, "20250101", XpuPlatform),
+        (None, None, None, CpuPlatform),
+    ],
+)
+def test_env_defaults_come_from_the_build_without_a_device_call(
+    monkeypatch, hip, cuda, xpu, expected,
+):
+    """The runtimes read their environment when they initialize, and resolving
+    ``current_platform`` counts devices, which initializes them."""
+
+    def device_call():
+        raise AssertionError("a device call before the environment was set")
+
+    monkeypatch.setattr(torch.cuda, "is_available", device_call)
+    monkeypatch.setattr(platforms, "resolve_platform", device_call)
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(torch.version, "cuda", cuda)
+    monkeypatch.setattr(torch.version, "xpu", xpu, raising=False)
+    monkeypatch.setattr(
+        expected, "process_env_defaults", lambda self: {"PLATFORM_ENV_TEST": type(self).__name__},
+    )
+    # set then deleted, so teardown removes what the call sets
+    monkeypatch.setenv("PLATFORM_ENV_TEST", "")
+    monkeypatch.delenv("PLATFORM_ENV_TEST")
+
+    platforms.apply_process_env_defaults()
+    assert os.environ["PLATFORM_ENV_TEST"] == expected.__name__
+
+
+def test_env_defaults_keep_a_value_already_set(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    monkeypatch.setattr(
+        RocmPlatform,
+        "process_env_defaults",
+        lambda self: {"PLATFORM_ENV_TEST_UNSET": "default", "PLATFORM_ENV_TEST_SET": "default"},
+    )
+    monkeypatch.setenv("PLATFORM_ENV_TEST_UNSET", "")
+    monkeypatch.delenv("PLATFORM_ENV_TEST_UNSET")
+    monkeypatch.setenv("PLATFORM_ENV_TEST_SET", "user")
+
+    platforms.apply_process_env_defaults()
+    assert os.environ["PLATFORM_ENV_TEST_UNSET"] == "default"
+    assert os.environ["PLATFORM_ENV_TEST_SET"] == "user"
+
+
+def test_a_worker_sets_its_env_defaults_before_anything_else(monkeypatch):
+    from mstar.conductor import conductor
+
+    class AppliedError(Exception):
+        """Raised by the stand-in, so nothing after it runs."""
+
+    def apply():
+        raise AppliedError
+
+    monkeypatch.setattr(conductor, "apply_process_env_defaults", apply)
+    with pytest.raises(AppliedError):
+        conductor._worker_process_target(*[None] * 12)

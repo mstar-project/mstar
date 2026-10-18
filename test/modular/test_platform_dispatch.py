@@ -1,16 +1,22 @@
-"""Choosing an implementation per platform, and the platform's inductor settings.
+"""Choosing an implementation per platform, and the platform's inductor
+settings at the engine's compile sites.
 
 Both resolve against ``current_platform``, which these tests point at a chosen
 ``Platform`` instance, so they run without any accelerator.
 """
 
+import functools
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
+import torch
 import torch._inductor.config as inductor_config
 
 from mstar import platforms
+from mstar.engine.cuda_graph_runner import CudaGraphRunner
+from mstar.engine.engine import Engine
 from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.platforms.dispatch import PlatformDispatch
@@ -185,3 +191,98 @@ def test_overrides_are_undone_when_the_call_raises(on_platform):
     with pytest.raises(RuntimeError, match="compile failed"):
         with_inductor_overrides(fails, 8)()
     assert inductor_config.max_autotune_gemm_backends == before
+
+
+# --- the engine's compile sites ---------------------------------------------
+
+
+class _EverythingOnAten(_SmallGemmsOnAten):
+    def inductor_overrides(self, num_tokens=None):
+        self.queries.append(num_tokens)
+        return {"max_autotune_gemm_backends": "ATEN"}
+
+
+class _Submodule:
+    def forward(self, *args, **kwargs):
+        return _read_gemm_backends(*args, **kwargs)
+
+    def forward_batched(self, *args, **kwargs):
+        return _read_gemm_backends(*args, **kwargs)
+
+
+@pytest.fixture
+def fake_compile(monkeypatch):
+    """``torch.compile`` returning a distinct callable that runs eagerly, so a
+    call reads the inductor config it ran under. Returns what it compiled."""
+    compiled = []
+
+    def compile_(fn, **kwargs):
+        compiled.append(fn)
+        return functools.partial(fn)
+
+    monkeypatch.setattr(torch, "compile", compile_)
+    return compiled
+
+
+class _GraphRunner:
+    _forward_for = CudaGraphRunner._forward_for
+
+    def __init__(self):
+        self._submodule = _Submodule()
+        self._compiled_forwards = {}
+
+
+def _bucket(num_tokens: int):
+    return SimpleNamespace(
+        config=SimpleNamespace(compile=True, capture_forward_method="forward_batched"),
+        config_idx=0,
+        num_tokens=num_tokens,
+    )
+
+
+def test_a_capture_without_overrides_gets_the_compiled_forward(on_platform, fake_compile):
+    on_platform(CudaPlatform())
+    runner = _GraphRunner()
+    first = runner._forward_for(_bucket(64))
+    assert first is runner._compiled_forwards[0]
+    assert runner._forward_for(_bucket(8)) is first
+    assert len(fake_compile) == 1
+
+
+def test_each_capture_runs_under_its_buckets_overrides(on_platform, fake_compile):
+    platform = on_platform(_SmallGemmsOnAten())
+    runner = _GraphRunner()
+    large = runner._forward_for(_bucket(64))
+    small = runner._forward_for(_bucket(16))
+    assert large is runner._compiled_forwards[0]
+    assert small()[0] == "ATEN"
+    assert platform.queries == [64, 16]
+    assert len(fake_compile) == 1, "buckets share one compiled forward"
+
+
+class _Engine:
+    _compile_submodules = Engine._compile_submodules
+
+    def __init__(self):
+        self._submodules = {
+            "node": SimpleNamespace(submodule=_Submodule(), forward=None, forward_batched=None),
+        }
+
+
+@pytest.mark.parametrize("overrides", [False, True])
+def test_compiled_submodule_forwards_take_overrides_for_any_token_count(
+    monkeypatch, on_platform, fake_compile, overrides,
+):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    platform = on_platform(_EverythingOnAten() if overrides else CudaPlatform())
+    engine = _Engine()
+    engine._compile_submodules()
+    mgmt = engine._submodules["node"]
+    expected = "ATEN" if overrides else inductor_config.max_autotune_gemm_backends
+    assert mgmt.forward()[0] == expected
+    assert mgmt.forward_batched()[0] == expected
+    assert len(fake_compile) == 2
+    if overrides:
+        assert platform.queries == [None, None]
+    else:
+        assert isinstance(mgmt.forward, functools.partial)

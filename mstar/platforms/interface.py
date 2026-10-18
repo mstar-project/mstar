@@ -62,6 +62,8 @@ class Platform:
         before its first device call, so a value already exported wins.
 
         For settings a runtime or library reads once, when it initializes.
+        ``apply_process_env_defaults`` asks the platform torch was built for,
+        since resolving ``current_platform`` is itself a device call.
         """
         return {}
 

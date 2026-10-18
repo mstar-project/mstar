@@ -11,6 +11,7 @@ hardware is.
 from __future__ import annotations
 
 import functools
+import os
 from typing import cast
 
 import torch
@@ -29,6 +30,7 @@ __all__ = [
     "Platform",
     "RocmPlatform",
     "XpuPlatform",
+    "apply_process_env_defaults",
     "current_platform",
     "resolve_platform",
 ]
@@ -56,3 +58,26 @@ class _CurrentPlatform:
 
 
 current_platform = cast(Platform, _CurrentPlatform())
+
+
+def _built_for() -> Platform:
+    """The platform torch was built for, which takes no device call to know."""
+    if torch.version.hip is not None:
+        return RocmPlatform()
+    if torch.version.cuda is not None:
+        return CudaPlatform()
+    if getattr(torch.version, "xpu", None) is not None:
+        return XpuPlatform()
+    return CpuPlatform()
+
+
+def apply_process_env_defaults() -> None:
+    """Set the platform's ``process_env_defaults``, keeping any value already set.
+
+    Call before the process's first device call: the HIP and CUDA runtimes
+    read much of their environment when they initialize, and resolving
+    ``current_platform`` counts devices, which initializes them. So the
+    platform asked here is the one torch was built for.
+    """
+    for key, value in _built_for().process_env_defaults().items():
+        os.environ.setdefault(key, value)
