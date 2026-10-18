@@ -44,6 +44,8 @@ class VideoFamily(Family):
     guidance: float | None = None
     negative_prompt: str | None = None
     generator_device = "cpu"
+    request_extra: dict = {}  # extra model_kwargs for the server only
+    ref_call_kwargs: dict = {}  # extra pipeline call kwargs for the reference only
 
     def model_kwargs(self, it) -> dict:
         kw = {"seed": it.params["seed"], "height": self.height, "width": self.width, "num_frames": self.num_frames,
@@ -52,7 +54,7 @@ class VideoFamily(Family):
             kw["guidance_scale"] = self.guidance
         if self.negative_prompt is not None:
             kw["negative_prompt"] = self.negative_prompt
-        return kw
+        return {**kw, **self.request_extra}
 
     def requests(self, sset: SampleSet) -> list[Request]:
         reqs = []
@@ -97,15 +99,22 @@ class VideoFamily(Family):
                 kw["negative_prompt"] = self.negative_prompt
             if self.image_to_video:
                 kw["image"] = Image.open(sset.path(it.files["image"])).convert("RGB")
+            kw.update(self.ref_call_kwargs)
             with torch.inference_mode():
                 gen = torch.Generator(self.generator_device if self.generator_device == "cpu" else device)
-                frames = pipe(prompt=it.prompt, generator=gen.manual_seed(int(it.params["seed"])), **kw).frames[0]
+                frames = self.reference_frames(pipe(prompt=it.prompt, generator=gen.manual_seed(int(it.params["seed"])),
+                                                    **kw))
             frames = (np.clip(np.asarray(frames), 0, 1) * 255).round().astype(np.uint8)
             np.save(ref_dir / "outputs" / f"{it.id}.npy", frames)
             write_video(frames, ref_dir / "outputs" / f"{it.id}.mp4", self.fps)
             print(f"  ref {it.id}: {frames.shape}", flush=True)
         write_meta(ref_dir, family=self.name, reference=self.reference_description(), set=sset.name,
                    pipeline=type(pipe).__name__)
+
+    @staticmethod
+    def reference_frames(out) -> np.ndarray:
+        """[T, H, W, 3] floats in [0, 1] from the pipeline output (output_type="np")."""
+        return out.frames[0]
 
     def score(self, sset: SampleSet, runs: list[Path], ref_dir: Path | None, work: Path,
               device: str) -> FamilyScore:
