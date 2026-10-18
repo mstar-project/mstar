@@ -187,6 +187,7 @@ FAMILIES: dict[str, type[Family]] = {
 
 UNSUPPORTED: dict[str, str] = {
     "test_text_session": "test-only config (session plumbing), no model output to verify",
+    "ltx2_5": "no family yet, its joint audio+video output needs its own reference and scoring",
 }
 
 
