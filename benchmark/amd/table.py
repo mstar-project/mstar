@@ -4,8 +4,9 @@
 
 Cells show the median over repeats, and the primary metric also its [min-max]. Flags are rerun
 (spread over the limit once), noisy (still over it after the re-run), error (failed requests or
-runs), client-bound (the benchmark client was busy most of the run) and HEALTH-FAIL (thermal
-throttling or new ECC errors during the arm).
+runs), client-bound (the benchmark client was busy most of the run), HEALTH-FAIL (thermal
+throttling or new ECC errors during the arm) and moe-untuned (a fused-MoE layer ran without a tuned
+launch-config table).
 """
 
 from __future__ import annotations
@@ -65,6 +66,28 @@ def _cotenants(arm_dir: Path) -> dict:
         if c.get("loadavg"):
             load = max(load or 0.0, c["loadavg"][0])
     return {"markers": sorted(markers), "peak_load": load}
+
+
+def _moe_status(a: dict) -> tuple[str, bool]:
+    """The fused-MoE configs an arm's server log names, and whether any MoE layer ran untuned. mstar
+    logs only the tables it finds, so its rows' expected sizes tell a missing table apart."""
+    st = a.get("startup") or {}
+    if "moe_configs" not in st:  # the server never came up, or the run predates the check
+        return "", False
+    tuned, default = st["moe_configs"].get("tuned") or [], st["moe_configs"].get("default") or []
+    row = catalog.ROWS.get(a.get("row"))
+    parts, untuned = [], bool(default)
+    if a.get("arm") == "mstar" and row and row.moe_shapes:
+        for shape in row.moe_shapes:
+            hit = [t for t in tuned if t.startswith(shape + ",")]
+            parts.append(f"MoE {shape}: {hit[0].rsplit('device_name=', 1)[-1].removesuffix('.json')} table" if hit
+                         else f"MoE {shape}: NO tuned table, default launch config")
+            untuned |= not hit
+    elif tuned:
+        parts.append("MoE configs " + ", ".join(tuned))
+    if default:
+        parts.append("MoE default config, not found: " + ", ".join(default))
+    return "; ".join(parts), untuned
 
 
 def collect(run_dir: Path) -> dict:
@@ -164,7 +187,8 @@ def render(data: dict) -> str:
                                                                if v["reasons"] else ""))
     lines.append("")
 
-    lines += ["## Arms", "", "| row | arm | status | engine / image | versions | env | attention (server log) | recipe "
+    lines += ["## Arms", "", "| row | arm | status | engine / image | versions | env | attention and MoE configs "
+              "(server log) | recipe "
               "| cold start: ready s, first request s | co-tenants during cells |",
               "|---|---|---|---|---|---|---|---|---|---|"]
     for a in data["arms"].values():
@@ -187,6 +211,8 @@ def render(data: dict) -> str:
         cold = f"{st.get('ready_s', '-')}, {st.get('first_request_s', '-')}" if st else "-"
         status = a["status"] + (f": {a['error'][0][:80]}" if a.get("error") else "")
         backends = ", ".join(st.get("backends") or []) or ("AUTO (platform default)" if a["arm"] == "mstar" else "")
+        moe_txt = _moe_status(a)[0]
+        backends = "; ".join(x for x in (backends, moe_txt) if x)
         co = a.get("cotenants") or {}
         co_txt = ", ".join(co.get("markers") or []) or "none"
         if co.get("peak_load") is not None:
@@ -229,10 +255,12 @@ def render(data: dict) -> str:
                                     f"{_fmt(s['max'], scale, dec)}]")
                     else:
                         vals.append(_fmt(s["median"], scale, dec))
-                h = (data["arms"].get(f"{row}/{c['arm']}") or {}).get("health") or {}
+                arm_rec = data["arms"].get(f"{row}/{c['arm']}") or {}
+                h = arm_rec.get("health") or {}
                 # Thermal throttling or new ECC errors during the arm void its cells.
                 flags = " ".join(c.get("flags", []) + (["error"] if c.get("errors") else [])
-                                 + (["HEALTH-FAIL"] if h.get("status") == "FAIL" else []))
+                                 + (["HEALTH-FAIL"] if h.get("status") == "FAIL" else [])
+                                 + (["moe-untuned"] if arm_rec and _moe_status(arm_rec)[1] else []))
                 corr = data["correctness"].get(f"{row}/{c['arm']}") or {}
                 corr_txt = _correctness_text(corr)
                 why = "; ".join(_comparability(data, row, c["arm"], wl_name, wl.family))
