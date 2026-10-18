@@ -1,0 +1,11 @@
+# The one-GPU placement of qwen3_omni_one_gpu.yaml with the tuned settings of qwen3_omni_rocm_tuned.yaml.
+base_config: qwen3_omni_one_gpu.yaml
+platforms:
+  rocm:
+    stages:
+      - stage_id: 0
+        attention_backend: ROCM_AITER_FA
+      - stage_id: 1
+        attention_backend: ROCM_AITER_FA
+      - stage_id: 2
+        enforce_eager: false
