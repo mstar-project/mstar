@@ -358,7 +358,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         else:
             ends = list(itertools.accumulate(seq_lens))
             last = hidden.index_select(0, torch.tensor([e - 1 for e in ends], device=hidden.device))
-        new_token = engine_inputs.resources[NANO_SAMPLER].sample(rids, logits=self.lm_head(last))
+        new_token = engine_inputs.resources[NANO_SAMPLER].sample(self.lm_head(last))
         rows = {
             "new_token": new_token.reshape(n),
             # the prompt (if any) has been consumed by this step: the loop-back
