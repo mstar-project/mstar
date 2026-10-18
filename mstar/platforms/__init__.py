@@ -2,10 +2,11 @@
 
 ``current_platform`` says whether the process drives NVIDIA (CUDA), AMD
 (ROCm), Intel (XPU) or no accelerator, and the GPU's architecture. Code that
-branches on hardware asks it rather than reading ``torch.version.hip``, the
-device type, or a raw compute capability. Which kernel to run stays the
-choice of the resource that runs it; the platform only says what the
-hardware is.
+branches on the GPU vendor or architecture asks it rather than reading
+``torch.version.hip``, the ``cuda`` device type, or a raw compute capability.
+``device.type == "cuda"`` is still the way to ask "is this a GPU". Which
+kernel to run stays the choice of the resource that runs it; the platform
+only says what the hardware is.
 """
 
 from __future__ import annotations
