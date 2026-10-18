@@ -639,9 +639,9 @@ if you want to reuse one.
    export MIOPEN_USER_DB_PATH=/tmp/$USER/miopen MIOPEN_CUSTOM_CACHE_DIR=/tmp/$USER/miopen
    export TORCHINDUCTOR_CACHE_DIR=/tmp/$USER/inductor TRITON_CACHE_DIR=/tmp/$USER/triton
 
-**Picking GPUs.** ``mstar serve --gpus 0,1`` sets ``CUDA_VISIBLE_DEVICES``, which HIP
-honours. HIP uses ``HIP_VISIBLE_DEVICES`` instead whenever that is set, so unset it (or
-set it to the same list) when you pass ``--gpus``.
+**Picking GPUs.** On ROCm ``mstar serve --gpus 0,1`` sets both ``CUDA_VISIBLE_DEVICES``
+and ``HIP_VISIBLE_DEVICES``, since HIP and torch read ``HIP_VISIBLE_DEVICES`` first.
+Without ``--gpus``, ``mstar serve`` won't start if the two are set to different lists.
 
 **Check the install.** On a node with an MI300X or MI325X:
 
