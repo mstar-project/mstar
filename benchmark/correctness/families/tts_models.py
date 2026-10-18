@@ -11,10 +11,13 @@ from pathlib import Path
 
 import numpy as np
 
+from benchmark.correctness.families.base import write_meta
 from benchmark.correctness.families.tts import TtsFamily
 from benchmark.correctness.sets import DEFAULT_DATA_ROOT, SampleSet
 
 REFENV = DEFAULT_DATA_ROOT / "refenv"
+# transformers 4.57.3 + the hub/tokenizers/accelerate it wants, for qwen-tts only (own process)
+TF457_OVERLAY = DEFAULT_DATA_ROOT / "refenv-tf457"
 
 
 def use_refenv() -> None:
@@ -44,24 +47,6 @@ def _stub_missing_espeak() -> None:
     stub.EspeakG2P = _Unavailable
     sys.modules["misaki.espeak"] = stub
     misaki.espeak = stub
-
-
-def _stub_unused_qwen_tts_deps() -> None:
-    """qwen_tts imports its 25 Hz tokenizer eagerly, which needs sox and onnxruntime. The 12 Hz
-    checkpoints never call into it, so empty modules are enough when those aren't installed."""
-    import importlib.util
-    import types
-
-    for name in ("sox", "onnxruntime"):
-        if name in sys.modules or importlib.util.find_spec(name) is not None:
-            continue
-        stub = types.ModuleType(name)
-
-        def _missing(attr, name=name):
-            raise RuntimeError(f"{name} is not installed (only qwen_tts' 25 Hz tokenizer uses it)")
-
-        stub.__getattr__ = _missing
-        sys.modules[name] = stub
 
 
 class KokoroTts(TtsFamily):
@@ -211,27 +196,28 @@ class Qwen3Tts(TtsFamily):
         return f"qwen-tts-0.1.1-{self.HF[self.model_key].split('/')[-1]}-sampled"
 
     def reference_description(self) -> str:
-        return f"`qwen-tts` 0.1.1 Qwen3TTSModel {self.HF[self.model_key]} (bf16, sdpa), checkpoint sampling defaults"
+        return (f"`qwen-tts` 0.1.1 Qwen3TTSModel {self.HF[self.model_key]} (bf16, sdpa), checkpoint sampling defaults, "
+                f"in its own process on the transformers 4.57.3 it pins")
 
-    def reference_synthesize(self, sset: SampleSet, device: str):
-        _stub_unused_qwen_tts_deps()
-        import torch
-        from qwen_tts import Qwen3TTSModel
+    def make_reference(self, sset: SampleSet, ref_dir: Path, device: str) -> None:
+        import json
+        import subprocess
 
-        model = Qwen3TTSModel.from_pretrained(self.HF[self.model_key], dtype=torch.bfloat16,
-                                              attn_implementation="sdpa", device_map=device)
-        for i, it in enumerate(sset.items):
-            torch.manual_seed(i)
-            if self.model_key == "qwen3_tts_voicedesign":
-                wavs, sr = model.generate_voice_design(text=it.prompt, language="English", instruct=self.INSTRUCT)
-            elif self.model_key == "qwen3_tts_base":
-                wavs, sr = model.generate_voice_clone(text=it.prompt, language="English",
-                                                      ref_audio=str(sset.path(it.files["prompt_audio"])),
-                                                      ref_text=it.params["prompt_text"])
-            else:
-                wavs, sr = model.generate_custom_voice(text=it.prompt, language="English",
-                                                       speaker=self.opt("voice", "vivian"))
-            yield it, np.asarray(wavs[0], dtype=np.float32), sr
+        from huggingface_hub import snapshot_download
+
+        mode = {"qwen3_tts_voicedesign": "design", "qwen3_tts_base": "clone"}.get(self.model_key, "custom")
+        # A local path: the overlay's older hub still calls the model API when offline.
+        req = {"hf_id": snapshot_download(self.HF[self.model_key]), "device": device, "mode": mode,
+               "instruct": self.INSTRUCT,
+               "voice": self.opt("voice", "vivian"), "out_dir": str(ref_dir / "outputs"),
+               "runner_root": str(Path(__file__).resolve().parents[3]),
+               "items": [{"id": it.id, "text": it.prompt, "prompt_audio": str(sset.path(it.files["prompt_audio"])),
+                          "prompt_text": it.params.get("prompt_text")} for it in sset.items]}
+        (ref_dir / "request.json").write_text(json.dumps(req, indent=1))
+        subprocess.run([sys.executable, "-I", str(Path(__file__).with_name("qwen_tts_ref.py")), "--overlay",
+                        str(TF457_OVERLAY), "--request", str(ref_dir / "request.json")], check=True)
+        write_meta(ref_dir, family=self.name, reference=self.reference_description(), set=sset.name,
+                   overlay=str(TF457_OVERLAY))
 
 
 class OmniVoiceTts(TtsFamily):
