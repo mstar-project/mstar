@@ -1,0 +1,22 @@
+model: "ltx2_5"
+
+# No node keeps a KV cache; max_seq_len only satisfies the conductor's config check
+# (the 1024-token prompt).
+max_seq_len: 1024
+
+# LTX-2.5 distilled on 2 GPUs: the DiT (38 GB) alone on rank 0; the Gemma-4 text
+# encoder + connectors (30 GB) and both decoders on rank 1, so one request's text
+# encoding and decode overlap another's denoising.
+model_kwargs:
+  # flashinfer: every DiT attention through the engine's ragged resources; sdpa: the
+  # reference pipeline's kernel, for parity runs
+  attention_backend: flashinfer
+  max_batch_size: 4
+
+node_groups:
+  - node_names: [dit]
+    ranks: [0]
+  - node_names: [text_encoder]
+    ranks: [1]
+  - node_names: [vae_decoder, audio_decoder]
+    ranks: [1]

@@ -7,7 +7,9 @@ counter, and the 3D ids are built here and passed in as cos/sin.
 """
 
 import logging
+import os
 from collections.abc import Mapping
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -68,18 +70,46 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    device_loopback_enabled,
 )
+from mstar.utils.knobs import ingraph_decode_rope
+from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 logger = logging.getLogger(__name__)
 
 
 class LLMSubmodule(ARNodeSubmodule):
-    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
+    # the decode walk reads its input ids off the sampler's slot masters
+    reads_device_loopback = True
+
+    # Total tokens of a packed text-prefill step, one captured graph per
+    # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
+    # an eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
+    # idle half the time: 78 ms of wall for 36 ms of kernels on 0.8B), so the
+    # ladder runs to 8192. MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS narrows or
+    # extends it (static buffers are sized by the largest bucket).
+    PREFILL_TOKEN_BUCKETS = [
+        int(x) for x in os.environ.get(
+            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,256,512,1024,2048,4096,8192",
+        ).split(",")
+    ]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # The ladder runs to 128 because the largest bucket is also the scheduler's
+    # cap on rows per decode step: with 32 as the top, 64 requests in flight
+    # ran as two alternating batches of 32 and each paid the whole per-step
+    # host cost. A step above 32 rows pads to the next bucket.
+    # MSTAR_DECODE_BUCKETS="1,2,4,8,16,32" narrows the ladder for every model
+    # that reads it (less graph memory, or the pre-#258 ladder for an A/B);
+    # MSTAR_QWEN35_DECODE_BUCKETS overrides it for this model alone.
+    DECODE_CAPTURE_BATCH_SIZES = [
+        int(x) for x in (
+            os.environ.get("MSTAR_QWEN35_DECODE_BUCKETS")
+            or os.environ.get("MSTAR_DECODE_BUCKETS", "1,2,4,8,16,32,48,64,96,128")
+        ).split(",")
+    ]
 
     # Text plus image tokens of a whole prompt. Capped at 4096, not the
     # processor's 16384, because static buffers are sized by the largest
@@ -260,13 +290,64 @@ class LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        has_loopback: bool = False,
         **kwargs: Any,
     ) -> ARNodeInputs:
         if graph_walk == "prefill_vision":
             return self._vision_inputs(fwd_info, inputs)
 
+        if graph_walk == "decode" and has_loopback and self._device_loopback():
+            # one token per row, read off the sampler's slot master in
+            # `preprocess`; the routed signal is empty (or ignored) here
+            return ARNodeInputs(input_seq_len=1)
         input_ids = inputs["text_inputs"][0]
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
+
+    def uniform_row_inputs(
+        self, graph_walk: str, has_loopback: bool = False,
+    ) -> ARNodeInputs | None:
+        # the loop-back decode row above, built once for the step's rows
+        if graph_walk == "decode" and has_loopback and self._device_loopback():
+            return ARNodeInputs(input_seq_len=1)
+        return None
+
+    def _device_loopback(self) -> bool:
+        return (
+            device_loopback_enabled()
+            and self.node_resources[SAMPLER].has_slot_masters
+        )
+
+    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        if graph_walk == "decode" and self._device_loopback():
+            return frozenset({"text_inputs"})
+        return frozenset()
+
+    @staticmethod
+    def _captured_decode(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+        """A decode step replayed on a leased slot, or being captured for one.
+        The caller's walk decides (a capture's own context carries the
+        piecewise walk), the lease says the slot's static buffers are in
+        play."""
+        if graph_walk != "decode":
+            return False
+        step = getattr(engine_inputs, "step", None)
+        ctx = getattr(step, "ctx", None) if step is not None else None
+        return ctx is not None and getattr(ctx, "slot_lease", None) is not None
+
+    def _decode_cos_sin(
+        self, engine_inputs: ModelInputsFromEngine, num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The rotary tables of a decode step from the position resource's
+        planned positions: one token per row, no custom grids."""
+        pos_ids = self.node_resources[ROPE].pos_ids("main")
+        assert pos_ids is not None, (
+            "position resource has no plan for this step; `plan` must run "
+            "before the forward"
+        )
+        pos = pos_ids[:num_tokens].unsqueeze(0).expand(3, -1)
+        return self.model.model.build_cos_sin(
+            pos, dtype=self.model.model.embed_tokens.weight.dtype,
+        )
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """``[3, total_tokens]`` for the step, in packed request order.
@@ -306,7 +387,33 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
-        if inputs[0].input_ids is not None:
+        captured = self._captured_decode(engine_inputs, graph_walk)
+        first = inputs[0]
+        if first.input_embeds is None and (
+            first.input_ids is None or any(inp.input_ids is None for inp in inputs)
+        ):
+            # device loop-back: every row of a decode step is its request's
+            # last sampled token, read by slot (padding rows read slot 0)
+            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            # rows whose last step ran elsewhere brought their token
+            routed = [
+                i for i, inp in enumerate(inputs)
+                if inp.input_ids is not None and inp.input_seq_len
+            ]
+            if routed:
+                ids.index_copy_(
+                    0, torch.tensor(routed, device=ids.device),
+                    torch.cat([inputs[i].input_ids for i in routed]).to(ids.dtype),
+                )
+            out["input_ids"] = ids
+            if PHASE_PERIOD:
+                phase_record("engine.preprocess.loopback", perf_counter() - t0)
+            if captured and ingraph_decode_rope():
+                # the captured forward builds the rotary tables itself
+                return out
+        elif inputs[0].input_ids is not None:
             out["input_ids"] = torch.cat([inp.input_ids for inp in inputs], dim=0)
         else:
             out["input_embeds"] = torch.cat(
@@ -390,13 +497,21 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        cos_3d: torch.Tensor,
-        sin_3d: torch.Tensor,
+        cos_3d: torch.Tensor | None = None,
+        sin_3d: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+        captured = self._captured_decode(engine_inputs, graph_walk)
+        if input_ids is None and input_embeds is None:
+            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+        if (captured and ingraph_decode_rope()) or cos_3d is None or sin_3d is None:
+            # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned
+            # positions, inside the graph; the static cos/sin stay unread
+            num_tokens = (input_ids if input_ids is not None else input_embeds).shape[0]
+            cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)
 
         embeds = (
             self.model.model.embed_tokens(input_ids)
@@ -415,8 +530,8 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        cos_3d: torch.Tensor,
-        sin_3d: torch.Tensor,
+        cos_3d: torch.Tensor | None = None,
+        sin_3d: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         **kwargs,
@@ -442,8 +557,8 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        cos_3d: torch.Tensor,
-        sin_3d: torch.Tensor,
+        cos_3d: torch.Tensor | None = None,
+        sin_3d: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         **kwargs,
@@ -497,6 +612,16 @@ class LLMSubmodule(ARNodeSubmodule):
         )
         return {"decode_loop"} if hit_eos or out_of_budget else set()
 
+    def step_is_input_free(self, graph_walk: str) -> bool:
+        # decode rows are one token each, like the template; the prefill walks
+        # feed `prefill_tokens` from the inputs
+        return graph_walk == "decode"
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        # the decode loop's client edge carries the sampled token the stop
+        # check already has on the host; prefill's new_token edge is persisted
+        return {"text_inputs": "new_token"} if graph_walk == "decode" else {}
+
     def check_stop_batched(
         self,
         request_ids: list[str],
@@ -508,23 +633,31 @@ class LLMSubmodule(ARNodeSubmodule):
         if not torch.is_tensor(tokens) or tokens.dim() == 0:
             return None
         values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        rows = host_rows.request_ids
+        if len(rows) >= len(request_ids) and all(
+            a == b for a, b in zip(request_ids, rows, strict=False)
+        ):
+            # the common case: the batch in forward order, no row map needed
+            pairs = zip(request_ids, values, strict=False)
+        else:
+            row_of = {rid: i for i, rid in enumerate(rows)}
+            pairs = (
+                (rid, values[i]) for rid in request_ids
+                if (i := row_of.get(rid)) is not None and i < len(values)
+            )  # no row, no output: the per-request path skips it too
         stop_ids = self.config.stop_token_ids
         stops: dict[str, set[str]] = {}
-        for rid in request_ids:
-            i = row_of.get(rid)
-            if i is None or i >= len(values):
-                continue  # no row, no output: the per-request path skips it too
+        for rid, value in pairs:
             info = request_infos[rid]
-            hit_eos = (
-                not info.resource_configs[SAMPLER].ignore_eos
-                and values[i] in stop_ids
-            )
-            out_of_budget = (
+            # the set test first: a stop id is rare, the config read behind it
+            # goes through the wrapper
+            if (
+                value in stop_ids
+                and not info.resource_configs[SAMPLER].ignore_eos
+            ) or (
                 info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
                 >= info.max_tokens
-            )
-            if hit_eos or out_of_budget:
+            ):
                 stops[rid] = {"decode_loop"}
         return stops
 

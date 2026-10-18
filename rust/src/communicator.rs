@@ -233,6 +233,36 @@ impl RawZmqCommunicator {
         Ok(())
     }
 
+    /// `send` that never blocks: Ok(true) when the frame was queued, Ok(false)
+    /// when the peer is at its high-water mark (the caller then falls back to
+    /// the blocking `send`, with the GIL released if it holds it).
+    pub fn try_send(&self, peer_id: &str, payload: &[u8]) -> Result<bool, CommError> {
+        let socket = {
+            let mut peers = self.peers.lock().expect("peers lock");
+            match peers.get(peer_id) {
+                Some(s) => s.clone(),
+                None => {
+                    let endpoint = self.resolve(peer_id)?;
+                    let push = self.ctx.socket(zmq::PUSH)?;
+                    push.set_linger(0)?;
+                    push.connect(&endpoint)?;
+                    let s = std::sync::Arc::new(Mutex::new(push));
+                    peers.insert(peer_id.to_string(), s.clone());
+                    s
+                }
+            }
+        };
+        let result = socket
+            .lock()
+            .expect("peer socket lock")
+            .send(payload, zmq::DONTWAIT);
+        match result {
+            Ok(()) => Ok(true),
+            Err(zmq::Error::EAGAIN) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Non-blocking: next inbound frame, or None.
     pub fn try_recv(&self) -> Option<zmq::Message> {
         let pull = self.pull.lock().expect("pull lock");

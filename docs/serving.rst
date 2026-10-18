@@ -175,7 +175,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - Maximum sequence length (sizes the KV cache).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
-       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``.
+       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. Each node of a
+       walk must be placed by exactly one entry for that walk.
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).

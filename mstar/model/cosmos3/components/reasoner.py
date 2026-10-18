@@ -27,10 +27,12 @@ import math
 from dataclasses import dataclass
 
 import torch
+from jinja2 import TemplateError
 from torchvision.transforms.v2 import InterpolationMode
 from torchvision.transforms.v2 import functional as tvF
 
 from mstar.model.cosmos3.config import Cosmos3MediaProcessorConfig, Cosmos3ReasonerConfig
+from mstar.model.multimodal import messages_from_parts
 
 IMAGE = "image"
 VIDEO = "video"
@@ -291,23 +293,22 @@ def render_chat(
     """Render ordered prompt parts (text / image / video, as written) through
     the checkpoint's chat template with the generation prompt appended.
     Media parts become the template's single-token placeholders, which
-    ``expand_placeholders`` then grows."""
-    content: list[dict] = []
+    ``expand_placeholders`` then grows. ``system_prompt`` leads only when the
+    client sent no system message of its own."""
     for part in parts:
-        if part.modality == "text":
-            if part.text:
-                content.append({"type": "text", "text": part.text})
-        elif part.modality in (IMAGE, VIDEO):
-            content.append({"type": part.modality})
-        else:
+        if part.modality not in ("text", IMAGE, VIDEO):
             raise ValueError(f"the Cosmos3 reasoner has no encoder for {part.modality!r} inputs")
-    messages: list[dict] = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": content})
+    if not any(part.text or part.modality != "text" for part in parts):
+        raise ValueError(
+            "Cosmos3-Edge got a request with no text and no attachments; send a prompt, an image or a video"
+        )
+    messages = messages_from_parts(parts, default_system=system_prompt or None)
     kwargs = {}
     if enable_thinking is not None:
         kwargs["enable_thinking"] = bool(enable_thinking)
     elif not cfg.enable_thinking:
         kwargs["enable_thinking"] = False
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **kwargs)
+    try:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **kwargs)
+    except TemplateError as exc:
+        raise ValueError(f"Cosmos3-Edge's chat template refused the chat: {exc}") from exc

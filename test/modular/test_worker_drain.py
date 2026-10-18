@@ -143,6 +143,7 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
     runtime.cleanup_consumed_inputs = lambda *args: FreedTensors.none()
     runtime.clear_pending_loop_stops = lambda: None
     runtime.get_dynamic_loop_iters = lambda rids, partition: []
+    runtime.update_dynamic_loop_iters = lambda per_request_info, partition: None
     runtime.send_outputs = lambda send_input: []
     runtime.complete_and_route_batch = lambda route_input: routed.append(route_input) or RouteOutput(
         completion_id=0, register_uuids=[], register_rids=[], new_token_output_idxs=[], local_streaming_by_signal={},
@@ -155,7 +156,9 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
         num_tensors=[len((outputs.get(rid) or {}).get(signal, ())) for rid in rids for signal in signals],
     )
     w.engine_manager.get_engine = lambda node: SimpleNamespace(
-        check_stop_for_batch=lambda batch, outputs, **kwargs: {}, extend_prefix_chains=lambda batch, outputs: None,
+        check_stop_for_batch=lambda batch, outputs, **kwargs: {},
+        extend_prefix_chains=lambda batch, outputs, **kwargs: None,
+        materialize_publish=lambda batch, rids: None,
     )
     w.request_state.get_fwd_info = lambda rid, partition: None
     w.request_state.get_pending_publish_info = lambda rid, partition: {}
