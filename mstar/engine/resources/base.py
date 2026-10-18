@@ -37,6 +37,21 @@ class CGSlotSpec:
     def num_tokens(self):
         return self.bucket.num_tokens
 
+    @property
+    def max_row_tokens(self) -> int:
+        """The most tokens one row of this bucket can carry: a batched capture
+        gives every row the same share, a packed one may give one row all."""
+        # deferred: the config module reaches back here through the submodule base
+        from mstar.engine.accelerator_graph_config import (
+            AcceleratorGraphConfigType,
+            PiecewiseConfigType,
+        )
+
+        kind = self.config.get_config_type()
+        if kind in (AcceleratorGraphConfigType.BASIC_BATCHED, PiecewiseConfigType.BATCHED):
+            return self.bucket.num_tokens // max(self.bucket.bs, 1)
+        return self.bucket.num_tokens
+
     def __str__(self) -> str:
         return f"{self.bucket} slot={self.slot}"
 
@@ -454,6 +469,17 @@ class Resource(ABC):
         # NOTE @nsagan: this should probably be refined; it was just the first
         # thing that came to mind
         return
+
+    def capture_refusal(self, spec: CGSlotSpec) -> str | None:
+        """Why this resource cannot run ``spec``'s bucket inside a graph, or
+        None if it can.
+
+        Asked before a capture starts, by every runner that captures against
+        this resource's node; a refused bucket runs eagerly. Answer from the
+        spec and this resource's configuration alone, never from per-rank
+        state, so every rank refuses the same buckets.
+        """
+        return None
 
     def post_warmup_validate(self):
         """
