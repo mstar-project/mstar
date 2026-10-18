@@ -179,14 +179,28 @@ def _spec_to_wav(
             ifft, output_size=(1, output_size), kernel_size=(1, win_length), stride=(1, hop_length),
         )[..., 0, 0, pad:-pad]
 
+        wav = wav / _window_envelope(window, T, hop_length, win_length, output_size, pad)
+        return wav
+
+
+_ENVELOPES: dict[tuple, torch.Tensor] = {}
+
+
+def _window_envelope(window: torch.Tensor, T: int, hop_length: int, win_length: int, output_size: int,
+                     pad: int) -> torch.Tensor:
+    """The overlap-added squared window ``_spec_to_wav`` divides by. It depends only
+    on the frame count, so it is built and checked (a host sync) once per shape,
+    which also keeps the decode free of syncs for CUDA-graph capture."""
+    key = (T, hop_length, win_length, window.device)
+    env = _ENVELOPES.get(key)
+    if env is None:
         window_sq = window.square().expand(T, -1).transpose(0, 1)
-        window_envelope = F.fold(
+        env = F.fold(
             window_sq, output_size=(1, output_size), kernel_size=(1, win_length), stride=(1, hop_length),
         ).squeeze()[pad:-pad]
-
-        assert (window_envelope > 1e-11).all(), "Window envelope has zero values, cannot normalize."
-        wav = wav / window_envelope
-        return wav
+        assert (env > 1e-11).all(), "Window envelope has zero values, cannot normalize."
+        _ENVELOPES[key] = env
+    return env
 
 
 class AudioCodec(nn.Module):
