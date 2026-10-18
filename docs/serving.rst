@@ -37,7 +37,8 @@ mstar serve
      - HTTP port.
    * - ``--gpus``
      - all visible
-     - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``).
+     - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``), and ``HIP_VISIBLE_DEVICES``
+       too on AMD GPUs.
    * - ``--config``
      - model default
      - Override the resolved default config with a path to your own YAML.
@@ -125,7 +126,8 @@ mstar-serve
      - HuggingFace weight cache directory.
    * - ``--socket-path-prefix``
      - ``/tmp/mstar``
-     - ZMQ IPC socket prefix (shared with conductor/workers).
+     - ZMQ IPC socket prefix (shared with conductor/workers). Give each server on a host
+       its own.
    * - ``--upload-dir``
      - ``/tmp/mstar_uploads``
      - Temp directory for uploaded media.
