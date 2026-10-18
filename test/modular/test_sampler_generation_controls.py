@@ -612,3 +612,16 @@ def test_fused_filter_matches_upstream(vocab):
             want = reference_probs(logits[i], dataclasses.replace(row, min_tokens=0), stop_ids=stop)
         assert torch.equal(got[i] > 0, want > 0), (i, int((got[i] > 0).sum()), int((want > 0).sum()))
         torch.testing.assert_close(got[i], want, rtol=1e-4, atol=1e-6)
+
+
+def test_a_windowed_penalty_needs_no_seen_token_mask():
+    """A windowed repetition penalty counts the generation history, so a node with the
+    history (``max_repetition_window``) and no seen-token mask admits it; a whole-
+    sequence penalty on that node is still refused."""
+    from mstar.engine.resources.sampler.config import SamplingReqConfig
+
+    spec = SamplerSpec(resource_key="s", nodes={"n"}, vocab_size=VOCAB,
+                       enable_repetion_penalty=False, max_repetition_window=16)
+    SamplingReqConfig(repetition_penalty=1.05, repetition_window=16).validate(spec)
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        SamplingReqConfig(repetition_penalty=1.05).validate(spec)
