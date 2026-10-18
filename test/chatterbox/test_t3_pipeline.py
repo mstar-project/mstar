@@ -66,8 +66,7 @@ def _snapshot(variant: str) -> str:
 
 
 class FakeGreedySampler:
-    def sample(self, request_ids, logits):
-        del request_ids
+    def sample(self, logits):
         return logits.argmax(dim=-1)
 
 
