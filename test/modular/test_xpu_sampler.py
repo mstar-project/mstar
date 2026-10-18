@@ -86,6 +86,9 @@ def test_cuda_fast_path_requires_every_top_k_row_disabled(monkeypatch, zero_coun
     flashinfer.sampling.top_p_sampling_from_probs.return_value = tokens
     flashinfer.sampling.top_k_top_p_sampling_from_probs.return_value = tokens
     monkeypatch.setitem(sys.modules, "flashinfer", flashinfer)
+    # the samplers the CUDA platform dispatches to, whatever platform runs this
+    for dispatch in (utils._top_p_sampling_from_probs, utils._top_k_top_p_sampling_from_probs):
+        monkeypatch.setattr(dispatch, "_impl", getattr(flashinfer.sampling, dispatch.name))
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
     monkeypatch.setattr(utils, "fused_temperature_softmax", Mock(return_value=torch.ones(2, 8)))
     top_k = {0: [2, 4], 1: [0, 4], 2: [0, 0], None: [0, 4]}[zero_count]
