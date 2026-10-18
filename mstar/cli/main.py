@@ -237,9 +237,10 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
 
 
 def _serve(args: argparse.Namespace) -> None:
+    from mstar.platforms import apply_visible_devices
+
     config = _resolve_config(args.model, args.config)
-    if args.gpus is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+    apply_visible_devices(args.gpus)
     if args.compile_level is not None:
         os.environ["MSTAR_COMPILE_LEVEL"] = str(args.compile_level)
 
@@ -296,7 +297,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="require 'Authorization: Bearer <key>' on every route except /health "
              "and /metrics (default: MSTAR_API_KEY; unset means no check)",
     )
-    serve.add_argument("--gpus", default=None, help="CUDA_VISIBLE_DEVICES, e.g. '0' or '0,1,2'")
+    serve.add_argument(
+        "--gpus", default=None,
+        help="GPUs to use, e.g. '0' or '0,1,2' (sets CUDA_VISIBLE_DEVICES, and HIP_VISIBLE_DEVICES on ROCm)",
+    )
     serve.add_argument(
         # unset leaves MSTAR_COMPILE_LEVEL alone, whose own default is 1
         "-O", "--compile-level", dest="compile_level", type=int, default=None, choices=[0, 1, 2],
