@@ -48,11 +48,12 @@ mstar serve
      - ``SHM``
      - Tensor transport: ``SHM`` (safe single-node default), ``TCP``, or ``RDMA``.
    * - ``--socket-path-prefix``
-     - ``/tmp/mstar_<user>/``
-     - ZMQ IPC socket prefix.
+     - a new ``/tmp/mstar_<user>_*/``
+     - ZMQ IPC socket prefix. By default each server gets a fresh directory, logged at
+       startup and removed at exit, so servers on one host never share sockets.
    * - ``--upload-dir``
-     - ``/tmp/mstar_uploads_<user>/``
-     - Temp directory for uploaded media.
+     - a new ``/tmp/mstar_uploads_<user>_*/``
+     - Temp directory for uploaded media. Per server and removed at exit, like the prefix.
    * - ``--log-level``
      - ``INFO``
      - ``DEBUG`` / ``INFO`` / ``WARNING`` / ``ERROR``.

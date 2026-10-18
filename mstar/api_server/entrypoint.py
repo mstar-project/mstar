@@ -1651,6 +1651,7 @@ def main(argv: list[str] | None = None):
         format="%(asctime)s %(levelname)s [api_server] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+    logger.info("IPC sockets under %s, uploads under %s", args.socket_path_prefix, args.upload_dir)
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
