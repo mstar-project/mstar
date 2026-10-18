@@ -54,6 +54,9 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "omnilingual_asr_ctc_1b": "omnilingual_asr_ctc_1b.yaml",
     "omnilingual_asr_ctc_3b": "omnilingual_asr_ctc_3b.yaml",
     "omnilingual_asr_ctc_7b": "omnilingual_asr_ctc_7b.yaml",
+    # ASR: NVIDIA's FastConformer models, batched and captured.
+    "parakeet": "parakeet.yaml",
+    "nemotron_asr": "nemotron_asr.yaml",
     "wan22": "wan22.yaml",
     "waypoint": "waypoint.yaml",
     "lingbot_world_1_3b": "lingbot_world_1_3b.yaml",
@@ -180,7 +183,9 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
-    if model in ("whisper_large", "higgs_audio") or model.startswith("omnilingual_asr_ctc_"):
+    if model.startswith("omnilingual_asr_ctc_") or model in (
+        "whisper_large", "higgs_audio", "parakeet", "nemotron_asr",
+    ):
         lines.append("    res = client.generate(text=\"\", audio=\"speech.wav\", "
                      "input_modalities=(\"audio\",\"text\"))")
         lines.append("    print(res.text)  # transcript")

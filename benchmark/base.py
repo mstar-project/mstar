@@ -418,6 +418,23 @@ class HiggsAudio(Model):
         }
 
 
+class _FastConformerAsr(Model):
+    """NVIDIA's FastConformer speech recognizers: audio in, a transcript out, greedy."""
+
+    def get_supported_modalities(self):
+        return {RequestType.A2T}
+
+
+class Parakeet(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/parakeet-tdt-0.6b-v3"
+
+
+class NemotronAsr(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/nemotron-3.5-asr-streaming-0.6b"
+
+
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
@@ -431,6 +448,8 @@ class ModelType(Enum):
     VJEPA2AC = "vjepa2ac"
     WHISPER_LARGE = "whisper_large"
     HIGGS_AUDIO = "higgs_audio"
+    PARAKEET = "parakeet"
+    NEMOTRON_ASR = "nemotron_asr"
     QWEN3_5 = "qwen3.5"
     QWEN3_8 = "qwen3.8"
 
@@ -459,6 +478,10 @@ class ModelType(Enum):
             return WhisperLarge(**kwargs)
         if self == ModelType.HIGGS_AUDIO:
             return HiggsAudio(**kwargs)
+        if self == ModelType.PARAKEET:
+            return Parakeet(**kwargs)
+        if self == ModelType.NEMOTRON_ASR:
+            return NemotronAsr(**kwargs)
         if self == ModelType.QWEN3_5:
             return Qwen3_5_Dense(**kwargs)
         if self == ModelType.QWEN3_8:

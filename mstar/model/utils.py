@@ -423,3 +423,55 @@ def load_generation_defaults(
     if False in (config.get(prefix + "do_sample"), config.get(prefix + "dosample")):
         out[stage + "temperature"] = 0.0
     return out
+
+
+# The 25 European languages of NVIDIA's Granary-trained speech checkpoints
+# (canary-1b-v2, parakeet-tdt-0.6b-v3).
+GRANARY_LANGUAGES = (
+    "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it",
+    "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk",
+)
+
+
+def base_language(code: str) -> str:
+    """``en-US``, ``en_us`` or ``EN`` -> ``en``."""
+    if not isinstance(code, str):
+        raise ValueError(f"a language is a code such as 'en'; got {code!r}")
+    return code.replace("_", "-").split("-")[0].lower()
+
+
+def check_loaded(module: torch.nn.Module, loaded: set[str], what: str) -> None:
+    """Raise unless ``loaded`` names every parameter of ``module``: one built on
+    ``meta`` and filled by a loader would otherwise serve uninitialized memory."""
+    missing = sorted({name for name, _ in module.named_parameters()} - loaded)
+    if missing:
+        raise KeyError(f"{what}: checkpoint is missing {len(missing)} parameters, e.g. {missing[:4]}")
+
+
+class SentencePieceDetokenizer:
+    """Per-token detokenization for SentencePiece-style vocabularies (``▁``
+    marks a word start, ``<0xNN>`` pieces are byte fallback), read from an HF
+    ``tokenizer.json``. Same contract as :class:`ByteLevelDetokenizer`: bytes
+    per token, so a character split across byte pieces reassembles client-side.
+    """
+
+    def __init__(self, tokenizer_json: dict, extra_skip_ids: set[int] = frozenset()):
+        vocab = tokenizer_json["model"]["vocab"]
+        if isinstance(vocab, list):  # Unigram: [piece, score] pairs
+            vocab = {piece: idx for idx, (piece, _) in enumerate(vocab)}
+        vocab = dict(vocab)
+        for added in tokenizer_json.get("added_tokens", []):
+            vocab[added["content"]] = added["id"]
+        self.pieces = {idx: piece for piece, idx in vocab.items()}
+        self.skip_ids = {a["id"] for a in tokenizer_json.get("added_tokens", []) if a["special"]} | set(extra_skip_ids)
+
+    def piece_bytes(self, token_id: int) -> bytes:
+        piece = self.pieces.get(token_id)
+        if piece is None or token_id in self.skip_ids:
+            return b""
+        if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
+            return bytes([int(piece[3:5], 16)])
+        return piece.replace("▁", " ").encode("utf-8")
+
+    def to_bytes(self, token_ids: list[int]) -> bytes:
+        return b"".join(self.piece_bytes(i) for i in token_ids)

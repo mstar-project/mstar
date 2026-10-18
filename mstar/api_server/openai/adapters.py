@@ -1065,6 +1065,52 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
     return language, segments, parts, start is not None
 
 
+def _untimed_transcription_kwargs(req: TranscriptionRequest, model: str) -> dict:
+    """``model_kwargs`` for a model that takes no conditioning text and emits
+    no timestamps: the OpenAI ``prompt`` is dropped, granularities refused."""
+    mk = _transcription_kwargs(req)
+    mk.pop("initial_prompt", None)
+    if req.timestamp_granularities:
+        raise ValueError(f"{model} does not produce timestamps; leave timestamp_granularities unset")
+    mk.pop("timestamps", None)
+    return mk
+
+
+class TransducerAdapter(OpenAIAdapter):
+    """NVIDIA Parakeet / Nemotron ASR: transducer speech recognition.
+
+    Parakeet-TDT (``detects_language``) detects the language from the speech
+    and refuses only a ``language`` it doesn't know; Nemotron takes it as its
+    prompt (a locale such as ``en-US``, a bare code, or ``auto``), checked
+    against the checkpoint's locales when the upload is preprocessed. Neither
+    takes free-text conditioning or emits timestamps here.
+    """
+
+    supports_transcriptions = True
+    # full attention over the clip; longer uploads run as independent windows
+    max_audio_seconds = 600.0
+    long_form = "parallel"
+    # greedy only: a retry at a higher temperature decodes the same text
+    compression_ratio_threshold = None
+
+    def __init__(self, detects_language: bool = False):
+        self.detects_language = detects_language
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        mk = _untimed_transcription_kwargs(req, "this model")
+        if self.detects_language:
+            from mstar.model.parakeet.config import check_detected_language
+
+            check_detected_language(mk.get("language"))
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
 class HiggsAudioAdapter(OpenAIAdapter):
     """Higgs-Audio v3 STT: an instruction-following LLM decoder, so the OpenAI
     ``prompt`` is the transcription instruction (the model has a default)."""
@@ -1148,6 +1194,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "wan22": Wan22Adapter(),
     "ltx2_5": LTX25Adapter(),
     "whisper_large": WhisperAdapter(),
+    "parakeet": TransducerAdapter(detects_language=True),
+    "nemotron_asr": TransducerAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
     "omnilingual_asr_ctc_300m": OmnilingualASRAdapter(),
     "omnilingual_asr_ctc_1b": OmnilingualASRAdapter(),

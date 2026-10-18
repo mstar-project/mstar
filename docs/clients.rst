@@ -238,7 +238,7 @@ Endpoints and model coverage:
      - speech models that publish a voice list through their speech adapter (``kokoro``, ``orpheus``; 404 otherwise)
      - The ``voice`` ids the served model accepts, plus its default.
    * - ``POST /v1/audio/transcriptions``
-     - ``whisper_large``, ``higgs_audio``, ``omnilingual_asr_ctc_*``
+     - ``whisper_large``, ``higgs_audio``, ``omnilingual_asr_ctc_*``, ``parakeet``, ``nemotron_asr``
      - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
        ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
    * - ``WS /v1/realtime?intent=transcription``
@@ -322,6 +322,12 @@ Per-model notes:
   in ``extra_body``, 5 to 40, sets both lengths). There are no timestamps: ``srt`` / ``vtt``
   get one cue spanning the file. Nothing detects the language: ``verbose_json``'s
   ``language`` is the request's ``language`` as given, or null.
+- **Parakeet / Nemotron ASR** — no conditioning text (``prompt`` is dropped) and no
+  timestamps: ``timestamp_granularities`` is a 400, and ``srt`` / ``vtt`` / ``verbose_json``
+  get one segment per window. Parakeet detects the language itself and refuses a
+  ``language`` outside the 25 it knows; Nemotron takes a locale (``en-US``), a bare code or
+  ``auto``. Uploads longer than the model's clip (10 min for Parakeet and Nemotron) run as
+  parallel windows.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``
