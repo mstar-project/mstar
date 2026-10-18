@@ -46,7 +46,7 @@ class ArrayOutputFamily(Family):
     def compare_to_reference(self, out: np.ndarray, ref: np.ndarray) -> dict:
         return M.array_errors(out, ref)
 
-    def reference_check(self, sc: FamilyScore, rows: list[dict]) -> None:
+    def reference_check(self, sc: FamilyScore, rows: list[dict], ref_dir: Path | None = None) -> None:
         pass
 
     def score(self, sset: SampleSet, runs: list[Path], ref_dir: Path | None, work: Path,
@@ -89,7 +89,7 @@ class ArrayOutputFamily(Family):
                                f"<={self.repro_pass} PASS, <={self.repro_warn} WARN (provisional, kernel choice "
                                "can differ per process)")
         if ref_out:
-            self.reference_check(sc, rows)
+            self.reference_check(sc, rows, ref_dir)
         elif not self.self_consistency_only:
             sc.check("agreement with reference", None, "NO_REFERENCE", self.reference_description())
         sc.rows = rows
@@ -204,11 +204,16 @@ class Vjepa2Embedding(ArrayOutputFamily):
     def to_array(self, raw, resp=None):
         return raw.reshape(1, -1, 1024)
 
+    @property
+    def ref_dtype(self) -> str:
+        """fp32 (the gate) or bf16 (--family-opt ref_dtype=bf16, to size the bf16 gap)."""
+        return self.opt("ref_dtype", "fp32")
+
     def reference_id(self) -> str:
-        return "hf-vjepa2-vitl-fpc64-256-encoder-fp32"
+        return f"hf-vjepa2-vitl-fpc64-256-encoder-{self.ref_dtype}"
 
     def reference_description(self) -> str:
-        return f"HF transformers VJEPA2Model {self.hf_id} (fp32, eager) encoder, AutoVideoProcessor"
+        return f"HF transformers VJEPA2Model {self.hf_id} ({self.ref_dtype}, eager) encoder, AutoVideoProcessor"
 
     def make_reference(self, sset: SampleSet, ref_dir: Path, device: str) -> None:
         import torch
@@ -216,11 +221,13 @@ class Vjepa2Embedding(ArrayOutputFamily):
 
         from benchmark.correctness.families.video import read_video
 
+        dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[self.ref_dtype]
         proc = AutoVideoProcessor.from_pretrained(self.hf_id)
-        model = VJEPA2Model.from_pretrained(self.hf_id, dtype=torch.float32).to(device).eval()
+        model = VJEPA2Model.from_pretrained(self.hf_id, dtype=dtype).to(device).eval()
         for it in sset.items:
             frames = read_video(sset.path(it.files["clip_mp4"]))
             inputs = proc(videos=torch.from_numpy(frames).permute(0, 3, 1, 2), return_tensors="pt").to(device)
+            inputs = {k: (v.to(dtype) if v.is_floating_point() else v) for k, v in inputs.items()}
             with torch.inference_mode():
                 out = model(**inputs, skip_predictor=True).last_hidden_state
             np.save(ref_dir / "outputs" / f"{it.id}.npy", out.float().cpu().numpy())
@@ -231,13 +238,20 @@ class Vjepa2Embedding(ArrayOutputFamily):
         e["cosine"] = M.cosine(out, ref)
         return e
 
-    def reference_check(self, sc: FamilyScore, rows: list[dict]) -> None:
+    def reference_check(self, sc: FamilyScore, rows: list[dict], ref_dir: Path | None = None) -> None:
         cos = [r["ref_cosine"] for r in rows if "ref_cosine" in r]
         if not cos:
             sc.check("embedding cosine vs reference", None, "ERROR", "no comparable outputs (size mismatch?)")
             return
         worst = min(cos)
         sc.metrics["cosine"] = M.distribution(cos)
+        # The bf16 reference against the fp32 one, when both exist: the gap bf16 alone opens.
+        other = ref_dir.parent.parent / "hf-vjepa2-vitl-fpc64-256-encoder-bf16" / ref_dir.name if ref_dir else None
+        if self.ref_dtype == "fp32" and other is not None and (other / "meta.json").is_file():
+            pairs = [(np.load(ref_dir / "outputs" / f"{r['id']}.npy"), np.load(other / "outputs" / f"{r['id']}.npy"))
+                     for r in rows if (other / "outputs" / f"{r['id']}.npy").is_file()]
+            sc.metrics["hf_bf16_vs_hf_fp32_cosine"] = M.distribution([M.cosine(b, a) for a, b in pairs
+                                                                      if a.shape == b.shape])
         sc.check("min embedding cosine vs reference", round(worst, 6),
                  band(worst, lambda v: v >= 0.999, lambda v: v >= 0.99), ">=0.999 PASS (competitor matrix bar), "
                  ">=0.99 WARN")
