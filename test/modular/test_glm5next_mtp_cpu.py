@@ -48,7 +48,7 @@ class _GreedySampler(Resource):
     def build(cls, spec, info):
         return cls()
 
-    def sample(self, request_ids, logits, **kwargs):
+    def sample(self, logits, **kwargs):
         return logits.argmax(-1)
 
 
@@ -464,7 +464,7 @@ def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
     eos = cfg.eos_token_ids[1]
     greedy = engine._resources[SAMPLER]
 
-    def eos_once(rids, logits, **kw):
+    def eos_once(logits, **kw):
         del greedy.sample  # back to the class's argmax
         return torch.full((logits.shape[0],), eos, dtype=torch.long)
 

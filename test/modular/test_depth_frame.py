@@ -80,6 +80,9 @@ class _StubSampler:
     def advance_offsets(self, draws):
         self.advanced.append(draws)
 
+    def sample(self, logits):
+        return logits.argmax(-1)
+
 
 class _StubFrame:
     """Records its launches instead of running the kernel."""
@@ -109,7 +112,7 @@ def _talker(frame):
 
 
 def _run_depth(talker, sampler, rows=3):
-    return talker._run_depth(torch.zeros(rows, 2048), torch.zeros(rows, dtype=torch.long), sampler, ["r"] * rows)
+    return talker._run_depth(torch.zeros(rows, 2048), torch.zeros(rows, dtype=torch.long), sampler)
 
 
 def test_a_step_the_frame_can_draw_runs_the_frame_and_moves_the_offsets_past_its_draws():

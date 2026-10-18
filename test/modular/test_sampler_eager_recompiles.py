@@ -49,7 +49,7 @@ def test_a_new_batch_of_a_seen_size_reuses_the_compiled_forward(monkeypatch):
 
     @torch.compile(backend="eager", dynamic=None)
     def head(hidden, request_ids):
-        return res.sample(request_ids, hidden * 2)
+        return res.sample(hidden * 2)
 
     torch._dynamo.reset()
     try:

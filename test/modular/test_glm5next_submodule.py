@@ -58,7 +58,7 @@ class _GreedySampler(Resource):
     def build(cls, spec, info):
         return cls()
 
-    def sample(self, request_ids, logits, **kwargs):
+    def sample(self, logits, **kwargs):
         return logits.argmax(-1)
 
 

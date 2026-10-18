@@ -49,7 +49,7 @@ class _FakeLM(nn.Module):
 
 
 class _GreedySampler:
-    def sample(self, request_ids, logits):
+    def sample(self, logits):
         self.logits = logits
         return logits.argmax(-1)
 

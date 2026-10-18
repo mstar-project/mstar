@@ -469,7 +469,7 @@ class LLMSubmodule(ARNodeSubmodule):
             sampler: SamplerResource = engine_inputs.resources[SAMPLER]
             t0 = perf_counter() if PHASE_PERIOD else 0.0
             laps = PhaseLaps("engine.preprocess.loopback.")
-            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            ids = sampler.loopback_tokens()
             laps.lap("tokens")
             decode = graph_walk == "decode"
             # rows whose last step ran elsewhere brought their token
@@ -589,7 +589,7 @@ class LLMSubmodule(ARNodeSubmodule):
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         if input_ids is None and input_embeds is None:
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            input_ids = sampler.loopback_tokens()
         if self._rope_in_graph(engine_inputs, graph_walk) or cos_3d is None or sin_3d is None:
             # the tables come from the planned positions, inside the graph
             # (off a captured decode's per-step critical path); the static
@@ -608,7 +608,7 @@ class LLMSubmodule(ARNodeSubmodule):
             # only the last token of each prefill row feeds the head
             hidden = attn.select_last_hidden(hidden)
         logits = self.model.lm_head(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+        return sampler.sample(logits)
 
     def forward(
         self,
