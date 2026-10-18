@@ -37,10 +37,14 @@ class FlashInferManager(AttentionManager):
         splits: tuple[CombinedSplit, ...] = (),
         max_rows_in_combined: Mapping[str, int | None] | None = None,
         sliding_window: int | None = None,
+        decode_tensor_cores: bool = True,
     ):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
         self._max_rows_in_combined = max_rows_in_combined or {}
+        # off where the build's decode-without-tensor-cores kernel is the
+        # faster one (FlashInfer on ROCm); see `flashinfer_kwargs`
+        self._decode_tensor_cores = decode_tensor_cores
         self._device = device
         self._dtype = dtype
         # FlashInfer counts preceding positions; M* counts the current token too.
@@ -115,6 +119,7 @@ class FlashInferManager(AttentionManager):
                 max_prefill_rows=split.max_prefill_rows(
                     self._max_rows_in_combined, num_rows,
                 ),
+                use_tensor_cores=self._decode_tensor_cores,
                 **kv_kwargs,
             )
         elif bucket.bs == bucket.num_tokens and not force_prefill:
@@ -122,6 +127,7 @@ class FlashInferManager(AttentionManager):
                 workspace_buffer=buffer,
                 batch_size=num_rows,
                 accelerator_graph=True,
+                use_tensor_cores=self._decode_tensor_cores,
                 **kv_kwargs,
             )
         else:
@@ -147,10 +153,14 @@ class FlashInferManager(AttentionManager):
         key = EagerSlotKey(label=label, slot=slot, is_decode=is_decode)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            cls = FlashInferDecodeWrapper if is_decode else FlashInferPrefillWrapper
+            kwargs = dict(self._wrapper_kv_kwargs)
+            if is_decode:
+                cls = FlashInferDecodeWrapper
+                kwargs["use_tensor_cores"] = self._decode_tensor_cores
+            else:
+                cls = FlashInferPrefillWrapper
             wrapper = self._eager_plan_states[key] = cls(
-                workspace_buffer=self._workspaces.get(label, slot),
-                **self._wrapper_kv_kwargs,
+                workspace_buffer=self._workspaces.get(label, slot), **kwargs,
             )
         return wrapper
 
