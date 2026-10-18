@@ -270,10 +270,12 @@ chatterbox_multilingual = [
 
 # Fun-CosyVoice3: reference clips decode through Chatterbox's loader (soundfile,
 # torchcodec as the fallback); the speech tokenizer and speaker encoder load from
-# the checkpoint's ONNX files without onnxruntime.
+# the checkpoint's ONNX files without onnxruntime; inflect spells out digits as
+# the reference's text frontend does.
 cosyvoice3 = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
+    "inflect>=7.3.1",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "soundfile",

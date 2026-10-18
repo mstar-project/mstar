@@ -721,6 +721,12 @@ CosyVoice3 notes
 - Japanese written in kana alone, with spaces between words, is read poorly,
   as it is by the official model: in tests both garbled common words such as
   ゆっくり and ありがとうございました on every seed.
+- Digits are spelled out before tokenizing, as the reference frontend does
+  without ``wetext`` ("Flight 247" becomes "Flight two hundred and
+  forty-seven", with ``inflect`` from the ``cosyvoice3`` extra); text with
+  Chinese gets the reference's blank, bracket and punctuation rules instead,
+  and text with a ``<|...|>`` tag is left alone. ``text_frontend: false``
+  sends the text as written.
 - The flow's DiT estimator runs in bfloat16 by default; the Euler state, the
   rest of the flow and the HiFT vocoder stay float32 (HiFT's F0 predictor
   float64).

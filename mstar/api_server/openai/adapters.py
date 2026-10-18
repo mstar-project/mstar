@@ -820,8 +820,9 @@ class CosyVoice3Adapter(OpenAIAdapter):
     media, or bare base64 audio; never a server path), with its transcript in
     ``ref_text``. ``instructions`` becomes ``instruct``. ``temperature``,
     ``top_p`` and ``seed`` are the standard fields; ``top_k``, ``ras_window``,
-    ``ras_tau``, ``n_cfm_timesteps`` and ``max_new_tokens`` (25 Hz speech
-    tokens) pass through ``extra_body``. ``speed`` is dropped.
+    ``ras_tau``, ``n_cfm_timesteps``, ``max_new_tokens`` (25 Hz speech
+    tokens) and ``text_frontend`` pass through ``extra_body``. ``speed`` is
+    dropped.
 
     Long text is synthesized in sentence chunks, as the reference frontend
     (``text_normalize``) does: pieces of about 80 tokens, or 60 to 80
