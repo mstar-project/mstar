@@ -210,7 +210,7 @@ def run_client(cmd: list[str], env: dict, log_path: Path) -> tuple[int, float]:
 
 
 def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, arm_dir: Path,
-             gpus: list[int]) -> dict:
+             gpus: list[int], numa: int | None = None) -> dict:
     cell_dir = arm_dir / "cells" / wl.name / f"c{c}"
     done = cell_dir / "cell.json"
     if plan.resume and done.is_file() and json.loads(done.read_text()).get("status") != "error":
@@ -228,6 +228,8 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
             rdir.mkdir(parents=True, exist_ok=True)
             warm = wl.warmup_waves_first if k == 1 else wl.warmup_waves_next
             cmd = runner_command(arm, row, wl, c, port, rdir, warm)
+            if numa is not None:
+                cmd = ["numactl", f"--cpunodebind={numa}", f"--membind={numa}", *cmd]
             (rdir / "cotenants.json").write_text(json.dumps(cotenants(os.environ.get("SLURM_JOB_ID")), indent=1))
             (rdir / "command.txt").write_text(shlex.join(cmd) + "\n")
             env = client_env(arm, row, gpus)
@@ -307,7 +309,7 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
                 if wl.family != row.family:
                     continue
                 for c in wl.concurrency:
-                    cell = run_cell(plan, arm, row, wl, c, port, arm_dir, gpus)
+                    cell = run_cell(plan, arm, row, wl, c, port, arm_dir, gpus, numa)
                     s = cell["summary"].get(wl.primary[0], {})
                     plan.log(f"{row.name}/{arm.name} {wl.name} c={c}: {wl.primary[0]} "
                              f"{s.get('median', float('nan')):.4g} spread "
@@ -333,28 +335,49 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
     return info
 
 
-def run_lane(plan: Plan, lane: str, gpus: list[int], rows: list[Row], port: int) -> None:
-    for i, row in enumerate(rows):
-        arms = catalog.arms_for(row, plan.arms)
-        # Rotate the arm order per row so no arm always runs first (or last) on a warm GPU.
-        k = i % len(arms) if arms else 0
-        for arm in arms[k:] + arms[:k]:
-            run_arm(plan, row, arm, gpus[: row.gpus], port, lane)
+def run_row(plan: Plan, row: Row, index: int, gpus: list[int], port: int) -> None:
+    """Every arm of one row, back to back on the same GPUs."""
+    arms = catalog.arms_for(row, plan.arms)
+    # Rotate the arm order per row so no arm always runs first (or last) on a warm GPU.
+    k = index % len(arms) if arms else 0
+    for arm in arms[k:] + arms[:k]:
+        run_arm(plan, row, arm, gpus, port, "")
 
 
-def assign_lanes(rows: list[Row], gpus: list[int], lanes: int) -> list[tuple[list[int], list[Row]]]:
-    """Split the GPUs into ``lanes`` equal groups and give each row to the lane with the least work."""
-    size = len(gpus) // lanes
-    if size < max(r.gpus for r in rows):
-        raise ValueError(f"{lanes} lanes on {len(gpus)} GPUs leaves {size} per lane, a row needs "
-                         f"{max(r.gpus for r in rows)}")
-    groups = [(gpus[i * size:(i + 1) * size], []) for i in range(lanes)]
-    load = [0] * lanes
-    for row in sorted(rows, key=lambda r: -r.gpus):
-        j = min(range(lanes), key=lambda x: load[x])
-        groups[j][1].append(row)
-        load[j] += 1
-    return groups
+def run_rows(plan: Plan, rows: list[Row], gpus: list[int], parallel: int, port_base: int) -> None:
+    """Run rows on the GPU pool, at most ``parallel`` at a time, each on as many GPUs as it needs.
+    Wide and expensive rows start first so the tail is short."""
+    free = list(gpus)
+    cond = threading.Condition()
+    running = [0]
+    threads = []
+
+    def one(row, index, mine, port):
+        try:
+            run_row(plan, row, index, mine, port)
+        finally:
+            with cond:
+                free.extend(mine)
+                running[0] -= 1
+                cond.notify_all()
+
+    order = sorted(rows, key=lambda r: (-r.gpus, -r.cost))
+    for i, row in enumerate(order):
+        if row.gpus > len(gpus):
+            plan.log(f"{row.name}: needs {row.gpus} GPUs, the run has {len(gpus)}; skipped")
+            continue
+        with cond:
+            while len(free) < row.gpus or running[0] >= parallel:
+                cond.wait()
+            mine = sorted(free)[: row.gpus]
+            for g in mine:
+                free.remove(g)
+            running[0] += 1
+        t = threading.Thread(target=one, args=(row, rows.index(row), mine, port_base + 10 * i), name=row.name)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
 
 
 def check_node(plan: Plan, node_type: str) -> dict:
@@ -386,7 +409,7 @@ def main(argv=None) -> int:
     ap.add_argument("--workloads", default=None, help="comma list (default: the table's)")
     ap.add_argument("--repeats", type=int, default=None)
     ap.add_argument("--concurrency", default=None, help="comma list replacing every workload's (dry runs)")
-    ap.add_argument("--lanes", type=int, default=1, help="rows run in parallel on disjoint GPU groups")
+    ap.add_argument("--lanes", type=int, default=1, help="rows that may run at once, each on its own GPUs")
     ap.add_argument("--numa", action="store_true", help="bind each server to its GPU's NUMA node")
     ap.add_argument("--port-base", type=int, default=8400)
     ap.add_argument("--expect-gpus", type=int, default=None, help="node GPU count for the health check")
@@ -447,18 +470,7 @@ def main(argv=None) -> int:
             plan.log("dry run: continuing past the health FAIL")
         health.snapshot(run_dir / "health" / "snapshot_table_before.txt")
 
-    lanes = assign_lanes(rows, gpus, args.lanes)
-    threads = []
-    for i, (lane_gpus, lane_rows) in enumerate(lanes):
-        if not lane_rows:
-            continue
-        port = args.port_base + 10 * i
-        name = f"lane{i}" if args.lanes > 1 else ""
-        t = threading.Thread(target=run_lane, args=(plan, name, lane_gpus, lane_rows, port), name=name or "lane0")
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
+    run_rows(plan, rows, gpus, args.lanes, args.port_base)
 
     if not args.skip_health:
         health.snapshot(run_dir / "health" / "snapshot_table_after.txt")
