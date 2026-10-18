@@ -1,10 +1,10 @@
-"""RoPE on AMD GPUs: FlashInfer's ROCm fork, reading a precomputed cos/sin cache.
+"""RoPE on AMD GPUs: FlashInfer's ROCm fork.
 
-The fork's cos/sin-cache kernel was the fastest measured on gfx942 at decode
-sizes, and it is the only form that covers Llama 3.1 scaling quickly: the fork's
-on-the-fly Llama 3.1 kernel is several times slower. ``PositionManager`` folds
-the frequency scaling and the rotary width into the fp32 cache. Imported only on
-ROCm.
+With the fp32 cos/sin cache ``PositionManager`` builds from its config (frequency
+scale and Llama 3.1 blend applied), the fork's cos/sin-cache kernel: the fastest
+measured on gfx942 at decode sizes, where the fork's on-the-fly Llama 3.1 kernel
+is several times slower. Without one (a layer passing arguments the cache was not
+built from), the on-the-fly kernels NVIDIA GPUs run. Imported only on ROCm.
 """
 
 import torch
@@ -27,12 +27,24 @@ def rope_apply_qk_inplace(
     high_freq_factor: float | None = None,
     old_context_len: float | None = None,
 ) -> None:
-    """Rotate the first ``cos_sin_cache.shape[-1]`` dims of each head in place."""
-    if cos_sin_cache is None:
-        raise RuntimeError(
-            "RoPE on AMD GPUs reads the cos/sin cache PositionManager builds; "
-            "none was passed"
+    """Rotate q and k in place; the cache, when given, fixes the angles."""
+    if cos_sin_cache is not None:
+        _rope.apply_rope_with_cos_sin_cache_inplace(
+            pos_ids, q, k, q.shape[-1], cos_sin_cache, is_neox=not interleave,
         )
-    _rope.apply_rope_with_cos_sin_cache_inplace(
-        pos_ids, q, k, q.shape[-1], cos_sin_cache, is_neox=not interleave,
+        return
+    rope_kwargs = dict(
+        rotary_dim=rotary_dim, interleave=interleave,
+        rope_scale=rope_scale, rope_theta=rope_theta,
     )
+    llama31 = None not in (low_freq_factor, high_freq_factor, old_context_len)
+    # the Llama 3.1 blend is the identity at scale 1, and its kernel is slower
+    if llama31 and rope_scale != 1.0:
+        _rope.apply_llama31_rope_pos_ids_inplace(
+            q, k, pos_ids, **rope_kwargs,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
+            old_context_len=old_context_len,
+        )
+    else:
+        _rope.apply_rope_pos_ids_inplace(q, k, pos_ids, **rope_kwargs)
