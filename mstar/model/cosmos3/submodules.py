@@ -3161,9 +3161,9 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
             embeds = embeds.masked_scatter(mask.unsqueeze(-1), vision_embeds.to(embeds.dtype))
         return embeds
 
-    def _sample(self, request_ids: list[str], logits: torch.Tensor, engine_inputs: ModelInputsFromEngine):
+    def _sample(self, logits: torch.Tensor, engine_inputs: ModelInputsFromEngine):
         resources = engine_inputs.resources or self.node_resources
-        tokens = resources[SAMPLER].sample(request_ids, logits)
+        tokens = resources[SAMPLER].sample(logits)
         # The sampler reuses its output buffer across calls; keep our own copy.
         return tokens.clone()
 
@@ -3184,13 +3184,13 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, input_ids, position_ids, seq_lens,
                 vision_embeds=None, **kwargs):
         logits = self._run(graph_walk, engine_inputs, input_ids, position_ids, seq_lens, vision_embeds)
-        tokens = self._sample(engine_inputs.request_ids, logits, engine_inputs)
+        tokens = self._sample(logits, engine_inputs)
         return {"new_token": [tokens[:1]]}
 
     def forward_batched(self, graph_walk, engine_inputs: ModelInputsFromEngine, input_ids, position_ids, seq_lens,
                         vision_embeds=None, **kwargs):
         logits = self._run(graph_walk, engine_inputs, input_ids, position_ids, seq_lens, vision_embeds)
-        tokens = self._sample(engine_inputs.request_ids, logits, engine_inputs)
+        tokens = self._sample(logits, engine_inputs)
         return {
             rid: {"new_token": [token]}
             for rid, token in zip(engine_inputs.request_ids, tokens.split(1), strict=True)
