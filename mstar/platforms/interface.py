@@ -120,8 +120,11 @@ class RocmPlatform(Platform):
         return {}
 
     def process_env_defaults(self) -> dict[str, str]:
-        # nothing yet, no candidate measured a win on MI300X
-        return {}
+        return {
+            # MIOpen's split-K implicit-GEMM conv solver is not deterministic. Turning
+            # it off costs about 1% and makes same-seed outputs repeat.
+            "MIOPEN_DEBUG_CONV_IMPLICIT_GEMM_ASM_FWD_GTC_XDLOPS_NHWC": "0",
+        }
 
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
