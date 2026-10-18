@@ -1,8 +1,11 @@
 test/modular/test_graph_io.py
 test/modular/test_resource_runner.py
+test/modular/test_per_request_state.py
+test/modular/test_windowing.py
 test/modular/test_admit_failure_handling.py
 test/modular/test_micro_scheduler.py
 test/modular/test_worker_drain.py
+test/modular/test_worker_message_handling.py
 test/modular/test_profiler_nvtx.py
 test/modular/test_ragged_attention_cpu.py
 test/modular/test_rid_handles.py
@@ -25,6 +28,7 @@ test/modular/test_binary_framing.py
 test/modular/test_video_frame_protocol.py
 test/modular/test_client_sdk.py
 test/modular/test_request_failure_propagation.py
+test/modular/test_ingest_unpersist.py
 test/modular/test_api_result_delivery.py
 test/modular/test_api_completion_guard.py
 test/modular/test_speculation_external_inputs.py
@@ -51,8 +55,10 @@ test/modular/test_recurrent_preplan.py
 test/modular/test_mamba2_geometry.py
 test/modular/test_mamba2_resource.py
 test/modular/test_streams.py
+test/modular/test_platforms.py
 test/modular/test_batched_model_output.py
 test/modular/test_qwen3_5_check_stop_batched.py
+test/modular/test_model_registration.py
 test/modular/test_lazy_publish.py
 test/modular/test_collect_outputs_fast_path.py
 test/modular/test_inline_tokens.py
@@ -71,6 +77,7 @@ test/modular/test_worker_device_loopback.py
 test/modular/test_gc_freeze.py
 test/modular/test_qwen3_5_bucket_knobs.py
 test/modular/test_fast_tokenize.py
+test/modular/test_qwen3_5_config.py
 test/modular/test_wire_codec.py
 test/modular/test_wire_security.py
 test/modular/test_model_kwargs_tensor_transport.py
@@ -89,3 +96,6 @@ test/modular/test_qwen3_5_mixed.py
 test/modular/test_qwen3omni_vision_mixed.py
 test/modular/test_flashinfer_force_prefill.py
 test/modular/test_spec_chain_key.py
+test/modular/test_launch_script_socket_prefix.py
+test/modular/test_startup_graph_validation.py
+test/modular/test_media_paths.py

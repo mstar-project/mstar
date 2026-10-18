@@ -139,7 +139,33 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
         },
     )
     assert r.status_code == 400
-    assert r.json()["error"]["type"] == "server_error"
+    assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_chat_refuses_server_paths_uniformly(client_and_stub, tmp_path):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    loop = tmp_path / "loop.png"
+    loop.symlink_to(loop)
+    for ref in (str(loop), str(tmp_path / "missing.png"), "/etc/hostname"):
+        r = client.post("/v1/chat/completions", json={"model": "bagel", "messages": [{
+            "role": "user", "content": [{"type": "image_url", "image_url": {"url": ref}}]}]})
+        assert r.status_code == 400, (ref, r.text)
+        message = r.json()["error"]["message"]
+        assert message.startswith("server file paths are refused") and str(tmp_path) not in message
+    assert stub.last_submit is None
+
+
+@pytest.mark.parametrize("model", ["qwen3_tts_base", "omnivoice"])
+def test_voice_clone_refuses_server_paths_uniformly(client_and_stub, model):
+    client, stub = client_and_stub
+    stub.model_name = model
+    # the suffix-less ones are valid base64; "//..." even decodes to an MPEG frame sync
+    for ref in ("/etc/passwd", "//etc/passwd", "//etc/shadow", "secret", "///x", "/etc/hostname.wav"):
+        r = client.post("/v1/audio/speech", json={"model": model, "input": "hi", "ref_audio": ref, "ref_text": "hi"})
+        assert r.status_code == 400, (ref, r.text)
+        assert r.json()["error"]["message"].startswith("server file paths are refused")
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
 
 
 def test_chat_audio_output(client_and_stub):
@@ -468,6 +494,32 @@ def test_image_routes_report_validation_errors_as_400(client_and_stub):
     )
     assert resp.status_code == 400
 
+
+def _refuse(**kw):
+    raise ValueError("size must be 'WxH'")
+
+
+@pytest.mark.parametrize("model,path,body", [
+    ("bagel", "/v1/chat/completions", {"json": {"messages": [{"role": "tool", "content": "sunny"}]}}),
+    ("orpheus", "/v1/audio/speech", {"json": {"input": "hi", "response_format": "xyz"}}),
+    ("whisper_large", "/v1/audio/transcriptions",
+     {"data": {"long_form": "xyz"}, "files": {"file": ("a.wav", b"RIFF", "audio/wav")}}),
+    ("bagel", "/v1/images/generations", {"json": {"prompt": "a cat"}}),
+    ("bagel", "/v1/images/edits",
+     {"data": {"prompt": "make it neon"}, "files": {"image": ("in.png", b"\x89PNGinput", "image/png")}}),
+    ("wan22", "/v1/videos/generations", {"json": {"prompt": "x", "video": "data:video/mp4;base64,AAAA"}}),
+], ids=["chat", "speech", "transcriptions", "images", "edits", "videos"])
+def test_every_route_calls_a_400_an_invalid_request_error(client_and_stub, model, path, body):
+    """OpenAI types a 400 ``invalid_request_error``: the request is at fault, and sending it again gets the same
+    400. ``server_error`` says the opposite."""
+    client, stub = client_and_stub
+    stub.model_name = model
+    stub.submit_request = _refuse  # bagel's image adapters refuse no field, so its routes refuse at submit
+    r = client.post(path, **body)
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error", "a 400 reads as the server's fault"
+
+
 def test_audio_voices_lists_model_voices(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "orpheus"
@@ -509,8 +561,8 @@ def test_speech_refuses_a_format_it_cannot_produce(client_and_stub, body):
 
 
 @pytest.mark.parametrize("ref,message", [
-    ("/etc/passwd", "paths on the server are refused"),
-    ("file:///etc/passwd", "paths on the server are refused"),
+    ("/etc/passwd", "server file paths are refused"),
+    ("file:///etc/passwd", "server file paths are refused"),
     (123, "got int"),
     ({"url": "x"}, "got dict"),
 ])

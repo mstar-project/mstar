@@ -17,11 +17,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``bagel``
      - ``ByteDance-Seed/BAGEL-7B-MoT``
      - Unified multimodal model (text + image understanding and generation).
-   * - ``chatterbox`` / ``chatterbox_turbo``
+   * - ``chatterbox`` / ``chatterbox_multilingual`` / ``chatterbox_turbo``
      - ``ResembleAI/chatterbox``, ``ResembleAI/chatterbox-turbo``
      - Zero-shot voice-cloning TTS: T3 speech-token LM (Llama-520M, or GPT-2-medium
        for Turbo) with CFG and exaggeration control, S3Gen flow-matching decoder,
-       HiFT vocoder, PerTh watermark. 24 kHz.
+       HiFT vocoder, PerTh watermark. 24 kHz. Multilingual covers 23 languages.
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
@@ -67,6 +67,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
        attention interleaved with full attention, plus a ViT tower.
+   * - ``qwen3_8_27b``
+     - ``Qwen/Qwen3.8-27B``
+     - Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -101,6 +104,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
+   * - ``waypoint``
+     - ``Overworld/Waypoint-1.5-1B``
+     - Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
+       frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.
    * - ``flux2_klein``
      - ``black-forest-labs/FLUX.2-klein-4B``
      - FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
@@ -140,8 +147,8 @@ OmniVoice notes
   rows over a few unmasking steps, so there is no KV cache and no per-token
   sampling loop. Serve it with ``mstar serve omnivoice --gpus 0``.
 
-Qwen3.5 (``qwen3_5_*``)
------------------------
+Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
+--------------------------------------------------
 
 Text-and-image chat on the Qwen3.5 dense family (five sizes; MoE variants are
 not supported yet; video is refused). Served on both ``POST /generate`` and
@@ -164,6 +171,19 @@ needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
 via ``extra_body``.
+
+Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
+code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::
+
+    mstar serve qwen3_8_27b --gpus 0,1,2,3
+
+Its ``output_gate_type: swish`` names the gated DeltaNet norm's activation,
+which is the SiLU every Qwen3.5 checkpoint already uses. transformers ignores
+the key and hard-codes SiLU, and vLLM reads it the same way. Video is still
+refused and the MTP head is skipped. The chat template's new
+``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
+request gets the template's defaults (``xhigh`` and preserved), whatever the
+client sends.
 
 Kokoro notes
 ------------
@@ -222,7 +242,8 @@ Qwen3-TTS notes
   defaults to automatic detection, ``instruct`` (OpenAI: ``instructions``)
   carries a style instruction (1.7B CustomVoice) or the voice description
   (VoiceDesign, required). Base clones a voice from one reference clip: on
-  ``/v1/audio/speech`` pass ``ref_audio`` (data URL, URL, path or base64) plus
+  ``/v1/audio/speech`` pass ``ref_audio`` (data URL, base64, or an http(s) URL
+  when the server sets ``MSTAR_ALLOW_REMOTE=1``; paths on the server are refused) plus
   ``ref_text`` (its transcript) or ``x_vector_only_mode: true``; with the SDK,
   ``client.tts(text, reference_audio="ref.wav", ref_text="...")``. The clip's
   conditioning (x-vector and codec frames) is memoised by content, so a voice
@@ -507,7 +528,8 @@ Cosmos3 environment requirements
   prefill, the captured CUDA graphs, and multi-request batches.
 - The default denoise attention backend is ``dense_gen``
   (``Cosmos3Config.attention_backend``), which runs bs=1 eager generation
-  attention as one FlashAttention-3 varlen kernel from the ``fa3-fwd`` wheel.
+  attention as one FlashAttention-3 varlen kernel from the ``fa3-fwd`` wheel
+  (AITER's varlen kernel on ROCm).
   That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
   exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
   one matching your environment. When it is not importable, the engine logs a
