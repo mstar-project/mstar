@@ -751,16 +751,10 @@ class MicroScheduler:
             blocked = self._unready_backlog_rids(
                 backlogged, request_state,
                 self._scan_limit(node_walk, pre_existing_batch_size),
-                capture_group_of,
+                capture_group_of, only_walk, skip_walk,
             )
             if not backlogged:
                 backlogged = None  # every row failed
-            elif backlogged.request_walks and (only_walk or skip_walk) is not None:
-                blocked |= {
-                    rid for rid in backlogged.request_to_worker_graph
-                    if (only_walk is not None and backlogged.walk_of(rid) != only_walk)
-                    or backlogged.walk_of(rid) == skip_walk
-                }
         walk_caps = self._walk_caps(node_walk)
 
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
@@ -858,9 +852,11 @@ class MicroScheduler:
     def _unready_backlog_rids(
         self, batch: ScheduledBatch, request_state: RequestStateManager,
         max_bs: int | None = None, capture_group_of: int | None = None,
+        only_walk: str | None = None, skip_walk: str | None = None,
     ) -> set[int]:
         """The rows of a backlogged ``batch`` that cannot run this step; failed
-        rows are dropped from it instead."""
+        rows are dropped from it instead. Rows of a walk other than
+        ``only_walk``, or of ``skip_walk``, are parked."""
         node_partition = request_state.get_partition_for_node(batch.node_name)
         # Held (OOM backoff) and pending-remove rows wait without asking the
         # engine, as on the fresh path: asking reloads an offloaded row, which
@@ -871,6 +867,13 @@ class MicroScheduler:
             rid for rid in batch.request_to_worker_graph
             if rid in self.pending_removes or self.held_until.get(rid, 0.0) > now
         }
+        # Parked by walk, likewise without a check and outside the step's worth.
+        if batch.request_walks and (only_walk or skip_walk) is not None:
+            waiting |= {
+                rid for rid in batch.request_to_worker_graph
+                if (only_walk is not None and batch.walk_of(rid) != only_walk)
+                or batch.walk_of(rid) == skip_walk
+            }
         # Check readiness in backlog order and stop once a step's worth is
         # found: the builder takes the first `max_bs` rids not excluded, which
         # are exactly the ones checked and found ready, and the rids past that
@@ -878,8 +881,8 @@ class MicroScheduler:
         # backlogged request was checked (an engine sweep over the resources
         # each) on every step, with 96 waiting at 128 in flight.
         #
-        # The capture group is settled in the same loop, not left to the
-        # builder: an off-group row must not consume the step's worth, or the
+        # The capture group and the walk are settled here, not left to the
+        # builder: an excluded row must not consume the step's worth, or the
         # scan would stop with rows the builder then takes unchecked.
         limit = len(batch) if max_bs is None else max(max_bs, 0)
         group = functools.partial(

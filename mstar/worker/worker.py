@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
 from time import sleep
+from typing import NamedTuple
 
 import torch
 
@@ -214,6 +215,11 @@ class EvictionPolicy(Enum):
     # gone (``Engine.offload_priority``), for cases where "least recently used"
     # is the wrong question. Needs eviction-policy metadata naming which
     # resource to consult.
+
+
+class SpeculationTarget(NamedTuple):
+    info: SpeculationOutput
+    walk_rids: list[int]  # the step's rids on ``info.graph_walk``
 
 
 # pinned host-row buffers in flight at once (see Worker._stage_host_rows)
@@ -2351,9 +2357,26 @@ class Worker:
         wire = self._rid_str(rid)
         return wire in self._pending_drains or wire in self._draining_rids
 
+    def _choose_spec_target(self, batch: ScheduledBatch) -> SpeculationTarget | None:
+        """The (node, walk) the step after ``batch`` speculates into, with the
+        rids of ``batch`` on that walk; None when nothing can be speculated."""
+        # One sample rid per real walk; the runtime filters eligibility per walk,
+        # prep_spec_rids the loop completion per rid.
+        groups = batch.rids_by_walk()
+        ready_for_spec = self._graph_runtime.speculate_node(
+            batch.node_name, list(groups), [rids[0] for rids in groups.values()],
+        )
+        if not ready_for_spec:
+            return None
+        # TODO: use the microscheduler to break ties when ready_for_spec
+        # contains multiple ready nodes or walks
+        info = ready_for_spec[0]
+        return SpeculationTarget(info, groups[info.graph_walk])
+
     def _try_speculate_next(
         self,
-        pending: PendingBatch
+        pending: PendingBatch,
+        target: SpeculationTarget,
     ) -> Speculation | None:
         """Build a speculative N+1 batch + node_batch, by checking which nodes
         will become ready after the current batch's outputs are ingested.
@@ -2371,21 +2394,9 @@ class Worker:
             current speculation chain to drain before they can be scheduled.
         """
         batch_N = pending.batch
-
-        # One sample rid per real walk; the runtime filters eligibility per walk,
-        # prep_spec_rids the loop completion per rid.
-        groups = batch_N.rids_by_walk()
-        ready_for_spec = self._graph_runtime.speculate_node(
-            batch_N.node_name, list(groups), [rids[0] for rids in groups.values()],
-        )
-        if not ready_for_spec:
-            return # no nodes can be speculated
-
-        # TODO: use the microscheduler to break ties when ready_for_spec
-        # contains multiple ready nodes or walks
-        spec_target_info = ready_for_spec[0]
+        spec_target_info, walk_rids = target
         graph_walk = spec_target_info.graph_walk
-        rid = groups[graph_walk][0]
+        rid = walk_rids[0]
         spec_node_name = spec_target_info.node_name
         speculating_same_node = spec_node_name == batch_N.node_name
 
@@ -2404,7 +2415,7 @@ class Worker:
 
         # Removes, aborts and failures are filtered here; prep_spec_rids
         # assumes that.
-        candidates = [r for r in groups[graph_walk] if not self._is_tearing_down(r)]
+        candidates = [r for r in walk_rids if not self._is_tearing_down(r)]
         # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, StreamingEdge]] = []
         per_rid_counts: list[int] = []
@@ -3871,20 +3882,25 @@ class Worker:
             # another (node, walk) actually ready to schedule on
             # this worker. On single-walk workers (Orpheus LLM,
             # Orpheus SNAC) this returns False and we always speculate.
+            # Keyed on the walk the chain speculates into, not the step's:
+            # after a mixed step that is the combined walk, which no row has,
+            # so the chain's own parked rows would count as other work.
+            target = self._choose_spec_target(pending.batch)
+            chain_key = (
+                (target.info.node_name, target.info.graph_walk) if target is not None
+                else (pending.node_name, pending.graph_walk)
+            )
             other_ready = (
                 fair.peek
                 and consecutive >= 1
-                and self.scheduler.has_ready_excluding(
-                    self.request_state,
-                    (pending.node_name, pending.graph_walk),
-                )
+                and self.scheduler.has_ready_excluding(self.request_state, chain_key)
             )
             must_yield_away = consecutive >= fair.max_consecutive or other_ready
-            if not must_yield_away and not admit_refused:
+            if target is not None and not must_yield_away and not admit_refused:
                 if self.enable_nvtx:
                     range_push("worker.speculate", synchronize=False)
                 _t0 = _time.perf_counter() if self._phase_period else 0.0
-                speculation = self._try_speculate_next(pending)
+                speculation = self._try_speculate_next(pending, target)
                 if self._phase_period:
                     self._phase_record("speculate", _time.perf_counter() - _t0)
                 if self.enable_nvtx:
@@ -3903,10 +3919,7 @@ class Worker:
             # without the fairness exclusion — it should be free to pick
             # up the batch ``_handle_admit_failure`` just pushed back.
             if speculation is None and not admit_refused:
-                yield_away_from_target = (
-                    pending.node_name,
-                    pending.graph_walk,
-                ) if must_yield_away else None
+                yield_away_from_target = chain_key if must_yield_away else None
                 with self._span("worker.schedule_yield_away"):
                     batch = self.scheduler.get_next_batch(
                         self.request_state,

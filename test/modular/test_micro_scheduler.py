@@ -1383,6 +1383,24 @@ def test_a_yield_away_leaves_the_chains_own_parked_rows():
     assert sorted(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == ["d0", "d1"]
 
 
+def test_a_yield_away_checks_the_rows_behind_the_chains_parked_ones():
+    """The chain's parked decode rows fill no part of the step's worth, so
+    the scan reaches the prompts behind them, and the one not ready stays."""
+    engine = _Engine(max_bs={MIXED: 4, WALK: 4, "prefill": 4}, not_ready={"p0"})
+    sched = _combined_scheduler(engine)
+    parked = _batch(["d0", "d1", "d2", "d3", "p0", "p1"], walk=MIXED)
+    parked.request_walks = {**{f"d{i}": WALK for i in range(4)}, "p0": "prefill", "p1": "prefill"}
+    sched.backlog[(NODE, MIXED)] = parked
+
+    batch = _next_batch(sched, _Manager([]), exclude_target=(NODE, WALK))
+
+    assert list(batch.request_to_worker_graph) == ["p1"]
+    assert engine.checked == ["p0", "p1"]
+    assert sorted(sched.backlog[(NODE, MIXED)].request_to_worker_graph) == [
+        "d0", "d1", "d2", "d3", "p0",
+    ]
+
+
 def test_a_full_merge_leaves_every_row_queued():
     """Continuing rows at the decode cap: the merge pops nothing, another
     walk's rows included, and the chain's room is its whole cap."""
