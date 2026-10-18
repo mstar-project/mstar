@@ -98,10 +98,10 @@ def _stats(values: list[float]) -> dict[str, float | None]:
 
 
 # ---------------------------------------------------------------------------
-# Peak-VRAM poller — nvidia-smi background sampler.
+# Peak-VRAM poller — nvidia-smi / amd-smi background sampler.
 # ---------------------------------------------------------------------------
 class VramPoller:
-    """Poll ``nvidia-smi memory.used`` on one GPU in a thread, keeping the peak.
+    """Poll memory in use on one GPU in a thread, keeping the peak (benchmark.gpu_query).
 
     Whole-GPU, so only meaningful on a preflighted card. A spike shorter than
     ``interval_s`` can be missed; the interval and sample count go in the schema.
@@ -116,13 +116,10 @@ class VramPoller:
         self._thread: threading.Thread | None = None
 
     def _poll_once(self) -> int | None:
+        from benchmark import gpu_query
+
         try:
-            out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits",
-                 "-i", str(self.gpu_index)],
-                capture_output=True, text=True, timeout=5, check=True,
-            )
-            return int(out.stdout.strip().splitlines()[0])
+            return int(gpu_query.used_mib(self.gpu_index))
         except Exception:  # noqa: BLE001 — a failed sample must not kill the bench
             return None
 
@@ -611,6 +608,10 @@ def probe_gpu(gpu_index: int) -> dict:
         import torch
         info["client_torch_version"] = torch.__version__
         info["client_cuda_version"] = torch.version.cuda
+        if info["name"] is None and torch.cuda.is_available():
+            # No nvidia-smi (an AMD machine): name and count from torch, HIP version alongside.
+            info.update(name=torch.cuda.get_device_name(0), count=torch.cuda.device_count(),
+                        client_hip_version=getattr(torch.version, "hip", None))
     except Exception:  # noqa: BLE001
         pass
     return info
