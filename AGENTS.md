@@ -116,6 +116,8 @@ Some additional information:
 
 `configs/*.yaml` `node_groups` map graph node names to GPU ranks. The same model code must run on one GPU or many with only the config changing. Don't branch on rank counts or device indices in model code; any branching should be contained to engine-level code (or worker, conductor, etc.), and should ideally be done in a modular manner (e.g., the `XPUAttentionManager` is a good example -- a new resource that encapsulates the accelerator-specific logic). 
 
+To branch on hardware, ask `mstar.platforms.current_platform` (`is_rocm()`, `arch()`, `has_cuda_capability()`) rather than `torch.version.hip`, the device type, or a raw compute capability: PyTorch's ROCm build calls AMD GPUs `cuda` devices and reports an MI300X as compute capability 9.4.
+
 ### 9. Update the documentation
 
 **Models and resources**: should be documented in docs/models.rst and docs/adding_models.rst, respectively.

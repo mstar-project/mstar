@@ -52,6 +52,7 @@ from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.resources import StepContext, StepRunner, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.model.qwen3_tts.config import LANGUAGE_ID_KEY, PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 from mstar.model.submodule_base import ModelInputsFromEngine
 
@@ -231,7 +232,8 @@ class MStarTalkerDriver:
         self.runner = StepRunner(self.resources)
         self.fwd_index = 0
 
-    def open_request(self, rid: str, model_kwargs: dict[str, Any]) -> CurrentForwardPassInfo:
+    def open_request(self, rid: str, model_kwargs: dict[str, Any], prompt: dict[str, Any]) -> CurrentForwardPassInfo:
+        """``prompt`` is ``process_prompt``'s metadata, which the prefill reads as step metadata."""
         configs = self.model.get_request_resource_configs({}, model_kwargs)
         for config in configs.values():
             config.apply_conductor_config(seed=1234)
@@ -239,7 +241,7 @@ class MStarTalkerDriver:
         return CurrentForwardPassInfo(
             request_id=rid, graph_walk="talker_prefill", fwd_index=0, random_seed=1234,
             max_tokens=8192, resource_configs=configs,
-            step_metadata={"talker_max_tokens": 8192, "is_prefill": True},
+            step_metadata={"talker_max_tokens": 8192, "is_prefill": True, **prompt},
         )
 
     def close_request(self, rid: str) -> None:
@@ -269,12 +271,12 @@ class MStarTalkerDriver:
 
 
 @torch.no_grad()
-def mstar_teacher_forced(driver: MStarTalkerDriver, tensors: dict, frame_embeds: torch.Tensor,
+def mstar_teacher_forced(driver: MStarTalkerDriver, tensors: dict, prompt: dict, frame_embeds: torch.Tensor,
                          greedy_kwargs: dict) -> tuple[torch.Tensor, torch.Tensor]:
     """M* group-0 logits and normed hidden per frame, fed the reference frames."""
     talker = driver.talker
     rid = "teacher-forced"
-    fwd = driver.open_request(rid, greedy_kwargs)
+    fwd = driver.open_request(rid, greedy_kwargs, prompt)
     logits, hiddens = [], []
 
     def backbone(engine_inputs, input_embeds, last_token_indices, suppress_eos):
@@ -310,11 +312,12 @@ def mstar_code_predictor_logits(talker, hidden: torch.Tensor, codes: torch.Tenso
 
 
 @torch.no_grad()
-def mstar_greedy(driver: MStarTalkerDriver, tensors: dict, frames: int, greedy_kwargs: dict) -> torch.Tensor:
+def mstar_greedy(driver: MStarTalkerDriver, tensors: dict, prompt: dict, frames: int,
+                 greedy_kwargs: dict) -> torch.Tensor:
     """M*'s own greedy generation through ``TalkerSubmodule.forward``."""
     talker = driver.talker
     rid = "greedy"
-    fwd = driver.open_request(rid, greedy_kwargs)
+    fwd = driver.open_request(rid, greedy_kwargs, prompt)
     codes = []
 
     def forward(engine_inputs, **kw):
@@ -506,20 +509,23 @@ def main(argv: list[str] | None = None) -> None:
     clone = reference_clone_prompt(ref, args)
     clone_report = None
     if clone is None:
-        tensors = model.process_prompt(args.text, ["text"], ["audio"], **request_kwargs)
+        result = model.process_prompt(args.text, ["text"], ["audio"], **request_kwargs)
     else:
         # Voice clone: M*'s load_audio -> process_prompt -> RefEncoder, compared
         # with the reference's own x-vector and codec frames for the same clip.
         clip = model.load_audio(args.ref_audio, args.device)
         request_kwargs.update({"ref_text": args.ref_text, "x_vector_only_mode": args.x_vector_only})
-        tensors = model.process_prompt(
+        result = model.process_prompt(
             args.text, ["audio", "text"], ["audio"], tensors={"audio_inputs": [clip.data]}, **request_kwargs,
         )
+    tensors, prompt = dict(result.new_input_tensors), result.metadata
+    if clone is not None:
         ref_encoder = model.get_submodule("RefEncoder", device=args.device, autocast_dtype=torch.bfloat16)
         prepared = ref_encoder.prepare_inputs(
             "talker_prefill_clone", CurrentForwardPassInfo(
                 request_id="clone", graph_walk="talker_prefill_clone", fwd_index=0, random_seed=0, max_tokens=0,
-            ), {"audio_inputs": [clip.data], "prompt_layout": tensors["prompt_layout"]},
+                step_metadata=prompt,
+            ), {"audio_inputs": [clip.data]},
         )
         with torch.no_grad():
             encoded = ref_encoder.forward(
@@ -563,7 +569,7 @@ def main(argv: list[str] | None = None) -> None:
     frames = ref_codes.shape[0]
     theirs_logits = ref.model.talker.codec_head(ref_hidden)
     frame_embeds = reference_frame_embeds(ref, ref_codes)
-    ours_logits, ours_hidden = mstar_teacher_forced(driver, tensors, frame_embeds, request_kwargs)
+    ours_logits, ours_hidden = mstar_teacher_forced(driver, tensors, prompt, frame_embeds, request_kwargs)
     talker_report = compare_logits("talker_group0_logits", ours_logits, theirs_logits)
     hidden_report = {
         "name": "talker_hidden",
@@ -572,8 +578,8 @@ def main(argv: list[str] | None = None) -> None:
     }
     # Diagnostic: the reference backbone over M*'s own prefill embeddings.
     prefill = talker._build_prefill(
-        "layout-probe", tensors["text_inputs"][0], tensors["prompt_layout"][0],
-        int(tensors["speaker_id"][0]), int(tensors["language_id"][0]),
+        "layout-probe", tensors["text_inputs"][0], prompt[PROMPT_LAYOUT_KEY],
+        prompt[SPEAKER_ID_KEY], prompt[LANGUAGE_ID_KEY],
         speaker_embed=tensors.get("speaker_embed", [None])[0],
         ref_codes=tensors.get("ref_codes", [None])[0],
     )
@@ -588,7 +594,7 @@ def main(argv: list[str] | None = None) -> None:
     cp_report = compare_logits("code_predictor_logits", cp_ours, cp_theirs)
 
     # 3: greedy end to end + audio.
-    ours_codes = mstar_greedy(driver, tensors, frames, request_kwargs)
+    ours_codes = mstar_greedy(driver, tensors, prompt, frames, request_kwargs)
     codes_report = compare_codes(ours_codes, ref_codes)
     n = codes_report["frames_compared"]
     audio_ref_codes_mstar = decode_audio(codec, ref_codes[:n])

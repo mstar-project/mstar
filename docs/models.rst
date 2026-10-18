@@ -247,7 +247,8 @@ Qwen3-TTS notes
   defaults to automatic detection, ``instruct`` (OpenAI: ``instructions``)
   carries a style instruction (1.7B CustomVoice) or the voice description
   (VoiceDesign, required). Base clones a voice from one reference clip: on
-  ``/v1/audio/speech`` pass ``ref_audio`` (data URL, URL, path or base64) plus
+  ``/v1/audio/speech`` pass ``ref_audio`` (data URL, base64, or an http(s) URL
+  when the server sets ``MSTAR_ALLOW_REMOTE=1``; paths on the server are refused) plus
   ``ref_text`` (its transcript) or ``x_vector_only_mode: true``; with the SDK,
   ``client.tts(text, reference_audio="ref.wav", ref_text="...")``. The clip's
   conditioning (x-vector and codec frames) is memoised by content, so a voice
@@ -532,7 +533,8 @@ Cosmos3 environment requirements
   prefill, the captured CUDA graphs, and multi-request batches.
 - The default denoise attention backend is ``dense_gen``
   (``Cosmos3Config.attention_backend``), which runs bs=1 eager generation
-  attention as one FlashAttention-3 varlen kernel from the ``fa3-fwd`` wheel.
+  attention as one FlashAttention-3 varlen kernel from the ``fa3-fwd`` wheel
+  (AITER's varlen kernel on ROCm).
   That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
   exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
   one matching your environment. When it is not importable, the engine logs a

@@ -449,6 +449,33 @@ def test_videos_both_conditioning_is_400():
         assert not stub.submitted  # rejected before submit
 
 
+def _server_file_refs():
+    secret = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    secret.write(b"\x89PNG\r\n\x1a\n")
+    secret.close()
+    return [secret.name, "../" * 8 + secret.name.lstrip("/"), f"file://{secret.name}"]
+
+
+def test_chat_refuses_server_file_paths(stack):
+    port, stub, _bridge, _proc = stack
+    for ref in _server_file_refs():
+        body = {"model": "qwen3_omni", "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": ref}}]}]}
+        status, out = _post_raw(port, "/v1/chat/completions", json.dumps(body).encode())
+        assert status == 400, (ref, status, out)
+    assert not stub.submitted
+
+
+def test_video_conditioning_refuses_server_file_paths():
+    stub = _VideoStubAPIServer()
+    with _model_stack("cosmos3", stub) as (port, _up):
+        for ref in _server_file_refs():
+            status, _ = _post_raw(port, "/v1/videos/generations", json.dumps(
+                {"model": "cosmos3", "prompt": "x", "image": ref}).encode())
+            assert status == 400, ref
+    assert not stub.submitted
+
+
 class _ErrorChunkStub(_StubAPIServer):
     """Deliver a backend failure the way the data plane does: a terminal chunk
     with modality 'error' + metadata.status that ends cleanly (no raise) — the

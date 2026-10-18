@@ -320,8 +320,7 @@ fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
 }
 
 /// Delete a request's persisted media 60 s after translation, matching
-/// mstar's deferred upload cleanup. Only files under `upload_dir` are ours to
-/// delete — local paths passed through by reference are left alone.
+/// mstar's deferred upload cleanup. Only files under `upload_dir` are deleted.
 fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
     let files: Vec<PathBuf> = args
         .file_paths
