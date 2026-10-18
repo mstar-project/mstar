@@ -42,6 +42,21 @@ WORKLOADS: dict[str, Workload] = {w.name: w for w in [
     # min_requests = the set size, so the first run at concurrency 1 covers every item for the WER check.
     Workload("asr-libri", "asr", "audio_to_text", (1, 8, 32), "set:asr_librispeech_v1", min_requests=100,
              primary=("rtfx", True)),
+    # Qwen3-Omni answering out loud: a text question, a food photo, a LibriSpeech clip (omni_v1 for the
+    # media). No ignore_eos: the talker is undefined past EOS (.claude/skills/benchmarking).
+    Workload("omni-text-speech", "omni", "text_to_speech", (1, 4, 16, 32), TEXT_PROMPTS,
+             primary=("audio_s_per_s", True)),
+    Workload("omni-image-speech", "omni", "image_to_speech", (1, 4, 16, 32), "set:omni_v1",
+             primary=("audio_s_per_s", True)),
+    Workload("omni-audio-speech", "omni", "audio_to_speech", (1, 4, 16, 32), "set:omni_v1",
+             primary=("audio_s_per_s", True)),
+    # 20 prompts x 2 sizes at fixed seeds (image_v1), steps and guidance from the correctness family. The
+    # first run at concurrency 1 covers the set, for PSNR against the diffusers reference.
+    Workload("image-gen", "image", "text_to_image", (1, 4, 8, 16), "set:image_v1", min_requests=40,
+             warmup_waves_first=1, primary=("images_per_s", True)),
+    # 5 prompts (video_v1) at the correctness family's resolution, frames, steps and guidance.
+    Workload("video-t2v", "video", "text_to_video", (1, 2), "set:video_v1", min_requests=5, waves=1,
+             warmup_waves_first=1, warmup_waves_next=0, primary=("clips_per_min", True)),
 ]}
 
 
@@ -62,6 +77,15 @@ TABLES: dict[str, Table] = {t.name: t for t in [
           note="Qwen3.5 dense, text in and out, greedy, fixed output length"),
     Table("tts-reference", ("kokoro", "orpheus"), ("mstar", "ref-kokoro", "ref-orpheus-vllm"), ("tts-seed",),
           note="TTS against reference implementations"),
+    Table("omni", ("qwen3omni_colocated", "qwen3omni_2gpu"), ("mstar", "vllm-omni", "vllm-omni-tuned"),
+          ("omni-text-speech", "omni-image-speech", "omni-audio-speech"),
+          note="Qwen3-Omni, spoken answers to text, image and audio questions"),
+    Table("image", ("flux2_klein", "z_image_turbo"), ("mstar", "vllm-omni", "sglang-diffusion"), ("image-gen",),
+          note="Image generation, latency at concurrency 1 and images/s above it"),
+    Table("video", ("wan22", "cosmos3_nano"), ("mstar", "vllm-omni"), ("video-t2v",),
+          note="Text-to-video, time per clip at concurrency 1 and makespan at 2"),
+    Table("asr", ("whisper_large",), ("mstar", "vllm-whisper", "sglang-whisper"), ("asr-libri",),
+          note="Whisper large-v3 on the OpenAI transcription route"),
     # Functional runs on one dev slice: every cell type once, no timing value.
     Table("dry-text", ("qwen3_5_0.8b",), ("mstar", "vllm-aiter", "sglang-aiter"), ("text-chat-256",), repeats=1),
     Table("dry-tts", ("kokoro", "orpheus_colocated"), ("mstar", "ref-kokoro", "ref-orpheus-vllm"), ("tts-seed",),
