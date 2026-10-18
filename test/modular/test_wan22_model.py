@@ -730,6 +730,8 @@ def test_wan22_process_prompt_accepts_valid_fps(fps):
 @pytest.mark.parametrize("fps,fragment", [
     (0, "must be positive"),
     (-1, "must be positive"),
+    (float("nan"), "must be positive"),
+    (float("inf"), "must be positive"),
     ("fast", "must be a number"),
 ])
 def test_wan22_process_prompt_rejects_bad_fps(fps, fragment):
