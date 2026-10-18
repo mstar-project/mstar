@@ -60,7 +60,6 @@ from mstar.model.base import (
     Model,
     ProcessPromptOutput,
     TensorAndMetadata,
-    video_metadata_dict,
 )
 from mstar.model.media_limits import VideoBudget
 from mstar.model.submodule_base import NodeSubmodule
@@ -584,21 +583,29 @@ class VJepa2Model(Model):
         but is intentionally ignored — decode stays on CPU, later steps
         move tensors to GPU as needed.
         """
-        from torchcodec.decoders import VideoDecoder
+        from mstar.model.components.media_io import sample_video
 
-        target_frames = self.config.frames_per_clip
         logger.info("load_video: opening %s", filepath)
-        decoder = VideoDecoder(filepath)
-        logger.info("load_video: decoder opened; reading metadata")
+        chosen: list[int] = []
 
-        metadata_obj = getattr(decoder, "metadata", None)
-        total = None
-        if metadata_obj is not None:
-            total = getattr(metadata_obj, "num_frames", None)
+        def choose(metadata: dict) -> list[int]:
+            chosen.extend(self._sample_indices(metadata.get("num_frames"), filepath))
+            return chosen
+
+        frames = sample_video(filepath, choose, on_frames=VideoBudget().add)
+        logger.info("load_video: decoded frames shape=%s", tuple(frames.data.shape))
+        video = frames.data.float() / 255.0
+        metadata = dict(frames.metadata)
+        metadata["sampled_indices"] = chosen
+        metadata["original_num_frames"] = int(frames.metadata["num_frames"])
+        return TensorAndMetadata(data=video, metadata=metadata)
+
+    def _sample_indices(self, total: int | None, filepath: str) -> list[int]:
+        """The frames ``load_video`` keeps out of ``total``."""
         if total is None:
-            total = len(decoder)
+            raise ValueError(f"Video has no frame count: {filepath}")
         total = int(total)
-
+        target_frames = self.config.frames_per_clip
         # ``frames_per_clip`` is an architectural config (also feeds
         # ``grid_depth`` for the predictor's attention mask) and must stay
         # at the trained value (64). For AC rollout requests the input
@@ -624,33 +631,7 @@ class VJepa2Model(Model):
             indices[-3:],
             step,
         )
-
-        height = getattr(metadata_obj, "height", None)
-        width = getattr(metadata_obj, "width", None)
-        if not (height and width):
-            height, width = decoder[indices[0]].shape[-2:]
-        VideoBudget().add(height, width, len(indices))
-        get_at = getattr(decoder, "get_frames_at", None)
-        if get_at is not None:
-            logger.info("load_video: calling get_frames_at(%d indices)", len(indices))
-            frame_batch = get_at(indices=indices)
-            frames = getattr(frame_batch, "data", frame_batch)
-        else:
-            # Older torchcodec: no batched sampled-decode API, per-index
-            # lookup still avoids materializing the whole video.
-            logger.info("load_video: per-index lookup (no get_frames_at)")
-            frames = torch.stack([decoder[i] for i in indices])
-        logger.info("load_video: decoded frames shape=%s", tuple(frames.shape))
-
-        video = frames.float() / 255.0
-
-        try:
-            metadata = video_metadata_dict(metadata_obj) if metadata_obj is not None else {}
-        except TypeError:
-            metadata = {}
-        metadata["sampled_indices"] = indices
-        metadata["original_num_frames"] = total
-        return TensorAndMetadata(data=video, metadata=metadata)
+        return indices
 
     def process_prompt(
         self,

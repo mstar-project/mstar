@@ -147,11 +147,11 @@ def load_audio_file(path: str, sample_rate: int = 16_000) -> torch.Tensor:
     """Decode an audio file to a float32 mono waveform at ``sample_rate``.
 
     libsndfile (``soundfile``) first — it needs no FFmpeg and covers WAV,
-    FLAC, OGG and MP3 — then torchcodec for anything else (M4A, WebM, ...).
-    Resampling goes through torchaudio. Audio longer than
+    FLAC, OGG and MP3 — then FFmpeg (torchcodec, else PyAV) for anything else
+    (M4A, WebM, ...). Resampling goes through torchaudio. Audio longer than
     ``media_io.MAX_AUDIO_SECONDS`` is refused while it decodes.
     """
-    from mstar.api_server.media_io import AudioRefusedError, decode_torchcodec_capped, read_soundfile_capped
+    from mstar.api_server.media_io import AudioRefusedError, decode_media_capped, read_soundfile_capped
 
     try:
         audio, sr = read_soundfile_capped(path)
@@ -159,7 +159,7 @@ def load_audio_file(path: str, sample_rate: int = 16_000) -> torch.Tensor:
     except AudioRefusedError:
         raise
     except Exception:  # noqa: BLE001 — not a libsndfile container; try FFmpeg
-        return decode_torchcodec_capped(path, sample_rate).to(torch.float32)
+        return decode_media_capped(path, sample_rate).to(torch.float32)
     check_resample_rate(sr, sample_rate)
     if sr != sample_rate:
         import torchaudio
