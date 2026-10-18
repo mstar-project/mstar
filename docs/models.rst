@@ -360,6 +360,11 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
+On AMD GPUs the gated DeltaNet layers run AITER's kernels (``linear_attn.backend:
+auto``): FlyDSL decode, a chunked eager prefill, and for captured prefill
+buckets up to ``linear_attn.max_captured_prefill_tokens`` (512 by default) a
+sequential kernel; text and vision prefill buckets above that run eagerly.
+
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
