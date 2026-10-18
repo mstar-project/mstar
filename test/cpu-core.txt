@@ -170,3 +170,4 @@ test/modular/test_wan_vae_compile_options.py
 test/modular/test_correctness_metrics.py
 test/modular/test_correctness_runner.py
 test/modular/test_media_decode.py
+test/modular/test_hf_attention.py
