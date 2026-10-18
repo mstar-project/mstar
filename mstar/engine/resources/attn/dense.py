@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, AttnBackend
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
@@ -42,11 +42,11 @@ def _fa3_unavailable_reason() -> str | None:
 
 
 @functools.cache
-def _warn_dense_fallback(reason: str) -> None:
+def _warn_dense_fallback(reason: str, fallback: AttnBackend) -> None:
     logger.warning(
         "Attention backend 'dense' requested but no varlen kernel is "
-        "available (%s); using the paged 'flashinfer' backend instead.",
-        reason,
+        "available (%s); using the paged %r backend instead.",
+        reason, fallback.value,
     )
 
 
