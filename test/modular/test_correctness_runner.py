@@ -175,3 +175,25 @@ def test_repeated_jit_build_failures_abort_startup(tmp_path):
                    + "RuntimeError: Ninja build failed. Ninja output:\n" * 3)
     msg = server._fatal_in_log(log)
     assert "3x 'Ninja build failed'" in msg and "batch_prefill_x_hd64" in msg and "unknown type name" in msg
+
+
+def test_image_question_set_for_vision_text_models(tmp_path):
+    from benchmark.correctness.families.text import TextImageFamily
+
+    cfg = yaml.safe_load((REPO / "configs/qwen3_5_0.8b.yaml").read_text())
+    fam = family_for_config("qwen3_5_0.8b", "qwen3_5_0.8b", cfg, {"set": "image"})
+    text = family_for_config("qwen3_5_0.8b", "qwen3_5_0.8b", cfg, {})
+    assert isinstance(fam, TextImageFamily) and fam.hf_id == text.hf_id == "Qwen/Qwen3.5-0.8B"
+    assert fam.set_name == "omni_v1" and fam.reference_id() != text.reference_id()
+    assert fam.set_name in sets.BUILDERS
+    items = [sets.Item(id="img_00", prompt="What is this?", files={"image": "image/00.jpg"},
+                       params={"modality": "image"}),
+             sets.Item(id="aud_00", prompt="Transcribe this.", files={"audio": "audio/00.wav"},
+                       params={"modality": "audio"})]
+    sset = sets.SampleSet("omni_v1", tmp_path, {}, fam.select_items(items))
+    (req,) = fam.requests(sset)
+    assert req.item_id == "img_00" and req.files == [tmp_path / "image/00.jpg"]
+    assert req.input_modalities == "image,text" and req.output_modalities == "text"
+    assert req.model_kwargs["temperature"] == 0.0 and req.model_kwargs["max_output_tokens"] == 128
+    duplex = family_for_config("nemotron_duplex", "nemotron_duplex", {}, {})
+    assert [it.id for it in duplex.select_items(items)] == ["aud_00"]
