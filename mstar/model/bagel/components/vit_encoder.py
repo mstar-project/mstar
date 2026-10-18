@@ -10,6 +10,7 @@
 # This modified file is released under the same license.
 
 
+import functools
 import logging
 
 import torch
@@ -18,6 +19,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from transformers.activations import ACT2FN
 
 from mstar.model.bagel.config import BagelViTConfig
+from mstar.model.components.hf_attention import varlen_attention, varlen_attention_available
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +30,19 @@ try:
 except ImportError:
     flash_attn_varlen_func = None
     _FLASH_ATTN_AVAILABLE = False
+
+
+@functools.cache
+def _eager_varlen_kernel() -> bool:
+    """True if the eager path can use varlen_attention. Checked on first use so
+    importing this module doesn't touch the GPU."""
+    if varlen_attention_available():
+        return True
     logger.warning(
         "flash_attn is not available; BagelViT will fall back to torch SDPA "
-        "with a block-diagonal mask. This is slower than flash-attn varlen."
+        "with a block-diagonal mask. This is slower than a varlen kernel."
     )
+    return False
 
 
 def _sdpa_varlen(
@@ -218,9 +229,10 @@ class BagelViTAttention(nn.Module):
           capture-legal option: flash-attn's varlen entry point is not
           reliably capturable, and the SDPA fallback builds its mask from data.
           The layout lives in the plan, so ``cu_seqlens`` goes unread here.
-        - clear (eager path) — flash-attn varlen, preferred when not
-          capturing: FlashInfer has no kernel for SigLIP2's head_dim=72 and
-          has to zero-pad q/k/v to 128, which flash-attn does not.
+        - clear (eager path) — flash-attn varlen (AITER's where flash_attn
+          is not installed), preferred when not capturing: FlashInfer has no
+          kernel for SigLIP2's head_dim=72 and has to zero-pad q/k/v to 128,
+          which flash-attn does not.
         """
         if self.use_ragged:
             return self.ragged_attn.run(q, k, v)
@@ -233,6 +245,11 @@ class BagelViTAttention(nn.Module):
                 max_seqlen_k=max_seqlen,
                 causal=causal,
                 softmax_scale=scale,
+            )
+        if _eager_varlen_kernel():
+            return varlen_attention(
+                q, k, v, cu_seqlens, cu_seqlens, int(max_seqlen), int(max_seqlen),
+                causal=causal, softmax_scale=scale,
             )
         return _sdpa_varlen(q, k, v, cu_seqlens, causal=causal, scale=scale)
 

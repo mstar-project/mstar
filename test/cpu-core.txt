@@ -109,3 +109,4 @@ test/modular/test_transcription_utf8.py
 test/modular/test_correctness_metrics.py
 test/modular/test_correctness_runner.py
 test/modular/test_media_decode.py
+test/modular/test_hf_attention.py
