@@ -3,8 +3,8 @@
     python -m benchmark.gpu_query used-mib <gpu>     # memory in use on one GPU, MiB
     python -m benchmark.gpu_query pids <gpu>         # one "pid used_mib" line per process on it
 
-The GPU index is the physical one (nvidia-smi -i / amd-smi -g). Harnesses that used to call
-nvidia-smi directly use this, so they don't die on a machine without it.
+The GPU index is the physical one (nvidia-smi -i / amd-smi -g). The Wan2.2 and Waypoint
+harnesses use this, so they also run where only amd-smi exists.
 """
 
 from __future__ import annotations
