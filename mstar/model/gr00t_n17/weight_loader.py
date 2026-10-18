@@ -34,6 +34,9 @@ NODE_PREFIXES: dict[str, tuple[str, tuple[str, ...]]] = {
     )),
 }
 
+# the one part of `visual.` that is GR00T's and not the reused tower's
+_DEEPSTACK = "deepstack_merger_list."
+
 # GR00T takes the LLM's hidden states before its final norm, and no logits
 SKIPPED = frozenset({
     "backbone.model.model.language_model.norm.weight",
@@ -65,7 +68,12 @@ def _remapper(node: str):
     def remap(name: str) -> str | None:
         if name in SKIPPED or not name.startswith(prefixes):
             return None
-        return name[len(root):]
+        name = name[len(root):]
+        # `vision_encoder` keeps Qwen3.5's tower under `.tower`, with GR00T's
+        # own DeepStack mergers beside it, so the tower's keys gain that prefix
+        if node == "vision_encoder" and not name.startswith(_DEEPSTACK):
+            name = "tower." + name
+        return name
 
     return remap
 
