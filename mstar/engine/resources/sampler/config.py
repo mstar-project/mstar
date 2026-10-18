@@ -109,7 +109,9 @@ class SamplingReqConfig(ResourceReqConfig):
         # refused here, not ignored: the node's sampler has no such filter
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
-        if self.repetition_penalty not in (None, 1) and not spec.enable_repetion_penalty:
+        # a windowed penalty counts the generation history, not the seen-token mask
+        windowed = self.repetition_window > 0 and spec.max_repetition_window > 0
+        if self.repetition_penalty not in (None, 1) and not (spec.enable_repetion_penalty or windowed):
             raise ValueError(
                 "this model does not support repetition_penalty; send 1 or leave it unset"
             )
