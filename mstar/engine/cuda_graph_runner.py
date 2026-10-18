@@ -1149,6 +1149,10 @@ class PiecewiseCudaGraphRunner:
     def any_graphs(self) -> bool:
         return bool(self._graphs)
 
+    @property
+    def eager_fallback(self) -> bool:
+        return self._config.eager_fallback
+
     def _dummy_key(self, shape: PiecewiseCaptureShape, slot: int) -> str:
         """Padding rows are per slot, as in ``CudaGraphRunner``: a slot's plan
         and commit run against its own tail, so sharing rows between slots puts

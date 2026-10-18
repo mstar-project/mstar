@@ -446,35 +446,32 @@ def test_assets_load_completely():
     assert wav.shape == (1, 50 * 480) and torch.isfinite(wav).all()
 
 
-@pytest.mark.parametrize("device", [
-    "cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
-])
-def test_window_short_of_its_stop_code(random_token2wav, device):
-    """A window that carried the TTS's stop code is a code short (the node drops it) and
-    not the last; the reply's last window comes after it. The caches' positions follow
-    what each window wrote, so the batched path still matches ``stream``."""
-    import copy
+@pytest.mark.parametrize("stop_at", [27, 10, 0])
+def test_the_window_holding_the_stop_code_is_the_last(stop_at):
+    """The TTS's stop code ends the speech, as upstream's stream does: the window
+    holding it runs as the last, without the code, and the stream's final chunk
+    (here only that window's overlap) is dropped."""
+    from types import SimpleNamespace
 
-    model = copy.deepcopy(random_token2wav).to(device)
-    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=1e-3)
-    p = 50
-    torch.manual_seed(2)
-    voice = model.prepare_voice(VoicePrompt(
-        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32).to(device),
-        spk_emb=torch.randn(1, 192).to(device), mel=torch.randn(1, 2 * p, 80).to(device),
-    ))
-    full = [w for w, last in stream_windows(torch.randint(0, 6561, (200,)).tolist()) if not last]
-    windows = [(w, False) for w in full[:4]] + [(full[4][:-1], False), (full[4][-4:], True)]
-    bank = VoiceBank.build({"v": voice})
-    kv_steps = _CacheSteps(bank, 2, device)
-    ref = model.new_state(voice)
-    for win, last in windows:
-        tokens = torch.tensor([win], dtype=torch.int32, device=device)
-        mel = model.flow_chunk(ref, voice, tokens, last)
-        state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
-        got = model.window_flow(state, bank, ids, tokens, kv, last)
-        commit()
-        torch.testing.assert_close(got, mel, **tol)
+    from mstar.model.minicpm_o.submodules import Token2WavSubmodule
+
+    eos = 6561
+    node = Token2WavSubmodule.__new__(Token2WavSubmodule)
+    torch.nn.Module.__init__(node)
+    node.request_states, node.eos_code = {}, eos
+    node._lead_silence = torch.zeros(3, dtype=torch.int32)
+    info = SimpleNamespace(rid_handle=0, step_metadata={})
+    node.request_state(0).add("started", True)
+    window = torch.arange(28, dtype=torch.int32)
+    window[stop_at] = eos
+
+    got = node.prepare_inputs("t2w_chunk", info, {"tts_code": [window]}, is_final_stream_chunk=False)
+    if stop_at == 0:
+        assert got is None
+    else:
+        assert got.kwargs["last"] and got.tensor_inputs["codes"].tolist() == [list(range(stop_at))]
+    tail = {"tts_code": [window[25:]]}
+    assert node.prepare_inputs("t2w_chunk", info, tail, is_final_stream_chunk=True) is None
 
 
 @pytest.mark.parametrize("device", [

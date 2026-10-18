@@ -836,25 +836,33 @@ class Token2WavSubmodule(NodeSubmodule):
             clip = inputs["voice_audio"][0].to("cpu", torch.float32).reshape(-1)
             self.request_state(fwd_info.rid_handle).add("voice_prompt", self.model.voice_encoder(clip))
             return NodeInputs(tensor_inputs={}, kwargs={})
-        if not inputs.get("tts_code"):
+        # keyed by the worker handle, as the forward and the engine's cleanup are
+        state = self.request_state(fwd_info.rid_handle)
+        if not inputs.get("tts_code") or state.get("ended", False):
+            # a text-only reply's stream closes with one empty chunk; after the stop
+            # code, the stream's final chunk is only the overlap of the window before
             return None
         # A host sync, which serializes this node's async pipeline. It is needed either
         # way: a window's length decides its capture and its cache writes. Filtering
         # the stop code on the device would need check_stop to filter outputs (an
         # engine change), and would still leave the length on the device.
         codes = inputs["tts_code"][0].reshape(-1).to("cpu", torch.int32)
-        # the TTS's stop code is streamed before its stop is seen; it is not speech
-        codes = codes[codes != self.eos_code]
+        # The TTS's stop code is streamed before its stop is seen. It is not speech,
+        # and it ends the speech: the window holding it is the last, as upstream's
+        # stream ends there, even when the stream's final chunk is still to come.
+        stop = (codes == self.eos_code).nonzero()
+        last = is_final_stream_chunk
+        if stop.numel():
+            codes = codes[:int(stop[0, 0])]
+            last = True
+            state.add("ended", True)
         if codes.numel() == 0:
-            # a text-only reply's stream closes with one empty chunk
             return None
-        # keyed by the worker handle, as the forward and the engine's cleanup are
-        state = self.request_state(fwd_info.rid_handle)
         if not state.get("started", False):
             codes = torch.cat([self._lead_silence, codes])
             if "voice_prompt" not in state:
                 state.add("voice", fwd_info.step_metadata.get("voice"))
-        return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": is_final_stream_chunk})
+        return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": last})
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
@@ -882,8 +890,8 @@ class Token2WavSubmodule(NodeSubmodule):
 
     # Each window's flow and HiFT run through a piecewise region: replayed when a graph
     # fits, else eagerly through the same step, so the resources always hold the plan
-    # of exactly the rows being run. Shapes that are never captured (a window short of
-    # the TTS's stop code, a one-window reply's HiFT) have eager-only regions.
+    # of exactly the rows being run. Shapes that are never captured (a one-window
+    # reply's HiFT) have eager-only regions.
 
     @staticmethod
     def flow_region(num_tokens: int, last: bool) -> str:

@@ -296,8 +296,8 @@ class CacheFamily(NamedTuple):
 
 
 def window_tokens(num_tokens: int, last: bool) -> int:
-    """25 Hz tokens a window adds to its caches: its own, without the lookahead (a window
-    is 28 codes, or fewer when it carried the TTS's stop code); none for a last window."""
+    """25 Hz tokens a window adds to its caches: its own, without the lookahead; none for
+    a last window."""
     return 0 if last else num_tokens - PRE_LOOKAHEAD
 
 
