@@ -1,14 +1,16 @@
 """``mstar.platforms``: which hardware the process runs on."""
 
+import copy
 import multiprocessing
 import os
+import pickle
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from mstar import platforms
-from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform, XpuPlatform, current_platform
+from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform, current_platform
 
 
 @pytest.fixture
@@ -45,6 +47,22 @@ def test_current_platform_follows_resolution(resolve):
     resolve(cuda=False)
     assert current_platform.is_cpu()
     assert repr(current_platform) == "CpuPlatform()"
+
+
+def test_current_platform_is_an_instance_of_the_resolved_class(resolve):
+    resolve(cuda=True, hip="7.0")
+    assert isinstance(current_platform, RocmPlatform)
+    assert isinstance(current_platform, Platform)
+    assert not isinstance(current_platform, CudaPlatform)
+    resolve(cuda=False)
+    assert isinstance(current_platform, CpuPlatform)
+
+
+def test_current_platform_pickles_and_copies_as_itself(resolve):
+    resolve(cuda=False)
+    assert pickle.loads(pickle.dumps(current_platform)) is current_platform
+    assert copy.copy(current_platform) is current_platform
+    assert copy.deepcopy(current_platform) is current_platform
 
 
 def test_an_mi300x_is_not_a_hopper(monkeypatch):

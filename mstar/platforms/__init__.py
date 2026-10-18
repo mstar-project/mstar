@@ -48,13 +48,25 @@ def resolve_platform() -> Platform:
 
 
 class _CurrentPlatform:
-    """Forwards to ``resolve_platform()``, so importing this probes no device."""
+    """Forwards to ``resolve_platform()``, so importing this probes no device.
+
+    ``__class__`` is forwarded too, as ``unittest.mock`` does, so
+    ``isinstance(current_platform, RocmPlatform)`` holds on ROCm.
+    """
+
+    @property
+    def __class__(self):
+        return type(resolve_platform())
 
     def __getattr__(self, name: str):
         return getattr(resolve_platform(), name)
 
     def __repr__(self) -> str:
         return repr(resolve_platform())
+
+    def __reduce__(self):
+        # by name: pickling through the forwarded __class__ would fail
+        return "current_platform"
 
 
 current_platform = cast(Platform, _CurrentPlatform())
