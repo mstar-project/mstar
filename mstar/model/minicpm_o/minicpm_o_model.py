@@ -57,7 +57,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, ProcessPromptOutput
 from mstar.model.minicpm_o import weight_loader
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.token2wav import (
@@ -129,6 +129,8 @@ DEFAULT_VOICE = "default"
 T2W_DEFAULT_SLOTS = 9
 # the longest custom voice prompt; it sizes the vocoder's caches when custom voices are on
 CUSTOM_VOICE_SECONDS = 10.0
+# the shortest custom voice token2wav's caches take (sizes their sink regions)
+CUSTOM_VOICE_MIN_SECONDS = 2.0
 
 # Upstream's `get_sys_prompt(mode="audio_assistant", language="en")`, around
 # the voice's reference audio.
@@ -284,8 +286,7 @@ class MiniCPMOModel(Model):
                     num_qo_heads=audio.encoder_attention_heads,
                     num_kv_heads=audio.encoder_attention_heads,
                     head_dim=audio.head_dim,
-                    # 30 s pieces: the largest captured bucket holds two
-                    max_segments_per_request=2,
+                    max_segments_per_request=AudioEncoderSubmodule.BLOCK_LOOP_MAX_PIECES,
                 ),
             ),
             *self._tts_resources(),
@@ -321,24 +322,28 @@ class MiniCPMOModel(Model):
             ),
         )]
 
-    def _t2w_capacity(self):
-        """Token2wav's caches sized for the longest voice: bundled, or custom when allowed."""
+    def _voice_seconds(self) -> tuple[float, float]:
+        """The shortest and longest voice: bundled, or custom when allowed."""
         import soundfile as sf
 
-        seconds = max(
-            sf.info(str(Path(self.local_dir) / "assets" / f)).duration for f in VOICES.values()
-        )
+        seconds = [sf.info(str(Path(self.local_dir) / "assets" / f)).duration for f in VOICES.values()]
         if self.custom_voices:
-            seconds = max(seconds, CUSTOM_VOICE_SECONDS)
+            seconds += [CUSTOM_VOICE_MIN_SECONDS, CUSTOM_VOICE_SECONDS]
+        return min(seconds), max(seconds)
+
+    def _t2w_capacity(self):
+        """Token2wav's caches sized for the longest voice."""
         # the s3 tokenizer runs at 25 Hz; one token of slack for rounding
-        return CacheCapacity(int(seconds * 25) + 1)
+        return CacheCapacity(int(self._voice_seconds()[1] * 25) + 1)
 
     def _t2w_slot_layout(self) -> dict:
         return slot_layout(self._t2w_capacity())
 
     def _t2w_kv(self) -> list[BoundedKVSpec]:
-        """Token2wav's attention caches, sized for the longest voice."""
+        """Token2wav's attention caches, sized for every voice length allowed."""
         voice_tokens = self._t2w_capacity().prompt_tokens
+        # one token of slack for rounding
+        min_tokens = max(0, int(self._voice_seconds()[0] * 25) - 1)
         return [
             BoundedKVSpec(
                 resource_key=T2W_KV[name], nodes={TOKEN2WAV},
@@ -348,6 +353,7 @@ class MiniCPMOModel(Model):
                     head_dim=family.head_dim,
                     rows_per_request=family.rows,
                     max_source_len=family.rate * voice_tokens,
+                    min_source_len=family.rate * min_tokens,
                     retention=family.retention,
                     max_slots=T2W_DEFAULT_SLOTS - 1,
                     reverse_step_order=family.reverse_step_order,
@@ -569,7 +575,7 @@ class MiniCPMOModel(Model):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         unsupported = set(output_modalities) - {TEXT, "audio"}
         if unsupported:
             raise ValueError(f"MiniCPM-o outputs text and audio; got {sorted(unsupported)}")
@@ -652,7 +658,22 @@ class MiniCPMOModel(Model):
                 result["audio_features"] = [torch.cat(pieces, dim=-1).to(torch.bfloat16)]
                 result["audio_feature_lens"] = [lens]
                 result["audio_positions"] = [positions]
+        if speech:
+            # The TTS reads the whole reply and then speaks it, all within its
+            # positions; a longer reply would run past them, so speech caps the text.
+            limit = self.speech_max_text_tokens
+            requested = kwargs.get("max_output_tokens")
+            if requested is not None and int(requested) > limit:
+                raise ValueError(f"a spoken reply holds at most {limit} text tokens; got max_output_tokens={requested}")
+            if requested is None:
+                return ProcessPromptOutput(result, {"max_output_tokens": min(MAX_OUTPUT_TOKENS, limit)})
         return result
+
+    @property
+    def speech_max_text_tokens(self) -> int:
+        """The longest reply the TTS can speak: its condition (the reply, then two
+        tokens) and every code it may sample fit its positions."""
+        return self.tts_config.max_position_embeddings - 2 - TTS_SAMPLING.max_new_tokens
 
     def get_voices(self) -> list[str]:
         return list(VOICES)

@@ -420,6 +420,11 @@ class AudioEncoderSubmodule(NodeSubmodule):
 
     # 50 frames a second: 5 s up to two full 30 s pieces
     BLOCK_LOOP_FRAME_BUCKETS = [256, 512, 1024, 1536, 3072]
+    # The captured loop's attention plan holds this many pieces (the resource's
+    # max_segments_per_request): a spoken reply's voice clip and two 30 s pieces,
+    # say. A request with more runs eagerly. The lease is settled from frames
+    # alone, so the node checks the count itself.
+    BLOCK_LOOP_MAX_PIECES = 4
 
     # Every clip has its own length, which a compiled forward would recompile
     # for; the captured block loop is what makes it fast.
@@ -455,7 +460,8 @@ class AudioEncoderSubmodule(NodeSubmodule):
         **kwargs,
     ) -> SubmoduleStep | None:
         # leased, the captured block loop plans its own attention per replay
-        if (piecewise_leases or {}).get(AUDIO_BLOCK_LOOP):
+        if (piecewise_leases or {}).get(AUDIO_BLOCK_LOOP) and self._fits_block_loop(
+                [n for inp in inputs for n in inp.kwargs["frames"]]):
             return None
         return SubmoduleStep(
             segments=[
@@ -499,12 +505,16 @@ class AudioEncoderSubmodule(NodeSubmodule):
             )
         }
 
+    def _fits_block_loop(self, frames: list[int]) -> bool:
+        return len(frames) <= self.BLOCK_LOOP_MAX_PIECES
+
     @torch.compiler.disable
     def _replay_block_loop(
         self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, frames: list[int],
     ) -> torch.Tensor | None:
         runner = engine_inputs.piecewise_runners.get(AUDIO_BLOCK_LOOP)
-        if runner is None or not runner.can_run(len(engine_inputs.request_ids), int(hidden.shape[0])):
+        if (runner is None or not self._fits_block_loop(frames)
+                or not runner.can_run(len(engine_inputs.request_ids), int(hidden.shape[0]))):
             return None
         return runner.run(
             static_inputs={"hidden": hidden},

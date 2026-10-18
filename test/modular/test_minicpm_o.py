@@ -158,18 +158,37 @@ def test_spoken_reply_system_prompt_with_and_without_the_voice_clip(model):
 
     tts_bos = model.tokenizer.convert_tokens_to_ids("<|tts_bos|>")
     parts = [PromptPart("text", "Say hello.")]
-    voiced = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts)
+    voiced = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts).new_input_tensors
     assert voiced["audio_positions"][0].numel() > 0
     assert voiced["text_inputs"][0][-1].item() == tts_bos
     plain = model.process_prompt(
         None, ["text"], ["text", "audio"], prompt_parts=parts,
         voice_prompt=False, system_prompt="You are a helpful assistant.",
-    )
+    ).new_input_tensors
     assert "audio_positions" not in plain
     assert plain["text_inputs"][0][-1].item() == tts_bos
     assert "You are a helpful assistant." in model.tokenizer.decode(plain["text_inputs"][0])
     with pytest.raises(ValueError, match="unknown MiniCPM-o voice"):
         model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, voice_prompt=False, voice="nope")
+
+
+@needs_ckpt
+def test_spoken_reply_text_fits_the_tts(model):
+    """The TTS speaks the whole reply within its positions: a spoken reply's text
+    budget defaults under that, and asking for more is refused (a 400)."""
+    from mstar.model.multimodal import PromptPart
+
+    parts = [PromptPart("text", "Say hello.")]
+    limit = model.speech_max_text_tokens
+    assert limit + 2 + 2047 == model.tts_config.max_position_embeddings
+    out = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts)
+    assert out.metadata == {"max_output_tokens": min(2048, limit)}
+    assert isinstance(model.process_prompt(
+        None, ["text"], ["text", "audio"], prompt_parts=parts, max_output_tokens=limit), dict)
+    with pytest.raises(ValueError, match="spoken reply"):
+        model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, max_output_tokens=limit + 1)
+    # text replies are not capped
+    assert isinstance(model.process_prompt(None, ["text"], ["text"], prompt_parts=parts, max_output_tokens=8192), dict)
 
 
 @needs_ckpt
