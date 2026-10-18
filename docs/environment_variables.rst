@@ -68,6 +68,9 @@ Communication
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
+       A bucket a resource refuses to capture counts as not captured too,
+       e.g. GDN prefill buckets above ``linear_attn.max_captured_prefill_tokens``
+       on AMD GPUs.
    * - ``MSTAR_SHM_ARENA``
      - ``0``
      - SHM tensor-transport implementation. ``0``: per-uuid files.
@@ -676,3 +679,18 @@ Compilation
        when that falls back to torch's). An exported value wins. Holds Triton's compiled
        kernels, Inductor's and those compiled outside it; without it, where a kernel
        lands depends on whether Inductor compiled first.
+
+Platform defaults
+-----------------
+
+Before it spawns workers, the conductor sets the platform's process
+environment defaults (``Platform.process_env_defaults``, applied by
+``mstar.platforms.apply_process_env_defaults``) with
+``os.environ.setdefault``, so anything you export wins. A default goes in only
+with a measured win. ROCm sets none yet; CUDA's (``NCCL_GRAPH_REGISTER``,
+``TRITON_PTXAS_BLACKWELL_PATH``) are listed with their variables above.
+
+The ROCm libraries read their own variables (``AITER_JIT_DIR``,
+``AITER_ROOT_DIR``, ``FLYDSL_RUNTIME_CACHE_DIR``, ``FLASHINFER_WORKSPACE_BASE``,
+``HIP_VISIBLE_DEVICES`` and the MIOpen cache paths). They aren't M* knobs. See
+:ref:`installation:ROCm (AMD Instinct MI300X/MI325X, gfx942)`.
