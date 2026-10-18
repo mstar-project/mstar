@@ -2,8 +2,8 @@
 
 The thinker runs greedy and is compared with the HF thinker using the text family's near-tie check,
 split by input modality. The talker samples, so its audio is scored by Whisper against the server's
-own text. If the HF processor preprocesses media differently from mstar, that modality will show
-early divergences.
+own text. The reference decodes media the way the server does, so a divergence points at the model
+rather than at preprocessing.
 """
 
 from __future__ import annotations
@@ -66,11 +66,38 @@ class OmniFamily(Family):
 
     def reference_description(self) -> str:
         return (f"HF transformers Qwen3OmniMoeForConditionalGeneration {self.hf_id} thinker (bf16, sdpa), "
-                f"processor + qwen_omni_utils media, greedy, top-{TOPK} logprobs")
+                f"HF processor on media decoded like the server, greedy, top-{TOPK} logprobs")
+
+    def media_inputs(self, sset: SampleSet, it) -> dict:
+        """Processor inputs decoded the way the server decodes them.
+
+        Images go to the image processor as torchvision-decoded uint8, without qwen_omni_utils'
+        extra resize. Videos use the server's frame choice and resize, and the sampled frame rate
+        sets the temporal positions (the processor would assume 1 fps otherwise).
+        """
+        import torchvision
+
+        mod = it.params["modality"]
+        path = str(sset.path(it.files[mod]))
+        if mod == "image":
+            return {"images": [torchvision.io.decode_image(path).permute(1, 2, 0).contiguous().numpy()]}
+        if mod == "audio":
+            x, sr = M.read_wav(path)
+            return {"audio": [M.resample(x, sr, 16000)]}
+        from mstar.model.components.media_io import uses_torchcodec
+
+        if uses_torchcodec():
+            from qwen_omni_utils.v2_5.vision_process import fetch_video
+
+            video, fps = fetch_video({"video": path}, return_video_sample_fps=True, image_patch_size=14)
+        else:
+            from mstar.model.qwen3_omni.qwen3_omni_model import _fetch_video_without_torchcodec
+
+            video, fps = _fetch_video_without_torchcodec(path, image_patch_size=14)
+        return {"videos": [video], "fps": fps}
 
     def make_reference(self, sset: SampleSet, ref_dir: Path, device: str) -> None:
         import torch
-        from qwen_omni_utils import process_mm_info
         from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
 
         proc = Qwen3OmniMoeProcessor.from_pretrained(self.hf_id)
@@ -81,16 +108,18 @@ class OmniFamily(Family):
         eos = [tok.convert_tokens_to_ids("<|im_end|>")]
         for it in sset.items:
             mod = it.params["modality"]
-            path = str(sset.path(it.files[mod]))
-            messages = [{"role": "system", "content": [{"type": "text", "text": SYSTEM}]},
-                        {"role": "user", "content": [{"type": mod, mod: path}, {"type": "text", "text": it.prompt}]}]
+            # Same messages as process_prompt in mstar/model/qwen3_omni: the template only writes placeholders.
+            messages = [{"role": "system", "content": SYSTEM},
+                        {"role": "user", "content": [{"type": mod, mod: ""}, {"type": "text", "text": it.prompt}]}]
             text = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            audios, images, videos = process_mm_info(messages, use_audio_in_video=False)
-            inputs = proc(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True,
-                          use_audio_in_video=False).to(device)
+            inputs = proc(text=text, return_tensors="pt", padding=True, use_audio_in_video=False,
+                          **self.media_inputs(sset, it))
+            if "video_second_per_grid" in inputs and not torch.is_tensor(inputs["video_second_per_grid"]):
+                inputs["video_second_per_grid"] = torch.tensor(inputs["video_second_per_grid"])
+            inputs = inputs.to(device)
             ids = inputs.pop("input_ids")[0].tolist()
-            extra = {k: (v.to(torch.bfloat16) if v.is_floating_point() else v) for k, v in inputs.items()
-                     if hasattr(v, "is_floating_point")}
+            extra = {k: (v.to(torch.bfloat16) if v.is_floating_point() and k != "video_second_per_grid" else v)
+                     for k, v in inputs.items() if hasattr(v, "is_floating_point")}
             rec = generate_reference(thinker, tok, ids, self.max_new_tokens, device, eos, **extra)
             (ref_dir / "outputs" / f"{it.id}.json").write_text(json.dumps(rec, ensure_ascii=False))
             print(f"  ref {it.id}: {len(ids)} prompt tokens, {len(rec['ids'])} generated", flush=True)
