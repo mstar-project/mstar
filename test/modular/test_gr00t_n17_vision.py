@@ -7,11 +7,15 @@ import pytest
 import torch
 from torch import nn
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources.step import Segment
 from mstar.model.components.qwen3_vit import VisionPatchEmbed, vision_interpolation, vision_position_ids
 from mstar.model.gr00t_n17.components.vision import ConvPatchEmbed, DeepStackMerger, Gr00tN17VisionEncoder
 from mstar.model.gr00t_n17.config import Gr00tN17Config
+from mstar.model.gr00t_n17.submodules import Gr00tN17VisionEncoderSubmodule
 from mstar.model.gr00t_n17.weight_loader import _remapper
-from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
+from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
+from mstar.model.submodule_base import ModelInputsFromEngine
 
 _HUB = Path.home() / ".cache/huggingface/hub"
 _GR00T = _HUB / "models--nvidia--GR00T-N1.7-3B/snapshots/2fc962b973bccdd5d8ce4f67cc63b264d6886495"
@@ -131,13 +135,18 @@ def _stubbed_encoder(taps: tuple[int, ...], depth: int = _DEPTH) -> Gr00tN17Visi
     return encoder
 
 
+def _tower_args(vision: Qwen3_5VisionConfig, grid: list[tuple[int, int, int]]) -> tuple[torch.Tensor, ...]:
+    """The grid-derived tensors the tower needs, straight from its own helpers."""
+    indices, weights = vision_interpolation(grid, vision.num_grid_per_side, vision.spatial_merge_size)
+    return indices, weights, vision_position_ids(grid, vision.spatial_merge_size)
+
+
 def _inputs(vision: Qwen3_5VisionConfig, grid: list[tuple[int, int, int]]) -> tuple[torch.Tensor, ...]:
     """What ``VisionEncoderSubmodule.prepare_inputs`` hands the tower, for one packed run."""
     total_patches = sum(t * h * w for t, h, w in grid)
     patch_numel = vision.in_channels * vision.temporal_patch_size * vision.patch_size**2
     pixel_values = torch.randn(total_patches, patch_numel, generator=torch.Generator().manual_seed(2))
-    indices, weights = vision_interpolation(grid, vision.num_grid_per_side, vision.spatial_merge_size)
-    return pixel_values, indices, weights, vision_position_ids(grid, vision.spatial_merge_size)
+    return pixel_values, *_tower_args(vision, grid)
 
 
 @pytest.mark.parametrize("taps", [(0, 2, 5), (1, 3, 5)])
@@ -213,3 +222,108 @@ def test_the_checkpoints_vision_tensors_name_this_modules_parameters():
     weight_map = json.loads((_GR00T / "model.safetensors.index.json").read_text())["weight_map"]
     remap = _remapper("vision_encoder")
     assert {remap(name) for name in weight_map} - {None} == {name for name, _ in encoder.named_parameters()}
+
+
+# ----------------------------------------------------------------------------
+# The node: `Gr00tN17VisionEncoderSubmodule`, driven the way the engine drives it
+# ----------------------------------------------------------------------------
+
+_WALK = "prefill_vision"
+_FWD = CurrentForwardPassInfo(request_id="r0", graph_walk=_WALK, fwd_index=0, random_seed=0, max_tokens=0)
+_ENGINE = ModelInputsFromEngine(request_ids=["r0"], per_request_info={})
+
+# what the walk's `image_grid_thw` list holds -> the frames it means
+_GRIDS = {
+    "one image": ([torch.tensor([[1, 4, 4]])], [(1, 4, 4)]),
+    "two sizes": ([torch.tensor([[1, 2, 2], [1, 4, 6]])], [(1, 2, 2), (1, 4, 6)]),
+    "four cameras": ([torch.tensor([[1, 2, 4]] * 4)], [(1, 2, 4)] * 4),
+    # one row, unbatched: three numbers that are one grid, not three images
+    "a bare row": ([torch.tensor([1, 4, 6])], [(1, 4, 6)]),
+    # t > 1 is several frames off one row, and they attend separately
+    "frames": ([torch.tensor([[2, 4, 6]]), torch.tensor([3, 2, 4])], [(2, 4, 6), (3, 2, 4)]),
+}
+
+
+def _node(taps: tuple[int, ...] = (1, 3, 5)) -> Gr00tN17VisionEncoderSubmodule:
+    config = _config(taps)
+    return Gr00tN17VisionEncoderSubmodule(Gr00tN17VisionEncoder(config), config.vision)
+
+
+def _walk_inputs(vision: Qwen3_5VisionConfig, grid_thw: list[torch.Tensor]) -> dict[str, list[torch.Tensor]]:
+    """The engine's two input lists: one grid tensor and one pixel block per entry."""
+    patch_numel = vision.in_channels * vision.temporal_patch_size * vision.patch_size**2
+    generator = torch.Generator().manual_seed(4)
+    pixel_values = [
+        torch.randn(int(g.reshape(-1, 3).prod(-1).sum()), patch_numel, generator=generator) for g in grid_thw
+    ]
+    return {"image_grid_thw": grid_thw, "pixel_values": pixel_values}
+
+
+@pytest.mark.parametrize("grid_thw, grid", list(_GRIDS.values()), ids=list(_GRIDS))
+def test_the_step_declares_one_attention_segment_per_frame(grid_thw, grid):
+    node = _node()
+    inputs = node.prepare_inputs(_WALK, _FWD, _walk_inputs(node.config, grid_thw))
+    step = node.declare_step(_WALK, ["r0"], [inputs])
+
+    spans = [h * w for t, h, w in grid for _ in range(t)]
+    assert step.segments == [Segment("r0", "main", span) for span in spans]
+    assert sum(spans) == inputs.input_seq_len
+    assert list(step.steps) == [VISION_ATTN]
+    assert step.steps[VISION_ATTN].causal is False
+
+
+@pytest.mark.parametrize("grid_thw, grid", list(_GRIDS.values()), ids=list(_GRIDS))
+def test_prepare_inputs_derives_the_grid_the_tower_helpers_expect(grid_thw, grid):
+    node = _node()
+    walk_inputs = _walk_inputs(node.config, grid_thw)
+    tensors = node.prepare_inputs(_WALK, _FWD, walk_inputs).tensor_inputs
+    indices, weights, position_ids = _tower_args(node.config, grid)
+
+    assert torch.equal(tensors["indices"], indices)
+    assert torch.equal(tensors["weights"], weights)
+    assert torch.equal(tensors["position_ids"], position_ids)
+    assert torch.equal(tensors["pixel_values"], torch.cat(walk_inputs["pixel_values"]))
+
+
+class _FrameAttention:
+    """Stands in for the ragged attention resource. The engine plans it from the
+    step's segments, so it attends within a frame and not across one."""
+
+    def __init__(self, seq_lengths: tuple[int, ...]):
+        self.seq_lengths = seq_lengths
+
+    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        out, start = [], 0
+        for span in self.seq_lengths:
+            frame = slice(start, start + span)
+            # the kernel's layout is [tokens, heads, dim]; SDPA wants heads first
+            out.append(
+                nn.functional.scaled_dot_product_attention(
+                    q[frame].transpose(0, 1), k[frame].transpose(0, 1), v[frame].transpose(0, 1)
+                ).transpose(0, 1)
+            )
+            start += span
+        return torch.cat(out)
+
+
+@torch.no_grad()
+def test_driving_the_node_runs_the_encoders_own_forward():
+    """The node is plumbing: what comes out of prepare_inputs -> preprocess -> forward
+    is what the module returns for the same images, under both of the forward's keys."""
+    node = _node()
+    grid_thw, grid = _GRIDS["two sizes"]
+    walk_inputs = _walk_inputs(node.config, grid_thw)
+    inputs = node.prepare_inputs(_WALK, _FWD, walk_inputs)
+    node.bind_node_resources({VISION_ATTN: _FrameAttention(inputs.kwargs["seq_lengths"])})
+
+    tensors = node.preprocess(_WALK, _ENGINE, [inputs])
+    # `seq_lengths` is spent on the segments, and is not a forward argument
+    assert set(tensors) == {"pixel_values", "indices", "weights", "position_ids"}
+    out = node.forward(_WALK, _ENGINE, **tensors)
+
+    embeds, features = node.model(torch.cat(walk_inputs["pixel_values"]), *_tower_args(node.config, grid))
+    assert torch.equal(out["vision_embeds"][0], embeds)
+    assert all(torch.equal(ours, theirs) for ours, theirs in zip(out["deepstack_embeds"], features, strict=True))
+    # one embedding and one feature per tap, each a row per 2x2 block: (2 * 2 + 4 * 6) / 4
+    shape = (7, node.config.out_hidden_size)
+    assert [tuple(t.shape) for t in out["vision_embeds"] + out["deepstack_embeds"]] == [shape] * 4
