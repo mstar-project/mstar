@@ -7,8 +7,11 @@ comes from. mstar runs its deployment config unchanged.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 CONTAINERS = "/work1/stephaniewang/atindra/amd/containers"
+# Deploy overlays for vllm-omni (the files inherit the model's deploy YAML inside the image).
+VLLM_OMNI_DEPLOY = Path(__file__).resolve().parent / "vllm_omni"
 # Packages the correctness runner installs outside the serving venv (kokoro, snac).
 REFENV = "/work1/stephaniewang/atindra/amd/results/correctness/data/refenv"
 
@@ -26,7 +29,9 @@ class Row:
     # Context length every engine is given (mstar's max_seq_len), so KV sizing starts from the same place.
     max_len: int | None = None
     runner_model_id: bool = False  # pass --model-id (the runner's Qwen3.5 class serves several sizes)
-    engine_args: dict = field(default_factory=dict)  # engine -> flags this model needs on it
+    # Flags and environment this model needs, keyed by arm name or engine name (the arm's entry wins).
+    engine_args: dict = field(default_factory=dict)
+    engine_env: dict = field(default_factory=dict)
     cost: float = 1.0  # rough relative run time, so the sweep starts the long rows first
 
 
@@ -46,7 +51,18 @@ ROWS: dict[str, Row] = {r.name: r for r in [
     Row("orpheus_colocated", "tts", "canopylabs/orpheus-3b-0.1-ft", "orpheus"),
     Row("qwen3tts", "tts", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "qwen3_tts",
         engine_args={"sglang-omni": ("--config", "/workspace/sglang-omni/examples/configs/"
-                                                 "qwen3_tts_0_6b_customvoice.yaml")}),
+                                                 "qwen3_tts_0_6b_customvoice.yaml"),
+                     "vllm-omni-tuned": ("--deploy-config", str(VLLM_OMNI_DEPLOY / "qwen3_tts_rocm_tuned.yaml"))}),
+    # Qwen3-Omni speaks its answers. vllm-omni's own layout is two GPUs; the one-GPU row places its stages
+    # on one device to sit next to mstar's colocated config.
+    Row("qwen3omni_colocated", "omni", "Qwen/Qwen3-Omni-30B-A3B-Instruct", "qwen3omni",
+        engine_args={"vllm-omni": ("--deploy-config", str(VLLM_OMNI_DEPLOY / "qwen3_omni_one_gpu.yaml")),
+                     "vllm-omni-tuned": ("--deploy-config",
+                                         str(VLLM_OMNI_DEPLOY / "qwen3_omni_one_gpu_rocm_tuned.yaml"))},
+        engine_env={"vllm-omni": {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}}, cost=3.0),
+    Row("qwen3omni_2gpu", "omni", "Qwen/Qwen3-Omni-30B-A3B-Instruct", "qwen3omni", gpus=2,
+        engine_args={"vllm-omni-tuned": ("--deploy-config", str(VLLM_OMNI_DEPLOY / "qwen3_omni_rocm_tuned.yaml"))},
+        engine_env={"vllm-omni": {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}}, cost=3.0),
     Row("whisper_large", "asr", "openai/whisper-large-v3", "whisper_large", max_len=448),
 ]}
 
@@ -110,15 +126,17 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
     Arm("sglang-diffusion", "sglang-diffusion", ("image", "video"), image="sglang",
         args=("--dit-cpu-offload", "false", "--text-encoder-cpu-offload", "false", "--vae-cpu-offload", "false"),
         recipe="SGLang Diffusion with every CPU offload off (DESIGN.md section 11; benchmark/wan22/reproduce.sh)"),
-    Arm("vllm-omni", "vllm-omni", ("tts",), client="vllm_omni", image="vllm-omni", models=("qwen3_tts",),
-        args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"),
-        recipe="vllm-omni v0.30.0 defaults on ROCm (AR stages on TRITON_ATTN, Code2Wav eager)",
+    Arm("vllm-omni", "vllm-omni", ("tts", "omni"), client="vllm_omni", image="vllm-omni",
+        models=("qwen3_tts", "qwen3omni"), args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"),
+        recipe="vllm-omni v0.30.0 defaults on ROCm: the model's deploy YAML with its platforms.rocm section "
+               "(AR stages on TRITON_ATTN, Code2Wav eager)",
         differs="Code2Wav runs eager on ROCm"),
-    Arm("vllm-omni-tuned", "vllm-omni", ("tts",), client="vllm_omni", image="vllm-omni", models=("qwen3_tts",),
-        env={"VLLM_ROCM_USE_AITER": "1", "MIOPEN_FIND_MODE": "FAST"},
+    Arm("vllm-omni-tuned", "vllm-omni", ("tts", "omni"), client="vllm_omni", image="vllm-omni",
+        models=("qwen3_tts", "qwen3omni"), env={"VLLM_ROCM_USE_AITER": "1", "MIOPEN_FIND_MODE": "FAST"},
         args=("--omni", "--init-timeout", "2700", "--stage-init-timeout", "2700"),
-        recipe="vllm-omni recipes (VLLM_ROCM_USE_AITER=1, MIOPEN_FIND_MODE=FAST); per-stage ROCM_AITER_FA needs "
-               "a --deploy-config"),
+        recipe="vllm-omni recipes/Qwen/Qwen3-TTS.md, 1x AMD MI300X (Code2Wav graphs allowed, MIOPEN_FIND_MODE="
+               "FAST) and vLLM's AMD guide (VLLM_ROCM_USE_AITER=1, ROCM_AITER_FA on the AR stages), applied by the "
+               "deploy overlays in benchmark/amd/vllm_omni/"),
     Arm("sglang-omni", "sglang-omni", ("tts",), client="sglang_omni", image="sglang-omni", models=("qwen3_tts",),
         recipe="sglang-omni v0.1.8 defaults, self-built on lmsysorg/sglang:v0.5.21-rocm720-mi30x",
         differs="prefill and Code2Wav graphs are off on ROCm"),
@@ -148,7 +166,8 @@ def arms_for(row: Row, names: list[str]) -> list[Arm]:
 
 def server_args(arm: Arm, row: Row) -> tuple[list[str], dict]:
     """Engine flags and environment for one (arm, row), without port or GPU selection."""
-    args, env = list(arm.args) + list(row.engine_args.get(arm.engine, ())), dict(arm.env)
+    args = list(arm.args) + list(row.engine_args.get(arm.name, row.engine_args.get(arm.engine, ())))
+    env = {**arm.env, **row.engine_env.get(arm.engine, {}), **row.engine_env.get(arm.name, {})}
     if row.tp > 1:
         args += list(arm.tp_args)
         env.update(arm.tp_env)

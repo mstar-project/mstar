@@ -338,3 +338,28 @@ def test_orpheus_vllm_decode_window():
     assert seen["levels"][2][0][:4] == [3, 4, 6, 7]
     assert len(pcm) == 2 * 2048  # the middle 2048 samples, int16
     assert c._decode([5000] + codes[1:]) is None
+
+
+def test_vllm_omni_deploy_overlays():
+    import yaml
+
+    tts = catalog.ROWS["qwen3tts"]
+    args, env = catalog.server_args(catalog.ARMS["vllm-omni-tuned"], tts)
+    deploy = Path(args[args.index("--deploy-config") + 1])
+    assert deploy.is_file() and env == {"VLLM_ROCM_USE_AITER": "1", "MIOPEN_FIND_MODE": "FAST"}
+    doc = yaml.safe_load(deploy.read_text())
+    stages = {s["stage_id"]: s for s in doc["platforms"]["rocm"]["stages"]}
+    assert doc["base_config"].endswith("/vllm_omni/deploy/qwen3_tts.yaml")
+    assert stages[0]["attention_backend"] == "ROCM_AITER_FA" and stages[1]["enforce_eager"] is False
+    assert "--deploy-config" not in catalog.server_args(catalog.ARMS["vllm-omni"], tts)[0]
+    one = catalog.ROWS["qwen3omni_colocated"]
+    for arm, name in (("vllm-omni", "qwen3_omni_one_gpu.yaml"),
+                      ("vllm-omni-tuned", "qwen3_omni_one_gpu_rocm_tuned.yaml")):
+        args, env = catalog.server_args(catalog.ARMS[arm], one)
+        assert args[args.index("--deploy-config") + 1].endswith(name)
+        assert env["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+    placed = yaml.safe_load((catalog.VLLM_OMNI_DEPLOY / "qwen3_omni_one_gpu.yaml").read_text())
+    assert {s["devices"] for s in placed["stages"]} == {"0"}
+    assert sum(s["gpu_memory_utilization"] for s in placed["stages"]) < 0.95
+    two = catalog.ROWS["qwen3omni_2gpu"]
+    assert "--deploy-config" not in catalog.server_args(catalog.ARMS["vllm-omni"], two)[0]
