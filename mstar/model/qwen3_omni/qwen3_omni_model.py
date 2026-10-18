@@ -73,6 +73,7 @@ from mstar.model.base import (
 )
 from mstar.model.components import MoeParallelConfig
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
+from mstar.model.components.moe import prepare_moe_weights
 from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
@@ -221,8 +222,11 @@ class Qwen3OmniModel(Model):
         model_path_hf: str,
         cache_dir: str | None = None,
         prefill_token_buckets: list[int] | None = None,
+        moe_backend: str = "auto",
         **kwargs,
     ):
+        """``moe_backend`` comes from the serving config's ``model_kwargs:`` and
+        picks the Thinker's and Talker's MoE kernels (see MoEBackend)."""
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
         # the Thinker's captured prefill ladder (`ThinkerSubmodule.PREFILL_TOKEN_BUCKETS`)
@@ -254,6 +258,8 @@ class Qwen3OmniModel(Model):
         self.config = Qwen3OmniModelConfig.from_pretrained(local_dir)
         self.local_dir = local_dir
         apply_code2wav_serving_overrides(self.config.code2wav, kwargs)
+        self.config.thinker_text.moe_backend = moe_backend
+        self.config.talker_text.moe_backend = moe_backend
 
         # Tokenizer (Thinker uses a Qwen-family tokenizer). Qwen3-Omni is native
         # in transformers, so no loader here runs code from the checkpoint repo.
@@ -1677,6 +1683,7 @@ class Qwen3OmniModel(Model):
             stacked_params=self._get_thinker_stacked_params(),
             name_remapper=self._thinker_remap,
         )
+        prepare_moe_weights(thinker_model)
         thinker_model.eval()
 
 
@@ -1746,6 +1753,7 @@ class Qwen3OmniModel(Model):
             stacked_params=stacked,
             name_remapper=self._thinker_remap,
         )
+        prepare_moe_weights(talker_model)
         talker_model.eval()
 
         from mstar.model.qwen3_omni.submodules import TalkerSubmodule
