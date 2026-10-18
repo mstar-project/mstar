@@ -1,0 +1,17 @@
+# vllm-omni "tuned" arm for Qwen3-Omni on ROCm, on the default layout of
+# vllm_omni/deploy/qwen3_omni_moe.yaml (thinker on GPU 0, talker and Code2Wav on GPU 1).
+#  - Thinker and talker run ROCM_AITER_FA, the backend vLLM's AMD guide recommends. vllm-omni falls back
+#    to TRITON_ATTN unless a stage names a backend (stage_init_utils._apply_rocm_attention_backend).
+#  - Code2Wav (stage 2) is not forced eager, with MIOPEN_FIND_MODE=FAST from the arm. That is the fix
+#    recipes/Qwen/Qwen3-TTS.md documents on MI300X for the same MIOpen capture problem; nothing documents
+#    it for Qwen3-Omni, so if capture fails here the arm fails and the table says so.
+base_config: /app/vllm-omni/vllm_omni/deploy/qwen3_omni_moe.yaml
+platforms:
+  rocm:
+    stages:
+      - stage_id: 0
+        attention_backend: ROCM_AITER_FA
+      - stage_id: 1
+        attention_backend: ROCM_AITER_FA
+      - stage_id: 2
+        enforce_eager: false
