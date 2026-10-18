@@ -9,7 +9,7 @@ handle only the gate_up GEMM, SwiGLU, down GEMM, and weighted sum over top-k.
 """
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 import triton.language as tl
@@ -77,6 +77,7 @@ def fused_experts(
     reduce_results: bool = True,
     skip_invalid: bool = False,
     alignment: MoeAlignment | None = None,
+    config: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -112,6 +113,10 @@ def fused_experts(
     alignment : MoeAlignment, optional
         Precomputed alignment of ``topk_ids``. Its ``block_m`` must be
         :func:`moe_block_m` for this shape. Computed here when omitted.
+    config : dict, optional
+        Kernel launch parameters (tile sizes, ``num_warps``, ``num_stages``
+        and any backend-specific compiler options), used for both GEMMs.
+        Defaults to :func:`get_config` for these sizes.
 
     Returns
     -------
@@ -145,12 +150,15 @@ def fused_experts(
         return decode.routed_experts(hidden_states, w1, w2, topk_weights, topk_ids,
                                      reduce=reduce_results)
 
-    # tuned launch options must reach a compiled launch as constants, and the alignment's torch
-    # fallback breaks the graph before it, so a compiled call without the CUDA op runs the default
-    # tiles. K is the weights' (static under any compile), not the activations'.
-    tuned = alignment is not None or not torch.compiler.is_compiling() or align._cuda_op_available()
-    config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=k_in, top_k=top_k,
-                                     dtype=hidden_states.dtype, device=hidden_states.device, tuned=tuned)
+    if config is None:
+        # tuned launch options must reach a compiled launch as constants, and the alignment's torch
+        # fallback breaks the graph before it, so a compiled call without the CUDA op runs the default
+        # tiles. K is the weights' (static under any compile), not the activations'.
+        tuned = alignment is not None or not torch.compiler.is_compiling() or align._cuda_op_available()
+        config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=k_in, top_k=top_k,
+                                         dtype=hidden_states.dtype, device=hidden_states.device, tuned=tuned)
+    else:
+        down_config = config
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
