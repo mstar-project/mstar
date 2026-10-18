@@ -182,7 +182,10 @@ def render(data: dict) -> str:
                                     f"{_fmt(s['max'], scale, dec)}]")
                     else:
                         vals.append(_fmt(s["median"], scale, dec))
-                flags = " ".join(c.get("flags", []) + (["error"] if c.get("errors") else []))
+                h = (data["arms"].get(f"{row}/{c['arm']}") or {}).get("health") or {}
+                # Thermal throttling or new ECC errors during the arm void its cells.
+                flags = " ".join(c.get("flags", []) + (["error"] if c.get("errors") else [])
+                                 + (["HEALTH-FAIL"] if h.get("status") == "FAIL" else []))
                 corr = data["correctness"].get(f"{row}/{c['arm']}") or {}
                 corr_txt = _correctness_text(corr)
                 why = "; ".join(_comparability(data, row, c["arm"], wl_name, wl.family))
