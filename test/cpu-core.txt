@@ -54,6 +54,7 @@ test/modular/test_gdn_gate_pad_alignment.py
 test/modular/test_gdn_no_sink_slot.py
 test/modular/test_gdn_prefill_padding_rows.py
 test/modular/test_gdn_tensor_parallel.py
+test/modular/test_gdn_kernels_dispatch.py
 test/modular/test_recurrent_padding_rows.py
 test/modular/test_recurrent_preplan.py
 test/modular/test_mamba2_geometry.py
