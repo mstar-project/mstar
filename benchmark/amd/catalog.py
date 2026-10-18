@@ -27,11 +27,12 @@ class Row:
     max_len: int | None = None
     runner_model_id: bool = False  # pass --model-id (the runner's Qwen3.5 class serves several sizes)
     engine_args: dict = field(default_factory=dict)  # engine -> flags this model needs on it
+    cost: float = 1.0  # rough relative run time, so the sweep starts the long rows first
 
 
 def _qwen(size: str, gpus: int = 1, tp: int = 1, name: str | None = None) -> Row:
     return Row(name or f"qwen3_5_{size.lower()}", "text", f"Qwen/Qwen3.5-{size}", "qwen3.5", gpus=gpus, tp=tp,
-               max_len=32768, runner_model_id=True)
+               max_len=32768, runner_model_id=True, cost=1 + float(size.rstrip("B")) / 4)
 
 
 ROWS: dict[str, Row] = {r.name: r for r in [
