@@ -9,6 +9,8 @@ graph.
 
 import torch
 
+from mstar.platforms.dispatch import PlatformDispatch
+
 
 @torch.library.custom_op("mstar::rope_apply_qk_inplace", mutates_args={"q", "k"})
 def rope_apply_qk_inplace(
@@ -26,8 +28,7 @@ def rope_apply_qk_inplace(
     )
 
 
-@torch.library.register_kernel(rope_apply_qk_inplace, "cuda")
-def _rope_apply_qk_inplace_cuda(
+def _rope_flashinfer(
     q: torch.Tensor,
     k: torch.Tensor,
     pos_ids: torch.Tensor,
@@ -72,6 +73,38 @@ def _rope_apply_qk_inplace_cuda(
             high_freq_factor=high_freq_factor,
             old_context_len=old_context_len,
         )
+
+
+def _rocm_rope():
+    from mstar.engine.resources.position.rocm import rope_apply_qk_inplace
+
+    return rope_apply_qk_inplace
+
+
+# torch calls AMD GPUs "cuda" devices too, so the kernel picks by platform
+_rope = PlatformDispatch(
+    "mstar::rope_apply_qk_inplace", cuda=lambda: _rope_flashinfer, rocm=_rocm_rope,
+)
+
+
+@torch.library.register_kernel(rope_apply_qk_inplace, "cuda")
+def _rope_apply_qk_inplace_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    rotary_dim: int | None,
+    interleave: bool,
+    rope_scale: float,
+    rope_theta: float,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+    old_context_len: float | None = None,
+) -> None:
+    _rope(
+        q, k, pos_ids, cos_sin_cache, rotary_dim, interleave, rope_scale,
+        rope_theta, low_freq_factor, high_freq_factor, old_context_len,
+    )
 
 
 @torch.library.register_kernel(rope_apply_qk_inplace, "xpu")
