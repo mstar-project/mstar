@@ -3,6 +3,9 @@ UNSUPPORTED (a test checks this)."""
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from benchmark.correctness.families.asr_models import HiggsAsr, WhisperAsr
 from benchmark.correctness.families.base import Family
 from benchmark.correctness.families.duplex import NemotronDuplex
@@ -43,17 +46,82 @@ class Wan22Video(VideoFamily):
     negative_prompt = ""
 
 
-class Cosmos3Video(VideoFamily):
-    # Cosmos3 draws its noise on the GPU, not the CPU.
+class Cosmos3Reference:
+    """diffusers' Cosmos3OmniPipeline built from the checkpoint's parts, prompted like mstar.
+
+    mstar leaves out the system prompt and the resolution and duration sentences unless a request
+    asks for them. diffusers 0.41 adds all three by default, which changes the conditioning.
+    """
+
+    generator_device = "cuda"  # Cosmos3 draws its noise on the GPU, not the CPU
+    ref_call_kwargs = {"use_system_prompt": False, "add_resolution_template": False,
+                       "add_duration_template": False, "enable_safety_check": False}
+    ref_scheduler_kwargs: dict = {}  # where the serving recipe differs from the checkpoint's scheduler config
+
+    def load_pipeline(self, device: str):
+        import torch
+        from diffusers import AutoencoderKLWan, UniPCMultistepScheduler
+        from diffusers.models.transformers.transformer_cosmos3 import Cosmos3OmniTransformer
+        from diffusers.pipelines.cosmos.pipeline_cosmos3_omni import Cosmos3OmniPipeline
+        from huggingface_hub import snapshot_download
+        from transformers import AutoTokenizer
+
+        snap = Path(snapshot_download(self.hf_id))
+        index = json.loads((snap / "model_index.json").read_text())
+        dtype = torch.bfloat16
+        return Cosmos3OmniPipeline(
+            transformer=Cosmos3OmniTransformer.from_pretrained(snap, subfolder="transformer", torch_dtype=dtype),
+            text_tokenizer=AutoTokenizer.from_pretrained(snap / "text_tokenizer"),
+            vae=AutoencoderKLWan.from_pretrained(snap, subfolder="vae", torch_dtype=dtype),
+            scheduler=UniPCMultistepScheduler.from_pretrained(snap, subfolder="scheduler",
+                                                              **self.ref_scheduler_kwargs),
+            sound_tokenizer=None, enable_safety_checker=False,
+            use_native_flow_schedule=bool(index.get("use_native_flow_schedule", False)),
+        ).to(device)
+
+    def reference_description(self) -> str:
+        extra = f", scheduler {self.ref_scheduler_kwargs}" if self.ref_scheduler_kwargs else ""
+        return super().reference_description() + ", no system prompt or metadata sentences" + extra
+
+    @staticmethod
+    def reference_frames(out):
+        return out.video
+
+
+class Cosmos3Video(Cosmos3Reference, VideoFamily):
     hf_id = "nvidia/Cosmos3-Nano"
-    generator_device = "cuda"
     height, width, num_frames, steps, fps = 480, 832, 17, 35, 24
     guidance = 6.0
 
 
+class Cosmos3I2V(Cosmos3Video):
+    """Image-to-video. diffusers 0.41 resizes the frame by cover-scale and center crop, so serve with
+    --override model_kwargs.conditioning_resize=aspect_crop (the Nano default is a plain stretch)."""
+
+    image_to_video = True
+
+
+class Cosmos3T2I(Cosmos3Reference, ImageFamily):
+    """Text-to-image. mstar's t2i recipe (flow shift 3, guidance only for t in [400, 1000]) has no
+    diffusers switch, so both sides run the checkpoint scheduler's shift with guidance on every step."""
+
+    hf_id = "nvidia/Cosmos3-Nano"
+    steps = 35
+    guidance = 6.0
+    request_extra = {"flow_shift": 1.0, "guidance_interval": [0.0, 1000.0]}
+
+    def pipeline_kwargs(self, it) -> dict:
+        return {**super().pipeline_kwargs(it), "num_frames": 1, "output_type": "pil", **self.ref_call_kwargs}
+
+    def reference_image(self, pipe, prompt: str, generator, kwargs: dict):
+        return pipe(prompt=prompt, generator=generator, **kwargs).video[0]
+
+
 class Cosmos3EdgeVideo(Cosmos3Video):
+    # The Edge yaml serves video at flow shift 12 on the native flow schedule, without the karras transform.
     hf_id = "nvidia/Cosmos3-Edge"
     num_frames, steps = 33, 20
+    ref_scheduler_kwargs = {"flow_shift": 12.0, "use_karras_sigmas": False}
 
 
 class Cosmos3SuperVideo(Cosmos3Video):
@@ -129,6 +197,8 @@ def family_for_config(config_name: str, model_key: str, cfg: dict, opts: dict[st
         raise NotImplementedError(f"{config_name}: no correctness family for model {model_key!r}")
     if model_key == "qwen3_omni" and opts.get("set") == "text":
         return OmniText(model_key, cfg, opts)
+    if model_key == "cosmos3" and opts.get("mode") in ("t2i", "i2v"):
+        return {"t2i": Cosmos3T2I, "i2v": Cosmos3I2V}[opts["mode"]](model_key, cfg, opts)
     if opts.get("set") == "image" and issubclass(FAMILIES[model_key], TextFamily):
         hf_id = FAMILIES[model_key].hf_id
         cls = type(f"TextImage_{hf_id.rsplit('/', 1)[-1]}", (TextImageFamily,), {"hf_id": hf_id})
