@@ -15,16 +15,6 @@ from functools import cached_property
 
 import torch
 
-from mstar.graph.base import TensorPointerInfo
-from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.model.components.diffusion.image_io import PNG_WORKERS
-
-try:
-    import torchaudio  # noqa: F401 — probes availability; real usage in callers
-    from torchcodec.decoders import VideoDecoder
-except (ImportError, RuntimeError, OSError):
-    VideoDecoder = None
-
 from mstar.api_server.request_types import (
     ClientAppend,
     DataWorkerProfile,
@@ -47,7 +37,10 @@ from mstar.communication.tensors import (
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
+from mstar.graph.base import TensorPointerInfo
+from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels
+from mstar.model.components.diffusion.image_io import PNG_WORKERS
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
