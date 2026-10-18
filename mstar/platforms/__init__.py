@@ -32,6 +32,7 @@ __all__ = [
     "RocmPlatform",
     "XpuPlatform",
     "apply_process_env_defaults",
+    "apply_visible_devices",
     "current_platform",
     "resolve_platform",
 ]
@@ -91,3 +92,11 @@ def apply_process_env_defaults() -> None:
             os.environ[key] = value(os.environ.get(key))
         else:
             os.environ.setdefault(key, value)
+
+
+def apply_visible_devices(devices: str | None) -> None:
+    """Limit this process and its children to ``devices`` (comma-separated
+    indices). With None, keep the env's choice after the platform checks it.
+    Call before the first device call, like apply_process_env_defaults.
+    """
+    os.environ.update(_built_for().visible_devices_env(devices, os.environ))
