@@ -193,6 +193,41 @@ class _SpecFairness:
 
 
 @dataclass
+class _ChainSteps:
+    """How long the decode loop has kept the worker, for ``_build_speculation``.
+
+    ``consecutive`` gates the fairness peek: speculative steps since the last
+    yield-away or serial step. ``since_other`` is what the consecutive-step cap
+    reads: steps since another (node, walk) ran or the loop fell back to the
+    serial path. A yield-away that lands back on the chain's own (node, walk),
+    the other capture group's backlog, does not end it: a chain over two
+    capture groups yields that way every other step, so a cap of 2 or more
+    would never be reached.
+    """
+    consecutive: int = 0
+    since_other: int = 0
+
+    def ran(self, speculation: "Speculation", chain: tuple[str, str] | None) -> None:
+        """Count a step submitted from ``_build_speculation``; ``chain`` is
+        the (node, walk) of the step it was built from."""
+        if not speculation.is_yield_away:
+            self.consecutive += 1
+            self.since_other += 1
+            return
+        self.consecutive = 0
+        batch = speculation.scheduled_batch
+        if (batch.node_name, batch.graph_walk) == chain:
+            self.since_other += 1
+        else:
+            self.since_other = 0
+
+    def reset(self) -> None:
+        """A serial step or a failed one: the chain is over."""
+        self.consecutive = 0
+        self.since_other = 0
+
+
+@dataclass
 class PendingBatch:
     batch: ScheduledBatch
     node_batch: ExecutingBatch
@@ -3998,7 +4033,7 @@ class Worker:
         # to officially send a removal message
 
     def _build_speculation(
-        self, pending: PendingBatch | None, consecutive: int,
+        self, pending: PendingBatch | None, chain: _ChainSteps,
         fair: "_SpecFairness",
     ) -> tuple[Speculation | None, tuple[str, str] | None]:
         """Speculate the step after ``pending`` (N+1 from N), or a
@@ -4037,10 +4072,10 @@ class Worker:
             )
             other_ready = (
                 fair.peek
-                and consecutive >= 1
+                and chain.consecutive >= 1
                 and self.scheduler.has_ready_excluding(self.request_state, chain_key)
             )
-            must_yield_away = consecutive >= fair.max_consecutive or other_ready
+            must_yield_away = chain.since_other >= fair.max_consecutive or other_ready
             if target is not None and not must_yield_away and not admit_refused:
                 if self.enable_nvtx:
                     range_push("worker.speculate", synchronize=False)
@@ -4213,7 +4248,7 @@ class Worker:
         fair = _SpecFairness(
             peek=spec_peek_for_fairness, max_consecutive=self._max_consecutive_spec,
         )
-        consecutive_spec_steps = 0
+        chain_steps = _ChainSteps()
         yield_away_from_target: tuple[str, str] | None = None
 
         def _arm_speculation(spec: Speculation) -> None:
@@ -4331,8 +4366,10 @@ class Worker:
                 # For non-AR or non-loop-body steps, falls through to the
                 # non-speculative path below (drain, then schedule).
                 speculation, yield_away_from_target = self._build_speculation(
-                    pending, consecutive_spec_steps, fair,
+                    pending, chain_steps, fair,
                 )
+                chain_target = None if pending is None \
+                    else (pending.node_name, pending.graph_walk)
                 if speculation is not None:
                     _arm_speculation(speculation)
 
@@ -4522,10 +4559,7 @@ class Worker:
                     _set_pending(None)
 
                 if spec_pending is not None:
-                    if speculation.is_yield_away:
-                        consecutive_spec_steps = 0
-                    else:
-                        consecutive_spec_steps += 1
+                    chain_steps.ran(speculation, chain_target)
                     if phase_period:
                         _phase_record("iter_total", _time.perf_counter() - _iter_start)
                         phase_bs.append(len(spec_pending.batch.request_to_worker_graph))
@@ -4533,7 +4567,7 @@ class Worker:
                         _phase_flush()
                     _set_pending(spec_pending)
                     continue
-                consecutive_spec_steps = 0
+                chain_steps.reset()
 
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
@@ -4601,5 +4635,5 @@ class Worker:
                 # calls .result() on the same completed-with-exception future
                 # and re-raises forever, wedging the worker on one bad batch.
                 _set_pending(None)
-                consecutive_spec_steps = 0
+                chain_steps.reset()
                 sleep(0.01)

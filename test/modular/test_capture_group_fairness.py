@@ -21,6 +21,8 @@ import contextlib
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, ".")
 
 from test_micro_scheduler import (
@@ -35,7 +37,7 @@ from test_micro_scheduler import (
 
 from mstar.worker.batch_builder import BatchBuildRequest, FIFOBatchBuilder
 from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.worker import Speculation, Worker, _SpecFairness
+from mstar.worker.worker import Speculation, Worker, _ChainSteps, _SpecFairness
 
 OTHER = "OTHER"
 SAME = {0: False, 1: False}
@@ -307,9 +309,10 @@ def _async_order(groups, steps=200, peek=True, max_consecutive=1024, other_stays
     sched.runtime = _AsyncRuntime(manager)
     loop = _Loop(sched, manager)
     fair = _SpecFairness(peek=peek, max_consecutive=max_consecutive)
-    pending, consecutive, order = None, 0, []
+    pending, chain, order = None, _ChainSteps(), []
     for _ in range(steps):
-        speculation, yield_away = loop._build_speculation(pending, consecutive, fair)
+        speculation, yield_away = loop._build_speculation(pending, chain, fair)
+        chain_target = None if pending is None else (pending.node_name, pending.graph_walk)
         if pending is not None:
             # N completes: its rids are re-readied unless N+1 already holds them
             done = pending.batch
@@ -321,9 +324,9 @@ def _async_order(groups, steps=200, peek=True, max_consecutive=1024, other_stays
                     manager.ingest(rid)
         if speculation is not None:
             batch = speculation.scheduled_batch
-            consecutive = 0 if speculation.is_yield_away else consecutive + 1
+            chain.ran(speculation, chain_target)
         else:
-            consecutive = 0
+            chain.reset()
             batch = None
             if yield_away is not None:
                 batch = sched.get_next_batch(manager, exclude_target=yield_away)
@@ -398,3 +401,37 @@ def test_the_consecutive_cap_alone_no_longer_needs_the_peek():
     # decode node's backlog
     first = _first_service_async(MIXED, peek=False, max_consecutive=1)
     assert first is not None and first <= 5, f"OTHER first ran at step {first}"
+
+
+@pytest.mark.parametrize("cap", [2, 8, 1024])
+def test_the_consecutive_cap_alone_yields_beside_two_groups(cap):
+    # With the peek off the cap is the only yield. Every other step the chain
+    # yields to the other group's backlog on the same node; counting that as
+    # leaving the chain kept the count at 0, 1, 0, 1 and OTHER never ran.
+    first = _first_service_async(MIXED, peek=False, max_consecutive=cap, steps=cap + 50)
+    assert first is not None and first <= cap + 2, f"OTHER first ran at step {first}"
+
+
+def test_the_cap_gives_two_groups_the_share_one_group_gets():
+    order = _async_order(MIXED, steps=40, peek=False, max_consecutive=2, other_stays_ready=True)
+    turns = _rids_per_turn(order)
+    assert len(turns) >= 5, f"OTHER ran only {len(turns) + 1} times: {order}"
+    assert all(turn == {0: 2, 1: 2} for turn in turns), turns
+
+
+def test_the_consecutive_cap_with_one_group_is_unchanged():
+    assert _first_service_async(SAME, peek=False, max_consecutive=2) == 3
+
+
+def test_only_a_step_of_another_node_restarts_the_cap_count():
+    def yield_away(node):
+        return SimpleNamespace(
+            is_yield_away=True,
+            scheduled_batch=SimpleNamespace(node_name=node, graph_walk=WALK),
+        )
+
+    chain = _ChainSteps(consecutive=3, since_other=3)
+    chain.ran(yield_away(NODE), (NODE, WALK))
+    assert (chain.consecutive, chain.since_other) == (0, 4)
+    chain.ran(yield_away(OTHER), (NODE, WALK))
+    assert (chain.consecutive, chain.since_other) == (0, 0)
