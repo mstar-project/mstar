@@ -1762,7 +1762,8 @@ Sizing the caches is only half of it: ``configs/whisper_large.yaml`` also sets
 ``max_concurrent_requests: 64``, so the conductor queues further requests instead of the
 worker offloading decoding requests to admit them. ``WhisperModel.validate_config_yaml``
 refuses at startup a cap that either cache cannot hold after the YAML's ``resources:``
-overrides.
+overrides, through ``mstar.model.utils.check_kv_pools_fit``, which any model with KV caches
+can call the same way.
 
 Whisper's ``declare_step`` shows how a write-once context is expressed with spans. The
 context segments have a non-zero span in the prefill step that writes them, and a span of

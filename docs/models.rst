@@ -106,6 +106,12 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, speech-to-text
        in 1,600+ languages with no language code. Not autoregressive; batched across
        requests. Apache-2.0.
+   * - ``canary``
+     - ``nvidia/canary-1b-v2``
+     - FastConformer encoder + Transformer decoder: speech recognition in 25 European
+       languages and translation to or from English (``language``, English if unset, and
+       ``target_language`` or ``task="translate"``). Clips up to 40 s; longer uploads are
+       windowed. No timestamps.
    * - ``parakeet``
      - ``nvidia/parakeet-tdt-0.6b-v3``
      - FastConformer + token-and-duration transducer, 25 European languages, language detected
@@ -217,8 +223,8 @@ Omnilingual ASR notes
   (``record_oracle.py`` runs the reference in its own venv, as it pins torch 2.8 and
   fairseq2).
 
-FastConformer ASR (``parakeet``, ``nemotron_asr``) notes
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+FastConformer ASR (``canary``, ``parakeet``, ``nemotron_asr``) notes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - Install with ``.[asr]``. Uploads that libsndfile can't read (M4A, WebM) are decoded by
   torchcodec, which needs FFmpeg.
@@ -231,12 +237,17 @@ FastConformer ASR (``parakeet``, ``nemotron_asr``) notes
     sk, sl, es, sv, ru, uk) and is then ignored; any other is refused.
   - ``nemotron_asr``: ``language`` is its prompt: a locale from the checkpoint's
     ``processor_config.json`` (such as ``en-US``), a bare code, or ``auto`` (the default).
+  - ``canary``: ``language`` (the speech's, default ``en``; one of Parakeet's 25),
+    ``target_language`` (a translation to or from English; the OpenAI route also takes
+    ``task="translate"``) and ``punctuation`` (default on).
 
-- A request holds up to 610 s on Parakeet and Nemotron. ``/v1/audio/transcriptions`` cuts
-  longer uploads (up to 30 min) into windows at quiet moments and joins their text. Neither
-  emits timestamps.
+- A request holds up to 610 s on Parakeet and Nemotron, and 40.96 s on Canary.
+  ``/v1/audio/transcriptions`` cuts longer uploads (up to 30 min) into windows at quiet
+  moments and joins their text. None of the three emits timestamps.
 - Parakeet and Nemotron hold no cache; ``compile_step: false`` in their ``model_kwargs``
   decodes with eager kernels instead of the compiled step.
+- Canary's YAML sizes the KV caches for ``max_concurrent_requests`` (64), and startup
+  refuses a cap the caches can't hold.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------

@@ -669,6 +669,14 @@ def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(WhisperModel, config=WhisperModelConfig())
 
 
+def _canary(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.canary.canary_model import CanaryModel
+    from mstar.model.canary.config import CanaryModelConfig
+    from mstar.model.components.fastconformer import FastConformerConfig
+    config = CanaryModelConfig(encoder=FastConformerConfig())
+    return _bare(CanaryModel, config=config)
+
+
 def _parakeet(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.components.fastconformer import FastConformerConfig
     from mstar.model.components.transducer import TransducerConfig
@@ -685,6 +693,7 @@ def _default(name, model_kwargs, tmp_path, monkeypatch):
 
 _FACTORIES = {
     "BagelModel": _bagel,
+    "CanaryModel": _canary,
     "ChatterboxModel": _chatterbox,
     "Cosmos3Model": _cosmos3,
     "Flux2KleinModel": _flux2,

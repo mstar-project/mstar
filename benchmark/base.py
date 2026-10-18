@@ -425,6 +425,11 @@ class _FastConformerAsr(Model):
         return {RequestType.A2T}
 
 
+class Canary(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/canary-1b-v2"
+
+
 class Parakeet(_FastConformerAsr):
     def get_hf_url(self):
         return "nvidia/parakeet-tdt-0.6b-v3"
@@ -448,6 +453,7 @@ class ModelType(Enum):
     VJEPA2AC = "vjepa2ac"
     WHISPER_LARGE = "whisper_large"
     HIGGS_AUDIO = "higgs_audio"
+    CANARY = "canary"
     PARAKEET = "parakeet"
     NEMOTRON_ASR = "nemotron_asr"
     QWEN3_5 = "qwen3.5"
@@ -478,6 +484,8 @@ class ModelType(Enum):
             return WhisperLarge(**kwargs)
         if self == ModelType.HIGGS_AUDIO:
             return HiggsAudio(**kwargs)
+        if self == ModelType.CANARY:
+            return Canary(**kwargs)
         if self == ModelType.PARAKEET:
             return Parakeet(**kwargs)
         if self == ModelType.NEMOTRON_ASR:

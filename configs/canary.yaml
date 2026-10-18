@@ -1,0 +1,14 @@
+model: "canary"
+max_seq_len: 1024
+# The decoder caches hold 64 requests at their limits (4 context pages for a
+# 40.96 s clip, 8 self-attention pages at the position limit), plus the page
+# each cache keeps as its sink.
+max_concurrent_requests: 64
+resources:
+  kv_cache:
+    max_num_pages: 513
+  cross_kv_cache:
+    max_num_pages: 257
+node_groups:
+  - node_names: [audio_encoder, decoder]
+    ranks: [0]

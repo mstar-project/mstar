@@ -1076,6 +1076,43 @@ def _untimed_transcription_kwargs(req: TranscriptionRequest, model: str) -> dict
     return mk
 
 
+class CanaryAdapter(OpenAIAdapter):
+    """NVIDIA Canary: speech recognition, and translation to or from English.
+
+    ``language`` is the speech's language (English by default); an
+    ``extra_body`` ``target_language`` other than it asks for a translation.
+    The decoder takes no free-text conditioning and emits no timestamps, so
+    ``prompt`` is dropped and timestamp granularities are refused.
+    """
+
+    supports_transcriptions = True
+    # Canary was trained on clips of up to 40 s; windows don't condition on
+    # each other, so they run in parallel
+    max_audio_seconds = 40.0
+    long_form = "parallel"
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        from mstar.model.canary.config import check_task
+
+        mk = _untimed_transcription_kwargs(req, "Canary")
+        # Whisper's convention: translate means into English
+        task = mk.pop("task", None)
+        if task not in (None, "transcribe", "translate"):
+            raise ValueError(f"task must be 'transcribe' or 'translate'; got {task!r}")
+        source = mk.get("language") or "en"
+        target = mk.get("target_language") or ("en" if task == "translate" else source)
+        mk["language"], mk["target_language"] = check_task(source, target)
+        if not isinstance(mk.get("punctuation", True), bool):
+            raise ValueError(f"punctuation must be true or false; got {mk['punctuation']!r}")
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
 class TransducerAdapter(OpenAIAdapter):
     """NVIDIA Parakeet / Nemotron ASR: transducer speech recognition.
 
@@ -1194,6 +1231,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "wan22": Wan22Adapter(),
     "ltx2_5": LTX25Adapter(),
     "whisper_large": WhisperAdapter(),
+    "canary": CanaryAdapter(),
     "parakeet": TransducerAdapter(detects_language=True),
     "nemotron_asr": TransducerAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
